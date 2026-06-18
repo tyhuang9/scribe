@@ -1,1 +1,7 @@
 /target
+
+# Graphify generated output/state should stay local.
+/.graphifyignore
+/graphify-out/
+/.graphify/
+/.graphify-cache/
