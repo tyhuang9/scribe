@@ -1,0 +1,143 @@
+use anyhow::{Result, anyhow};
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+
+pub struct HotkeyService {
+    manager: Option<GlobalHotKeyManager>,
+    hotkey: Option<HotKey>,
+    pub last_error: Option<String>,
+}
+
+impl HotkeyService {
+    pub fn new(spec: &str) -> Self {
+        let mut service = Self {
+            manager: None,
+            hotkey: None,
+            last_error: None,
+        };
+        if let Err(err) = service.register(spec) {
+            service.last_error = Some(err.to_string());
+        }
+        service
+    }
+
+    pub fn register(&mut self, spec: &str) -> Result<()> {
+        self.hotkey = None;
+        self.manager = None;
+
+        let manager = GlobalHotKeyManager::new()?;
+        let hotkey = parse_hotkey(spec)?;
+        manager.register(hotkey)?;
+
+        self.manager = Some(manager);
+        self.hotkey = Some(hotkey);
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub fn poll_pressed(&self) -> bool {
+        let mut pressed = false;
+        while GlobalHotKeyEvent::receiver().try_recv().is_ok() {
+            pressed = true;
+        }
+        pressed
+    }
+}
+
+pub fn parse_hotkey(spec: &str) -> Result<HotKey> {
+    let mut modifiers = Modifiers::empty();
+    let mut key = None;
+
+    for part in spec.split('+') {
+        let token = part.trim().to_ascii_lowercase();
+        match token.as_str() {
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "alt" | "option" => modifiers |= Modifiers::ALT,
+            "super" | "meta" | "cmd" | "command" | "win" => modifiers |= Modifiers::SUPER,
+            "" => {}
+            _ => key = Some(parse_key(&token)?),
+        }
+    }
+
+    let key =
+        key.ok_or_else(|| anyhow!("hotkey must include a key, for example Ctrl+Shift+Space"))?;
+    Ok(HotKey::new(Some(modifiers), key))
+}
+
+fn parse_key(token: &str) -> Result<Code> {
+    match token {
+        "space" => Ok(Code::Space),
+        "enter" | "return" => Ok(Code::Enter),
+        "tab" => Ok(Code::Tab),
+        "escape" | "esc" => Ok(Code::Escape),
+        "backspace" => Ok(Code::Backspace),
+        "delete" => Ok(Code::Delete),
+        "up" | "arrowup" => Ok(Code::ArrowUp),
+        "down" | "arrowdown" => Ok(Code::ArrowDown),
+        "left" | "arrowleft" => Ok(Code::ArrowLeft),
+        "right" | "arrowright" => Ok(Code::ArrowRight),
+        "f1" => Ok(Code::F1),
+        "f2" => Ok(Code::F2),
+        "f3" => Ok(Code::F3),
+        "f4" => Ok(Code::F4),
+        "f5" => Ok(Code::F5),
+        "f6" => Ok(Code::F6),
+        "f7" => Ok(Code::F7),
+        "f8" => Ok(Code::F8),
+        "f9" => Ok(Code::F9),
+        "f10" => Ok(Code::F10),
+        "f11" => Ok(Code::F11),
+        "f12" => Ok(Code::F12),
+        _ if token.len() == 1 => {
+            let ch = token.chars().next().unwrap();
+            match ch {
+                'a'..='z' => Ok(letter_code(ch)),
+                '0' => Ok(Code::Digit0),
+                '1' => Ok(Code::Digit1),
+                '2' => Ok(Code::Digit2),
+                '3' => Ok(Code::Digit3),
+                '4' => Ok(Code::Digit4),
+                '5' => Ok(Code::Digit5),
+                '6' => Ok(Code::Digit6),
+                '7' => Ok(Code::Digit7),
+                '8' => Ok(Code::Digit8),
+                '9' => Ok(Code::Digit9),
+                _ => Err(anyhow!("unsupported hotkey key: {token}")),
+            }
+        }
+        _ => Err(anyhow!("unsupported hotkey key: {token}")),
+    }
+}
+
+fn letter_code(ch: char) -> Code {
+    match ch {
+        'a' => Code::KeyA,
+        'b' => Code::KeyB,
+        'c' => Code::KeyC,
+        'd' => Code::KeyD,
+        'e' => Code::KeyE,
+        'f' => Code::KeyF,
+        'g' => Code::KeyG,
+        'h' => Code::KeyH,
+        'i' => Code::KeyI,
+        'j' => Code::KeyJ,
+        'k' => Code::KeyK,
+        'l' => Code::KeyL,
+        'm' => Code::KeyM,
+        'n' => Code::KeyN,
+        'o' => Code::KeyO,
+        'p' => Code::KeyP,
+        'q' => Code::KeyQ,
+        'r' => Code::KeyR,
+        's' => Code::KeyS,
+        't' => Code::KeyT,
+        'u' => Code::KeyU,
+        'v' => Code::KeyV,
+        'w' => Code::KeyW,
+        'x' => Code::KeyX,
+        'y' => Code::KeyY,
+        'z' => Code::KeyZ,
+        _ => Code::Space,
+    }
+}
