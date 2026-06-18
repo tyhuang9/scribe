@@ -14,6 +14,8 @@
 - Add Vosk runtime support.
 - Add sherpa-onnx streaming runtime support.
 - Add faster-whisper runtime support.
+- Add Moonshine runtime support.
+- Add Parakeet runtime support.
 - Add a native whisper.cpp library backend to avoid child-process overhead.
 - Add per-backend capability flags for streaming, timestamps, and language selection.
 

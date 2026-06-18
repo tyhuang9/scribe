@@ -18,9 +18,17 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - whisper.cpp small.en
   - whisper.cpp medium.en
   - Vosk small English placeholder
-  - sherpa-onnx streaming placeholder
-  - faster-whisper placeholder
-- Model Playground that records audio once and sends the same WAV file through all enabled models.
+  - faster-whisper tiny.en
+  - faster-whisper base.en
+  - faster-whisper small.en
+  - faster-whisper medium.en
+  - faster-whisper large-v3
+  - faster-whisper turbo
+  - faster-whisper distil-large-v3
+  - sherpa-onnx Zipformer Small
+  - Moonshine
+  - Parakeet 0.6B
+- Model Playground that shows the full catalog, supports enable/disable, persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
 - Transcript copy and clear actions.
 
 ## Requirements
@@ -41,6 +49,21 @@ sudo apt-get install -y build-essential pkg-config libasound2-dev
 
 ```bash
 cargo run
+```
+
+On Linux, the app defaults to software rendering to avoid common EGL/Mesa driver
+crashes in lightweight desktop or WSL-style environments. To opt back into GPU
+rendering:
+
+```bash
+LOCAL_TRANSCRIBER_USE_GPU=1 cargo run
+```
+
+If your system still reports Mesa/Zink/EGL errors, run it explicitly with Mesa's
+software driver:
+
+```bash
+LIBGL_ALWAYS_SOFTWARE=1 cargo run
 ```
 
 For a quick compile check:
@@ -78,6 +101,7 @@ The config stores:
 
 - selected default model
 - enabled models
+- persisted model playground order
 - global hotkey
 - whisper.cpp executable path
 - model file paths
@@ -89,7 +113,7 @@ Temporary WAV files are deleted after transcription unless debug mode is enabled
 
 ## Notes
 
-- Placeholder backends are visible and configurable but intentionally return clear "not wired yet" errors.
+- Non-whisper.cpp backends are visible and configurable for playground planning, but intentionally return clear "not wired yet" errors.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button.

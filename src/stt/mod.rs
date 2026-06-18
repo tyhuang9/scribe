@@ -35,7 +35,7 @@ pub fn transcribe_with_config(
             }
             backend.transcribe(audio_path, model)
         }
-        "Vosk" | "sherpa-onnx" | "faster-whisper" => Err(anyhow!(
+        "Vosk" | "sherpa-onnx" | "faster-whisper" | "Moonshine" | "Parakeet" => Err(anyhow!(
             "{} is present as configurable metadata, but its runtime is not wired yet",
             model.backend
         )),

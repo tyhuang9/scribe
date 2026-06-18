@@ -43,6 +43,15 @@ struct PlaygroundCardState {
     latency_ms: Option<u128>,
 }
 
+enum PlaygroundAction {
+    Clear(String),
+    SetEnabled(String, bool),
+    MoveBefore {
+        dragged_id: String,
+        target_id: String,
+    },
+}
+
 enum AppEvent {
     TranscriptionDone {
         source: RecordingSource,
@@ -145,7 +154,71 @@ impl LocalTranscriberApp {
                 self.status_message = format!("Failed to save settings: {err}");
             }
         }
-        self.playground_cards = cards_from_config(&self.config);
+        self.refresh_playground_cards_from_config();
+    }
+
+    fn refresh_playground_cards_from_config(&mut self) {
+        let existing_cards = std::mem::take(&mut self.playground_cards);
+        let mut existing_by_id = existing_cards
+            .into_iter()
+            .map(|card| (card.model.id.clone(), card))
+            .collect::<HashMap<_, _>>();
+
+        self.playground_cards = cards_from_config(&self.config)
+            .into_iter()
+            .map(|mut card| {
+                if let Some(mut existing) = existing_by_id.remove(&card.model.id) {
+                    existing.model = card.model;
+                    existing.status = runtime_status_for_model(&self.config, &existing.model);
+                    existing
+                } else {
+                    card.status = runtime_status_for_model(&self.config, &card.model);
+                    card
+                }
+            })
+            .collect();
+    }
+
+    fn apply_playground_action(&mut self, action: PlaygroundAction) {
+        match action {
+            PlaygroundAction::Clear(model_id) => {
+                if let Some(card) = self
+                    .playground_cards
+                    .iter_mut()
+                    .find(|card| card.model.id == model_id)
+                {
+                    card.transcript.clear();
+                    card.latency_ms = None;
+                }
+            }
+            PlaygroundAction::SetEnabled(model_id, enabled) => {
+                set_model_enabled(&mut self.config, &model_id, enabled);
+                if !enabled {
+                    if let Some(card) = self
+                        .playground_cards
+                        .iter_mut()
+                        .find(|card| card.model.id == model_id)
+                    {
+                        card.transcript.clear();
+                        card.latency_ms = None;
+                    }
+                }
+                self.save_config();
+            }
+            PlaygroundAction::MoveBefore {
+                dragged_id,
+                target_id,
+            } => {
+                if dragged_id != target_id {
+                    move_model_before(
+                        &mut self.config.playground_model_order,
+                        &dragged_id,
+                        &target_id,
+                    );
+                    self.save_config();
+                }
+            }
+        }
     }
 
     fn start_recording(&mut self, source: RecordingSource) {
@@ -361,7 +434,10 @@ impl LocalTranscriberApp {
     }
 
     fn dispatch_playground_transcriptions(&mut self, audio_path: PathBuf) {
-        let models = self.enabled_models();
+        let models = config::configured_models_for_playground(&self.config)
+            .into_iter()
+            .filter(|model| model.enabled)
+            .collect::<Vec<_>>();
         if models.is_empty() {
             self.status = TranscriptionStatus::Error;
             self.status_message =
@@ -409,12 +485,9 @@ impl LocalTranscriberApp {
     }
 
     fn reset_playground_for_run(&mut self) {
-        self.playground_cards = cards_from_config(&self.config)
-            .into_iter()
-            .filter(|card| card.model.enabled)
-            .collect();
+        self.playground_cards = cards_from_config(&self.config).into_iter().collect();
         for card in &mut self.playground_cards {
-            card.status = ModelRuntimeStatus::Ready;
+            card.status = runtime_status_for_model(&self.config, &card.model);
             card.transcript.clear();
             card.latency_ms = None;
         }
@@ -450,26 +523,36 @@ impl LocalTranscriberApp {
 }
 
 impl eframe::App for LocalTranscriberApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::from_rgb(248, 248, 248).to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_hotkey();
         self.poll_recording();
         self.poll_events();
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Local Transcriber").font(FontId::proportional(24.0)));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_pill(ui, self.status);
-                    if let Some(model) = self.selected_model() {
-                        ui.label(format!("{} / {}", model.backend, model.name));
-                    }
+        let panel_fill = Color32::from_rgb(248, 248, 248);
+        let content_fill = Color32::from_rgb(252, 252, 252);
+
+        egui::TopBottomPanel::top("header")
+            .frame(Frame::none().fill(panel_fill))
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Local Transcriber").font(FontId::proportional(24.0)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        status_pill(ui, self.status);
+                        if let Some(model) = self.selected_model() {
+                            ui.label(format!("{} / {}", model.backend, model.name));
+                        }
+                    });
                 });
+                ui.add_space(8.0);
             });
-            ui.add_space(8.0);
-        });
 
         egui::SidePanel::left("navigation")
+            .frame(Frame::none().fill(panel_fill))
             .resizable(false)
             .exact_width(180.0)
             .show(ctx, |ui| {
@@ -485,18 +568,22 @@ impl eframe::App for LocalTranscriberApp {
                 nav_button(ui, &mut self.current_tab, Tab::Settings, "Settings");
             });
 
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&self.status_message).color(Color32::DARK_GRAY));
+        egui::TopBottomPanel::bottom("footer")
+            .frame(Frame::none().fill(panel_fill))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&self.status_message).color(Color32::DARK_GRAY));
+                });
             });
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
-            Tab::Transcribe => self.ui_transcribe(ui),
-            Tab::Models => self.ui_models(ui),
-            Tab::Playground => self.ui_playground(ui),
-            Tab::Settings => self.ui_settings(ui),
-        });
+        egui::CentralPanel::default()
+            .frame(Frame::none().fill(content_fill))
+            .show(ctx, |ui| match self.current_tab {
+                Tab::Transcribe => self.ui_transcribe(ui),
+                Tab::Models => self.ui_models(ui),
+                Tab::Playground => self.ui_playground(ui),
+                Tab::Settings => self.ui_settings(ui),
+            });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -660,7 +747,11 @@ impl LocalTranscriberApp {
         page(ui, "Model Playground", |ui| {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} enabled model(s)", self.enabled_models().len()));
+                    ui.label(format!(
+                        "{} model(s), {} enabled",
+                        self.playground_cards.len(),
+                        self.enabled_models().len()
+                    ));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let text = if self.active_recording.is_some() {
                             "Stop test recording"
@@ -679,36 +770,37 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
+            let mut pending_actions = Vec::new();
             ScrollArea::vertical().show(ui, |ui| {
                 if self.playground_cards.is_empty() {
-                    ui.label("Enable at least one model on the Models page.");
+                    ui.label("No models are configured.");
                 }
                 for card_state in &mut self.playground_cards {
-                    card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.heading(&card_state.model.name);
-                                ui.label(&card_state.model.backend);
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Clear").clicked() {
-                                    card_state.transcript.clear();
-                                }
-                                ui.label(card_state.status.to_string());
-                            });
+                    let model_id = card_state.model.id.clone();
+                    let drag_id = ui.id().with(("playground-card", &model_id));
+                    let (inner, dropped_payload) =
+                        ui.dnd_drop_zone::<String, _>(playground_card_frame(ui), |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
+                                playground_card_ui(ui, card_state)
+                            })
+                            .inner
                         });
-                        if let Some(latency) = card_state.latency_ms {
-                            ui.label(format!("Latency estimate: {latency} ms"));
-                        }
-                        ui.add(
-                            TextEdit::multiline(&mut card_state.transcript)
-                                .desired_rows(5)
-                                .hint_text("Result"),
-                        );
-                    });
+                    pending_actions.extend(inner.inner);
+
+                    if let Some(dragged_id) = dropped_payload {
+                        pending_actions.push(PlaygroundAction::MoveBefore {
+                            dragged_id: dragged_id.to_string(),
+                            target_id: model_id,
+                        });
+                    }
                     ui.add_space(8.0);
                 }
             });
+
+            if let Some(action) = pending_actions.into_iter().next() {
+                self.apply_playground_action(action);
+            }
         });
     }
 
@@ -774,8 +866,62 @@ fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     Frame::group(ui.style())
         .inner_margin(Margin::same(12.0))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             add_contents(ui);
         });
+}
+
+fn playground_card_frame(ui: &Ui) -> Frame {
+    Frame::group(ui.style()).inner_margin(Margin::same(12.0))
+}
+
+fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<PlaygroundAction> {
+    let mut actions = Vec::new();
+    ui.set_min_width(ui.available_width());
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("≡").color(Color32::GRAY));
+        ui.vertical(|ui| {
+            ui.heading(&card_state.model.name);
+            ui.label(format!(
+                "{} | RAM {} | Accuracy {} | Speed {} | {}",
+                card_state.model.backend,
+                card_state.model.expected_ram,
+                card_state.model.accuracy_tier,
+                card_state.model.speed_tier,
+                card_state.model.download_status
+            ));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Clear").clicked() {
+                actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
+            }
+            let mut enabled = card_state.model.enabled;
+            let toggle_label = if enabled { "Enabled" } else { "Disabled" };
+            if ui.checkbox(&mut enabled, toggle_label).changed() {
+                actions.push(PlaygroundAction::SetEnabled(
+                    card_state.model.id.clone(),
+                    enabled,
+                ));
+            }
+            ui.label(card_state.status.to_string());
+        });
+    });
+
+    if let Some(latency) = card_state.latency_ms {
+        ui.label(format!("Latency estimate: {latency} ms"));
+    }
+
+    ui.add_space(8.0);
+    ui.add_sized(
+        [ui.available_width(), 132.0],
+        TextEdit::multiline(&mut card_state.transcript)
+            .desired_rows(7)
+            .desired_width(f32::INFINITY)
+            .hint_text("Result"),
+    );
+
+    actions
 }
 
 fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab, label: &str) {
@@ -821,19 +967,23 @@ fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
     }
 }
 
+fn move_model_before(order: &mut Vec<String>, dragged_id: &str, target_id: &str) {
+    let Some(from_index) = order.iter().position(|id| id == dragged_id) else {
+        return;
+    };
+    let dragged = order.remove(from_index);
+    let to_index = order
+        .iter()
+        .position(|id| id == target_id)
+        .unwrap_or(order.len());
+    order.insert(to_index, dragged);
+}
+
 fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
-    config::enabled_models(config)
+    config::configured_models_for_playground(config)
         .into_iter()
         .map(|model| {
-            let status = if !model.enabled {
-                ModelRuntimeStatus::Disabled
-            } else if model.backend != "whisper.cpp" {
-                ModelRuntimeStatus::NotImplemented
-            } else if config.whisper_executable_path.is_none() || model.local_path.is_none() {
-                ModelRuntimeStatus::MissingConfiguration
-            } else {
-                ModelRuntimeStatus::Ready
-            };
+            let status = runtime_status_for_model(config, &model);
             PlaygroundCardState {
                 model,
                 status,
@@ -842,4 +992,16 @@ fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
             }
         })
         .collect()
+}
+
+fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
+    if !model.enabled {
+        ModelRuntimeStatus::Disabled
+    } else if model.backend != "whisper.cpp" {
+        ModelRuntimeStatus::NotImplemented
+    } else if config.whisper_executable_path.is_none() || model.local_path.is_none() {
+        ModelRuntimeStatus::MissingConfiguration
+    } else {
+        ModelRuntimeStatus::Ready
+    }
 }
