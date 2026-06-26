@@ -12,6 +12,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Local microphone recording through `cpal`, saved as a temporary WAV file through `hound`.
 - `whisper.cpp` backend integration through a configured executable path and model file path.
 - Non-blocking UI for recording and transcription using background threads and channels.
+- Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
+- Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
 - Model metadata for:
   - whisper.cpp tiny.en
   - whisper.cpp base.en
@@ -38,11 +40,11 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - A microphone visible to the host OS.
 - `whisper.cpp` built separately if you want real transcription.
 
-On Ubuntu, install the microphone build dependency:
+On Ubuntu, install the microphone and tray build dependencies:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libasound2-dev
+sudo apt-get install -y build-essential pkg-config libasound2-dev libgtk-3-dev libappindicator3-dev
 ```
 
 ## Run
@@ -108,6 +110,10 @@ The config stores:
 - last used backend
 - debug mode
 - max recording duration
+- close-to-tray behavior
+- automatic focused-app transcript insertion
+- clipboard restore after insertion
+- paste automation delay
 
 Temporary WAV files are deleted after transcription unless debug mode is enabled.
 
@@ -116,7 +122,8 @@ Temporary WAV files are deleted after transcription unless debug mode is enabled
 - Non-whisper.cpp backends are visible and configurable for playground planning, but intentionally return clear "not wired yet" errors.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
-- Global hotkeys can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button.
+- Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
+- The window close button hides the app to the tray when tray integration is available. Use the tray Quit action to exit fully.
 
 ## Development
 
@@ -134,3 +141,5 @@ The main modules are:
 - `src/models.rs`: shared STT model/result/status structs.
 - `src/stt/mod.rs`: backend trait and dispatch.
 - `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
+- `src/text_output.rs`: focused-app transcript insertion through clipboard plus paste automation.
+- `src/tray.rs`: tray icon, tray menu, and tray command mapping.

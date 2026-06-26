@@ -20,6 +20,14 @@ pub struct AppConfig {
     pub last_used_backend: String,
     pub debug_mode: bool,
     pub max_recording_seconds: u32,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    #[serde(default = "default_true")]
+    pub auto_insert_transcript: bool,
+    #[serde(default = "default_true")]
+    pub restore_clipboard_after_insert: bool,
+    #[serde(default = "default_paste_delay_ms")]
+    pub paste_delay_ms: u64,
 }
 
 impl Default for AppConfig {
@@ -34,6 +42,10 @@ impl Default for AppConfig {
             last_used_backend: "whisper.cpp".to_owned(),
             debug_mode: false,
             max_recording_seconds: 30,
+            close_to_tray: true,
+            auto_insert_transcript: true,
+            restore_clipboard_after_insert: true,
+            paste_delay_ms: default_paste_delay_ms(),
         }
     }
 }
@@ -157,6 +169,17 @@ pub fn normalize_config(config: &mut AppConfig) {
     if config.max_recording_seconds == 0 {
         config.max_recording_seconds = 30;
     }
+    if config.paste_delay_ms == 0 {
+        config.paste_delay_ms = default_paste_delay_ms();
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_paste_delay_ms() -> u64 {
+    75
 }
 
 fn default_playground_model_order() -> Vec<String> {
@@ -315,6 +338,10 @@ mod tests {
                 .iter()
                 .any(|id| id == "faster_whisper_turbo")
         );
+        assert!(config.close_to_tray);
+        assert!(config.auto_insert_transcript);
+        assert!(config.restore_clipboard_after_insert);
+        assert_eq!(config.paste_delay_ms, 75);
     }
 
     #[test]

@@ -4,6 +4,8 @@ mod config;
 mod hotkey;
 mod models;
 mod stt;
+mod text_output;
+mod tray;
 
 use eframe::egui;
 

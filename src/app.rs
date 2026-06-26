@@ -7,6 +7,7 @@ use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{
     self, Align, Color32, FontId, Frame, Layout, Margin, RichText, ScrollArea, TextEdit, Ui,
+    ViewportCommand,
 };
 
 use crate::audio::{self, RecordingSession};
@@ -14,6 +15,8 @@ use crate::config::{self, AppConfig};
 use crate::hotkey::HotkeyService;
 use crate::models::{ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus};
 use crate::stt;
+use crate::text_output;
+use crate::tray::{TrayCommand, TrayService};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -81,6 +84,8 @@ pub struct LocalTranscriberApp {
     playground_pending: usize,
     playground_audio_path: Option<PathBuf>,
     hotkey_service: HotkeyService,
+    tray_service: Option<TrayService>,
+    quit_requested: bool,
 }
 
 impl LocalTranscriberApp {
@@ -123,7 +128,18 @@ impl LocalTranscriberApp {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
+            tray_service: None,
+            quit_requested: false,
         };
+
+        match TrayService::new(false, false) {
+            Ok(tray_service) => {
+                app.tray_service = Some(tray_service);
+            }
+            Err(err) => {
+                app.status_message = format!("Tray unavailable: {err}");
+            }
+        }
 
         if let Some(err) = &app.hotkey_service.last_error {
             app.status_message = format!("Hotkey unavailable: {err}");
@@ -303,6 +319,73 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray_service) = &self.tray_service else {
+            return;
+        };
+        if let Some(command) = tray_service.poll_command() {
+            self.apply_tray_command(command, ctx);
+        }
+    }
+
+    fn sync_tray_state(&self) {
+        if let Some(tray_service) = &self.tray_service {
+            tray_service.set_recording(self.active_recording.is_some());
+            tray_service.set_has_transcript(!self.transcript.trim().is_empty());
+        }
+    }
+
+    fn apply_tray_command(&mut self, command: TrayCommand, ctx: &egui::Context) {
+        match command {
+            TrayCommand::Show => self.show_window(ctx),
+            TrayCommand::Hide => self.hide_window(ctx),
+            TrayCommand::ToggleRecording => self.toggle_recording(),
+            TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
+            TrayCommand::Quit => {
+                self.quit_requested = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested
+            && self.config.close_to_tray
+            && self.tray_service.is_some()
+            && !self.quit_requested
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.status_message = "Scribe is running in the tray".to_owned();
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.status_message = "Scribe window restored".to_owned();
+    }
+
+    fn copy_transcript_to_clipboard(&mut self) {
+        if self.transcript.trim().is_empty() {
+            self.status_message = "No transcript to copy".to_owned();
+            return;
+        }
+
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(self.transcript.clone()))
+        {
+            Ok(()) => self.status_message = "Transcript copied".to_owned(),
+            Err(err) => {
+                self.status_message = format!("Clipboard failed: {err}");
+            }
+        }
+    }
+
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -326,7 +409,7 @@ impl LocalTranscriberApp {
                             let stderr_bytes = result.stderr.len();
                             self.transcript = result.text.clone();
                             self.status = TranscriptionStatus::Idle;
-                            self.status_message = format!(
+                            let completion_message = format!(
                                 "{} via {} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
                                 result.model_name,
                                 result.backend,
@@ -337,6 +420,18 @@ impl LocalTranscriberApp {
                                 stdout_bytes,
                                 stderr_bytes
                             );
+                            if self.config.auto_insert_transcript {
+                                let output_result = text_output::write_to_focused_app(
+                                    &self.transcript,
+                                    &self.config,
+                                );
+                                self.status_message = format!(
+                                    "{completion_message}. {}",
+                                    output_result.status_message()
+                                );
+                            } else {
+                                self.status_message = completion_message;
+                            }
                         }
                         RecordingSource::Playground => {
                             self.apply_playground_result(result);
@@ -528,9 +623,12 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close_request(ctx);
+        self.poll_tray(ctx);
         self.poll_hotkey();
         self.poll_recording();
         self.poll_events();
+        self.sync_tray_state();
 
         let panel_fill = Color32::from_rgb(248, 248, 248);
         let content_fill = Color32::from_rgb(252, 252, 252);
@@ -639,14 +737,7 @@ impl LocalTranscriberApp {
                             self.transcript.clear();
                         }
                         if ui.button("Copy").clicked() {
-                            match Clipboard::new().and_then(|mut clipboard| {
-                                clipboard.set_text(self.transcript.clone())
-                            }) {
-                                Ok(()) => self.status_message = "Transcript copied".to_owned(),
-                                Err(err) => {
-                                    self.status_message = format!("Clipboard failed: {err}");
-                                }
-                            }
+                            self.copy_transcript_to_clipboard();
                         }
                     });
                 });
@@ -835,6 +926,49 @@ impl LocalTranscriberApp {
                 });
 
                 ui.separator();
+                let mut close_to_tray = self.config.close_to_tray;
+                if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
+                    self.config.close_to_tray = close_to_tray;
+                    self.save_config();
+                }
+                let mut auto_insert = self.config.auto_insert_transcript;
+                if ui
+                    .checkbox(&mut auto_insert, "Insert transcript into focused app")
+                    .changed()
+                {
+                    self.config.auto_insert_transcript = auto_insert;
+                    self.save_config();
+                }
+                let mut restore_clipboard = self.config.restore_clipboard_after_insert;
+                if ui
+                    .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
+                    .changed()
+                {
+                    self.config.restore_clipboard_after_insert = restore_clipboard;
+                    self.save_config();
+                }
+                let mut paste_delay = self.config.paste_delay_ms as i32;
+                ui.horizontal(|ui| {
+                    ui.label("Paste delay ms");
+                    if ui
+                        .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                        .changed()
+                    {
+                        self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                        self.save_config();
+                    }
+                });
+                if self.tray_service.is_none() {
+                    ui.colored_label(
+                        Color32::from_rgb(180, 40, 40),
+                        "Tray integration is unavailable in this desktop session.",
+                    );
+                }
+                if let Some(notice) = text_output::paste_automation_notice() {
+                    ui.colored_label(Color32::from_rgb(150, 100, 20), notice);
+                }
+
+                ui.separator();
                 ui.label("Runtime behavior");
                 ui.label("Models are invoked only when transcription starts.");
                 ui.label("Placeholder backends are listed for configuration but do not run yet.");
@@ -847,8 +981,7 @@ impl LocalTranscriberApp {
                 ui.label("TODO: VAD for automatic stop detection");
                 ui.label("TODO: voice commands such as scratch that");
                 ui.label("TODO: local cleanup/reasoning pass");
-                ui.label("TODO: insert transcript into the active application");
-                ui.label("TODO: model downloader and tray-only mode");
+                ui.label("TODO: model downloader");
                 ui.label("TODO: native whisper.cpp library integration");
             });
         });

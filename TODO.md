@@ -25,7 +25,6 @@
 - Add VAD for auto-stop and silence trimming.
 - Add voice commands such as "scratch that".
 - Add an optional local cleanup/reasoning pass for punctuation and formatting.
-- Add insertion into the active application after transcription completes.
 
 ## Model Management
 
@@ -36,7 +35,6 @@
 
 ## Desktop Integration
 
-- Add tray-only mode.
 - Add start minimized behavior.
 - Add native notifications for completed transcriptions and errors.
 - Improve Linux Wayland hotkey guidance if global registration fails.
