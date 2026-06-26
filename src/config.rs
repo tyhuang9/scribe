@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{SttModelInfo, default_model_catalog};
+use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -16,6 +16,12 @@ pub struct AppConfig {
     pub playground_model_order: Vec<String>,
     pub hotkey: String,
     pub whisper_executable_path: Option<PathBuf>,
+    #[serde(default = "default_model_storage_dir")]
+    pub model_storage_dir: PathBuf,
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
+    #[serde(default)]
+    pub audio_input_device_name: Option<String>,
     pub model_paths: HashMap<String, PathBuf>,
     pub last_used_backend: String,
     pub debug_mode: bool,
@@ -30,6 +36,26 @@ pub struct AppConfig {
     pub paste_delay_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ThemeMode {
+    #[default]
+    Light,
+    Dark,
+    System,
+}
+
+impl ThemeMode {
+    pub const ALL: [ThemeMode; 3] = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::System => "System",
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -38,6 +64,9 @@ impl Default for AppConfig {
             playground_model_order: default_playground_model_order(),
             hotkey: "Ctrl+Shift+Space".to_owned(),
             whisper_executable_path: None,
+            model_storage_dir: default_model_storage_dir(),
+            theme_mode: ThemeMode::Light,
+            audio_input_device_name: None,
             model_paths: default_model_paths(),
             last_used_backend: "whisper.cpp".to_owned(),
             debug_mode: false,
@@ -51,6 +80,15 @@ impl Default for AppConfig {
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {
+    scribe_project_dirs()
+}
+
+fn scribe_project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("com", "Scribe", "Scribe")
+        .ok_or_else(|| anyhow!("could not resolve a platform config directory"))
+}
+
+fn legacy_project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("com", "Local Transcriber", "Local Transcriber")
         .ok_or_else(|| anyhow!("could not resolve a platform config directory"))
 }
@@ -66,17 +104,34 @@ pub fn cache_dir() -> Result<PathBuf> {
 pub fn load_config() -> Result<(AppConfig, PathBuf)> {
     let path = config_file_path()?;
     if !path.exists() {
+        if let Ok(legacy_path) = legacy_config_file_path() {
+            if legacy_path.exists() {
+                let mut config = read_config_file(&legacy_path)?;
+                normalize_config(&mut config);
+                save_config(&config)?;
+                return Ok((config, path));
+            }
+        }
+
         let config = AppConfig::default();
         save_config(&config)?;
         return Ok((config, path));
     }
 
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read config {}", path.display()))?;
-    let mut config: AppConfig = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", path.display()))?;
+    let mut config = read_config_file(&path)?;
     normalize_config(&mut config);
     Ok((config, path))
+}
+
+fn legacy_config_file_path() -> Result<PathBuf> {
+    Ok(legacy_project_dirs()?.config_dir().join("config.json"))
+}
+
+fn read_config_file(path: &PathBuf) -> Result<AppConfig> {
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse config {}", path.display()))
 }
 
 pub fn save_config(config: &AppConfig) -> Result<()> {
@@ -96,11 +151,15 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
         .into_iter()
         .map(|mut model| {
             model.enabled = config.enabled_models.iter().any(|id| id == &model.id);
-            model.local_path = config.model_paths.get(&model.id).cloned();
-            model.download_status = match &model.local_path {
-                Some(path) if path.exists() => "Configured".to_owned(),
-                Some(_) => "Missing file".to_owned(),
-                None => "Not configured".to_owned(),
+            let configured_path = config.model_paths.get(&model.id).cloned();
+            let downloaded_path =
+                downloaded_model_path(config, &model).filter(|path| path.exists());
+
+            model.local_path = configured_path.or(downloaded_path);
+            model.install_status = match &model.local_path {
+                Some(path) if path.exists() => ModelInstallStatus::Installed,
+                Some(_) => ModelInstallStatus::Missing,
+                None => ModelInstallStatus::NotInstalled,
             };
             model
         })
@@ -136,6 +195,22 @@ pub fn enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
         .collect()
 }
 
+pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
+    if config.model_storage_dir.as_os_str().is_empty() {
+        default_model_storage_dir()
+    } else {
+        config.model_storage_dir.clone()
+    }
+}
+
+pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
+    model.download_model.as_ref().map(|download_model| {
+        model_storage_dir(config)
+            .join("whisper.cpp")
+            .join(format!("ggml-{download_model}.bin"))
+    })
+}
+
 pub fn normalize_config(config: &mut AppConfig) {
     let catalog = default_model_catalog();
     let catalog_ids = catalog
@@ -145,6 +220,14 @@ pub fn normalize_config(config: &mut AppConfig) {
 
     migrate_legacy_model_ids(config);
     apply_default_model_paths(config);
+    if config.model_storage_dir.as_os_str().is_empty() {
+        config.model_storage_dir = default_model_storage_dir();
+    }
+    if let Some(device_name) = &config.audio_input_device_name {
+        if device_name.trim().is_empty() {
+            config.audio_input_device_name = None;
+        }
+    }
 
     if !catalog
         .iter()
@@ -180,6 +263,12 @@ fn default_true() -> bool {
 
 fn default_paste_delay_ms() -> u64 {
     75
+}
+
+fn default_model_storage_dir() -> PathBuf {
+    scribe_project_dirs()
+        .map(|dirs| dirs.data_dir().join("models"))
+        .unwrap_or_else(|_| PathBuf::from("models"))
 }
 
 fn default_playground_model_order() -> Vec<String> {
@@ -342,6 +431,10 @@ mod tests {
         assert!(config.auto_insert_transcript);
         assert!(config.restore_clipboard_after_insert);
         assert_eq!(config.paste_delay_ms, 75);
+        assert_eq!(config.theme_mode, ThemeMode::Light);
+        assert!(config.audio_input_device_name.is_none());
+        assert!(!config.model_storage_dir.as_os_str().is_empty());
+        assert!(config.model_storage_dir.ends_with("models"));
     }
 
     #[test]
@@ -372,6 +465,23 @@ mod tests {
                 .position(|id| id == "vosk_small_en")
                 .expect("vosk model should be present")
                 > 1
+        );
+    }
+
+    #[test]
+    fn downloaded_model_path_resolves_inside_storage_dir() {
+        let config = AppConfig {
+            model_storage_dir: PathBuf::from("/tmp/scribe-models"),
+            ..AppConfig::default()
+        };
+        let model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        assert_eq!(
+            downloaded_model_path(&config, &model).unwrap(),
+            PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
         );
     }
 }

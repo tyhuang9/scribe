@@ -15,6 +15,10 @@ impl HotkeyService {
             hotkey: None,
             last_error: None,
         };
+        if let Err(err) = global_hotkey_startup_allowed() {
+            service.last_error = Some(err.to_string());
+            return service;
+        }
         if let Err(err) = service.register(spec) {
             service.last_error = Some(err.to_string());
         }
@@ -24,6 +28,7 @@ impl HotkeyService {
     pub fn register(&mut self, spec: &str) -> Result<()> {
         self.hotkey = None;
         self.manager = None;
+        global_hotkey_startup_allowed()?;
 
         let manager = GlobalHotKeyManager::new()?;
         let hotkey = parse_hotkey(spec)?;
@@ -42,6 +47,23 @@ impl HotkeyService {
         }
         pressed
     }
+}
+
+fn global_hotkey_startup_allowed() -> Result<()> {
+    if std::env::var_os("SCRIBE_DISABLE_HOTKEY").is_some() {
+        return Err(anyhow!("global hotkey disabled by SCRIBE_DISABLE_HOTKEY"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("SCRIBE_ENABLE_GLOBAL_HOTKEY").is_none() {
+            return Err(anyhow!(
+                "global hotkey disabled on Linux; set SCRIBE_ENABLE_GLOBAL_HOTKEY=1 to enable it"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn parse_hotkey(spec: &str) -> Result<HotKey> {
@@ -139,5 +161,22 @@ fn letter_code(ch: char) -> Code {
         'y' => Code::KeyY,
         'z' => Code::KeyZ,
         _ => Code::Space,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_common_modifier_combo() {
+        assert!(parse_hotkey("Ctrl+Shift+Space").is_ok());
+        assert!(parse_hotkey("command+alt+k").is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_or_unknown_key() {
+        assert!(parse_hotkey("Ctrl+Shift").is_err());
+        assert!(parse_hotkey("Ctrl+Mouse1").is_err());
     }
 }

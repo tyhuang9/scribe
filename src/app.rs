@@ -1,19 +1,26 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{
-    self, Align, Color32, FontId, Frame, Layout, Margin, RichText, ScrollArea, TextEdit, Ui,
-    ViewportCommand,
+    self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
+    ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
 };
+use rfd::FileDialog;
 
 use crate::audio::{self, RecordingSession};
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, ThemeMode};
 use crate::hotkey::HotkeyService;
-use crate::models::{ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus};
+use crate::models::{
+    ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
+    backend_capabilities, whisper_cpp_download_url,
+};
 use crate::stt;
 use crate::text_output;
 use crate::tray::{TrayCommand, TrayService};
@@ -36,6 +43,8 @@ struct ActiveRecording {
     session: RecordingSession,
     source: RecordingSource,
     stop_requested: bool,
+    started_at: Instant,
+    max_duration_seconds: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +74,19 @@ enum AppEvent {
         model_id: String,
         message: String,
     },
+    ModelDownloadProgress {
+        model_id: String,
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    ModelDownloadDone {
+        model_id: String,
+        path: PathBuf,
+    },
+    ModelDownloadFailed {
+        model_id: String,
+        message: String,
+    },
 }
 
 pub struct LocalTranscriberApp {
@@ -76,7 +98,13 @@ pub struct LocalTranscriberApp {
     status_message: String,
     hotkey_input: String,
     whisper_path_input: String,
+    model_storage_dir_input: String,
+    model_search: String,
+    model_backend_filter: String,
+    audio_devices: Vec<String>,
+    capturing_hotkey: bool,
     model_path_inputs: HashMap<String, String>,
+    model_downloads: HashMap<String, ModelInstallStatus>,
     active_recording: Option<ActiveRecording>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -90,7 +118,7 @@ pub struct LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        cc.egui_ctx.set_visuals(stitch_visuals(ThemeMode::Light));
 
         let (mut config, config_path, status_message) = match config::load_config() {
             Ok((config, path)) => (config, Some(path), "Ready".to_owned()),
@@ -110,11 +138,17 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
+            model_search: String::new(),
+            model_backend_filter: "All".to_owned(),
+            audio_devices: Vec::new(),
+            capturing_hotkey: false,
             model_path_inputs: config
                 .model_paths
                 .iter()
                 .map(|(id, path)| (id.clone(), path.display().to_string()))
                 .collect(),
+            model_downloads: HashMap::new(),
             playground_cards: cards_from_config(&config),
             hotkey_service: HotkeyService::new(&config.hotkey),
             config,
@@ -242,24 +276,44 @@ impl LocalTranscriberApp {
             return;
         }
 
+        if source == RecordingSource::Transcribe {
+            let Some(model) = self.selected_model() else {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    "Choose or install a local model before transcribing.".to_owned();
+                return;
+            };
+            let runtime_status = runtime_status_for_model(&self.config, &model);
+            if runtime_status != ModelRuntimeStatus::Ready {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = setup_message_for_status(&runtime_status);
+                return;
+            }
+        }
+
         if source == RecordingSource::Playground {
             self.reset_playground_for_run();
         }
 
-        match audio::start_recording(self.config.max_recording_seconds) {
+        match audio::start_recording(
+            self.config.max_recording_seconds,
+            self.config.audio_input_device_name.clone(),
+        ) {
             Ok(session) => {
                 let path = session.audio_path.display().to_string();
                 self.active_recording = Some(ActiveRecording {
                     session,
                     source,
                     stop_requested: false,
+                    started_at: Instant::now(),
+                    max_duration_seconds: self.config.max_recording_seconds,
                 });
                 self.status = TranscriptionStatus::Listening;
                 self.status_message = format!("Listening. Temporary WAV: {path}");
             }
             Err(err) => {
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Recording failed: {err}");
+                self.status_message = format!("Microphone failed: {err}");
             }
         }
     }
@@ -464,6 +518,42 @@ impl LocalTranscriberApp {
                     }
                     self.cleanup_after_job(source);
                 }
+                AppEvent::ModelDownloadProgress {
+                    model_id,
+                    downloaded_bytes,
+                    total_bytes,
+                } => {
+                    self.model_downloads.insert(
+                        model_id,
+                        ModelInstallStatus::Downloading {
+                            downloaded_bytes,
+                            total_bytes,
+                        },
+                    );
+                }
+                AppEvent::ModelDownloadDone { model_id, path } => {
+                    self.model_downloads
+                        .insert(model_id.clone(), ModelInstallStatus::Installed);
+                    self.config
+                        .model_paths
+                        .insert(model_id.clone(), path.clone());
+                    self.model_path_inputs
+                        .insert(model_id.clone(), path.display().to_string());
+                    if self.config.selected_default_model == model_id
+                        && !self.config.enabled_models.iter().any(|id| id == &model_id)
+                    {
+                        self.config.enabled_models.push(model_id.clone());
+                    }
+                    self.save_config();
+                    self.status = TranscriptionStatus::Idle;
+                    self.status_message = format!("Model installed at {}", path.display());
+                }
+                AppEvent::ModelDownloadFailed { model_id, message } => {
+                    self.model_downloads
+                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Download failed: {message}");
+                }
             }
         }
     }
@@ -605,6 +695,7 @@ impl LocalTranscriberApp {
     fn apply_hotkey(&mut self) {
         match self.hotkey_service.register(&self.hotkey_input) {
             Ok(()) => {
+                self.capturing_hotkey = false;
                 self.config.hotkey = self.hotkey_input.clone();
                 self.save_config();
                 self.status_message = format!("Registered hotkey {}", self.config.hotkey);
@@ -615,67 +706,151 @@ impl LocalTranscriberApp {
             }
         }
     }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        ctx.set_visuals(stitch_visuals(self.config.theme_mode));
+    }
+
+    fn poll_hotkey_capture(&mut self, ctx: &egui::Context) {
+        if !self.capturing_hotkey {
+            return;
+        }
+
+        if let Some(spec) = ctx.input(captured_hotkey_spec) {
+            self.hotkey_input = spec;
+            self.apply_hotkey();
+        }
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        match audio::input_device_names() {
+            Ok(devices) => {
+                self.audio_devices = devices;
+                self.status_message = "Microphone list refreshed".to_owned();
+            }
+            Err(err) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not list microphones: {err}");
+            }
+        }
+    }
+
+    fn select_model_as_default(&mut self, model: &SttModelInfo) {
+        self.config.selected_default_model = model.id.clone();
+        if !self.config.enabled_models.iter().any(|id| id == &model.id) {
+            self.config.enabled_models.push(model.id.clone());
+        }
+        self.config.last_used_backend = model.backend.clone();
+        self.save_config();
+    }
+
+    fn effective_install_status(&self, model: &SttModelInfo) -> ModelInstallStatus {
+        self.model_downloads
+            .get(&model.id)
+            .cloned()
+            .unwrap_or_else(|| model.install_status.clone())
+    }
+
+    fn start_model_download(&mut self, model: &SttModelInfo) {
+        let Some(download_model) = model.download_model.clone() else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("{} does not have a supported download.", model.name);
+            return;
+        };
+
+        if !backend_capabilities(&model.backend).supports_downloads {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("{} cannot be downloaded in this build.", model.name);
+            return;
+        }
+
+        let Some(destination) = config::downloaded_model_path(&self.config, model) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "No model storage directory is configured.".to_owned();
+            return;
+        };
+
+        self.model_downloads.insert(
+            model.id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 0,
+                total_bytes: None,
+            },
+        );
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = format!("Downloading {}...", model.name);
+
+        let tx = self.tx.clone();
+        let model_id = model.id.clone();
+        let url = whisper_cpp_download_url(&download_model);
+        thread::spawn(move || {
+            let result = download_model_file(&url, &destination, &tx, &model_id);
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::ModelDownloadDone {
+                        model_id,
+                        path: destination,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for LocalTranscriberApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        Color32::from_rgb(248, 248, 248).to_normalized_gamma_f32()
+        SHELL_BG.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
-        self.poll_hotkey();
+        self.poll_hotkey_capture(ctx);
+        if !self.capturing_hotkey {
+            self.poll_hotkey();
+        }
         self.poll_recording();
         self.poll_events();
         self.sync_tray_state();
 
-        let panel_fill = Color32::from_rgb(248, 248, 248);
-        let content_fill = Color32::from_rgb(252, 252, 252);
-
-        egui::TopBottomPanel::top("header")
-            .frame(Frame::none().fill(panel_fill))
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Local Transcriber").font(FontId::proportional(24.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_pill(ui, self.status);
-                        if let Some(model) = self.selected_model() {
-                            ui.label(format!("{} / {}", model.backend, model.name));
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-            });
-
         egui::SidePanel::left("navigation")
-            .frame(Frame::none().fill(panel_fill))
+            .frame(Frame::none().fill(SHELL_BG))
             .resizable(false)
-            .exact_width(180.0)
+            .exact_width(200.0)
             .show(ctx, |ui| {
-                ui.add_space(12.0);
+                ui.add_space(20.0);
+                ui.label(
+                    RichText::new("Scribe")
+                        .font(FontId::proportional(24.0))
+                        .strong(),
+                );
+                ui.label(RichText::new("Local speech to text").color(MUTED_TEXT));
+                ui.add_space(28.0);
                 nav_button(ui, &mut self.current_tab, Tab::Transcribe, "Transcribe");
                 nav_button(ui, &mut self.current_tab, Tab::Models, "Models");
-                nav_button(
-                    ui,
-                    &mut self.current_tab,
-                    Tab::Playground,
-                    "Model Playground",
-                );
+                nav_button(ui, &mut self.current_tab, Tab::Playground, "Playground");
                 nav_button(ui, &mut self.current_tab, Tab::Settings, "Settings");
+                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                    ui.label(RichText::new("Offline first").color(MUTED_TEXT));
+                    ui.label(RichText::new("No cloud STT").color(MUTED_TEXT));
+                });
             });
 
         egui::TopBottomPanel::bottom("footer")
-            .frame(Frame::none().fill(panel_fill))
+            .frame(Frame::none().fill(SHELL_BG))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(&self.status_message).color(Color32::DARK_GRAY));
+                    status_badge(ui, self.status);
+                    ui.label(RichText::new(&self.status_message).color(MUTED_TEXT));
                 });
             });
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(content_fill))
+            .frame(Frame::none().fill(CONTENT_BG))
             .show(ctx, |ui| match self.current_tab {
                 Tab::Transcribe => self.ui_transcribe(ui),
                 Tab::Models => self.ui_models(ui),
@@ -683,52 +858,120 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Settings => self.ui_settings(ui),
             });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
         page(ui, "Transcribe", |ui| {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label("Selected model");
-                        if let Some(model) = self.selected_model() {
-                            ui.heading(format!("{} / {}", model.backend, model.name));
-                            ui.label(format!(
-                                "RAM {} | Accuracy {} | Speed {} | {}",
-                                model.expected_ram,
-                                model.accuracy_tier,
-                                model.speed_tier,
-                                model.download_status
-                            ));
-                        } else {
-                            ui.heading("No model selected");
-                        }
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let button_text = if self.active_recording.is_some() {
-                            "Stop listening"
-                        } else {
-                            "Start listening"
-                        };
-                        if ui.button(button_text).clicked() {
-                            self.toggle_recording();
-                        }
-                    });
+            let selected_model = self.selected_model();
+            let runtime_status = selected_model
+                .as_ref()
+                .map(|model| runtime_status_for_model(&self.config, model));
+            let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
+
+            ui.columns(2, |columns| {
+                card(&mut columns[0], |ui| {
+                    ui.label(RichText::new("Current model").color(MUTED_TEXT));
+                    if let Some(model) = &selected_model {
+                        ui.add_space(4.0);
+                        ui.heading(&model.name);
+                        ui.horizontal_wrapped(|ui| {
+                            badge(ui, &model.backend, ChipTone::Neutral);
+                            badge(
+                                ui,
+                                &self.effective_install_status(model).label(),
+                                install_chip_tone(&self.effective_install_status(model)),
+                            );
+                        });
+                    } else {
+                        ui.heading("No model selected");
+                    }
+                    ui.add_space(12.0);
+                    if ui.button("Open Models").clicked() {
+                        self.current_tab = Tab::Models;
+                    }
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Hotkey");
-                    ui.text_edit_singleline(&mut self.hotkey_input);
-                    if ui.button("Apply").clicked() {
-                        self.apply_hotkey();
+
+                card(&mut columns[1], |ui| {
+                    ui.label(RichText::new("Hotkey").color(MUTED_TEXT));
+                    ui.add_space(4.0);
+                    ui.heading(&self.config.hotkey);
+                    ui.add_space(12.0);
+                    if ui.button("Edit in Settings").clicked() {
+                        self.current_tab = Tab::Settings;
                     }
                 });
             });
 
-            ui.add_space(12.0);
+            if !ready && self.active_recording.is_none() {
+                ui.add_space(12.0);
+                card(ui, |ui| {
+                    let setup_message = runtime_status
+                        .as_ref()
+                        .map(setup_message_for_status)
+                        .unwrap_or_else(|| {
+                            "Choose a local whisper.cpp model to start transcribing.".to_owned()
+                        });
+                    ui.heading("Setup required");
+                    ui.label(RichText::new(setup_message).color(MUTED_TEXT));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        for model_id in ["whisper_cpp_base_en", "whisper_cpp_tiny_en"] {
+                            if let Some(model) = config::configured_models(&self.config)
+                                .into_iter()
+                                .find(|model| model.id == model_id)
+                            {
+                                let label = if model_id == "whisper_cpp_base_en" {
+                                    "Download base.en"
+                                } else {
+                                    "Download tiny.en"
+                                };
+                                if ui.button(label).clicked() {
+                                    self.select_model_as_default(&model);
+                                    self.start_model_download(&model);
+                                }
+                            }
+                        }
+                        if ui.button("Configure paths").clicked() {
+                            self.current_tab = Tab::Models;
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                let listening = self.active_recording.is_some();
+                let button_text = if listening {
+                    "Stop Listening"
+                } else {
+                    "Start Listening"
+                };
+                if ui
+                    .add_enabled(listening || ready, primary_button(button_text))
+                    .clicked()
+                {
+                    self.toggle_recording();
+                }
+                ui.add_space(8.0);
+                if let Some(active) = &self.active_recording {
+                    let elapsed = active.started_at.elapsed().as_secs_f32();
+                    let total = active.max_duration_seconds.max(1) as f32;
+                    ui.add(
+                        egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
+                            .desired_width(220.0)
+                            .text(recording_timer_text(active)),
+                    );
+                } else if ready {
+                    ui.label(
+                        RichText::new("Press the button or use the hotkey.").color(MUTED_TEXT),
+                    );
+                }
+            });
+
+            ui.add_space(28.0);
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Transcript");
@@ -744,7 +987,8 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
                 ui.add(
                     TextEdit::multiline(&mut self.transcript)
-                        .desired_rows(18)
+                        .desired_rows(20)
+                        .desired_width(f32::INFINITY)
                         .hint_text("Transcript output will appear here"),
                 );
             });
@@ -752,7 +996,14 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        let models = config::configured_models(&self.config);
+        let all_models = config::configured_models(&self.config);
+        let mut backends = all_models
+            .iter()
+            .map(|model| model.backend.clone())
+            .collect::<Vec<_>>();
+        backends.sort();
+        backends.dedup();
+
         page(ui, "Models", |ui| {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -765,14 +1016,81 @@ impl LocalTranscriberApp {
                             path_from_input(&self.whisper_path_input);
                         self.save_config();
                     }
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = FileDialog::new().pick_file() {
+                            self.whisper_path_input = path.display().to_string();
+                            self.config.whisper_executable_path = Some(path);
+                            self.save_config();
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Model storage");
+                    if ui
+                        .text_edit_singleline(&mut self.model_storage_dir_input)
+                        .changed()
+                    {
+                        if let Some(path) = path_from_input(&self.model_storage_dir_input) {
+                            self.config.model_storage_dir = path;
+                            self.save_config();
+                        }
+                    }
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = FileDialog::new().pick_folder() {
+                            self.model_storage_dir_input = path.display().to_string();
+                            self.config.model_storage_dir = path;
+                            self.save_config();
+                        }
+                    }
                 });
             });
 
             ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    ui.add(
+                        TextEdit::singleline(&mut self.model_search)
+                            .desired_width(220.0)
+                            .hint_text("Model or backend"),
+                    );
+                    ComboBox::from_id_source("model-backend-filter")
+                        .selected_text(&self.model_backend_filter)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model_backend_filter,
+                                "All".to_owned(),
+                                "All backends",
+                            );
+                            for backend in &backends {
+                                ui.selectable_value(
+                                    &mut self.model_backend_filter,
+                                    backend.clone(),
+                                    backend,
+                                );
+                            }
+                        });
+                });
+            });
+
+            ui.add_space(12.0);
+            let search = self.model_search.trim().to_ascii_lowercase();
+            let models = all_models
+                .into_iter()
+                .filter(|model| {
+                    (self.model_backend_filter == "All"
+                        || self.model_backend_filter == model.backend)
+                        && (search.is_empty()
+                            || model.name.to_ascii_lowercase().contains(&search)
+                            || model.backend.to_ascii_lowercase().contains(&search))
+                })
+                .collect::<Vec<_>>();
+
             ScrollArea::vertical().show(ui, |ui| {
                 for model in models {
                     card(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_top(|ui| {
                             let mut enabled = model.enabled;
                             if ui.checkbox(&mut enabled, "").changed() {
                                 set_model_enabled(&mut self.config, &model.id, enabled);
@@ -781,26 +1099,49 @@ impl LocalTranscriberApp {
 
                             ui.vertical(|ui| {
                                 ui.heading(&model.name);
-                                ui.label(format!(
-                                    "{} | RAM {} | Accuracy {} | Speed {}",
-                                    model.backend,
-                                    model.expected_ram,
-                                    model.accuracy_tier,
-                                    model.speed_tier
-                                ));
-                                ui.label(format!("Status: {}", model.download_status));
+                                ui.label(RichText::new(&model.description).color(MUTED_TEXT));
+                                ui.add_space(4.0);
+                                let install_status = self.effective_install_status(&model);
+                                ui.horizontal_wrapped(|ui| {
+                                    badge(ui, &model.backend, ChipTone::Neutral);
+                                    badge(
+                                        ui,
+                                        &install_status.label(),
+                                        install_chip_tone(&install_status),
+                                    );
+                                    badge(
+                                        ui,
+                                        &format!("RAM {}", model.expected_ram),
+                                        ChipTone::Neutral,
+                                    );
+                                    badge(
+                                        ui,
+                                        &format!("{} accuracy", model.accuracy_tier),
+                                        ChipTone::Neutral,
+                                    );
+                                    if !backend_capabilities(&model.backend).runnable {
+                                        badge(ui, "Planned", ChipTone::Warning);
+                                    }
+                                });
                             });
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let selected = self.config.selected_default_model == model.id;
                                 if ui.selectable_label(selected, "Default").clicked() {
-                                    self.config.selected_default_model = model.id.clone();
-                                    if !self.config.enabled_models.iter().any(|id| id == &model.id)
-                                    {
-                                        self.config.enabled_models.push(model.id.clone());
-                                    }
-                                    self.config.last_used_backend = model.backend.clone();
-                                    self.save_config();
+                                    self.select_model_as_default(&model);
+                                }
+                                let install_status = self.effective_install_status(&model);
+                                let can_download = model.download_model.is_some()
+                                    && !matches!(
+                                        install_status,
+                                        ModelInstallStatus::Downloading { .. }
+                                            | ModelInstallStatus::Installed
+                                    );
+                                if ui
+                                    .add_enabled(can_download, Button::new("Download"))
+                                    .clicked()
+                                {
+                                    self.start_model_download(&model);
                                 }
                             });
                         });
@@ -808,18 +1149,33 @@ impl LocalTranscriberApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label("Model path");
-                            let input = self
-                                .model_path_inputs
-                                .entry(model.id.clone())
-                                .or_insert_with(|| {
-                                    model
-                                        .local_path
-                                        .as_ref()
-                                        .map(|path| path.display().to_string())
-                                        .unwrap_or_default()
-                                });
-                            if ui.text_edit_singleline(input).changed() {
-                                if let Some(path) = path_from_input(input) {
+                            let mut changed = false;
+                            {
+                                let input = self
+                                    .model_path_inputs
+                                    .entry(model.id.clone())
+                                    .or_insert_with(|| {
+                                        model
+                                            .local_path
+                                            .as_ref()
+                                            .map(|path| path.display().to_string())
+                                            .unwrap_or_default()
+                                    });
+                                changed |= ui.text_edit_singleline(input).changed();
+                                if ui.button("Browse").clicked() {
+                                    if let Some(path) = FileDialog::new().pick_file() {
+                                        *input = path.display().to_string();
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                let input = self
+                                    .model_path_inputs
+                                    .get(&model.id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if let Some(path) = path_from_input(&input) {
                                     self.config.model_paths.insert(model.id.clone(), path);
                                 } else {
                                     self.config.model_paths.remove(&model.id);
@@ -835,29 +1191,52 @@ impl LocalTranscriberApp {
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
-        page(ui, "Model Playground", |ui| {
+        page(ui, "Playground", |ui| {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{} model(s), {} enabled",
-                        self.playground_cards.len(),
-                        self.enabled_models().len()
-                    ));
+                    badge(
+                        ui,
+                        &format!("{} enabled", self.enabled_models().len()),
+                        ChipTone::Neutral,
+                    );
+                    ui.label(
+                        RichText::new("Record once and compare enabled local models.")
+                            .color(MUTED_TEXT),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let text = if self.active_recording.is_some() {
-                            "Stop test recording"
+                            "Stop Recording"
                         } else {
-                            "Start test recording"
+                            "Start Test Recording"
                         };
-                        if ui.button(text).clicked() {
+                        if ui.add(Button::new(text)).clicked() {
                             if self.active_recording.is_some() {
                                 self.stop_recording();
                             } else {
                                 self.start_recording(RecordingSource::Playground);
                             }
                         }
+                        if ui.button("Clear Results").clicked() {
+                            for card in &mut self.playground_cards {
+                                card.transcript.clear();
+                                card.latency_ms = None;
+                                card.status = runtime_status_for_model(&self.config, &card.model);
+                            }
+                        }
                     });
                 });
+                if let Some(active) = &self.active_recording {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::ProgressBar::new(
+                            (active.started_at.elapsed().as_secs_f32()
+                                / active.max_duration_seconds.max(1) as f32)
+                                .clamp(0.0, 1.0),
+                        )
+                        .desired_width(260.0)
+                        .text(recording_timer_text(active)),
+                    );
+                }
             });
 
             ui.add_space(12.0);
@@ -898,34 +1277,8 @@ impl LocalTranscriberApp {
     fn ui_settings(&mut self, ui: &mut Ui) {
         page(ui, "Settings", |ui| {
             card(ui, |ui| {
-                ui.heading("Local settings");
-                if let Some(path) = &self.config_path {
-                    ui.label(format!("Config file: {}", path.display()));
-                }
+                ui.heading("General");
                 ui.add_space(8.0);
-
-                let mut debug = self.config.debug_mode;
-                if ui
-                    .checkbox(&mut debug, "Keep temporary WAV files")
-                    .changed()
-                {
-                    self.config.debug_mode = debug;
-                    self.save_config();
-                }
-
-                let mut max_duration = self.config.max_recording_seconds as i32;
-                ui.horizontal(|ui| {
-                    ui.label("Max recording seconds");
-                    if ui
-                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
-                        .changed()
-                    {
-                        self.config.max_recording_seconds = max_duration.max(1) as u32;
-                        self.save_config();
-                    }
-                });
-
-                ui.separator();
                 let mut close_to_tray = self.config.close_to_tray;
                 if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
                     self.config.close_to_tray = close_to_tray;
@@ -958,72 +1311,257 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
-                if self.tray_service.is_none() {
-                    ui.colored_label(
-                        Color32::from_rgb(180, 40, 40),
-                        "Tray integration is unavailable in this desktop session.",
-                    );
-                }
-                if let Some(notice) = text_output::paste_automation_notice() {
-                    ui.colored_label(Color32::from_rgb(150, 100, 20), notice);
-                }
-
-                ui.separator();
-                ui.label("Runtime behavior");
-                ui.label("Models are invoked only when transcription starts.");
-                ui.label("Placeholder backends are listed for configuration but do not run yet.");
             });
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Future hooks");
-                ui.label("TODO: streaming partial transcription");
-                ui.label("TODO: VAD for automatic stop detection");
-                ui.label("TODO: voice commands such as scratch that");
-                ui.label("TODO: local cleanup/reasoning pass");
-                ui.label("TODO: model downloader");
-                ui.label("TODO: native whisper.cpp library integration");
+                ui.heading("Shortcuts");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Record toggle");
+                    ui.text_edit_singleline(&mut self.hotkey_input);
+                    if ui.button("Apply").clicked() {
+                        self.apply_hotkey();
+                    }
+                    if ui
+                        .button(if self.capturing_hotkey {
+                            "Listening..."
+                        } else {
+                            "Capture"
+                        })
+                        .clicked()
+                    {
+                        self.capturing_hotkey = true;
+                        self.status_message = "Press the new hotkey combination.".to_owned();
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.heading("Paths");
+                ui.add_space(8.0);
+                if let Some(path) = &self.config_path {
+                    ui.label(
+                        RichText::new(format!("Config file: {}", path.display())).color(MUTED_TEXT),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("whisper.cpp executable");
+                    if ui
+                        .text_edit_singleline(&mut self.whisper_path_input)
+                        .changed()
+                    {
+                        self.config.whisper_executable_path =
+                            path_from_input(&self.whisper_path_input);
+                        self.save_config();
+                    }
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = FileDialog::new().pick_file() {
+                            self.whisper_path_input = path.display().to_string();
+                            self.config.whisper_executable_path = Some(path);
+                            self.save_config();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Model storage");
+                    if ui
+                        .text_edit_singleline(&mut self.model_storage_dir_input)
+                        .changed()
+                    {
+                        if let Some(path) = path_from_input(&self.model_storage_dir_input) {
+                            self.config.model_storage_dir = path;
+                            self.save_config();
+                        }
+                    }
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = FileDialog::new().pick_folder() {
+                            self.model_storage_dir_input = path.display().to_string();
+                            self.config.model_storage_dir = path;
+                            self.save_config();
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.heading("Audio");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let before = self.config.audio_input_device_name.clone();
+                    ui.label("Microphone");
+                    ComboBox::from_id_source("audio-input-device")
+                        .selected_text(
+                            self.config
+                                .audio_input_device_name
+                                .as_deref()
+                                .unwrap_or("OS default"),
+                        )
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.config.audio_input_device_name,
+                                None,
+                                "OS default",
+                            );
+                            for device in &self.audio_devices {
+                                ui.selectable_value(
+                                    &mut self.config.audio_input_device_name,
+                                    Some(device.clone()),
+                                    device,
+                                );
+                            }
+                        });
+                    if before != self.config.audio_input_device_name {
+                        self.save_config();
+                    }
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_audio_devices();
+                    }
+                });
+                let mut max_duration = self.config.max_recording_seconds as i32;
+                ui.horizontal(|ui| {
+                    ui.label("Max recording seconds");
+                    if ui
+                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
+                        .changed()
+                    {
+                        self.config.max_recording_seconds = max_duration.max(1) as u32;
+                        self.save_config();
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.heading("Appearance");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let before = self.config.theme_mode;
+                    ui.label("Theme");
+                    ComboBox::from_id_source("theme-mode")
+                        .selected_text(self.config.theme_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in ThemeMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.config.theme_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    if before != self.config.theme_mode {
+                        self.save_config();
+                    }
+                });
+                let mut debug = self.config.debug_mode;
+                if ui
+                    .checkbox(&mut debug, "Keep temporary WAV files")
+                    .changed()
+                {
+                    self.config.debug_mode = debug;
+                    self.save_config();
+                }
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.heading("Runtime");
+                ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").color(MUTED_TEXT));
+                if self.tray_service.is_none() {
+                    ui.colored_label(
+                        ERROR,
+                        "Tray integration is unavailable in this desktop session.",
+                    );
+                }
+                if let Some(notice) = text_output::paste_automation_notice() {
+                    ui.colored_label(WARNING, notice);
+                }
             });
         });
     }
 }
 
+const SHELL_BG: Color32 = Color32::from_rgb(247, 249, 251);
+const CONTENT_BG: Color32 = Color32::from_rgb(247, 249, 251);
+const CARD_BG: Color32 = Color32::WHITE;
+const TEXT: Color32 = Color32::from_rgb(29, 33, 42);
+const MUTED_TEXT: Color32 = Color32::from_rgb(85, 95, 109);
+const BORDER: Color32 = Color32::from_rgb(226, 232, 240);
+const BORDER_STRONG: Color32 = Color32::from_rgb(203, 213, 225);
+const PRIMARY: Color32 = Color32::from_rgb(6, 10, 18);
+const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
+const SUCCESS: Color32 = Color32::from_rgb(22, 163, 74);
+const WARNING: Color32 = Color32::from_rgb(202, 138, 4);
+const ERROR: Color32 = Color32::from_rgb(220, 38, 38);
+
+#[derive(Clone, Copy)]
+enum ChipTone {
+    Neutral,
+    Success,
+    Warning,
+    Error,
+    Active,
+}
+
 fn page(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
+    ui.add_space(24.0);
+    ui.horizontal(|ui| {
+        ui.heading(
+            RichText::new(title)
+                .font(FontId::proportional(26.0))
+                .color(TEXT),
+        );
+    });
     ui.add_space(16.0);
-    ui.heading(title);
-    ui.add_space(12.0);
     add_contents(ui);
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    Frame::group(ui.style())
-        .inner_margin(Margin::same(12.0))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add_contents(ui);
-        });
+    card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add_contents(ui);
+    });
 }
 
 fn playground_card_frame(ui: &Ui) -> Frame {
-    Frame::group(ui.style()).inner_margin(Margin::same(12.0))
+    let _ = ui;
+    card_frame()
+}
+
+fn card_frame() -> Frame {
+    Frame::none()
+        .fill(CARD_BG)
+        .stroke(Stroke::new(1.0, BORDER))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::same(14.0))
 }
 
 fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<PlaygroundAction> {
     let mut actions = Vec::new();
     ui.set_min_width(ui.available_width());
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("≡").color(Color32::GRAY));
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new("≡").color(MUTED_TEXT));
         ui.vertical(|ui| {
             ui.heading(&card_state.model.name);
-            ui.label(format!(
-                "{} | RAM {} | Accuracy {} | Speed {} | {}",
-                card_state.model.backend,
-                card_state.model.expected_ram,
-                card_state.model.accuracy_tier,
-                card_state.model.speed_tier,
-                card_state.model.download_status
-            ));
+            ui.label(RichText::new(&card_state.model.description).color(MUTED_TEXT));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                badge(ui, &card_state.model.backend, ChipTone::Neutral);
+                badge(
+                    ui,
+                    &card_state.model.install_status.label(),
+                    install_chip_tone(&card_state.model.install_status),
+                );
+                badge(
+                    ui,
+                    &format!("{} speed", card_state.model.speed_tier),
+                    ChipTone::Neutral,
+                );
+            });
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Clear").clicked() {
@@ -1037,12 +1575,16 @@ fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<
                     enabled,
                 ));
             }
-            ui.label(card_state.status.to_string());
+            badge(
+                ui,
+                &card_state.status.to_string(),
+                runtime_chip_tone(&card_state.status),
+            );
         });
     });
 
     if let Some(latency) = card_state.latency_ms {
-        ui.label(format!("Latency estimate: {latency} ms"));
+        ui.label(RichText::new(format!("Latency: {latency} ms")).color(MUTED_TEXT));
     }
 
     ui.add_space(8.0);
@@ -1059,19 +1601,145 @@ fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<
 
 fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab, label: &str) {
     let selected = *current_tab == tab;
-    if ui.selectable_label(selected, label).clicked() {
+    let response = ui.add_sized(
+        [ui.available_width(), 34.0],
+        Button::new(RichText::new(label).color(if selected { TEXT } else { MUTED_TEXT }))
+            .fill(if selected { CARD_BG } else { SHELL_BG })
+            .stroke(if selected {
+                Stroke::new(1.0, BORDER_STRONG)
+            } else {
+                Stroke::NONE
+            })
+            .rounding(Rounding::same(6.0)),
+    );
+    if response.clicked() {
         *current_tab = tab;
     }
 }
 
-fn status_pill(ui: &mut Ui, status: TranscriptionStatus) {
-    let color = match status {
-        TranscriptionStatus::Idle => Color32::from_rgb(58, 134, 86),
-        TranscriptionStatus::Listening => Color32::from_rgb(24, 102, 196),
-        TranscriptionStatus::Transcribing => Color32::from_rgb(150, 100, 20),
-        TranscriptionStatus::Error => Color32::from_rgb(180, 40, 40),
+fn primary_button(label: &str) -> Button<'_> {
+    Button::new(RichText::new(label).color(Color32::WHITE).strong())
+        .fill(PRIMARY)
+        .stroke(Stroke::new(1.0, PRIMARY))
+        .rounding(Rounding::same(24.0))
+        .min_size(Vec2::new(190.0, 46.0))
+}
+
+fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
+    let tone = match status {
+        TranscriptionStatus::Idle => ChipTone::Success,
+        TranscriptionStatus::Listening => ChipTone::Active,
+        TranscriptionStatus::Transcribing => ChipTone::Warning,
+        TranscriptionStatus::Error => ChipTone::Error,
     };
-    ui.colored_label(color, RichText::new(status.to_string()).strong());
+    badge(ui, &status.to_string(), tone);
+}
+
+fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
+    let (text, fill, stroke) = chip_colors(tone);
+    ui.label(
+        RichText::new(format!(" {label} "))
+            .color(text)
+            .background_color(fill),
+    )
+    .on_hover_text(label);
+    let _ = stroke;
+}
+
+fn chip_colors(tone: ChipTone) -> (Color32, Color32, Stroke) {
+    match tone {
+        ChipTone::Neutral => (
+            MUTED_TEXT,
+            Color32::from_rgb(248, 250, 252),
+            Stroke::new(1.0, BORDER),
+        ),
+        ChipTone::Success => (
+            SUCCESS,
+            Color32::from_rgb(240, 253, 244),
+            Stroke::new(1.0, Color32::from_rgb(187, 247, 208)),
+        ),
+        ChipTone::Warning => (
+            WARNING,
+            Color32::from_rgb(254, 252, 232),
+            Stroke::new(1.0, Color32::from_rgb(254, 240, 138)),
+        ),
+        ChipTone::Error => (
+            ERROR,
+            Color32::from_rgb(254, 242, 242),
+            Stroke::new(1.0, Color32::from_rgb(254, 202, 202)),
+        ),
+        ChipTone::Active => (
+            ACCENT,
+            Color32::from_rgb(219, 234, 254),
+            Stroke::new(1.0, Color32::from_rgb(191, 219, 254)),
+        ),
+    }
+}
+
+fn install_chip_tone(status: &ModelInstallStatus) -> ChipTone {
+    match status {
+        ModelInstallStatus::Installed => ChipTone::Success,
+        ModelInstallStatus::Downloading { .. } => ChipTone::Active,
+        ModelInstallStatus::Missing | ModelInstallStatus::Error(_) => ChipTone::Error,
+        ModelInstallStatus::NotInstalled => ChipTone::Warning,
+    }
+}
+
+fn runtime_chip_tone(status: &ModelRuntimeStatus) -> ChipTone {
+    match status {
+        ModelRuntimeStatus::Ready => ChipTone::Success,
+        ModelRuntimeStatus::Running => ChipTone::Active,
+        ModelRuntimeStatus::Disabled
+        | ModelRuntimeStatus::NotImplemented
+        | ModelRuntimeStatus::NotInstalled
+        | ModelRuntimeStatus::MissingConfiguration
+        | ModelRuntimeStatus::Downloading => ChipTone::Warning,
+        ModelRuntimeStatus::Error(_) => ChipTone::Error,
+    }
+}
+
+fn recording_timer_text(active: &ActiveRecording) -> String {
+    let elapsed = active.started_at.elapsed().as_secs();
+    let total = active.max_duration_seconds.max(1) as u64;
+    let remaining = total.saturating_sub(elapsed);
+    format!("{elapsed}s elapsed · {remaining}s left")
+}
+
+fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
+    match status {
+        ModelRuntimeStatus::Ready => "Ready to transcribe.".to_owned(),
+        ModelRuntimeStatus::MissingConfiguration => {
+            "Set the whisper.cpp executable and a local model file before transcribing.".to_owned()
+        }
+        ModelRuntimeStatus::NotInstalled => {
+            "Install a local whisper.cpp model or browse to an existing model file.".to_owned()
+        }
+        ModelRuntimeStatus::Downloading => "The selected model is still downloading.".to_owned(),
+        ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
+        ModelRuntimeStatus::Disabled => "Enable this model before transcribing.".to_owned(),
+        ModelRuntimeStatus::NotImplemented => {
+            "This backend is planned metadata only; choose a whisper.cpp model.".to_owned()
+        }
+        ModelRuntimeStatus::Error(message) => message.clone(),
+    }
+}
+
+fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
+    let mut visuals = match theme_mode {
+        ThemeMode::Dark => egui::Visuals::dark(),
+        ThemeMode::Light | ThemeMode::System => egui::Visuals::light(),
+    };
+    visuals.override_text_color = Some(match theme_mode {
+        ThemeMode::Dark => Color32::from_rgb(236, 241, 247),
+        ThemeMode::Light | ThemeMode::System => TEXT,
+    });
+    visuals.selection.bg_fill = ACCENT;
+    visuals.hyperlink_color = ACCENT;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals
 }
 
 fn path_from_input(input: &str) -> Option<PathBuf> {
@@ -1130,11 +1798,190 @@ fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
     if !model.enabled {
         ModelRuntimeStatus::Disabled
-    } else if model.backend != "whisper.cpp" {
+    } else if !backend_capabilities(&model.backend).runnable {
         ModelRuntimeStatus::NotImplemented
-    } else if config.whisper_executable_path.is_none() || model.local_path.is_none() {
-        ModelRuntimeStatus::MissingConfiguration
+    } else if model.install_status.is_runnable() {
+        let executable_ready = config
+            .whisper_executable_path
+            .as_ref()
+            .is_some_and(|path| path.exists());
+        if executable_ready {
+            ModelRuntimeStatus::Ready
+        } else {
+            ModelRuntimeStatus::MissingConfiguration
+        }
     } else {
-        ModelRuntimeStatus::Ready
+        match &model.install_status {
+            ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
+            ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
+            ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
+            ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
+            ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message.clone()),
+        }
     }
+}
+
+fn captured_hotkey_spec(input: &egui::InputState) -> Option<String> {
+    input.events.iter().find_map(|event| {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } = event
+        {
+            hotkey_spec_from_key(*key, *modifiers)
+        } else {
+            None
+        }
+    })
+}
+
+fn hotkey_spec_from_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
+    let key = key_to_hotkey_token(key)?;
+    let mut parts = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if modifiers.shift {
+        parts.push("Shift");
+    }
+    if modifiers.alt {
+        parts.push("Alt");
+    }
+    if modifiers.command && !modifiers.ctrl {
+        parts.push("Super");
+    }
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
+fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
+    Some(match key {
+        egui::Key::Space => "Space",
+        egui::Key::Enter => "Enter",
+        egui::Key::Tab => "Tab",
+        egui::Key::Escape => "Esc",
+        egui::Key::Backspace => "Backspace",
+        egui::Key::Delete => "Delete",
+        egui::Key::ArrowUp => "Up",
+        egui::Key::ArrowDown => "Down",
+        egui::Key::ArrowLeft => "Left",
+        egui::Key::ArrowRight => "Right",
+        egui::Key::F1 => "F1",
+        egui::Key::F2 => "F2",
+        egui::Key::F3 => "F3",
+        egui::Key::F4 => "F4",
+        egui::Key::F5 => "F5",
+        egui::Key::F6 => "F6",
+        egui::Key::F7 => "F7",
+        egui::Key::F8 => "F8",
+        egui::Key::F9 => "F9",
+        egui::Key::F10 => "F10",
+        egui::Key::F11 => "F11",
+        egui::Key::F12 => "F12",
+        egui::Key::A => "A",
+        egui::Key::B => "B",
+        egui::Key::C => "C",
+        egui::Key::D => "D",
+        egui::Key::E => "E",
+        egui::Key::F => "F",
+        egui::Key::G => "G",
+        egui::Key::H => "H",
+        egui::Key::I => "I",
+        egui::Key::J => "J",
+        egui::Key::K => "K",
+        egui::Key::L => "L",
+        egui::Key::M => "M",
+        egui::Key::N => "N",
+        egui::Key::O => "O",
+        egui::Key::P => "P",
+        egui::Key::Q => "Q",
+        egui::Key::R => "R",
+        egui::Key::S => "S",
+        egui::Key::T => "T",
+        egui::Key::U => "U",
+        egui::Key::V => "V",
+        egui::Key::W => "W",
+        egui::Key::X => "X",
+        egui::Key::Y => "Y",
+        egui::Key::Z => "Z",
+        egui::Key::Num0 => "0",
+        egui::Key::Num1 => "1",
+        egui::Key::Num2 => "2",
+        egui::Key::Num3 => "3",
+        egui::Key::Num4 => "4",
+        egui::Key::Num5 => "5",
+        egui::Key::Num6 => "6",
+        egui::Key::Num7 => "7",
+        egui::Key::Num8 => "8",
+        egui::Key::Num9 => "9",
+        _ => return None,
+    })
+}
+
+fn download_model_file(
+    url: &str,
+    destination: &Path,
+    tx: &Sender<AppEvent>,
+    model_id: &str,
+) -> Result<(), String> {
+    if destination.exists() {
+        return Ok(());
+    }
+
+    let partial_path = destination.with_extension("bin.partial");
+    let result = (|| {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+
+        let response = ureq::get(url)
+            .call()
+            .map_err(|err| format!("request failed for {url}: {err}"))?;
+        let total_bytes = response
+            .header("content-length")
+            .and_then(|value| value.parse::<u64>().ok());
+        let mut reader = response.into_reader();
+        let mut file = fs::File::create(&partial_path)
+            .map_err(|err| format!("failed to create {}: {err}", partial_path.display()))?;
+        let mut downloaded_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|err| format!("download read failed: {err}"))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|err| format!("failed to write {}: {err}", partial_path.display()))?;
+            downloaded_bytes += read as u64;
+            let _ = tx.send(AppEvent::ModelDownloadProgress {
+                model_id: model_id.to_owned(),
+                downloaded_bytes,
+                total_bytes,
+            });
+        }
+
+        file.sync_all()
+            .map_err(|err| format!("failed to finish {}: {err}", partial_path.display()))?;
+        fs::rename(&partial_path, destination).map_err(|err| {
+            format!(
+                "failed to move {} to {}: {err}",
+                partial_path.display(),
+                destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&partial_path);
+    }
+
+    result
 }

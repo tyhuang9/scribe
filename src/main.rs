@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod config;
+mod core;
 mod hotkey;
 mod models;
 mod stt;
@@ -18,26 +19,77 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([840.0, 600.0]),
         follow_system_theme: false,
         default_theme: eframe::Theme::Light,
+        event_loop_builder: Some(Box::new(configure_event_loop_backend)),
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Local Transcriber",
+    let result = eframe::run_native(
+        "Scribe",
         options,
         Box::new(|cc| Box::new(app::LocalTranscriberApp::new(cc))),
-    )
+    );
+    if let Err(err) = &result {
+        eprintln!("Scribe failed to start: {err}");
+        print_linux_display_help(err);
+    }
+    result
 }
 
 fn configure_graphics_environment() {
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("LOCAL_TRANSCRIBER_USE_GPU").is_some() {
+        if std::env::var_os("SCRIBE_USE_GPU").is_some()
+            || std::env::var_os("LOCAL_TRANSCRIBER_USE_GPU").is_some()
+        {
             return;
         }
 
         // Set before eframe/winit starts threads or creates the GL context.
         unsafe {
             std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_event_loop_backend<T: 'static>(event_loop: &mut eframe::EventLoopBuilder<T>) {
+    use winit::platform::wayland::EventLoopBuilderExtWayland;
+    use winit::platform::x11::EventLoopBuilderExtX11;
+
+    if std::env::var_os("SCRIBE_FORCE_X11").is_some() {
+        event_loop.with_x11();
+        return;
+    }
+
+    if std::env::var_os("SCRIBE_FORCE_WAYLAND").is_some() {
+        event_loop.with_wayland();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_event_loop_backend<T: 'static>(_event_loop: &mut eframe::EventLoopBuilder<T>) {}
+
+fn print_linux_display_help(err: &eframe::Error) {
+    #[cfg(target_os = "linux")]
+    {
+        let message = err.to_string();
+        let lower_message = message.to_ascii_lowercase();
+        if lower_message.contains("nocompositor")
+            || lower_message.contains("wayland")
+            || lower_message.contains("x connection")
+            || lower_message.contains("broken pipe")
+            || lower_message.contains("exit failure")
+            || lower_message.contains("not supported by winit")
+        {
+            eprintln!(
+                "Linux display diagnostics: DISPLAY={:?}, WAYLAND_DISPLAY={:?}, XDG_RUNTIME_DIR={:?}",
+                std::env::var_os("DISPLAY"),
+                std::env::var_os("WAYLAND_DISPLAY"),
+                std::env::var_os("XDG_RUNTIME_DIR")
+            );
+            eprintln!(
+                "Under WSL this usually means WSLg/Weston crashed or is unreachable. Try `wsl.exe --shutdown` from Windows PowerShell, then reopen WSL and run `cargo run` again. To force X11 for one run, use `SCRIBE_FORCE_X11=1 cargo run`; to force Wayland, use `SCRIBE_FORCE_WAYLAND=1 cargo run`."
+            );
         }
     }
 }

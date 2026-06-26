@@ -1,16 +1,18 @@
-# Local Transcriber
+# Scribe
 
-Local Transcriber is a lightweight local-first desktop speech-to-text MVP built with Rust and egui/eframe. It does not use Tauri, Electron, React, a Python server, or any always-running model process.
+Scribe is a lightweight local-first desktop speech-to-text app built with Rust and egui/eframe. It does not use Tauri, Electron, React, a Python server, cloud STT, account sync, or any always-running model process.
 
 The app shell stays small and only invokes an STT runtime when the user records audio and starts transcription.
 
 ## Current Features
 
-- Native egui desktop UI with Transcribe, Models, Model Playground, and Settings pages.
-- Local JSON config for hotkey, model selections, executable paths, model paths, debug mode, and max recording duration.
+- Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
+- Local JSON config for hotkey, model selections, executable paths, model storage, model paths, theme mode, audio input device, debug mode, and max recording duration.
+- One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default.
-- Local microphone recording through `cpal`, saved as a temporary WAV file through `hound`.
+- Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
 - `whisper.cpp` backend integration through a configured executable path and model file path.
+- Background downloads for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
 - Non-blocking UI for recording and transcription using background threads and channels.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
@@ -30,7 +32,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - sherpa-onnx Zipformer Small
   - Moonshine
   - Parakeet 0.6B
-- Model Playground that shows the full catalog, supports enable/disable, persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
+- Playground that shows the full catalog, supports enable/disable, persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
 - Transcript copy and clear actions.
 
 ## Requirements
@@ -44,7 +46,33 @@ On Ubuntu, install the microphone and tray build dependencies:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libasound2-dev libgtk-3-dev libappindicator3-dev
+sudo apt-get install -y build-essential pkg-config libasound2-dev libgtk-3-dev libayatana-appindicator3-1 libayatana-appindicator3-dev
+```
+
+If your distribution uses the older AppIndicator package names, install
+`libappindicator3-1` and `libappindicator3-dev` instead. Scribe can still run
+without these tray libraries; close-to-tray behavior is simply disabled.
+
+To bypass tray startup entirely while debugging desktop-session issues:
+
+```bash
+SCRIBE_DISABLE_TRAY=1 cargo run
+```
+
+When running under WSL, Scribe disables tray integration by default because
+AppIndicator/GTK tray initialization is unreliable in WSLg. The main window
+still works. To opt into tray behavior under WSL:
+
+```bash
+SCRIBE_ENABLE_TRAY=1 cargo run
+```
+
+On Linux, global hotkey registration is disabled by default because some
+desktop/X sessions terminate the app when global key hooks are initialized.
+Use the in-app Start/Stop button, or opt in explicitly:
+
+```bash
+SCRIBE_ENABLE_GLOBAL_HOTKEY=1 cargo run
 ```
 
 ## Run
@@ -58,7 +86,30 @@ crashes in lightweight desktop or WSL-style environments. To opt back into GPU
 rendering:
 
 ```bash
-LOCAL_TRANSCRIBER_USE_GPU=1 cargo run
+SCRIBE_USE_GPU=1 cargo run
+```
+
+The old `LOCAL_TRANSCRIBER_USE_GPU=1` opt-in is still accepted for compatibility.
+
+On Linux, Winit prefers Wayland whenever `WAYLAND_DISPLAY` is set. In WSLg, a
+stale or crashed compositor can still advertise `WAYLAND_DISPLAY`, then fail
+with `Could not find wayland compositor` or `X connection to :0 broken`. If
+startup fails, restart WSLg from Windows PowerShell:
+
+```powershell
+wsl.exe --shutdown
+```
+
+Then reopen WSL and run `cargo run` again. To force X11 for one run:
+
+```bash
+SCRIBE_FORCE_X11=1 cargo run
+```
+
+To force Wayland for one run:
+
+```bash
+SCRIBE_FORCE_WAYLAND=1 cargo run
 ```
 
 If your system still reports Mesa/Zink/EGL errors, run it explicitly with Mesa's
@@ -79,15 +130,14 @@ cargo check
 This MVP does not bundle whisper.cpp or model files.
 
 1. Build whisper.cpp separately.
-2. Download a compatible `.bin` model, such as `ggml-tiny.en.bin`.
-3. Launch Local Transcriber.
-4. Open `Models`.
-5. Set the `whisper.cpp executable` path.
+2. Launch Scribe.
+3. Open `Models`.
+4. Set the `whisper.cpp executable` path.
    - Newer whisper.cpp builds usually produce `whisper-cli`.
    - Older builds may produce `main`.
-6. Set the model path for the whisper.cpp model you want to use.
-7. Select that model as the default.
-8. Return to `Transcribe`, record, stop, and wait for the transcript.
+5. Either download `tiny.en`, `base.en`, `small.en`, or `medium.en`, or browse to an existing compatible `ggml-*.bin` model file.
+6. Select that model as the default.
+7. Return to `Transcribe`, record, stop, and wait for the transcript.
 
 The backend calls whisper.cpp like this:
 
@@ -99,6 +149,8 @@ whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt
 
 Settings are stored in a platform-specific config directory using the `directories` crate. The exact config file path is shown on the Settings page after launch.
 
+Scribe stores new config under the Scribe application directory. On first launch, if no Scribe config exists and an old Local Transcriber config is present, Scribe reads and saves a migrated copy into the new config path.
+
 The config stores:
 
 - selected default model
@@ -106,7 +158,10 @@ The config stores:
 - persisted model playground order
 - global hotkey
 - whisper.cpp executable path
+- model storage directory
 - model file paths
+- theme mode
+- optional audio input device name
 - last used backend
 - debug mode
 - max recording duration
@@ -137,6 +192,7 @@ The main modules are:
 - `src/app.rs`: egui UI, app state, event polling, and background job dispatch.
 - `src/audio.rs`: microphone capture and temporary WAV writing.
 - `src/config.rs`: local JSON config loading/saving.
+- `src/core.rs`: testable recording/transcription workflow reducer.
 - `src/hotkey.rs`: global hotkey parsing and registration.
 - `src/models.rs`: shared STT model/result/status structs.
 - `src/stt/mod.rs`: backend trait and dispatch.

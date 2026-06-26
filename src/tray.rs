@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -29,6 +29,19 @@ pub struct TrayService {
 
 impl TrayService {
     pub fn new(is_recording: bool, has_transcript: bool) -> Result<Self> {
+        if std::env::var_os("SCRIBE_DISABLE_TRAY").is_some() {
+            return Err(anyhow!("system tray disabled by SCRIBE_DISABLE_TRAY"));
+        }
+        if running_in_wsl() && std::env::var_os("SCRIBE_ENABLE_TRAY").is_none() {
+            return Err(anyhow!(
+                "system tray disabled by default under WSL; set SCRIBE_ENABLE_TRAY=1 to enable it"
+            ));
+        }
+        ensure_tray_runtime_available()?;
+        catch_tray_init_panic(|| Self::build(is_recording, has_transcript))?
+    }
+
+    fn build(is_recording: bool, has_transcript: bool) -> Result<Self> {
         let show_item = MenuItem::with_id(MENU_SHOW, "Show Scribe", true, None);
         let hide_item = MenuItem::with_id(MENU_HIDE, "Hide Window", true, None);
         let toggle_recording_item = MenuItem::with_id(
@@ -55,7 +68,7 @@ impl TrayService {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Local Transcriber")
+            .with_tooltip("Scribe")
             .with_icon(scribe_icon()?)
             .build()
             .context("failed to create tray icon")?;
@@ -97,6 +110,72 @@ impl TrayService {
             }
         }
         command
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_tray_runtime_available() -> Result<()> {
+    let candidates = [
+        "libayatana-appindicator3.so.1",
+        "libappindicator3.so.1",
+        "libayatana-appindicator3.so",
+        "libappindicator3.so",
+    ];
+
+    if candidates
+        .iter()
+        .any(|name| unsafe { libloading::Library::new(name).is_ok() })
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "system tray unavailable: install libayatana-appindicator3-1 or libappindicator3-1"
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_tray_runtime_available() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn running_in_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|release| {
+                let release = release.to_ascii_lowercase();
+                release.contains("microsoft") || release.contains("wsl")
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_in_wsl() -> bool {
+    false
+}
+
+fn catch_tray_init_panic<T>(init: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(init);
+    std::panic::set_hook(previous_hook);
+
+    result.map_err(|payload| {
+        anyhow!(
+            "system tray unavailable: {}",
+            panic_payload_message(payload)
+        )
+    })
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "tray initialization panicked".to_owned()
     }
 }
 

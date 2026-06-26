@@ -28,7 +28,23 @@ impl RecordingSession {
     }
 }
 
-pub fn start_recording(max_duration_seconds: u32) -> Result<RecordingSession> {
+pub fn input_device_names() -> Result<Vec<String>> {
+    let host = cpal::default_host();
+    let mut names = host
+        .input_devices()
+        .context("failed to enumerate microphone devices")?
+        .filter_map(|device| device.name().ok())
+        .filter(|name| !name.trim().is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+pub fn start_recording(
+    max_duration_seconds: u32,
+    input_device_name: Option<String>,
+) -> Result<RecordingSession> {
     let audio_path = temp_wav_path()?;
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
@@ -40,6 +56,7 @@ pub fn start_recording(max_duration_seconds: u32) -> Result<RecordingSession> {
             worker_path.clone(),
             stop_rx,
             max_duration_seconds,
+            input_device_name,
             started_tx,
         );
         let _ = finished_tx.send(result.map(|_| worker_path).map_err(|err| err.to_string()));
@@ -73,15 +90,14 @@ fn record_to_wav(
     path: PathBuf,
     stop_rx: Receiver<()>,
     max_duration_seconds: u32,
+    input_device_name: Option<String>,
     started_tx: Sender<Result<(), String>>,
 ) -> Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input microphone was found"))?;
+    let device = select_input_device(&host, input_device_name.as_deref())?;
     let supported_config = device
         .default_input_config()
-        .context("failed to read the default input config")?;
+        .context("failed to read the microphone input config")?;
     let sample_format = supported_config.sample_format();
     let stream_config: cpal::StreamConfig = supported_config.into();
     let channels = stream_config.channels;
@@ -145,6 +161,28 @@ fn record_to_wav(
     }
 
     Ok(())
+}
+
+fn select_input_device(host: &cpal::Host, input_device_name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(target_name) = input_device_name.filter(|name| !name.trim().is_empty()) {
+        if let Ok(devices) = host.input_devices() {
+            for device in devices {
+                if device.name().ok().as_deref() == Some(target_name) {
+                    return Ok(device);
+                }
+            }
+        }
+    }
+
+    host.default_input_device().ok_or_else(|| {
+        if let Some(target_name) = input_device_name {
+            anyhow!(
+                "microphone \"{target_name}\" was not found and no default input microphone is available"
+            )
+        } else {
+            anyhow!("no default input microphone was found")
+        }
+    })
 }
 
 fn write_f32(input: &[f32], writer: &SharedWavWriter) {

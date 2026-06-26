@@ -2,12 +2,10 @@
 
 ## MVP Hardening
 
-- Add a first-run setup checklist for missing whisper.cpp executable and model paths.
-- Add file picker buttons for executable and model paths.
-- Surface microphone device selection instead of using only the OS default input device.
-- Show a visible countdown for the max recording duration.
+- Expand first-run setup with richer validation and recovery guidance.
 - Add structured transcription logs behind debug mode.
-- Add tests for hotkey parsing, config normalization, and whisper.cpp stdout parsing.
+- Add visual regression notes/screenshots for the Stitch-aligned egui pages.
+- Split the remaining egui rendering out of `src/app.rs` into smaller page/component modules.
 
 ## STT Backends
 
@@ -17,7 +15,7 @@
 - Add Moonshine runtime support.
 - Add Parakeet runtime support.
 - Add a native whisper.cpp library backend to avoid child-process overhead.
-- Add per-backend capability flags for streaming, timestamps, and language selection.
+- Expand backend capability flags for timestamps, language selection, and streaming options.
 
 ## Streaming And Voice UX
 
@@ -28,7 +26,7 @@
 
 ## Model Management
 
-- Add a model downloader with checksum verification.
+- Add checksum verification for downloaded whisper.cpp models.
 - Add local model inventory scanning.
 - Add disk usage reporting.
 - Add per-model benchmark history for latency and accuracy notes.

@@ -105,7 +105,7 @@ impl SttBackend for WhisperCppBackend {
     }
 }
 
-fn parse_final_text(stdout: &str) -> String {
+pub(crate) fn parse_final_text(stdout: &str) -> String {
     stdout
         .lines()
         .map(str::trim)
@@ -124,4 +124,28 @@ fn strip_timestamp_prefix(line: &str) -> String {
         }
     }
     line.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_final_text_removes_timestamps_and_diagnostics() {
+        let stdout = r#"
+            whisper_init_from_file_with_params_no_state: loading model
+            [00:00:00.000 --> 00:00:01.000]  First sentence.
+            [00:00:01.000 --> 00:00:02.000]  Second sentence.
+        "#;
+
+        assert_eq!(
+            parse_final_text(stdout),
+            "First sentence.\nSecond sentence."
+        );
+    }
+
+    #[test]
+    fn parse_final_text_keeps_plain_lines() {
+        assert_eq!(parse_final_text("hello world"), "hello world");
+    }
 }
