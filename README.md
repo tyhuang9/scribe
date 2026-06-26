@@ -7,11 +7,11 @@ The app shell stays small and only invokes an STT runtime when the user records 
 ## Current Features
 
 - Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
-- Local JSON config for hotkey, model selections, executable paths, model storage, model paths, theme mode, audio input device, debug mode, and max recording duration.
+- Local JSON config for hotkey, model selections, executable paths, managed model storage, theme mode, audio input device, debug mode, and max recording duration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp` backend integration through a configured executable path and model file path.
+- `whisper.cpp` backend integration through a configured executable path and managed downloaded models.
 - Background downloads for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
 - Non-blocking UI for recording and transcription using background threads and channels.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
@@ -127,15 +127,16 @@ cargo check
 
 ## Configure whisper.cpp
 
-This MVP does not bundle whisper.cpp or model files.
+This MVP does not bundle whisper.cpp, but the app can download supported
+whisper.cpp model files into managed local storage.
 
 1. Build whisper.cpp separately.
 2. Launch Scribe.
-3. Open `Models`.
+3. Open `Settings`.
 4. Set the `whisper.cpp executable` path.
    - Newer whisper.cpp builds usually produce `whisper-cli`.
    - Older builds may produce `main`.
-5. Either download `tiny.en`, `base.en`, `small.en`, or `medium.en`, or browse to an existing compatible `ggml-*.bin` model file.
+5. Open `Models` and download `tiny.en`, `base.en`, `small.en`, or `medium.en`.
 6. Select that model as the default.
 7. Return to `Transcribe`, record, stop, and wait for the transcript.
 
@@ -158,8 +159,7 @@ The config stores:
 - persisted model playground order
 - global hotkey
 - whisper.cpp executable path
-- model storage directory
-- model file paths
+- managed model storage directory
 - theme mode
 - optional audio input device name
 - last used backend

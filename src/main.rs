@@ -13,19 +13,9 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     configure_graphics_environment();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([840.0, 600.0]),
-        follow_system_theme: false,
-        default_theme: eframe::Theme::Light,
-        event_loop_builder: Some(Box::new(configure_event_loop_backend)),
-        ..Default::default()
-    };
-
     let result = eframe::run_native(
         "Scribe",
-        options,
+        native_options(),
         Box::new(|cc| Box::new(app::LocalTranscriberApp::new(cc))),
     );
     if let Err(err) = &result {
@@ -33,6 +23,20 @@ fn main() -> eframe::Result<()> {
         print_linux_display_help(err);
     }
     result
+}
+
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 760.0])
+            .with_min_inner_size([840.0, 600.0])
+            .with_resizable(true)
+            .with_transparent(false),
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Light,
+        event_loop_builder: Some(Box::new(configure_event_loop_backend)),
+        ..Default::default()
+    }
 }
 
 fn configure_graphics_environment() {
@@ -91,5 +95,23 @@ fn print_linux_display_help(err: &eframe::Error) {
                 "Under WSL this usually means WSLg/Weston crashed or is unreachable. Try `wsl.exe --shutdown` from Windows PowerShell, then reopen WSL and run `cargo run` again. To force X11 for one run, use `SCRIBE_FORCE_X11=1 cargo run`; to force Wayland, use `SCRIBE_FORCE_WAYLAND=1 cargo run`."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_window_is_resizable_opaque_and_minimum_sized() {
+        let options = native_options();
+
+        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1100.0, 760.0)));
+        assert_eq!(
+            options.viewport.min_inner_size,
+            Some(egui::vec2(840.0, 600.0))
+        );
+        assert_eq!(options.viewport.resizable, Some(true));
+        assert_eq!(options.viewport.transparent, Some(false));
     }
 }

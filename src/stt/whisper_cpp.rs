@@ -38,7 +38,7 @@ impl SttBackend for WhisperCppBackend {
         let model_path = model
             .local_path
             .clone()
-            .ok_or_else(|| anyhow!("configure the model file path for {}", model.name))?;
+            .ok_or_else(|| anyhow!("download {} before transcribing", model.name))?;
 
         if !executable.exists() {
             return Err(anyhow!(

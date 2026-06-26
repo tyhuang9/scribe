@@ -155,7 +155,11 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             let downloaded_path =
                 downloaded_model_path(config, &model).filter(|path| path.exists());
 
-            model.local_path = configured_path.or(downloaded_path);
+            model.local_path = match configured_path {
+                Some(path) if path.exists() => Some(path),
+                Some(path) => downloaded_path.or(Some(path)),
+                None => downloaded_path,
+            };
             model.install_status = match &model.local_path {
                 Some(path) if path.exists() => ModelInstallStatus::Installed,
                 Some(_) => ModelInstallStatus::Missing,
@@ -483,5 +487,37 @@ mod tests {
             downloaded_model_path(&config, &model).unwrap(),
             PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
         );
+    }
+
+    #[test]
+    fn downloaded_model_file_wins_over_stale_configured_path() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-config-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let model_dir = temp_dir.join("whisper.cpp");
+        fs::create_dir_all(&model_dir).unwrap();
+        let downloaded_path = model_dir.join("ggml-base.en.bin");
+        fs::write(&downloaded_path, b"model").unwrap();
+
+        let mut model_paths = HashMap::new();
+        model_paths.insert(
+            "whisper_cpp_base_en".to_owned(),
+            temp_dir.join("missing-model.bin"),
+        );
+        let config = AppConfig {
+            model_storage_dir: temp_dir.clone(),
+            model_paths,
+            ..AppConfig::default()
+        };
+
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        assert_eq!(model.local_path.as_deref(), Some(downloaded_path.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

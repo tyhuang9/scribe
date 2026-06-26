@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
-    ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
+    self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
+    Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
 use rfd::FileDialog;
 
@@ -31,6 +31,34 @@ enum Tab {
     Models,
     Playground,
     Settings,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Transcribe => "Transcribe",
+            Self::Models => "Models",
+            Self::Playground => "Model Playground",
+            Self::Settings => "Settings",
+        }
+    }
+}
+
+fn initial_tab() -> Tab {
+    std::env::var("SCRIBE_START_TAB")
+        .ok()
+        .and_then(|value| tab_from_env_value(&value))
+        .unwrap_or(Tab::Transcribe)
+}
+
+fn tab_from_env_value(value: &str) -> Option<Tab> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "transcribe" => Some(Tab::Transcribe),
+        "models" | "model" => Some(Tab::Models),
+        "playground" | "model-playground" | "model playground" => Some(Tab::Playground),
+        "settings" => Some(Tab::Settings),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +109,6 @@ enum AppEvent {
     },
     ModelDownloadDone {
         model_id: String,
-        path: PathBuf,
     },
     ModelDownloadFailed {
         model_id: String,
@@ -103,7 +130,6 @@ pub struct LocalTranscriberApp {
     model_backend_filter: String,
     audio_devices: Vec<String>,
     capturing_hotkey: bool,
-    model_path_inputs: HashMap<String, String>,
     model_downloads: HashMap<String, ModelInstallStatus>,
     active_recording: Option<ActiveRecording>,
     tx: Sender<AppEvent>,
@@ -119,6 +145,7 @@ pub struct LocalTranscriberApp {
 impl LocalTranscriberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        configure_stitch_style(&cc.egui_ctx);
 
         let (mut config, config_path, status_message) = match config::load_config() {
             Ok((config, path)) => (config, Some(path), "Ready".to_owned()),
@@ -143,17 +170,12 @@ impl LocalTranscriberApp {
             model_backend_filter: "All".to_owned(),
             audio_devices: Vec::new(),
             capturing_hotkey: false,
-            model_path_inputs: config
-                .model_paths
-                .iter()
-                .map(|(id, path)| (id.clone(), path.display().to_string()))
-                .collect(),
             model_downloads: HashMap::new(),
             playground_cards: cards_from_config(&config),
             hotkey_service: HotkeyService::new(&config.hotkey),
             config,
             config_path,
-            current_tab: Tab::Transcribe,
+            current_tab: initial_tab(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             status_message,
@@ -531,14 +553,9 @@ impl LocalTranscriberApp {
                         },
                     );
                 }
-                AppEvent::ModelDownloadDone { model_id, path } => {
+                AppEvent::ModelDownloadDone { model_id } => {
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
-                    self.config
-                        .model_paths
-                        .insert(model_id.clone(), path.clone());
-                    self.model_path_inputs
-                        .insert(model_id.clone(), path.display().to_string());
                     if self.config.selected_default_model == model_id
                         && !self.config.enabled_models.iter().any(|id| id == &model_id)
                     {
@@ -546,7 +563,7 @@ impl LocalTranscriberApp {
                     }
                     self.save_config();
                     self.status = TranscriptionStatus::Idle;
-                    self.status_message = format!("Model installed at {}", path.display());
+                    self.status_message = "Model downloaded and ready.".to_owned();
                 }
                 AppEvent::ModelDownloadFailed { model_id, message } => {
                     self.model_downloads
@@ -787,10 +804,7 @@ impl LocalTranscriberApp {
             let result = download_model_file(&url, &destination, &tx, &model_id);
             match result {
                 Ok(()) => {
-                    let _ = tx.send(AppEvent::ModelDownloadDone {
-                        model_id,
-                        path: destination,
-                    });
+                    let _ = tx.send(AppEvent::ModelDownloadDone { model_id });
                 }
                 Err(message) => {
                     let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
@@ -802,11 +816,12 @@ impl LocalTranscriberApp {
 
 impl eframe::App for LocalTranscriberApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        SHELL_BG.to_normalized_gamma_f32()
+        CONTENT_BG.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
+        paint_viewport_background(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
         self.poll_hotkey_capture(ctx);
@@ -818,39 +833,35 @@ impl eframe::App for LocalTranscriberApp {
         self.sync_tray_state();
 
         egui::SidePanel::left("navigation")
-            .frame(Frame::none().fill(SHELL_BG))
+            .frame(
+                Frame::none()
+                    .fill(SIDEBAR_BG)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::symmetric(14.0, 16.0)),
+            )
             .resizable(false)
             .exact_width(200.0)
             .show(ctx, |ui| {
-                ui.add_space(20.0);
                 ui.label(
                     RichText::new("Scribe")
-                        .font(FontId::proportional(24.0))
+                        .font(FontId::proportional(20.0))
+                        .color(PRIMARY)
                         .strong(),
                 );
-                ui.label(RichText::new("Local speech to text").color(MUTED_TEXT));
-                ui.add_space(28.0);
-                nav_button(ui, &mut self.current_tab, Tab::Transcribe, "Transcribe");
-                nav_button(ui, &mut self.current_tab, Tab::Models, "Models");
-                nav_button(ui, &mut self.current_tab, Tab::Playground, "Playground");
-                nav_button(ui, &mut self.current_tab, Tab::Settings, "Settings");
+                ui.label(RichText::new("Local-First STT").small().color(MUTED_TEXT));
+                ui.add_space(22.0);
+                nav_button(ui, &mut self.current_tab, Tab::Transcribe);
+                nav_button(ui, &mut self.current_tab, Tab::Models);
+                nav_button(ui, &mut self.current_tab, Tab::Playground);
+                nav_button(ui, &mut self.current_tab, Tab::Settings);
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(RichText::new("Offline first").color(MUTED_TEXT));
-                    ui.label(RichText::new("No cloud STT").color(MUTED_TEXT));
-                });
-            });
-
-        egui::TopBottomPanel::bottom("footer")
-            .frame(Frame::none().fill(SHELL_BG))
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    status_badge(ui, self.status);
-                    ui.label(RichText::new(&self.status_message).color(MUTED_TEXT));
+                    sidebar_link(ui, "Privacy");
+                    sidebar_link(ui, "Help");
                 });
             });
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(CONTENT_BG))
+            .frame(content_panel_frame())
             .show(ctx, |ui| match self.current_tab {
                 Tab::Transcribe => self.ui_transcribe(ui),
                 Tab::Models => self.ui_models(ui),
@@ -864,60 +875,80 @@ impl eframe::App for LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
-        page(ui, "Transcribe", |ui| {
+        let status = self.status;
+        let status_message = self.status_message.clone();
+        page(ui, "Transcribe", status, &status_message, |ui| {
             let selected_model = self.selected_model();
             let runtime_status = selected_model
                 .as_ref()
                 .map(|model| runtime_status_for_model(&self.config, model));
             let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
+            let selected_model_summary = selected_model.as_ref().map(|model| {
+                (
+                    model.name.clone(),
+                    model.backend.clone(),
+                    self.effective_install_status(model),
+                )
+            });
+            let hotkey = self.config.hotkey.clone();
+            let mut requested_tab = None;
 
             ui.columns(2, |columns| {
-                card(&mut columns[0], |ui| {
-                    ui.label(RichText::new("Current model").color(MUTED_TEXT));
-                    if let Some(model) = &selected_model {
-                        ui.add_space(4.0);
-                        ui.heading(&model.name);
-                        ui.horizontal_wrapped(|ui| {
-                            badge(ui, &model.backend, ChipTone::Neutral);
-                            badge(
-                                ui,
-                                &self.effective_install_status(model).label(),
-                                install_chip_tone(&self.effective_install_status(model)),
-                            );
-                        });
-                    } else {
-                        ui.heading("No model selected");
-                    }
-                    ui.add_space(12.0);
-                    if ui.button("Open Models").clicked() {
-                        self.current_tab = Tab::Models;
-                    }
-                });
+                summary_card(
+                    &mut columns[0],
+                    "Current Model",
+                    |ui| {
+                        if let Some((name, backend, install_status)) = &selected_model_summary {
+                            ui.label(body_strong(name));
+                            ui.horizontal_wrapped(|ui| {
+                                badge(ui, backend, ChipTone::Neutral);
+                                badge(
+                                    ui,
+                                    &install_status.label(),
+                                    install_chip_tone(install_status),
+                                );
+                            });
+                        } else {
+                            ui.label(body_strong("No model selected"));
+                        }
+                    },
+                    |ui| {
+                        if ui.add(small_button("Change")).clicked() {
+                            requested_tab = Some(Tab::Models);
+                        }
+                    },
+                );
 
-                card(&mut columns[1], |ui| {
-                    ui.label(RichText::new("Hotkey").color(MUTED_TEXT));
-                    ui.add_space(4.0);
-                    ui.heading(&self.config.hotkey);
-                    ui.add_space(12.0);
-                    if ui.button("Edit in Settings").clicked() {
-                        self.current_tab = Tab::Settings;
-                    }
-                });
+                summary_card(
+                    &mut columns[1],
+                    "Hotkey",
+                    |ui| {
+                        ui.label(body_strong(&hotkey));
+                    },
+                    |ui| {
+                        if ui.add(small_button("Edit")).clicked() {
+                            requested_tab = Some(Tab::Settings);
+                        }
+                    },
+                );
             });
+            if let Some(tab) = requested_tab {
+                self.current_tab = tab;
+            }
 
             if !ready && self.active_recording.is_none() {
                 ui.add_space(12.0);
-                card(ui, |ui| {
+                panel(ui, |ui| {
                     let setup_message = runtime_status
                         .as_ref()
                         .map(setup_message_for_status)
                         .unwrap_or_else(|| {
                             "Choose a local whisper.cpp model to start transcribing.".to_owned()
                         });
-                    ui.heading("Setup required");
-                    ui.label(RichText::new(setup_message).color(MUTED_TEXT));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.label(section_heading("Setup required"));
+                    ui.label(mut_text(setup_message));
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
                         for model_id in ["whisper_cpp_base_en", "whisper_cpp_tiny_en"] {
                             if let Some(model) = config::configured_models(&self.config)
                                 .into_iter()
@@ -928,69 +959,77 @@ impl LocalTranscriberApp {
                                 } else {
                                     "Download tiny.en"
                                 };
-                                if ui.button(label).clicked() {
+                                if ui.add(small_button(label)).clicked() {
                                     self.select_model_as_default(&model);
                                     self.start_model_download(&model);
                                 }
                             }
                         }
-                        if ui.button("Configure paths").clicked() {
+                        if ui.add(small_button("Manage models")).clicked() {
                             self.current_tab = Tab::Models;
                         }
                     });
                 });
             }
 
-            ui.add_space(28.0);
-            ui.vertical_centered(|ui| {
-                let listening = self.active_recording.is_some();
-                let button_text = if listening {
-                    "Stop Listening"
-                } else {
-                    "Start Listening"
-                };
-                if ui
-                    .add_enabled(listening || ready, primary_button(button_text))
-                    .clicked()
-                {
-                    self.toggle_recording();
-                }
-                ui.add_space(8.0);
-                if let Some(active) = &self.active_recording {
-                    let elapsed = active.started_at.elapsed().as_secs_f32();
-                    let total = active.max_duration_seconds.max(1) as f32;
-                    ui.add(
-                        egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
-                            .desired_width(220.0)
-                            .text(recording_timer_text(active)),
-                    );
-                } else if ready {
-                    ui.label(
-                        RichText::new("Press the button or use the hotkey.").color(MUTED_TEXT),
-                    );
-                }
+            ui.add_space(12.0);
+            recessed_panel(ui, 110.0, |ui| {
+                ui.vertical_centered(|ui| {
+                    let listening = self.active_recording.is_some();
+                    let button_text = if listening {
+                        "Stop Listening"
+                    } else {
+                        "Start Listening"
+                    };
+                    if ui
+                        .add_enabled(listening || ready, primary_button(button_text))
+                        .clicked()
+                    {
+                        self.toggle_recording();
+                    }
+                    ui.add_space(8.0);
+                    if let Some(active) = &self.active_recording {
+                        let elapsed = active.started_at.elapsed().as_secs_f32();
+                        let total = active.max_duration_seconds.max(1) as f32;
+                        ui.add(
+                            egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
+                                .desired_width(220.0)
+                                .text(recording_timer_text(active)),
+                        );
+                    } else if ready {
+                        ui.label(
+                            RichText::new("System audio & microphone active")
+                                .small()
+                                .color(MUTED_TEXT),
+                        );
+                    }
+                });
             });
 
-            ui.add_space(28.0);
-            card(ui, |ui| {
+            ui.add_space(12.0);
+            transcript_panel(ui, status, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Transcript");
+                    ui.label(section_heading("Transcript"));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Clear").clicked() {
-                            self.transcript.clear();
-                        }
-                        if ui.button("Copy").clicked() {
-                            self.copy_transcript_to_clipboard();
-                        }
+                        ready_dot(ui, self.status);
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.add(
                     TextEdit::multiline(&mut self.transcript)
-                        .desired_rows(20)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Transcript output will appear here"),
+                        .desired_rows(14)
+                        .desired_width(usable_width(ui))
+                        .hint_text("Your transcription appears here..."),
                 );
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(small_button("Clear")).clicked() {
+                        self.transcript.clear();
+                    }
+                    if ui.add(small_button("Copy")).clicked() {
+                        self.copy_transcript_to_clipboard();
+                    }
+                });
             });
         });
     }
@@ -1004,59 +1043,25 @@ impl LocalTranscriberApp {
         backends.sort();
         backends.dedup();
 
-        page(ui, "Models", |ui| {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("whisper.cpp executable");
-                    if ui
-                        .text_edit_singleline(&mut self.whisper_path_input)
-                        .changed()
-                    {
-                        self.config.whisper_executable_path =
-                            path_from_input(&self.whisper_path_input);
-                        self.save_config();
-                    }
-                    if ui.button("Browse").clicked() {
-                        if let Some(path) = FileDialog::new().pick_file() {
-                            self.whisper_path_input = path.display().to_string();
-                            self.config.whisper_executable_path = Some(path);
-                            self.save_config();
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Model storage");
-                    if ui
-                        .text_edit_singleline(&mut self.model_storage_dir_input)
-                        .changed()
-                    {
-                        if let Some(path) = path_from_input(&self.model_storage_dir_input) {
-                            self.config.model_storage_dir = path;
-                            self.save_config();
-                        }
-                    }
-                    if ui.button("Browse").clicked() {
-                        if let Some(path) = FileDialog::new().pick_folder() {
-                            self.model_storage_dir_input = path.display().to_string();
-                            self.config.model_storage_dir = path;
-                            self.save_config();
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Search");
+        let status = self.status;
+        let status_message = self.status_message.clone();
+        page(ui, "Models Catalog", status, &status_message, |ui| {
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(label_caps("Search"));
                     ui.add(
                         TextEdit::singleline(&mut self.model_search)
-                            .desired_width(220.0)
-                            .hint_text("Model or backend"),
+                            .desired_width(width_before_trailing(ui, 290.0, 120.0))
+                            .hint_text("Search models..."),
                     );
+                    ui.label(label_caps("Filter Backend:"));
                     ComboBox::from_id_source("model-backend-filter")
-                        .selected_text(&self.model_backend_filter)
+                        .selected_text(if self.model_backend_filter == "All" {
+                            "All Backends"
+                        } else {
+                            &self.model_backend_filter
+                        })
+                        .width(130.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.model_backend_filter,
@@ -1087,142 +1092,108 @@ impl LocalTranscriberApp {
                 })
                 .collect::<Vec<_>>();
 
-            ScrollArea::vertical().show(ui, |ui| {
-                for model in models {
-                    card(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            let mut enabled = model.enabled;
-                            if ui.checkbox(&mut enabled, "").changed() {
-                                set_model_enabled(&mut self.config, &model.id, enabled);
-                                self.save_config();
-                            }
+            for model in models {
+                let selected = self.config.selected_default_model == model.id;
+                let install_status = self.effective_install_status(&model);
+                let supports_download = model.download_model.is_some()
+                    && backend_capabilities(&model.backend).supports_downloads;
+                let can_download = supports_download
+                    && !matches!(
+                        install_status,
+                        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::Installed
+                    );
+                let mut enabled_update = None;
+                let mut select_default = false;
+                let mut start_download = false;
 
-                            ui.vertical(|ui| {
-                                ui.heading(&model.name);
-                                ui.label(RichText::new(&model.description).color(MUTED_TEXT));
-                                ui.add_space(4.0);
-                                let install_status = self.effective_install_status(&model);
-                                ui.horizontal_wrapped(|ui| {
-                                    badge(ui, &model.backend, ChipTone::Neutral);
-                                    badge(
-                                        ui,
-                                        &install_status.label(),
-                                        install_chip_tone(&install_status),
-                                    );
-                                    badge(
-                                        ui,
-                                        &format!("RAM {}", model.expected_ram),
-                                        ChipTone::Neutral,
-                                    );
-                                    badge(
-                                        ui,
-                                        &format!("{} accuracy", model.accuracy_tier),
-                                        ChipTone::Neutral,
-                                    );
-                                    if !backend_capabilities(&model.backend).runnable {
-                                        badge(ui, "Planned", ChipTone::Warning);
-                                    }
-                                });
-                            });
+                model_catalog_row(ui, &model, &install_status, selected, |ui| {
+                    let mut enabled = model.enabled;
+                    if ui.checkbox(&mut enabled, "Enabled").changed() {
+                        enabled_update = Some(enabled);
+                    }
 
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let selected = self.config.selected_default_model == model.id;
-                                if ui.selectable_label(selected, "Default").clicked() {
-                                    self.select_model_as_default(&model);
-                                }
-                                let install_status = self.effective_install_status(&model);
-                                let can_download = model.download_model.is_some()
-                                    && !matches!(
-                                        install_status,
-                                        ModelInstallStatus::Downloading { .. }
-                                            | ModelInstallStatus::Installed
-                                    );
-                                if ui
-                                    .add_enabled(can_download, Button::new("Download"))
-                                    .clicked()
-                                {
-                                    self.start_model_download(&model);
-                                }
-                            });
-                        });
+                    if ui
+                        .add_enabled(
+                            !selected,
+                            primary_small_button(if selected { "Active" } else { "Select" }),
+                        )
+                        .clicked()
+                    {
+                        select_default = true;
+                    }
 
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Model path");
-                            let mut changed = false;
-                            {
-                                let input = self
-                                    .model_path_inputs
-                                    .entry(model.id.clone())
-                                    .or_insert_with(|| {
-                                        model
-                                            .local_path
-                                            .as_ref()
-                                            .map(|path| path.display().to_string())
-                                            .unwrap_or_default()
-                                    });
-                                changed |= ui.text_edit_singleline(input).changed();
-                                if ui.button("Browse").clicked() {
-                                    if let Some(path) = FileDialog::new().pick_file() {
-                                        *input = path.display().to_string();
-                                        changed = true;
-                                    }
-                                }
+                    if supports_download {
+                        let download_label = match &install_status {
+                            ModelInstallStatus::Downloading { .. } => "Downloading",
+                            ModelInstallStatus::Installed => "Installed",
+                            ModelInstallStatus::Error(_) => "Retry",
+                            ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => {
+                                "Download"
                             }
-                            if changed {
-                                let input = self
-                                    .model_path_inputs
-                                    .get(&model.id)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                if let Some(path) = path_from_input(&input) {
-                                    self.config.model_paths.insert(model.id.clone(), path);
-                                } else {
-                                    self.config.model_paths.remove(&model.id);
-                                }
-                                self.save_config();
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
+                        };
+                        if ui
+                            .add_enabled(can_download, small_button(download_label))
+                            .clicked()
+                        {
+                            start_download = true;
+                        }
+                    } else if !backend_capabilities(&model.backend).runnable {
+                        let _ = ui.add_enabled(false, small_button("Planned"));
+                    }
+                });
+
+                if let Some(enabled) = enabled_update {
+                    set_model_enabled(&mut self.config, &model.id, enabled);
+                    self.save_config();
+                }
+                if select_default {
+                    self.select_model_as_default(&model);
+                }
+                if start_download {
+                    self.start_model_download(&model);
+                }
+                ui.add_space(8.0);
+            }
+
+            empty_import_panel(ui, |ui| {
+                if ui.add(small_button("Import Custom Model")).clicked() {
+                    self.status_message = "Custom model import is not wired yet.".to_owned();
                 }
             });
         });
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
-        page(ui, "Playground", |ui| {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    badge(
-                        ui,
-                        &format!("{} enabled", self.enabled_models().len()),
-                        ChipTone::Neutral,
-                    );
-                    ui.label(
-                        RichText::new("Record once and compare enabled local models.")
-                            .color(MUTED_TEXT),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let text = if self.active_recording.is_some() {
-                            "Stop Recording"
+        let status = self.status;
+        let status_message = self.status_message.clone();
+        page(ui, "Model Playground", status, &status_message, |ui| {
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let text = if self.active_recording.is_some() {
+                        "Stop Recording"
+                    } else {
+                        "Start Test Recording"
+                    };
+                    if ui.add(primary_small_button(text)).clicked() {
+                        if self.active_recording.is_some() {
+                            self.stop_recording();
                         } else {
-                            "Start Test Recording"
-                        };
-                        if ui.add(Button::new(text)).clicked() {
-                            if self.active_recording.is_some() {
-                                self.stop_recording();
-                            } else {
-                                self.start_recording(RecordingSource::Playground);
-                            }
+                            self.start_recording(RecordingSource::Playground);
                         }
-                        if ui.button("Clear Results").clicked() {
-                            for card in &mut self.playground_cards {
-                                card.transcript.clear();
-                                card.latency_ms = None;
-                                card.status = runtime_status_for_model(&self.config, &card.model);
-                            }
+                    }
+                    if ui.add(small_button("Clear Results")).clicked() {
+                        for card in &mut self.playground_cards {
+                            card.transcript.clear();
+                            card.latency_ms = None;
+                            card.status = runtime_status_for_model(&self.config, &card.model);
                         }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        badge(
+                            ui,
+                            &format!("{} enabled", self.enabled_models().len()),
+                            ChipTone::Neutral,
+                        );
                     });
                 });
                 if let Some(active) = &self.active_recording {
@@ -1240,44 +1211,85 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
-            let mut pending_actions = Vec::new();
-            ScrollArea::vertical().show(ui, |ui| {
-                if self.playground_cards.is_empty() {
-                    ui.label("No models are configured.");
-                }
-                for card_state in &mut self.playground_cards {
-                    let model_id = card_state.model.id.clone();
-                    let drag_id = ui.id().with(("playground-card", &model_id));
-                    let (inner, dropped_payload) =
-                        ui.dnd_drop_zone::<String, _>(playground_card_frame(ui), |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
-                                playground_card_ui(ui, card_state)
-                            })
-                            .inner
-                        });
-                    pending_actions.extend(inner.inner);
-
-                    if let Some(dragged_id) = dropped_payload {
-                        pending_actions.push(PlaygroundAction::MoveBefore {
-                            dragged_id: dragged_id.to_string(),
-                            target_id: model_id,
-                        });
-                    }
-                    ui.add_space(8.0);
-                }
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(section_heading("Enabled Models"));
+                    ui.label(mut_text(
+                        "Performance comparison based on current system hardware.",
+                    ));
+                });
+                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                    badge(ui, "Sort by Speed", ChipTone::Neutral);
+                });
             });
+            ui.add_space(8.0);
+            let mut pending_actions = Vec::new();
+            if self.playground_cards.is_empty() {
+                panel(ui, |ui| {
+                    ui.label(mut_text("No models are configured."));
+                });
+            }
+            for card_state in &mut self.playground_cards {
+                let model_id = card_state.model.id.clone();
+                let drag_id = ui.id().with(("playground-card", &model_id));
+                let outer_width = usable_width(ui);
+                let (inner, dropped_payload) = ui
+                    .scope(|ui| {
+                        suppress_drop_zone_frame(ui);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(outer_width, 0.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                set_exact_width(ui, outer_width);
+                                ui.dnd_drop_zone::<String, _>(Frame::none(), |ui| {
+                                    full_width_frame(ui, card_frame(), |ui| {
+                                        ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
+                                            playground_card_ui(ui, card_state)
+                                        })
+                                        .inner
+                                    })
+                                    .inner
+                                })
+                            },
+                        )
+                        .inner
+                    })
+                    .inner;
+                pending_actions.extend(inner.inner);
+
+                if let Some(dragged_id) = dropped_payload {
+                    pending_actions.push(PlaygroundAction::MoveBefore {
+                        dragged_id: dragged_id.to_string(),
+                        target_id: model_id,
+                    });
+                }
+                ui.add_space(8.0);
+            }
 
             if let Some(action) = pending_actions.into_iter().next() {
                 self.apply_playground_action(action);
             }
+
+            ui.add_space(8.0);
+            info_panel(ui, |ui| {
+                ui.label(section_heading("Testing Environment"));
+                ui.label(mut_text("Performance numbers are calculated locally. Duration includes model loading, inference, and post-processing for the current recording."));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, "Local execution", ChipTone::Success);
+                    badge(ui, "No cloud STT", ChipTone::Neutral);
+                    badge(ui, "Model load included", ChipTone::Neutral);
+                });
+            });
         });
     }
 
     fn ui_settings(&mut self, ui: &mut Ui) {
-        page(ui, "Settings", |ui| {
+        let status = self.status;
+        let status_message = self.status_message.clone();
+        page(ui, "Settings", status, &status_message, |ui| {
             card(ui, |ui| {
-                ui.heading("General");
+                ui.label(section_heading("General"));
                 ui.add_space(8.0);
                 let mut close_to_tray = self.config.close_to_tray;
                 if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
@@ -1301,7 +1313,7 @@ impl LocalTranscriberApp {
                     self.save_config();
                 }
                 let mut paste_delay = self.config.paste_delay_ms as i32;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Paste delay ms");
                     if ui
                         .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
@@ -1315,20 +1327,23 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Shortcuts");
+                ui.label(section_heading("Shortcuts"));
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Record toggle");
-                    ui.text_edit_singleline(&mut self.hotkey_input);
-                    if ui.button("Apply").clicked() {
+                    ui.add(
+                        TextEdit::singleline(&mut self.hotkey_input)
+                            .desired_width(width_before_trailing(ui, 154.0, 96.0)),
+                    );
+                    if ui.add(small_button("Apply")).clicked() {
                         self.apply_hotkey();
                     }
                     if ui
-                        .button(if self.capturing_hotkey {
+                        .add(small_button(if self.capturing_hotkey {
                             "Listening..."
                         } else {
                             "Capture"
-                        })
+                        }))
                         .clicked()
                     {
                         self.capturing_hotkey = true;
@@ -1339,7 +1354,7 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Paths");
+                ui.label(section_heading("Paths"));
                 ui.add_space(8.0);
                 if let Some(path) = &self.config_path {
                     ui.label(
@@ -1347,17 +1362,20 @@ impl LocalTranscriberApp {
                     );
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("whisper.cpp executable");
                     if ui
-                        .text_edit_singleline(&mut self.whisper_path_input)
+                        .add(
+                            TextEdit::singleline(&mut self.whisper_path_input)
+                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
+                        )
                         .changed()
                     {
                         self.config.whisper_executable_path =
                             path_from_input(&self.whisper_path_input);
                         self.save_config();
                     }
-                    if ui.button("Browse").clicked() {
+                    if ui.add(small_button("Browse")).clicked() {
                         if let Some(path) = FileDialog::new().pick_file() {
                             self.whisper_path_input = path.display().to_string();
                             self.config.whisper_executable_path = Some(path);
@@ -1365,10 +1383,13 @@ impl LocalTranscriberApp {
                         }
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Model storage");
                     if ui
-                        .text_edit_singleline(&mut self.model_storage_dir_input)
+                        .add(
+                            TextEdit::singleline(&mut self.model_storage_dir_input)
+                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
+                        )
                         .changed()
                     {
                         if let Some(path) = path_from_input(&self.model_storage_dir_input) {
@@ -1376,7 +1397,7 @@ impl LocalTranscriberApp {
                             self.save_config();
                         }
                     }
-                    if ui.button("Browse").clicked() {
+                    if ui.add(small_button("Browse")).clicked() {
                         if let Some(path) = FileDialog::new().pick_folder() {
                             self.model_storage_dir_input = path.display().to_string();
                             self.config.model_storage_dir = path;
@@ -1388,9 +1409,9 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Audio");
+                ui.label(section_heading("Audio"));
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let before = self.config.audio_input_device_name.clone();
                     ui.label("Microphone");
                     ComboBox::from_id_source("audio-input-device")
@@ -1417,12 +1438,12 @@ impl LocalTranscriberApp {
                     if before != self.config.audio_input_device_name {
                         self.save_config();
                     }
-                    if ui.button("Refresh").clicked() {
+                    if ui.add(small_button("Refresh")).clicked() {
                         self.refresh_audio_devices();
                     }
                 });
                 let mut max_duration = self.config.max_recording_seconds as i32;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Max recording seconds");
                     if ui
                         .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
@@ -1436,9 +1457,9 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Appearance");
+                ui.label(section_heading("Appearance"));
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let before = self.config.theme_mode;
                     ui.label("Theme");
                     ComboBox::from_id_source("theme-mode")
@@ -1468,7 +1489,7 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.heading("Runtime");
+                ui.label(section_heading("Runtime"));
                 ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").color(MUTED_TEXT));
                 if self.tray_service.is_none() {
                     ui.colored_label(
@@ -1486,7 +1507,9 @@ impl LocalTranscriberApp {
 
 const SHELL_BG: Color32 = Color32::from_rgb(247, 249, 251);
 const CONTENT_BG: Color32 = Color32::from_rgb(247, 249, 251);
+const SIDEBAR_BG: Color32 = Color32::WHITE;
 const CARD_BG: Color32 = Color32::WHITE;
+const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
 const TEXT: Color32 = Color32::from_rgb(29, 33, 42);
 const MUTED_TEXT: Color32 = Color32::from_rgb(85, 95, 109);
 const BORDER: Color32 = Color32::from_rgb(226, 232, 240);
@@ -1506,29 +1529,88 @@ enum ChipTone {
     Active,
 }
 
-fn page(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
-    ui.add_space(24.0);
-    ui.horizontal(|ui| {
-        ui.heading(
-            RichText::new(title)
-                .font(FontId::proportional(26.0))
-                .color(TEXT),
-        );
-    });
-    ui.add_space(16.0);
-    add_contents(ui);
+fn configure_stitch_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.button_padding = Vec2::new(10.0, 6.0);
+    style.spacing.interact_size = Vec2::new(24.0, 28.0);
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(24.0, FontFamily::Proportional),
+    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
+    style.text_styles.insert(
+        TextStyle::Button,
+        FontId::new(13.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(12.0, FontFamily::Proportional),
+    );
+    ctx.set_style(style);
+}
+
+fn paint_viewport_background(ctx: &egui::Context) {
+    ctx.layer_painter(egui::LayerId::background())
+        .rect_filled(ctx.screen_rect(), 0.0, CONTENT_BG);
+}
+
+fn page(
+    ui: &mut Ui,
+    title: &str,
+    status: TranscriptionStatus,
+    status_message: &str,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let page_width = usable_width(ui);
+    ui.allocate_ui_with_layout(
+        Vec2::new(page_width, ui.available_height()),
+        Layout::top_down(Align::LEFT),
+        |ui| {
+            set_exact_width(ui, page_width);
+            ui.add_space(24.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::proportional(24.0))
+                        .color(PRIMARY)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    status_badge(ui, status);
+                });
+            });
+            if !status_message.trim().is_empty() {
+                ui.add_space(2.0);
+                ui.label(mut_text(status_message));
+            }
+            ui.add_space(14.0);
+            let body_width = usable_width(ui);
+            ScrollArea::vertical()
+                .id_source(("page-scroll", title))
+                .max_width(body_width)
+                .min_scrolled_width(body_width)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    with_usable_width_cap(ui, body_width, |ui| {
+                        set_exact_width(ui, body_width);
+                        add_contents(ui);
+                    });
+                });
+        },
+    );
+}
+
+fn content_panel_frame() -> Frame {
+    Frame::none()
+        .fill(CONTENT_BG)
+        .inner_margin(Margin::symmetric(24.0, 0.0))
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    card_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        add_contents(ui);
-    });
-}
-
-fn playground_card_frame(ui: &Ui) -> Frame {
-    let _ = ui;
-    card_frame()
+    full_width_frame(ui, card_frame(), add_contents);
 }
 
 fn card_frame() -> Frame {
@@ -1539,46 +1621,234 @@ fn card_frame() -> Frame {
         .inner_margin(Margin::same(14.0))
 }
 
+fn suppress_drop_zone_frame(ui: &mut Ui) {
+    let transparent = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+    let transparent_stroke = Stroke::new(0.0, transparent);
+    let widgets = &mut ui.visuals_mut().widgets;
+    widgets.inactive.bg_fill = transparent;
+    widgets.inactive.bg_stroke = transparent_stroke;
+    widgets.active.bg_fill = transparent;
+    widgets.active.bg_stroke = transparent_stroke;
+}
+
+fn panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    card(ui, add_contents);
+}
+
+fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    full_width_frame(
+        ui,
+        Frame::none()
+            .fill(Color32::from_rgb(248, 250, 252))
+            .stroke(Stroke::new(1.0, BORDER))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::same(14.0)),
+        add_contents,
+    );
+}
+
+fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
+    full_width_frame(
+        ui,
+        Frame::none()
+            .fill(Color32::from_rgb(248, 250, 252))
+            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::same(18.0)),
+        |ui| {
+            ui.set_min_height(min_height);
+            ui.centered_and_justified(add_contents);
+        },
+    );
+}
+
+fn transcript_panel(ui: &mut Ui, _status: TranscriptionStatus, add_contents: impl FnOnce(&mut Ui)) {
+    card(ui, add_contents);
+}
+
+fn summary_card(
+    ui: &mut Ui,
+    title: &str,
+    body: impl FnOnce(&mut Ui),
+    actions: impl FnOnce(&mut Ui),
+) {
+    full_width_frame(ui, card_frame(), |ui| {
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.label(label_caps(title));
+                ui.add_space(6.0);
+                body(ui);
+            });
+            ui.with_layout(Layout::right_to_left(Align::TOP), actions);
+        });
+    });
+}
+
+fn model_catalog_row(
+    ui: &mut Ui,
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+    selected: bool,
+    actions: impl FnOnce(&mut Ui),
+) {
+    let stroke = if selected {
+        Stroke::new(1.0, ACCENT)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+    full_width_frame(
+        ui,
+        Frame::none()
+            .fill(CARD_BG)
+            .stroke(stroke)
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::same(14.0)),
+        |ui| {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let actions_width = 112.0;
+                let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(detail_width, 0.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            set_exact_width(ui, detail_width);
+                            ui.horizontal_wrapped(|ui| {
+                                wrapped_label(ui, body_strong(&model.name));
+                                if selected {
+                                    badge(ui, "Active", ChipTone::Active);
+                                }
+                            });
+                            wrapped_label(ui, mut_text(&model.description));
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                badge(ui, &model.backend, ChipTone::Neutral);
+                                badge(
+                                    ui,
+                                    &install_status.label(),
+                                    install_chip_tone(install_status),
+                                );
+                                badge(
+                                    ui,
+                                    &format!("RAM {}", model.expected_ram),
+                                    ChipTone::Neutral,
+                                );
+                                badge(
+                                    ui,
+                                    &format!("{} speed", model.speed_tier),
+                                    ChipTone::Neutral,
+                                );
+                                badge(
+                                    ui,
+                                    &format!("{} accuracy", model.accuracy_tier),
+                                    ChipTone::Neutral,
+                                );
+                                if !backend_capabilities(&model.backend).runnable {
+                                    badge(ui, "Planned", ChipTone::Warning);
+                                }
+                            });
+                        },
+                    );
+                    ui.add_space(12.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(actions_width, 0.0),
+                        Layout::top_down(Align::RIGHT),
+                        |ui| {
+                            set_exact_width(ui, actions_width);
+                            actions(ui);
+                        },
+                    );
+                });
+            });
+        },
+    );
+}
+
+fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
+    full_width_frame(
+        ui,
+        Frame::none()
+            .fill(Color32::from_rgb(248, 250, 252))
+            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::same(18.0)),
+        |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(section_heading("Custom Model"));
+                ui.label(mut_text("Custom imports are planned for a later build."));
+                ui.add_space(8.0);
+                actions(ui);
+            });
+        },
+    );
+}
+
 fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<PlaygroundAction> {
     let mut actions = Vec::new();
-    ui.set_min_width(ui.available_width());
 
-    ui.horizontal_top(|ui| {
-        ui.label(RichText::new("≡").color(MUTED_TEXT));
-        ui.vertical(|ui| {
-            ui.heading(&card_state.model.name);
-            ui.label(RichText::new(&card_state.model.description).color(MUTED_TEXT));
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                badge(ui, &card_state.model.backend, ChipTone::Neutral);
-                badge(
-                    ui,
-                    &card_state.model.install_status.label(),
-                    install_chip_tone(&card_state.model.install_status),
-                );
-                badge(
-                    ui,
-                    &format!("{} speed", card_state.model.speed_tier),
-                    ChipTone::Neutral,
-                );
-            });
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Clear").clicked() {
-                actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
-            }
-            let mut enabled = card_state.model.enabled;
-            let toggle_label = if enabled { "Enabled" } else { "Disabled" };
-            if ui.checkbox(&mut enabled, toggle_label).changed() {
-                actions.push(PlaygroundAction::SetEnabled(
-                    card_state.model.id.clone(),
-                    enabled,
-                ));
-            }
-            badge(
-                ui,
-                &card_state.status.to_string(),
-                runtime_chip_tone(&card_state.status),
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let move_width = 38.0;
+        let actions_width = 132.0;
+        let gap = 12.0;
+        let detail_width = (ui.available_width() - move_width - actions_width - gap * 2.0).max(0.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(move_width, 0.0),
+                Layout::top_down(Align::LEFT),
+                |ui| {
+                    set_exact_width(ui, move_width);
+                    ui.label(label_caps("Move"));
+                },
+            );
+            ui.add_space(gap);
+            ui.allocate_ui_with_layout(
+                Vec2::new(detail_width, 0.0),
+                Layout::top_down(Align::LEFT),
+                |ui| {
+                    set_exact_width(ui, detail_width);
+                    wrapped_label(ui, body_strong(&card_state.model.name));
+                    wrapped_label(ui, mut_text(&card_state.model.description));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        badge(ui, &card_state.model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &card_state.model.install_status.label(),
+                            install_chip_tone(&card_state.model.install_status),
+                        );
+                        badge(
+                            ui,
+                            &format!("{} speed", card_state.model.speed_tier),
+                            ChipTone::Neutral,
+                        );
+                    });
+                },
+            );
+            ui.add_space(gap);
+            ui.allocate_ui_with_layout(
+                Vec2::new(actions_width, 0.0),
+                Layout::top_down(Align::RIGHT),
+                |ui| {
+                    set_exact_width(ui, actions_width);
+                    if ui.add(small_button("Clear")).clicked() {
+                        actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
+                    }
+                    let mut enabled = card_state.model.enabled;
+                    let toggle_label = if enabled { "Enabled" } else { "Disabled" };
+                    if ui.checkbox(&mut enabled, toggle_label).changed() {
+                        actions.push(PlaygroundAction::SetEnabled(
+                            card_state.model.id.clone(),
+                            enabled,
+                        ));
+                    }
+                    badge(
+                        ui,
+                        &card_state.status.to_string(),
+                        runtime_chip_tone(&card_state.status),
+                    );
+                },
             );
         });
     });
@@ -1587,23 +1857,155 @@ fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<
         ui.label(RichText::new(format!("Latency: {latency} ms")).color(MUTED_TEXT));
     }
 
-    ui.add_space(8.0);
-    ui.add_sized(
-        [ui.available_width(), 132.0],
-        TextEdit::multiline(&mut card_state.transcript)
-            .desired_rows(7)
-            .desired_width(f32::INFINITY)
-            .hint_text("Result"),
-    );
+    ui.add_space(6.0);
+    playground_result_editor(ui, &card_state.model.id, &card_state.transcript);
 
     actions
 }
 
-fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab, label: &str) {
+fn playground_result_editor(ui: &mut Ui, result_id: &str, transcript: &str) -> egui::Response {
+    let width = usable_width(ui).max(0.0);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(width, PLAYGROUND_RESULT_HEIGHT),
+        egui::Sense::hover(),
+    );
+
+    ui.painter().rect_filled(rect, Rounding::same(4.0), CARD_BG);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.0, BORDER));
+
+    let content_rect = rect.shrink2(Vec2::new(10.0, 8.0));
+    let mut content_ui = ui.child_ui(content_rect, Layout::top_down(Align::LEFT));
+    content_ui.set_clip_rect(content_rect);
+    ScrollArea::vertical()
+        .id_source(("playground-result", result_id))
+        .max_height(content_rect.height())
+        .auto_shrink([false, false])
+        .show(&mut content_ui, |ui| {
+            set_exact_width(ui, content_rect.width());
+            if transcript.trim().is_empty() {
+                ui.label(mut_text("Result"));
+            } else {
+                ui.label(RichText::new(transcript).color(TEXT));
+            }
+        });
+
+    if transcript.trim().is_empty() {
+        response
+    } else {
+        response.on_hover_text(transcript)
+    }
+}
+
+fn usable_width(ui: &Ui) -> f32 {
+    let mut width = None;
+    if let Some(cap) = ui.data(|data| data.get_temp::<f32>(usable_width_cap_id())) {
+        if cap.is_finite() && cap > 0.0 {
+            width = Some(cap);
+        }
+    }
+    let cursor_x = ui.next_widget_position().x;
+    let available_rect = ui.available_rect_before_wrap();
+    let min_rect = ui.min_rect();
+    let screen_rect = ui.ctx().screen_rect();
+    for candidate in [
+        ui.available_width(),
+        ui.max_rect().width(),
+        min_rect.width(),
+        ui.clip_rect().width(),
+        screen_rect.width(),
+        ui.available_rect_before_wrap().max.x - cursor_x,
+        min_rect.max.x - cursor_x,
+        ui.max_rect().max.x - cursor_x,
+        ui.clip_rect().max.x - cursor_x,
+        screen_rect.max.x - cursor_x,
+        ui.clip_rect().max.x - available_rect.min.x,
+        screen_rect.max.x - available_rect.min.x,
+    ] {
+        if candidate.is_finite() && candidate > 0.0 {
+            width = Some(width.map_or(candidate, |current: f32| current.min(candidate)));
+        }
+    }
+    width.unwrap_or(0.0)
+}
+
+fn with_usable_width_cap<R>(ui: &mut Ui, width: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let id = usable_width_cap_id();
+    let previous = ui.data(|data| data.get_temp::<f32>(id));
+    ui.data_mut(|data| data.insert_temp(id, width));
+    let result = add_contents(ui);
+    ui.data_mut(|data| {
+        if let Some(previous) = previous {
+            data.insert_temp(id, previous);
+        } else {
+            data.remove_temp::<f32>(id);
+        }
+    });
+    result
+}
+
+fn usable_width_cap_id() -> egui::Id {
+    egui::Id::new("scribe-usable-width-cap")
+}
+
+fn set_exact_width(ui: &mut Ui, width: f32) {
+    if width.is_finite() && width > 0.0 {
+        ui.set_width(width);
+    }
+}
+
+fn full_width_frame<R>(
+    ui: &mut Ui,
+    frame: Frame,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let outer_width = usable_width(ui);
+    let margins = frame.inner_margin + frame.outer_margin;
+    let inner_width = (outer_width - margins.sum().x).max(0.0);
+    let outer_min = ui.next_widget_position();
+    let outer_seed = egui::Rect::from_min_size(outer_min, Vec2::new(outer_width, 0.0));
+    let mut inner_seed = margins.shrink_rect(outer_seed);
+    inner_seed.max.x = inner_seed.max.x.max(inner_seed.min.x);
+    inner_seed.max.y = inner_seed.max.y.max(inner_seed.min.y);
+
+    let background_idx = ui.painter().add(egui::Shape::Noop);
+    let mut content_ui = ui.child_ui(inner_seed, Layout::top_down(Align::LEFT));
+    let horizontal_clip = egui::Rect::from_min_max(
+        egui::pos2(outer_min.x, ui.clip_rect().min.y),
+        egui::pos2(outer_min.x + outer_width, ui.clip_rect().max.y),
+    );
+    content_ui.set_clip_rect(ui.clip_rect().intersect(horizontal_clip));
+    set_exact_width(&mut content_ui, inner_width);
+    let inner = add_contents(&mut content_ui);
+
+    let content_height = content_ui.min_rect().height().max(0.0);
+    let fixed_content_rect =
+        egui::Rect::from_min_size(inner_seed.min, Vec2::new(inner_width, content_height));
+    let paint_rect = frame.inner_margin.expand_rect(fixed_content_rect);
+    let allocated_rect = margins.expand_rect(fixed_content_rect);
+    if ui.is_rect_visible(paint_rect) {
+        ui.painter().set(background_idx, frame.paint(paint_rect));
+    }
+    let response = ui.allocate_rect(allocated_rect, egui::Sense::hover());
+
+    egui::InnerResponse::new(inner, response)
+}
+
+fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
+    let available = usable_width(ui);
+    if available <= trailing_width {
+        return available.max(0.0);
+    }
+    (available - trailing_width)
+        .max(min_width)
+        .min(available - trailing_width)
+}
+
+fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab) {
     let selected = *current_tab == tab;
     let response = ui.add_sized(
         [ui.available_width(), 34.0],
-        Button::new(RichText::new(label).color(if selected { TEXT } else { MUTED_TEXT }))
+        Button::new(RichText::new(tab.label()).color(if selected { TEXT } else { MUTED_TEXT }))
             .fill(if selected { CARD_BG } else { SHELL_BG })
             .stroke(if selected {
                 Stroke::new(1.0, BORDER_STRONG)
@@ -1617,12 +2019,32 @@ fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab, label: &str) {
     }
 }
 
+fn sidebar_link(ui: &mut Ui, label: &str) {
+    ui.label(RichText::new(label).small().color(MUTED_TEXT));
+}
+
 fn primary_button(label: &str) -> Button<'_> {
     Button::new(RichText::new(label).color(Color32::WHITE).strong())
         .fill(PRIMARY)
         .stroke(Stroke::new(1.0, PRIMARY))
         .rounding(Rounding::same(24.0))
         .min_size(Vec2::new(190.0, 46.0))
+}
+
+fn primary_small_button(label: &str) -> Button<'_> {
+    Button::new(RichText::new(label).color(Color32::WHITE).strong())
+        .fill(PRIMARY)
+        .stroke(Stroke::new(1.0, PRIMARY))
+        .rounding(Rounding::same(5.0))
+        .min_size(Vec2::new(82.0, 30.0))
+}
+
+fn small_button(label: &str) -> Button<'_> {
+    Button::new(RichText::new(label).color(TEXT))
+        .fill(CARD_BG)
+        .stroke(Stroke::new(1.0, BORDER_STRONG))
+        .rounding(Rounding::same(5.0))
+        .min_size(Vec2::new(68.0, 30.0))
 }
 
 fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
@@ -1635,15 +2057,51 @@ fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
     badge(ui, &status.to_string(), tone);
 }
 
+fn ready_dot(ui: &mut Ui, status: TranscriptionStatus) {
+    status_badge(ui, status);
+}
+
 fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
     let (text, fill, stroke) = chip_colors(tone);
-    ui.label(
-        RichText::new(format!(" {label} "))
-            .color(text)
-            .background_color(fill),
-    )
-    .on_hover_text(label);
-    let _ = stroke;
+    Frame::none()
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).size(12.0).color(text).strong());
+        })
+        .response
+        .on_hover_text(label);
+}
+
+fn label_caps(label: impl Into<String>) -> RichText {
+    RichText::new(label.into().to_ascii_uppercase())
+        .size(11.0)
+        .color(MUTED_TEXT)
+        .strong()
+}
+
+fn section_heading(label: &str) -> RichText {
+    RichText::new(label)
+        .font(FontId::proportional(16.0))
+        .color(PRIMARY)
+        .strong()
+}
+
+fn body_strong(label: &str) -> RichText {
+    RichText::new(label)
+        .font(FontId::proportional(15.0))
+        .color(TEXT)
+        .strong()
+}
+
+fn mut_text(label: impl Into<String>) -> RichText {
+    RichText::new(label.into()).color(MUTED_TEXT)
+}
+
+fn wrapped_label(ui: &mut Ui, text: RichText) {
+    ui.add(egui::Label::new(text).wrap(true));
 }
 
 fn chip_colors(tone: ChipTone) -> (Color32, Color32, Stroke) {
@@ -1702,17 +2160,18 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
     let elapsed = active.started_at.elapsed().as_secs();
     let total = active.max_duration_seconds.max(1) as u64;
     let remaining = total.saturating_sub(elapsed);
-    format!("{elapsed}s elapsed · {remaining}s left")
+    format!("{elapsed}s elapsed - {remaining}s left")
 }
 
 fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
     match status {
         ModelRuntimeStatus::Ready => "Ready to transcribe.".to_owned(),
         ModelRuntimeStatus::MissingConfiguration => {
-            "Set the whisper.cpp executable and a local model file before transcribing.".to_owned()
+            "Set the whisper.cpp executable and download the selected model before transcribing."
+                .to_owned()
         }
         ModelRuntimeStatus::NotInstalled => {
-            "Install a local whisper.cpp model or browse to an existing model file.".to_owned()
+            "Download a local whisper.cpp model before transcribing.".to_owned()
         }
         ModelRuntimeStatus::Downloading => "The selected model is still downloading.".to_owned(),
         ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
@@ -1984,4 +2443,437 @@ fn download_model_file(
     }
 
     result
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn start_tab_env_parser_accepts_known_tabs() {
+        assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
+        assert_eq!(
+            tab_from_env_value("model playground"),
+            Some(Tab::Playground)
+        );
+        assert_eq!(tab_from_env_value("settings"), Some(Tab::Settings));
+        assert_eq!(tab_from_env_value("unknown"), None);
+    }
+
+    #[test]
+    fn model_catalog_row_paints_within_viewport_at_minimum_and_wide_widths() {
+        for width in [840.0, 1440.0, 4096.0] {
+            let output = render_model_catalog_row(width);
+            let max_painted_x = max_visible_painted_x(&output);
+
+            assert!(
+                max_painted_x <= width + 1.0,
+                "model catalog row painted beyond viewport: max_x={max_painted_x}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn models_page_paints_within_viewport_at_minimum_and_wide_widths() {
+        for width in [840.0, 1440.0, 4096.0] {
+            let output = render_models_page(width);
+            let max_painted_x = max_visible_painted_x(&output);
+
+            assert!(
+                max_painted_x <= width + 1.0,
+                "models page painted beyond viewport: max_x={max_painted_x}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_shell_pages_paint_within_viewport_at_minimum_and_wide_widths() {
+        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
+            for width in [840.0, 1440.0, 4096.0] {
+                let output = render_app_tab(tab, width);
+                let max_painted_x = max_visible_painted_x(&output);
+
+                assert!(
+                    max_painted_x <= width + 1.0,
+                    "{tab:?} painted beyond viewport: max_x={max_painted_x}, width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_pages_do_not_expand_across_repaints() {
+        for tab in [Tab::Models, Tab::Playground] {
+            let max_painted_x = render_app_tab_repeatedly(tab, 840.0, 8)
+                .into_iter()
+                .fold(0.0_f32, f32::max);
+
+            assert!(
+                max_painted_x <= 841.0,
+                "{tab:?} expanded across repaints: max_x={max_painted_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_clear_color_is_opaque_content_background() {
+        let app = test_app();
+        let clear_color = eframe::App::clear_color(&app, &egui::Visuals::light());
+
+        assert_eq!(clear_color, CONTENT_BG.to_normalized_gamma_f32());
+        assert_eq!(clear_color[3], 1.0);
+    }
+
+    #[test]
+    fn page_uses_wide_available_body_width() {
+        let body_width = render_page_body_width(2048.0);
+
+        assert!(
+            body_width > 1600.0,
+            "page body width still looks artificially capped: {body_width}"
+        );
+    }
+
+    #[test]
+    fn viewport_background_paints_full_screen_width() {
+        let output = render_viewport_background(2048.0);
+        let max_painted_x = max_visible_painted_x(&output);
+
+        assert!(
+            max_painted_x >= 2047.0,
+            "viewport background did not cover full width: {max_painted_x}"
+        );
+    }
+
+    #[test]
+    fn playground_result_editor_keeps_fixed_layout_height() {
+        let allocated_height = render_playground_result_editor_height(960.0);
+
+        assert!(
+            (allocated_height - PLAYGROUND_RESULT_HEIGHT).abs() <= 1.0,
+            "result editor allocated {allocated_height}, expected {PLAYGROUND_RESULT_HEIGHT}"
+        );
+    }
+
+    fn render_model_catalog_row(width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+
+        ctx.run(raw_input, |ctx| {
+            let mut current_tab = Tab::Models;
+            show_test_navigation(ctx, &mut current_tab);
+            egui::CentralPanel::default()
+                .frame(content_panel_frame())
+                .show(ctx, |ui| {
+                    page(
+                        ui,
+                        "Models Catalog",
+                        TranscriptionStatus::Idle,
+                        "Ready",
+                        |ui| {
+                            panel(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(label_caps("Search"));
+                                    let mut search = "whisper".to_owned();
+                                    ui.add(
+                                        TextEdit::singleline(&mut search)
+                                            .desired_width(width_before_trailing(ui, 290.0, 120.0))
+                                            .hint_text("Search models..."),
+                                    );
+                                    ui.label(label_caps("Filter Backend:"));
+                                    ComboBox::from_id_source("test-model-backend-filter")
+                                        .selected_text("All Backends")
+                                        .width(130.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.label("All backends");
+                                        });
+                                });
+                            });
+
+                            ui.add_space(12.0);
+                            let model = test_model();
+                            let install_status = ModelInstallStatus::Installed;
+                            let mut enabled = true;
+
+                            model_catalog_row(ui, &model, &install_status, true, |ui| {
+                                let _ = ui.checkbox(&mut enabled, "Enabled");
+                                let _ = ui.add_enabled(false, primary_small_button("Active"));
+                                let _ = ui.add_enabled(false, small_button("Installed"));
+                            });
+                        },
+                    );
+                });
+        })
+    }
+
+    fn render_page_body_width(width: f32) -> f32 {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut observed_width = 0.0;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let mut current_tab = Tab::Playground;
+            show_test_navigation(ctx, &mut current_tab);
+            egui::CentralPanel::default()
+                .frame(content_panel_frame())
+                .show(ctx, |ui| {
+                    page(
+                        ui,
+                        "Model Playground",
+                        TranscriptionStatus::Idle,
+                        "Ready",
+                        |ui| {
+                            observed_width = usable_width(ui);
+                        },
+                    );
+                });
+        });
+
+        observed_width
+    }
+
+    fn render_viewport_background(width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+
+        ctx.run(raw_input, |ctx| {
+            paint_viewport_background(ctx);
+        })
+    }
+
+    fn render_playground_result_editor_height(width: f32) -> f32 {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+        let transcript = "wrapped result line\n".repeat(48);
+        let mut allocated_height = 0.0;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(content_panel_frame())
+                .show(ctx, |ui| {
+                    allocated_height = playground_result_editor(ui, "test-result", &transcript)
+                        .rect
+                        .height();
+                });
+        });
+
+        allocated_height
+    }
+
+    fn render_models_page(width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut app = test_app();
+
+        ctx.run(raw_input, |ctx| {
+            show_test_navigation(ctx, &mut app.current_tab);
+            egui::CentralPanel::default()
+                .frame(content_panel_frame())
+                .show(ctx, |ui| app.ui_models(ui));
+        })
+    }
+
+    fn render_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut app = test_app();
+        app.current_tab = tab;
+
+        ctx.run(raw_input, |ctx| {
+            show_test_navigation(ctx, &mut app.current_tab);
+            egui::CentralPanel::default()
+                .frame(content_panel_frame())
+                .show(ctx, |ui| match app.current_tab {
+                    Tab::Transcribe => app.ui_transcribe(ui),
+                    Tab::Models => app.ui_models(ui),
+                    Tab::Playground => app.ui_playground(ui),
+                    Tab::Settings => app.ui_settings(ui),
+                });
+        })
+    }
+
+    fn render_app_tab_repeatedly(tab: Tab, width: f32, frames: usize) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = tab;
+        let mut max_x_by_frame = Vec::new();
+
+        for _ in 0..frames {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 760.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(raw_input, |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame())
+                    .show(ctx, |ui| match app.current_tab {
+                        Tab::Transcribe => app.ui_transcribe(ui),
+                        Tab::Models => app.ui_models(ui),
+                        Tab::Playground => app.ui_playground(ui),
+                        Tab::Settings => app.ui_settings(ui),
+                    });
+            });
+            max_x_by_frame.push(max_painted_x(&output));
+        }
+
+        max_x_by_frame
+    }
+
+    fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
+        egui::SidePanel::left("test-navigation")
+            .frame(
+                Frame::none()
+                    .fill(SIDEBAR_BG)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::symmetric(14.0, 16.0)),
+            )
+            .resizable(false)
+            .exact_width(200.0)
+            .show(ctx, |ui| {
+                ui.label("Scribe");
+                nav_button(ui, current_tab, Tab::Transcribe);
+                nav_button(ui, current_tab, Tab::Models);
+                nav_button(ui, current_tab, Tab::Playground);
+                nav_button(ui, current_tab, Tab::Settings);
+            });
+    }
+
+    fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
+        output
+            .shapes
+            .iter()
+            .map(|shape| {
+                shape
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(shape.clip_rect)
+                    .max
+                    .x
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    fn max_painted_x(output: &egui::FullOutput) -> f32 {
+        output
+            .shapes
+            .iter()
+            .map(|shape| shape.shape.visual_bounding_rect().max.x)
+            .fold(0.0_f32, f32::max)
+    }
+
+    fn test_app() -> LocalTranscriberApp {
+        let mut config = AppConfig::default();
+        config::normalize_config(&mut config);
+        let (tx, rx) = unbounded();
+
+        LocalTranscriberApp {
+            hotkey_input: config.hotkey.clone(),
+            whisper_path_input: config
+                .whisper_executable_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
+            model_search: String::new(),
+            model_backend_filter: "All".to_owned(),
+            audio_devices: Vec::new(),
+            capturing_hotkey: false,
+            model_downloads: HashMap::new(),
+            playground_cards: cards_from_config(&config),
+            hotkey_service: HotkeyService::new(&config.hotkey),
+            config,
+            config_path: None,
+            current_tab: Tab::Models,
+            status: TranscriptionStatus::Idle,
+            transcript: String::new(),
+            status_message: "Ready".to_owned(),
+            active_recording: None,
+            tx,
+            rx,
+            playground_pending: 0,
+            playground_audio_path: None,
+            tray_service: None,
+            quit_requested: false,
+        }
+    }
+
+    fn test_model() -> SttModelInfo {
+        SttModelInfo {
+            id: "whisper_cpp_base_en".to_owned(),
+            name: "whisper.cpp base.en".to_owned(),
+            backend: "whisper.cpp".to_owned(),
+            description:
+                "Recommended first-run local English model with a better speed/quality balance."
+                    .to_owned(),
+            expected_ram: "1 GB".to_owned(),
+            accuracy_tier: "Good accuracy".to_owned(),
+            speed_tier: "Fast speed".to_owned(),
+            local_path: Some(PathBuf::from(
+                "/home/tyhuang/Projects/whisper.cpp/models/ggml-base.en.bin",
+            )),
+            install_status: ModelInstallStatus::Installed,
+            download_model: Some("base.en".to_owned()),
+            enabled: true,
+        }
+    }
 }
