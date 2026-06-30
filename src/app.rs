@@ -1534,7 +1534,8 @@ impl LocalTranscriberApp {
 
             empty_import_panel(ui, |ui| {
                 if ui.add(small_button("Import Custom Model")).clicked() {
-                    self.status_message = "Custom model import is not wired yet.".to_owned();
+                    self.status_message =
+                        "Custom model import is not available in this build.".to_owned();
                 }
             });
         });

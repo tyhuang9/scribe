@@ -9,6 +9,7 @@
 
 ## STT Backends
 
+- Package managed whisper.cpp runtime sidecars for release builds.
 - Add Vosk runtime support.
 - Add sherpa-onnx streaming runtime support.
 - Add faster-whisper runtime support.
@@ -26,6 +27,7 @@
 
 ## Model Management
 
+- Add production runtime package manifests and hosted downloads.
 - Add checksum verification for downloaded whisper.cpp models.
 - Add local model inventory scanning.
 - Add disk usage reporting.

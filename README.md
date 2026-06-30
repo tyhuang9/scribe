@@ -7,13 +7,13 @@ The app shell stays small and only invokes an STT runtime when the user records 
 ## Current Features
 
 - Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
-- Local JSON config for hotkey, model selections, executable paths, whisper.cpp CUDA/CPU compute mode, managed model storage, theme mode, audio input device, debug mode, and max recording duration.
+- Local JSON config for hotkey, active model, Playground ordering, managed model/runtime metadata, performance mode, theme mode, audio input device, and max recording duration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp` backend integration through a configured executable path, managed downloaded models, CUDA GPU device selection, and CPU fallback mode.
-- Background downloads for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
-- Non-blocking UI for recording and transcription using background threads and channels, with debug-mode latency breakdown for the latest transcription.
+- `whisper.cpp` backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes.
+- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
+- Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
 - Model metadata for:
@@ -21,7 +21,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - whisper.cpp base.en
   - whisper.cpp small.en
   - whisper.cpp medium.en
-  - Vosk small English placeholder
+  - Vosk small English
   - faster-whisper tiny.en
   - faster-whisper base.en
   - faster-whisper small.en
@@ -32,7 +32,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - sherpa-onnx Zipformer Small
   - Moonshine
   - Parakeet 0.6B
-- Playground that shows the full catalog, supports enable/disable, persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
+- Playground that shows the full catalog, keeps enable/disable controls for testing, supports persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
 - Transcript copy and clear actions.
 
 ## Requirements
@@ -40,8 +40,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Rust 1.96 or newer.
 - Linux, macOS, or Windows desktop session supported by `eframe` and `global-hotkey`.
 - A microphone visible to the host OS.
-- `whisper.cpp` built separately if you want real transcription.
-- NVIDIA GPU transcription requires an NVIDIA driver plus either a CUDA-capable whisper.cpp build or a dynamic CUDA backend such as Ollama's local CUDA runtime.
+- Real transcription requires a whisper.cpp runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
+- NVIDIA GPU transcription requires an NVIDIA driver plus a whisper.cpp runtime that can use CUDA or another supported GPU backend.
 
 On Ubuntu, install the microphone and tray build dependencies:
 
@@ -127,35 +127,29 @@ For a quick compile check:
 cargo check
 ```
 
-## Configure whisper.cpp
+## Models and Runtime
 
-This MVP does not bundle whisper.cpp, but the app can download supported
-whisper.cpp model files into managed local storage.
+Open `Models` to install a local whisper.cpp model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI.
 
-1. Build whisper.cpp separately.
-2. Launch Scribe.
-3. Open `Settings`.
-4. Set the `whisper.cpp executable` path.
-   - Newer whisper.cpp builds usually produce `whisper-cli`.
-   - Older builds may produce `main`.
-   - Typed path changes are saved when you click `Apply`; `Browse` saves the selected path immediately.
-5. Set `whisper.cpp compute` to `CUDA GPU` and choose GPU device `0`, or set it to `CPU only` for fallback.
-6. Open `Models` and download `tiny.en`, `base.en`, `small.en`, or `medium.en`.
-7. Select that model as the default.
-8. Return to `Transcribe`, record, stop, and wait for the transcript.
+Runtime discovery is internal. Scribe checks for a bundled whisper.cpp sidecar next to the executable, then a managed runtime under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI` or `SCRIBE_WHISPER_CUDA_CLI` as fallback runtime paths.
 
-For CUDA without installing the full CUDA Toolkit, Scribe can use a
-dynamic-backend whisper.cpp build with Ollama's local CUDA runtime:
+`Settings` exposes one performance control:
+
+- `Auto`: let whisper.cpp choose the device.
+- `Prefer GPU`: pass the selected GPU device to whisper.cpp.
+- `CPU only`: force CPU mode.
+
+For CUDA development without installing the full CUDA Toolkit, Scribe can use a dynamic-backend whisper.cpp build with Ollama's local CUDA runtime:
 
 ```bash
 scripts/build-whisper-ollama-cuda-backend.sh
 ```
 
-Then set:
+Then launch with the runtime path in the environment, for example:
 
-- `whisper.cpp executable` to `../whisper.cpp/build-dl-ollama/bin/whisper-cli`
-- `CUDA backend` to `/usr/local/lib/ollama/cuda_v13/libggml-cuda.so` or `/usr/local/lib/ollama/cuda_v12/libggml-cuda.so`
-- `CUDA library dirs` to `/usr/local/lib/ollama:/usr/local/lib/ollama/cuda_v13` or `/usr/local/lib/ollama:/usr/local/lib/ollama/cuda_v12`
+```bash
+SCRIBE_WHISPER_CPP_CLI=/home/tyhuang/Projects/whisper.cpp/build-dl-ollama/bin/whisper-cli cargo run
+```
 
 For a native CUDA Toolkit build, install a toolkit that provides `nvcc`, then
 build the adjacent whisper.cpp checkout with GGML_CUDA enabled:
@@ -171,38 +165,38 @@ The backend calls whisper.cpp like this:
 whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt -dev 0
 ```
 
-CPU-only mode appends `-ng` instead of `-dev 0`.
+`Auto` omits explicit device flags. `Prefer GPU` appends `-dev <device>`, and `CPU only` appends `-ng`.
 
 ## Config
 
-Settings are stored in a platform-specific config directory using the `directories` crate. The exact config file path is shown on the Settings page after launch.
+Settings are stored in a platform-specific config directory using the `directories` crate.
 
 Scribe stores new config under the Scribe application directory. On first launch, if no Scribe config exists and an old Local Transcriber config is present, Scribe reads and saves a migrated copy into the new config path.
 
 The config stores:
 
 - selected default model
-- enabled models
+- Playground-enabled models
 - persisted model playground order
+- managed model install metadata
+- managed runtime install metadata
 - global hotkey and hotkey mode
-- whisper.cpp executable path
-- whisper.cpp compute mode, GPU device, CUDA backend path, and CUDA library directories
-- managed model storage directory
+- performance mode and internal whisper.cpp runtime options
 - theme mode
 - optional audio input device name
 - last used backend
-- debug mode
+- deprecated path/debug fields for migration compatibility
 - max recording duration
 - close-to-tray behavior
 - automatic focused-app transcript insertion
 - clipboard restore after insertion
 - paste automation delay
 
-Temporary WAV files are deleted after transcription unless debug mode is enabled. Debug mode also shows the latest transcription latency breakdown in Settings.
+Temporary WAV files are deleted after transcription in normal operation. The latest transcription latency breakdown is diagnostic-only and is not persisted.
 
 ## Notes
 
-- Non-whisper.cpp backends are visible and configurable for playground planning, but intentionally return clear "not wired yet" errors.
+- Non-whisper.cpp backends have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
