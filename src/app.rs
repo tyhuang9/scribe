@@ -1704,10 +1704,12 @@ impl LocalTranscriberApp {
                                         ui,
                                         model_card_frame(ui, is_active_model),
                                         |ui| {
-                                            ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
-                                                playground_card_ui(ui, card_state, is_active_model)
-                                            })
-                                            .inner
+                                            playground_card_ui(
+                                                ui,
+                                                card_state,
+                                                is_active_model,
+                                                drag_id,
+                                            )
                                         },
                                     )
                                     .inner
@@ -2350,10 +2352,87 @@ fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
     );
 }
 
+fn playground_drag_handle(
+    ui: &mut Ui,
+    drag_id: egui::Id,
+    payload: String,
+    model_name: &str,
+    active_model: bool,
+) {
+    let colors = ui_palette(ui);
+    let dragging = ui.ctx().is_being_dragged(drag_id);
+    let fill = if dragging || active_model {
+        colors.active_card_bg
+    } else {
+        colors.panel_bg
+    };
+    let stroke = if dragging {
+        Stroke::new(1.5, colors.accent)
+    } else {
+        Stroke::new(1.0, colors.border)
+    };
+    let size = Vec2::new(ui.available_width().max(38.0), 30.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let response = ui
+        .interact(rect, drag_id, egui::Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::Grab)
+        .on_hover_text("Drag to reorder");
+    response.dnd_set_drag_payload(payload);
+
+    ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
+    ui.painter().rect_stroke(rect, Rounding::same(5.0), stroke);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Move",
+        FontId::proportional(11.0),
+        colors.muted_text,
+    );
+
+    if dragging {
+        paint_playground_drag_preview(ui.ctx(), model_name);
+    }
+}
+
+fn paint_playground_drag_preview(ctx: &egui::Context, model_name: &str) {
+    let Some(pointer_pos) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    let colors = theme_palette(ctx);
+    let rect =
+        egui::Rect::from_min_size(pointer_pos + Vec2::new(14.0, 14.0), Vec2::new(230.0, 34.0));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("playground-drag-preview"),
+    ));
+
+    painter.rect_filled(rect, Rounding::same(6.0), colors.card_bg);
+    painter.rect_stroke(rect, Rounding::same(6.0), Stroke::new(1.0, colors.accent));
+    painter.text(
+        rect.left_center() + Vec2::new(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        drag_preview_label(model_name),
+        FontId::proportional(13.0),
+        colors.text,
+    );
+}
+
+fn drag_preview_label(model_name: &str) -> String {
+    const MAX_CHARS: usize = 30;
+    let mut chars = model_name.chars();
+    let preview = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 fn playground_card_ui(
     ui: &mut Ui,
     card_state: &mut PlaygroundCardState,
     is_active_model: bool,
+    drag_id: egui::Id,
 ) -> Vec<PlaygroundAction> {
     let mut actions = Vec::new();
 
@@ -2369,7 +2448,13 @@ fn playground_card_ui(
                 Layout::top_down(Align::LEFT),
                 |ui| {
                     set_exact_width(ui, move_width);
-                    ui.label(label_caps("Move"));
+                    playground_drag_handle(
+                        ui,
+                        drag_id,
+                        card_state.model.id.clone(),
+                        &card_state.model.name,
+                        is_active_model,
+                    );
                 },
             );
             ui.add_space(gap);
@@ -3469,6 +3554,15 @@ mod layout_tests {
         assert_eq!(visuals.window_fill, dark.card_bg);
         assert_eq!(visuals.extreme_bg_color, dark.panel_bg);
         assert_ne!(visuals.panel_fill, light.panel_fill);
+    }
+
+    #[test]
+    fn drag_preview_label_truncates_long_model_names() {
+        assert_eq!(drag_preview_label("tiny"), "tiny");
+        assert_eq!(
+            drag_preview_label("faster-whisper distil-large-v3 experimental"),
+            "faster-whisper distil-large-v3..."
+        );
     }
 
     #[test]
