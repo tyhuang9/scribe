@@ -28,6 +28,9 @@ use crate::stt;
 use crate::text_output;
 use crate::tray::{TrayCommand, TrayService};
 
+const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
+const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
     Transcribe,
@@ -348,6 +351,63 @@ impl LocalTranscriberApp {
                 }
             })
             .collect();
+    }
+
+    fn next_repaint_delay(&self) -> Duration {
+        if self.has_active_work() {
+            ACTIVE_REPAINT_DELAY
+        } else {
+            // Hotkey and tray events are integrated from update(), so idle still polls slowly.
+            IDLE_REPAINT_DELAY
+        }
+    }
+
+    fn has_active_work(&self) -> bool {
+        self.active_recording.is_some()
+            || self.playground_pending > 0
+            || matches!(
+                self.status,
+                TranscriptionStatus::Listening | TranscriptionStatus::Transcribing
+            )
+            || self
+                .model_downloads
+                .values()
+                .any(|status| matches!(status, ModelInstallStatus::Downloading { .. }))
+    }
+
+    fn apply_whisper_path_input(&mut self) {
+        if update_whisper_executable_path_from_input(&mut self.config, &self.whisper_path_input) {
+            self.save_config();
+        }
+    }
+
+    fn apply_cuda_backend_path_input(&mut self) {
+        if update_cuda_backend_path_from_input(
+            &mut self.config,
+            &self.whisper_cuda_backend_path_input,
+        ) {
+            self.save_config();
+        }
+    }
+
+    fn apply_cuda_library_paths_input(&mut self) {
+        if update_cuda_library_paths_from_input(
+            &mut self.config,
+            &self.whisper_cuda_library_paths_input,
+        ) {
+            self.save_config();
+        }
+    }
+
+    fn apply_model_storage_dir_input(&mut self) {
+        if path_from_input(&self.model_storage_dir_input).is_none() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "Model storage path is required.".to_owned();
+            return;
+        }
+        if update_model_storage_dir_from_input(&mut self.config, &self.model_storage_dir_input) {
+            self.save_config();
+        }
     }
 
     fn apply_playground_action(&mut self, action: PlaygroundAction) {
@@ -1106,7 +1166,7 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Settings => self.ui_settings(ui),
             });
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(self.next_repaint_delay());
     }
 }
 
@@ -1699,16 +1759,12 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("whisper.cpp executable");
-                    if ui
-                        .add(
-                            TextEdit::singleline(&mut self.whisper_path_input)
-                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
-                        )
-                        .changed()
-                    {
-                        self.config.whisper_executable_path =
-                            path_from_input(&self.whisper_path_input);
-                        self.save_config();
+                    ui.add(
+                        TextEdit::singleline(&mut self.whisper_path_input)
+                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
+                    );
+                    if ui.add(small_button("Apply")).clicked() {
+                        self.apply_whisper_path_input();
                     }
                     if ui.add(small_button("Browse")).clicked() {
                         if let Some(path) = FileDialog::new().pick_file() {
@@ -1754,17 +1810,19 @@ impl LocalTranscriberApp {
                 );
                 ui.horizontal_wrapped(|ui| {
                     ui.label("CUDA backend");
+                    ui.add_enabled(
+                        self.config.whisper_compute_mode.uses_gpu(),
+                        TextEdit::singleline(&mut self.whisper_cuda_backend_path_input)
+                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
+                    );
                     if ui
                         .add_enabled(
                             self.config.whisper_compute_mode.uses_gpu(),
-                            TextEdit::singleline(&mut self.whisper_cuda_backend_path_input)
-                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
+                            small_button("Apply"),
                         )
-                        .changed()
+                        .clicked()
                     {
-                        self.config.whisper_cuda_backend_path =
-                            path_from_input(&self.whisper_cuda_backend_path_input);
-                        self.save_config();
+                        self.apply_cuda_backend_path_input();
                     }
                     if ui
                         .add_enabled(
@@ -1782,32 +1840,29 @@ impl LocalTranscriberApp {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("CUDA library dirs");
+                    ui.add_enabled(
+                        self.config.whisper_compute_mode.uses_gpu(),
+                        TextEdit::singleline(&mut self.whisper_cuda_library_paths_input)
+                            .desired_width(width_before_trailing(ui, 82.0, 96.0)),
+                    );
                     if ui
                         .add_enabled(
                             self.config.whisper_compute_mode.uses_gpu(),
-                            TextEdit::singleline(&mut self.whisper_cuda_library_paths_input)
-                                .desired_width(usable_width(ui)),
+                            small_button("Apply"),
                         )
-                        .changed()
+                        .clicked()
                     {
-                        self.config.whisper_cuda_library_paths =
-                            paths_from_list_input(&self.whisper_cuda_library_paths_input);
-                        self.save_config();
+                        self.apply_cuda_library_paths_input();
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Model storage");
-                    if ui
-                        .add(
-                            TextEdit::singleline(&mut self.model_storage_dir_input)
-                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
-                        )
-                        .changed()
-                    {
-                        if let Some(path) = path_from_input(&self.model_storage_dir_input) {
-                            self.config.model_storage_dir = path;
-                            self.save_config();
-                        }
+                    ui.add(
+                        TextEdit::singleline(&mut self.model_storage_dir_input)
+                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
+                    );
+                    if ui.add(small_button("Apply")).clicked() {
+                        self.apply_model_storage_dir_input();
                     }
                     if ui.add(small_button("Browse")).clicked() {
                         if let Some(path) = FileDialog::new().pick_folder() {
@@ -2857,6 +2912,44 @@ fn path_from_input(input: &str) -> Option<PathBuf> {
     }
 }
 
+fn update_whisper_executable_path_from_input(config: &mut AppConfig, input: &str) -> bool {
+    let next = path_from_input(input);
+    if config.whisper_executable_path == next {
+        return false;
+    }
+    config.whisper_executable_path = next;
+    true
+}
+
+fn update_cuda_backend_path_from_input(config: &mut AppConfig, input: &str) -> bool {
+    let next = path_from_input(input);
+    if config.whisper_cuda_backend_path == next {
+        return false;
+    }
+    config.whisper_cuda_backend_path = next;
+    true
+}
+
+fn update_cuda_library_paths_from_input(config: &mut AppConfig, input: &str) -> bool {
+    let next = paths_from_list_input(input);
+    if config.whisper_cuda_library_paths == next {
+        return false;
+    }
+    config.whisper_cuda_library_paths = next;
+    true
+}
+
+fn update_model_storage_dir_from_input(config: &mut AppConfig, input: &str) -> bool {
+    let Some(next) = path_from_input(input) else {
+        return false;
+    };
+    if config.model_storage_dir == next {
+        return false;
+    }
+    config.model_storage_dir = next;
+    true
+}
+
 fn path_list_input(paths: &[PathBuf]) -> String {
     std::env::join_paths(paths)
         .ok()
@@ -3300,6 +3393,105 @@ mod layout_tests {
                 "Focused-app output: 75 ms",
                 "Total observed: 735 ms",
             ]
+        );
+    }
+
+    #[test]
+    fn repaint_delay_is_fast_only_for_active_work() {
+        let mut app = test_app();
+        assert_eq!(app.next_repaint_delay(), IDLE_REPAINT_DELAY);
+
+        app.status = TranscriptionStatus::Transcribing;
+        assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
+
+        app.status = TranscriptionStatus::Idle;
+        app.playground_pending = 1;
+        assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
+
+        app.playground_pending = 0;
+        app.model_downloads.insert(
+            "whisper_cpp_base_en".to_owned(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 42,
+                total_bytes: None,
+            },
+        );
+        assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
+    }
+
+    #[test]
+    fn path_input_buffers_update_config_only_when_applied() {
+        let mut app = test_app();
+        let before = app.config.whisper_executable_path.clone();
+        app.whisper_path_input = "/tmp/scribe-whisper".to_owned();
+        assert_eq!(app.config.whisper_executable_path, before);
+
+        assert!(update_whisper_executable_path_from_input(
+            &mut app.config,
+            &app.whisper_path_input
+        ));
+        assert_eq!(
+            app.config.whisper_executable_path,
+            Some(PathBuf::from("/tmp/scribe-whisper"))
+        );
+        assert!(!update_whisper_executable_path_from_input(
+            &mut app.config,
+            &app.whisper_path_input
+        ));
+
+        assert!(update_whisper_executable_path_from_input(
+            &mut app.config,
+            " "
+        ));
+        assert_eq!(app.config.whisper_executable_path, None);
+    }
+
+    #[test]
+    fn path_apply_helpers_report_real_config_changes() {
+        let mut config = AppConfig::default();
+        let original_storage_dir = config.model_storage_dir.clone();
+
+        assert!(update_cuda_backend_path_from_input(
+            &mut config,
+            "/tmp/libggml-cuda.so"
+        ));
+        assert_eq!(
+            config.whisper_cuda_backend_path,
+            Some(PathBuf::from("/tmp/libggml-cuda.so"))
+        );
+
+        let cuda_dirs = std::env::join_paths([
+            PathBuf::from("/tmp/cuda-one"),
+            PathBuf::from("/tmp/cuda-two"),
+        ])
+        .expect("test CUDA paths should join")
+        .into_string()
+        .expect("test CUDA paths should be UTF-8");
+        assert!(update_cuda_library_paths_from_input(
+            &mut config,
+            &cuda_dirs
+        ));
+        assert_eq!(
+            config.whisper_cuda_library_paths,
+            vec![
+                PathBuf::from("/tmp/cuda-one"),
+                PathBuf::from("/tmp/cuda-two")
+            ]
+        );
+        assert!(!update_cuda_library_paths_from_input(
+            &mut config,
+            &cuda_dirs
+        ));
+
+        assert!(!update_model_storage_dir_from_input(&mut config, " "));
+        assert_eq!(config.model_storage_dir, original_storage_dir);
+        assert!(update_model_storage_dir_from_input(
+            &mut config,
+            "/tmp/scribe-models"
+        ));
+        assert_eq!(
+            config.model_storage_dir,
+            PathBuf::from("/tmp/scribe-models")
         );
     }
 
