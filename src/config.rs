@@ -93,10 +93,6 @@ impl WhisperComputeMode {
             Self::Cpu => "CPU only",
         }
     }
-
-    pub fn uses_gpu(self) -> bool {
-        self != Self::Cpu
-    }
 }
 
 impl ThemeMode {
@@ -609,7 +605,6 @@ mod tests {
         let mode: WhisperComputeMode = serde_json::from_str(r#""cuda""#).unwrap();
 
         assert_eq!(mode, WhisperComputeMode::PreferGpu);
-        assert!(mode.uses_gpu());
     }
 
     #[test]

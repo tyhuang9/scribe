@@ -21,7 +21,7 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    backend_capabilities, whisper_cpp_download_url,
+    whisper_cpp_download_url,
 };
 use crate::stt;
 use crate::text_output;
@@ -248,7 +248,7 @@ fn model_action_state(
                 ModelPrimaryAction::Select
             },
             primary_enabled: !selected,
-            show_uninstall: true,
+            show_uninstall: supports_managed_uninstall(model, install_status),
         },
         ModelInstallStatus::Downloading { .. } => ModelActionState {
             primary: ModelPrimaryAction::Installing,
@@ -269,7 +269,16 @@ fn model_action_state(
 }
 
 fn supports_managed_install(model: &SttModelInfo) -> bool {
-    model.download_model.is_some() && backend_capabilities(&model.backend).supports_downloads
+    stt::provider_for_backend(&model.backend)
+        .is_some_and(|provider| provider.can_install_model(model))
+}
+
+fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstallStatus) -> bool {
+    stt::provider_for_backend(&model.backend).is_some_and(|provider| {
+        let mut model = model.clone();
+        model.install_status = install_status.clone();
+        provider.can_uninstall_model(&model)
+    })
 }
 
 pub struct LocalTranscriberApp {
@@ -1400,12 +1409,10 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        let mut backends = config::configured_models(&self.config)
+        let backends = stt::provider_adapters()
             .iter()
-            .map(|model| model.backend.clone())
+            .map(|provider| provider.backend.to_owned())
             .collect::<Vec<_>>();
-        backends.sort();
-        backends.dedup();
 
         let status = self.status;
         let status_message = self.status_message.clone();
@@ -1809,6 +1816,41 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
+                if let Some(provider) = stt::provider_for_backend("whisper.cpp") {
+                    if provider.device_detection_supported {
+                        let devices = provider.detect_devices(&self.config);
+                        if devices.len() > 1 {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("GPU device");
+                                let mut selected_device =
+                                    self.config.whisper_gpu_device.to_string();
+                                ComboBox::from_id_source("transcription-device-picker")
+                                    .selected_text(
+                                        devices
+                                            .iter()
+                                            .find(|device| device.id == selected_device)
+                                            .map(|device| device.name.as_str())
+                                            .unwrap_or("Auto"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for device in &devices {
+                                            ui.selectable_value(
+                                                &mut selected_device,
+                                                device.id.clone(),
+                                                &device.name,
+                                            );
+                                        }
+                                    });
+                                if let Ok(device_index) = selected_device.parse::<u32>() {
+                                    if device_index != self.config.whisper_gpu_device {
+                                        self.config.whisper_gpu_device = device_index;
+                                        self.save_config();
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
             });
 
             ui.add_space(12.0);
@@ -2976,24 +3018,19 @@ fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
 
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
     if !model.enabled {
-        ModelRuntimeStatus::Disabled
-    } else if !backend_capabilities(&model.backend).runnable {
-        ModelRuntimeStatus::NotImplemented
-    } else if model.install_status.is_runnable() {
-        let executable_ready = stt::whisper_cpp::resolve_whisper_cpp_executable(config).is_some();
-        if executable_ready {
-            ModelRuntimeStatus::Ready
-        } else {
-            ModelRuntimeStatus::MissingConfiguration
-        }
-    } else {
-        match &model.install_status {
-            ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
-            ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
-            ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
-            ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
-            ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message.clone()),
-        }
+        return ModelRuntimeStatus::Disabled;
+    }
+
+    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        return ModelRuntimeStatus::Error(format!("unsupported STT backend: {}", model.backend));
+    };
+
+    match provider.model_install_status(model) {
+        ModelInstallStatus::Installed => provider.runtime_status(config),
+        ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
+        ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
+        ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
+        ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message),
     }
 }
 

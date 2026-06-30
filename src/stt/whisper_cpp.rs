@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, WhisperComputeMode};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
 
 use super::SttBackend;
@@ -18,7 +18,7 @@ pub struct WhisperCppBackend {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhisperCppOptions {
-    pub use_gpu: bool,
+    pub compute_mode: WhisperComputeMode,
     pub gpu_device: u32,
     pub cuda_backend_path: Option<PathBuf>,
     pub cuda_library_paths: Vec<PathBuf>,
@@ -27,7 +27,7 @@ pub struct WhisperCppOptions {
 impl Default for WhisperCppOptions {
     fn default() -> Self {
         Self {
-            use_gpu: true,
+            compute_mode: WhisperComputeMode::Auto,
             gpu_device: 0,
             cuda_backend_path: None,
             cuda_library_paths: Vec::new(),
@@ -108,9 +108,11 @@ impl SttBackend for WhisperCppBackend {
                 stderr.trim()
             ));
         }
-        if self.options.use_gpu && whisper_reported_no_gpu(&stderr) {
+        if self.options.compute_mode == WhisperComputeMode::PreferGpu
+            && whisper_reported_no_gpu(&stderr)
+        {
             return Err(anyhow!(
-                "CUDA GPU mode was requested, but the selected whisper.cpp executable did not find a GPU. Build whisper.cpp with GGML_CUDA=1 and select that executable, or switch compute mode to CPU only."
+                "GPU mode was requested, but the managed whisper.cpp runtime did not find a GPU. Switch transcription device to Auto or CPU only."
             ));
         }
 
@@ -239,18 +241,22 @@ fn whisper_cli_args(
         OsString::from("-nt"),
     ];
 
-    if options.use_gpu {
-        args.push(OsString::from("-dev"));
-        args.push(OsString::from(options.gpu_device.to_string()));
-    } else {
-        args.push(OsString::from("-ng"));
+    match options.compute_mode {
+        WhisperComputeMode::Auto => {}
+        WhisperComputeMode::PreferGpu => {
+            args.push(OsString::from("-dev"));
+            args.push(OsString::from(options.gpu_device.to_string()));
+        }
+        WhisperComputeMode::Cpu => {
+            args.push(OsString::from("-ng"));
+        }
     }
 
     args
 }
 
 fn apply_whisper_environment(command: &mut Command, options: &WhisperCppOptions) -> Result<()> {
-    if !options.use_gpu {
+    if options.compute_mode == WhisperComputeMode::Cpu {
         return Ok(());
     }
 
@@ -346,7 +352,7 @@ mod tests {
             Path::new("/models/ggml-small.en.bin"),
             Path::new("/tmp/audio.wav"),
             &WhisperCppOptions {
-                use_gpu: true,
+                compute_mode: WhisperComputeMode::PreferGpu,
                 gpu_device: 1,
                 ..WhisperCppOptions::default()
             },
@@ -367,12 +373,36 @@ mod tests {
     }
 
     #[test]
+    fn whisper_args_auto_defers_device_choice_to_runtime() {
+        let args = whisper_cli_args(
+            Path::new("/models/ggml-base.en.bin"),
+            Path::new("/tmp/audio.wav"),
+            &WhisperCppOptions {
+                compute_mode: WhisperComputeMode::Auto,
+                gpu_device: 0,
+                ..WhisperCppOptions::default()
+            },
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("/models/ggml-base.en.bin"),
+                OsString::from("-f"),
+                OsString::from("/tmp/audio.wav"),
+                OsString::from("-nt"),
+            ]
+        );
+    }
+
+    #[test]
     fn whisper_args_can_disable_gpu() {
         let args = whisper_cli_args(
             Path::new("/models/ggml-base.en.bin"),
             Path::new("/tmp/audio.wav"),
             &WhisperCppOptions {
-                use_gpu: false,
+                compute_mode: WhisperComputeMode::Cpu,
                 gpu_device: 0,
                 ..WhisperCppOptions::default()
             },
@@ -509,7 +539,7 @@ mod tests {
         let backend = WhisperCppBackend::new(
             Some(executable),
             WhisperCppOptions {
-                use_gpu: true,
+                compute_mode: WhisperComputeMode::PreferGpu,
                 gpu_device: 0,
                 cuda_backend_path,
                 cuda_library_paths,
