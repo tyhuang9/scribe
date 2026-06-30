@@ -18,7 +18,7 @@ use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
-use crate::config::{self, AppConfig, ThemeMode, WhisperComputeMode};
+use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::HotkeyService;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
@@ -1544,6 +1544,24 @@ impl LocalTranscriberApp {
                     {
                         self.capturing_hotkey = true;
                         self.status_message = "Press the new hotkey combination.".to_owned();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let before = self.config.hotkey_mode;
+                    ui.label("Hotkey mode");
+                    ComboBox::from_id_source("hotkey-mode")
+                        .selected_text(self.config.hotkey_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in HotkeyMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.config.hotkey_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    if before != self.config.hotkey_mode {
+                        self.save_config();
                     }
                 });
             });

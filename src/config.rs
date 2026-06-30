@@ -15,6 +15,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub playground_model_order: Vec<String>,
     pub hotkey: String,
+    #[serde(default)]
+    pub hotkey_mode: HotkeyMode,
     pub whisper_executable_path: Option<PathBuf>,
     #[serde(default = "default_legacy_whisper_compute_mode")]
     pub whisper_compute_mode: WhisperComputeMode,
@@ -87,6 +89,25 @@ impl ThemeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyMode {
+    #[default]
+    Toggle,
+    HoldToTalk,
+}
+
+impl HotkeyMode {
+    pub const ALL: [HotkeyMode; 2] = [HotkeyMode::Toggle, HotkeyMode::HoldToTalk];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Toggle => "Toggle record",
+            Self::HoldToTalk => "Hold to talk",
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +115,7 @@ impl Default for AppConfig {
             enabled_models: vec!["whisper_cpp_tiny_en".to_owned()],
             playground_model_order: default_playground_model_order(),
             hotkey: "Ctrl+Shift+Space".to_owned(),
+            hotkey_mode: HotkeyMode::Toggle,
             whisper_executable_path: None,
             whisper_compute_mode: WhisperComputeMode::Cuda,
             whisper_gpu_device: 0,
@@ -513,6 +535,7 @@ mod tests {
         assert!(config.close_to_tray);
         assert!(config.auto_insert_transcript);
         assert!(config.restore_clipboard_after_insert);
+        assert_eq!(config.hotkey_mode, HotkeyMode::Toggle);
         assert_eq!(config.paste_delay_ms, 75);
         assert_eq!(config.theme_mode, ThemeMode::Light);
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cpu);
@@ -529,6 +552,18 @@ mod tests {
 
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cuda);
         assert_eq!(config.whisper_gpu_device, 0);
+    }
+
+    #[test]
+    fn hotkey_mode_uses_stable_snake_case_names() {
+        let mut config = AppConfig::default();
+        config.hotkey_mode = HotkeyMode::HoldToTalk;
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains(r#""hotkey_mode":"hold_to_talk""#));
+
+        let parsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.hotkey_mode, HotkeyMode::HoldToTalk);
     }
 
     #[test]
