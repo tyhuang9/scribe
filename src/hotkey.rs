@@ -1,6 +1,12 @@
 use anyhow::{Result, anyhow};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HotkeyEvent {
+    Pressed,
+    Released,
+}
 
 pub struct HotkeyService {
     manager: Option<GlobalHotKeyManager>,
@@ -40,12 +46,26 @@ impl HotkeyService {
         Ok(())
     }
 
-    pub fn poll_pressed(&self) -> bool {
-        let mut pressed = false;
-        while GlobalHotKeyEvent::receiver().try_recv().is_ok() {
-            pressed = true;
+    pub fn poll_events(&self) -> Vec<HotkeyEvent> {
+        let registered_id = self.hotkey.map(|hotkey| hotkey.id());
+        let mut events = Vec::new();
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if let Some(event) = event_from_global(event, registered_id) {
+                events.push(event);
+            }
         }
-        pressed
+        events
+    }
+}
+
+fn event_from_global(event: GlobalHotKeyEvent, registered_id: Option<u32>) -> Option<HotkeyEvent> {
+    if registered_id.is_some_and(|id| id != event.id()) {
+        return None;
+    }
+
+    match event.state() {
+        HotKeyState::Pressed => Some(HotkeyEvent::Pressed),
+        HotKeyState::Released => Some(HotkeyEvent::Released),
     }
 }
 
@@ -178,5 +198,48 @@ mod tests {
     fn rejects_missing_or_unknown_key() {
         assert!(parse_hotkey("Ctrl+Shift").is_err());
         assert!(parse_hotkey("Ctrl+Mouse1").is_err());
+    }
+
+    #[test]
+    fn maps_registered_global_hotkey_events_to_press_and_release() {
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+
+        assert_eq!(
+            event_from_global(
+                GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Pressed,
+                },
+                Some(hotkey.id())
+            ),
+            Some(HotkeyEvent::Pressed)
+        );
+        assert_eq!(
+            event_from_global(
+                GlobalHotKeyEvent {
+                    id: hotkey.id(),
+                    state: HotKeyState::Released,
+                },
+                Some(hotkey.id())
+            ),
+            Some(HotkeyEvent::Released)
+        );
+    }
+
+    #[test]
+    fn ignores_events_for_other_hotkeys() {
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let other = parse_hotkey("Ctrl+Alt+K").unwrap();
+
+        assert_eq!(
+            event_from_global(
+                GlobalHotKeyEvent {
+                    id: other.id(),
+                    state: HotKeyState::Pressed,
+                },
+                Some(hotkey.id())
+            ),
+            None
+        );
     }
 }

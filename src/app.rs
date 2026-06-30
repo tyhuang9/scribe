@@ -19,7 +19,7 @@ use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
 use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
-use crate::hotkey::HotkeyService;
+use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
     backend_capabilities, whisper_cpp_download_url,
@@ -424,8 +424,19 @@ impl LocalTranscriberApp {
     }
 
     fn poll_hotkey(&mut self) {
-        if self.hotkey_service.poll_pressed() {
-            self.toggle_recording();
+        for event in self.hotkey_service.poll_events() {
+            match hotkey_recording_action(
+                self.config.hotkey_mode,
+                event,
+                self.active_recording.as_ref().map(|active| active.source),
+            ) {
+                Some(HotkeyRecordingAction::StartTranscribe) => {
+                    self.start_recording(RecordingSource::Transcribe)
+                }
+                Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
+                Some(HotkeyRecordingAction::Toggle) => self.toggle_recording(),
+                None => {}
+            }
         }
     }
 
@@ -2653,6 +2664,33 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
     format!("{elapsed}s elapsed - {remaining}s left")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HotkeyRecordingAction {
+    StartTranscribe,
+    Stop,
+    Toggle,
+}
+
+fn hotkey_recording_action(
+    mode: HotkeyMode,
+    event: HotkeyEvent,
+    active_source: Option<RecordingSource>,
+) -> Option<HotkeyRecordingAction> {
+    match (mode, event, active_source) {
+        (HotkeyMode::Toggle, HotkeyEvent::Pressed, _) => Some(HotkeyRecordingAction::Toggle),
+        (HotkeyMode::Toggle, HotkeyEvent::Released, _) => None,
+        (HotkeyMode::HoldToTalk, HotkeyEvent::Pressed, None) => {
+            Some(HotkeyRecordingAction::StartTranscribe)
+        }
+        (HotkeyMode::HoldToTalk, HotkeyEvent::Pressed, Some(_)) => None,
+        (HotkeyMode::HoldToTalk, HotkeyEvent::Released, Some(RecordingSource::Transcribe)) => {
+            Some(HotkeyRecordingAction::Stop)
+        }
+        (HotkeyMode::HoldToTalk, HotkeyEvent::Released, Some(RecordingSource::Playground)) => None,
+        (HotkeyMode::HoldToTalk, HotkeyEvent::Released, None) => None,
+    }
+}
+
 fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
     match status {
         ModelRuntimeStatus::Ready => "Ready to transcribe.".to_owned(),
@@ -3053,6 +3091,70 @@ mod layout_tests {
 
         assert_eq!(config.selected_default_model, active_model);
         assert!(!config.enabled_models.iter().any(|id| id == &active_model));
+    }
+
+    #[test]
+    fn toggle_hotkey_toggles_only_on_press() {
+        assert_eq!(
+            hotkey_recording_action(HotkeyMode::Toggle, HotkeyEvent::Pressed, None),
+            Some(HotkeyRecordingAction::Toggle)
+        );
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::Toggle,
+                HotkeyEvent::Pressed,
+                Some(RecordingSource::Transcribe)
+            ),
+            Some(HotkeyRecordingAction::Toggle)
+        );
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::Toggle,
+                HotkeyEvent::Released,
+                Some(RecordingSource::Transcribe)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hold_to_talk_starts_on_press_and_stops_on_release() {
+        assert_eq!(
+            hotkey_recording_action(HotkeyMode::HoldToTalk, HotkeyEvent::Pressed, None),
+            Some(HotkeyRecordingAction::StartTranscribe)
+        );
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::HoldToTalk,
+                HotkeyEvent::Pressed,
+                Some(RecordingSource::Transcribe)
+            ),
+            None
+        );
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::HoldToTalk,
+                HotkeyEvent::Released,
+                Some(RecordingSource::Transcribe)
+            ),
+            Some(HotkeyRecordingAction::Stop)
+        );
+        assert_eq!(
+            hotkey_recording_action(HotkeyMode::HoldToTalk, HotkeyEvent::Released, None),
+            None
+        );
+    }
+
+    #[test]
+    fn hold_to_talk_release_does_not_stop_playground_recording() {
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::HoldToTalk,
+                HotkeyEvent::Released,
+                Some(RecordingSource::Playground)
+            ),
+            None
+        );
     }
 
     #[test]
