@@ -1076,8 +1076,8 @@ impl LocalTranscriberApp {
 
     fn select_model_as_default(&mut self, model: &SttModelInfo) {
         self.config.selected_default_model = model.id.clone();
-        if !self.config.enabled_models.iter().any(|id| id == &model.id) {
-            self.config.enabled_models.push(model.id.clone());
+        if !self.config.playground_enabled_models.iter().any(|id| id == &model.id) {
+            self.config.playground_enabled_models.push(model.id.clone());
         }
         self.config.last_used_backend = model.backend.clone();
         self.save_config();
@@ -3010,22 +3010,22 @@ fn paths_from_list_input(input: &str) -> Vec<PathBuf> {
 
 fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
     if enabled {
-        if !config.enabled_models.iter().any(|id| id == model_id) {
-            config.enabled_models.push(model_id.to_owned());
+        if !config.playground_enabled_models.iter().any(|id| id == model_id) {
+            config.playground_enabled_models.push(model_id.to_owned());
         }
     } else {
-        config.enabled_models.retain(|id| id != model_id);
+        config.playground_enabled_models.retain(|id| id != model_id);
     }
 }
 
 fn set_all_models_enabled(config: &mut AppConfig, enabled: bool) {
     if enabled {
-        config.enabled_models = config::configured_models(config)
+        config.playground_enabled_models = config::configured_models(config)
             .into_iter()
             .map(|model| model.id)
             .collect();
     } else {
-        config.enabled_models.clear();
+        config.playground_enabled_models.clear();
     }
 }
 
@@ -3338,7 +3338,7 @@ mod layout_tests {
         config::normalize_config(&mut config);
 
         assert_eq!(config.selected_default_model, active_model);
-        assert!(!config.enabled_models.iter().any(|id| id == &active_model));
+        assert!(!config.playground_enabled_models.iter().any(|id| id == &active_model));
     }
 
     #[test]
@@ -3583,7 +3583,7 @@ mod layout_tests {
 
         set_all_models_enabled(&mut config, false);
         config::normalize_config(&mut config);
-        assert!(config.enabled_models.is_empty());
+        assert!(config.playground_enabled_models.is_empty());
         assert!(
             config::configured_models(&config)
                 .iter()
@@ -3592,7 +3592,7 @@ mod layout_tests {
 
         set_all_models_enabled(&mut config, true);
         config::normalize_config(&mut config);
-        assert!(!config.enabled_models.is_empty());
+        assert!(!config.playground_enabled_models.is_empty());
         assert!(
             config::configured_models(&config)
                 .iter()

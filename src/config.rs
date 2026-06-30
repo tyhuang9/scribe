@@ -11,9 +11,14 @@ use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub selected_default_model: String,
-    pub enabled_models: Vec<String>,
+    #[serde(default, alias = "enabled_models")]
+    pub playground_enabled_models: Vec<String>,
     #[serde(default)]
     pub playground_model_order: Vec<String>,
+    #[serde(default)]
+    pub managed_models: HashMap<String, ManagedModelInstall>,
+    #[serde(default)]
+    pub managed_runtimes: HashMap<String, ManagedRuntimeInstall>,
     pub hotkey: String,
     #[serde(default)]
     pub hotkey_mode: HotkeyMode,
@@ -46,6 +51,16 @@ pub struct AppConfig {
     pub paste_delay_ms: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedModelInstall {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedRuntimeInstall {
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ThemeMode {
     #[default]
@@ -58,22 +73,29 @@ pub enum ThemeMode {
 #[serde(rename_all = "snake_case")]
 pub enum WhisperComputeMode {
     #[default]
-    Cuda,
+    Auto,
+    #[serde(alias = "cuda")]
+    PreferGpu,
     Cpu,
 }
 
 impl WhisperComputeMode {
-    pub const ALL: [WhisperComputeMode; 2] = [WhisperComputeMode::Cuda, WhisperComputeMode::Cpu];
+    pub const ALL: [WhisperComputeMode; 3] = [
+        WhisperComputeMode::Auto,
+        WhisperComputeMode::PreferGpu,
+        WhisperComputeMode::Cpu,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Cuda => "CUDA GPU",
+            Self::Auto => "Auto",
+            Self::PreferGpu => "Prefer GPU",
             Self::Cpu => "CPU only",
         }
     }
 
     pub fn uses_gpu(self) -> bool {
-        self == Self::Cuda
+        self != Self::Cpu
     }
 }
 
@@ -112,12 +134,14 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            enabled_models: vec!["whisper_cpp_tiny_en".to_owned()],
+            playground_enabled_models: vec!["whisper_cpp_tiny_en".to_owned()],
             playground_model_order: default_playground_model_order(),
+            managed_models: HashMap::new(),
+            managed_runtimes: HashMap::new(),
             hotkey: "Ctrl+Shift+Space".to_owned(),
             hotkey_mode: HotkeyMode::Toggle,
             whisper_executable_path: None,
-            whisper_compute_mode: WhisperComputeMode::Cuda,
+            whisper_compute_mode: WhisperComputeMode::Auto,
             whisper_gpu_device: 0,
             whisper_cuda_backend_path: default_whisper_cuda_backend_path(),
             whisper_cuda_library_paths: default_whisper_cuda_library_paths(),
@@ -207,16 +231,18 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     default_model_catalog()
         .into_iter()
         .map(|mut model| {
-            model.enabled = config.enabled_models.iter().any(|id| id == &model.id);
+            model.enabled = config.playground_enabled_models.iter().any(|id| id == &model.id);
             let configured_path = config.model_paths.get(&model.id).cloned();
+            let managed_path = managed_model_path(config, &model);
             let downloaded_path =
                 downloaded_model_path(config, &model).filter(|path| path.exists());
 
-            model.local_path = match configured_path {
-                Some(path) if path.exists() => Some(path),
-                Some(path) => downloaded_path.or(Some(path)),
-                None => downloaded_path,
-            };
+            model.local_path = first_existing_path(
+                [managed_path, downloaded_path, configured_path.clone()]
+                    .into_iter()
+                    .flatten(),
+            )
+            .or(configured_path);
             model.install_status = match &model.local_path {
                 Some(path) if path.exists() => ModelInstallStatus::Installed,
                 Some(_) => ModelInstallStatus::Missing,
@@ -261,6 +287,10 @@ pub fn enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
         .collect()
 }
 
+pub fn playground_enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
+    enabled_models(config)
+}
+
 pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
     if config.model_storage_dir.as_os_str().is_empty() {
         default_model_storage_dir()
@@ -269,12 +299,51 @@ pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
     }
 }
 
+pub fn runtime_storage_dir() -> PathBuf {
+    scribe_project_dirs()
+        .map(|dirs| dirs.data_dir().join("runtimes"))
+        .unwrap_or_else(|_| PathBuf::from("runtimes"))
+}
+
+pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
+    config
+        .managed_models
+        .get(&model.id)
+        .map(|install| install.path.clone())
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
     model.download_model.as_ref().map(|download_model| {
         model_storage_dir(config)
             .join("whisper.cpp")
             .join(format!("ggml-{download_model}.bin"))
     })
+}
+
+pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
+    config
+        .managed_runtimes
+        .get(&runtime_id_for_backend(backend))
+        .map(|install| install.path.clone())
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+pub fn runtime_id_for_backend(backend: &str) -> String {
+    backend
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
@@ -286,6 +355,7 @@ pub fn normalize_config(config: &mut AppConfig) {
 
     migrate_legacy_model_ids(config);
     apply_default_model_paths(config);
+    apply_managed_model_metadata(config);
     if config.model_storage_dir.as_os_str().is_empty() {
         config.model_storage_dir = default_model_storage_dir();
     }
@@ -310,9 +380,9 @@ pub fn normalize_config(config: &mut AppConfig) {
     }
 
     config
-        .enabled_models
+        .playground_enabled_models
         .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
-    dedup_preserving_order(&mut config.enabled_models);
+    dedup_preserving_order(&mut config.playground_enabled_models);
 
     normalize_playground_order(config, &catalog_ids);
 
@@ -424,6 +494,23 @@ fn apply_default_model_paths(config: &mut AppConfig) {
     }
 }
 
+fn apply_managed_model_metadata(config: &mut AppConfig) {
+    for (id, path) in &config.model_paths {
+        if path.exists() {
+            config
+                .managed_models
+                .entry(id.clone())
+                .or_insert_with(|| ManagedModelInstall { path: path.clone() });
+        }
+    }
+
+    for install in config.managed_models.values_mut() {
+        if install.path.as_os_str().is_empty() {
+            install.path = PathBuf::new();
+        }
+    }
+}
+
 fn migrate_legacy_model_ids(config: &mut AppConfig) {
     let legacy_ids = [
         "faster_whisper",
@@ -442,7 +529,7 @@ fn migrate_legacy_model_ids(config: &mut AppConfig) {
         if config.selected_default_model == old_id {
             config.selected_default_model = new_id.to_owned();
         }
-        for id in &mut config.enabled_models {
+        for id in &mut config.playground_enabled_models {
             if id == old_id {
                 *id = new_id.to_owned();
             }
@@ -455,10 +542,19 @@ fn migrate_legacy_model_ids(config: &mut AppConfig) {
         if let Some(path) = config.model_paths.remove(old_id) {
             config.model_paths.entry(new_id.to_owned()).or_insert(path);
         }
+        if let Some(install) = config.managed_models.remove(old_id) {
+            config
+                .managed_models
+                .entry(new_id.to_owned())
+                .or_insert(install);
+        }
     }
 
     config
         .model_paths
+        .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
+    config
+        .managed_models
         .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
 }
 
@@ -503,6 +599,10 @@ fn dedup_paths_preserving_order(paths: &mut Vec<PathBuf>) {
     });
 }
 
+fn first_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path.exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +639,10 @@ mod tests {
         assert_eq!(config.paste_delay_ms, 75);
         assert_eq!(config.theme_mode, ThemeMode::Light);
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cpu);
+        assert_eq!(
+            config.playground_enabled_models,
+            vec!["whisper_cpp_tiny_en".to_owned()]
+        );
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(config.whisper_cuda_library_paths.len() <= 3);
         assert!(config.audio_input_device_name.is_none());
@@ -547,11 +651,19 @@ mod tests {
     }
 
     #[test]
-    fn new_default_config_prefers_cuda() {
+    fn new_default_config_uses_auto_performance() {
         let config = AppConfig::default();
 
-        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cuda);
+        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
+    }
+
+    #[test]
+    fn old_cuda_value_deserializes_to_prefer_gpu() {
+        let mode: WhisperComputeMode = serde_json::from_str(r#""cuda""#).unwrap();
+
+        assert_eq!(mode, WhisperComputeMode::PreferGpu);
+        assert!(mode.uses_gpu());
     }
 
     #[test]
@@ -600,13 +712,13 @@ mod tests {
     #[test]
     fn empty_enabled_models_remain_empty_after_normalize() {
         let mut config = AppConfig {
-            enabled_models: Vec::new(),
+            playground_enabled_models: Vec::new(),
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
 
-        assert!(config.enabled_models.is_empty());
+        assert!(config.playground_enabled_models.is_empty());
         assert_eq!(config.selected_default_model, "whisper_cpp_tiny_en");
     }
 
@@ -614,7 +726,7 @@ mod tests {
     fn playground_models_pin_active_model_then_sort_enabled_by_manual_order() {
         let mut config = AppConfig {
             selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            enabled_models: vec![
+            playground_enabled_models: vec![
                 "faster_whisper_medium_en_gpu".to_owned(),
                 "whisper_cpp_tiny_en".to_owned(),
             ],
@@ -689,5 +801,44 @@ mod tests {
         assert_eq!(model.install_status, ModelInstallStatus::Installed);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn existing_configured_model_path_populates_managed_metadata() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-managed-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let model_path = temp_dir.join("ggml-base.en.bin");
+        fs::write(&model_path, b"model").unwrap();
+
+        let mut model_paths = HashMap::new();
+        model_paths.insert("whisper_cpp_base_en".to_owned(), model_path.clone());
+        let mut config = AppConfig {
+            model_paths,
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+
+        assert_eq!(
+            managed_model_path(
+                &config,
+                &configured_models(&config)
+                    .into_iter()
+                    .find(|model| model.id == "whisper_cpp_base_en")
+                    .unwrap()
+            )
+            .as_deref(),
+            Some(model_path.as_path())
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_ids_are_stable_slugs() {
+        assert_eq!(runtime_id_for_backend("whisper.cpp"), "whisper_cpp");
+        assert_eq!(runtime_id_for_backend("sherpa-onnx"), "sherpa_onnx");
     }
 }
