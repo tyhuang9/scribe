@@ -16,6 +16,14 @@ pub struct AppConfig {
     pub playground_model_order: Vec<String>,
     pub hotkey: String,
     pub whisper_executable_path: Option<PathBuf>,
+    #[serde(default = "default_legacy_whisper_compute_mode")]
+    pub whisper_compute_mode: WhisperComputeMode,
+    #[serde(default)]
+    pub whisper_gpu_device: u32,
+    #[serde(default = "default_whisper_cuda_backend_path")]
+    pub whisper_cuda_backend_path: Option<PathBuf>,
+    #[serde(default = "default_whisper_cuda_library_paths")]
+    pub whisper_cuda_library_paths: Vec<PathBuf>,
     #[serde(default = "default_model_storage_dir")]
     pub model_storage_dir: PathBuf,
     #[serde(default)]
@@ -44,6 +52,29 @@ pub enum ThemeMode {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhisperComputeMode {
+    #[default]
+    Cuda,
+    Cpu,
+}
+
+impl WhisperComputeMode {
+    pub const ALL: [WhisperComputeMode; 2] = [WhisperComputeMode::Cuda, WhisperComputeMode::Cpu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cuda => "CUDA GPU",
+            Self::Cpu => "CPU only",
+        }
+    }
+
+    pub fn uses_gpu(self) -> bool {
+        self == Self::Cuda
+    }
+}
+
 impl ThemeMode {
     pub const ALL: [ThemeMode; 3] = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System];
 
@@ -64,6 +95,10 @@ impl Default for AppConfig {
             playground_model_order: default_playground_model_order(),
             hotkey: "Ctrl+Shift+Space".to_owned(),
             whisper_executable_path: None,
+            whisper_compute_mode: WhisperComputeMode::Cuda,
+            whisper_gpu_device: 0,
+            whisper_cuda_backend_path: default_whisper_cuda_backend_path(),
+            whisper_cuda_library_paths: default_whisper_cuda_library_paths(),
             model_storage_dir: default_model_storage_dir(),
             theme_mode: ThemeMode::Light,
             audio_input_device_name: None,
@@ -175,12 +210,17 @@ pub fn configured_models_for_playground(config: &AppConfig) -> Vec<SttModelInfo>
     let order = &config.playground_model_order;
 
     models.sort_by_key(|model| {
+        let active_group = if model.id == config.selected_default_model {
+            0
+        } else {
+            1
+        };
         let enabled_group = if model.enabled { 0 } else { 1 };
         let order_index = order
             .iter()
             .position(|id| id == &model.id)
             .unwrap_or(usize::MAX);
-        (enabled_group, order_index)
+        (active_group, enabled_group, order_index)
     });
 
     models
@@ -232,6 +272,13 @@ pub fn normalize_config(config: &mut AppConfig) {
             config.audio_input_device_name = None;
         }
     }
+    if config.whisper_gpu_device > 16 {
+        config.whisper_gpu_device = 0;
+    }
+    config
+        .whisper_cuda_library_paths
+        .retain(|path| !path.as_os_str().is_empty());
+    dedup_paths_preserving_order(&mut config.whisper_cuda_library_paths);
 
     if !catalog
         .iter()
@@ -245,12 +292,6 @@ pub fn normalize_config(config: &mut AppConfig) {
         .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
     dedup_preserving_order(&mut config.enabled_models);
 
-    if config.enabled_models.is_empty() {
-        config
-            .enabled_models
-            .push(config.selected_default_model.clone());
-    }
-
     normalize_playground_order(config, &catalog_ids);
 
     if config.max_recording_seconds == 0 {
@@ -263,6 +304,32 @@ pub fn normalize_config(config: &mut AppConfig) {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_legacy_whisper_compute_mode() -> WhisperComputeMode {
+    WhisperComputeMode::Cpu
+}
+
+fn default_whisper_cuda_backend_path() -> Option<PathBuf> {
+    [
+        "/usr/local/lib/ollama/cuda_v13/libggml-cuda.so",
+        "/usr/local/lib/ollama/cuda_v12/libggml-cuda.so",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.exists())
+}
+
+fn default_whisper_cuda_library_paths() -> Vec<PathBuf> {
+    [
+        "/usr/local/lib/ollama",
+        "/usr/local/lib/ollama/cuda_v13",
+        "/usr/local/lib/ollama/cuda_v12",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .filter(|path| path.exists())
+    .collect()
 }
 
 fn default_paste_delay_ms() -> u64 {
@@ -402,6 +469,18 @@ fn dedup_preserving_order(ids: &mut Vec<String>) {
     });
 }
 
+fn dedup_paths_preserving_order(paths: &mut Vec<PathBuf>) {
+    let mut seen = Vec::new();
+    paths.retain(|path| {
+        if seen.iter().any(|seen_path| seen_path == path) {
+            false
+        } else {
+            seen.push(path.clone());
+            true
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,14 +515,70 @@ mod tests {
         assert!(config.restore_clipboard_after_insert);
         assert_eq!(config.paste_delay_ms, 75);
         assert_eq!(config.theme_mode, ThemeMode::Light);
+        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cpu);
+        assert_eq!(config.whisper_gpu_device, 0);
+        assert!(config.whisper_cuda_library_paths.len() <= 3);
         assert!(config.audio_input_device_name.is_none());
         assert!(!config.model_storage_dir.as_os_str().is_empty());
         assert!(config.model_storage_dir.ends_with("models"));
     }
 
     #[test]
-    fn playground_models_sort_enabled_first_then_manual_order() {
+    fn new_default_config_prefers_cuda() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cuda);
+        assert_eq!(config.whisper_gpu_device, 0);
+    }
+
+    #[test]
+    fn invalid_gpu_device_normalizes_to_default() {
         let mut config = AppConfig {
+            whisper_gpu_device: 99,
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+
+        assert_eq!(config.whisper_gpu_device, 0);
+    }
+
+    #[test]
+    fn duplicate_cuda_library_paths_normalize_to_unique_paths() {
+        let mut config = AppConfig {
+            whisper_cuda_library_paths: vec![
+                PathBuf::from("/tmp/cuda"),
+                PathBuf::from("/tmp/cuda"),
+                PathBuf::new(),
+            ],
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+
+        assert_eq!(
+            config.whisper_cuda_library_paths,
+            vec![PathBuf::from("/tmp/cuda")]
+        );
+    }
+
+    #[test]
+    fn empty_enabled_models_remain_empty_after_normalize() {
+        let mut config = AppConfig {
+            enabled_models: Vec::new(),
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+
+        assert!(config.enabled_models.is_empty());
+        assert_eq!(config.selected_default_model, "whisper_cpp_tiny_en");
+    }
+
+    #[test]
+    fn playground_models_pin_active_model_then_sort_enabled_by_manual_order() {
+        let mut config = AppConfig {
+            selected_default_model: "whisper_cpp_tiny_en".to_owned(),
             enabled_models: vec![
                 "faster_whisper_medium_en_gpu".to_owned(),
                 "whisper_cpp_tiny_en".to_owned(),
@@ -462,8 +597,8 @@ mod tests {
             .map(|model| model.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids[0], "faster_whisper_medium_en_gpu");
-        assert_eq!(ids[1], "whisper_cpp_tiny_en");
+        assert_eq!(ids[0], "whisper_cpp_tiny_en");
+        assert_eq!(ids[1], "faster_whisper_medium_en_gpu");
         assert!(
             ids.iter()
                 .position(|id| id == "vosk_small_en")

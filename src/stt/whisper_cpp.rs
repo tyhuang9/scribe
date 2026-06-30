@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -10,11 +12,34 @@ use super::SttBackend;
 
 pub struct WhisperCppBackend {
     executable_path: Option<PathBuf>,
+    options: WhisperCppOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhisperCppOptions {
+    pub use_gpu: bool,
+    pub gpu_device: u32,
+    pub cuda_backend_path: Option<PathBuf>,
+    pub cuda_library_paths: Vec<PathBuf>,
+}
+
+impl Default for WhisperCppOptions {
+    fn default() -> Self {
+        Self {
+            use_gpu: true,
+            gpu_device: 0,
+            cuda_backend_path: None,
+            cuda_library_paths: Vec::new(),
+        }
+    }
 }
 
 impl WhisperCppBackend {
-    pub fn new(executable_path: Option<PathBuf>) -> Self {
-        Self { executable_path }
+    pub fn new(executable_path: Option<PathBuf>, options: WhisperCppOptions) -> Self {
+        Self {
+            executable_path,
+            options,
+        }
     }
 }
 
@@ -61,12 +86,10 @@ impl SttBackend for WhisperCppBackend {
         }
 
         let started = Instant::now();
-        let output = Command::new(&executable)
-            .arg("-m")
-            .arg(&model_path)
-            .arg("-f")
-            .arg(&audio_path)
-            .arg("-nt")
+        let mut command = Command::new(&executable);
+        command.args(whisper_cli_args(&model_path, &audio_path, &self.options));
+        apply_whisper_environment(&mut command, &self.options)?;
+        let output = command
             .output()
             .with_context(|| format!("failed to run {}", executable.display()))?;
 
@@ -78,6 +101,11 @@ impl SttBackend for WhisperCppBackend {
                 "whisper.cpp failed with status {}\n{}",
                 output.status,
                 stderr.trim()
+            ));
+        }
+        if self.options.use_gpu && whisper_reported_no_gpu(&stderr) {
+            return Err(anyhow!(
+                "CUDA GPU mode was requested, but the selected whisper.cpp executable did not find a GPU. Build whisper.cpp with GGML_CUDA=1 and select that executable, or switch compute mode to CPU only."
             ));
         }
 
@@ -105,6 +133,71 @@ impl SttBackend for WhisperCppBackend {
     }
 }
 
+fn whisper_cli_args(
+    model_path: &Path,
+    audio_path: &Path,
+    options: &WhisperCppOptions,
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-m"),
+        model_path.as_os_str().to_owned(),
+        OsString::from("-f"),
+        audio_path.as_os_str().to_owned(),
+        OsString::from("-nt"),
+    ];
+
+    if options.use_gpu {
+        args.push(OsString::from("-dev"));
+        args.push(OsString::from(options.gpu_device.to_string()));
+    } else {
+        args.push(OsString::from("-ng"));
+    }
+
+    args
+}
+
+fn apply_whisper_environment(command: &mut Command, options: &WhisperCppOptions) -> Result<()> {
+    if !options.use_gpu {
+        return Ok(());
+    }
+
+    if let Some(backend_path) = &options.cuda_backend_path {
+        if !backend_path.as_os_str().is_empty() {
+            command.env("GGML_BACKEND_PATH", backend_path);
+        }
+    }
+    if let Some(library_path) = joined_library_path(&options.cuda_library_paths)? {
+        command.env("LD_LIBRARY_PATH", library_path);
+    }
+
+    Ok(())
+}
+
+fn joined_library_path(paths: &[PathBuf]) -> Result<Option<OsString>> {
+    let mut values = paths
+        .iter()
+        .filter(|path| !path.as_os_str().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if let Some(existing) = env::var_os("LD_LIBRARY_PATH") {
+        values.extend(env::split_paths(&existing));
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    env::join_paths(values)
+        .map(Some)
+        .with_context(|| "failed to build LD_LIBRARY_PATH for whisper.cpp")
+}
+
+fn whisper_reported_no_gpu(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("no gpu found"))
+}
+
 pub(crate) fn parse_final_text(stdout: &str) -> String {
     stdout
         .lines()
@@ -128,6 +221,9 @@ fn strip_timestamp_prefix(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::default_model_catalog;
+    use crate::stt::SttBackend;
+
     use super::*;
 
     #[test]
@@ -147,5 +243,117 @@ mod tests {
     #[test]
     fn parse_final_text_keeps_plain_lines() {
         assert_eq!(parse_final_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn whisper_args_select_cuda_device_when_gpu_is_enabled() {
+        let args = whisper_cli_args(
+            Path::new("/models/ggml-small.en.bin"),
+            Path::new("/tmp/audio.wav"),
+            &WhisperCppOptions {
+                use_gpu: true,
+                gpu_device: 1,
+                ..WhisperCppOptions::default()
+            },
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("/models/ggml-small.en.bin"),
+                OsString::from("-f"),
+                OsString::from("/tmp/audio.wav"),
+                OsString::from("-nt"),
+                OsString::from("-dev"),
+                OsString::from("1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn whisper_args_can_disable_gpu() {
+        let args = whisper_cli_args(
+            Path::new("/models/ggml-base.en.bin"),
+            Path::new("/tmp/audio.wav"),
+            &WhisperCppOptions {
+                use_gpu: false,
+                gpu_device: 0,
+                ..WhisperCppOptions::default()
+            },
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("/models/ggml-base.en.bin"),
+                OsString::from("-f"),
+                OsString::from("/tmp/audio.wav"),
+                OsString::from("-nt"),
+                OsString::from("-ng"),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_gpu_fallback_message() {
+        assert!(whisper_reported_no_gpu(
+            "whisper_backend_init_gpu: device 0: CPU (type: 0)\nwhisper_backend_init_gpu: no GPU found"
+        ));
+        assert!(!whisper_reported_no_gpu(
+            "whisper_backend_init_gpu: device 0: NVIDIA GeForce"
+        ));
+    }
+
+    #[test]
+    fn joins_cuda_library_paths() {
+        let paths = vec![PathBuf::from("/opt/cuda"), PathBuf::from("/opt/cublas")];
+        let joined = joined_library_path(&paths).unwrap().unwrap();
+
+        assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cuda")));
+        assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cublas")));
+    }
+
+    #[test]
+    #[ignore = "requires a local CUDA-capable whisper.cpp executable, model, sample audio, and GPU access"]
+    fn whisper_cuda_smoke_uses_configured_backend() {
+        let executable = PathBuf::from(
+            env::var_os("SCRIBE_WHISPER_CUDA_CLI")
+                .expect("set SCRIBE_WHISPER_CUDA_CLI to whisper-cli"),
+        );
+        let model_path = PathBuf::from(
+            env::var_os("SCRIBE_WHISPER_CUDA_MODEL")
+                .expect("set SCRIBE_WHISPER_CUDA_MODEL to a ggml model"),
+        );
+        let audio_path = PathBuf::from(
+            env::var_os("SCRIBE_WHISPER_CUDA_AUDIO")
+                .expect("set SCRIBE_WHISPER_CUDA_AUDIO to a wav file"),
+        );
+        let cuda_backend_path = env::var_os("SCRIBE_WHISPER_CUDA_BACKEND").map(PathBuf::from);
+        let cuda_library_paths = env::var_os("SCRIBE_WHISPER_CUDA_LIBRARY_PATHS")
+            .map(|paths| env::split_paths(&paths).collect())
+            .unwrap_or_default();
+
+        let mut model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_small_en")
+            .expect("whisper.cpp small model exists in catalog");
+        model.local_path = Some(model_path);
+
+        let backend = WhisperCppBackend::new(
+            Some(executable),
+            WhisperCppOptions {
+                use_gpu: true,
+                gpu_device: 0,
+                cuda_backend_path,
+                cuda_library_paths,
+            },
+        );
+        let result = backend.transcribe(audio_path, model).unwrap();
+
+        assert!(!whisper_reported_no_gpu(&result.stderr));
+        assert!(result.stderr.contains("using CUDA"));
+        assert!(result.text.to_lowercase().contains("ask not"));
     }
 }

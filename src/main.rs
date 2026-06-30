@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod benchmark;
 mod config;
 mod core;
 mod hotkey;
@@ -9,6 +10,13 @@ mod text_output;
 mod tray;
 
 use eframe::egui;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxDisplayBackend {
+    Auto,
+    X11,
+    Wayland,
+}
 
 fn main() -> eframe::Result<()> {
     configure_graphics_environment();
@@ -60,18 +68,66 @@ fn configure_event_loop_backend<T: 'static>(event_loop: &mut eframe::EventLoopBu
     use winit::platform::wayland::EventLoopBuilderExtWayland;
     use winit::platform::x11::EventLoopBuilderExtX11;
 
-    if std::env::var_os("SCRIBE_FORCE_X11").is_some() {
-        event_loop.with_x11();
-        return;
-    }
-
-    if std::env::var_os("SCRIBE_FORCE_WAYLAND").is_some() {
-        event_loop.with_wayland();
+    match linux_display_backend_preference() {
+        LinuxDisplayBackend::X11 => {
+            event_loop.with_x11();
+        }
+        LinuxDisplayBackend::Wayland => {
+            event_loop.with_wayland();
+        }
+        LinuxDisplayBackend::Auto => {}
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 fn configure_event_loop_backend<T: 'static>(_event_loop: &mut eframe::EventLoopBuilder<T>) {}
+
+#[cfg(target_os = "linux")]
+fn linux_display_backend_preference() -> LinuxDisplayBackend {
+    display_backend_preference(
+        std::env::var_os("SCRIBE_FORCE_X11").is_some(),
+        std::env::var_os("SCRIBE_FORCE_WAYLAND").is_some(),
+        running_under_wsl(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    )
+}
+
+fn display_backend_preference(
+    force_x11: bool,
+    force_wayland: bool,
+    under_wsl: bool,
+    has_wayland: bool,
+    has_x11: bool,
+) -> LinuxDisplayBackend {
+    if force_x11 {
+        return LinuxDisplayBackend::X11;
+    }
+    if force_wayland {
+        return LinuxDisplayBackend::Wayland;
+    }
+    if under_wsl && has_wayland {
+        return LinuxDisplayBackend::Wayland;
+    }
+    if under_wsl && has_x11 {
+        return LinuxDisplayBackend::X11;
+    }
+    LinuxDisplayBackend::Auto
+}
+
+#[cfg(target_os = "linux")]
+fn running_under_wsl() -> bool {
+    if std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|release| {
+            let release = release.to_ascii_lowercase();
+            release.contains("microsoft") || release.contains("wsl")
+        })
+        .unwrap_or(false)
+}
 
 fn print_linux_display_help(err: &eframe::Error) {
     #[cfg(target_os = "linux")]
@@ -113,5 +169,45 @@ mod tests {
         );
         assert_eq!(options.viewport.resizable, Some(true));
         assert_eq!(options.viewport.transparent, Some(false));
+    }
+
+    #[test]
+    fn display_backend_force_x11_wins() {
+        assert_eq!(
+            display_backend_preference(true, true, true, true, true),
+            LinuxDisplayBackend::X11
+        );
+    }
+
+    #[test]
+    fn display_backend_force_wayland_when_not_forcing_x11() {
+        assert_eq!(
+            display_backend_preference(false, true, true, true, true),
+            LinuxDisplayBackend::Wayland
+        );
+    }
+
+    #[test]
+    fn display_backend_picks_wayland_under_wsl_when_available() {
+        assert_eq!(
+            display_backend_preference(false, false, true, true, true),
+            LinuxDisplayBackend::Wayland
+        );
+    }
+
+    #[test]
+    fn display_backend_falls_back_to_x11_under_wsl() {
+        assert_eq!(
+            display_backend_preference(false, false, true, false, true),
+            LinuxDisplayBackend::X11
+        );
+    }
+
+    #[test]
+    fn display_backend_keeps_winit_auto_outside_wsl() {
+        assert_eq!(
+            display_backend_preference(false, false, false, true, true),
+            LinuxDisplayBackend::Auto
+        );
     }
 }

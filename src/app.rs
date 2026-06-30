@@ -15,7 +15,10 @@ use eframe::egui::{
 use rfd::FileDialog;
 
 use crate::audio::{self, RecordingSession};
-use crate::config::{self, AppConfig, ThemeMode};
+use crate::benchmark::{
+    self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
+};
+use crate::config::{self, AppConfig, ThemeMode, WhisperComputeMode};
 use crate::hotkey::HotkeyService;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
@@ -81,6 +84,9 @@ struct PlaygroundCardState {
     status: ModelRuntimeStatus,
     transcript: String,
     latency_ms: Option<u128>,
+    audio_duration_ms: Option<u128>,
+    peak_ram_mb: Option<f64>,
+    peak_vram_mb: Option<f64>,
 }
 
 enum PlaygroundAction {
@@ -125,6 +131,8 @@ pub struct LocalTranscriberApp {
     status_message: String,
     hotkey_input: String,
     whisper_path_input: String,
+    whisper_cuda_backend_path_input: String,
+    whisper_cuda_library_paths_input: String,
     model_storage_dir_input: String,
     model_search: String,
     model_backend_filter: String,
@@ -135,6 +143,9 @@ pub struct LocalTranscriberApp {
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
+    playground_reference_transcript: String,
+    playground_reference_user_edited: bool,
+    playground_ranking_mode: RankingMode,
     playground_pending: usize,
     playground_audio_path: Option<PathBuf>,
     hotkey_service: HotkeyService,
@@ -165,6 +176,12 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            whisper_cuda_backend_path_input: config
+                .whisper_cuda_backend_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            whisper_cuda_library_paths_input: path_list_input(&config.whisper_cuda_library_paths),
             model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
             model_search: String::new(),
             model_backend_filter: "All".to_owned(),
@@ -172,6 +189,9 @@ impl LocalTranscriberApp {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             playground_cards: cards_from_config(&config),
+            playground_reference_transcript: String::new(),
+            playground_reference_user_edited: false,
+            playground_ranking_mode: RankingMode::Balanced,
             hotkey_service: HotkeyService::new(&config.hotkey),
             config,
             config_path,
@@ -254,6 +274,7 @@ impl LocalTranscriberApp {
     fn apply_playground_action(&mut self, action: PlaygroundAction) {
         match action {
             PlaygroundAction::Clear(model_id) => {
+                let clearing_active_model = model_id == self.config.selected_default_model;
                 if let Some(card) = self
                     .playground_cards
                     .iter_mut()
@@ -261,9 +282,16 @@ impl LocalTranscriberApp {
                 {
                     card.transcript.clear();
                     card.latency_ms = None;
+                    card.audio_duration_ms = None;
+                    card.peak_ram_mb = None;
+                    card.peak_vram_mb = None;
+                }
+                if clearing_active_model && !self.playground_reference_user_edited {
+                    self.playground_reference_transcript.clear();
                 }
             }
             PlaygroundAction::SetEnabled(model_id, enabled) => {
+                let was_active_model = model_id == self.config.selected_default_model;
                 set_model_enabled(&mut self.config, &model_id, enabled);
                 if !enabled {
                     if let Some(card) = self
@@ -273,6 +301,12 @@ impl LocalTranscriberApp {
                     {
                         card.transcript.clear();
                         card.latency_ms = None;
+                        card.audio_duration_ms = None;
+                        card.peak_ram_mb = None;
+                        card.peak_vram_mb = None;
+                    }
+                    if was_active_model && !self.playground_reference_user_edited {
+                        self.playground_reference_transcript.clear();
                     }
                 }
                 self.save_config();
@@ -556,11 +590,6 @@ impl LocalTranscriberApp {
                 AppEvent::ModelDownloadDone { model_id } => {
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
-                    if self.config.selected_default_model == model_id
-                        && !self.config.enabled_models.iter().any(|id| id == &model_id)
-                    {
-                        self.config.enabled_models.push(model_id.clone());
-                    }
                     self.save_config();
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = "Model downloaded and ready.".to_owned();
@@ -650,6 +679,7 @@ impl LocalTranscriberApp {
 
         self.playground_audio_path = Some(audio_path.clone());
         self.playground_pending = models.len();
+        let audio_duration_ms = audio::wav_duration_ms(&audio_path);
         let config = self.config.clone();
 
         for model in models {
@@ -661,6 +691,9 @@ impl LocalTranscriberApp {
                 card.status = ModelRuntimeStatus::Running;
                 card.transcript.clear();
                 card.latency_ms = None;
+                card.audio_duration_ms = audio_duration_ms;
+                card.peak_ram_mb = None;
+                card.peak_vram_mb = None;
             }
 
             let tx = self.tx.clone();
@@ -692,21 +725,104 @@ impl LocalTranscriberApp {
             card.status = runtime_status_for_model(&self.config, &card.model);
             card.transcript.clear();
             card.latency_ms = None;
+            card.audio_duration_ms = None;
+            card.peak_ram_mb = None;
+            card.peak_vram_mb = None;
+        }
+        if !self.playground_reference_user_edited {
+            self.playground_reference_transcript.clear();
         }
         self.playground_pending = 0;
         self.playground_audio_path = None;
     }
 
     fn apply_playground_result(&mut self, result: TranscriptResult) {
+        let is_active_model = result.model_id == self.config.selected_default_model;
+        let transcript = result.text;
         if let Some(card) = self
             .playground_cards
             .iter_mut()
             .find(|card| card.model.id == result.model_id)
         {
             card.status = ModelRuntimeStatus::Ready;
-            card.transcript = result.text;
+            card.transcript = transcript.clone();
             card.latency_ms = result.duration_ms;
         }
+        if is_active_model && !self.playground_reference_user_edited {
+            self.playground_reference_transcript = transcript;
+        }
+    }
+
+    fn clear_playground_results(&mut self, clear_reference: bool) {
+        for card in &mut self.playground_cards {
+            card.transcript.clear();
+            card.latency_ms = None;
+            card.audio_duration_ms = None;
+            card.peak_ram_mb = None;
+            card.peak_vram_mb = None;
+            card.status = runtime_status_for_model(&self.config, &card.model);
+        }
+        if clear_reference {
+            self.playground_reference_transcript.clear();
+            self.playground_reference_user_edited = false;
+        }
+    }
+
+    fn set_all_models_enabled(&mut self, enabled: bool) {
+        set_all_models_enabled(&mut self.config, enabled);
+        self.save_config();
+        if !enabled {
+            self.clear_playground_results(true);
+        }
+        self.status_message = if enabled {
+            "Enabled all models".to_owned()
+        } else {
+            "Disabled all models".to_owned()
+        };
+    }
+
+    fn active_playground_output(&self) -> Option<(String, String)> {
+        self.playground_cards
+            .iter()
+            .find(|card| {
+                card.model.id == self.config.selected_default_model
+                    && !card.transcript.trim().is_empty()
+            })
+            .map(|card| (card.model.name.clone(), card.transcript.clone()))
+    }
+
+    fn apply_active_playground_output_as_reference(&mut self) -> bool {
+        let Some((_model_name, transcript)) = self.active_playground_output() else {
+            return false;
+        };
+        self.playground_reference_transcript = transcript;
+        self.playground_reference_user_edited = false;
+        true
+    }
+
+    fn playground_benchmark_results(&self) -> Vec<BenchmarkModelResult> {
+        let reference = self.playground_reference_transcript.trim();
+        if reference.is_empty() {
+            return Vec::new();
+        }
+
+        let inputs = self
+            .playground_cards
+            .iter()
+            .filter(|card| !card.transcript.trim().is_empty())
+            .map(|card| BenchmarkModelInput {
+                model_id: card.model.id.clone(),
+                model_name: card.model.name.clone(),
+                predicted_transcript: card.transcript.clone(),
+                reference_transcript: reference.to_owned(),
+                elapsed_ms: card.latency_ms,
+                audio_duration_ms: card.audio_duration_ms,
+                peak_ram_mb: card.peak_ram_mb,
+                peak_vram_mb: card.peak_vram_mb,
+            })
+            .collect::<Vec<_>>();
+
+        benchmark::score_benchmark_models(inputs)
     }
 
     fn apply_hotkey(&mut self) {
@@ -1035,8 +1151,7 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        let all_models = config::configured_models(&self.config);
-        let mut backends = all_models
+        let mut backends = config::configured_models(&self.config)
             .iter()
             .map(|model| model.backend.clone())
             .collect::<Vec<_>>();
@@ -1076,12 +1191,18 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
+                    if ui.add(small_button("Enable All")).clicked() {
+                        self.set_all_models_enabled(true);
+                    }
+                    if ui.add(small_button("Disable All")).clicked() {
+                        self.set_all_models_enabled(false);
+                    }
                 });
             });
 
             ui.add_space(12.0);
             let search = self.model_search.trim().to_ascii_lowercase();
-            let models = all_models
+            let models = config::configured_models(&self.config)
                 .into_iter()
                 .filter(|model| {
                     (self.model_backend_filter == "All"
@@ -1182,11 +1303,13 @@ impl LocalTranscriberApp {
                         }
                     }
                     if ui.add(small_button("Clear Results")).clicked() {
-                        for card in &mut self.playground_cards {
-                            card.transcript.clear();
-                            card.latency_ms = None;
-                            card.status = runtime_status_for_model(&self.config, &card.model);
-                        }
+                        self.clear_playground_results(true);
+                    }
+                    if ui.add(small_button("Enable All")).clicked() {
+                        self.set_all_models_enabled(true);
+                    }
+                    if ui.add(small_button("Disable All")).clicked() {
+                        self.set_all_models_enabled(false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         badge(
@@ -1211,15 +1334,87 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(section_heading("Benchmark Reference"));
+                        if let Some((model_name, _)) = self.active_playground_output() {
+                            ui.horizontal_wrapped(|ui| {
+                                badge(ui, "Active model truth", ChipTone::Active);
+                                badge(ui, &model_name, ChipTone::Neutral);
+                            });
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                badge(ui, "Waiting for active model", ChipTone::Warning);
+                                if let Some(model) = self.selected_model() {
+                                    badge(ui, &model.name, ChipTone::Neutral);
+                                }
+                            });
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                        if ui.add(small_button("Use Active Output")).clicked()
+                            && !self.apply_active_playground_output_as_reference()
+                        {
+                            self.status_message =
+                                "Run the active model before using its output.".to_owned();
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        TextEdit::multiline(&mut self.playground_reference_transcript)
+                            .desired_rows(4)
+                            .desired_width(usable_width(ui))
+                            .hint_text("Reference transcript"),
+                    )
+                    .changed()
+                {
+                    self.playground_reference_user_edited = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(label_caps("Ranking"));
+                    ComboBox::from_id_source("playground-ranking-mode")
+                        .selected_text(self.playground_ranking_mode.label())
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for mode in RankingMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.playground_ranking_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    let completed = self
+                        .playground_cards
+                        .iter()
+                        .filter(|card| !card.transcript.trim().is_empty())
+                        .count();
+                    badge(ui, &format!("{completed} completed"), ChipTone::Neutral);
+                });
+            });
+
+            let benchmark_results = self.playground_benchmark_results();
+            if !benchmark_results.is_empty() {
+                ui.add_space(12.0);
+                benchmark_grid_ui(
+                    ui,
+                    &benchmark_results,
+                    self.playground_ranking_mode,
+                    &self.config.selected_default_model,
+                );
+            }
+
+            ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.label(section_heading("Enabled Models"));
                     ui.label(mut_text(
                         "Performance comparison based on current system hardware.",
                     ));
-                });
-                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                    badge(ui, "Sort by Speed", ChipTone::Neutral);
                 });
             });
             ui.add_space(8.0);
@@ -1231,20 +1426,21 @@ impl LocalTranscriberApp {
             }
             for card_state in &mut self.playground_cards {
                 let model_id = card_state.model.id.clone();
+                let is_active_model = model_id == self.config.selected_default_model;
                 let drag_id = ui.id().with(("playground-card", &model_id));
                 let outer_width = usable_width(ui);
                 let (inner, dropped_payload) = ui
                     .scope(|ui| {
-                        suppress_drop_zone_frame(ui);
+                        configure_drop_zone_feedback(ui);
                         ui.allocate_ui_with_layout(
                             Vec2::new(outer_width, 0.0),
                             Layout::top_down(Align::LEFT),
                             |ui| {
                                 set_exact_width(ui, outer_width);
-                                ui.dnd_drop_zone::<String, _>(Frame::none(), |ui| {
-                                    full_width_frame(ui, card_frame(), |ui| {
+                                ui.dnd_drop_zone::<String, _>(drop_zone_frame(), |ui| {
+                                    full_width_frame(ui, model_card_frame(is_active_model), |ui| {
                                         ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
-                                            playground_card_ui(ui, card_state)
+                                            playground_card_ui(ui, card_state, is_active_model)
                                         })
                                         .inner
                                     })
@@ -1384,6 +1580,83 @@ impl LocalTranscriberApp {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
+                    ui.label("whisper.cpp compute");
+                    let mut compute_mode = self.config.whisper_compute_mode;
+                    ComboBox::from_id_source("whisper-compute-mode")
+                        .selected_text(compute_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in WhisperComputeMode::ALL {
+                                ui.selectable_value(&mut compute_mode, mode, mode.label());
+                            }
+                        });
+                    if compute_mode != self.config.whisper_compute_mode {
+                        self.config.whisper_compute_mode = compute_mode;
+                        self.save_config();
+                    }
+
+                    ui.label("GPU device");
+                    let mut gpu_device = self.config.whisper_gpu_device;
+                    if ui
+                        .add_enabled(
+                            compute_mode.uses_gpu(),
+                            egui::DragValue::new(&mut gpu_device).clamp_range(0..=16),
+                        )
+                        .changed()
+                    {
+                        self.config.whisper_gpu_device = gpu_device;
+                        self.save_config();
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "CUDA mode requires a CUDA-capable whisper.cpp executable or a dynamic CUDA backend.",
+                    )
+                    .color(MUTED_TEXT),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("CUDA backend");
+                    if ui
+                        .add_enabled(
+                            self.config.whisper_compute_mode.uses_gpu(),
+                            TextEdit::singleline(&mut self.whisper_cuda_backend_path_input)
+                                .desired_width(width_before_trailing(ui, 82.0, 64.0)),
+                        )
+                        .changed()
+                    {
+                        self.config.whisper_cuda_backend_path =
+                            path_from_input(&self.whisper_cuda_backend_path_input);
+                        self.save_config();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.config.whisper_compute_mode.uses_gpu(),
+                            small_button("Browse"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = FileDialog::new().pick_file() {
+                            self.whisper_cuda_backend_path_input = path.display().to_string();
+                            self.config.whisper_cuda_backend_path = Some(path);
+                            self.save_config();
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("CUDA library dirs");
+                    if ui
+                        .add_enabled(
+                            self.config.whisper_compute_mode.uses_gpu(),
+                            TextEdit::singleline(&mut self.whisper_cuda_library_paths_input)
+                                .desired_width(usable_width(ui)),
+                        )
+                        .changed()
+                    {
+                        self.config.whisper_cuda_library_paths =
+                            paths_from_list_input(&self.whisper_cuda_library_paths_input);
+                        self.save_config();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Model storage");
                     if ui
                         .add(
@@ -1509,6 +1782,7 @@ const SHELL_BG: Color32 = Color32::from_rgb(247, 249, 251);
 const CONTENT_BG: Color32 = Color32::from_rgb(247, 249, 251);
 const SIDEBAR_BG: Color32 = Color32::WHITE;
 const CARD_BG: Color32 = Color32::WHITE;
+const ACTIVE_CARD_BG: Color32 = Color32::from_rgb(239, 246, 255);
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
 const TEXT: Color32 = Color32::from_rgb(29, 33, 42);
 const MUTED_TEXT: Color32 = Color32::from_rgb(85, 95, 109);
@@ -1621,14 +1895,34 @@ fn card_frame() -> Frame {
         .inner_margin(Margin::same(14.0))
 }
 
-fn suppress_drop_zone_frame(ui: &mut Ui) {
+fn model_card_frame(selected: bool) -> Frame {
+    let fill = if selected { ACTIVE_CARD_BG } else { CARD_BG };
+    let stroke = if selected {
+        Stroke::new(1.5, ACCENT)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+    Frame::none()
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::same(14.0))
+}
+
+fn configure_drop_zone_feedback(ui: &mut Ui) {
     let transparent = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
     let transparent_stroke = Stroke::new(0.0, transparent);
     let widgets = &mut ui.visuals_mut().widgets;
     widgets.inactive.bg_fill = transparent;
     widgets.inactive.bg_stroke = transparent_stroke;
-    widgets.active.bg_fill = transparent;
-    widgets.active.bg_stroke = transparent_stroke;
+    widgets.active.bg_fill = ACTIVE_CARD_BG;
+    widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
+}
+
+fn drop_zone_frame() -> Frame {
+    Frame::none()
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(3.0))
 }
 
 fn panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -1691,78 +1985,60 @@ fn model_catalog_row(
     selected: bool,
     actions: impl FnOnce(&mut Ui),
 ) {
-    let stroke = if selected {
-        Stroke::new(1.0, ACCENT)
-    } else {
-        Stroke::new(1.0, BORDER)
-    };
-    full_width_frame(
-        ui,
-        Frame::none()
-            .fill(CARD_BG)
-            .stroke(stroke)
-            .rounding(Rounding::same(6.0))
-            .inner_margin(Margin::same(14.0)),
-        |ui| {
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let actions_width = 112.0;
-                let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(detail_width, 0.0),
-                        Layout::top_down(Align::LEFT),
-                        |ui| {
-                            set_exact_width(ui, detail_width);
-                            ui.horizontal_wrapped(|ui| {
-                                wrapped_label(ui, body_strong(&model.name));
-                                if selected {
-                                    badge(ui, "Active", ChipTone::Active);
-                                }
-                            });
-                            wrapped_label(ui, mut_text(&model.description));
-                            ui.add_space(6.0);
-                            ui.horizontal_wrapped(|ui| {
-                                badge(ui, &model.backend, ChipTone::Neutral);
-                                badge(
-                                    ui,
-                                    &install_status.label(),
-                                    install_chip_tone(install_status),
-                                );
-                                badge(
-                                    ui,
-                                    &format!("RAM {}", model.expected_ram),
-                                    ChipTone::Neutral,
-                                );
-                                badge(
-                                    ui,
-                                    &format!("{} speed", model.speed_tier),
-                                    ChipTone::Neutral,
-                                );
-                                badge(
-                                    ui,
-                                    &format!("{} accuracy", model.accuracy_tier),
-                                    ChipTone::Neutral,
-                                );
-                                if !backend_capabilities(&model.backend).runnable {
-                                    badge(ui, "Planned", ChipTone::Warning);
-                                }
-                            });
-                        },
-                    );
-                    ui.add_space(12.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(actions_width, 0.0),
-                        Layout::top_down(Align::RIGHT),
-                        |ui| {
-                            set_exact_width(ui, actions_width);
-                            actions(ui);
-                        },
-                    );
-                });
+    full_width_frame(ui, model_card_frame(selected), |ui| {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let actions_width = 112.0;
+            let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(detail_width, 0.0),
+                    Layout::top_down(Align::LEFT),
+                    |ui| {
+                        set_exact_width(ui, detail_width);
+                        wrapped_label(ui, card_title(&model.name, selected));
+                        wrapped_label(ui, mut_text(&model.description));
+                        ui.add_space(8.0);
+                        tag_row(ui, |ui| {
+                            badge(ui, &model.backend, ChipTone::Neutral);
+                            badge(
+                                ui,
+                                &install_status.label(),
+                                install_chip_tone(install_status),
+                            );
+                            badge(
+                                ui,
+                                &format!("RAM {}", model.expected_ram),
+                                ChipTone::Neutral,
+                            );
+                            badge(
+                                ui,
+                                &format!("{} speed", model.speed_tier),
+                                ChipTone::Neutral,
+                            );
+                            badge(
+                                ui,
+                                &format!("{} accuracy", model.accuracy_tier),
+                                ChipTone::Neutral,
+                            );
+                            if !backend_capabilities(&model.backend).runnable {
+                                badge(ui, "Planned", ChipTone::Warning);
+                            }
+                        });
+                    },
+                );
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(actions_width, 0.0),
+                    Layout::top_down(Align::RIGHT),
+                    |ui| {
+                        set_exact_width(ui, actions_width);
+                        actions(ui);
+                    },
+                );
             });
-        },
-    );
+        });
+    });
 }
 
 fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
@@ -1784,7 +2060,11 @@ fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
     );
 }
 
-fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<PlaygroundAction> {
+fn playground_card_ui(
+    ui: &mut Ui,
+    card_state: &mut PlaygroundCardState,
+    is_active_model: bool,
+) -> Vec<PlaygroundAction> {
     let mut actions = Vec::new();
 
     ui.scope(|ui| {
@@ -1808,10 +2088,10 @@ fn playground_card_ui(ui: &mut Ui, card_state: &mut PlaygroundCardState) -> Vec<
                 Layout::top_down(Align::LEFT),
                 |ui| {
                     set_exact_width(ui, detail_width);
-                    wrapped_label(ui, body_strong(&card_state.model.name));
+                    wrapped_label(ui, card_title(&card_state.model.name, is_active_model));
                     wrapped_label(ui, mut_text(&card_state.model.description));
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
+                    ui.add_space(8.0);
+                    tag_row(ui, |ui| {
                         badge(ui, &card_state.model.backend, ChipTone::Neutral);
                         badge(
                             ui,
@@ -1895,6 +2175,184 @@ fn playground_result_editor(ui: &mut Ui, result_id: &str, transcript: &str) -> e
     } else {
         response.on_hover_text(transcript)
     }
+}
+
+fn benchmark_grid_ui(
+    ui: &mut Ui,
+    results: &[BenchmarkModelResult],
+    ranking_mode: RankingMode,
+    active_model_id: &str,
+) {
+    let mut rows = results.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let left_score = left
+            .overall_scores
+            .get(&ranking_mode)
+            .copied()
+            .unwrap_or(-1.0);
+        let right_score = right
+            .overall_scores
+            .get(&ranking_mode)
+            .copied()
+            .unwrap_or(-1.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let best_score = rows
+        .iter()
+        .filter_map(|result| result.overall_scores.get(&ranking_mode).copied())
+        .reduce(f64::max);
+    let metrics = visible_benchmark_metrics(results);
+
+    panel(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui.label(section_heading("Benchmark Scores"));
+                ui.label(mut_text(
+                    "Raw metric values are colored by relative score in this run.",
+                ));
+            });
+            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                badge(ui, ranking_mode.label(), ChipTone::Active);
+            });
+        });
+        ui.add_space(10.0);
+        ScrollArea::horizontal()
+            .id_source("benchmark-grid-scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("benchmark-grid")
+                    .striped(true)
+                    .num_columns(metrics.len() + 2)
+                    .spacing(Vec2::new(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(label_caps("Model"));
+                        ui.label(label_caps("Overall")).on_hover_text(
+                            "Weighted normalized score for the selected ranking mode.",
+                        );
+                        for metric in &metrics {
+                            ui.label(label_caps(metric.header()))
+                                .on_hover_text(metric.tooltip());
+                        }
+                        ui.end_row();
+
+                        for result in rows {
+                            let overall = result.overall_scores.get(&ranking_mode).copied();
+                            let is_best = best_score
+                                .zip(overall)
+                                .is_some_and(|(best, score)| (best - score).abs() <= 0.0001);
+                            benchmark_model_cell(ui, result, active_model_id, is_best);
+                            benchmark_score_cell(
+                                ui,
+                                benchmark::format_overall_score(overall),
+                                overall,
+                            );
+                            for metric in &metrics {
+                                let value = result.raw_metrics.value(*metric);
+                                let score = result.normalized_scores.get(metric).copied();
+                                benchmark_score_cell(
+                                    ui,
+                                    benchmark::format_metric_value(*metric, value),
+                                    score,
+                                );
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
+}
+
+fn visible_benchmark_metrics(results: &[BenchmarkModelResult]) -> Vec<BenchmarkMetric> {
+    [
+        BenchmarkMetric::Wer,
+        BenchmarkMetric::Cer,
+        BenchmarkMetric::Wip,
+        BenchmarkMetric::Wil,
+        BenchmarkMetric::Latency,
+        BenchmarkMetric::Rtf,
+        BenchmarkMetric::Ram,
+        BenchmarkMetric::Vram,
+    ]
+    .into_iter()
+    .filter(|metric| {
+        matches!(
+            metric,
+            BenchmarkMetric::Wer
+                | BenchmarkMetric::Cer
+                | BenchmarkMetric::Wip
+                | BenchmarkMetric::Wil
+        ) || results
+            .iter()
+            .any(|result| result.raw_metrics.value(*metric).is_some())
+    })
+    .collect()
+}
+
+fn benchmark_model_cell(
+    ui: &mut Ui,
+    result: &BenchmarkModelResult,
+    active_model_id: &str,
+    is_best: bool,
+) {
+    ui.vertical(|ui| {
+        ui.set_min_width(190.0);
+        wrapped_label(ui, body_strong(&result.model_name));
+        ui.horizontal_wrapped(|ui| {
+            if result.model_id == active_model_id {
+                badge(ui, "Reference", ChipTone::Active);
+            }
+            if is_best {
+                badge(ui, "Best", ChipTone::Success);
+            }
+        });
+    });
+}
+
+fn benchmark_score_cell(ui: &mut Ui, label: String, score: Option<f64>) {
+    Frame::none()
+        .fill(benchmark_heatmap_fill(score))
+        .stroke(Stroke::new(1.0, BORDER))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::symmetric(8.0, 5.0))
+        .show(ui, |ui| {
+            ui.set_min_width(68.0);
+            ui.label(RichText::new(label).color(TEXT).strong());
+        });
+}
+
+fn benchmark_heatmap_fill(score: Option<f64>) -> Color32 {
+    let Some(score) = score else {
+        return Color32::from_rgb(248, 250, 252);
+    };
+    let score = score.clamp(0.0, 1.0);
+    if score < 0.5 {
+        let t = score / 0.5;
+        lerp_color(
+            Color32::from_rgb(254, 226, 226),
+            Color32::from_rgb(254, 249, 195),
+            t,
+        )
+    } else {
+        let t = (score - 0.5) / 0.5;
+        lerp_color(
+            Color32::from_rgb(254, 249, 195),
+            Color32::from_rgb(220, 252, 231),
+            t,
+        )
+    }
+}
+
+fn lerp_color(start: Color32, end: Color32, t: f64) -> Color32 {
+    let t = t.clamp(0.0, 1.0) as f32;
+    let mix = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * t).round() as u8 };
+    Color32::from_rgb(
+        mix(start.r(), end.r()),
+        mix(start.g(), end.g()),
+        mix(start.b(), end.b()),
+    )
 }
 
 fn usable_width(ui: &Ui) -> f32 {
@@ -2047,6 +2505,13 @@ fn small_button(label: &str) -> Button<'_> {
         .min_size(Vec2::new(68.0, 30.0))
 }
 
+fn tag_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(7.0, 6.0);
+        add_contents(ui);
+    });
+}
+
 fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
     let tone = match status {
         TranscriptionStatus::Idle => ChipTone::Success,
@@ -2067,7 +2532,7 @@ fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
         .fill(fill)
         .stroke(stroke)
         .rounding(Rounding::same(4.0))
-        .inner_margin(Margin::symmetric(7.0, 3.0))
+        .inner_margin(Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(12.0).color(text).strong());
         })
@@ -2093,6 +2558,13 @@ fn body_strong(label: &str) -> RichText {
     RichText::new(label)
         .font(FontId::proportional(15.0))
         .color(TEXT)
+        .strong()
+}
+
+fn card_title(label: &str, active: bool) -> RichText {
+    RichText::new(label)
+        .font(FontId::proportional(15.0))
+        .color(if active { ACCENT } else { TEXT })
         .strong()
 }
 
@@ -2210,6 +2682,28 @@ fn path_from_input(input: &str) -> Option<PathBuf> {
     }
 }
 
+fn path_list_input(paths: &[PathBuf]) -> String {
+    std::env::join_paths(paths)
+        .ok()
+        .and_then(|paths| paths.into_string().ok())
+        .unwrap_or_else(|| {
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+}
+
+fn paths_from_list_input(input: &str) -> Vec<PathBuf> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(trimmed).collect()
+    }
+}
+
 fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
     if enabled {
         if !config.enabled_models.iter().any(|id| id == model_id) {
@@ -2217,13 +2711,17 @@ fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
         }
     } else {
         config.enabled_models.retain(|id| id != model_id);
-        if config.selected_default_model == model_id {
-            config.selected_default_model = config
-                .enabled_models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "whisper_cpp_tiny_en".to_owned());
-        }
+    }
+}
+
+fn set_all_models_enabled(config: &mut AppConfig, enabled: bool) {
+    if enabled {
+        config.enabled_models = config::configured_models(config)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+    } else {
+        config.enabled_models.clear();
     }
 }
 
@@ -2249,6 +2747,9 @@ fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
                 status,
                 transcript: String::new(),
                 latency_ms: None,
+                audio_duration_ms: None,
+                peak_ram_mb: None,
+                peak_vram_mb: None,
             }
         })
         .collect()
@@ -2522,6 +3023,41 @@ mod layout_tests {
 
         assert_eq!(clear_color, CONTENT_BG.to_normalized_gamma_f32());
         assert_eq!(clear_color[3], 1.0);
+    }
+
+    #[test]
+    fn active_model_can_stay_pinned_when_disabled() {
+        let mut config = AppConfig::default();
+        let active_model = config.selected_default_model.clone();
+
+        set_model_enabled(&mut config, &active_model, false);
+        config::normalize_config(&mut config);
+
+        assert_eq!(config.selected_default_model, active_model);
+        assert!(!config.enabled_models.iter().any(|id| id == &active_model));
+    }
+
+    #[test]
+    fn set_all_models_enabled_toggles_every_catalog_model() {
+        let mut config = AppConfig::default();
+
+        set_all_models_enabled(&mut config, false);
+        config::normalize_config(&mut config);
+        assert!(config.enabled_models.is_empty());
+        assert!(
+            config::configured_models(&config)
+                .iter()
+                .all(|model| !model.enabled)
+        );
+
+        set_all_models_enabled(&mut config, true);
+        config::normalize_config(&mut config);
+        assert!(!config.enabled_models.is_empty());
+        assert!(
+            config::configured_models(&config)
+                .iter()
+                .all(|model| model.enabled)
+        );
     }
 
     #[test]
@@ -2833,6 +3369,12 @@ mod layout_tests {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            whisper_cuda_backend_path_input: config
+                .whisper_cuda_backend_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            whisper_cuda_library_paths_input: path_list_input(&config.whisper_cuda_library_paths),
             model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
             model_search: String::new(),
             model_backend_filter: "All".to_owned(),
@@ -2840,6 +3382,9 @@ mod layout_tests {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             playground_cards: cards_from_config(&config),
+            playground_reference_transcript: String::new(),
+            playground_reference_user_edited: false,
+            playground_ranking_mode: RankingMode::Balanced,
             hotkey_service: HotkeyService::new(&config.hotkey),
             config,
             config_path: None,

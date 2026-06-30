@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,18 @@ pub fn input_device_names() -> Result<Vec<String>> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+pub fn wav_duration_ms(path: &Path) -> Option<u128> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 || spec.channels == 0 {
+        return None;
+    }
+
+    let total_channel_samples = reader.duration() as u128;
+    let frames = total_channel_samples / spec.channels as u128;
+    Some(frames * 1000 / spec.sample_rate as u128)
 }
 
 pub fn start_recording(

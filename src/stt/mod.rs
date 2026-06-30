@@ -20,8 +20,15 @@ pub fn transcribe_with_config(
 ) -> Result<TranscriptResult> {
     match model.backend.as_str() {
         "whisper.cpp" => {
-            let backend =
-                whisper_cpp::WhisperCppBackend::new(config.whisper_executable_path.clone());
+            let backend = whisper_cpp::WhisperCppBackend::new(
+                config.whisper_executable_path.clone(),
+                whisper_cpp::WhisperCppOptions {
+                    use_gpu: config.whisper_compute_mode.uses_gpu(),
+                    gpu_device: config.whisper_gpu_device,
+                    cuda_backend_path: config.whisper_cuda_backend_path.clone(),
+                    cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+                },
+            );
             let backend_id = backend.id().to_owned();
             if !backend
                 .list_models()
