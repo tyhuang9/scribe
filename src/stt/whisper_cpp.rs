@@ -141,24 +141,46 @@ impl SttBackend for WhisperCppBackend {
 }
 
 pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
-    let bundled_root = env::current_exe()
+    resolve_whisper_cpp_executable_from_candidates(
+        bundled_runtime_root(),
+        managed_runtime_roots(config),
+        dev_runtime_paths(config),
+    )
+}
+
+pub fn resolve_whisper_cpp_packaged_executable(config: &AppConfig) -> Option<PathBuf> {
+    resolve_whisper_cpp_executable_from_candidates(
+        bundled_runtime_root(),
+        managed_runtime_roots(config),
+        [],
+    )
+}
+
+fn bundled_runtime_root() -> Option<PathBuf> {
+    env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let managed_roots = [
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn managed_runtime_roots(config: &AppConfig) -> Vec<PathBuf> {
+    [
         config::managed_runtime_path(config, "whisper.cpp"),
         Some(config::runtime_storage_dir().join("whisper_cpp")),
-    ];
-    let dev_paths = [
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn dev_runtime_paths(config: &AppConfig) -> Vec<PathBuf> {
+    [
         env::var_os("SCRIBE_WHISPER_CPP_CLI").map(PathBuf::from),
         env::var_os("SCRIBE_WHISPER_CUDA_CLI").map(PathBuf::from),
         config.whisper_executable_path.clone(),
-    ];
-
-    resolve_whisper_cpp_executable_from_candidates(
-        bundled_root.into_iter(),
-        managed_roots.into_iter().flatten(),
-        dev_paths.into_iter().flatten(),
-    )
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 pub(crate) fn resolve_whisper_cpp_executable_from_candidates(

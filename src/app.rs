@@ -824,10 +824,19 @@ impl LocalTranscriberApp {
                                 .managed_models
                                 .insert(model_id.clone(), config::ManagedModelInstall { path });
                         }
+                        self.record_packaged_runtime_metadata(&model);
                     }
                     self.save_config();
                     self.status = TranscriptionStatus::Idle;
-                    self.status_message = "Model downloaded and ready.".to_owned();
+                    self.status_message = match config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == model_id)
+                        .map(|model| runtime_status_for_model(&self.config, &model))
+                    {
+                        Some(ModelRuntimeStatus::Ready) => "Model installed and ready.".to_owned(),
+                        _ => "Model installed. Managed runtime is not available in this build yet."
+                            .to_owned(),
+                    };
                 }
                 AppEvent::ModelDownloadFailed { model_id, message } => {
                     self.model_downloads
@@ -1185,6 +1194,22 @@ impl LocalTranscriberApp {
             Ok(false) => format!("Removed {} from Scribe.", model.name),
             Err(message) => format!("Removed {} from Scribe. {message}", model.name),
         };
+    }
+
+    fn record_packaged_runtime_metadata(&mut self, model: &SttModelInfo) {
+        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+            return;
+        };
+        if !provider.runtime_install_supported || model.backend != "whisper.cpp" {
+            return;
+        }
+        if let Some(path) = stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(&self.config)
+        {
+            self.config.managed_runtimes.insert(
+                provider.runtime_id.to_owned(),
+                config::ManagedRuntimeInstall { path },
+            );
+        }
     }
 }
 
