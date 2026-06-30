@@ -9,11 +9,11 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
 - Local JSON config for hotkey, model selections, executable paths, whisper.cpp CUDA/CPU compute mode, managed model storage, theme mode, audio input device, debug mode, and max recording duration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
-- Global hotkey support with `Ctrl+Shift+Space` as the default.
+- Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
 - `whisper.cpp` backend integration through a configured executable path, managed downloaded models, CUDA GPU device selection, and CPU fallback mode.
 - Background downloads for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
-- Non-blocking UI for recording and transcription using background threads and channels.
+- Non-blocking UI for recording and transcription using background threads and channels, with debug-mode latency breakdown for the latest transcription.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
 - Model metadata for:
@@ -138,6 +138,7 @@ whisper.cpp model files into managed local storage.
 4. Set the `whisper.cpp executable` path.
    - Newer whisper.cpp builds usually produce `whisper-cli`.
    - Older builds may produce `main`.
+   - Typed path changes are saved when you click `Apply`; `Browse` saves the selected path immediately.
 5. Set `whisper.cpp compute` to `CUDA GPU` and choose GPU device `0`, or set it to `CPU only` for fallback.
 6. Open `Models` and download `tiny.en`, `base.en`, `small.en`, or `medium.en`.
 7. Select that model as the default.
@@ -183,7 +184,7 @@ The config stores:
 - selected default model
 - enabled models
 - persisted model playground order
-- global hotkey
+- global hotkey and hotkey mode
 - whisper.cpp executable path
 - whisper.cpp compute mode, GPU device, CUDA backend path, and CUDA library directories
 - managed model storage directory
@@ -197,7 +198,7 @@ The config stores:
 - clipboard restore after insertion
 - paste automation delay
 
-Temporary WAV files are deleted after transcription unless debug mode is enabled.
+Temporary WAV files are deleted after transcription unless debug mode is enabled. Debug mode also shows the latest transcription latency breakdown in Settings.
 
 ## Notes
 
