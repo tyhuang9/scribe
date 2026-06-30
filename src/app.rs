@@ -76,6 +76,81 @@ struct ActiveRecording {
     stop_requested: bool,
     started_at: Instant,
     max_duration_seconds: u32,
+    latency: LatencyTrace,
+}
+
+#[derive(Clone, Debug)]
+struct LatencyTrace {
+    activation_at: Instant,
+    recorder_started_at: Option<Instant>,
+    stop_requested_at: Option<Instant>,
+    wav_finalized_at: Option<Instant>,
+    transcription_dispatched_at: Option<Instant>,
+    transcription_completed_at: Option<Instant>,
+    ui_result_at: Option<Instant>,
+    paste_completed_at: Option<Instant>,
+}
+
+impl LatencyTrace {
+    fn started_now() -> Self {
+        Self {
+            activation_at: Instant::now(),
+            recorder_started_at: None,
+            stop_requested_at: None,
+            wav_finalized_at: None,
+            transcription_dispatched_at: None,
+            transcription_completed_at: None,
+            ui_result_at: None,
+            paste_completed_at: None,
+        }
+    }
+
+    fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(duration) = duration_between(Some(self.activation_at), self.recorder_started_at)
+        {
+            lines.push(format!("Activation to recorder ready: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.stop_requested_at, self.wav_finalized_at) {
+            lines.push(format!("Stop to WAV finalized: {duration}"));
+        }
+        if let Some(duration) = duration_between(
+            self.transcription_dispatched_at,
+            self.transcription_completed_at,
+        ) {
+            lines.push(format!("Transcription job: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.transcription_completed_at, self.ui_result_at)
+        {
+            lines.push(format!("STT done to UI update: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.ui_result_at, self.paste_completed_at) {
+            lines.push(format!("Focused-app output: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.final_observed_instant())
+        {
+            lines.push(format!("Total observed: {duration}"));
+        }
+        lines
+    }
+
+    fn final_observed_instant(&self) -> Option<Instant> {
+        self.paste_completed_at
+            .or(self.ui_result_at)
+            .or(self.transcription_completed_at)
+            .or(self.wav_finalized_at)
+            .or(self.stop_requested_at)
+            .or(self.recorder_started_at)
+    }
+}
+
+fn duration_between(start: Option<Instant>, end: Option<Instant>) -> Option<String> {
+    Some(format_duration_ms(end?.saturating_duration_since(start?)))
+}
+
+fn format_duration_ms(duration: Duration) -> String {
+    format!("{} ms", duration.as_millis())
 }
 
 #[derive(Clone, Debug)]
@@ -102,11 +177,13 @@ enum AppEvent {
     TranscriptionDone {
         source: RecordingSource,
         result: TranscriptResult,
+        latency: Option<LatencyTrace>,
     },
     TranscriptionFailed {
         source: RecordingSource,
         model_id: String,
         message: String,
+        latency: Option<LatencyTrace>,
     },
     ModelDownloadProgress {
         model_id: String,
@@ -148,6 +225,7 @@ pub struct LocalTranscriberApp {
     playground_ranking_mode: RankingMode,
     playground_pending: usize,
     playground_audio_path: Option<PathBuf>,
+    latest_latency: Option<LatencyTrace>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
     quit_requested: bool,
@@ -204,6 +282,7 @@ impl LocalTranscriberApp {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
+            latest_latency: None,
             tray_service: None,
             quit_requested: false,
         };
@@ -331,6 +410,7 @@ impl LocalTranscriberApp {
         if self.active_recording.is_some() {
             return;
         }
+        let mut latency = LatencyTrace::started_now();
 
         if source == RecordingSource::Transcribe {
             let Some(model) = self.selected_model() else {
@@ -356,6 +436,7 @@ impl LocalTranscriberApp {
             self.config.audio_input_device_name.clone(),
         ) {
             Ok(session) => {
+                latency.recorder_started_at = Some(Instant::now());
                 let path = session.audio_path.display().to_string();
                 self.active_recording = Some(ActiveRecording {
                     session,
@@ -363,6 +444,7 @@ impl LocalTranscriberApp {
                     stop_requested: false,
                     started_at: Instant::now(),
                     max_duration_seconds: self.config.max_recording_seconds,
+                    latency,
                 });
                 self.status = TranscriptionStatus::Listening;
                 self.status_message = format!("Listening. Temporary WAV: {path}");
@@ -379,6 +461,7 @@ impl LocalTranscriberApp {
             if !active.stop_requested {
                 active.session.stop();
                 active.stop_requested = true;
+                active.latency.stop_requested_at = Some(Instant::now());
                 self.status_message = "Stopping recording".to_owned();
             }
         }
@@ -401,14 +484,18 @@ impl LocalTranscriberApp {
         });
 
         if let Some((source, result)) = finished {
-            self.active_recording = None;
+            let mut active = self
+                .active_recording
+                .take()
+                .expect("finished recording should still be active");
+            active.latency.wav_finalized_at = Some(Instant::now());
             match result {
                 Ok(audio_path) => {
                     self.status = TranscriptionStatus::Transcribing;
                     self.status_message = format!("Transcribing {}", audio_path.display());
                     match source {
                         RecordingSource::Transcribe => {
-                            self.dispatch_default_transcription(audio_path)
+                            self.dispatch_default_transcription(audio_path, active.latency)
                         }
                         RecordingSource::Playground => {
                             self.dispatch_playground_transcriptions(audio_path)
@@ -510,7 +597,15 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                AppEvent::TranscriptionDone { source, result } => {
+                AppEvent::TranscriptionDone {
+                    source,
+                    result,
+                    latency,
+                } => {
+                    let mut latency = latency.map(|mut latency| {
+                        latency.ui_result_at = Some(Instant::now());
+                        latency
+                    });
                     match source {
                         RecordingSource::Transcribe => {
                             let segment_count = result.segments.len();
@@ -546,6 +641,9 @@ impl LocalTranscriberApp {
                                     &self.transcript,
                                     &self.config,
                                 );
+                                if let Some(latency) = latency.as_mut() {
+                                    latency.paste_completed_at = Some(Instant::now());
+                                }
                                 self.status_message = format!(
                                     "{completion_message}. {}",
                                     output_result.status_message()
@@ -553,6 +651,7 @@ impl LocalTranscriberApp {
                             } else {
                                 self.status_message = completion_message;
                             }
+                            self.latest_latency = latency;
                         }
                         RecordingSource::Playground => {
                             self.apply_playground_result(result);
@@ -564,7 +663,12 @@ impl LocalTranscriberApp {
                     source,
                     model_id,
                     message,
+                    latency,
                 } => {
+                    if let Some(mut latency) = latency {
+                        latency.ui_result_at = Some(Instant::now());
+                        self.latest_latency = Some(latency);
+                    }
                     match source {
                         RecordingSource::Transcribe => {
                             self.status = TranscriptionStatus::Error;
@@ -639,7 +743,7 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn dispatch_default_transcription(&mut self, audio_path: PathBuf) {
+    fn dispatch_default_transcription(&mut self, audio_path: PathBuf, mut latency: LatencyTrace) {
         let Some(model) = self.selected_model() else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "No default model selected".to_owned();
@@ -647,12 +751,14 @@ impl LocalTranscriberApp {
             return;
         };
 
+        latency.transcription_dispatched_at = Some(Instant::now());
         let config = self.config.clone();
         let tx = self.tx.clone();
         let delete_after = !self.config.debug_mode;
 
         thread::spawn(move || {
             let result = stt::transcribe_with_config(&config, audio_path.clone(), model.clone());
+            latency.transcription_completed_at = Some(Instant::now());
             if delete_after {
                 let _ = fs::remove_file(&audio_path);
             }
@@ -662,6 +768,7 @@ impl LocalTranscriberApp {
                     let _ = tx.send(AppEvent::TranscriptionDone {
                         source: RecordingSource::Transcribe,
                         result,
+                        latency: Some(latency),
                     });
                 }
                 Err(err) => {
@@ -669,6 +776,7 @@ impl LocalTranscriberApp {
                         source: RecordingSource::Transcribe,
                         model_id: model.id,
                         message: err.to_string(),
+                        latency: Some(latency),
                     });
                 }
             }
@@ -716,6 +824,7 @@ impl LocalTranscriberApp {
                         let _ = tx.send(AppEvent::TranscriptionDone {
                             source: RecordingSource::Playground,
                             result,
+                            latency: None,
                         });
                     }
                     Err(err) => {
@@ -723,6 +832,7 @@ impl LocalTranscriberApp {
                             source: RecordingSource::Playground,
                             model_id: model.id,
                             message: err.to_string(),
+                            latency: None,
                         });
                     }
                 }
@@ -1793,6 +1903,15 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Runtime"));
                 ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").color(MUTED_TEXT));
+                if self.config.debug_mode {
+                    if let Some(latency) = &self.latest_latency {
+                        ui.add_space(8.0);
+                        ui.label(section_heading("Last Latency"));
+                        for line in latency.summary_lines() {
+                            ui.label(mut_text(line));
+                        }
+                    }
+                }
                 if self.tray_service.is_none() {
                     ui.colored_label(
                         ERROR,
@@ -3158,6 +3277,33 @@ mod layout_tests {
     }
 
     #[test]
+    fn latency_summary_reports_observed_phases_and_total() {
+        let base = Instant::now();
+        let trace = LatencyTrace {
+            activation_at: base,
+            recorder_started_at: Some(base + Duration::from_millis(10)),
+            stop_requested_at: Some(base + Duration::from_millis(100)),
+            wav_finalized_at: Some(base + Duration::from_millis(140)),
+            transcription_dispatched_at: Some(base + Duration::from_millis(150)),
+            transcription_completed_at: Some(base + Duration::from_millis(650)),
+            ui_result_at: Some(base + Duration::from_millis(660)),
+            paste_completed_at: Some(base + Duration::from_millis(735)),
+        };
+
+        assert_eq!(
+            trace.summary_lines(),
+            vec![
+                "Activation to recorder ready: 10 ms",
+                "Stop to WAV finalized: 40 ms",
+                "Transcription job: 500 ms",
+                "STT done to UI update: 10 ms",
+                "Focused-app output: 75 ms",
+                "Total observed: 735 ms",
+            ]
+        );
+    }
+
+    #[test]
     fn set_all_models_enabled_toggles_every_catalog_model() {
         let mut config = AppConfig::default();
 
@@ -3517,6 +3663,7 @@ mod layout_tests {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
+            latest_latency: None,
             tray_service: None,
             quit_requested: false,
         }
