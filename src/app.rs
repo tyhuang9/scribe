@@ -82,6 +82,12 @@ struct ActiveRecording {
     latency: LatencyTrace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrayUiState {
+    is_recording: bool,
+    has_transcript: bool,
+}
+
 #[derive(Clone, Debug)]
 struct LatencyTrace {
     activation_at: Instant,
@@ -231,6 +237,7 @@ pub struct LocalTranscriberApp {
     latest_latency: Option<LatencyTrace>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
+    last_tray_state: Option<TrayUiState>,
     quit_requested: bool,
 }
 
@@ -287,12 +294,21 @@ impl LocalTranscriberApp {
             playground_audio_path: None,
             latest_latency: None,
             tray_service: None,
+            last_tray_state: None,
             quit_requested: false,
         };
 
-        match TrayService::new(false, false) {
+        let initial_tray_state = TrayUiState {
+            is_recording: false,
+            has_transcript: false,
+        };
+        match TrayService::new(
+            initial_tray_state.is_recording,
+            initial_tray_state.has_transcript,
+        ) {
             Ok(tray_service) => {
                 app.tray_service = Some(tray_service);
+                app.last_tray_state = Some(initial_tray_state);
             }
             Err(err) => {
                 app.status_message = format!("Tray unavailable: {err}");
@@ -596,11 +612,20 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn sync_tray_state(&self) {
-        if let Some(tray_service) = &self.tray_service {
-            tray_service.set_recording(self.active_recording.is_some());
-            tray_service.set_has_transcript(!self.transcript.trim().is_empty());
+    fn sync_tray_state(&mut self) {
+        let Some(tray_service) = &self.tray_service else {
+            self.last_tray_state = None;
+            return;
+        };
+
+        let current = tray_ui_state(self.active_recording.is_some(), &self.transcript);
+        if !tray_state_needs_sync(self.last_tray_state, current) {
+            return;
         }
+
+        tray_service.set_recording(current.is_recording);
+        tray_service.set_has_transcript(current.has_transcript);
+        self.last_tray_state = Some(current);
     }
 
     fn apply_tray_command(&mut self, command: TrayCommand, ctx: &egui::Context) {
@@ -2838,6 +2863,17 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
     format!("{elapsed}s elapsed - {remaining}s left")
 }
 
+fn tray_ui_state(is_recording: bool, transcript: &str) -> TrayUiState {
+    TrayUiState {
+        is_recording,
+        has_transcript: !transcript.trim().is_empty(),
+    }
+}
+
+fn tray_state_needs_sync(previous: Option<TrayUiState>, current: TrayUiState) -> bool {
+    previous != Some(current)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HotkeyRecordingAction {
     StartTranscribe,
@@ -3496,6 +3532,52 @@ mod layout_tests {
     }
 
     #[test]
+    fn tray_state_tracks_visible_recording_and_transcript_changes() {
+        let idle = tray_ui_state(false, "  \n ");
+        assert_eq!(
+            idle,
+            TrayUiState {
+                is_recording: false,
+                has_transcript: false
+            }
+        );
+
+        let recording = tray_ui_state(true, "  \n ");
+        assert_eq!(
+            recording,
+            TrayUiState {
+                is_recording: true,
+                has_transcript: false
+            }
+        );
+
+        let with_transcript = tray_ui_state(false, "hello");
+        assert_eq!(
+            with_transcript,
+            TrayUiState {
+                is_recording: false,
+                has_transcript: true
+            }
+        );
+    }
+
+    #[test]
+    fn tray_state_syncs_only_when_cached_state_changes() {
+        let idle = tray_ui_state(false, "");
+        let recording = tray_ui_state(true, "");
+        let with_transcript = tray_ui_state(false, "hello");
+
+        assert!(tray_state_needs_sync(None, idle));
+        assert!(!tray_state_needs_sync(Some(idle), idle));
+        assert!(tray_state_needs_sync(Some(idle), recording));
+        assert!(tray_state_needs_sync(Some(idle), with_transcript));
+        assert!(!tray_state_needs_sync(
+            Some(with_transcript),
+            tray_ui_state(false, "  hello  ")
+        ));
+    }
+
+    #[test]
     fn set_all_models_enabled_toggles_every_catalog_model() {
         let mut config = AppConfig::default();
 
@@ -3857,6 +3939,7 @@ mod layout_tests {
             playground_audio_path: None,
             latest_latency: None,
             tray_service: None,
+            last_tray_state: None,
             quit_requested: false,
         }
     }
