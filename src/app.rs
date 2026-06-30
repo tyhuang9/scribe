@@ -208,6 +208,71 @@ enum AppEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelPrimaryAction {
+    Install,
+    Retry,
+    Installing,
+    Select,
+    Active,
+}
+
+impl ModelPrimaryAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "Install",
+            Self::Retry => "Retry",
+            Self::Installing => "Installing",
+            Self::Select => "Select",
+            Self::Active => "Active",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModelActionState {
+    primary: ModelPrimaryAction,
+    primary_enabled: bool,
+    show_uninstall: bool,
+}
+
+fn model_action_state(
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+    selected: bool,
+) -> ModelActionState {
+    match install_status {
+        ModelInstallStatus::Installed => ModelActionState {
+            primary: if selected {
+                ModelPrimaryAction::Active
+            } else {
+                ModelPrimaryAction::Select
+            },
+            primary_enabled: !selected,
+            show_uninstall: true,
+        },
+        ModelInstallStatus::Downloading { .. } => ModelActionState {
+            primary: ModelPrimaryAction::Installing,
+            primary_enabled: false,
+            show_uninstall: false,
+        },
+        ModelInstallStatus::Error(_) => ModelActionState {
+            primary: ModelPrimaryAction::Retry,
+            primary_enabled: supports_managed_install(model),
+            show_uninstall: false,
+        },
+        ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => ModelActionState {
+            primary: ModelPrimaryAction::Install,
+            primary_enabled: supports_managed_install(model),
+            show_uninstall: false,
+        },
+    }
+}
+
+fn supports_managed_install(model: &SttModelInfo) -> bool {
+    model.download_model.is_some() && backend_capabilities(&model.backend).supports_downloads
+}
+
 pub struct LocalTranscriberApp {
     config: AppConfig,
     config_path: Option<PathBuf>,
@@ -790,6 +855,16 @@ impl LocalTranscriberApp {
                 AppEvent::ModelDownloadDone { model_id } => {
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
+                    if let Some(model) = config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == model_id)
+                    {
+                        if let Some(path) = config::downloaded_model_path(&self.config, &model) {
+                            self.config
+                                .managed_models
+                                .insert(model_id.clone(), config::ManagedModelInstall { path });
+                        }
+                    }
                     self.save_config();
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = "Model downloaded and ready.".to_owned();
@@ -1076,9 +1151,6 @@ impl LocalTranscriberApp {
 
     fn select_model_as_default(&mut self, model: &SttModelInfo) {
         self.config.selected_default_model = model.id.clone();
-        if !self.config.playground_enabled_models.iter().any(|id| id == &model.id) {
-            self.config.playground_enabled_models.push(model.id.clone());
-        }
         self.config.last_used_backend = model.backend.clone();
         self.save_config();
     }
@@ -1097,9 +1169,12 @@ impl LocalTranscriberApp {
             return;
         };
 
-        if !backend_capabilities(&model.backend).supports_downloads {
+        if !supports_managed_install(model) {
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!("{} cannot be downloaded in this build.", model.name);
+            self.status_message = format!(
+                "Managed installer for {} is not available in this build.",
+                model.name
+            );
             return;
         }
 
@@ -1133,6 +1208,25 @@ impl LocalTranscriberApp {
                 }
             }
         });
+    }
+
+    fn uninstall_model(&mut self, model: &SttModelInfo) {
+        let removal = uninstall_model_files(&self.config, model);
+        self.model_downloads.remove(&model.id);
+        self.config.managed_models.remove(&model.id);
+        self.config.model_paths.remove(&model.id);
+
+        if self.config.selected_default_model == model.id {
+            select_first_installed_model(&mut self.config);
+        }
+
+        self.save_config();
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = match removal {
+            Ok(true) => format!("Uninstalled {}.", model.name),
+            Ok(false) => format!("Removed {} from Scribe.", model.name),
+            Err(message) => format!("Removed {} from Scribe. {message}", model.name),
+        };
     }
 }
 
@@ -1397,12 +1491,6 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
-                    if ui.add(small_button("Enable All")).clicked() {
-                        self.set_all_models_enabled(true);
-                    }
-                    if ui.add(small_button("Disable All")).clicked() {
-                        self.set_all_models_enabled(false);
-                    }
                 });
             });
 
@@ -1422,62 +1510,44 @@ impl LocalTranscriberApp {
             for model in models {
                 let selected = self.config.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
-                let supports_download = model.download_model.is_some()
-                    && backend_capabilities(&model.backend).supports_downloads;
-                let can_download = supports_download
-                    && !matches!(
-                        install_status,
-                        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::Installed
-                    );
-                let mut enabled_update = None;
+                let action_state = model_action_state(&model, &install_status, selected);
                 let mut select_default = false;
-                let mut start_download = false;
+                let mut start_install = false;
+                let mut uninstall = false;
 
                 model_catalog_row(ui, &model, &install_status, selected, |ui| {
-                    let mut enabled = model.enabled;
-                    if ui.checkbox(&mut enabled, "Enabled").changed() {
-                        enabled_update = Some(enabled);
-                    }
-
+                    let primary_button = match action_state.primary {
+                        ModelPrimaryAction::Select | ModelPrimaryAction::Active => {
+                            primary_small_button(action_state.primary.label())
+                        }
+                        _ => small_button(action_state.primary.label()),
+                    };
                     if ui
-                        .add_enabled(
-                            !selected,
-                            primary_small_button(if selected { "Active" } else { "Select" }),
-                        )
+                        .add_enabled(action_state.primary_enabled, primary_button)
                         .clicked()
                     {
-                        select_default = true;
-                    }
-
-                    if supports_download {
-                        let download_label = match &install_status {
-                            ModelInstallStatus::Downloading { .. } => "Downloading",
-                            ModelInstallStatus::Installed => "Installed",
-                            ModelInstallStatus::Error(_) => "Retry",
-                            ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => {
-                                "Download"
+                        match action_state.primary {
+                            ModelPrimaryAction::Select => select_default = true,
+                            ModelPrimaryAction::Install | ModelPrimaryAction::Retry => {
+                                start_install = true;
                             }
-                        };
-                        if ui
-                            .add_enabled(can_download, small_button(download_label))
-                            .clicked()
-                        {
-                            start_download = true;
+                            ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
                         }
-                    } else if !backend_capabilities(&model.backend).runnable {
-                        let _ = ui.add_enabled(false, small_button("Planned"));
+                    }
+                    if action_state.show_uninstall && ui.add(small_button("Uninstall")).clicked()
+                    {
+                        uninstall = true;
                     }
                 });
 
-                if let Some(enabled) = enabled_update {
-                    set_model_enabled(&mut self.config, &model.id, enabled);
-                    self.save_config();
-                }
                 if select_default {
                     self.select_model_as_default(&model);
                 }
-                if start_download {
+                if start_install {
                     self.start_model_download(&model);
+                }
+                if uninstall {
+                    self.uninstall_model(&model);
                 }
                 ui.add_space(8.0);
             }
@@ -2216,7 +2286,7 @@ fn model_catalog_row(
     full_width_frame(ui, model_card_frame(selected), |ui| {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let actions_width = 112.0;
+            let actions_width = 132.0;
             let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
@@ -2226,14 +2296,13 @@ fn model_catalog_row(
                         set_exact_width(ui, detail_width);
                         wrapped_label(ui, card_title(&model.name, selected));
                         wrapped_label(ui, mut_text(&model.description));
+                        if let Some(detail) = model_install_detail(model, install_status) {
+                            ui.add_space(4.0);
+                            wrapped_label(ui, mut_text(&detail));
+                        }
                         ui.add_space(8.0);
                         tag_row(ui, |ui| {
                             badge(ui, &model.backend, ChipTone::Neutral);
-                            badge(
-                                ui,
-                                &install_status.label(),
-                                install_chip_tone(install_status),
-                            );
                             badge(
                                 ui,
                                 &format!("RAM {}", model.expected_ram),
@@ -2249,9 +2318,6 @@ fn model_catalog_row(
                                 &format!("{} accuracy", model.accuracy_tier),
                                 ChipTone::Neutral,
                             );
-                            if !backend_capabilities(&model.backend).runnable {
-                                badge(ui, "Planned", ChipTone::Warning);
-                            }
                         });
                     },
                 );
@@ -3008,6 +3074,75 @@ fn paths_from_list_input(input: &str) -> Vec<PathBuf> {
     }
 }
 
+fn model_install_detail(model: &SttModelInfo, install_status: &ModelInstallStatus) -> Option<String> {
+    match install_status {
+        ModelInstallStatus::NotInstalled if !supports_managed_install(model) => Some(format!(
+            "{} runtime installer is not bundled in this build.",
+            model.backend
+        )),
+        ModelInstallStatus::Downloading { .. } => Some(install_status.label()),
+        ModelInstallStatus::Missing => {
+            Some("The installed model file is missing. Reinstall to use this model.".to_owned())
+        }
+        ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
+        ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => None,
+    }
+}
+
+fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<bool, String> {
+    let mut removed_any = false;
+    for path in uninstall_candidate_paths(config, model) {
+        if !path.exists() || !is_app_managed_model_path(config, &path) {
+            continue;
+        }
+        let result = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|err| format!("Could not delete {}: {err}", path.display()))?;
+        removed_any = true;
+    }
+    Ok(removed_any)
+}
+
+fn uninstall_candidate_paths(config: &AppConfig, model: &SttModelInfo) -> Vec<PathBuf> {
+    let mut paths = [
+        config::managed_model_path(config, model),
+        config::downloaded_model_path(config, model),
+        model.local_path.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    dedup_paths(&mut paths);
+    paths
+}
+
+fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
+    path.starts_with(config::model_storage_dir(config))
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = Vec::new();
+    paths.retain(|path| {
+        if seen.iter().any(|seen_path| seen_path == path) {
+            false
+        } else {
+            seen.push(path.clone());
+            true
+        }
+    });
+}
+
+fn select_first_installed_model(config: &mut AppConfig) {
+    config.selected_default_model = config::configured_models(config)
+        .into_iter()
+        .find(|model| model.install_status.is_runnable())
+        .map(|model| model.id)
+        .unwrap_or_default();
+}
+
 fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
     if enabled {
         if !config.playground_enabled_models.iter().any(|id| id == model_id) {
@@ -3678,12 +3813,10 @@ mod layout_tests {
                             ui.add_space(12.0);
                             let model = test_model();
                             let install_status = ModelInstallStatus::Installed;
-                            let mut enabled = true;
 
                             model_catalog_row(ui, &model, &install_status, true, |ui| {
-                                let _ = ui.checkbox(&mut enabled, "Enabled");
                                 let _ = ui.add_enabled(false, primary_small_button("Active"));
-                                let _ = ui.add_enabled(false, small_button("Installed"));
+                                let _ = ui.add(small_button("Uninstall"));
                             });
                         },
                     );
@@ -3962,5 +4095,146 @@ mod layout_tests {
             download_model: Some("base.en".to_owned()),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn model_action_state_matches_install_select_uninstall_rules() {
+        let mut whisper = test_model();
+        whisper.install_status = ModelInstallStatus::NotInstalled;
+
+        assert_eq!(
+            model_action_state(&whisper, &ModelInstallStatus::NotInstalled, false),
+            ModelActionState {
+                primary: ModelPrimaryAction::Install,
+                primary_enabled: true,
+                show_uninstall: false,
+            }
+        );
+        assert_eq!(
+            model_action_state(&whisper, &ModelInstallStatus::Installed, false),
+            ModelActionState {
+                primary: ModelPrimaryAction::Select,
+                primary_enabled: true,
+                show_uninstall: true,
+            }
+        );
+        assert_eq!(
+            model_action_state(&whisper, &ModelInstallStatus::Installed, true),
+            ModelActionState {
+                primary: ModelPrimaryAction::Active,
+                primary_enabled: false,
+                show_uninstall: true,
+            }
+        );
+        assert_eq!(
+            model_action_state(
+                &whisper,
+                &ModelInstallStatus::Error("network failed".to_owned()),
+                false,
+            ),
+            ModelActionState {
+                primary: ModelPrimaryAction::Retry,
+                primary_enabled: true,
+                show_uninstall: false,
+            }
+        );
+
+        let mut unavailable = whisper;
+        unavailable.backend = "faster-whisper".to_owned();
+        unavailable.download_model = None;
+        assert_eq!(
+            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false),
+            ModelActionState {
+                primary: ModelPrimaryAction::Install,
+                primary_enabled: false,
+                show_uninstall: false,
+            }
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_managed_model_file_and_selects_next_installed_model() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-uninstall-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let model_dir = temp_dir.join("whisper.cpp");
+        fs::create_dir_all(&model_dir).unwrap();
+        let base_path = model_dir.join("ggml-base.en.bin");
+        let small_path = model_dir.join("ggml-small.en.bin");
+        fs::write(&base_path, b"base").unwrap();
+        fs::write(&small_path, b"small").unwrap();
+
+        let mut config = AppConfig {
+            selected_default_model: "whisper_cpp_base_en".to_owned(),
+            model_storage_dir: temp_dir.clone(),
+            ..AppConfig::default()
+        };
+        config.managed_models.insert(
+            "whisper_cpp_base_en".to_owned(),
+            config::ManagedModelInstall {
+                path: base_path.clone(),
+            },
+        );
+        config.managed_models.insert(
+            "whisper_cpp_small_en".to_owned(),
+            config::ManagedModelInstall {
+                path: small_path.clone(),
+            },
+        );
+
+        let base_model = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        assert!(uninstall_model_files(&config, &base_model).unwrap());
+        assert!(!base_path.exists());
+        config.managed_models.remove("whisper_cpp_base_en");
+        select_first_installed_model(&mut config);
+
+        assert_eq!(config.selected_default_model, "whisper_cpp_small_en");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn uninstall_clears_active_model_when_no_installed_models_remain() {
+        let mut config = AppConfig {
+            selected_default_model: "whisper_cpp_base_en".to_owned(),
+            ..AppConfig::default()
+        };
+
+        select_first_installed_model(&mut config);
+
+        assert!(config.selected_default_model.is_empty());
+    }
+
+    #[test]
+    fn uninstall_does_not_delete_external_migrated_model_paths() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-external-model-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let app_storage = temp_dir.join("app-models");
+        let external_path = temp_dir.join("external").join("ggml-base.en.bin");
+        fs::create_dir_all(external_path.parent().unwrap()).unwrap();
+        fs::write(&external_path, b"external").unwrap();
+
+        let mut model_paths = HashMap::new();
+        model_paths.insert("whisper_cpp_base_en".to_owned(), external_path.clone());
+        let config = AppConfig {
+            model_storage_dir: app_storage,
+            model_paths,
+            ..AppConfig::default()
+        };
+        let model = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        assert!(!uninstall_model_files(&config, &model).unwrap());
+        assert!(external_path.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

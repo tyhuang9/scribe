@@ -147,7 +147,7 @@ impl fmt::Display for ModelRuntimeStatus {
             Self::Downloading => write!(f, "Downloading"),
             Self::Running => write!(f, "Running"),
             Self::Disabled => write!(f, "Disabled"),
-            Self::NotImplemented => write!(f, "Placeholder"),
+            Self::NotImplemented => write!(f, "Runtime unavailable"),
             Self::Error(message) => write!(f, "Error: {message}"),
         }
     }
@@ -242,9 +242,9 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
         ),
         model(
             "vosk_small_en",
-            "Vosk small English placeholder",
+            "Vosk small English",
             "Vosk",
-            "Planned offline runtime; catalog metadata only in this phase.",
+            "Offline English model for low-resource machines once the managed Vosk runtime is bundled.",
             "1 GB",
             "Basic",
             "Fast",
@@ -255,7 +255,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_tiny_en",
             "faster-whisper tiny.en",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "GPU-oriented tiny English model once the managed faster-whisper runtime is bundled.",
             "1 GB",
             "Basic",
             "Fastest GPU",
@@ -266,7 +266,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_base_en",
             "faster-whisper base.en",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "GPU-oriented base English model once the managed faster-whisper runtime is bundled.",
             "1 GB",
             "Good",
             "Fast GPU",
@@ -277,7 +277,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_small_en_gpu",
             "faster-whisper small.en",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "GPU-oriented small English model once the managed faster-whisper runtime is bundled.",
             "1-2 GB",
             "Good",
             "Fast GPU",
@@ -288,7 +288,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_medium_en_gpu",
             "faster-whisper medium.en",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "GPU-oriented medium English model once the managed faster-whisper runtime is bundled.",
             "3-6 GB",
             "High",
             "Medium GPU",
@@ -299,7 +299,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_large_v3",
             "faster-whisper large-v3",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "High-accuracy GPU model once the managed faster-whisper runtime is bundled.",
             "5-10 GB",
             "Highest",
             "Slow GPU",
@@ -310,7 +310,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_turbo",
             "faster-whisper turbo",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "Fast GPU model once the managed faster-whisper runtime is bundled.",
             "4-8 GB",
             "High",
             "Fast GPU",
@@ -321,7 +321,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_distil_large_v3",
             "faster-whisper distil-large-v3",
             "faster-whisper",
-            "Planned GPU-oriented runtime; catalog metadata only in this phase.",
+            "Distilled high-accuracy GPU model once the managed faster-whisper runtime is bundled.",
             "3-6 GB",
             "High",
             "Fast GPU",
@@ -332,7 +332,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "sherpa_onnx_zipformer_small",
             "sherpa-onnx Zipformer Small",
             "sherpa-onnx",
-            "Planned streaming runtime; catalog metadata only in this phase.",
+            "Streaming-capable local model once the managed sherpa-onnx runtime is bundled.",
             "1-2 GB",
             "Good",
             "Streaming",
@@ -343,7 +343,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "moonshine",
             "Moonshine",
             "Moonshine",
-            "Planned lightweight runtime; catalog metadata only in this phase.",
+            "Lightweight local model once the managed Moonshine runtime is bundled.",
             "1-2 GB",
             "Good",
             "Fast",
@@ -354,7 +354,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "parakeet_0_6b",
             "Parakeet 0.6B",
             "Parakeet",
-            "Planned experimental runtime; catalog metadata only in this phase.",
+            "Experimental high-accuracy local model once the managed Parakeet runtime is bundled.",
             "2-4 GB",
             "High",
             "Medium",
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn only_whisper_cpp_is_runnable_in_this_phase() {
+    fn only_whisper_cpp_has_bundled_installer_in_this_phase() {
         assert!(backend_capabilities("whisper.cpp").runnable);
         assert!(!backend_capabilities("faster-whisper").runnable);
         assert!(!backend_capabilities("Vosk").supports_downloads);

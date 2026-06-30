@@ -148,7 +148,7 @@ impl Default for AppConfig {
             model_storage_dir: default_model_storage_dir(),
             theme_mode: ThemeMode::Light,
             audio_input_device_name: None,
-            model_paths: default_model_paths(),
+            model_paths: HashMap::new(),
             last_used_backend: "whisper.cpp".to_owned(),
             debug_mode: false,
             max_recording_seconds: 30,
@@ -354,7 +354,6 @@ pub fn normalize_config(config: &mut AppConfig) {
         .collect::<Vec<_>>();
 
     migrate_legacy_model_ids(config);
-    apply_default_model_paths(config);
     apply_managed_model_metadata(config);
     if config.model_storage_dir.as_os_str().is_empty() {
         config.model_storage_dir = default_model_storage_dir();
@@ -372,7 +371,8 @@ pub fn normalize_config(config: &mut AppConfig) {
         .retain(|path| !path.as_os_str().is_empty());
     dedup_paths_preserving_order(&mut config.whisper_cuda_library_paths);
 
-    if !catalog
+    if !config.selected_default_model.is_empty()
+        && !catalog
         .iter()
         .any(|model| model.id == config.selected_default_model)
     {
@@ -439,59 +439,6 @@ fn default_playground_model_order() -> Vec<String> {
         .into_iter()
         .map(|model| model.id)
         .collect()
-}
-
-fn default_model_paths() -> HashMap<String, PathBuf> {
-    [
-        (
-            "whisper_cpp_tiny_en",
-            "/home/tyhuang/Projects/whisper.cpp/models/ggml-tiny.en.bin",
-        ),
-        (
-            "whisper_cpp_base_en",
-            "/home/tyhuang/Projects/whisper.cpp/models/ggml-base.en.bin",
-        ),
-        (
-            "whisper_cpp_small_en",
-            "/home/tyhuang/Projects/whisper.cpp/models/ggml-small.en.bin",
-        ),
-        (
-            "whisper_cpp_medium_en",
-            "/home/tyhuang/Projects/whisper.cpp/models/ggml-medium.en.bin",
-        ),
-        (
-            "faster_whisper_small_en_gpu",
-            "/home/tyhuang/Projects/stt-models/faster-whisper-small.en",
-        ),
-        (
-            "faster_whisper_medium_en_gpu",
-            "/home/tyhuang/Projects/stt-models/faster-whisper-medium.en",
-        ),
-        (
-            "sherpa_onnx_zipformer_small",
-            "/home/tyhuang/Projects/stt-models/sherpa-onnx-zipformer-small-en",
-        ),
-        (
-            "moonshine",
-            "/home/tyhuang/Projects/stt-models/moonshine/examples/ios/Transcriber/models/small-streaming-en",
-        ),
-        (
-            "parakeet_0_6b",
-            "/home/tyhuang/Projects/stt-models/parakeet-tdt-0.6b-v3/parakeet-tdt-0.6b-v3.nemo",
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(id, path)| {
-        let path = PathBuf::from(path);
-        path.exists().then(|| (id.to_owned(), path))
-    })
-    .collect()
-}
-
-fn apply_default_model_paths(config: &mut AppConfig) {
-    for (id, path) in default_model_paths() {
-        config.model_paths.entry(id).or_insert(path);
-    }
 }
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
