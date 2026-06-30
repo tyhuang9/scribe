@@ -1214,12 +1214,15 @@ impl LocalTranscriberApp {
 }
 
 impl eframe::App for LocalTranscriberApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        CONTENT_BG.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        ThemePalette::from_visuals(visuals)
+            .content_bg
+            .to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx, frame);
+        let colors = theme_palette(ctx);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
@@ -1234,8 +1237,8 @@ impl eframe::App for LocalTranscriberApp {
         egui::SidePanel::left("navigation")
             .frame(
                 Frame::none()
-                    .fill(SIDEBAR_BG)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(colors.sidebar_bg)
+                    .stroke(Stroke::new(1.0, colors.border))
                     .inner_margin(Margin::symmetric(14.0, 16.0)),
             )
             .resizable(false)
@@ -1244,10 +1247,10 @@ impl eframe::App for LocalTranscriberApp {
                 ui.label(
                     RichText::new("Scribe")
                         .font(FontId::proportional(20.0))
-                        .color(PRIMARY)
+                        .color(colors.primary)
                         .strong(),
                 );
-                ui.label(RichText::new("Local-First STT").small().color(MUTED_TEXT));
+                ui.label(RichText::new("Local-First STT").small().weak());
                 ui.add_space(22.0);
                 nav_button(ui, &mut self.current_tab, Tab::Transcribe);
                 nav_button(ui, &mut self.current_tab, Tab::Models);
@@ -1260,7 +1263,7 @@ impl eframe::App for LocalTranscriberApp {
             });
 
         egui::CentralPanel::default()
-            .frame(content_panel_frame())
+            .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
                 Tab::Transcribe => self.ui_transcribe(ui),
                 Tab::Models => self.ui_models(ui),
@@ -1312,7 +1315,7 @@ impl LocalTranscriberApp {
                         }
                     },
                     |ui| {
-                        if ui.add(small_button("Change")).clicked() {
+                        if ui.add(small_button(ui, "Change")).clicked() {
                             requested_tab = Some(Tab::Models);
                         }
                     },
@@ -1325,7 +1328,7 @@ impl LocalTranscriberApp {
                         ui.label(body_strong(&hotkey));
                     },
                     |ui| {
-                        if ui.add(small_button("Edit")).clicked() {
+                        if ui.add(small_button(ui, "Edit")).clicked() {
                             requested_tab = Some(Tab::Settings);
                         }
                     },
@@ -1358,13 +1361,13 @@ impl LocalTranscriberApp {
                                 } else {
                                     "Download tiny.en"
                                 };
-                                if ui.add(small_button(label)).clicked() {
+                                if ui.add(small_button(ui, label)).clicked() {
                                     self.select_model_as_default(&model);
                                     self.start_model_download(&model);
                                 }
                             }
                         }
-                        if ui.add(small_button("Manage models")).clicked() {
+                        if ui.add(small_button(ui, "Manage models")).clicked() {
                             self.current_tab = Tab::Models;
                         }
                     });
@@ -1381,7 +1384,7 @@ impl LocalTranscriberApp {
                         "Start Listening"
                     };
                     if ui
-                        .add_enabled(listening || ready, primary_button(button_text))
+                        .add_enabled(listening || ready, primary_button(ui, button_text))
                         .clicked()
                     {
                         self.toggle_recording();
@@ -1399,7 +1402,7 @@ impl LocalTranscriberApp {
                         ui.label(
                             RichText::new("System audio & microphone active")
                                 .small()
-                                .color(MUTED_TEXT),
+                                .weak(),
                         );
                     }
                 });
@@ -1422,10 +1425,10 @@ impl LocalTranscriberApp {
                 );
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(small_button("Clear")).clicked() {
+                    if ui.add(small_button(ui, "Clear")).clicked() {
                         self.transcript.clear();
                     }
-                    if ui.add(small_button("Copy")).clicked() {
+                    if ui.add(small_button(ui, "Copy")).clicked() {
                         self.copy_transcript_to_clipboard();
                     }
                 });
@@ -1499,9 +1502,9 @@ impl LocalTranscriberApp {
                 model_catalog_row(ui, &model, &install_status, selected, |ui| {
                     let primary_button = match action_state.primary {
                         ModelPrimaryAction::Select | ModelPrimaryAction::Active => {
-                            primary_small_button(action_state.primary.label())
+                            primary_small_button(ui, action_state.primary.label())
                         }
-                        _ => small_button(action_state.primary.label()),
+                        _ => small_button(ui, action_state.primary.label()),
                     };
                     if ui
                         .add_enabled(action_state.primary_enabled, primary_button)
@@ -1515,7 +1518,9 @@ impl LocalTranscriberApp {
                             ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
                         }
                     }
-                    if action_state.show_uninstall && ui.add(small_button("Uninstall")).clicked() {
+                    if action_state.show_uninstall
+                        && ui.add(small_button(ui, "Uninstall")).clicked()
+                    {
                         uninstall = true;
                     }
                 });
@@ -1533,7 +1538,7 @@ impl LocalTranscriberApp {
             }
 
             empty_import_panel(ui, |ui| {
-                if ui.add(small_button("Import Custom Model")).clicked() {
+                if ui.add(small_button(ui, "Import Custom Model")).clicked() {
                     self.status_message =
                         "Custom model import is not available in this build.".to_owned();
                 }
@@ -1552,20 +1557,20 @@ impl LocalTranscriberApp {
                     } else {
                         "Start Test Recording"
                     };
-                    if ui.add(primary_small_button(text)).clicked() {
+                    if ui.add(primary_small_button(ui, text)).clicked() {
                         if self.active_recording.is_some() {
                             self.stop_recording();
                         } else {
                             self.start_recording(RecordingSource::Playground);
                         }
                     }
-                    if ui.add(small_button("Clear Results")).clicked() {
+                    if ui.add(small_button(ui, "Clear Results")).clicked() {
                         self.clear_playground_results(true);
                     }
-                    if ui.add(small_button("Enable All")).clicked() {
+                    if ui.add(small_button(ui, "Enable All")).clicked() {
                         self.set_all_models_enabled(true);
                     }
-                    if ui.add(small_button("Disable All")).clicked() {
+                    if ui.add(small_button(ui, "Disable All")).clicked() {
                         self.set_all_models_enabled(false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1610,7 +1615,7 @@ impl LocalTranscriberApp {
                         }
                     });
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        if ui.add(small_button("Use Active Output")).clicked()
+                        if ui.add(small_button(ui, "Use Active Output")).clicked()
                             && !self.apply_active_playground_output_as_reference()
                         {
                             self.status_message =
@@ -1695,12 +1700,16 @@ impl LocalTranscriberApp {
                             |ui| {
                                 set_exact_width(ui, outer_width);
                                 ui.dnd_drop_zone::<String, _>(drop_zone_frame(), |ui| {
-                                    full_width_frame(ui, model_card_frame(is_active_model), |ui| {
-                                        ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
-                                            playground_card_ui(ui, card_state, is_active_model)
-                                        })
-                                        .inner
-                                    })
+                                    full_width_frame(
+                                        ui,
+                                        model_card_frame(ui, is_active_model),
+                                        |ui| {
+                                            ui.dnd_drag_source(drag_id, model_id.clone(), |ui| {
+                                                playground_card_ui(ui, card_state, is_active_model)
+                                            })
+                                            .inner
+                                        },
+                                    )
                                     .inner
                                 })
                             },
@@ -1788,15 +1797,18 @@ impl LocalTranscriberApp {
                         TextEdit::singleline(&mut self.hotkey_input)
                             .desired_width(width_before_trailing(ui, 154.0, 96.0)),
                     );
-                    if ui.add(small_button("Apply")).clicked() {
+                    if ui.add(small_button(ui, "Apply")).clicked() {
                         self.apply_hotkey();
                     }
                     if ui
-                        .add(small_button(if self.capturing_hotkey {
-                            "Listening..."
-                        } else {
-                            "Capture"
-                        }))
+                        .add(small_button(
+                            ui,
+                            if self.capturing_hotkey {
+                                "Listening..."
+                            } else {
+                                "Capture"
+                            },
+                        ))
                         .clicked()
                     {
                         self.capturing_hotkey = true;
@@ -1910,7 +1922,7 @@ impl LocalTranscriberApp {
                     if before != self.config.audio_input_device_name {
                         self.save_config();
                     }
-                    if ui.add(small_button("Refresh")).clicked() {
+                    if ui.add(small_button(ui, "Refresh")).clicked() {
                         self.refresh_audio_devices();
                     }
                 });
@@ -1954,7 +1966,7 @@ impl LocalTranscriberApp {
             ui.add_space(12.0);
             card(ui, |ui| {
                 ui.label(section_heading("Runtime"));
-                ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").color(MUTED_TEXT));
+                ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").weak());
                 if let Some(latency) = &self.latest_latency {
                     ui.add_space(8.0);
                     ui.label(section_heading("Last Latency"));
@@ -1964,33 +1976,102 @@ impl LocalTranscriberApp {
                 }
                 if self.tray_service.is_none() {
                     ui.colored_label(
-                        ERROR,
+                        ui_palette(ui).error,
                         "Tray integration is unavailable in this desktop session.",
                     );
                 }
                 if let Some(notice) = text_output::paste_automation_notice() {
-                    ui.colored_label(WARNING, notice);
+                    ui.colored_label(ui_palette(ui).warning, notice);
                 }
             });
         });
     }
 }
 
-const SHELL_BG: Color32 = Color32::from_rgb(247, 249, 251);
-const CONTENT_BG: Color32 = Color32::from_rgb(247, 249, 251);
-const SIDEBAR_BG: Color32 = Color32::WHITE;
-const CARD_BG: Color32 = Color32::WHITE;
-const ACTIVE_CARD_BG: Color32 = Color32::from_rgb(239, 246, 255);
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
-const TEXT: Color32 = Color32::from_rgb(29, 33, 42);
-const MUTED_TEXT: Color32 = Color32::from_rgb(85, 95, 109);
-const BORDER: Color32 = Color32::from_rgb(226, 232, 240);
-const BORDER_STRONG: Color32 = Color32::from_rgb(203, 213, 225);
-const PRIMARY: Color32 = Color32::from_rgb(6, 10, 18);
-const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
-const SUCCESS: Color32 = Color32::from_rgb(22, 163, 74);
-const WARNING: Color32 = Color32::from_rgb(202, 138, 4);
-const ERROR: Color32 = Color32::from_rgb(220, 38, 38);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThemePalette {
+    shell_bg: Color32,
+    content_bg: Color32,
+    sidebar_bg: Color32,
+    card_bg: Color32,
+    panel_bg: Color32,
+    active_card_bg: Color32,
+    text: Color32,
+    muted_text: Color32,
+    border: Color32,
+    border_strong: Color32,
+    primary: Color32,
+    accent: Color32,
+    success: Color32,
+    warning: Color32,
+    error: Color32,
+    primary_button_bg: Color32,
+    primary_button_text: Color32,
+}
+
+impl ThemePalette {
+    fn from_visuals(visuals: &egui::Visuals) -> Self {
+        if visuals.dark_mode {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    fn light() -> Self {
+        Self {
+            shell_bg: Color32::from_rgb(247, 249, 251),
+            content_bg: Color32::from_rgb(247, 249, 251),
+            sidebar_bg: Color32::WHITE,
+            card_bg: Color32::WHITE,
+            panel_bg: Color32::from_rgb(248, 250, 252),
+            active_card_bg: Color32::from_rgb(239, 246, 255),
+            text: Color32::from_rgb(29, 33, 42),
+            muted_text: Color32::from_rgb(85, 95, 109),
+            border: Color32::from_rgb(226, 232, 240),
+            border_strong: Color32::from_rgb(203, 213, 225),
+            primary: Color32::from_rgb(6, 10, 18),
+            accent: Color32::from_rgb(37, 99, 235),
+            success: Color32::from_rgb(22, 163, 74),
+            warning: Color32::from_rgb(202, 138, 4),
+            error: Color32::from_rgb(220, 38, 38),
+            primary_button_bg: Color32::from_rgb(6, 10, 18),
+            primary_button_text: Color32::WHITE,
+        }
+    }
+
+    fn dark() -> Self {
+        Self {
+            shell_bg: Color32::from_rgb(15, 18, 24),
+            content_bg: Color32::from_rgb(15, 18, 24),
+            sidebar_bg: Color32::from_rgb(20, 24, 32),
+            card_bg: Color32::from_rgb(26, 31, 41),
+            panel_bg: Color32::from_rgb(22, 27, 36),
+            active_card_bg: Color32::from_rgb(25, 42, 68),
+            text: Color32::from_rgb(236, 241, 247),
+            muted_text: Color32::from_rgb(156, 166, 179),
+            border: Color32::from_rgb(53, 61, 76),
+            border_strong: Color32::from_rgb(76, 86, 104),
+            primary: Color32::from_rgb(247, 250, 252),
+            accent: Color32::from_rgb(96, 165, 250),
+            success: Color32::from_rgb(74, 222, 128),
+            warning: Color32::from_rgb(251, 191, 36),
+            error: Color32::from_rgb(248, 113, 113),
+            primary_button_bg: Color32::from_rgb(37, 99, 235),
+            primary_button_text: Color32::WHITE,
+        }
+    }
+}
+
+fn theme_palette(ctx: &egui::Context) -> ThemePalette {
+    ThemePalette::from_visuals(&ctx.style().visuals)
+}
+
+fn ui_palette(ui: &Ui) -> ThemePalette {
+    ThemePalette::from_visuals(ui.visuals())
+}
 
 #[derive(Clone, Copy)]
 enum ChipTone {
@@ -2025,8 +2106,12 @@ fn configure_stitch_style(ctx: &egui::Context) {
 }
 
 fn paint_viewport_background(ctx: &egui::Context) {
-    ctx.layer_painter(egui::LayerId::background())
-        .rect_filled(ctx.screen_rect(), 0.0, CONTENT_BG);
+    let colors = theme_palette(ctx);
+    ctx.layer_painter(egui::LayerId::background()).rect_filled(
+        ctx.screen_rect(),
+        0.0,
+        colors.content_bg,
+    );
 }
 
 fn page(
@@ -2047,7 +2132,7 @@ fn page(
                 ui.label(
                     RichText::new(title)
                         .font(FontId::proportional(24.0))
-                        .color(PRIMARY)
+                        .color(ui_palette(ui).primary)
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2075,30 +2160,37 @@ fn page(
     );
 }
 
-fn content_panel_frame() -> Frame {
+fn content_panel_frame(ctx: &egui::Context) -> Frame {
+    let colors = theme_palette(ctx);
     Frame::none()
-        .fill(CONTENT_BG)
+        .fill(colors.content_bg)
         .inner_margin(Margin::symmetric(24.0, 0.0))
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    full_width_frame(ui, card_frame(), add_contents);
+    full_width_frame(ui, card_frame(ui), add_contents);
 }
 
-fn card_frame() -> Frame {
+fn card_frame(ui: &Ui) -> Frame {
+    let colors = ui_palette(ui);
     Frame::none()
-        .fill(CARD_BG)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(colors.card_bg)
+        .stroke(Stroke::new(1.0, colors.border))
         .rounding(Rounding::same(6.0))
         .inner_margin(Margin::same(14.0))
 }
 
-fn model_card_frame(selected: bool) -> Frame {
-    let fill = if selected { ACTIVE_CARD_BG } else { CARD_BG };
-    let stroke = if selected {
-        Stroke::new(1.5, ACCENT)
+fn model_card_frame(ui: &Ui, selected: bool) -> Frame {
+    let colors = ui_palette(ui);
+    let fill = if selected {
+        colors.active_card_bg
     } else {
-        Stroke::new(1.0, BORDER)
+        colors.card_bg
+    };
+    let stroke = if selected {
+        Stroke::new(1.5, colors.accent)
+    } else {
+        Stroke::new(1.0, colors.border)
     };
     Frame::none()
         .fill(fill)
@@ -2108,13 +2200,14 @@ fn model_card_frame(selected: bool) -> Frame {
 }
 
 fn configure_drop_zone_feedback(ui: &mut Ui) {
+    let colors = ui_palette(ui);
     let transparent = Color32::from_rgba_unmultiplied(0, 0, 0, 0);
     let transparent_stroke = Stroke::new(0.0, transparent);
     let widgets = &mut ui.visuals_mut().widgets;
     widgets.inactive.bg_fill = transparent;
     widgets.inactive.bg_stroke = transparent_stroke;
-    widgets.active.bg_fill = ACTIVE_CARD_BG;
-    widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
+    widgets.active.bg_fill = colors.active_card_bg;
+    widgets.active.bg_stroke = Stroke::new(1.5, colors.accent);
 }
 
 fn drop_zone_frame() -> Frame {
@@ -2128,11 +2221,12 @@ fn panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
 }
 
 fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    let colors = ui_palette(ui);
     full_width_frame(
         ui,
         Frame::none()
-            .fill(Color32::from_rgb(248, 250, 252))
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(colors.panel_bg)
+            .stroke(Stroke::new(1.0, colors.border))
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::same(14.0)),
         add_contents,
@@ -2140,11 +2234,12 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
 }
 
 fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
+    let colors = ui_palette(ui);
     full_width_frame(
         ui,
         Frame::none()
-            .fill(Color32::from_rgb(248, 250, 252))
-            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .fill(colors.panel_bg)
+            .stroke(Stroke::new(1.0, colors.border_strong))
             .rounding(Rounding::same(8.0))
             .inner_margin(Margin::same(18.0)),
         |ui| {
@@ -2164,7 +2259,7 @@ fn summary_card(
     body: impl FnOnce(&mut Ui),
     actions: impl FnOnce(&mut Ui),
 ) {
-    full_width_frame(ui, card_frame(), |ui| {
+    full_width_frame(ui, card_frame(ui), |ui| {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.label(label_caps(title));
@@ -2183,7 +2278,7 @@ fn model_catalog_row(
     selected: bool,
     actions: impl FnOnce(&mut Ui),
 ) {
-    full_width_frame(ui, model_card_frame(selected), |ui| {
+    full_width_frame(ui, model_card_frame(ui, selected), |ui| {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let actions_width = 132.0;
@@ -2194,7 +2289,7 @@ fn model_catalog_row(
                     Layout::top_down(Align::LEFT),
                     |ui| {
                         set_exact_width(ui, detail_width);
-                        wrapped_label(ui, card_title(&model.name, selected));
+                        wrapped_label(ui, card_title(ui, &model.name, selected));
                         wrapped_label(ui, mut_text(&model.description));
                         if let Some(detail) = model_install_detail(model, install_status) {
                             ui.add_space(4.0);
@@ -2236,11 +2331,12 @@ fn model_catalog_row(
 }
 
 fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
+    let colors = ui_palette(ui);
     full_width_frame(
         ui,
         Frame::none()
-            .fill(Color32::from_rgb(248, 250, 252))
-            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .fill(colors.panel_bg)
+            .stroke(Stroke::new(1.0, colors.border_strong))
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::same(18.0)),
         |ui| {
@@ -2282,7 +2378,7 @@ fn playground_card_ui(
                 Layout::top_down(Align::LEFT),
                 |ui| {
                     set_exact_width(ui, detail_width);
-                    wrapped_label(ui, card_title(&card_state.model.name, is_active_model));
+                    wrapped_label(ui, card_title(ui, &card_state.model.name, is_active_model));
                     wrapped_label(ui, mut_text(&card_state.model.description));
                     ui.add_space(8.0);
                     tag_row(ui, |ui| {
@@ -2306,7 +2402,7 @@ fn playground_card_ui(
                 Layout::top_down(Align::RIGHT),
                 |ui| {
                     set_exact_width(ui, actions_width);
-                    if ui.add(small_button("Clear")).clicked() {
+                    if ui.add(small_button(ui, "Clear")).clicked() {
                         actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
                     }
                     let mut enabled = card_state.model.enabled;
@@ -2328,7 +2424,7 @@ fn playground_card_ui(
     });
 
     if let Some(latency) = card_state.latency_ms {
-        ui.label(RichText::new(format!("Latency: {latency} ms")).color(MUTED_TEXT));
+        ui.label(RichText::new(format!("Latency: {latency} ms")).weak());
     }
 
     ui.add_space(6.0);
@@ -2338,15 +2434,17 @@ fn playground_card_ui(
 }
 
 fn playground_result_editor(ui: &mut Ui, result_id: &str, transcript: &str) -> egui::Response {
+    let colors = ui_palette(ui);
     let width = usable_width(ui).max(0.0);
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(width, PLAYGROUND_RESULT_HEIGHT),
         egui::Sense::hover(),
     );
 
-    ui.painter().rect_filled(rect, Rounding::same(4.0), CARD_BG);
     ui.painter()
-        .rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.0, BORDER));
+        .rect_filled(rect, Rounding::same(4.0), colors.card_bg);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.0, colors.border));
 
     let content_rect = rect.shrink2(Vec2::new(10.0, 8.0));
     let mut content_ui = ui.child_ui(content_rect, Layout::top_down(Align::LEFT));
@@ -2360,7 +2458,7 @@ fn playground_result_editor(ui: &mut Ui, result_id: &str, transcript: &str) -> e
             if transcript.trim().is_empty() {
                 ui.label(mut_text("Result"));
             } else {
-                ui.label(RichText::new(transcript).color(TEXT));
+                ui.label(RichText::new(transcript));
             }
         });
 
@@ -2506,20 +2604,21 @@ fn benchmark_model_cell(
 }
 
 fn benchmark_score_cell(ui: &mut Ui, label: String, score: Option<f64>) {
+    let colors = ui_palette(ui);
     Frame::none()
-        .fill(benchmark_heatmap_fill(score))
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(benchmark_heatmap_fill(ui, score))
+        .stroke(Stroke::new(1.0, colors.border))
         .rounding(Rounding::same(4.0))
         .inner_margin(Margin::symmetric(8.0, 5.0))
         .show(ui, |ui| {
             ui.set_min_width(68.0);
-            ui.label(RichText::new(label).color(TEXT).strong());
+            ui.label(RichText::new(label).strong());
         });
 }
 
-fn benchmark_heatmap_fill(score: Option<f64>) -> Color32 {
+fn benchmark_heatmap_fill(ui: &Ui, score: Option<f64>) -> Color32 {
     let Some(score) = score else {
-        return Color32::from_rgb(248, 250, 252);
+        return ui_palette(ui).panel_bg;
     };
     let score = score.clamp(0.0, 1.0);
     if score < 0.5 {
@@ -2654,17 +2753,26 @@ fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
 }
 
 fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab) {
+    let colors = ui_palette(ui);
     let selected = *current_tab == tab;
     let response = ui.add_sized(
         [ui.available_width(), 34.0],
-        Button::new(RichText::new(tab.label()).color(if selected { TEXT } else { MUTED_TEXT }))
-            .fill(if selected { CARD_BG } else { SHELL_BG })
-            .stroke(if selected {
-                Stroke::new(1.0, BORDER_STRONG)
-            } else {
-                Stroke::NONE
-            })
-            .rounding(Rounding::same(6.0)),
+        Button::new(RichText::new(tab.label()).color(if selected {
+            colors.text
+        } else {
+            colors.muted_text
+        }))
+        .fill(if selected {
+            colors.card_bg
+        } else {
+            colors.shell_bg
+        })
+        .stroke(if selected {
+            Stroke::new(1.0, colors.border_strong)
+        } else {
+            Stroke::NONE
+        })
+        .rounding(Rounding::same(6.0)),
     );
     if response.clicked() {
         *current_tab = tab;
@@ -2672,29 +2780,40 @@ fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab) {
 }
 
 fn sidebar_link(ui: &mut Ui, label: &str) {
-    ui.label(RichText::new(label).small().color(MUTED_TEXT));
+    ui.label(RichText::new(label).small().weak());
 }
 
-fn primary_button(label: &str) -> Button<'_> {
-    Button::new(RichText::new(label).color(Color32::WHITE).strong())
-        .fill(PRIMARY)
-        .stroke(Stroke::new(1.0, PRIMARY))
-        .rounding(Rounding::same(24.0))
-        .min_size(Vec2::new(190.0, 46.0))
+fn primary_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+    let colors = ui_palette(ui);
+    Button::new(
+        RichText::new(label)
+            .color(colors.primary_button_text)
+            .strong(),
+    )
+    .fill(colors.primary_button_bg)
+    .stroke(Stroke::new(1.0, colors.primary_button_bg))
+    .rounding(Rounding::same(24.0))
+    .min_size(Vec2::new(190.0, 46.0))
 }
 
-fn primary_small_button(label: &str) -> Button<'_> {
-    Button::new(RichText::new(label).color(Color32::WHITE).strong())
-        .fill(PRIMARY)
-        .stroke(Stroke::new(1.0, PRIMARY))
-        .rounding(Rounding::same(5.0))
-        .min_size(Vec2::new(82.0, 30.0))
+fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+    let colors = ui_palette(ui);
+    Button::new(
+        RichText::new(label)
+            .color(colors.primary_button_text)
+            .strong(),
+    )
+    .fill(colors.primary_button_bg)
+    .stroke(Stroke::new(1.0, colors.primary_button_bg))
+    .rounding(Rounding::same(5.0))
+    .min_size(Vec2::new(82.0, 30.0))
 }
 
-fn small_button(label: &str) -> Button<'_> {
-    Button::new(RichText::new(label).color(TEXT))
-        .fill(CARD_BG)
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
+fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+    let colors = ui_palette(ui);
+    Button::new(RichText::new(label).color(colors.text))
+        .fill(colors.card_bg)
+        .stroke(Stroke::new(1.0, colors.border_strong))
         .rounding(Rounding::same(5.0))
         .min_size(Vec2::new(68.0, 30.0))
 }
@@ -2721,7 +2840,7 @@ fn ready_dot(ui: &mut Ui, status: TranscriptionStatus) {
 }
 
 fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
-    let (text, fill, stroke) = chip_colors(tone);
+    let (text, fill, stroke) = chip_colors(ui, tone);
     Frame::none()
         .fill(fill)
         .stroke(stroke)
@@ -2737,63 +2856,86 @@ fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
 fn label_caps(label: impl Into<String>) -> RichText {
     RichText::new(label.into().to_ascii_uppercase())
         .size(11.0)
-        .color(MUTED_TEXT)
+        .weak()
         .strong()
 }
 
 fn section_heading(label: &str) -> RichText {
     RichText::new(label)
         .font(FontId::proportional(16.0))
-        .color(PRIMARY)
         .strong()
 }
 
 fn body_strong(label: &str) -> RichText {
     RichText::new(label)
         .font(FontId::proportional(15.0))
-        .color(TEXT)
         .strong()
 }
 
-fn card_title(label: &str, active: bool) -> RichText {
-    RichText::new(label)
+fn card_title(ui: &Ui, label: &str, active: bool) -> RichText {
+    let text = RichText::new(label)
         .font(FontId::proportional(15.0))
-        .color(if active { ACCENT } else { TEXT })
-        .strong()
+        .strong();
+    if active {
+        text.color(ui_palette(ui).accent)
+    } else {
+        text
+    }
 }
 
 fn mut_text(label: impl Into<String>) -> RichText {
-    RichText::new(label.into()).color(MUTED_TEXT)
+    RichText::new(label.into()).weak()
 }
 
 fn wrapped_label(ui: &mut Ui, text: RichText) {
     ui.add(egui::Label::new(text).wrap(true));
 }
 
-fn chip_colors(tone: ChipTone) -> (Color32, Color32, Stroke) {
+fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
+    let colors = ui_palette(ui);
     match tone {
         ChipTone::Neutral => (
-            MUTED_TEXT,
-            Color32::from_rgb(248, 250, 252),
-            Stroke::new(1.0, BORDER),
+            colors.muted_text,
+            colors.panel_bg,
+            Stroke::new(1.0, colors.border),
+        ),
+        ChipTone::Success if ui.visuals().dark_mode => (
+            colors.success,
+            Color32::from_rgb(20, 61, 42),
+            Stroke::new(1.0, Color32::from_rgb(34, 105, 70)),
         ),
         ChipTone::Success => (
-            SUCCESS,
+            colors.success,
             Color32::from_rgb(240, 253, 244),
             Stroke::new(1.0, Color32::from_rgb(187, 247, 208)),
         ),
+        ChipTone::Warning if ui.visuals().dark_mode => (
+            colors.warning,
+            Color32::from_rgb(69, 50, 18),
+            Stroke::new(1.0, Color32::from_rgb(117, 83, 25)),
+        ),
         ChipTone::Warning => (
-            WARNING,
+            colors.warning,
             Color32::from_rgb(254, 252, 232),
             Stroke::new(1.0, Color32::from_rgb(254, 240, 138)),
         ),
+        ChipTone::Error if ui.visuals().dark_mode => (
+            colors.error,
+            Color32::from_rgb(78, 29, 36),
+            Stroke::new(1.0, Color32::from_rgb(127, 45, 55)),
+        ),
         ChipTone::Error => (
-            ERROR,
+            colors.error,
             Color32::from_rgb(254, 242, 242),
             Stroke::new(1.0, Color32::from_rgb(254, 202, 202)),
         ),
+        ChipTone::Active if ui.visuals().dark_mode => (
+            colors.accent,
+            Color32::from_rgb(24, 48, 84),
+            Stroke::new(1.0, Color32::from_rgb(42, 86, 143)),
+        ),
         ChipTone::Active => (
-            ACCENT,
+            colors.accent,
             Color32::from_rgb(219, 234, 254),
             Stroke::new(1.0, Color32::from_rgb(191, 219, 254)),
         ),
@@ -2902,16 +3044,19 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
         ThemeMode::Dark => egui::Visuals::dark(),
         ThemeMode::Light | ThemeMode::System => egui::Visuals::light(),
     };
-    visuals.override_text_color = Some(match theme_mode {
-        ThemeMode::Dark => Color32::from_rgb(236, 241, 247),
-        ThemeMode::Light | ThemeMode::System => TEXT,
-    });
-    visuals.selection.bg_fill = ACCENT;
-    visuals.hyperlink_color = ACCENT;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    let colors = ThemePalette::from_visuals(&visuals);
+    visuals.override_text_color = Some(colors.text);
+    visuals.selection.bg_fill = colors.accent;
+    visuals.hyperlink_color = colors.accent;
+    visuals.panel_fill = colors.content_bg;
+    visuals.window_fill = colors.card_bg;
+    visuals.extreme_bg_color = colors.panel_bg;
+    visuals.widgets.noninteractive.bg_fill = colors.card_bg;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.border);
+    visuals.widgets.inactive.bg_fill = colors.card_bg;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.border);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.border_strong);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, colors.accent);
     visuals
 }
 
@@ -3298,10 +3443,32 @@ mod layout_tests {
     #[test]
     fn app_clear_color_is_opaque_content_background() {
         let app = test_app();
-        let clear_color = eframe::App::clear_color(&app, &egui::Visuals::light());
+        let light_clear_color = eframe::App::clear_color(&app, &egui::Visuals::light());
+        let dark_clear_color = eframe::App::clear_color(&app, &egui::Visuals::dark());
 
-        assert_eq!(clear_color, CONTENT_BG.to_normalized_gamma_f32());
-        assert_eq!(clear_color[3], 1.0);
+        assert_eq!(
+            light_clear_color,
+            ThemePalette::light().content_bg.to_normalized_gamma_f32()
+        );
+        assert_eq!(
+            dark_clear_color,
+            ThemePalette::dark().content_bg.to_normalized_gamma_f32()
+        );
+        assert_eq!(light_clear_color[3], 1.0);
+        assert_eq!(dark_clear_color[3], 1.0);
+    }
+
+    #[test]
+    fn dark_visuals_use_dark_shell_palette() {
+        let visuals = stitch_visuals(ThemeMode::Dark);
+        let dark = ThemePalette::dark();
+        let light = stitch_visuals(ThemeMode::Light);
+
+        assert!(visuals.dark_mode);
+        assert_eq!(visuals.panel_fill, dark.content_bg);
+        assert_eq!(visuals.window_fill, dark.card_bg);
+        assert_eq!(visuals.extreme_bg_color, dark.panel_bg);
+        assert_ne!(visuals.panel_fill, light.panel_fill);
     }
 
     #[test]
@@ -3600,7 +3767,7 @@ mod layout_tests {
             let mut current_tab = Tab::Models;
             show_test_navigation(ctx, &mut current_tab);
             egui::CentralPanel::default()
-                .frame(content_panel_frame())
+                .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| {
                     page(
                         ui,
@@ -3632,8 +3799,8 @@ mod layout_tests {
                             let install_status = ModelInstallStatus::Installed;
 
                             model_catalog_row(ui, &model, &install_status, true, |ui| {
-                                let _ = ui.add_enabled(false, primary_small_button("Active"));
-                                let _ = ui.add(small_button("Uninstall"));
+                                let _ = ui.add_enabled(false, primary_small_button(ui, "Active"));
+                                let _ = ui.add(small_button(ui, "Uninstall"));
                             });
                         },
                     );
@@ -3659,7 +3826,7 @@ mod layout_tests {
             let mut current_tab = Tab::Playground;
             show_test_navigation(ctx, &mut current_tab);
             egui::CentralPanel::default()
-                .frame(content_panel_frame())
+                .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| {
                     page(
                         ui,
@@ -3711,7 +3878,7 @@ mod layout_tests {
 
         let _ = ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default()
-                .frame(content_panel_frame())
+                .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| {
                     allocated_height = playground_result_editor(ui, "test-result", &transcript)
                         .rect
@@ -3739,7 +3906,7 @@ mod layout_tests {
         ctx.run(raw_input, |ctx| {
             show_test_navigation(ctx, &mut app.current_tab);
             egui::CentralPanel::default()
-                .frame(content_panel_frame())
+                .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| app.ui_models(ui));
         })
     }
@@ -3762,7 +3929,7 @@ mod layout_tests {
         ctx.run(raw_input, |ctx| {
             show_test_navigation(ctx, &mut app.current_tab);
             egui::CentralPanel::default()
-                .frame(content_panel_frame())
+                .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| match app.current_tab {
                     Tab::Transcribe => app.ui_transcribe(ui),
                     Tab::Models => app.ui_models(ui),
@@ -3791,7 +3958,7 @@ mod layout_tests {
             let output = ctx.run(raw_input, |ctx| {
                 show_test_navigation(ctx, &mut app.current_tab);
                 egui::CentralPanel::default()
-                    .frame(content_panel_frame())
+                    .frame(content_panel_frame(ctx))
                     .show(ctx, |ui| match app.current_tab {
                         Tab::Transcribe => app.ui_transcribe(ui),
                         Tab::Models => app.ui_models(ui),
@@ -3806,11 +3973,12 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
+        let colors = theme_palette(ctx);
         egui::SidePanel::left("test-navigation")
             .frame(
                 Frame::none()
-                    .fill(SIDEBAR_BG)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(colors.sidebar_bg)
+                    .stroke(Stroke::new(1.0, colors.border))
                     .inner_margin(Margin::symmetric(14.0, 16.0)),
             )
             .resizable(false)
