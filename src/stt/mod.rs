@@ -21,7 +21,7 @@ pub fn transcribe_with_config(
     match model.backend.as_str() {
         "whisper.cpp" => {
             let backend = whisper_cpp::WhisperCppBackend::new(
-                config.whisper_executable_path.clone(),
+                whisper_cpp::resolve_whisper_cpp_executable(config),
                 whisper_cpp::WhisperCppOptions {
                     use_gpu: config.whisper_compute_mode.uses_gpu(),
                     gpu_device: config.whisper_gpu_device,
@@ -43,7 +43,7 @@ pub fn transcribe_with_config(
             backend.transcribe(audio_path, model)
         }
         "Vosk" | "sherpa-onnx" | "faster-whisper" | "Moonshine" | "Parakeet" => Err(anyhow!(
-            "{} is present as configurable metadata, but its runtime is not wired yet",
+            "{} managed runtime is not bundled yet",
             model.backend
         )),
         backend => Err(anyhow!("unsupported STT backend: {backend}")),

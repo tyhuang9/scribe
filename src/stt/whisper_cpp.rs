@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::config::{self, AppConfig};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
 
 use super::SttBackend;
@@ -59,7 +60,11 @@ impl SttBackend for WhisperCppBackend {
         let executable = self
             .executable_path
             .clone()
-            .ok_or_else(|| anyhow!("configure the whisper.cpp executable path first"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "whisper.cpp runtime is not installed. Install a whisper.cpp model/runtime from Models, or set SCRIBE_WHISPER_CPP_CLI for development."
+                )
+            })?;
         let model_path = model
             .local_path
             .clone()
@@ -131,6 +136,94 @@ impl SttBackend for WhisperCppBackend {
             stderr,
         })
     }
+}
+
+pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
+    let bundled_root = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let managed_roots = [
+        config::managed_runtime_path(config, "whisper.cpp"),
+        Some(config::runtime_storage_dir().join("whisper_cpp")),
+    ];
+    let dev_paths = [
+        env::var_os("SCRIBE_WHISPER_CPP_CLI").map(PathBuf::from),
+        env::var_os("SCRIBE_WHISPER_CUDA_CLI").map(PathBuf::from),
+        config.whisper_executable_path.clone(),
+    ];
+
+    resolve_whisper_cpp_executable_from_candidates(
+        bundled_root.into_iter(),
+        managed_roots.into_iter().flatten(),
+        dev_paths.into_iter().flatten(),
+    )
+}
+
+pub(crate) fn resolve_whisper_cpp_executable_from_candidates(
+    bundled_roots: impl IntoIterator<Item = PathBuf>,
+    managed_roots: impl IntoIterator<Item = PathBuf>,
+    dev_paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    first_existing_path(
+        bundled_roots
+            .into_iter()
+            .flat_map(|root| whisper_runtime_candidates(&root))
+            .chain(
+                managed_roots
+                    .into_iter()
+                    .flat_map(|root| whisper_runtime_candidates(&root)),
+            )
+            .chain(dev_paths),
+    )
+}
+
+fn whisper_runtime_candidates(root: &Path) -> Vec<PathBuf> {
+    if root.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    if root.is_file() {
+        return vec![root.to_path_buf()];
+    }
+
+    whisper_cli_binary_names()
+        .iter()
+        .flat_map(|&binary_name| {
+            [
+                root.join("runtimes")
+                    .join("whisper.cpp")
+                    .join("bin")
+                    .join(binary_name),
+                root.join("runtimes")
+                    .join("whisper_cpp")
+                    .join("bin")
+                    .join(binary_name),
+                root.join("bin").join(binary_name),
+                root.join(binary_name),
+            ]
+        })
+        .collect()
+}
+
+fn whisper_cli_binary_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["whisper-cli.exe", "main.exe"]
+    } else {
+        &["whisper-cli", "main"]
+    }
+}
+
+fn first_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let mut seen = Vec::new();
+    for path in paths {
+        if path.as_os_str().is_empty() || seen.iter().any(|seen_path| seen_path == &path) {
+            continue;
+        }
+        seen.push(path.clone());
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn whisper_cli_args(
@@ -221,6 +314,8 @@ fn strip_timestamp_prefix(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::models::default_model_catalog;
     use crate::stt::SttBackend;
 
@@ -313,6 +408,76 @@ mod tests {
 
         assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cuda")));
         assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cublas")));
+    }
+
+    #[test]
+    fn resolver_prefers_bundled_before_managed_and_dev_paths() {
+        let root = test_runtime_root("prefers-bundled");
+        let bundled_root = root.join("bundled");
+        let managed_root = root.join("managed");
+        let dev_runtime = root.join("dev").join(whisper_cli_binary_names()[0]);
+        let bundled_runtime = bundled_root
+            .join("runtimes")
+            .join("whisper.cpp")
+            .join("bin")
+            .join(whisper_cli_binary_names()[0]);
+        let managed_runtime = managed_root.join("bin").join(whisper_cli_binary_names()[0]);
+        write_test_runtime(&bundled_runtime);
+        write_test_runtime(&managed_runtime);
+        write_test_runtime(&dev_runtime);
+
+        let resolved = resolve_whisper_cpp_executable_from_candidates(
+            [bundled_root],
+            [managed_root],
+            [dev_runtime],
+        );
+
+        assert_eq!(resolved, Some(bundled_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_uses_managed_runtime_before_dev_paths() {
+        let root = test_runtime_root("managed-before-dev");
+        let managed_root = root.join("managed");
+        let dev_runtime = root.join("dev").join(whisper_cli_binary_names()[0]);
+        let managed_runtime = managed_root.join("bin").join(whisper_cli_binary_names()[0]);
+        write_test_runtime(&managed_runtime);
+        write_test_runtime(&dev_runtime);
+
+        let resolved =
+            resolve_whisper_cpp_executable_from_candidates([], [managed_root], [dev_runtime]);
+
+        assert_eq!(resolved, Some(managed_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_accepts_direct_runtime_file_paths() {
+        let root = test_runtime_root("direct-file");
+        let managed_runtime = root.join("managed-runtime");
+        write_test_runtime(&managed_runtime);
+
+        let resolved =
+            resolve_whisper_cpp_executable_from_candidates([], [managed_runtime.clone()], []);
+
+        assert_eq!(resolved, Some(managed_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_runtime_root(name: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "scribe-whisper-runtime-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_test_runtime(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"whisper runtime").unwrap();
     }
 
     #[test]

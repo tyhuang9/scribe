@@ -377,8 +377,8 @@ impl LocalTranscriberApp {
         config::selected_model(&self.config)
     }
 
-    fn enabled_models(&self) -> Vec<SttModelInfo> {
-        config::enabled_models(&self.config)
+    fn playground_enabled_models(&self) -> Vec<SttModelInfo> {
+        config::playground_enabled_models(&self.config)
     }
 
     fn save_config(&mut self) {
@@ -1538,7 +1538,7 @@ impl LocalTranscriberApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         badge(
                             ui,
-                            &format!("{} enabled", self.enabled_models().len()),
+                            &format!("{} enabled", self.playground_enabled_models().len()),
                             ChipTone::Neutral,
                         );
                     });
@@ -2803,7 +2803,7 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
     match status {
         ModelRuntimeStatus::Ready => "Ready to transcribe.".to_owned(),
         ModelRuntimeStatus::MissingConfiguration => {
-            "Set the whisper.cpp executable and download the selected model before transcribing."
+            "Install the selected model and managed runtime from Models before transcribing."
                 .to_owned()
         }
         ModelRuntimeStatus::NotInstalled => {
@@ -2813,7 +2813,7 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
         ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
         ModelRuntimeStatus::Disabled => "Enable this model before transcribing.".to_owned(),
         ModelRuntimeStatus::NotImplemented => {
-            "This backend is planned metadata only; choose a whisper.cpp model.".to_owned()
+            "This backend runtime is not bundled yet; choose a whisper.cpp model.".to_owned()
         }
         ModelRuntimeStatus::Error(message) => message.clone(),
     }
@@ -2980,10 +2980,7 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     } else if !backend_capabilities(&model.backend).runnable {
         ModelRuntimeStatus::NotImplemented
     } else if model.install_status.is_runnable() {
-        let executable_ready = config
-            .whisper_executable_path
-            .as_ref()
-            .is_some_and(|path| path.exists());
+        let executable_ready = stt::whisper_cpp::resolve_whisper_cpp_executable(config).is_some();
         if executable_ready {
             ModelRuntimeStatus::Ready
         } else {

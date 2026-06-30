@@ -283,15 +283,11 @@ pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
         .find(|model| model.id == config.selected_default_model)
 }
 
-pub fn enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
+pub fn playground_enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
     configured_models(config)
         .into_iter()
         .filter(|model| model.enabled)
         .collect()
-}
-
-pub fn playground_enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    enabled_models(config)
 }
 
 pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
