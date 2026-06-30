@@ -231,7 +231,10 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     default_model_catalog()
         .into_iter()
         .map(|mut model| {
-            model.enabled = config.playground_enabled_models.iter().any(|id| id == &model.id);
+            model.enabled = config
+                .playground_enabled_models
+                .iter()
+                .any(|id| id == &model.id);
             let configured_path = config.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path =
@@ -373,8 +376,8 @@ pub fn normalize_config(config: &mut AppConfig) {
 
     if !config.selected_default_model.is_empty()
         && !catalog
-        .iter()
-        .any(|model| model.id == config.selected_default_model)
+            .iter()
+            .any(|model| model.id == config.selected_default_model)
     {
         config.selected_default_model = "whisper_cpp_tiny_en".to_owned();
     }

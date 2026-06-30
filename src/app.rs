@@ -12,7 +12,6 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
-use rfd::FileDialog;
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -281,10 +280,6 @@ pub struct LocalTranscriberApp {
     transcript: String,
     status_message: String,
     hotkey_input: String,
-    whisper_path_input: String,
-    whisper_cuda_backend_path_input: String,
-    whisper_cuda_library_paths_input: String,
-    model_storage_dir_input: String,
     model_search: String,
     model_backend_filter: String,
     audio_devices: Vec<String>,
@@ -308,7 +303,6 @@ pub struct LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         configure_stitch_style(&cc.egui_ctx);
 
         let (mut config, config_path, status_message) = match config::load_config() {
@@ -320,22 +314,14 @@ impl LocalTranscriberApp {
             ),
         };
         config::normalize_config(&mut config);
+        cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
+            config.theme_mode,
+            cc.integration_info.system_theme,
+        )));
 
         let (tx, rx) = unbounded();
         let mut app = Self {
             hotkey_input: config.hotkey.clone(),
-            whisper_path_input: config
-                .whisper_executable_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            whisper_cuda_backend_path_input: config
-                .whisper_cuda_backend_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            whisper_cuda_library_paths_input: path_list_input(&config.whisper_cuda_library_paths),
-            model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
             model_search: String::new(),
             model_backend_filter: "All".to_owned(),
             audio_devices: Vec::new(),
@@ -454,41 +440,6 @@ impl LocalTranscriberApp {
                 .model_downloads
                 .values()
                 .any(|status| matches!(status, ModelInstallStatus::Downloading { .. }))
-    }
-
-    fn apply_whisper_path_input(&mut self) {
-        if update_whisper_executable_path_from_input(&mut self.config, &self.whisper_path_input) {
-            self.save_config();
-        }
-    }
-
-    fn apply_cuda_backend_path_input(&mut self) {
-        if update_cuda_backend_path_from_input(
-            &mut self.config,
-            &self.whisper_cuda_backend_path_input,
-        ) {
-            self.save_config();
-        }
-    }
-
-    fn apply_cuda_library_paths_input(&mut self) {
-        if update_cuda_library_paths_from_input(
-            &mut self.config,
-            &self.whisper_cuda_library_paths_input,
-        ) {
-            self.save_config();
-        }
-    }
-
-    fn apply_model_storage_dir_input(&mut self) {
-        if path_from_input(&self.model_storage_dir_input).is_none() {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "Model storage path is required.".to_owned();
-            return;
-        }
-        if update_model_storage_dir_from_input(&mut self.config, &self.model_storage_dir_input) {
-            self.save_config();
-        }
     }
 
     fn apply_playground_action(&mut self, action: PlaygroundAction) {
@@ -893,10 +844,8 @@ impl LocalTranscriberApp {
                 if self.playground_pending == 0 {
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = "Model playground finished".to_owned();
-                    if !self.config.debug_mode {
-                        if let Some(path) = self.playground_audio_path.take() {
-                            let _ = fs::remove_file(path);
-                        }
+                    if let Some(path) = self.playground_audio_path.take() {
+                        let _ = fs::remove_file(path);
                     }
                 }
             }
@@ -914,14 +863,11 @@ impl LocalTranscriberApp {
         latency.transcription_dispatched_at = Some(Instant::now());
         let config = self.config.clone();
         let tx = self.tx.clone();
-        let delete_after = !self.config.debug_mode;
 
         thread::spawn(move || {
             let result = stt::transcribe_with_config(&config, audio_path.clone(), model.clone());
             latency.transcription_completed_at = Some(Instant::now());
-            if delete_after {
-                let _ = fs::remove_file(&audio_path);
-            }
+            let _ = fs::remove_file(&audio_path);
 
             match result {
                 Ok(result) => {
@@ -1121,8 +1067,11 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn apply_theme(&self, ctx: &egui::Context) {
-        ctx.set_visuals(stitch_visuals(self.config.theme_mode));
+    fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
+        ctx.set_visuals(stitch_visuals(resolve_theme_mode(
+            self.config.theme_mode,
+            frame.info().system_theme,
+        )));
     }
 
     fn poll_hotkey_capture(&mut self, ctx: &egui::Context) {
@@ -1235,8 +1184,8 @@ impl eframe::App for LocalTranscriberApp {
         CONTENT_BG.to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.apply_theme(ctx);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.apply_theme(ctx, frame);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
@@ -1534,8 +1483,7 @@ impl LocalTranscriberApp {
                             ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
                         }
                     }
-                    if action_state.show_uninstall && ui.add(small_button("Uninstall")).clicked()
-                    {
+                    if action_state.show_uninstall && ui.add(small_button("Uninstall")).clicked() {
                         uninstall = true;
                     }
                 });
@@ -1844,35 +1792,12 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Paths"));
-                ui.add_space(8.0);
-                if let Some(path) = &self.config_path {
-                    ui.label(
-                        RichText::new(format!("Config file: {}", path.display())).color(MUTED_TEXT),
-                    );
-                }
+                ui.label(section_heading("Performance"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("whisper.cpp executable");
-                    ui.add(
-                        TextEdit::singleline(&mut self.whisper_path_input)
-                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
-                    );
-                    if ui.add(small_button("Apply")).clicked() {
-                        self.apply_whisper_path_input();
-                    }
-                    if ui.add(small_button("Browse")).clicked() {
-                        if let Some(path) = FileDialog::new().pick_file() {
-                            self.whisper_path_input = path.display().to_string();
-                            self.config.whisper_executable_path = Some(path);
-                            self.save_config();
-                        }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("whisper.cpp compute");
+                    ui.label("Transcription device");
                     let mut compute_mode = self.config.whisper_compute_mode;
-                    ComboBox::from_id_source("whisper-compute-mode")
+                    ComboBox::from_id_source("transcription-device-mode")
                         .selected_text(compute_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in WhisperComputeMode::ALL {
@@ -1882,89 +1807,6 @@ impl LocalTranscriberApp {
                     if compute_mode != self.config.whisper_compute_mode {
                         self.config.whisper_compute_mode = compute_mode;
                         self.save_config();
-                    }
-
-                    ui.label("GPU device");
-                    let mut gpu_device = self.config.whisper_gpu_device;
-                    if ui
-                        .add_enabled(
-                            compute_mode.uses_gpu(),
-                            egui::DragValue::new(&mut gpu_device).clamp_range(0..=16),
-                        )
-                        .changed()
-                    {
-                        self.config.whisper_gpu_device = gpu_device;
-                        self.save_config();
-                    }
-                });
-                ui.label(
-                    RichText::new(
-                        "CUDA mode requires a CUDA-capable whisper.cpp executable or a dynamic CUDA backend.",
-                    )
-                    .color(MUTED_TEXT),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("CUDA backend");
-                    ui.add_enabled(
-                        self.config.whisper_compute_mode.uses_gpu(),
-                        TextEdit::singleline(&mut self.whisper_cuda_backend_path_input)
-                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
-                    );
-                    if ui
-                        .add_enabled(
-                            self.config.whisper_compute_mode.uses_gpu(),
-                            small_button("Apply"),
-                        )
-                        .clicked()
-                    {
-                        self.apply_cuda_backend_path_input();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.config.whisper_compute_mode.uses_gpu(),
-                            small_button("Browse"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = FileDialog::new().pick_file() {
-                            self.whisper_cuda_backend_path_input = path.display().to_string();
-                            self.config.whisper_cuda_backend_path = Some(path);
-                            self.save_config();
-                        }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("CUDA library dirs");
-                    ui.add_enabled(
-                        self.config.whisper_compute_mode.uses_gpu(),
-                        TextEdit::singleline(&mut self.whisper_cuda_library_paths_input)
-                            .desired_width(width_before_trailing(ui, 82.0, 96.0)),
-                    );
-                    if ui
-                        .add_enabled(
-                            self.config.whisper_compute_mode.uses_gpu(),
-                            small_button("Apply"),
-                        )
-                        .clicked()
-                    {
-                        self.apply_cuda_library_paths_input();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Model storage");
-                    ui.add(
-                        TextEdit::singleline(&mut self.model_storage_dir_input)
-                            .desired_width(width_before_trailing(ui, 158.0, 64.0)),
-                    );
-                    if ui.add(small_button("Apply")).clicked() {
-                        self.apply_model_storage_dir_input();
-                    }
-                    if ui.add(small_button("Browse")).clicked() {
-                        if let Some(path) = FileDialog::new().pick_folder() {
-                            self.model_storage_dir_input = path.display().to_string();
-                            self.config.model_storage_dir = path;
-                            self.save_config();
-                        }
                     }
                 });
             });
@@ -2039,27 +1881,17 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
-                let mut debug = self.config.debug_mode;
-                if ui
-                    .checkbox(&mut debug, "Keep temporary WAV files")
-                    .changed()
-                {
-                    self.config.debug_mode = debug;
-                    self.save_config();
-                }
             });
 
             ui.add_space(12.0);
             card(ui, |ui| {
                 ui.label(section_heading("Runtime"));
                 ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").color(MUTED_TEXT));
-                if self.config.debug_mode {
-                    if let Some(latency) = &self.latest_latency {
-                        ui.add_space(8.0);
-                        ui.label(section_heading("Last Latency"));
-                        for line in latency.summary_lines() {
-                            ui.label(mut_text(line));
-                        }
+                if let Some(latency) = &self.latest_latency {
+                    ui.add_space(8.0);
+                    ui.label(section_heading("Last Latency"));
+                    for line in latency.summary_lines() {
+                        ui.label(mut_text(line));
                     }
                 }
                 if self.tray_service.is_none() {
@@ -2987,6 +2819,16 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
     }
 }
 
+fn resolve_theme_mode(theme_mode: ThemeMode, system_theme: Option<eframe::Theme>) -> ThemeMode {
+    match theme_mode {
+        ThemeMode::System => match system_theme {
+            Some(eframe::Theme::Dark) => ThemeMode::Dark,
+            Some(eframe::Theme::Light) | None => ThemeMode::Light,
+        },
+        explicit => explicit,
+    }
+}
+
 fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     let mut visuals = match theme_mode {
         ThemeMode::Dark => egui::Visuals::dark(),
@@ -3005,76 +2847,10 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     visuals
 }
 
-fn path_from_input(input: &str) -> Option<PathBuf> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
-}
-
-fn update_whisper_executable_path_from_input(config: &mut AppConfig, input: &str) -> bool {
-    let next = path_from_input(input);
-    if config.whisper_executable_path == next {
-        return false;
-    }
-    config.whisper_executable_path = next;
-    true
-}
-
-fn update_cuda_backend_path_from_input(config: &mut AppConfig, input: &str) -> bool {
-    let next = path_from_input(input);
-    if config.whisper_cuda_backend_path == next {
-        return false;
-    }
-    config.whisper_cuda_backend_path = next;
-    true
-}
-
-fn update_cuda_library_paths_from_input(config: &mut AppConfig, input: &str) -> bool {
-    let next = paths_from_list_input(input);
-    if config.whisper_cuda_library_paths == next {
-        return false;
-    }
-    config.whisper_cuda_library_paths = next;
-    true
-}
-
-fn update_model_storage_dir_from_input(config: &mut AppConfig, input: &str) -> bool {
-    let Some(next) = path_from_input(input) else {
-        return false;
-    };
-    if config.model_storage_dir == next {
-        return false;
-    }
-    config.model_storage_dir = next;
-    true
-}
-
-fn path_list_input(paths: &[PathBuf]) -> String {
-    std::env::join_paths(paths)
-        .ok()
-        .and_then(|paths| paths.into_string().ok())
-        .unwrap_or_else(|| {
-            paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(":")
-        })
-}
-
-fn paths_from_list_input(input: &str) -> Vec<PathBuf> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        std::env::split_paths(trimmed).collect()
-    }
-}
-
-fn model_install_detail(model: &SttModelInfo, install_status: &ModelInstallStatus) -> Option<String> {
+fn model_install_detail(
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+) -> Option<String> {
     match install_status {
         ModelInstallStatus::NotInstalled if !supports_managed_install(model) => Some(format!(
             "{} runtime installer is not bundled in this build.",
@@ -3145,7 +2921,11 @@ fn select_first_installed_model(config: &mut AppConfig) {
 
 fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
     if enabled {
-        if !config.playground_enabled_models.iter().any(|id| id == model_id) {
+        if !config
+            .playground_enabled_models
+            .iter()
+            .any(|id| id == model_id)
+        {
             config.playground_enabled_models.push(model_id.to_owned());
         }
     } else {
@@ -3465,6 +3245,26 @@ mod layout_tests {
     }
 
     #[test]
+    fn system_theme_uses_reported_native_theme() {
+        assert_eq!(
+            resolve_theme_mode(ThemeMode::System, Some(eframe::Theme::Dark)),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            resolve_theme_mode(ThemeMode::System, Some(eframe::Theme::Light)),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            resolve_theme_mode(ThemeMode::System, None),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            resolve_theme_mode(ThemeMode::Dark, Some(eframe::Theme::Light)),
+            ThemeMode::Dark
+        );
+    }
+
+    #[test]
     fn active_model_can_stay_pinned_when_disabled() {
         let mut config = AppConfig::default();
         let active_model = config.selected_default_model.clone();
@@ -3473,7 +3273,12 @@ mod layout_tests {
         config::normalize_config(&mut config);
 
         assert_eq!(config.selected_default_model, active_model);
-        assert!(!config.playground_enabled_models.iter().any(|id| id == &active_model));
+        assert!(
+            !config
+                .playground_enabled_models
+                .iter()
+                .any(|id| id == &active_model)
+        );
     }
 
     #[test]
@@ -3591,79 +3396,31 @@ mod layout_tests {
     }
 
     #[test]
-    fn path_input_buffers_update_config_only_when_applied() {
-        let mut app = test_app();
-        let before = app.config.whisper_executable_path.clone();
-        app.whisper_path_input = "/tmp/scribe-whisper".to_owned();
-        assert_eq!(app.config.whisper_executable_path, before);
+    fn performance_modes_are_layman_facing() {
+        let labels = WhisperComputeMode::ALL
+            .into_iter()
+            .map(WhisperComputeMode::label)
+            .collect::<Vec<_>>();
 
-        assert!(update_whisper_executable_path_from_input(
-            &mut app.config,
-            &app.whisper_path_input
-        ));
-        assert_eq!(
-            app.config.whisper_executable_path,
-            Some(PathBuf::from("/tmp/scribe-whisper"))
-        );
-        assert!(!update_whisper_executable_path_from_input(
-            &mut app.config,
-            &app.whisper_path_input
-        ));
-
-        assert!(update_whisper_executable_path_from_input(
-            &mut app.config,
-            " "
-        ));
-        assert_eq!(app.config.whisper_executable_path, None);
+        assert_eq!(labels, vec!["Auto", "Prefer GPU", "CPU only"]);
     }
 
     #[test]
-    fn path_apply_helpers_report_real_config_changes() {
-        let mut config = AppConfig::default();
-        let original_storage_dir = config.model_storage_dir.clone();
+    fn playground_cleanup_deletes_temp_audio_even_when_debug_mode_is_set() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "scribe-playground-cleanup-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"wav").unwrap();
 
-        assert!(update_cuda_backend_path_from_input(
-            &mut config,
-            "/tmp/libggml-cuda.so"
-        ));
-        assert_eq!(
-            config.whisper_cuda_backend_path,
-            Some(PathBuf::from("/tmp/libggml-cuda.so"))
-        );
+        let mut app = test_app();
+        app.config.debug_mode = true;
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(temp_path.clone());
 
-        let cuda_dirs = std::env::join_paths([
-            PathBuf::from("/tmp/cuda-one"),
-            PathBuf::from("/tmp/cuda-two"),
-        ])
-        .expect("test CUDA paths should join")
-        .into_string()
-        .expect("test CUDA paths should be UTF-8");
-        assert!(update_cuda_library_paths_from_input(
-            &mut config,
-            &cuda_dirs
-        ));
-        assert_eq!(
-            config.whisper_cuda_library_paths,
-            vec![
-                PathBuf::from("/tmp/cuda-one"),
-                PathBuf::from("/tmp/cuda-two")
-            ]
-        );
-        assert!(!update_cuda_library_paths_from_input(
-            &mut config,
-            &cuda_dirs
-        ));
+        app.cleanup_after_job(RecordingSource::Playground);
 
-        assert!(!update_model_storage_dir_from_input(&mut config, " "));
-        assert_eq!(config.model_storage_dir, original_storage_dir);
-        assert!(update_model_storage_dir_from_input(
-            &mut config,
-            "/tmp/scribe-models"
-        ));
-        assert_eq!(
-            config.model_storage_dir,
-            PathBuf::from("/tmp/scribe-models")
-        );
+        assert!(!temp_path.exists());
     }
 
     #[test]
@@ -4037,18 +3794,6 @@ mod layout_tests {
 
         LocalTranscriberApp {
             hotkey_input: config.hotkey.clone(),
-            whisper_path_input: config
-                .whisper_executable_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            whisper_cuda_backend_path_input: config
-                .whisper_cuda_backend_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
-            whisper_cuda_library_paths_input: path_list_input(&config.whisper_cuda_library_paths),
-            model_storage_dir_input: config::model_storage_dir(&config).display().to_string(),
             model_search: String::new(),
             model_backend_filter: "All".to_owned(),
             audio_devices: Vec::new(),

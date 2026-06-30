@@ -40,7 +40,7 @@ fn native_options() -> eframe::NativeOptions {
             .with_min_inner_size([840.0, 600.0])
             .with_resizable(true)
             .with_transparent(false),
-        follow_system_theme: false,
+        follow_system_theme: true,
         default_theme: eframe::Theme::Light,
         event_loop_builder: Some(Box::new(configure_event_loop_backend)),
         ..Default::default()
@@ -169,6 +169,7 @@ mod tests {
         );
         assert_eq!(options.viewport.resizable, Some(true));
         assert_eq!(options.viewport.transparent, Some(false));
+        assert!(options.follow_system_theme);
     }
 
     #[test]
