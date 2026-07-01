@@ -85,8 +85,8 @@ def safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
 def extracted_model_root(extract_dir: Path) -> Path:
     if is_vosk_model_dir(extract_dir):
         return extract_dir
-    for child in sorted(extract_dir.iterdir()):
-        if child.is_dir() and is_vosk_model_dir(child):
+    for child in sorted(path for path in extract_dir.rglob("*") if path.is_dir()):
+        if is_vosk_model_dir(child):
             return child
     raise RuntimeError(f"download did not contain a valid Vosk model: {extract_dir}")
 

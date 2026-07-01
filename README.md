@@ -11,8 +11,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp`, `faster-whisper`, and Vosk backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
-- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper and Vosk model directories.
+- `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
+- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper, Vosk, sherpa-onnx, Moonshine, and Parakeet model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
@@ -30,8 +30,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - faster-whisper turbo
   - faster-whisper distil-large-v3
   - sherpa-onnx Zipformer Small
-  - Moonshine
-  - Parakeet 0.6B
+  - Moonshine tiny English
+  - Parakeet Unified 0.6B int8
 - Playground that shows the full catalog, keeps enable/disable controls for testing, supports persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
 - Transcript copy and clear actions.
 
@@ -40,7 +40,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Rust 1.96 or newer.
 - Linux, macOS, or Windows desktop session supported by `eframe` and `global-hotkey`.
 - A microphone visible to the host OS.
-- Real transcription requires a whisper.cpp, faster-whisper, or Vosk runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
+- Real transcription requires a supported runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
 - NVIDIA GPU transcription requires an NVIDIA driver plus a runtime that can use CUDA or another supported GPU backend.
 
 On Ubuntu, install the microphone and tray build dependencies:
@@ -129,11 +129,11 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp, faster-whisper, or Vosk model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
+Open `Models` to install a local whisper.cpp, faster-whisper, Vosk, sherpa-onnx, Moonshine, or Parakeet model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
 
 Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
 
-Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, or `SCRIBE_VOSK_CLI` as fallback runtime paths.
+Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, `SCRIBE_VOSK_CLI`, `SCRIBE_SHERPA_ONNX_CLI`, `SCRIBE_MOONSHINE_CLI`, or `SCRIBE_PARAKEET_CLI` as fallback runtime paths.
 
 When running from a source checkout on Unix, the Models page can also use the
 checked-in `scripts/bundle-*-runtime.sh` helpers as a development fallback. If a
@@ -154,11 +154,15 @@ scripts/build-release-bundle.sh
 ```
 
 The release bundle places whisper.cpp files under
-`target/release/runtimes/whisper_cpp` and stages the faster-whisper Python
-sidecar under `target/release/runtimes/faster_whisper`. It also stages the
-Vosk Python sidecar under `target/release/runtimes/vosk`. These are the same
-locations the app checks before falling back to user-managed or development
-runtime paths.
+`target/release/runtimes/whisper_cpp` and stages Python sidecars under
+`target/release/runtimes/faster_whisper`, `target/release/runtimes/vosk`,
+`target/release/runtimes/sherpa_onnx`, `target/release/runtimes/moonshine`,
+and `target/release/runtimes/parakeet`. These are the same locations the app
+checks before falling back to user-managed or development runtime paths. Set
+`SCRIBE_SKIP_FASTER_WHISPER=1`, `SCRIBE_SKIP_VOSK=1`,
+`SCRIBE_SKIP_SHERPA_ONNX=1`, `SCRIBE_SKIP_MOONSHINE=1`, or
+`SCRIBE_SKIP_PARAKEET=1` to omit a generated Python sidecar from a release
+bundle.
 
 To stage only the faster-whisper runtime during development:
 
@@ -184,6 +188,27 @@ the Vosk small English model is installed from the app. The Vosk catalog lists
 that model as 40M and Apache 2.0. The upstream model catalog does not publish a
 checksum alongside the ZIP; release packaging should record a SHA256 in the
 runtime manifest before distributing a fixed bundle.
+
+To stage only one of the sherpa-onnx-family runtimes during development:
+
+```bash
+scripts/bundle-sherpa-onnx-runtime.sh
+scripts/bundle-moonshine-runtime.sh
+scripts/bundle-parakeet-runtime.sh
+```
+
+These runtimes are generated Python virtual environments with `sherpa-onnx`
+and `sherpa-onnx-bin` plus a small Scribe runner. Each backend gets a separate
+managed runtime directory and wrapper, but they share the same runner. The
+runner downloads official sherpa-onnx model archives for:
+
+- `sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2`
+- `sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2`
+- `sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2`
+
+The model archives are validated by required ONNX/ORT and `tokens.txt` files
+before Scribe marks them installed. Release packaging should record SHA256
+checksums for these archives before distributing fixed bundles.
 
 GPU-capable bundles are intentionally opt-in because the CUDA runtime payload is
 large. On a machine with Ollama's CUDA libraries available, run:
@@ -234,8 +259,9 @@ whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt -dev 0
 `Auto` omits explicit whisper.cpp device flags and lets faster-whisper fall back
 to CPU when CUDA is unavailable. `Prefer GPU` appends `-dev <device>` for
 whisper.cpp and asks faster-whisper for CUDA. `CPU only` appends `-ng` for
-whisper.cpp and asks faster-whisper for CPU/int8 mode. Vosk is CPU-oriented in
-this build and ignores the GPU preference.
+whisper.cpp and asks faster-whisper for CPU/int8 mode. Vosk, sherpa-onnx,
+Moonshine, and Parakeet are CPU-oriented in this build and ignore the GPU
+preference.
 
 ## Config
 
@@ -266,7 +292,7 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 
 ## Notes
 
-- sherpa-onnx, Moonshine, and Parakeet have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
+- sherpa-onnx, Moonshine, and Parakeet use managed sherpa-onnx Python sidecars in this build. They currently run batch transcription only; true streaming partial transcription still needs a `SttBackend` streaming API.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
@@ -290,5 +316,6 @@ The main modules are:
 - `src/stt/mod.rs`: backend trait and dispatch.
 - `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
 - `src/stt/faster_whisper.rs`: faster-whisper child-process integration.
+- `src/stt/sherpa_onnx.rs`: sherpa-onnx-family child-process integration for sherpa-onnx, Moonshine, and Parakeet.
 - `src/text_output.rs`: focused-app transcript insertion through clipboard plus paste automation.
 - `src/tray.rs`: tray icon, tray menu, and tray command mapping.

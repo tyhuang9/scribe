@@ -13,7 +13,7 @@ use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_m
 
 use super::SttBackend;
 
-const MIN_VOSK_RUNNER_REVISION: u32 = 2;
+const MIN_VOSK_RUNNER_REVISION: u32 = 3;
 
 pub struct VoskBackend {
     executable_path: Option<PathBuf>,
@@ -422,11 +422,31 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn resolver_skips_stale_packaged_runner_revision_before_dev_path() {
+        let root = test_runtime_root("skips-stale-revision");
+        let managed_root = root.join("managed");
+        let managed_runtime = managed_root.join("bin").join(vosk_runner_names()[0]);
+        let dev_runtime = root.join("dev").join("scribe-vosk-dev");
+        write_test_runtime_with_revision(&managed_runtime, 2);
+        write_test_runtime(&dev_runtime);
+
+        let resolved =
+            resolve_vosk_executable_from_candidates([], [managed_root], [dev_runtime.clone()]);
+
+        assert_eq!(resolved, Some(dev_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_runtime_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("scribe-vosk-runtime-{name}-{}", std::process::id()))
     }
 
     fn write_test_runtime(path: &Path) {
+        write_test_runtime_with_revision(path, 3);
+    }
+
+    fn write_test_runtime_with_revision(path: &Path, runner_revision: u32) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"Vosk runtime").unwrap();
         if let Some(runtime_root) =
@@ -439,7 +459,11 @@ mod tests {
             fs::create_dir_all(python.parent().unwrap()).unwrap();
             fs::write(runner, b"runner").unwrap();
             fs::write(python, b"python").unwrap();
-            fs::write(manifest, br#"{"runner_revision":2}"#).unwrap();
+            fs::write(
+                manifest,
+                format!(r#"{{"runner_revision":{runner_revision}}}"#),
+            )
+            .unwrap();
         }
     }
 }

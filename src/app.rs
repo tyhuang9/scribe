@@ -25,7 +25,7 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    format_bytes, vosk_model_download_url, whisper_cpp_download_url,
+    format_bytes, sherpa_model_download_url, vosk_model_download_url, whisper_cpp_download_url,
 };
 use crate::stt;
 use crate::text_output;
@@ -330,7 +330,7 @@ fn model_primary_disabled_tooltip(
             if !supports_managed_install(model) =>
         {
             Some(format!(
-                "Managed downloads for {} models are not bundled in this build.",
+                "Managed downloads are not available for {} models in this build.",
                 model.backend
             ))
         }
@@ -422,6 +422,14 @@ fn resolve_managed_runtime_executable(
             stt::faster_whisper::resolve_faster_whisper_executable_from_candidates([], [root], [])
         }
         "Vosk" => stt::vosk::resolve_vosk_executable_from_candidates([], [root], []),
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+            stt::sherpa_onnx::resolve_executable_from_candidates(
+                provider.runtime_id,
+                [],
+                [root],
+                [],
+            )
+        }
         _ => None,
     }
 }
@@ -431,6 +439,9 @@ fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pat
         "whisper.cpp" => stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(config),
         "faster-whisper" => stt::faster_whisper::resolve_faster_whisper_packaged_executable(config),
         "Vosk" => stt::vosk::resolve_vosk_packaged_executable(config),
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+            stt::sherpa_onnx::resolve_packaged_executable_for_backend(config, &model.backend)
+        }
         _ => None,
     }
 }
@@ -484,6 +495,21 @@ fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> 
             script_name: "bundle-vosk-runtime.sh",
             destination_env: "SCRIBE_VOSK_RUNTIME_DEST",
             executable_relative_path: "bin/scribe-vosk",
+        }),
+        "sherpa_onnx" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-sherpa-onnx-runtime.sh",
+            destination_env: "SCRIBE_SHERPA_ONNX_RUNTIME_DEST",
+            executable_relative_path: "bin/scribe-sherpa-onnx",
+        }),
+        "moonshine" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-moonshine-runtime.sh",
+            destination_env: "SCRIBE_MOONSHINE_RUNTIME_DEST",
+            executable_relative_path: "bin/scribe-moonshine",
+        }),
+        "parakeet" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-parakeet-runtime.sh",
+            destination_env: "SCRIBE_PARAKEET_RUNTIME_DEST",
+            executable_relative_path: "bin/scribe-parakeet",
         }),
         _ => None,
     }
@@ -1071,8 +1097,10 @@ impl LocalTranscriberApp {
                         .map(|model| runtime_status_for_model(&self.config, &model))
                     {
                         Some(ModelRuntimeStatus::Ready) => "Model installed and ready.".to_owned(),
-                        _ => "Model installed. Managed runtime is not available in this build yet."
-                            .to_owned(),
+                        _ => {
+                            "Model installed. Install its managed runtime from Models before transcribing."
+                                .to_owned()
+                        }
                     };
                 }
                 AppEvent::ModelDownloadFailed { model_id, message } => {
@@ -1460,7 +1488,40 @@ impl LocalTranscriberApp {
                     }
                 });
             }
-            _ => {
+            "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+                let Some(runtime) =
+                    stt::sherpa_onnx::resolve_executable_for_backend(&self.config, &model.backend)
+                else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!(
+                        "Install the {} runtime before downloading this model.",
+                        model.backend
+                    );
+                    self.model_downloads.remove(&model.id);
+                    return;
+                };
+                let model_for_download = model.clone();
+                thread::spawn(move || {
+                    let result = download_sherpa_model(
+                        &runtime,
+                        &model_for_download,
+                        &download_model,
+                        &destination,
+                        &tx,
+                        &model_id,
+                        expected_total_bytes,
+                    );
+                    match result {
+                        Ok(path) => {
+                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+                        }
+                    }
+                });
+            }
+            "whisper.cpp" => {
                 let url = whisper_cpp_download_url(&download_model);
                 thread::spawn(move || {
                     let result = download_model_file(
@@ -1479,6 +1540,11 @@ impl LocalTranscriberApp {
                         }
                     }
                 });
+            }
+            backend => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Managed downloader for {backend} is not available.");
+                self.model_downloads.remove(&model.id);
             }
         }
     }
@@ -3922,8 +3988,8 @@ fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
         "faster_whisper_distil_large_v3" => "~1.5 GB",
         "vosk_small_en" => "~50 MB",
         "sherpa_onnx_zipformer_small" => "~80 MB",
-        "moonshine" => "~250 MB",
-        "parakeet_0_6b" => "~2.5 GB",
+        "moonshine" => "~35 MB",
+        "parakeet_0_6b" => "~640 MB",
         _ => "varies",
     }
 }
@@ -3942,6 +4008,9 @@ fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
         "faster_whisper_turbo" => Some(gib(1.6)),
         "faster_whisper_distil_large_v3" => Some(gib(1.5)),
         "vosk_small_en" => Some(40 * MIB),
+        "sherpa_onnx_zipformer_small" => Some(85 * MIB),
+        "moonshine" => Some(35 * MIB),
+        "parakeet_0_6b" => Some(650 * MIB),
         _ => None,
     }
 }
@@ -3951,7 +4020,7 @@ fn runtime_storage_estimate(backend: &str) -> &'static str {
         "whisper.cpp" => "~20 MB+",
         "faster-whisper" => "~450 MB+",
         "Vosk" => "~20 MB+",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled",
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => "~100 MB+",
         _ => "varies",
     }
 }
@@ -3961,7 +4030,9 @@ fn runtime_storage_detail(backend: &str) -> &'static str {
         "whisper.cpp" => "~20 MB for the CPU runtime; CUDA bundles are larger",
         "faster-whisper" => "~450 MB for the CPU Python runtime; CUDA bundles are larger",
         "Vosk" => "~20 MB for the pinned Python Vosk runtime",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled in this build",
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+            "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate"
+        }
         _ => "varies",
     }
 }
@@ -4091,6 +4162,9 @@ fn installed_runtime_executable_usable(runtime_id: &str, executable: &Path) -> b
     match runtime_id {
         "faster_whisper" => stt::faster_whisper::is_faster_whisper_runtime_usable(executable),
         "vosk" => stt::vosk::is_vosk_runtime_usable(executable),
+        "sherpa_onnx" | "moonshine" | "parakeet" => {
+            stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, executable)
+        }
         _ => executable.exists(),
     }
 }
@@ -4671,6 +4745,122 @@ fn download_vosk_model(
     Ok(validated_path)
 }
 
+fn download_sherpa_model(
+    runner: &Path,
+    model: &SttModelInfo,
+    model_name: &str,
+    destination: &Path,
+    tx: &Sender<AppEvent>,
+    model_id: &str,
+    expected_total_bytes: Option<u64>,
+) -> Result<PathBuf, String> {
+    if sherpa_model_download_url(model_name).is_none() {
+        return Err(format!(
+            "unsupported {} model download: {model_name}",
+            model.backend
+        ));
+    }
+    if destination.exists() {
+        if config::is_valid_model_install_path(model, destination) {
+            return Ok(destination.to_path_buf());
+        }
+        let result = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        result.map_err(|err| {
+            format!(
+                "failed to replace incomplete {} model at {}: {err}",
+                model.backend,
+                destination.display()
+            )
+        })?;
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+
+    let started_at = Instant::now();
+    let mut child = Command::new(runner)
+        .args(["download-model", "--model", model_name, "--output"])
+        .arg(destination)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
+    let stdout = child.stdout.take().map(read_stream_to_string);
+    let stderr = child.stderr.take().map(read_stream_to_string);
+    let mut last_progress_at = started_at;
+    let mut last_downloaded_bytes = 0_u64;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
+        {
+            Some(status) => break status,
+            None => {
+                let now = Instant::now();
+                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
+                    last_progress_at = now;
+                    last_downloaded_bytes =
+                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+                    let _ = tx.send(AppEvent::ModelDownloadProgress {
+                        model_id: model_id.to_owned(),
+                        downloaded_bytes: last_downloaded_bytes,
+                        total_bytes: expected_total_bytes,
+                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
+                    });
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let finished_at = Instant::now();
+    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+    let _ = tx.send(AppEvent::ModelDownloadProgress {
+        model_id: model_id.to_owned(),
+        downloaded_bytes,
+        total_bytes: expected_total_bytes,
+        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
+    });
+    let stdout = join_stream_reader(stdout, "sherpa-onnx stdout")?;
+    let stderr = join_stream_reader(stderr, "sherpa-onnx stderr")?;
+
+    if !status.success() {
+        let _ = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        return Err(format!(
+            "{} model download failed with status {}: {}",
+            model.backend,
+            status,
+            stderr.trim()
+        ));
+    }
+
+    let runner_path =
+        parse_sherpa_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
+    let validated_path = if config::is_valid_model_install_path(model, &runner_path)
+        && (runner_path == destination || runner_path.starts_with(destination))
+    {
+        runner_path
+    } else if config::is_valid_model_install_path(model, destination) {
+        destination.to_path_buf()
+    } else {
+        return Err(format!(
+            "{} runner finished but did not create a complete model at {}",
+            model.backend,
+            destination.display()
+        ));
+    };
+
+    Ok(validated_path)
+}
+
 fn read_stream_to_string<R>(mut reader: R) -> JoinHandle<Result<String, String>>
 where
     R: Read + Send + 'static,
@@ -4753,6 +4943,19 @@ fn parse_vosk_download_path(stdout: &str) -> Option<PathBuf> {
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str::<VoskDownloadOutput>(line.trim()).ok())
+        .map(|output| output.path)
+}
+
+#[derive(Debug, Deserialize)]
+struct SherpaDownloadOutput {
+    path: PathBuf,
+}
+
+fn parse_sherpa_download_path(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<SherpaDownloadOutput>(line.trim()).ok())
         .map(|output| output.path)
 }
 
@@ -5467,6 +5670,10 @@ mod layout_tests {
     }
 
     fn write_vosk_runtime(root: &Path) -> PathBuf {
+        write_vosk_runtime_with_revision(root, 3)
+    }
+
+    fn write_vosk_runtime_with_revision(root: &Path, runner_revision: u32) -> PathBuf {
         let executable = root.join("bin").join("scribe-vosk");
         let runner = root.join("bin").join("vosk_runner.py");
         let manifest = root.join("runtime-manifest.json");
@@ -5479,7 +5686,33 @@ mod layout_tests {
         fs::create_dir_all(python.parent().unwrap()).unwrap();
         fs::write(&executable, b"vosk runtime").unwrap();
         fs::write(runner, b"runner").unwrap();
-        fs::write(manifest, br#"{"runner_revision":2}"#).unwrap();
+        fs::write(
+            manifest,
+            format!(r#"{{"runner_revision":{runner_revision}}}"#),
+        )
+        .unwrap();
+        fs::write(python, b"python").unwrap();
+        executable
+    }
+
+    fn write_sherpa_family_runtime(root: &Path, runtime_id: &str, wrapper: &str) -> PathBuf {
+        let executable = root.join("bin").join(wrapper);
+        let runner = root.join("bin").join("sherpa_onnx_runner.py");
+        let manifest = root.join("runtime-manifest.json");
+        let python = if cfg!(windows) {
+            root.join("venv").join("Scripts").join("python.exe")
+        } else {
+            root.join("venv").join("bin").join("python")
+        };
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&executable, b"sherpa runtime").unwrap();
+        fs::write(runner, b"runner").unwrap();
+        fs::write(
+            manifest,
+            format!(r#"{{"runtime_id":"{runtime_id}","runner_revision":1}}"#),
+        )
+        .unwrap();
         fs::write(python, b"python").unwrap();
         executable
     }
@@ -5566,7 +5799,7 @@ mod layout_tests {
         )
         .unwrap();
 
-        assert!(tooltip.contains("not bundled"));
+        assert!(tooltip.contains("not available"));
         assert!(tooltip.contains("sherpa-onnx"));
     }
 
@@ -5690,6 +5923,44 @@ mod layout_tests {
     }
 
     #[test]
+    fn sherpa_family_models_have_progress_totals_and_managed_downloads() {
+        let models = config::configured_models(&AppConfig::default());
+        let sherpa = models
+            .iter()
+            .find(|model| model.id == "sherpa_onnx_zipformer_small")
+            .unwrap();
+        let moonshine = models.iter().find(|model| model.id == "moonshine").unwrap();
+        let parakeet = models
+            .iter()
+            .find(|model| model.id == "parakeet_0_6b")
+            .unwrap();
+
+        assert_eq!(
+            sherpa.download_model.as_deref(),
+            Some("sherpa-onnx-zipformer-small-en-2023-06-26")
+        );
+        assert_eq!(model_download_total_bytes(sherpa), Some(85 * 1024 * 1024));
+        assert_eq!(
+            moonshine.download_model.as_deref(),
+            Some("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27")
+        );
+        assert_eq!(model_storage_estimate(moonshine), "~35 MB");
+        assert_eq!(
+            model_download_total_bytes(moonshine),
+            Some(35 * 1024 * 1024)
+        );
+        assert_eq!(
+            parakeet.download_model.as_deref(),
+            Some("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
+        );
+        assert_eq!(model_storage_estimate(parakeet), "~640 MB");
+        assert_eq!(
+            model_download_total_bytes(parakeet),
+            Some(650 * 1024 * 1024)
+        );
+    }
+
+    #[test]
     fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
         let runtime_root =
             std::env::temp_dir().join(format!("scribe-runtime-action-{}", std::process::id()));
@@ -5765,16 +6036,74 @@ mod layout_tests {
             }
         );
 
-        let mut sherpa = test_model();
-        sherpa.backend = "sherpa-onnx".to_owned();
-        let unsupported_action = runtime_action_state(&AppConfig::default(), &sherpa);
+        let managed_models = [
+            (
+                "sherpa-onnx",
+                "sherpa_onnx",
+                "scribe-sherpa-onnx",
+                "sherpa-onnx-zipformer-small-en-2023-06-26",
+            ),
+            (
+                "Moonshine",
+                "moonshine",
+                "scribe-moonshine",
+                "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
+            ),
+            (
+                "Parakeet",
+                "parakeet",
+                "scribe-parakeet",
+                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
+            ),
+        ];
+        for (backend, runtime_id, wrapper, download_model) in managed_models {
+            let mut model = test_model();
+            model.backend = backend.to_owned();
+            model.download_model = Some(download_model.to_owned());
+
+            assert_eq!(
+                runtime_action_state(&AppConfig::default(), &model),
+                RuntimeActionState {
+                    kind: RuntimeActionKind::Install,
+                    enabled: true,
+                    disabled_tooltip: None,
+                },
+                "{backend} should be installable"
+            );
+
+            config.managed_runtimes.clear();
+            config.managed_runtimes.insert(
+                runtime_id.to_owned(),
+                config::ManagedRuntimeInstall {
+                    path: write_sherpa_family_runtime(
+                        &runtime_root.join(runtime_id),
+                        runtime_id,
+                        wrapper,
+                    ),
+                },
+            );
+
+            assert_eq!(
+                runtime_action_state(&config, &model),
+                RuntimeActionState {
+                    kind: RuntimeActionKind::Uninstall,
+                    enabled: true,
+                    disabled_tooltip: None,
+                },
+                "{backend} should detect installed runtime"
+            );
+        }
+
+        let mut unsupported = test_model();
+        unsupported.backend = "Unsupported".to_owned();
+        let unsupported_action = runtime_action_state(&AppConfig::default(), &unsupported);
         assert_eq!(unsupported_action.kind, RuntimeActionKind::Install);
         assert!(!unsupported_action.enabled);
         assert!(
             unsupported_action
                 .disabled_tooltip
                 .as_deref()
-                .is_some_and(|tooltip| tooltip.contains("installer is not bundled"))
+                .is_some_and(|tooltip| tooltip.contains("not a supported STT backend"))
         );
 
         let _ = fs::remove_dir_all(runtime_root);
@@ -5782,6 +6111,10 @@ mod layout_tests {
 
     #[test]
     fn runtime_action_state_ignores_stale_runtime_metadata() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-stale-runtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+
         let mut config = AppConfig::default();
         config.managed_runtimes.insert(
             "faster_whisper".to_owned(),
@@ -5797,6 +6130,22 @@ mod layout_tests {
 
         assert_eq!(action.kind, RuntimeActionKind::Install);
         assert!(action.enabled);
+
+        config.managed_runtimes.clear();
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            config::ManagedRuntimeInstall {
+                path: write_vosk_runtime_with_revision(&runtime_root.join("vosk"), 2),
+            },
+        );
+        model.backend = "Vosk".to_owned();
+        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+
+        let action = runtime_action_state(&config, &model);
+
+        assert_eq!(action.kind, RuntimeActionKind::Install);
+        assert!(action.enabled);
+        let _ = fs::remove_dir_all(runtime_root);
     }
 
     #[cfg(unix)]
@@ -5919,6 +6268,19 @@ mod layout_tests {
         .unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/scribe-models/vosk/vosk_small_en"));
+    }
+
+    #[test]
+    fn parses_sherpa_download_path_from_runner_json() {
+        let path = parse_sherpa_download_path(
+            r#"{"model":"sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27","path":"/tmp/scribe-models/moonshine/moonshine"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/scribe-models/moonshine/moonshine")
+        );
     }
 
     #[test]

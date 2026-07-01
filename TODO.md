@@ -11,10 +11,10 @@
 
 - Add installer/package integration around staged whisper.cpp runtime sidecars.
 - Harden Vosk release packaging with recorded model/runtime SHA256 checksums.
-- Add sherpa-onnx streaming runtime support.
+- Add checksum verification for sherpa-onnx, Moonshine, and Parakeet model archives and runtime packages.
+- Add sherpa-onnx streaming runtime support once `SttBackend` exposes partial transcription events.
 - Add production packaging hardening for generated faster-whisper Python sidecars.
-- Add Moonshine runtime support.
-- Add Parakeet runtime support.
+- Add production packaging hardening for generated sherpa-onnx-family Python sidecars.
 - Add a native whisper.cpp library backend to avoid child-process overhead.
 - Expand backend capability flags for timestamps, language selection, and streaming options.
 

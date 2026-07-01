@@ -97,7 +97,7 @@ cat > "$DEST/runtime-manifest.json" <<EOF
   "runtime_id": "vosk",
   "backend": "Vosk",
   "runner": "bin/scribe-vosk",
-  "runner_revision": 2,
+  "runner_revision": 3,
   "python": "venv/bin/python",
   "vosk_version": "$VOSK_VERSION",
   "model_source": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"

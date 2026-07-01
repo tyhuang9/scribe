@@ -8,6 +8,7 @@ use crate::models::{
 };
 
 pub mod faster_whisper;
+pub mod sherpa_onnx;
 pub mod vosk;
 pub mod whisper_cpp;
 
@@ -53,9 +54,9 @@ const PROVIDER_ADAPTERS: &[SttProviderAdapter] = &[
     SttProviderAdapter {
         backend: "sherpa-onnx",
         runtime_id: "sherpa_onnx",
-        model_install_supported: false,
-        runtime_install_supported: false,
-        transcription_supported: false,
+        model_install_supported: true,
+        runtime_install_supported: true,
+        transcription_supported: true,
         device_detection_supported: false,
     },
     SttProviderAdapter {
@@ -69,17 +70,17 @@ const PROVIDER_ADAPTERS: &[SttProviderAdapter] = &[
     SttProviderAdapter {
         backend: "Moonshine",
         runtime_id: "moonshine",
-        model_install_supported: false,
-        runtime_install_supported: false,
-        transcription_supported: false,
+        model_install_supported: true,
+        runtime_install_supported: true,
+        transcription_supported: true,
         device_detection_supported: false,
     },
     SttProviderAdapter {
         backend: "Parakeet",
         runtime_id: "parakeet",
-        model_install_supported: false,
-        runtime_install_supported: false,
-        transcription_supported: false,
+        model_install_supported: true,
+        runtime_install_supported: true,
+        transcription_supported: true,
         device_detection_supported: false,
     },
 ];
@@ -113,6 +114,13 @@ impl SttProviderAdapter {
             }
             "Vosk" => {
                 if vosk::resolve_vosk_executable(config).is_some() {
+                    ModelRuntimeStatus::Ready
+                } else {
+                    ModelRuntimeStatus::MissingConfiguration
+                }
+            }
+            "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+                if sherpa_onnx::resolve_executable_for_backend(config, self.backend).is_some() {
                     ModelRuntimeStatus::Ready
                 } else {
                     ModelRuntimeStatus::MissingConfiguration
@@ -247,9 +255,33 @@ pub fn transcribe_with_config(
             }
             backend.transcribe(audio_path, model)
         }
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => provider_for_backend(&model.backend)
-            .ok_or_else(|| anyhow!("unsupported STT backend: {}", model.backend))?
-            .transcribe(config, audio_path, model),
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+            let provider = provider_for_backend(&model.backend)
+                .ok_or_else(|| anyhow!("unsupported STT backend: {}", model.backend))?;
+            let backend = sherpa_onnx::SherpaOnnxBackend::new(
+                &model.backend,
+                sherpa_onnx::resolve_executable_for_backend(config, &model.backend),
+            );
+            let capabilities = backend_capabilities(provider.backend);
+            if !capabilities.runnable {
+                return Err(anyhow!(
+                    "{} managed runtime is not bundled yet",
+                    model.backend
+                ));
+            }
+            let backend_id = backend.id().to_owned();
+            if !backend
+                .list_models()
+                .iter()
+                .any(|available_model| available_model.id == model.id)
+            {
+                return Err(anyhow!(
+                    "{backend_id} does not advertise support for {}",
+                    model.name
+                ));
+            }
+            backend.transcribe(audio_path, model)
+        }
         backend => Err(anyhow!("unsupported STT backend: {backend}")),
     }
 }
@@ -303,6 +335,23 @@ mod tests {
         assert!(vosk.can_install_model(vosk_model));
         assert!(vosk.runtime_install_supported);
         assert!(vosk.transcription_supported);
+
+        for backend in ["sherpa-onnx", "Moonshine", "Parakeet"] {
+            let provider = provider_for_backend(backend).unwrap();
+            let model = models
+                .iter()
+                .find(|model| model.backend == backend)
+                .unwrap();
+            assert!(provider.can_install_model(model), "{backend} can install");
+            assert!(
+                provider.runtime_install_supported,
+                "{backend} runtime install"
+            );
+            assert!(
+                provider.transcription_supported,
+                "{backend} transcription support"
+            );
+        }
     }
 
     #[test]
@@ -311,6 +360,9 @@ mod tests {
         let whisper = provider_for_backend("whisper.cpp").unwrap();
         let faster_whisper = provider_for_backend("faster-whisper").unwrap();
         let vosk = provider_for_backend("Vosk").unwrap();
+        let sherpa = provider_for_backend("sherpa-onnx").unwrap();
+        let moonshine = provider_for_backend("Moonshine").unwrap();
+        let parakeet = provider_for_backend("Parakeet").unwrap();
 
         assert_eq!(
             whisper.runtime_status(&config),
@@ -322,6 +374,18 @@ mod tests {
         );
         assert_eq!(
             vosk.runtime_status(&config),
+            ModelRuntimeStatus::MissingConfiguration
+        );
+        assert_eq!(
+            sherpa.runtime_status(&config),
+            ModelRuntimeStatus::MissingConfiguration
+        );
+        assert_eq!(
+            moonshine.runtime_status(&config),
+            ModelRuntimeStatus::MissingConfiguration
+        );
+        assert_eq!(
+            parakeet.runtime_status(&config),
             ModelRuntimeStatus::MissingConfiguration
         );
     }

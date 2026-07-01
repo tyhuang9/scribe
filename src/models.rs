@@ -195,10 +195,10 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
             experimental: false,
         },
         "sherpa-onnx" | "Moonshine" | "Parakeet" => BackendCapabilities {
-            runnable: false,
+            runnable: true,
             supports_local_files: true,
-            supports_downloads: false,
-            streaming: backend == "sherpa-onnx",
+            supports_downloads: true,
+            streaming: false,
             experimental: true,
         },
         _ => BackendCapabilities {
@@ -220,6 +220,21 @@ pub fn vosk_model_download_url(model_name: &str) -> Option<&'static str> {
         "vosk-model-small-en-us-0.15" => {
             Some("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
         }
+        _ => None,
+    }
+}
+
+pub fn sherpa_model_download_url(model_name: &str) -> Option<&'static str> {
+    match model_name {
+        "sherpa-onnx-zipformer-small-en-2023-06-26" => Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2",
+        ),
+        "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27" => Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",
+        ),
+        "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming" => Some(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2",
+        ),
         _ => None,
     }
 }
@@ -362,33 +377,33 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "sherpa_onnx_zipformer_small",
             "sherpa-onnx Zipformer Small",
             "sherpa-onnx",
-            "Streaming-capable local model once the managed sherpa-onnx runtime is bundled.",
+            "Offline English Zipformer transducer model through the managed sherpa-onnx runtime.",
             "1-2 GB",
             "Good",
-            "Streaming",
-            None,
+            "Fast",
+            Some("sherpa-onnx-zipformer-small-en-2023-06-26"),
             false,
         ),
         model(
             "moonshine",
+            "Moonshine tiny English",
             "Moonshine",
-            "Moonshine",
-            "Lightweight local model once the managed Moonshine runtime is bundled.",
+            "Low-latency English Moonshine ONNX model through the managed sherpa-onnx-based Moonshine runtime.",
             "1-2 GB",
             "Good",
             "Fast",
-            None,
+            Some("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"),
             false,
         ),
         model(
             "parakeet_0_6b",
-            "Parakeet 0.6B",
+            "Parakeet Unified 0.6B int8",
             "Parakeet",
-            "Experimental high-accuracy local model once the managed Parakeet runtime is bundled.",
+            "Experimental high-accuracy NVIDIA Parakeet unified 0.6B int8 ONNX model through the managed sherpa-onnx-based Parakeet runtime.",
             "2-4 GB",
             "High",
             "Medium",
-            None,
+            Some("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"),
             false,
         ),
     ]
@@ -454,6 +469,30 @@ mod tests {
     }
 
     #[test]
+    fn sherpa_family_download_urls_use_supported_model_archives() {
+        assert_eq!(
+            sherpa_model_download_url("sherpa-onnx-zipformer-small-en-2023-06-26"),
+            Some(
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2"
+            )
+        );
+        assert_eq!(
+            sherpa_model_download_url("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"),
+            Some(
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2"
+            )
+        );
+        assert_eq!(
+            sherpa_model_download_url(
+                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
+            ),
+            Some(
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2"
+            )
+        );
+    }
+
+    #[test]
     fn install_status_labels_progress() {
         let status = ModelInstallStatus::Downloading {
             downloaded_bytes: 25,
@@ -483,12 +522,18 @@ mod tests {
     }
 
     #[test]
-    fn bundled_phase_supports_whisper_cpp_faster_whisper_and_vosk() {
+    fn bundled_phase_supports_all_managed_runtime_backends() {
         assert!(backend_capabilities("whisper.cpp").runnable);
         assert!(backend_capabilities("faster-whisper").runnable);
         assert!(backend_capabilities("faster-whisper").supports_downloads);
         assert!(backend_capabilities("Vosk").runnable);
         assert!(backend_capabilities("Vosk").supports_downloads);
-        assert!(!backend_capabilities("sherpa-onnx").supports_downloads);
+        assert!(backend_capabilities("sherpa-onnx").runnable);
+        assert!(backend_capabilities("sherpa-onnx").supports_downloads);
+        assert!(!backend_capabilities("sherpa-onnx").streaming);
+        assert!(backend_capabilities("Moonshine").runnable);
+        assert!(backend_capabilities("Moonshine").supports_downloads);
+        assert!(backend_capabilities("Parakeet").runnable);
+        assert!(backend_capabilities("Parakeet").supports_downloads);
     }
 }

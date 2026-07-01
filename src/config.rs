@@ -321,6 +321,9 @@ pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
         "whisper.cpp" => path.is_file(),
         "faster-whisper" => is_faster_whisper_model_dir(path),
         "Vosk" => is_vosk_model_dir(path),
+        "sherpa-onnx" => is_sherpa_onnx_model_dir(path),
+        "Moonshine" => is_moonshine_model_dir(path),
+        "Parakeet" => is_parakeet_model_dir(path),
         _ => path.exists(),
     }
 }
@@ -337,6 +340,81 @@ pub fn is_vosk_model_dir(path: &Path) -> bool {
         && path.join("am").join("final.mdl").is_file()
         && path.join("conf").join("model.conf").is_file()
         && has_graph
+}
+
+pub fn is_sherpa_onnx_model_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("tokens.txt").is_file()
+        && first_matching_file(
+            path,
+            &[
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "encoder-epoch-99-avg-1.onnx",
+                "encoder*.onnx",
+            ],
+        )
+        .is_some()
+        && first_matching_file(
+            path,
+            &[
+                "decoder-epoch-99-avg-1.onnx",
+                "decoder-epoch-99-avg-1.int8.onnx",
+                "decoder*.onnx",
+            ],
+        )
+        .is_some()
+        && first_matching_file(
+            path,
+            &[
+                "joiner-epoch-99-avg-1.int8.onnx",
+                "joiner-epoch-99-avg-1.onnx",
+                "joiner*.onnx",
+            ],
+        )
+        .is_some()
+}
+
+pub fn is_moonshine_model_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("tokens.txt").is_file()
+        && path.join("encoder_model.ort").is_file()
+        && path.join("decoder_model_merged.ort").is_file()
+}
+
+pub fn is_parakeet_model_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("tokens.txt").is_file()
+        && path.join("encoder.int8.onnx").is_file()
+        && path.join("decoder.int8.onnx").is_file()
+        && path.join("joiner.int8.onnx").is_file()
+}
+
+fn first_matching_file(root: &Path, patterns: &[&str]) -> Option<PathBuf> {
+    for pattern in patterns {
+        let literal = root.join(pattern);
+        if literal.is_file() {
+            return Some(literal);
+        }
+        if !pattern.contains('*') {
+            continue;
+        }
+        let Some((prefix, suffix)) = pattern.split_once('*') else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.is_file() && file_name.starts_with(prefix) && file_name.ends_with(suffix) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
@@ -801,6 +879,40 @@ mod tests {
         fs::write(root.join("graph").join("Gr.fst"), b"gr").unwrap();
 
         assert!(is_vosk_model_dir(&root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sherpa_family_directories_require_backend_specific_model_files() {
+        let root = std::env::temp_dir().join(format!("scribe-sherpa-model-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sherpa = root.join("sherpa");
+        let moonshine = root.join("moonshine");
+        let parakeet = root.join("parakeet");
+        fs::create_dir_all(&sherpa).unwrap();
+        fs::create_dir_all(&moonshine).unwrap();
+        fs::create_dir_all(&parakeet).unwrap();
+
+        fs::write(sherpa.join("tokens.txt"), b"tokens").unwrap();
+        fs::write(sherpa.join("encoder-epoch-99-avg-1.int8.onnx"), b"encoder").unwrap();
+        fs::write(sherpa.join("decoder-epoch-99-avg-1.onnx"), b"decoder").unwrap();
+        assert!(!is_sherpa_onnx_model_dir(&sherpa));
+        fs::write(sherpa.join("joiner-epoch-99-avg-1.int8.onnx"), b"joiner").unwrap();
+        assert!(is_sherpa_onnx_model_dir(&sherpa));
+
+        fs::write(moonshine.join("tokens.txt"), b"tokens").unwrap();
+        fs::write(moonshine.join("encoder_model.ort"), b"encoder").unwrap();
+        assert!(!is_moonshine_model_dir(&moonshine));
+        fs::write(moonshine.join("decoder_model_merged.ort"), b"decoder").unwrap();
+        assert!(is_moonshine_model_dir(&moonshine));
+
+        fs::write(parakeet.join("tokens.txt"), b"tokens").unwrap();
+        fs::write(parakeet.join("encoder.int8.onnx"), b"encoder").unwrap();
+        fs::write(parakeet.join("decoder.int8.onnx"), b"decoder").unwrap();
+        assert!(!is_parakeet_model_dir(&parakeet));
+        fs::write(parakeet.join("joiner.int8.onnx"), b"joiner").unwrap();
+        assert!(is_parakeet_model_dir(&parakeet));
+
         let _ = fs::remove_dir_all(root);
     }
 
