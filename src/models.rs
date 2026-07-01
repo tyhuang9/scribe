@@ -187,7 +187,14 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
             streaming: false,
             experimental: false,
         },
-        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => BackendCapabilities {
+        "Vosk" => BackendCapabilities {
+            runnable: true,
+            supports_local_files: true,
+            supports_downloads: true,
+            streaming: false,
+            experimental: false,
+        },
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => BackendCapabilities {
             runnable: false,
             supports_local_files: true,
             supports_downloads: false,
@@ -206,6 +213,15 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
 
 pub fn whisper_cpp_download_url(model_name: &str) -> String {
     format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin")
+}
+
+pub fn vosk_model_download_url(model_name: &str) -> Option<&'static str> {
+    match model_name {
+        "vosk-model-small-en-us-0.15" => {
+            Some("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+        }
+        _ => None,
+    }
 }
 
 pub fn default_model_catalog() -> Vec<SttModelInfo> {
@@ -258,11 +274,11 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "vosk_small_en",
             "Vosk small English",
             "Vosk",
-            "Offline English model for low-resource machines once the managed Vosk runtime is bundled.",
+            "Offline Apache 2.0 English model for low-resource CPU transcription with the managed Vosk runtime.",
             "1 GB",
             "Basic",
             "Fast",
-            None,
+            Some("vosk-model-small-en-us-0.15"),
             false,
         ),
         model(
@@ -430,6 +446,14 @@ mod tests {
     }
 
     #[test]
+    fn vosk_download_url_uses_official_model_catalog_entry() {
+        assert_eq!(
+            vosk_model_download_url("vosk-model-small-en-us-0.15"),
+            Some("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+        );
+    }
+
+    #[test]
     fn install_status_labels_progress() {
         let status = ModelInstallStatus::Downloading {
             downloaded_bytes: 25,
@@ -459,10 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn bundled_phase_supports_whisper_cpp_and_faster_whisper() {
+    fn bundled_phase_supports_whisper_cpp_faster_whisper_and_vosk() {
         assert!(backend_capabilities("whisper.cpp").runnable);
         assert!(backend_capabilities("faster-whisper").runnable);
         assert!(backend_capabilities("faster-whisper").supports_downloads);
-        assert!(!backend_capabilities("Vosk").supports_downloads);
+        assert!(backend_capabilities("Vosk").runnable);
+        assert!(backend_capabilities("Vosk").supports_downloads);
+        assert!(!backend_capabilities("sherpa-onnx").supports_downloads);
     }
 }

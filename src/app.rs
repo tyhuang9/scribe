@@ -24,7 +24,7 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    format_bytes, whisper_cpp_download_url,
+    format_bytes, vosk_model_download_url, whisper_cpp_download_url,
 };
 use crate::stt;
 use crate::text_output;
@@ -401,6 +401,7 @@ fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pat
     match model.backend.as_str() {
         "whisper.cpp" => stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(config),
         "faster-whisper" => stt::faster_whisper::resolve_faster_whisper_packaged_executable(config),
+        "Vosk" => stt::vosk::resolve_vosk_packaged_executable(config),
         _ => None,
     }
 }
@@ -1303,6 +1304,33 @@ impl LocalTranscriberApp {
                 };
                 thread::spawn(move || {
                     let result = download_faster_whisper_model(
+                        &runtime,
+                        &download_model,
+                        &destination,
+                        &tx,
+                        &model_id,
+                        expected_total_bytes,
+                    );
+                    match result {
+                        Ok(path) => {
+                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+                        }
+                    }
+                });
+            }
+            "Vosk" => {
+                let Some(runtime) = stt::vosk::resolve_vosk_executable(&self.config) else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "Install the Vosk runtime before downloading this model.".to_owned();
+                    self.model_downloads.remove(&model.id);
+                    return;
+                };
+                thread::spawn(move || {
+                    let result = download_vosk_model(
                         &runtime,
                         &download_model,
                         &destination,
@@ -3793,6 +3821,7 @@ fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
         "faster_whisper_large_v3" => Some(gib(3.1)),
         "faster_whisper_turbo" => Some(gib(1.6)),
         "faster_whisper_distil_large_v3" => Some(gib(1.5)),
+        "vosk_small_en" => Some(40 * MIB),
         _ => None,
     }
 }
@@ -3801,7 +3830,8 @@ fn runtime_storage_estimate(backend: &str) -> &'static str {
     match backend {
         "whisper.cpp" => "~20 MB+",
         "faster-whisper" => "~450 MB+",
-        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled",
+        "Vosk" => "~20 MB+",
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled",
         _ => "varies",
     }
 }
@@ -3810,7 +3840,8 @@ fn runtime_storage_detail(backend: &str) -> &'static str {
     match backend {
         "whisper.cpp" => "~20 MB for the CPU runtime; CUDA bundles are larger",
         "faster-whisper" => "~450 MB for the CPU Python runtime; CUDA bundles are larger",
-        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled in this build",
+        "Vosk" => "~20 MB for the pinned Python Vosk runtime",
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled in this build",
         _ => "varies",
     }
 }
@@ -4349,6 +4380,114 @@ fn download_faster_whisper_model(
     Ok(validated_path)
 }
 
+fn download_vosk_model(
+    runner: &Path,
+    model_name: &str,
+    destination: &Path,
+    tx: &Sender<AppEvent>,
+    model_id: &str,
+    expected_total_bytes: Option<u64>,
+) -> Result<PathBuf, String> {
+    if vosk_model_download_url(model_name).is_none() {
+        return Err(format!("unsupported Vosk model download: {model_name}"));
+    }
+    if destination.exists() {
+        if config::is_vosk_model_dir(destination) {
+            return Ok(destination.to_path_buf());
+        }
+        let result = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        result.map_err(|err| {
+            format!(
+                "failed to replace incomplete Vosk model at {}: {err}",
+                destination.display()
+            )
+        })?;
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+
+    let started_at = Instant::now();
+    let mut child = Command::new(runner)
+        .args(["download-model", "--model", model_name, "--output"])
+        .arg(destination)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
+    let stdout = child.stdout.take().map(read_stream_to_string);
+    let stderr = child.stderr.take().map(read_stream_to_string);
+    let mut last_progress_at = started_at;
+    let mut last_downloaded_bytes = 0_u64;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
+        {
+            Some(status) => break status,
+            None => {
+                let now = Instant::now();
+                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
+                    last_progress_at = now;
+                    last_downloaded_bytes =
+                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+                    let _ = tx.send(AppEvent::ModelDownloadProgress {
+                        model_id: model_id.to_owned(),
+                        downloaded_bytes: last_downloaded_bytes,
+                        total_bytes: expected_total_bytes,
+                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
+                    });
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let finished_at = Instant::now();
+    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+    let _ = tx.send(AppEvent::ModelDownloadProgress {
+        model_id: model_id.to_owned(),
+        downloaded_bytes,
+        total_bytes: expected_total_bytes,
+        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
+    });
+    let stdout = join_stream_reader(stdout, "Vosk stdout")?;
+    let stderr = join_stream_reader(stderr, "Vosk stderr")?;
+
+    if !status.success() {
+        let _ = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        return Err(format!(
+            "Vosk model download failed with status {}: {}",
+            status,
+            stderr.trim()
+        ));
+    }
+
+    let runner_path =
+        parse_vosk_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
+    let validated_path =
+        if config::is_vosk_model_dir(&runner_path) && runner_path.starts_with(destination) {
+            runner_path
+        } else if config::is_vosk_model_dir(destination) {
+            destination.to_path_buf()
+        } else {
+            return Err(format!(
+                "Vosk runner finished but did not create a complete model at {}",
+                destination.display()
+            ));
+        };
+
+    Ok(validated_path)
+}
+
 fn read_stream_to_string<R>(mut reader: R) -> JoinHandle<Result<String, String>>
 where
     R: Read + Send + 'static,
@@ -4418,6 +4557,19 @@ fn parse_faster_whisper_download_path(stdout: &str) -> Option<PathBuf> {
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str::<FasterWhisperDownloadOutput>(line.trim()).ok())
+        .map(|output| output.path)
+}
+
+#[derive(Debug, Deserialize)]
+struct VoskDownloadOutput {
+    path: PathBuf,
+}
+
+fn parse_vosk_download_path(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<VoskDownloadOutput>(line.trim()).ok())
         .map(|output| output.path)
 }
 
@@ -5174,7 +5326,7 @@ mod layout_tests {
         );
 
         let mut unavailable = whisper;
-        unavailable.backend = "Vosk".to_owned();
+        unavailable.backend = "sherpa-onnx".to_owned();
         unavailable.download_model = None;
         assert_eq!(
             model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false),
@@ -5201,7 +5353,7 @@ mod layout_tests {
         );
 
         let mut unavailable = whisper;
-        unavailable.backend = "Vosk".to_owned();
+        unavailable.backend = "sherpa-onnx".to_owned();
         unavailable.download_model = None;
         let unavailable_state =
             model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false);
@@ -5214,7 +5366,7 @@ mod layout_tests {
         .unwrap();
 
         assert!(tooltip.contains("not bundled"));
-        assert!(tooltip.contains("Vosk"));
+        assert!(tooltip.contains("sherpa-onnx"));
     }
 
     #[test]
@@ -5322,6 +5474,21 @@ mod layout_tests {
     }
 
     #[test]
+    fn vosk_small_en_has_progress_total_and_managed_download() {
+        let model = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "vosk_small_en")
+            .unwrap();
+
+        assert_eq!(model_storage_estimate(&model), "~50 MB");
+        assert_eq!(
+            model.download_model.as_deref(),
+            Some("vosk-model-small-en-us-0.15")
+        );
+        assert_eq!(model_download_total_bytes(&model), Some(40 * 1024 * 1024));
+    }
+
+    #[test]
     fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
         let whisper = test_model();
         let mut config = AppConfig::default();
@@ -5354,6 +5521,28 @@ mod layout_tests {
                 .as_deref()
                 .is_some_and(|tooltip| tooltip.contains("No packaged faster-whisper runtime"))
         );
+
+        let mut vosk = test_model();
+        vosk.id = "vosk_small_en".to_owned();
+        vosk.name = "Vosk small English".to_owned();
+        vosk.backend = "Vosk".to_owned();
+        vosk.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+        config.managed_runtimes.clear();
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            config::ManagedRuntimeInstall {
+                path: PathBuf::from("/tmp/scribe-runtimes/vosk/bin/scribe-vosk"),
+            },
+        );
+
+        assert_eq!(
+            runtime_action_state(&config, &vosk),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Uninstall,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        );
     }
 
     #[test]
@@ -5370,6 +5559,32 @@ mod layout_tests {
 
         assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
         assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
+    }
+
+    #[test]
+    fn vosk_model_needs_runtime_instead_of_placeholder_backend_message() {
+        let mut model = test_model();
+        model.id = "vosk_small_en".to_owned();
+        model.name = "Vosk small English".to_owned();
+        model.backend = "Vosk".to_owned();
+        model.local_path = Some(PathBuf::from("/tmp/scribe-vosk-small"));
+        model.install_status = ModelInstallStatus::Installed;
+        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+
+        let status = runtime_status_for_model(&AppConfig::default(), &model);
+
+        assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
+        assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
+    }
+
+    #[test]
+    fn parses_vosk_download_path_from_runner_json() {
+        let path = parse_vosk_download_path(
+            r#"{"model":"vosk-model-small-en-us-0.15","path":"/tmp/scribe-models/vosk/vosk_small_en"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/scribe-models/vosk/vosk_small_en"));
     }
 
     #[test]

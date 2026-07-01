@@ -8,6 +8,7 @@ use crate::models::{
 };
 
 pub mod faster_whisper;
+pub mod vosk;
 pub mod whisper_cpp;
 
 pub trait SttBackend: Send + Sync {
@@ -44,9 +45,9 @@ const PROVIDER_ADAPTERS: &[SttProviderAdapter] = &[
     SttProviderAdapter {
         backend: "Vosk",
         runtime_id: "vosk",
-        model_install_supported: false,
-        runtime_install_supported: false,
-        transcription_supported: false,
+        model_install_supported: true,
+        runtime_install_supported: true,
+        transcription_supported: true,
         device_detection_supported: false,
     },
     SttProviderAdapter {
@@ -105,6 +106,13 @@ impl SttProviderAdapter {
             }
             "faster-whisper" => {
                 if faster_whisper::resolve_faster_whisper_executable(config).is_some() {
+                    ModelRuntimeStatus::Ready
+                } else {
+                    ModelRuntimeStatus::MissingConfiguration
+                }
+            }
+            "Vosk" => {
+                if vosk::resolve_vosk_executable(config).is_some() {
                     ModelRuntimeStatus::Ready
                 } else {
                     ModelRuntimeStatus::MissingConfiguration
@@ -215,7 +223,31 @@ pub fn transcribe_with_config(
             }
             backend.transcribe(audio_path, model)
         }
-        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => provider_for_backend(&model.backend)
+        "Vosk" => {
+            let provider = provider_for_backend("Vosk")
+                .ok_or_else(|| anyhow!("missing Vosk provider adapter"))?;
+            let backend = vosk::VoskBackend::new(vosk::resolve_vosk_executable(config));
+            let capabilities = backend_capabilities(provider.backend);
+            if !capabilities.runnable {
+                return Err(anyhow!(
+                    "{} managed runtime is not bundled yet",
+                    model.backend
+                ));
+            }
+            let backend_id = backend.id().to_owned();
+            if !backend
+                .list_models()
+                .iter()
+                .any(|available_model| available_model.id == model.id)
+            {
+                return Err(anyhow!(
+                    "{backend_id} does not advertise support for {}",
+                    model.name
+                ));
+            }
+            backend.transcribe(audio_path, model)
+        }
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => provider_for_backend(&model.backend)
             .ok_or_else(|| anyhow!("unsupported STT backend: {}", model.backend))?
             .transcribe(config, audio_path, model),
         backend => Err(anyhow!("unsupported STT backend: {backend}")),
@@ -265,6 +297,12 @@ mod tests {
         assert!(faster_whisper.can_install_model(faster_model));
         assert!(!faster_whisper.can_uninstall_model(faster_model));
         assert!(faster_whisper.transcription_supported);
+
+        let vosk = provider_for_backend("Vosk").unwrap();
+        let vosk_model = models.iter().find(|model| model.backend == "Vosk").unwrap();
+        assert!(vosk.can_install_model(vosk_model));
+        assert!(vosk.runtime_install_supported);
+        assert!(vosk.transcription_supported);
     }
 
     #[test]
@@ -284,7 +322,7 @@ mod tests {
         );
         assert_eq!(
             vosk.runtime_status(&config),
-            ModelRuntimeStatus::NotImplemented
+            ModelRuntimeStatus::MissingConfiguration
         );
     }
 }

@@ -11,8 +11,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp` and `faster-whisper` backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes.
-- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper model directories.
+- `whisper.cpp`, `faster-whisper`, and Vosk backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
+- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper and Vosk model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
@@ -40,7 +40,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Rust 1.96 or newer.
 - Linux, macOS, or Windows desktop session supported by `eframe` and `global-hotkey`.
 - A microphone visible to the host OS.
-- Real transcription requires a whisper.cpp or faster-whisper runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
+- Real transcription requires a whisper.cpp, faster-whisper, or Vosk runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
 - NVIDIA GPU transcription requires an NVIDIA driver plus a runtime that can use CUDA or another supported GPU backend.
 
 On Ubuntu, install the microphone and tray build dependencies:
@@ -129,11 +129,11 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp or faster-whisper model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
+Open `Models` to install a local whisper.cpp, faster-whisper, or Vosk model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
 
 Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
 
-Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, or `SCRIBE_FASTER_WHISPER_CLI` as fallback runtime paths.
+Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, or `SCRIBE_VOSK_CLI` as fallback runtime paths.
 
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
@@ -150,7 +150,8 @@ scripts/build-release-bundle.sh
 
 The release bundle places whisper.cpp files under
 `target/release/runtimes/whisper_cpp` and stages the faster-whisper Python
-sidecar under `target/release/runtimes/faster_whisper`. These are the same
+sidecar under `target/release/runtimes/faster_whisper`. It also stages the
+Vosk Python sidecar under `target/release/runtimes/vosk`. These are the same
 locations the app checks before falling back to user-managed or development
 runtime paths.
 
@@ -164,6 +165,20 @@ The faster-whisper runtime is a generated Python virtual environment with a
 small Scribe runner. The runner downloads CTranslate2 faster-whisper model
 directories through faster-whisper's Hugging Face integration when a model is
 installed from the app.
+
+To stage only the Vosk runtime during development:
+
+```bash
+scripts/bundle-vosk-runtime.sh
+```
+
+The Vosk runtime is a generated Python virtual environment pinned to
+`vosk==0.3.45` with a small Scribe runner. The runner downloads and extracts
+`vosk-model-small-en-us-0.15.zip` from the official Vosk model catalog when
+the Vosk small English model is installed from the app. The Vosk catalog lists
+that model as 40M and Apache 2.0. The upstream model catalog does not publish a
+checksum alongside the ZIP; release packaging should record a SHA256 in the
+runtime manifest before distributing a fixed bundle.
 
 GPU-capable bundles are intentionally opt-in because the CUDA runtime payload is
 large. On a machine with Ollama's CUDA libraries available, run:
@@ -214,7 +229,8 @@ whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt -dev 0
 `Auto` omits explicit whisper.cpp device flags and lets faster-whisper fall back
 to CPU when CUDA is unavailable. `Prefer GPU` appends `-dev <device>` for
 whisper.cpp and asks faster-whisper for CUDA. `CPU only` appends `-ng` for
-whisper.cpp and asks faster-whisper for CPU/int8 mode.
+whisper.cpp and asks faster-whisper for CPU/int8 mode. Vosk is CPU-oriented in
+this build and ignores the GPU preference.
 
 ## Config
 
@@ -245,7 +261,7 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 
 ## Notes
 
-- Vosk, sherpa-onnx, Moonshine, and Parakeet have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
+- sherpa-onnx, Moonshine, and Parakeet have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.

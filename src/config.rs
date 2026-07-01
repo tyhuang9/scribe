@@ -320,12 +320,25 @@ pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
     match model.backend.as_str() {
         "whisper.cpp" => path.is_file(),
         "faster-whisper" => is_faster_whisper_model_dir(path),
+        "Vosk" => is_vosk_model_dir(path),
         _ => path.exists(),
     }
 }
 
 pub fn is_faster_whisper_model_dir(path: &Path) -> bool {
     path.is_dir() && path.join("model.bin").is_file() && path.join("config.json").is_file()
+}
+
+pub fn is_vosk_model_dir(path: &Path) -> bool {
+    let graph = path.join("graph");
+    let has_graph = graph.join("HCLG.fst").is_file()
+        || (graph.join("HCLr.fst").is_file() && graph.join("Gr.fst").is_file());
+    path.is_dir()
+        && path.join("am").join("final.mdl").is_file()
+        && path.join("conf").join("model.conf").is_file()
+        && graph.join("phones.txt").is_file()
+        && graph.join("words.txt").is_file()
+        && has_graph
 }
 
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
@@ -770,6 +783,26 @@ mod tests {
             downloaded_model_path(&config, &faster_model).unwrap(),
             PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
         );
+    }
+
+    #[test]
+    fn vosk_directory_requires_model_payload() {
+        let root = std::env::temp_dir().join(format!("scribe-vosk-model-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("am")).unwrap();
+        fs::create_dir_all(root.join("conf")).unwrap();
+        fs::create_dir_all(root.join("graph")).unwrap();
+        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
+        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
+        fs::write(root.join("graph").join("phones.txt"), b"phones").unwrap();
+        fs::write(root.join("graph").join("words.txt"), b"words").unwrap();
+
+        assert!(!is_vosk_model_dir(&root));
+
+        fs::write(root.join("graph").join("HCLG.fst"), b"graph").unwrap();
+
+        assert!(is_vosk_model_dir(&root));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

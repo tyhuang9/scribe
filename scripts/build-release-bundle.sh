@@ -16,12 +16,22 @@ case "${SCRIBE_SKIP_FASTER_WHISPER:-0}" in
     faster_whisper_runtime="$SCRIBE_DIR/target/release/runtimes/faster_whisper"
     ;;
 esac
+case "${SCRIBE_SKIP_VOSK:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    vosk_runtime="skipped"
+    ;;
+  *)
+    SCRIBE_PROFILE=release "$SCRIPT_DIR/bundle-vosk-runtime.sh"
+    vosk_runtime="$SCRIBE_DIR/target/release/runtimes/vosk"
+    ;;
+esac
 
 cat <<EOF
 Release bundle ready:
   executable:             $SCRIBE_DIR/target/release/local-transcriber
   whisper.cpp runtime:    $SCRIBE_DIR/target/release/runtimes/whisper_cpp
   faster-whisper runtime: $faster_whisper_runtime
+  Vosk runtime:           $vosk_runtime
 EOF
 
 case "${SCRIBE_BUNDLE_CUDA:-0}" in

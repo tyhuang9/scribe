@@ -10,7 +10,7 @@
 ## STT Backends
 
 - Add installer/package integration around staged whisper.cpp runtime sidecars.
-- Add Vosk runtime support.
+- Harden Vosk release packaging with recorded model/runtime SHA256 checksums.
 - Add sherpa-onnx streaming runtime support.
 - Add production packaging hardening for generated faster-whisper Python sidecars.
 - Add Moonshine runtime support.
