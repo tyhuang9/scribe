@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
@@ -233,19 +233,27 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
                 .any(|id| id == &model.id);
             let configured_path = config.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
-            let downloaded_path =
-                downloaded_model_path(config, &model).filter(|path| path.exists());
+            let downloaded_path = downloaded_model_path(config, &model);
+            let explicit_path =
+                first_non_empty_path([managed_path.clone(), configured_path.clone()]);
+            let mut candidate_paths = [downloaded_path, managed_path, configured_path]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            dedup_paths_preserving_order(&mut candidate_paths);
 
-            model.local_path = first_existing_path(
-                [managed_path, downloaded_path, configured_path.clone()]
-                    .into_iter()
-                    .flatten(),
-            )
-            .or(configured_path);
-            model.install_status = match &model.local_path {
-                Some(path) if path.exists() => ModelInstallStatus::Installed,
-                Some(_) => ModelInstallStatus::Missing,
-                None => ModelInstallStatus::NotInstalled,
+            let installed_path = first_valid_model_path(&model, candidate_paths.iter().cloned());
+            let existing_invalid_path = first_existing_path(candidate_paths.iter().cloned());
+            model.local_path = installed_path
+                .clone()
+                .or(existing_invalid_path)
+                .or(explicit_path);
+            model.install_status = if installed_path.is_some() {
+                ModelInstallStatus::Installed
+            } else if model.local_path.is_some() {
+                ModelInstallStatus::Missing
+            } else {
+                ModelInstallStatus::NotInstalled
             };
             model
         })
@@ -308,12 +316,33 @@ pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pa
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
+    match model.backend.as_str() {
+        "whisper.cpp" => path.is_file(),
+        "faster-whisper" => is_faster_whisper_model_dir(path),
+        _ => path.exists(),
+    }
+}
+
+pub fn is_faster_whisper_model_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("model.bin").is_file() && path.join("config.json").is_file()
+}
+
 pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
-    model.download_model.as_ref().map(|download_model| {
-        model_storage_dir(config)
-            .join("whisper.cpp")
-            .join(format!("ggml-{download_model}.bin"))
-    })
+    model
+        .download_model
+        .as_ref()
+        .map(|download_model| match model.backend.as_str() {
+            "whisper.cpp" => model_storage_dir(config)
+                .join("whisper.cpp")
+                .join(format!("ggml-{download_model}.bin")),
+            "faster-whisper" => model_storage_dir(config)
+                .join("faster-whisper")
+                .join(&model.id),
+            _ => model_storage_dir(config)
+                .join(runtime_id_for_backend(&model.backend))
+                .join(&model.id),
+        })
 }
 
 pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
@@ -349,10 +378,10 @@ pub fn normalize_config(config: &mut AppConfig) {
         .collect::<Vec<_>>();
 
     migrate_legacy_model_ids(config);
-    apply_managed_model_metadata(config);
     if config.model_storage_dir.as_os_str().is_empty() {
         config.model_storage_dir = default_model_storage_dir();
     }
+    apply_managed_model_metadata(config);
     if let Some(device_name) = &config.audio_input_device_name {
         if device_name.trim().is_empty() {
             config.audio_input_device_name = None;
@@ -437,8 +466,13 @@ fn default_playground_model_order() -> Vec<String> {
 }
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
+    let storage_dir = model_storage_dir(config);
+    config.managed_models.retain(|_, install| {
+        !install.path.as_os_str().is_empty() && install.path.starts_with(&storage_dir)
+    });
+
     for (id, path) in &config.model_paths {
-        if path.exists() {
+        if path.exists() && path.starts_with(&storage_dir) {
             config
                 .managed_models
                 .entry(id.clone())
@@ -543,6 +577,22 @@ fn dedup_paths_preserving_order(paths: &mut Vec<PathBuf>) {
 
 fn first_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|path| path.exists())
+}
+
+fn first_valid_model_path(
+    model: &SttModelInfo,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .find(|path| is_valid_model_install_path(model, path))
+}
+
+fn first_non_empty_path(paths: impl IntoIterator<Item = Option<PathBuf>>) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .flatten()
+        .find(|path| !path.as_os_str().is_empty())
 }
 
 #[cfg(test)]
@@ -710,6 +760,16 @@ mod tests {
             downloaded_model_path(&config, &model).unwrap(),
             PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
         );
+
+        let faster_model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_tiny_en")
+            .unwrap();
+
+        assert_eq!(
+            downloaded_model_path(&config, &faster_model).unwrap(),
+            PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
+        );
     }
 
     #[test]
@@ -749,13 +809,16 @@ mod tests {
         let temp_dir =
             std::env::temp_dir().join(format!("scribe-managed-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let model_path = temp_dir.join("ggml-base.en.bin");
+        let app_storage = temp_dir.join("app-models");
+        fs::create_dir_all(&app_storage).unwrap();
+        let model_path = app_storage.join("whisper.cpp").join("ggml-base.en.bin");
+        fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         fs::write(&model_path, b"model").unwrap();
 
         let mut model_paths = HashMap::new();
         model_paths.insert("whisper_cpp_base_en".to_owned(), model_path.clone());
         let mut config = AppConfig {
+            model_storage_dir: app_storage,
             model_paths,
             ..AppConfig::default()
         };
@@ -773,6 +836,74 @@ mod tests {
             .as_deref(),
             Some(model_path.as_path())
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn external_configured_model_path_stays_readable_but_not_managed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scribe-external-config-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let app_storage = temp_dir.join("app-models");
+        let external_path = temp_dir.join("external").join("ggml-base.en.bin");
+        fs::create_dir_all(external_path.parent().unwrap()).unwrap();
+        fs::write(&external_path, b"model").unwrap();
+
+        let mut model_paths = HashMap::new();
+        model_paths.insert("whisper_cpp_base_en".to_owned(), external_path.clone());
+        let mut config = AppConfig {
+            model_storage_dir: app_storage,
+            model_paths,
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        assert_eq!(managed_model_path(&config, &model), None);
+        assert_eq!(model.local_path.as_deref(), Some(external_path.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn faster_whisper_directory_requires_ctranslate2_payload() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-fw-config-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let model_dir = temp_dir
+            .join("faster-whisper")
+            .join("faster_whisper_small_en_gpu");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), b"{}").unwrap();
+
+        let config = AppConfig {
+            model_storage_dir: temp_dir.clone(),
+            ..AppConfig::default()
+        };
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_small_en_gpu")
+            .unwrap();
+
+        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Missing);
+
+        fs::write(model_dir.join("model.bin"), b"model").unwrap();
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_small_en_gpu")
+            .unwrap();
+
+        assert_eq!(model.local_path.as_deref(), Some(model_dir.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

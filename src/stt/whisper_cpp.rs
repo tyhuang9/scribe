@@ -93,7 +93,7 @@ impl SttBackend for WhisperCppBackend {
         let started = Instant::now();
         let mut command = Command::new(&executable);
         command.args(whisper_cli_args(&model_path, &audio_path, &self.options));
-        apply_whisper_environment(&mut command, &self.options)?;
+        apply_whisper_environment(&mut command, &executable, &self.options)?;
         let output = command
             .output()
             .with_context(|| format!("failed to run {}", executable.display()))?;
@@ -163,13 +163,10 @@ fn bundled_runtime_root() -> Option<PathBuf> {
 }
 
 fn managed_runtime_roots(config: &AppConfig) -> Vec<PathBuf> {
-    [
-        config::managed_runtime_path(config, "whisper.cpp"),
-        Some(config::runtime_storage_dir().join("whisper_cpp")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    [config::managed_runtime_path(config, "whisper.cpp")]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn dev_runtime_paths(config: &AppConfig) -> Vec<PathBuf> {
@@ -277,21 +274,64 @@ fn whisper_cli_args(
     args
 }
 
-fn apply_whisper_environment(command: &mut Command, options: &WhisperCppOptions) -> Result<()> {
-    if options.compute_mode == WhisperComputeMode::Cpu {
-        return Ok(());
-    }
+fn apply_whisper_environment(
+    command: &mut Command,
+    executable_path: &Path,
+    options: &WhisperCppOptions,
+) -> Result<()> {
+    let runtime_paths = bundled_runtime_library_paths(executable_path);
+    let configured_paths = if options.compute_mode == WhisperComputeMode::Cpu {
+        Vec::new()
+    } else {
+        options.cuda_library_paths.clone()
+    };
 
-    if let Some(backend_path) = &options.cuda_backend_path {
-        if !backend_path.as_os_str().is_empty() {
-            command.env("GGML_BACKEND_PATH", backend_path);
+    if options.compute_mode != WhisperComputeMode::Cpu {
+        if let Some(backend_path) =
+            bundled_cuda_backend_path(executable_path).or_else(|| options.cuda_backend_path.clone())
+        {
+            if !backend_path.as_os_str().is_empty() {
+                command.env("GGML_BACKEND_PATH", backend_path);
+            }
         }
     }
-    if let Some(library_path) = joined_library_path(&options.cuda_library_paths)? {
+
+    if let Some(library_path) = joined_library_path(
+        runtime_paths
+            .into_iter()
+            .chain(configured_paths)
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )? {
         command.env("LD_LIBRARY_PATH", library_path);
     }
 
     Ok(())
+}
+
+fn bundled_runtime_library_paths(executable_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(bin_dir) = executable_path.parent() {
+        paths.push(bin_dir.to_path_buf());
+        if let Some(runtime_root) = bin_dir.parent() {
+            paths.push(runtime_root.join("lib"));
+            paths.push(runtime_root.join("cuda"));
+            paths.push(runtime_root.join("cuda_v13"));
+            paths.push(runtime_root.join("cuda_v12"));
+        }
+    }
+    paths.into_iter().filter(|path| path.exists()).collect()
+}
+
+fn bundled_cuda_backend_path(executable_path: &Path) -> Option<PathBuf> {
+    let bin_dir = executable_path.parent()?;
+    let runtime_root = bin_dir.parent()?;
+    first_existing_path([
+        runtime_root.join("cuda").join("libggml-cuda.so"),
+        runtime_root.join("cuda_v13").join("libggml-cuda.so"),
+        runtime_root.join("cuda_v12").join("libggml-cuda.so"),
+        bin_dir.join("libggml-cuda.so"),
+    ])
 }
 
 fn joined_library_path(paths: &[PathBuf]) -> Result<Option<OsString>> {
@@ -342,6 +382,7 @@ fn strip_timestamp_prefix(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
 
     use crate::models::default_model_catalog;
@@ -463,6 +504,58 @@ mod tests {
     }
 
     #[test]
+    fn bundled_runtime_paths_include_staged_bin_and_cuda_dirs() {
+        let root = test_runtime_root("bundled-library-paths");
+        let runtime_root = root.join("runtimes").join("whisper_cpp");
+        let bin_dir = runtime_root.join("bin");
+        let cuda_dir = runtime_root.join("cuda");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&cuda_dir).unwrap();
+        let executable = bin_dir.join(whisper_cli_binary_names()[0]);
+        write_test_runtime(&executable);
+
+        let paths = bundled_runtime_library_paths(&executable);
+
+        assert!(paths.contains(&bin_dir));
+        assert!(paths.contains(&cuda_dir));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn whisper_environment_prefers_bundled_cuda_backend_over_configured_host_path() {
+        let root = test_runtime_root("prefers-bundled-cuda");
+        let runtime_root = root.join("runtimes").join("whisper_cpp");
+        let bin_dir = runtime_root.join("bin");
+        let cuda_backend = runtime_root.join("cuda").join("libggml-cuda.so");
+        let executable = bin_dir.join(whisper_cli_binary_names()[0]);
+        write_test_runtime(&executable);
+        write_test_runtime(&cuda_backend);
+
+        let mut command = Command::new("whisper-cli");
+        apply_whisper_environment(
+            &mut command,
+            &executable,
+            &WhisperCppOptions {
+                compute_mode: WhisperComputeMode::PreferGpu,
+                cuda_backend_path: Some(PathBuf::from(
+                    "/usr/local/lib/ollama/cuda/libggml-cuda.so",
+                )),
+                cuda_library_paths: vec![PathBuf::from("/usr/local/lib/ollama")],
+                ..WhisperCppOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_env(&command, "GGML_BACKEND_PATH").as_deref(),
+            Some(cuda_backend.as_os_str())
+        );
+        let library_path = command_env(&command, "LD_LIBRARY_PATH").unwrap();
+        assert!(env::split_paths(&library_path).any(|path| path == bin_dir));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resolver_prefers_bundled_before_managed_and_dev_paths() {
         let root = test_runtime_root("prefers-bundled");
         let bundled_root = root.join("bundled");
@@ -530,6 +623,16 @@ mod tests {
     fn write_test_runtime(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"whisper runtime").unwrap();
+    }
+
+    fn command_env(command: &Command, key: &str) -> Option<OsString> {
+        command.get_envs().find_map(|(env_key, env_value)| {
+            if env_key == OsStr::new(key) {
+                env_value.map(OsString::from)
+            } else {
+                None
+            }
+        })
     }
 
     #[test]

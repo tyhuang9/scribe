@@ -7,6 +7,7 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, backend_capabilities,
 };
 
+pub mod faster_whisper;
 pub mod whisper_cpp;
 
 pub trait SttBackend: Send + Sync {
@@ -59,9 +60,9 @@ const PROVIDER_ADAPTERS: &[SttProviderAdapter] = &[
     SttProviderAdapter {
         backend: "faster-whisper",
         runtime_id: "faster_whisper",
-        model_install_supported: false,
-        runtime_install_supported: false,
-        transcription_supported: false,
+        model_install_supported: true,
+        runtime_install_supported: true,
+        transcription_supported: true,
         device_detection_supported: false,
     },
     SttProviderAdapter {
@@ -97,6 +98,13 @@ impl SttProviderAdapter {
         match self.backend {
             "whisper.cpp" => {
                 if whisper_cpp::resolve_whisper_cpp_executable(config).is_some() {
+                    ModelRuntimeStatus::Ready
+                } else {
+                    ModelRuntimeStatus::MissingConfiguration
+                }
+            }
+            "faster-whisper" => {
+                if faster_whisper::resolve_faster_whisper_executable(config).is_some() {
                     ModelRuntimeStatus::Ready
                 } else {
                     ModelRuntimeStatus::MissingConfiguration
@@ -176,11 +184,40 @@ pub fn transcribe_with_config(
             }
             backend.transcribe(audio_path, model)
         }
-        "Vosk" | "sherpa-onnx" | "faster-whisper" | "Moonshine" | "Parakeet" => {
-            provider_for_backend(&model.backend)
-                .ok_or_else(|| anyhow!("unsupported STT backend: {}", model.backend))?
-                .transcribe(config, audio_path, model)
+        "faster-whisper" => {
+            let provider = provider_for_backend("faster-whisper")
+                .ok_or_else(|| anyhow!("missing faster-whisper provider adapter"))?;
+            let backend = faster_whisper::FasterWhisperBackend::new(
+                faster_whisper::resolve_faster_whisper_executable(config),
+                faster_whisper::FasterWhisperOptions {
+                    compute_mode: config.whisper_compute_mode,
+                    gpu_device: config.whisper_gpu_device,
+                    cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+                },
+            );
+            let capabilities = backend_capabilities(provider.backend);
+            if !capabilities.runnable {
+                return Err(anyhow!(
+                    "{} managed runtime is not bundled yet",
+                    model.backend
+                ));
+            }
+            let backend_id = backend.id().to_owned();
+            if !backend
+                .list_models()
+                .iter()
+                .any(|available_model| available_model.id == model.id)
+            {
+                return Err(anyhow!(
+                    "{backend_id} does not advertise support for {}",
+                    model.name
+                ));
+            }
+            backend.transcribe(audio_path, model)
         }
+        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => provider_for_backend(&model.backend)
+            .ok_or_else(|| anyhow!("unsupported STT backend: {}", model.backend))?
+            .transcribe(config, audio_path, model),
         backend => Err(anyhow!("unsupported STT backend: {backend}")),
     }
 }
@@ -225,19 +262,24 @@ mod tests {
         assert!(whisper.transcription_supported);
         assert!(!whisper.device_detection_supported);
 
-        assert!(!faster_whisper.can_install_model(faster_model));
+        assert!(faster_whisper.can_install_model(faster_model));
         assert!(!faster_whisper.can_uninstall_model(faster_model));
-        assert!(!faster_whisper.transcription_supported);
+        assert!(faster_whisper.transcription_supported);
     }
 
     #[test]
     fn provider_runtime_status_uses_managed_resolver_for_whisper_cpp() {
         let config = AppConfig::default();
         let whisper = provider_for_backend("whisper.cpp").unwrap();
+        let faster_whisper = provider_for_backend("faster-whisper").unwrap();
         let vosk = provider_for_backend("Vosk").unwrap();
 
         assert_eq!(
             whisper.runtime_status(&config),
+            ModelRuntimeStatus::MissingConfiguration
+        );
+        assert_eq!(
+            faster_whisper.runtime_status(&config),
             ModelRuntimeStatus::MissingConfiguration
         );
         assert_eq!(

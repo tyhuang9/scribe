@@ -11,8 +11,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp` backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes.
-- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` models from the upstream whisper.cpp Hugging Face path.
+- `whisper.cpp` and `faster-whisper` backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes.
+- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
@@ -40,8 +40,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Rust 1.96 or newer.
 - Linux, macOS, or Windows desktop session supported by `eframe` and `global-hotkey`.
 - A microphone visible to the host OS.
-- Real transcription requires a whisper.cpp runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
-- NVIDIA GPU transcription requires an NVIDIA driver plus a whisper.cpp runtime that can use CUDA or another supported GPU backend.
+- Real transcription requires a whisper.cpp or faster-whisper runtime discoverable as a bundled sidecar, a managed runtime under the app data directory, or a development fallback environment variable.
+- NVIDIA GPU transcription requires an NVIDIA driver plus a runtime that can use CUDA or another supported GPU backend.
 
 On Ubuntu, install the microphone and tray build dependencies:
 
@@ -129,14 +129,60 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI.
+Open `Models` to install a local whisper.cpp or faster-whisper model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
 
-Runtime discovery is internal. Scribe checks for a bundled whisper.cpp sidecar next to the executable, then a managed runtime under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI` or `SCRIBE_WHISPER_CUDA_CLI` as fallback runtime paths.
+Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
 
-`Settings` exposes one performance control:
+Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, or `SCRIBE_FASTER_WHISPER_CLI` as fallback runtime paths.
 
-- `Auto`: let whisper.cpp choose the device.
-- `Prefer GPU`: pass the selected GPU device to whisper.cpp.
+Builds can stage the supported whisper.cpp runtime next to the executable:
+
+```bash
+scripts/bundle-whisper-runtime.sh
+```
+
+By default this copies the CPU-capable whisper.cpp sidecar into
+`target/debug/runtimes/whisper_cpp`. For a release build, run:
+
+```bash
+scripts/build-release-bundle.sh
+```
+
+The release bundle places whisper.cpp files under
+`target/release/runtimes/whisper_cpp` and stages the faster-whisper Python
+sidecar under `target/release/runtimes/faster_whisper`. These are the same
+locations the app checks before falling back to user-managed or development
+runtime paths.
+
+To stage only the faster-whisper runtime during development:
+
+```bash
+scripts/bundle-faster-whisper-runtime.sh
+```
+
+The faster-whisper runtime is a generated Python virtual environment with a
+small Scribe runner. The runner downloads CTranslate2 faster-whisper model
+directories through faster-whisper's Hugging Face integration when a model is
+installed from the app.
+
+GPU-capable bundles are intentionally opt-in because the CUDA runtime payload is
+large. On a machine with Ollama's CUDA libraries available, run:
+
+```bash
+SCRIBE_BUNDLE_CUDA=1 scripts/build-release-bundle.sh
+```
+
+This copies `libggml-cuda.so` plus its required CUDA shared libraries into the
+bundled runtime. The app prefers those bundled CUDA libraries over host-specific
+CUDA config when they are present. When both Ollama CUDA v12 and v13 runtimes
+exist, the bundler prefers v12 for wider driver compatibility. Set
+`CUDA_RUNTIME_DIR=/path/to/cuda_v13` or another CUDA runtime directory to
+override that choice.
+
+`Settings` exposes one performance control shared by supported local runtimes:
+
+- `Auto`: let the runtime choose the device.
+- `Prefer GPU`: pass the selected GPU device to the runtime.
 - `CPU only`: force CPU mode.
 
 For CUDA development without installing the full CUDA Toolkit, Scribe can use a dynamic-backend whisper.cpp build with Ollama's local CUDA runtime:
@@ -165,7 +211,10 @@ The backend calls whisper.cpp like this:
 whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt -dev 0
 ```
 
-`Auto` omits explicit device flags. `Prefer GPU` appends `-dev <device>`, and `CPU only` appends `-ng`.
+`Auto` omits explicit whisper.cpp device flags and lets faster-whisper fall back
+to CPU when CUDA is unavailable. `Prefer GPU` appends `-dev <device>` for
+whisper.cpp and asks faster-whisper for CUDA. `CPU only` appends `-ng` for
+whisper.cpp and asks faster-whisper for CPU/int8 mode.
 
 ## Config
 
@@ -196,7 +245,7 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 
 ## Notes
 
-- Non-whisper.cpp backends have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
+- Vosk, sherpa-onnx, Moonshine, and Parakeet have provider adapters and catalog entries, but their managed runtime packages are not bundled yet. Normal model install actions remain disabled until a backend has a runtime package.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
@@ -219,5 +268,6 @@ The main modules are:
 - `src/models.rs`: shared STT model/result/status structs.
 - `src/stt/mod.rs`: backend trait and dispatch.
 - `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
+- `src/stt/faster_whisper.rs`: faster-whisper child-process integration.
 - `src/text_output.rs`: focused-app transcript insertion through clipboard plus paste automation.
 - `src/tray.rs`: tray icon, tray menu, and tray command mapping.

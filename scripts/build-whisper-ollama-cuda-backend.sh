@@ -16,15 +16,16 @@ fi
 cmake \
   -S "$WHISPER_DIR" \
   -B "$BUILD_DIR" \
+  -U "GGML_BACKEND_DIR" \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DBUILD_SHARED_LIBS=ON \
   -DGGML_BACKEND_DL=ON \
   -DGGML_NATIVE=OFF \
   -DGGML_CPU_ALL_VARIANTS=ON \
-  -DGGML_BACKEND_DIR="$OLLAMA_LIB_DIR" \
+  -DGGML_BACKEND_DIR="" \
   "$@"
 cmake --build "$BUILD_DIR" --target whisper-cli -j2 --config Release
 
 echo "Dynamic-backend whisper.cpp binary: $BUILD_DIR/bin/whisper-cli"
-echo "Use CUDA backend: $OLLAMA_LIB_DIR/cuda_v13/libggml-cuda.so or $OLLAMA_LIB_DIR/cuda_v12/libggml-cuda.so"
-echo "Use CUDA library dirs: $OLLAMA_LIB_DIR:$OLLAMA_LIB_DIR/cuda_v13 or $OLLAMA_LIB_DIR:$OLLAMA_LIB_DIR/cuda_v12"
+echo "Use CUDA backend: $OLLAMA_LIB_DIR/cuda_v12/libggml-cuda.so or $OLLAMA_LIB_DIR/cuda_v13/libggml-cuda.so"
+echo "Use CUDA library dirs: $OLLAMA_LIB_DIR:$OLLAMA_LIB_DIR/cuda_v12 or $OLLAMA_LIB_DIR:$OLLAMA_LIB_DIR/cuda_v13"

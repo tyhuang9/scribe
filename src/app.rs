@@ -3,7 +3,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
@@ -12,6 +14,7 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
+use serde::Deserialize;
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -21,7 +24,7 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    whisper_cpp_download_url,
+    format_bytes, whisper_cpp_download_url,
 };
 use crate::stt;
 use crate::text_output;
@@ -29,6 +32,7 @@ use crate::tray::{TrayCommand, TrayService};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -197,9 +201,11 @@ enum AppEvent {
         model_id: String,
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
+        bytes_per_second: Option<u64>,
     },
     ModelDownloadDone {
         model_id: String,
+        path: PathBuf,
     },
     ModelDownloadFailed {
         model_id: String,
@@ -229,10 +235,32 @@ impl ModelPrimaryAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeActionKind {
+    Install,
+    Uninstall,
+}
+
+impl RuntimeActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "Install Runtime",
+            Self::Uninstall => "Uninstall Runtime",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ModelActionState {
     primary: ModelPrimaryAction,
     primary_enabled: bool,
     show_uninstall: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeActionState {
+    kind: RuntimeActionKind,
+    enabled: bool,
+    disabled_tooltip: Option<String>,
 }
 
 fn model_action_state(
@@ -268,6 +296,87 @@ fn model_action_state(
     }
 }
 
+fn model_primary_disabled_tooltip(
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+    selected: bool,
+    action_state: &ModelActionState,
+) -> Option<String> {
+    if action_state.primary_enabled {
+        return None;
+    }
+
+    match action_state.primary {
+        ModelPrimaryAction::Active if selected => {
+            Some("This model is already the active transcription model.".to_owned())
+        }
+        ModelPrimaryAction::Installing => Some("This model is still downloading.".to_owned()),
+        ModelPrimaryAction::Install | ModelPrimaryAction::Retry
+            if !supports_managed_install(model) =>
+        {
+            Some(format!(
+                "Managed downloads for {} models are not bundled in this build.",
+                model.backend
+            ))
+        }
+        ModelPrimaryAction::Retry => match install_status {
+            ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
+            _ => Some("Retry is not available for this model.".to_owned()),
+        },
+        ModelPrimaryAction::Select => Some("Install this model before selecting it.".to_owned()),
+        ModelPrimaryAction::Install => {
+            Some("This model does not have a managed installer.".to_owned())
+        }
+        ModelPrimaryAction::Active => Some("This model cannot be selected right now.".to_owned()),
+    }
+}
+
+fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
+    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        return RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: false,
+            disabled_tooltip: Some(format!("{} is not a supported STT backend.", model.backend)),
+        };
+    };
+
+    if !provider.runtime_install_supported {
+        return RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: false,
+            disabled_tooltip: Some(format!(
+                "The managed {} runtime installer is not bundled in this build.",
+                model.backend
+            )),
+        };
+    }
+
+    if has_managed_runtime_install(config, provider.runtime_id) {
+        return RuntimeActionState {
+            kind: RuntimeActionKind::Uninstall,
+            enabled: true,
+            disabled_tooltip: None,
+        };
+    }
+
+    if packaged_runtime_path(config, model).is_some() {
+        RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: true,
+            disabled_tooltip: None,
+        }
+    } else {
+        RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: false,
+            disabled_tooltip: Some(format!(
+                "No packaged {} runtime was found. Install a build that bundles this runtime or configure a development runtime path.",
+                model.backend
+            )),
+        }
+    }
+}
+
 fn supports_managed_install(model: &SttModelInfo) -> bool {
     stt::provider_for_backend(&model.backend)
         .is_some_and(|provider| provider.can_install_model(model))
@@ -279,6 +388,21 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
         model.install_status = install_status.clone();
         provider.can_uninstall_model(&model)
     })
+}
+
+fn has_managed_runtime_install(config: &AppConfig, runtime_id: &str) -> bool {
+    config
+        .managed_runtimes
+        .get(runtime_id)
+        .is_some_and(|install| !install.path.as_os_str().is_empty())
+}
+
+fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
+    match model.backend.as_str() {
+        "whisper.cpp" => stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(config),
+        "faster-whisper" => stt::faster_whisper::resolve_faster_whisper_packaged_executable(config),
+        _ => None,
+    }
 }
 
 pub struct LocalTranscriberApp {
@@ -803,27 +927,27 @@ impl LocalTranscriberApp {
                     model_id,
                     downloaded_bytes,
                     total_bytes,
+                    bytes_per_second,
                 } => {
                     self.model_downloads.insert(
                         model_id,
                         ModelInstallStatus::Downloading {
                             downloaded_bytes,
                             total_bytes,
+                            bytes_per_second,
                         },
                     );
                 }
-                AppEvent::ModelDownloadDone { model_id } => {
+                AppEvent::ModelDownloadDone { model_id, path } => {
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
                     if let Some(model) = config::configured_models(&self.config)
                         .into_iter()
                         .find(|model| model.id == model_id)
                     {
-                        if let Some(path) = config::downloaded_model_path(&self.config, &model) {
-                            self.config
-                                .managed_models
-                                .insert(model_id.clone(), config::ManagedModelInstall { path });
-                        }
+                        self.config
+                            .managed_models
+                            .insert(model_id.clone(), config::ManagedModelInstall { path });
                         self.record_packaged_runtime_metadata(&model);
                     }
                     self.save_config();
@@ -1151,11 +1275,13 @@ impl LocalTranscriberApp {
             return;
         };
 
+        let expected_total_bytes = model_download_total_bytes(model);
         self.model_downloads.insert(
             model.id.clone(),
             ModelInstallStatus::Downloading {
                 downloaded_bytes: 0,
-                total_bytes: None,
+                total_bytes: expected_total_bytes,
+                bytes_per_second: None,
             },
         );
         self.status = TranscriptionStatus::Idle;
@@ -1163,18 +1289,58 @@ impl LocalTranscriberApp {
 
         let tx = self.tx.clone();
         let model_id = model.id.clone();
-        let url = whisper_cpp_download_url(&download_model);
-        thread::spawn(move || {
-            let result = download_model_file(&url, &destination, &tx, &model_id);
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(AppEvent::ModelDownloadDone { model_id });
-                }
-                Err(message) => {
-                    let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
-                }
+        match model.backend.as_str() {
+            "faster-whisper" => {
+                let Some(runtime) =
+                    stt::faster_whisper::resolve_faster_whisper_executable(&self.config)
+                else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "Install the faster-whisper runtime before downloading this model."
+                            .to_owned();
+                    self.model_downloads.remove(&model.id);
+                    return;
+                };
+                thread::spawn(move || {
+                    let result = download_faster_whisper_model(
+                        &runtime,
+                        &download_model,
+                        &destination,
+                        &tx,
+                        &model_id,
+                        expected_total_bytes,
+                    );
+                    match result {
+                        Ok(path) => {
+                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+                        }
+                    }
+                });
             }
-        });
+            _ => {
+                let url = whisper_cpp_download_url(&download_model);
+                thread::spawn(move || {
+                    let result = download_model_file(
+                        &url,
+                        &destination,
+                        &tx,
+                        &model_id,
+                        expected_total_bytes,
+                    );
+                    match result {
+                        Ok(path) => {
+                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+                        }
+                    }
+                });
+            }
+        }
     }
 
     fn uninstall_model(&mut self, model: &SttModelInfo) {
@@ -1196,15 +1362,83 @@ impl LocalTranscriberApp {
         };
     }
 
+    fn install_runtime(&mut self, model: &SttModelInfo) {
+        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("{} is not a supported STT backend.", model.backend);
+            return;
+        };
+
+        if !provider.runtime_install_supported {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "Managed runtime installer for {} is not available in this build.",
+                model.backend
+            );
+            return;
+        }
+
+        let Some(packaged_path) = packaged_runtime_path(&self.config, model) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "No packaged {} runtime was found in this build.",
+                model.backend
+            );
+            return;
+        };
+
+        let path = match install_runtime_files(provider.runtime_id, &packaged_path) {
+            Ok(path) => path,
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+        };
+
+        self.config.managed_runtimes.insert(
+            provider.runtime_id.to_owned(),
+            config::ManagedRuntimeInstall { path },
+        );
+        self.save_config();
+        self.refresh_playground_runtime_statuses();
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = format!("Installed {} runtime.", model.backend);
+    }
+
+    fn uninstall_runtime(&mut self, model: &SttModelInfo) {
+        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("{} is not a supported STT backend.", model.backend);
+            return;
+        };
+
+        let removal = uninstall_runtime_files(&self.config, provider.runtime_id);
+        self.config.managed_runtimes.remove(provider.runtime_id);
+        self.save_config();
+        self.refresh_playground_runtime_statuses();
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = match removal {
+            Ok(true) => format!("Uninstalled {} runtime.", model.backend),
+            Ok(false) => format!("Removed {} runtime from Scribe.", model.backend),
+            Err(message) => format!("Removed {} runtime from Scribe. {message}", model.backend),
+        };
+    }
+
+    fn refresh_playground_runtime_statuses(&mut self) {
+        for card in &mut self.playground_cards {
+            card.status = runtime_status_for_model(&self.config, &card.model);
+        }
+    }
+
     fn record_packaged_runtime_metadata(&mut self, model: &SttModelInfo) {
         let Some(provider) = stt::provider_for_backend(&model.backend) else {
             return;
         };
-        if !provider.runtime_install_supported || model.backend != "whisper.cpp" {
+        if !provider.runtime_install_supported {
             return;
         }
-        if let Some(path) = stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(&self.config)
-        {
+        if let Some(path) = packaged_runtime_path(&self.config, model) {
             self.config.managed_runtimes.insert(
                 provider.runtime_id.to_owned(),
                 config::ManagedRuntimeInstall { path },
@@ -1383,9 +1617,27 @@ impl LocalTranscriberApp {
                     } else {
                         "Start Listening"
                     };
-                    if ui
-                        .add_enabled(listening || ready, primary_button(ui, button_text))
-                        .clicked()
+                    let disabled_tooltip = if listening || ready {
+                        None
+                    } else {
+                        Some(
+                            runtime_status
+                                .as_ref()
+                                .map(setup_message_for_status)
+                                .unwrap_or_else(|| {
+                                    "Choose or install a local model before transcribing."
+                                        .to_owned()
+                                }),
+                        )
+                    };
+                    let record_button = primary_button(ui, button_text);
+                    if add_enabled_button(
+                        ui,
+                        listening || ready,
+                        record_button,
+                        disabled_tooltip.as_deref(),
+                    )
+                    .clicked()
                     {
                         self.toggle_recording();
                     }
@@ -1479,6 +1731,93 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
+            let download_rows = current_download_rows(&self.config, &self.model_downloads);
+            if !download_rows.is_empty() {
+                panel(ui, |ui| {
+                    ui.label(section_heading("Downloads"));
+                    ui.add_space(8.0);
+                    for (index, (model, install_status)) in download_rows.iter().enumerate() {
+                        download_summary_row(ui, model, install_status);
+                        if index + 1 < download_rows.len() {
+                            ui.add_space(8.0);
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+            }
+
+            let mut runtime_action = None;
+            panel(ui, |ui| {
+                ui.label(section_heading("Runtimes"));
+                ui.label(mut_text(
+                    "Install each backend runtime independently. Model rows show the runtime they use and estimated storage.",
+                ));
+                wrapped_label(
+                    ui,
+                    mut_text(&format!(
+                        "Storage: models in {} · runtimes in {}",
+                        config::model_storage_dir(&self.config).display(),
+                        config::runtime_storage_dir().display()
+                    )),
+                );
+                ui.add_space(8.0);
+                for model in runtime_representative_models(&self.config) {
+                    let runtime_status = stt::provider_for_backend(&model.backend)
+                        .map(|provider| provider.runtime_status(&self.config))
+                        .unwrap_or_else(|| {
+                            ModelRuntimeStatus::Error(format!(
+                                "unsupported STT backend: {}",
+                                model.backend
+                            ))
+                        });
+                    let action_state = runtime_action_state(&self.config, &model);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(body_strong(&format!("{} runtime", model.backend)));
+                            wrapped_label(
+                                ui,
+                                mut_text(&runtime_detail_text(
+                                    &self.config,
+                                    &model,
+                                    &runtime_status,
+                                )),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            let runtime_button = small_button(ui, action_state.kind.label());
+                            let response = add_enabled_button(
+                                ui,
+                                action_state.enabled,
+                                runtime_button,
+                                action_state.disabled_tooltip.as_deref(),
+                            );
+                            if response.clicked() {
+                                runtime_action = Some((model.clone(), action_state.kind));
+                            }
+                            badge(
+                                ui,
+                                &runtime_status.to_string(),
+                                runtime_chip_tone(&runtime_status),
+                            );
+                            badge(
+                                ui,
+                                &format!("Runtime {}", runtime_storage_estimate(&model.backend)),
+                                ChipTone::Neutral,
+                            );
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+
+            if let Some((model, kind)) = runtime_action {
+                match kind {
+                    RuntimeActionKind::Install => self.install_runtime(&model),
+                    RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
+                }
+            }
+
+            ui.add_space(12.0);
             let search = self.model_search.trim().to_ascii_lowercase();
             let models = config::configured_models(&self.config)
                 .into_iter()
@@ -1495,6 +1834,12 @@ impl LocalTranscriberApp {
                 let selected = self.config.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
                 let action_state = model_action_state(&model, &install_status, selected);
+                let primary_disabled_tooltip = model_primary_disabled_tooltip(
+                    &model,
+                    &install_status,
+                    selected,
+                    &action_state,
+                );
                 let mut select_default = false;
                 let mut start_install = false;
                 let mut uninstall = false;
@@ -1506,9 +1851,13 @@ impl LocalTranscriberApp {
                         }
                         _ => small_button(ui, action_state.primary.label()),
                     };
-                    if ui
-                        .add_enabled(action_state.primary_enabled, primary_button)
-                        .clicked()
+                    if add_enabled_button(
+                        ui,
+                        action_state.primary_enabled,
+                        primary_button,
+                        primary_disabled_tooltip.as_deref(),
+                    )
+                    .clicked()
                     {
                         match action_state.primary {
                             ModelPrimaryAction::Select => select_default = true,
@@ -2283,7 +2632,7 @@ fn model_catalog_row(
     full_width_frame(ui, model_card_frame(ui, selected), |ui| {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let actions_width = 132.0;
+            let actions_width = 92.0;
             let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
@@ -2297,9 +2646,19 @@ fn model_catalog_row(
                             ui.add_space(4.0);
                             wrapped_label(ui, mut_text(&detail));
                         }
+                        if matches!(install_status, ModelInstallStatus::Downloading { .. }) {
+                            ui.add_space(8.0);
+                            download_progress_bar(ui, install_status);
+                        }
                         ui.add_space(8.0);
                         tag_row(ui, |ui| {
                             badge(ui, &model.backend, ChipTone::Neutral);
+                            badge(ui, &format!("Runtime {}", model.backend), ChipTone::Neutral);
+                            badge(
+                                ui,
+                                &format!("Model {}", model_storage_estimate(model)),
+                                ChipTone::Neutral,
+                            );
                             badge(
                                 ui,
                                 &format!("RAM {}", model.expected_ram),
@@ -2332,6 +2691,158 @@ fn model_catalog_row(
     });
 }
 
+fn current_download_rows(
+    config: &AppConfig,
+    downloads: &HashMap<String, ModelInstallStatus>,
+) -> Vec<(SttModelInfo, ModelInstallStatus)> {
+    let mut rows = config::configured_models(config)
+        .into_iter()
+        .filter_map(|model| {
+            downloads
+                .get(&model.id)
+                .cloned()
+                .map(|status| (model, status))
+        })
+        .filter(|(_, status)| !matches!(status, ModelInstallStatus::NotInstalled))
+        .collect::<Vec<_>>();
+
+    rows.sort_by_key(|(_, status)| match status {
+        ModelInstallStatus::Downloading { .. } => 0,
+        ModelInstallStatus::Error(_) => 1,
+        ModelInstallStatus::Installed => 2,
+        ModelInstallStatus::Missing => 3,
+        ModelInstallStatus::NotInstalled => 4,
+    });
+    rows
+}
+
+fn download_summary_row(ui: &mut Ui, model: &SttModelInfo, install_status: &ModelInstallStatus) {
+    full_width_frame(
+        ui,
+        Frame::none().inner_margin(Margin::symmetric(0.0, 4.0)),
+        |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    wrapped_label(ui, body_strong(&model.name));
+                    tag_row(ui, |ui| {
+                        badge(ui, &model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &install_status.label(),
+                            install_chip_tone(install_status),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    download_progress_bar(ui, install_status);
+                });
+            });
+        },
+    );
+}
+
+fn download_progress_bar(ui: &mut Ui, install_status: &ModelInstallStatus) {
+    let progress = download_progress_fraction(install_status);
+    let text = download_progress_bar_text(install_status);
+    wrapped_label(ui, body_strong(&text));
+    ui.add_space(4.0);
+    paint_download_progress_track(ui, progress);
+    if let Some(detail) = download_progress_detail(install_status) {
+        ui.add_space(4.0);
+        wrapped_label(ui, mut_text(detail));
+    }
+}
+
+fn paint_download_progress_track(ui: &mut Ui, progress: Option<f32>) {
+    let colors = ui_palette(ui);
+    let width = usable_width(ui).max(1.0);
+    let height = 14.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    let track_fill = if ui.visuals().dark_mode {
+        Color32::from_rgb(35, 41, 52)
+    } else {
+        Color32::from_rgb(229, 231, 235)
+    };
+
+    ui.painter()
+        .rect_filled(rect, Rounding::same(7.0), track_fill);
+
+    if let Some(progress) = progress {
+        let fill_width = (rect.width() * progress.clamp(0.0, 1.0)).clamp(0.0, rect.width());
+        if fill_width > 0.0 {
+            let mut fill_rect = rect;
+            fill_rect.max.x = fill_rect.min.x + fill_width;
+            ui.painter()
+                .rect_filled(fill_rect, Rounding::same(7.0), colors.accent);
+        }
+    }
+
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(7.0), Stroke::new(1.0, colors.border));
+}
+
+fn download_progress_fraction(install_status: &ModelInstallStatus) -> Option<f32> {
+    match install_status {
+        ModelInstallStatus::Downloading {
+            downloaded_bytes,
+            total_bytes: Some(total_bytes),
+            ..
+        } if *total_bytes > 0 => {
+            Some((*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0))
+        }
+        ModelInstallStatus::Installed => Some(1.0),
+        _ => None,
+    }
+}
+
+fn download_progress_bar_text(install_status: &ModelInstallStatus) -> String {
+    match install_status {
+        ModelInstallStatus::Downloading {
+            downloaded_bytes,
+            total_bytes: Some(total_bytes),
+            ..
+        } if *total_bytes > 0 => {
+            let percent =
+                (*downloaded_bytes as f64 / *total_bytes as f64 * 100.0).clamp(0.0, 100.0);
+            format!("{percent:.0}% Completed")
+        }
+        ModelInstallStatus::Downloading { .. } => "Downloading".to_owned(),
+        ModelInstallStatus::Installed => "100% Completed".to_owned(),
+        ModelInstallStatus::Error(_) => "Failed".to_owned(),
+        ModelInstallStatus::Missing => "Missing".to_owned(),
+        ModelInstallStatus::NotInstalled => "Not installed".to_owned(),
+    }
+}
+
+fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<String> {
+    match install_status {
+        ModelInstallStatus::Downloading {
+            downloaded_bytes,
+            total_bytes,
+            bytes_per_second,
+        } => {
+            let transferred = match total_bytes {
+                Some(total_bytes) if *total_bytes > 0 => {
+                    let displayed_total = (*total_bytes).max(*downloaded_bytes);
+                    format!(
+                        "{} / {}",
+                        format_bytes(*downloaded_bytes),
+                        format_bytes(displayed_total)
+                    )
+                }
+                _ => format_bytes(*downloaded_bytes),
+            };
+            Some(match bytes_per_second.filter(|speed| *speed > 0) {
+                Some(speed) => format!("{transferred} · {}/s", format_bytes(speed)),
+                None => transferred,
+            })
+        }
+        ModelInstallStatus::Installed => Some("Installed".to_owned()),
+        ModelInstallStatus::Error(message) => Some(message.clone()),
+        ModelInstallStatus::Missing => Some("Missing file".to_owned()),
+        ModelInstallStatus::NotInstalled => None,
+    }
+}
+
 fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
     let colors = ui_palette(ui);
     full_width_frame(
@@ -2361,33 +2872,35 @@ fn playground_drag_handle(
 ) {
     let colors = ui_palette(ui);
     let dragging = ui.ctx().is_being_dragged(drag_id);
-    let fill = if dragging || active_model {
+    let size = Vec2::new(ui.available_width().max(24.0), 34.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let response = ui
+        .interact(rect, drag_id, egui::Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::Grab)
+        .on_hover_text("Drag to reorder this model");
+    response.dnd_set_drag_payload(payload);
+
+    let fill = if dragging || response.hovered() {
         colors.active_card_bg
-    } else {
+    } else if active_model {
         colors.panel_bg
+    } else {
+        colors.card_bg
     };
     let stroke = if dragging {
         Stroke::new(1.5, colors.accent)
     } else {
         Stroke::new(1.0, colors.border)
     };
-    let size = Vec2::new(ui.available_width().max(38.0), 30.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let response = ui
-        .interact(rect, drag_id, egui::Sense::drag())
-        .on_hover_cursor(egui::CursorIcon::Grab)
-        .on_hover_text("Drag to reorder");
-    response.dnd_set_drag_payload(payload);
-
     ui.painter().rect_filled(rect, Rounding::same(5.0), fill);
     ui.painter().rect_stroke(rect, Rounding::same(5.0), stroke);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Move",
-        FontId::proportional(11.0),
-        colors.muted_text,
-    );
+    for row in 0..3 {
+        for col in 0..2 {
+            let offset = Vec2::new((col as f32 - 0.5) * 7.0, (row as f32 - 1.0) * 7.0);
+            ui.painter()
+                .circle_filled(rect.center() + offset, 1.6, colors.muted_text);
+        }
+    }
 
     if dragging {
         paint_playground_drag_preview(ui.ctx(), model_name);
@@ -2438,7 +2951,7 @@ fn playground_card_ui(
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        let move_width = 38.0;
+        let move_width = 28.0;
         let actions_width = 132.0;
         let gap = 12.0;
         let detail_width = (ui.available_width() - move_width - actions_width - gap * 2.0).max(0.0);
@@ -2491,8 +3004,13 @@ fn playground_card_ui(
                         actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
                     }
                     let mut enabled = card_state.model.enabled;
-                    let toggle_label = if enabled { "Enabled" } else { "Disabled" };
-                    if ui.checkbox(&mut enabled, toggle_label).changed() {
+                    if ui
+                        .checkbox(&mut enabled, "Run")
+                        .on_hover_text(
+                            "Turn this off to keep the model here but skip it during playground runs.",
+                        )
+                        .changed()
+                    {
                         actions.push(PlaygroundAction::SetEnabled(
                             card_state.model.id.clone(),
                             enabled,
@@ -2891,7 +3409,7 @@ fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
     .fill(colors.primary_button_bg)
     .stroke(Stroke::new(1.0, colors.primary_button_bg))
     .rounding(Rounding::same(5.0))
-    .min_size(Vec2::new(82.0, 30.0))
+    .min_size(Vec2::new(72.0, 30.0))
 }
 
 fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
@@ -2901,6 +3419,22 @@ fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
         .stroke(Stroke::new(1.0, colors.border_strong))
         .rounding(Rounding::same(5.0))
         .min_size(Vec2::new(68.0, 30.0))
+}
+
+fn add_enabled_button<'a>(
+    ui: &mut Ui,
+    enabled: bool,
+    button: Button<'a>,
+    disabled_tooltip: Option<&str>,
+) -> egui::Response {
+    let response = ui.add_enabled(enabled, button);
+    if enabled {
+        response
+    } else if let Some(disabled_tooltip) = disabled_tooltip {
+        response.on_disabled_hover_text(disabled_tooltip)
+    } else {
+        response
+    }
 }
 
 fn tag_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -3149,17 +3683,135 @@ fn model_install_detail(
     model: &SttModelInfo,
     install_status: &ModelInstallStatus,
 ) -> Option<String> {
+    let base = format!(
+        "Runtime: {} · Model storage: {}",
+        model.backend,
+        model_storage_estimate(model)
+    );
     match install_status {
-        ModelInstallStatus::NotInstalled if !supports_managed_install(model) => Some(format!(
-            "{} runtime installer is not bundled in this build.",
-            model.backend
-        )),
-        ModelInstallStatus::Downloading { .. } => Some(install_status.label()),
-        ModelInstallStatus::Missing => {
-            Some("The installed model file is missing. Reinstall to use this model.".to_owned())
+        ModelInstallStatus::NotInstalled if !supports_managed_install(model) => {
+            Some(format!("{base} · Installer unavailable in this build."))
         }
-        ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
-        ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => None,
+        ModelInstallStatus::Downloading { .. } => {
+            Some(format!("{base} · {}", install_status.label()))
+        }
+        ModelInstallStatus::Missing => Some(format!(
+            "{base} · The configured model path is missing or incomplete. Reinstall to use this model."
+        )),
+        ModelInstallStatus::Error(message) => Some(format!("{base} · Install failed: {message}")),
+        ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => Some(base),
+    }
+}
+
+fn runtime_representative_models(config: &AppConfig) -> Vec<SttModelInfo> {
+    let mut seen_backends = Vec::new();
+    config::configured_models(config)
+        .into_iter()
+        .filter(|model| {
+            if seen_backends
+                .iter()
+                .any(|backend: &String| backend == &model.backend)
+            {
+                false
+            } else {
+                seen_backends.push(model.backend.clone());
+                true
+            }
+        })
+        .collect()
+}
+
+fn runtime_detail_text(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    status: &ModelRuntimeStatus,
+) -> String {
+    let used_by = runtime_model_summary(config, &model.backend);
+    let storage = runtime_storage_detail(&model.backend);
+    let status_detail = match status {
+        ModelRuntimeStatus::Ready => {
+            format!("{} models can use this local runtime.", model.backend)
+        }
+        ModelRuntimeStatus::MissingConfiguration => format!(
+            "{} models are installed separately, but this runtime is not configured.",
+            model.backend
+        ),
+        ModelRuntimeStatus::NotImplemented => format!(
+            "{} models are listed for comparison, but their managed runtime is not bundled yet.",
+            model.backend
+        ),
+        ModelRuntimeStatus::Error(message) => message.clone(),
+        _ => setup_message_for_status(status),
+    };
+    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}")
+}
+
+fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
+    let models = config::configured_models(config)
+        .into_iter()
+        .filter(|model| model.backend == backend)
+        .map(|model| model.name)
+        .collect::<Vec<_>>();
+    let count = models.len();
+    let preview = models.into_iter().take(3).collect::<Vec<_>>().join(", ");
+    if count > 3 {
+        format!("{preview}, +{} more", count - 3)
+    } else if preview.is_empty() {
+        "no catalog models".to_owned()
+    } else {
+        preview
+    }
+}
+
+fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
+    match model.id.as_str() {
+        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => "~75 MB",
+        "whisper_cpp_base_en" | "faster_whisper_base_en" => "~150 MB",
+        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => "~470 MB",
+        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => "~1.5 GB",
+        "faster_whisper_large_v3" => "~3.1 GB",
+        "faster_whisper_turbo" => "~1.6 GB",
+        "faster_whisper_distil_large_v3" => "~1.5 GB",
+        "vosk_small_en" => "~50 MB",
+        "sherpa_onnx_zipformer_small" => "~80 MB",
+        "moonshine" => "~250 MB",
+        "parakeet_0_6b" => "~2.5 GB",
+        _ => "varies",
+    }
+}
+
+fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let gib = |value: f64| (value * GIB as f64).round() as u64;
+
+    match model.id.as_str() {
+        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => Some(75 * MIB),
+        "whisper_cpp_base_en" | "faster_whisper_base_en" => Some(150 * MIB),
+        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => Some(470 * MIB),
+        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => Some(gib(1.5)),
+        "faster_whisper_large_v3" => Some(gib(3.1)),
+        "faster_whisper_turbo" => Some(gib(1.6)),
+        "faster_whisper_distil_large_v3" => Some(gib(1.5)),
+        _ => None,
+    }
+}
+
+fn runtime_storage_estimate(backend: &str) -> &'static str {
+    match backend {
+        "whisper.cpp" => "~20 MB+",
+        "faster-whisper" => "~450 MB+",
+        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled",
+        _ => "varies",
+    }
+}
+
+fn runtime_storage_detail(backend: &str) -> &'static str {
+    match backend {
+        "whisper.cpp" => "~20 MB for the CPU runtime; CUDA bundles are larger",
+        "faster-whisper" => "~450 MB for the CPU Python runtime; CUDA bundles are larger",
+        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => "not bundled in this build",
+        _ => "varies",
     }
 }
 
@@ -3178,6 +3830,126 @@ fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<boo
         removed_any = true;
     }
     Ok(removed_any)
+}
+
+fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool, String> {
+    let Some(install) = config.managed_runtimes.get(runtime_id) else {
+        return Ok(false);
+    };
+    let Some(target) =
+        runtime_uninstall_target(&config::runtime_storage_dir(), runtime_id, &install.path)
+    else {
+        return Ok(false);
+    };
+    if !target.exists() {
+        return Ok(false);
+    }
+
+    let result = if target.is_dir() {
+        fs::remove_dir_all(&target)
+    } else {
+        fs::remove_file(&target)
+    };
+    result.map_err(|err| format!("Could not delete {}: {err}", target.display()))?;
+    Ok(true)
+}
+
+fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result<PathBuf, String> {
+    let Some(source_root) = runtime_package_root(packaged_executable) else {
+        return Err(format!(
+            "Could not determine runtime package root for {}.",
+            packaged_executable.display()
+        ));
+    };
+    let relative_executable = packaged_executable
+        .strip_prefix(&source_root)
+        .map_err(|_| {
+            format!(
+                "Runtime executable {} is outside package root {}.",
+                packaged_executable.display(),
+                source_root.display()
+            )
+        })?
+        .to_path_buf();
+    let target_root = config::runtime_storage_dir().join(runtime_id);
+    if source_root == target_root {
+        return Ok(packaged_executable.to_path_buf());
+    }
+
+    if target_root.exists() {
+        let result = if target_root.is_dir() {
+            fs::remove_dir_all(&target_root)
+        } else {
+            fs::remove_file(&target_root)
+        };
+        result.map_err(|err| format!("Could not replace {}: {err}", target_root.display()))?;
+    }
+    copy_dir_all(&source_root, &target_root)?;
+    let installed_executable = target_root.join(relative_executable);
+    if !installed_executable.exists() {
+        return Err(format!(
+            "Runtime install did not create {}.",
+            installed_executable.display()
+        ));
+    }
+    Ok(installed_executable)
+}
+
+fn runtime_package_root(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if parent.file_name().is_some_and(|name| name == "bin") {
+        parent.parent().map(Path::to_path_buf)
+    } else if executable.is_dir() {
+        Some(executable.to_path_buf())
+    } else {
+        parent.parent().map(Path::to_path_buf)
+    }
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target)
+        .map_err(|err| format!("Could not create {}: {err}", target.display()))?;
+    for entry in
+        fs::read_dir(source).map_err(|err| format!("Could not read {}: {err}", source.display()))?
+    {
+        let entry = entry.map_err(|err| format!("Could not read {}: {err}", source.display()))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("Could not inspect {}: {err}", source_path.display()))?;
+        if file_type.is_dir() {
+            copy_dir_all(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).map_err(|err| {
+                format!(
+                    "Could not copy {} to {}: {err}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn runtime_uninstall_target(
+    storage_dir: &Path,
+    runtime_id: &str,
+    installed_path: &Path,
+) -> Option<PathBuf> {
+    if runtime_id.is_empty() || installed_path.as_os_str().is_empty() {
+        return None;
+    }
+
+    let runtime_dir = storage_dir.join(runtime_id);
+    if installed_path.starts_with(&runtime_dir) {
+        Some(runtime_dir)
+    } else if installed_path.starts_with(storage_dir) {
+        Some(installed_path.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn uninstall_candidate_paths(config: &AppConfig, model: &SttModelInfo) -> Vec<PathBuf> {
@@ -3395,9 +4167,10 @@ fn download_model_file(
     destination: &Path,
     tx: &Sender<AppEvent>,
     model_id: &str,
-) -> Result<(), String> {
+    expected_total_bytes: Option<u64>,
+) -> Result<PathBuf, String> {
     if destination.exists() {
-        return Ok(());
+        return Ok(destination.to_path_buf());
     }
 
     let partial_path = destination.with_extension("bin.partial");
@@ -3412,12 +4185,15 @@ fn download_model_file(
             .map_err(|err| format!("request failed for {url}: {err}"))?;
         let total_bytes = response
             .header("content-length")
-            .and_then(|value| value.parse::<u64>().ok());
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(expected_total_bytes);
         let mut reader = response.into_reader();
         let mut file = fs::File::create(&partial_path)
             .map_err(|err| format!("failed to create {}: {err}", partial_path.display()))?;
         let mut downloaded_bytes = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
+        let started_at = Instant::now();
+        let mut last_progress_at = started_at;
 
         loop {
             let read = reader
@@ -3429,13 +4205,25 @@ fn download_model_file(
             file.write_all(&buffer[..read])
                 .map_err(|err| format!("failed to write {}: {err}", partial_path.display()))?;
             downloaded_bytes += read as u64;
-            let _ = tx.send(AppEvent::ModelDownloadProgress {
-                model_id: model_id.to_owned(),
-                downloaded_bytes,
-                total_bytes,
-            });
+            let now = Instant::now();
+            if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
+                last_progress_at = now;
+                let _ = tx.send(AppEvent::ModelDownloadProgress {
+                    model_id: model_id.to_owned(),
+                    downloaded_bytes,
+                    total_bytes,
+                    bytes_per_second: download_speed(downloaded_bytes, started_at, now),
+                });
+            }
         }
 
+        let finished_at = Instant::now();
+        let _ = tx.send(AppEvent::ModelDownloadProgress {
+            model_id: model_id.to_owned(),
+            downloaded_bytes,
+            total_bytes,
+            bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
+        });
         file.sync_all()
             .map_err(|err| format!("failed to finish {}: {err}", partial_path.display()))?;
         fs::rename(&partial_path, destination).map_err(|err| {
@@ -3445,7 +4233,7 @@ fn download_model_file(
                 destination.display()
             )
         })?;
-        Ok(())
+        Ok(destination.to_path_buf())
     })();
 
     if result.is_err() {
@@ -3453,6 +4241,184 @@ fn download_model_file(
     }
 
     result
+}
+
+fn download_faster_whisper_model(
+    runner: &Path,
+    model_name: &str,
+    destination: &Path,
+    tx: &Sender<AppEvent>,
+    model_id: &str,
+    expected_total_bytes: Option<u64>,
+) -> Result<PathBuf, String> {
+    if destination.exists() {
+        if config::is_faster_whisper_model_dir(destination) {
+            return Ok(destination.to_path_buf());
+        }
+        let result = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        result.map_err(|err| {
+            format!(
+                "failed to replace incomplete faster-whisper model at {}: {err}",
+                destination.display()
+            )
+        })?;
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+
+    let started_at = Instant::now();
+    let mut child = Command::new(runner)
+        .args(["download-model", "--model", model_name, "--output"])
+        .arg(destination)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
+    let stdout = child.stdout.take().map(read_stream_to_string);
+    let stderr = child.stderr.take().map(read_stream_to_string);
+    let mut last_progress_at = started_at;
+    let mut last_downloaded_bytes = 0_u64;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
+        {
+            Some(status) => break status,
+            None => {
+                let now = Instant::now();
+                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
+                    last_progress_at = now;
+                    last_downloaded_bytes =
+                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+                    let _ = tx.send(AppEvent::ModelDownloadProgress {
+                        model_id: model_id.to_owned(),
+                        downloaded_bytes: last_downloaded_bytes,
+                        total_bytes: expected_total_bytes,
+                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
+                    });
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let finished_at = Instant::now();
+    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
+    let _ = tx.send(AppEvent::ModelDownloadProgress {
+        model_id: model_id.to_owned(),
+        downloaded_bytes,
+        total_bytes: expected_total_bytes,
+        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
+    });
+    let stdout = join_stream_reader(stdout, "faster-whisper stdout")?;
+    let stderr = join_stream_reader(stderr, "faster-whisper stderr")?;
+
+    if !status.success() {
+        let _ = if destination.is_dir() {
+            fs::remove_dir_all(destination)
+        } else {
+            fs::remove_file(destination)
+        };
+        return Err(format!(
+            "faster-whisper model download failed with status {}: {}",
+            status,
+            stderr.trim()
+        ));
+    }
+
+    let runner_path =
+        parse_faster_whisper_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
+    let validated_path = if config::is_faster_whisper_model_dir(&runner_path)
+        && runner_path.starts_with(destination)
+    {
+        runner_path
+    } else if config::is_faster_whisper_model_dir(destination) {
+        destination.to_path_buf()
+    } else {
+        return Err(format!(
+            "faster-whisper runner finished but did not create a complete model at {}",
+            destination.display()
+        ));
+    };
+
+    Ok(validated_path)
+}
+
+fn read_stream_to_string<R>(mut reader: R) -> JoinHandle<Result<String, String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = String::new();
+        reader
+            .read_to_string(&mut output)
+            .map_err(|err| format!("failed to read child process output: {err}"))?;
+        Ok(output)
+    })
+}
+
+fn join_stream_reader(
+    handle: Option<JoinHandle<Result<String, String>>>,
+    label: &str,
+) -> Result<String, String> {
+    match handle {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| format!("{label} reader panicked"))?,
+        None => Ok(String::new()),
+    }
+}
+
+fn download_speed(downloaded_bytes: u64, started_at: Instant, measured_at: Instant) -> Option<u64> {
+    let elapsed = measured_at.duration_since(started_at).as_secs_f64();
+    if downloaded_bytes == 0 || elapsed <= 0.0 {
+        None
+    } else {
+        Some((downloaded_bytes as f64 / elapsed).round() as u64)
+    }
+}
+
+fn installed_path_size(path: &Path) -> Result<u64, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let metadata =
+        fs::metadata(path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+    let entries =
+        fs::read_dir(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("failed to read entry in {}: {err}", path.display()))?;
+        total = total.saturating_add(installed_path_size(&entry.path())?);
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Deserialize)]
+struct FasterWhisperDownloadOutput {
+    path: PathBuf,
+}
+
+fn parse_faster_whisper_download_path(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<FasterWhisperDownloadOutput>(line.trim()).ok())
+        .map(|output| output.path)
 }
 
 #[cfg(test)]
@@ -3711,6 +4677,7 @@ mod layout_tests {
             ModelInstallStatus::Downloading {
                 downloaded_bytes: 42,
                 total_bytes: None,
+                bytes_per_second: None,
             },
         );
         assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
@@ -4207,7 +5174,7 @@ mod layout_tests {
         );
 
         let mut unavailable = whisper;
-        unavailable.backend = "faster-whisper".to_owned();
+        unavailable.backend = "Vosk".to_owned();
         unavailable.download_model = None;
         assert_eq!(
             model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false),
@@ -4216,6 +5183,214 @@ mod layout_tests {
                 primary_enabled: false,
                 show_uninstall: false,
             }
+        );
+    }
+
+    #[test]
+    fn disabled_model_actions_explain_why_they_are_disabled() {
+        let whisper = test_model();
+        let active_state = model_action_state(&whisper, &ModelInstallStatus::Installed, true);
+        assert_eq!(
+            model_primary_disabled_tooltip(
+                &whisper,
+                &ModelInstallStatus::Installed,
+                true,
+                &active_state,
+            ),
+            Some("This model is already the active transcription model.".to_owned())
+        );
+
+        let mut unavailable = whisper;
+        unavailable.backend = "Vosk".to_owned();
+        unavailable.download_model = None;
+        let unavailable_state =
+            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false);
+        let tooltip = model_primary_disabled_tooltip(
+            &unavailable,
+            &ModelInstallStatus::NotInstalled,
+            false,
+            &unavailable_state,
+        )
+        .unwrap();
+
+        assert!(tooltip.contains("not bundled"));
+        assert!(tooltip.contains("Vosk"));
+    }
+
+    #[test]
+    fn parses_faster_whisper_download_path_from_runner_json() {
+        let path = parse_faster_whisper_download_path(
+            r#"{"model":"small.en","path":"/tmp/scribe-models/faster-whisper/small"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/scribe-models/faster-whisper/small")
+        );
+    }
+
+    #[test]
+    fn download_progress_uses_known_total_for_fraction_and_labels() {
+        let status = ModelInstallStatus::Downloading {
+            downloaded_bytes: 256 * 1024 * 1024,
+            total_bytes: Some(1024 * 1024 * 1024),
+            bytes_per_second: Some(4 * 1024 * 1024),
+        };
+
+        assert_eq!(download_progress_fraction(&status), Some(0.25));
+        assert_eq!(download_progress_bar_text(&status), "25% Completed");
+        assert_eq!(
+            download_progress_detail(&status),
+            Some("256 MB / 1.0 GB · 4 MB/s".to_owned())
+        );
+    }
+
+    #[test]
+    fn download_progress_bar_paints_proportional_fill_in_full_track() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let status = ModelInstallStatus::Downloading {
+            downloaded_bytes: 256 * 1024 * 1024,
+            total_bytes: Some(1024 * 1024 * 1024),
+            bytes_per_second: None,
+        };
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 220.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        with_usable_width_cap(ui, 400.0, |ui| {
+                            download_progress_bar(ui, &status);
+                        });
+                    });
+            },
+        );
+
+        let track_fill = Color32::from_rgb(229, 231, 235);
+        let track = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == track_fill => Some(rect.rect),
+                _ => None,
+            })
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .unwrap();
+        let fill = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == ThemePalette::light().accent => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .unwrap();
+
+        assert!(track.width() >= 390.0, "track width was {}", track.width());
+        assert!(
+            (fill.width() / track.width() - 0.25).abs() <= 0.01,
+            "fill was {} of track {}",
+            fill.width(),
+            track.width()
+        );
+    }
+
+    #[test]
+    fn faster_whisper_large_v3_has_progress_total() {
+        let model = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_large_v3")
+            .unwrap();
+
+        assert_eq!(model_storage_estimate(&model), "~3.1 GB");
+        assert_eq!(
+            model_download_total_bytes(&model),
+            Some((3.1_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64)
+        );
+    }
+
+    #[test]
+    fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
+        let whisper = test_model();
+        let mut config = AppConfig::default();
+        config.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall {
+                path: PathBuf::from("/tmp/scribe-runtimes/whisper_cpp/bin/whisper-cli"),
+            },
+        );
+
+        assert_eq!(
+            runtime_action_state(&config, &whisper),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Uninstall,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        );
+
+        let mut faster_whisper = whisper;
+        faster_whisper.backend = "faster-whisper".to_owned();
+        faster_whisper.download_model = Some("tiny.en".to_owned());
+        let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
+
+        assert_eq!(action.kind, RuntimeActionKind::Install);
+        assert!(!action.enabled);
+        assert!(
+            action
+                .disabled_tooltip
+                .as_deref()
+                .is_some_and(|tooltip| tooltip.contains("No packaged faster-whisper runtime"))
+        );
+    }
+
+    #[test]
+    fn faster_whisper_model_needs_runtime_instead_of_placeholder_backend_message() {
+        let mut model = test_model();
+        model.id = "faster_whisper_tiny_en".to_owned();
+        model.name = "faster-whisper tiny.en".to_owned();
+        model.backend = "faster-whisper".to_owned();
+        model.local_path = Some(PathBuf::from("/tmp/scribe-fw-tiny"));
+        model.install_status = ModelInstallStatus::Installed;
+        model.download_model = Some("tiny.en".to_owned());
+
+        let status = runtime_status_for_model(&AppConfig::default(), &model);
+
+        assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
+        assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
+    }
+
+    #[test]
+    fn runtime_uninstall_target_only_allows_app_runtime_storage() {
+        let storage_dir = PathBuf::from("/tmp/scribe-runtimes");
+        let runtime_dir = storage_dir.join("whisper_cpp");
+        let runtime_executable = runtime_dir.join("bin").join("whisper-cli");
+        let sibling_runtime_file = storage_dir.join("legacy-whisper-cli");
+        let external_runtime = PathBuf::from("/opt/whisper.cpp/bin/whisper-cli");
+
+        assert_eq!(
+            runtime_uninstall_target(&storage_dir, "whisper_cpp", &runtime_executable),
+            Some(runtime_dir)
+        );
+        assert_eq!(
+            runtime_uninstall_target(&storage_dir, "whisper_cpp", &sibling_runtime_file),
+            Some(sibling_runtime_file)
+        );
+        assert_eq!(
+            runtime_uninstall_target(&storage_dir, "whisper_cpp", &external_runtime),
+            None
         );
     }
 
@@ -4266,14 +5441,19 @@ mod layout_tests {
 
     #[test]
     fn uninstall_clears_active_model_when_no_installed_models_remain() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scribe-empty-models-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
         let mut config = AppConfig {
             selected_default_model: "whisper_cpp_base_en".to_owned(),
+            model_storage_dir: temp_dir.clone(),
             ..AppConfig::default()
         };
 
         select_first_installed_model(&mut config);
 
         assert!(config.selected_default_model.is_empty());
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

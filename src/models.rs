@@ -24,6 +24,8 @@ pub enum ModelInstallStatus {
     Downloading {
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
+        #[serde(default)]
+        bytes_per_second: Option<u64>,
     },
     Installed,
     Missing,
@@ -41,14 +43,21 @@ impl ModelInstallStatus {
             Self::Downloading {
                 downloaded_bytes,
                 total_bytes,
-            } => match total_bytes {
-                Some(total) if *total > 0 => {
-                    let percent =
-                        (*downloaded_bytes as f64 / *total as f64 * 100.0).clamp(0.0, 100.0);
-                    format!("Downloading {:.0}%", percent)
+                bytes_per_second,
+            } => {
+                let progress = match total_bytes {
+                    Some(total) if *total > 0 => {
+                        let percent =
+                            (*downloaded_bytes as f64 / *total as f64 * 100.0).clamp(0.0, 100.0);
+                        format!("Downloading {:.0}%", percent)
+                    }
+                    _ => format!("Downloading {}", format_bytes(*downloaded_bytes)),
+                };
+                match bytes_per_second.filter(|speed| *speed > 0) {
+                    Some(speed) => format!("{progress} · {}/s", format_bytes(speed)),
+                    None => progress,
                 }
-                _ => format!("Downloading {}", format_bytes(*downloaded_bytes)),
-            },
+            }
             Self::Installed => "Installed".to_owned(),
             Self::Missing => "Missing file".to_owned(),
             Self::Error(message) => format!("Error: {message}"),
@@ -146,7 +155,7 @@ impl fmt::Display for ModelRuntimeStatus {
             Self::NotInstalled => write!(f, "Not installed"),
             Self::Downloading => write!(f, "Downloading"),
             Self::Running => write!(f, "Running"),
-            Self::Disabled => write!(f, "Disabled"),
+            Self::Disabled => write!(f, "Skipped"),
             Self::NotImplemented => write!(f, "Runtime unavailable"),
             Self::Error(message) => write!(f, "Error: {message}"),
         }
@@ -171,15 +180,20 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
             streaming: false,
             experimental: false,
         },
-        "Vosk" | "sherpa-onnx" | "faster-whisper" | "Moonshine" | "Parakeet" => {
-            BackendCapabilities {
-                runnable: false,
-                supports_local_files: true,
-                supports_downloads: false,
-                streaming: backend == "sherpa-onnx",
-                experimental: true,
-            }
-        }
+        "faster-whisper" => BackendCapabilities {
+            runnable: true,
+            supports_local_files: true,
+            supports_downloads: true,
+            streaming: false,
+            experimental: false,
+        },
+        "Vosk" | "sherpa-onnx" | "Moonshine" | "Parakeet" => BackendCapabilities {
+            runnable: false,
+            supports_local_files: true,
+            supports_downloads: false,
+            streaming: backend == "sherpa-onnx",
+            experimental: true,
+        },
         _ => BackendCapabilities {
             runnable: false,
             supports_local_files: false,
@@ -255,77 +269,77 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "faster_whisper_tiny_en",
             "faster-whisper tiny.en",
             "faster-whisper",
-            "GPU-oriented tiny English model once the managed faster-whisper runtime is bundled.",
+            "GPU-oriented tiny English model for quick faster-whisper smoke tests.",
             "1 GB",
             "Basic",
             "Fastest GPU",
-            None,
+            Some("tiny.en"),
             false,
         ),
         model(
             "faster_whisper_base_en",
             "faster-whisper base.en",
             "faster-whisper",
-            "GPU-oriented base English model once the managed faster-whisper runtime is bundled.",
+            "GPU-oriented base English model with a balanced faster-whisper footprint.",
             "1 GB",
             "Good",
             "Fast GPU",
-            None,
+            Some("base.en"),
             false,
         ),
         model(
             "faster_whisper_small_en_gpu",
             "faster-whisper small.en",
             "faster-whisper",
-            "GPU-oriented small English model once the managed faster-whisper runtime is bundled.",
+            "GPU-oriented small English model for better faster-whisper accuracy.",
             "1-2 GB",
             "Good",
             "Fast GPU",
-            None,
+            Some("small.en"),
             false,
         ),
         model(
             "faster_whisper_medium_en_gpu",
             "faster-whisper medium.en",
             "faster-whisper",
-            "GPU-oriented medium English model once the managed faster-whisper runtime is bundled.",
+            "GPU-oriented medium English model for high-accuracy faster-whisper transcription.",
             "3-6 GB",
             "High",
             "Medium GPU",
-            None,
+            Some("medium.en"),
             false,
         ),
         model(
             "faster_whisper_large_v3",
             "faster-whisper large-v3",
             "faster-whisper",
-            "High-accuracy GPU model once the managed faster-whisper runtime is bundled.",
+            "High-accuracy faster-whisper GPU model.",
             "5-10 GB",
             "Highest",
             "Slow GPU",
-            None,
+            Some("large-v3"),
             false,
         ),
         model(
             "faster_whisper_turbo",
             "faster-whisper turbo",
             "faster-whisper",
-            "Fast GPU model once the managed faster-whisper runtime is bundled.",
+            "Fast faster-whisper GPU model.",
             "4-8 GB",
             "High",
             "Fast GPU",
-            None,
+            Some("turbo"),
             false,
         ),
         model(
             "faster_whisper_distil_large_v3",
             "faster-whisper distil-large-v3",
             "faster-whisper",
-            "Distilled high-accuracy GPU model once the managed faster-whisper runtime is bundled.",
+            "Distilled high-accuracy faster-whisper GPU model.",
             "3-6 GB",
             "High",
             "Fast GPU",
-            None,
+            Some("distil-large-v3"),
             false,
         ),
         model(
@@ -390,7 +404,7 @@ fn model(
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let bytes = bytes as f64;
@@ -420,6 +434,7 @@ mod tests {
         let status = ModelInstallStatus::Downloading {
             downloaded_bytes: 25,
             total_bytes: Some(100),
+            bytes_per_second: None,
         };
 
         assert_eq!(status.label(), "Downloading 25%");
@@ -428,9 +443,26 @@ mod tests {
     }
 
     #[test]
-    fn only_whisper_cpp_has_bundled_installer_in_this_phase() {
+    fn install_status_labels_download_speed() {
+        let status = ModelInstallStatus::Downloading {
+            downloaded_bytes: 1024 * 1024,
+            total_bytes: None,
+            bytes_per_second: Some(2 * 1024 * 1024),
+        };
+
+        assert_eq!(status.label(), "Downloading 1 MB · 2 MB/s");
+    }
+
+    #[test]
+    fn disabled_runtime_status_is_labeled_as_skipped() {
+        assert_eq!(ModelRuntimeStatus::Disabled.to_string(), "Skipped");
+    }
+
+    #[test]
+    fn bundled_phase_supports_whisper_cpp_and_faster_whisper() {
         assert!(backend_capabilities("whisper.cpp").runnable);
-        assert!(!backend_capabilities("faster-whisper").runnable);
+        assert!(backend_capabilities("faster-whisper").runnable);
+        assert!(backend_capabilities("faster-whisper").supports_downloads);
         assert!(!backend_capabilities("Vosk").supports_downloads);
     }
 }

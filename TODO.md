@@ -9,10 +9,10 @@
 
 ## STT Backends
 
-- Package managed whisper.cpp runtime sidecars for release builds.
+- Add installer/package integration around staged whisper.cpp runtime sidecars.
 - Add Vosk runtime support.
 - Add sherpa-onnx streaming runtime support.
-- Add faster-whisper runtime support.
+- Add production packaging hardening for generated faster-whisper Python sidecars.
 - Add Moonshine runtime support.
 - Add Parakeet runtime support.
 - Add a native whisper.cpp library backend to avoid child-process overhead.
