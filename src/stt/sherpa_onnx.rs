@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -13,7 +14,7 @@ use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_m
 
 use super::SttBackend;
 
-const MIN_SHERPA_ONNX_RUNNER_REVISION: u32 = 1;
+const MIN_SHERPA_ONNX_RUNNER_REVISION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SherpaRuntimeSpec {
@@ -68,6 +69,7 @@ struct RunnerSegment {
 struct RuntimeManifest {
     runtime_id: Option<String>,
     runner_revision: Option<u32>,
+    versions: Option<HashMap<String, Option<String>>>,
 }
 
 impl SherpaOnnxBackend {
@@ -359,7 +361,17 @@ fn manifest_has_supported_runner(spec: SherpaRuntimeSpec, runtime_root: &Path) -
                 .runner_revision
                 .is_some_and(|revision| revision >= MIN_SHERPA_ONNX_RUNNER_REVISION)
                 && manifest.runtime_id.as_deref() == Some(spec.runtime_id)
+                && manifest_has_numpy(&manifest)
         })
+}
+
+fn manifest_has_numpy(manifest: &RuntimeManifest) -> bool {
+    manifest
+        .versions
+        .as_ref()
+        .and_then(|versions| versions.get("numpy"))
+        .and_then(|version| version.as_deref())
+        .is_some_and(|version| !version.trim().is_empty())
 }
 
 pub(crate) fn sherpa_onnx_args(
@@ -521,6 +533,31 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn resolver_skips_packaged_runtime_without_numpy_before_dev_runtime() {
+        let root = temp_root("resolver-missing-numpy");
+        let managed_root = root.join("managed");
+        let broken_runtime = write_packaged_runtime_with_manifest(
+            &managed_root,
+            "parakeet",
+            r#"{"runtime_id":"parakeet","runner_revision":2,"versions":{"numpy":null}}"#,
+        );
+        let dev_runtime = root.join("dev").join("scribe-parakeet-dev");
+        fs::create_dir_all(dev_runtime.parent().unwrap()).unwrap();
+        fs::write(&dev_runtime, b"dev Parakeet runtime").unwrap();
+
+        let resolved = resolve_executable_from_candidates(
+            "parakeet",
+            [],
+            [managed_root],
+            [dev_runtime.clone()],
+        );
+
+        assert_ne!(resolved, Some(broken_runtime));
+        assert_eq!(resolved, Some(dev_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "scribe-sherpa-runtime-{name}-{}",
@@ -529,6 +566,20 @@ mod tests {
     }
 
     fn write_packaged_runtime(root: &Path, runtime_id: &str) -> PathBuf {
+        write_packaged_runtime_with_manifest(
+            root,
+            runtime_id,
+            &format!(
+                r#"{{"runtime_id":"{runtime_id}","runner_revision":2,"versions":{{"numpy":"2.3.2"}}}}"#
+            ),
+        )
+    }
+
+    fn write_packaged_runtime_with_manifest(
+        root: &Path,
+        runtime_id: &str,
+        manifest_contents: &str,
+    ) -> PathBuf {
         let spec = runtime_spec_for_runtime_id(runtime_id).unwrap();
         let executable = root.join("bin").join(spec.wrapper_name);
         let runner = root.join("bin").join("sherpa_onnx_runner.py");
@@ -538,11 +589,7 @@ mod tests {
         fs::create_dir_all(python.parent().unwrap()).unwrap();
         fs::write(&executable, b"sherpa runtime").unwrap();
         fs::write(runner, b"runner").unwrap();
-        fs::write(
-            manifest,
-            format!(r#"{{"runtime_id":"{runtime_id}","runner_revision":1}}"#),
-        )
-        .unwrap();
+        fs::write(manifest, manifest_contents).unwrap();
         fs::write(python, b"python").unwrap();
         executable
     }

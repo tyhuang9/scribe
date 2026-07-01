@@ -197,9 +197,9 @@ scripts/bundle-moonshine-runtime.sh
 scripts/bundle-parakeet-runtime.sh
 ```
 
-These runtimes are generated Python virtual environments with `sherpa-onnx`
-and `sherpa-onnx-bin` plus a small Scribe runner. Each backend gets a separate
-managed runtime directory and wrapper, but they share the same runner. The
+These runtimes are generated Python virtual environments with `sherpa-onnx`,
+`sherpa-onnx-bin`, and `numpy` plus a small Scribe runner. Each backend gets a
+separate managed runtime directory and wrapper, but they share the same runner. The
 runner downloads official sherpa-onnx model archives for:
 
 - `sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2`

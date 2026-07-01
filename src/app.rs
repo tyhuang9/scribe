@@ -1913,34 +1913,14 @@ impl LocalTranscriberApp {
         page(ui, "Models Catalog", status, &status_message, |ui| {
             panel(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(label_caps("Search"));
-                    ui.add(
-                        TextEdit::singleline(&mut self.model_search)
-                            .desired_width(width_before_trailing(ui, 290.0, 120.0))
-                            .hint_text("Search models..."),
+                    model_search_filter_control(ui, &mut self.model_search);
+                    ui.add_space(10.0);
+                    model_backend_filter_control(
+                        ui,
+                        "model-backend-filter",
+                        &mut self.model_backend_filter,
+                        &backends,
                     );
-                    ui.label(label_caps("Filter Backend:"));
-                    ComboBox::from_id_source("model-backend-filter")
-                        .selected_text(if self.model_backend_filter == "All" {
-                            "All Backends"
-                        } else {
-                            &self.model_backend_filter
-                        })
-                        .width(130.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.model_backend_filter,
-                                "All".to_owned(),
-                                "All backends",
-                            );
-                            for backend in &backends {
-                                ui.selectable_value(
-                                    &mut self.model_backend_filter,
-                                    backend.clone(),
-                                    backend,
-                                );
-                            }
-                        });
                 });
             });
 
@@ -2796,6 +2776,40 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
             .inner_margin(Margin::same(14.0)),
         add_contents,
     );
+}
+
+fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
+    ui.vertical(|ui| {
+        ui.label(label_caps("Search"));
+        ui.add_sized(
+            [190.0, 28.0],
+            TextEdit::singleline(search).hint_text("Search models..."),
+        );
+    });
+}
+
+fn model_backend_filter_control(
+    ui: &mut Ui,
+    id_source: &'static str,
+    selected_backend: &mut String,
+    backends: &[String],
+) {
+    ui.vertical(|ui| {
+        ui.label(label_caps("Filter Backend"));
+        ComboBox::from_id_source(id_source)
+            .selected_text(if selected_backend == "All" {
+                "All Backends"
+            } else {
+                selected_backend.as_str()
+            })
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected_backend, "All".to_owned(), "All backends");
+                for backend in backends {
+                    ui.selectable_value(selected_backend, backend.clone(), backend);
+                }
+            });
+    });
 }
 
 fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
@@ -5376,20 +5390,17 @@ mod layout_tests {
                         |ui| {
                             panel(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(label_caps("Search"));
                                     let mut search = "whisper".to_owned();
-                                    ui.add(
-                                        TextEdit::singleline(&mut search)
-                                            .desired_width(width_before_trailing(ui, 290.0, 120.0))
-                                            .hint_text("Search models..."),
+                                    model_search_filter_control(ui, &mut search);
+                                    ui.add_space(10.0);
+                                    let mut backend = "All".to_owned();
+                                    let backends = vec!["whisper.cpp".to_owned()];
+                                    model_backend_filter_control(
+                                        ui,
+                                        "test-model-backend-filter",
+                                        &mut backend,
+                                        &backends,
                                     );
-                                    ui.label(label_caps("Filter Backend:"));
-                                    ComboBox::from_id_source("test-model-backend-filter")
-                                        .selected_text("All Backends")
-                                        .width(130.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.label("All backends");
-                                        });
                                 });
                             });
 
@@ -5710,7 +5721,9 @@ mod layout_tests {
         fs::write(runner, b"runner").unwrap();
         fs::write(
             manifest,
-            format!(r#"{{"runtime_id":"{runtime_id}","runner_revision":1}}"#),
+            format!(
+                r#"{{"runtime_id":"{runtime_id}","runner_revision":2,"versions":{{"numpy":"2.3.2"}}}}"#
+            ),
         )
         .unwrap();
         fs::write(python, b"python").unwrap();

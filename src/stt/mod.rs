@@ -145,21 +145,6 @@ impl SttProviderAdapter {
     pub fn detect_devices(self, _config: &AppConfig) -> Vec<RuntimeDevice> {
         Vec::new()
     }
-
-    pub fn transcribe(
-        self,
-        config: &AppConfig,
-        audio_path: PathBuf,
-        model: SttModelInfo,
-    ) -> Result<TranscriptResult> {
-        if !self.transcription_supported {
-            return Err(anyhow!(
-                "{} managed runtime is not bundled yet",
-                model.backend
-            ));
-        }
-        transcribe_with_config(config, audio_path, model)
-    }
 }
 
 pub fn transcribe_with_config(

@@ -29,6 +29,7 @@ Environment:
   PYTHON_BIN=/path/to/python3                   Python used to create the venv
   SCRIBE_REBUILD_SHERPA_ONNX_RUNTIME=1          recreate the venv before install
   SCRIBE_SHERPA_ONNX_VERSION=1.13.3             optional pinned PyPI version
+  SCRIBE_NUMPY_VERSION=2.3.2                    optional pinned NumPy version
 
 Output:
   $DEST/bin/$WRAPPER_NAME
@@ -66,6 +67,12 @@ if [[ -n "${SCRIBE_SHERPA_ONNX_VERSION:-}" ]]; then
     "sherpa-onnx-bin==$SCRIBE_SHERPA_ONNX_VERSION"
 elif ! "$VENV_PYTHON" -c "import sherpa_onnx" >/dev/null 2>&1; then
   "$VENV_PYTHON" -m pip install --upgrade sherpa-onnx sherpa-onnx-bin
+fi
+
+if [[ -n "${SCRIBE_NUMPY_VERSION:-}" ]]; then
+  "$VENV_PYTHON" -m pip install --upgrade "numpy==$SCRIBE_NUMPY_VERSION"
+elif ! "$VENV_PYTHON" -c "import numpy" >/dev/null 2>&1; then
+  "$VENV_PYTHON" -m pip install --upgrade numpy
 fi
 
 cp "$RUNNER_SRC" "$RUNNER_DST"
@@ -111,7 +118,7 @@ cat > "$DEST/runtime-manifest.json" <<EOF
   "runtime_id": "$RUNTIME_ID",
   "backend": "$BACKEND",
   "runner": "bin/$WRAPPER_NAME",
-  "runner_revision": 1,
+  "runner_revision": 2,
   "python": "venv/bin/python",
   "versions": $versions,
   "model_sources": {
