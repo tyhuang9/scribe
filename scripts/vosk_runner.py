@@ -45,8 +45,6 @@ def is_vosk_model_dir(path: Path) -> bool:
         path.is_dir()
         and (path / "am" / "final.mdl").is_file()
         and (path / "conf" / "model.conf").is_file()
-        and (graph / "phones.txt").is_file()
-        and (graph / "words.txt").is_file()
         and has_graph
     )
 
@@ -87,9 +85,9 @@ def safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
 def extracted_model_root(extract_dir: Path) -> Path:
     if is_vosk_model_dir(extract_dir):
         return extract_dir
-    children = [child for child in extract_dir.iterdir() if child.is_dir()]
-    if len(children) == 1 and is_vosk_model_dir(children[0]):
-        return children[0]
+    for child in sorted(extract_dir.iterdir()):
+        if child.is_dir() and is_vosk_model_dir(child):
+            return child
     raise RuntimeError(f"download did not contain a valid Vosk model: {extract_dir}")
 
 

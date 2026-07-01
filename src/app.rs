@@ -366,7 +366,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
         };
     }
 
-    if has_managed_runtime_install(config, provider.runtime_id) {
+    if has_managed_runtime_install(config, provider) {
         return RuntimeActionState {
             kind: RuntimeActionKind::Uninstall,
             enabled: true,
@@ -405,11 +405,25 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
     })
 }
 
-fn has_managed_runtime_install(config: &AppConfig, runtime_id: &str) -> bool {
-    config
-        .managed_runtimes
-        .get(runtime_id)
-        .is_some_and(|install| !install.path.as_os_str().is_empty())
+fn has_managed_runtime_install(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
+    resolve_managed_runtime_executable(config, provider).is_some()
+}
+
+fn resolve_managed_runtime_executable(
+    config: &AppConfig,
+    provider: &stt::SttProviderAdapter,
+) -> Option<PathBuf> {
+    let root = config::managed_runtime_path(config, provider.backend)?;
+    match provider.backend {
+        "whisper.cpp" => {
+            stt::whisper_cpp::resolve_whisper_cpp_executable_from_candidates([], [root], [])
+        }
+        "faster-whisper" => {
+            stt::faster_whisper::resolve_faster_whisper_executable_from_candidates([], [root], [])
+        }
+        "Vosk" => stt::vosk::resolve_vosk_executable_from_candidates([], [root], []),
+        _ => None,
+    }
 }
 
 fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
@@ -1518,7 +1532,7 @@ impl LocalTranscriberApp {
                 install_runtime_files(provider.runtime_id, &packaged_path)
             }
             RuntimeInstallSource::DevelopmentScript(package) => {
-                build_development_runtime_package(&model.backend, package)
+                build_development_runtime_package(provider.runtime_id, &model.backend, package)
             }
         };
         let path = match path {
@@ -3992,6 +4006,7 @@ fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool,
 }
 
 fn build_development_runtime_package(
+    runtime_id: &str,
     backend: &str,
     package: DevelopmentRuntimePackage,
 ) -> Result<PathBuf, String> {
@@ -4014,9 +4029,9 @@ fn build_development_runtime_package(
         ));
     }
 
-    if !package.executable_path.exists() {
+    if !installed_runtime_executable_usable(runtime_id, &package.executable_path) {
         return Err(format!(
-            "{} runtime build finished but did not create {}.",
+            "{} runtime build finished but did not create a usable runtime at {}.",
             backend,
             package.executable_path.display()
         ));
@@ -4044,7 +4059,13 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
         .to_path_buf();
     let target_root = config::runtime_storage_dir().join(runtime_id);
     if source_root == target_root {
-        return Ok(packaged_executable.to_path_buf());
+        if installed_runtime_executable_usable(runtime_id, packaged_executable) {
+            return Ok(packaged_executable.to_path_buf());
+        }
+        return Err(format!(
+            "Runtime install found an unusable runtime at {}.",
+            packaged_executable.display()
+        ));
     }
 
     if target_root.exists() {
@@ -4057,13 +4078,21 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
     }
     copy_dir_all(&source_root, &target_root)?;
     let installed_executable = target_root.join(relative_executable);
-    if !installed_executable.exists() {
+    if !installed_runtime_executable_usable(runtime_id, &installed_executable) {
         return Err(format!(
-            "Runtime install did not create {}.",
+            "Runtime install did not create a usable runtime at {}.",
             installed_executable.display()
         ));
     }
     Ok(installed_executable)
+}
+
+fn installed_runtime_executable_usable(runtime_id: &str, executable: &Path) -> bool {
+    match runtime_id {
+        "faster_whisper" => stt::faster_whisper::is_faster_whisper_runtime_usable(executable),
+        "vosk" => stt::vosk::is_vosk_runtime_usable(executable),
+        _ => executable.exists(),
+    }
 }
 
 fn command_output_message(stdout: &[u8], stderr: &[u8]) -> String {
@@ -5437,6 +5466,24 @@ mod layout_tests {
         }
     }
 
+    fn write_vosk_runtime(root: &Path) -> PathBuf {
+        let executable = root.join("bin").join("scribe-vosk");
+        let runner = root.join("bin").join("vosk_runner.py");
+        let manifest = root.join("runtime-manifest.json");
+        let python = if cfg!(windows) {
+            root.join("venv").join("Scripts").join("python.exe")
+        } else {
+            root.join("venv").join("bin").join("python")
+        };
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&executable, b"vosk runtime").unwrap();
+        fs::write(runner, b"runner").unwrap();
+        fs::write(manifest, br#"{"runner_revision":2}"#).unwrap();
+        fs::write(python, b"python").unwrap();
+        executable
+    }
+
     #[test]
     fn model_action_state_matches_install_select_uninstall_rules() {
         let mut whisper = test_model();
@@ -5644,12 +5691,22 @@ mod layout_tests {
 
     #[test]
     fn runtime_action_state_explains_supported_and_unsupported_runtimes() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-action-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+
         let whisper = test_model();
         let mut config = AppConfig::default();
+        let whisper_runtime = runtime_root
+            .join("whisper_cpp")
+            .join("bin")
+            .join("whisper-cli");
+        fs::create_dir_all(whisper_runtime.parent().unwrap()).unwrap();
+        fs::write(&whisper_runtime, b"whisper runtime").unwrap();
         config.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
             config::ManagedRuntimeInstall {
-                path: PathBuf::from("/tmp/scribe-runtimes/whisper_cpp/bin/whisper-cli"),
+                path: whisper_runtime,
             },
         );
 
@@ -5695,7 +5752,7 @@ mod layout_tests {
         config.managed_runtimes.insert(
             "vosk".to_owned(),
             config::ManagedRuntimeInstall {
-                path: PathBuf::from("/tmp/scribe-runtimes/vosk/bin/scribe-vosk"),
+                path: write_vosk_runtime(&runtime_root.join("vosk")),
             },
         );
 
@@ -5719,6 +5776,27 @@ mod layout_tests {
                 .as_deref()
                 .is_some_and(|tooltip| tooltip.contains("installer is not bundled"))
         );
+
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn runtime_action_state_ignores_stale_runtime_metadata() {
+        let mut config = AppConfig::default();
+        config.managed_runtimes.insert(
+            "faster_whisper".to_owned(),
+            config::ManagedRuntimeInstall {
+                path: PathBuf::from("/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper"),
+            },
+        );
+        let mut model = test_model();
+        model.backend = "faster-whisper".to_owned();
+        model.download_model = Some("tiny.en".to_owned());
+
+        let action = runtime_action_state(&config, &model);
+
+        assert_eq!(action.kind, RuntimeActionKind::Install);
+        assert!(action.enabled);
     }
 
     #[cfg(unix)]
@@ -5744,6 +5822,7 @@ mod layout_tests {
 
         let installed = build_development_runtime_package(
             "test",
+            "test",
             DevelopmentRuntimePackage {
                 script,
                 destination_env: "SCRIBE_TEST_RUNTIME_DEST",
@@ -5755,6 +5834,48 @@ mod layout_tests {
 
         assert_eq!(installed, executable);
         assert!(installed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_runtime_script_rejects_broken_python_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-broken-python-runtime-test-{}",
+            std::process::id()
+        ));
+        let script = root.join("bundle-broken-runtime.sh");
+        let destination = root.join("runtime");
+        let executable = destination.join("bin").join("scribe-faster-whisper");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"runtime").unwrap();
+        fs::write(
+            destination.join("bin").join("faster_whisper_runner.py"),
+            b"runner",
+        )
+        .unwrap();
+        fs::write(&script, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let err = build_development_runtime_package(
+            "faster_whisper",
+            "faster-whisper",
+            DevelopmentRuntimePackage {
+                script,
+                destination_env: "SCRIBE_TEST_RUNTIME_DEST",
+                destination_root: destination,
+                executable_path: executable,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("usable runtime"));
         let _ = fs::remove_dir_all(root);
     }
 

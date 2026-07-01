@@ -263,11 +263,50 @@ fn first_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathB
             continue;
         }
         seen.push(path.clone());
-        if path.exists() {
+        if is_faster_whisper_runtime_usable(&path) {
             return Some(path);
         }
     }
     None
+}
+
+pub(crate) fn is_faster_whisper_runtime_usable(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if !is_packaged_runner_path(path) {
+        return true;
+    }
+    let Some(runtime_root) = packaged_runtime_root(path) else {
+        return false;
+    };
+    runtime_root
+        .join("bin")
+        .join("faster_whisper_runner.py")
+        .is_file()
+        && runtime_root.join(venv_python_relative_path()).is_file()
+}
+
+fn is_packaged_runner_path(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == "bin")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| faster_whisper_runner_names().contains(&name))
+}
+
+fn packaged_runtime_root(path: &Path) -> Option<PathBuf> {
+    path.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn venv_python_relative_path() -> &'static Path {
+    if cfg!(windows) {
+        Path::new("venv/Scripts/python.exe")
+    } else {
+        Path::new("venv/bin/python")
+    }
 }
 
 fn faster_whisper_args(
@@ -467,6 +506,28 @@ mod tests {
     }
 
     #[test]
+    fn resolver_skips_broken_packaged_runtime_before_dev_path() {
+        let root = test_runtime_root("skips-broken-packaged");
+        let managed_root = root.join("managed");
+        let broken_runtime = managed_root
+            .join("bin")
+            .join(faster_whisper_runner_names()[0]);
+        let dev_runtime = root.join("dev").join("scribe-faster-whisper-dev");
+        fs::create_dir_all(broken_runtime.parent().unwrap()).unwrap();
+        fs::write(&broken_runtime, b"broken faster-whisper runtime").unwrap();
+        write_test_runtime(&dev_runtime);
+
+        let resolved = resolve_faster_whisper_executable_from_candidates(
+            [],
+            [managed_root],
+            [dev_runtime.clone()],
+        );
+
+        assert_eq!(resolved, Some(dev_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn faster_whisper_environment_includes_cuda_library_paths() {
         let root = test_runtime_root("cuda-library-paths");
         let runtime_root = root.join("runtimes").join("faster_whisper");
@@ -538,6 +599,16 @@ mod tests {
     fn write_test_runtime(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"faster-whisper runtime").unwrap();
+        if let Some(runtime_root) =
+            packaged_runtime_root(path).filter(|_| is_packaged_runner_path(path))
+        {
+            let runner = runtime_root.join("bin").join("faster_whisper_runner.py");
+            let python = runtime_root.join(venv_python_relative_path());
+            fs::create_dir_all(runner.parent().unwrap()).unwrap();
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(runner, b"runner").unwrap();
+            fs::write(python, b"python").unwrap();
+        }
     }
 
     fn command_env(command: &Command, key: &str) -> Option<OsString> {

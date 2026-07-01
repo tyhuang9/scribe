@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -11,6 +12,8 @@ use crate::config::{self, AppConfig};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
 
 use super::SttBackend;
+
+const MIN_VOSK_RUNNER_REVISION: u32 = 2;
 
 pub struct VoskBackend {
     executable_path: Option<PathBuf>,
@@ -29,6 +32,11 @@ struct RunnerSegment {
     start_ms: Option<u64>,
     end_ms: Option<u64>,
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeManifest {
+    runner_revision: Option<u32>,
 }
 
 impl VoskBackend {
@@ -232,11 +240,56 @@ fn first_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathB
             continue;
         }
         seen.push(path.clone());
-        if path.exists() {
+        if is_vosk_runtime_usable(&path) {
             return Some(path);
         }
     }
     None
+}
+
+pub(crate) fn is_vosk_runtime_usable(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if !is_packaged_runner_path(path) {
+        return true;
+    }
+    let Some(runtime_root) = packaged_runtime_root(path) else {
+        return false;
+    };
+    runtime_root.join("bin").join("vosk_runner.py").is_file()
+        && runtime_root.join(venv_python_relative_path()).is_file()
+        && vosk_manifest_has_supported_runner(&runtime_root)
+}
+
+fn is_packaged_runner_path(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == "bin")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| vosk_runner_names().contains(&name))
+}
+
+fn packaged_runtime_root(path: &Path) -> Option<PathBuf> {
+    path.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn venv_python_relative_path() -> &'static Path {
+    if cfg!(windows) {
+        Path::new("venv/Scripts/python.exe")
+    } else {
+        Path::new("venv/bin/python")
+    }
+}
+
+fn vosk_manifest_has_supported_runner(runtime_root: &Path) -> bool {
+    fs::read_to_string(runtime_root.join("runtime-manifest.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<RuntimeManifest>(&contents).ok())
+        .and_then(|manifest| manifest.runner_revision)
+        .is_some_and(|revision| revision >= MIN_VOSK_RUNNER_REVISION)
 }
 
 fn vosk_args(model_path: &Path, audio_path: &Path) -> Vec<OsString> {
@@ -352,6 +405,23 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn resolver_skips_broken_packaged_runtime_before_dev_path() {
+        let root = test_runtime_root("skips-broken-packaged");
+        let managed_root = root.join("managed");
+        let broken_runtime = managed_root.join("bin").join(vosk_runner_names()[0]);
+        let dev_runtime = root.join("dev").join("scribe-vosk-dev");
+        fs::create_dir_all(broken_runtime.parent().unwrap()).unwrap();
+        fs::write(&broken_runtime, b"broken Vosk runtime").unwrap();
+        write_test_runtime(&dev_runtime);
+
+        let resolved =
+            resolve_vosk_executable_from_candidates([], [managed_root], [dev_runtime.clone()]);
+
+        assert_eq!(resolved, Some(dev_runtime));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_runtime_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("scribe-vosk-runtime-{name}-{}", std::process::id()))
     }
@@ -359,5 +429,17 @@ mod tests {
     fn write_test_runtime(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"Vosk runtime").unwrap();
+        if let Some(runtime_root) =
+            packaged_runtime_root(path).filter(|_| is_packaged_runner_path(path))
+        {
+            let runner = runtime_root.join("bin").join("vosk_runner.py");
+            let python = runtime_root.join(venv_python_relative_path());
+            let manifest = runtime_root.join("runtime-manifest.json");
+            fs::create_dir_all(runner.parent().unwrap()).unwrap();
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(runner, b"runner").unwrap();
+            fs::write(python, b"python").unwrap();
+            fs::write(manifest, br#"{"runner_revision":2}"#).unwrap();
+        }
     }
 }

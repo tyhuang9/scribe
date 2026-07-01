@@ -7,6 +7,7 @@ PROFILE="${SCRIBE_PROFILE:-debug}"
 DEST="${SCRIBE_FAST_WHISPER_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/faster_whisper}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="$DEST/venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER_SRC="$SCRIPT_DIR/faster_whisper_runner.py"
 RUNNER_DST="$DEST/bin/faster_whisper_runner.py"
 WRAPPER="$DEST/bin/scribe-faster-whisper"
@@ -39,24 +40,27 @@ fi
 
 if [[ "${SCRIBE_REBUILD_FAST_WHISPER_RUNTIME:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
   rm -rf "$VENV_DIR"
+elif [[ -d "$VENV_DIR" && ! -x "$VENV_PYTHON" ]]; then
+  echo "faster-whisper venv is incomplete; recreating $VENV_DIR" >&2
+  rm -rf "$VENV_DIR"
 fi
 
 mkdir -p "$DEST/bin"
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+if [[ ! -x "$VENV_PYTHON" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
 
-if ! "$VENV_DIR/bin/python" -c "import faster_whisper" >/dev/null 2>&1; then
-  "$VENV_DIR/bin/python" -m pip install --upgrade faster-whisper
+if ! "$VENV_PYTHON" -c "import faster_whisper" >/dev/null 2>&1; then
+  "$VENV_PYTHON" -m pip install --upgrade faster-whisper
 fi
 
 cuda_bundled=false
 case "${SCRIBE_BUNDLE_FAST_WHISPER_CUDA:-0}" in
   1|true|TRUE|yes|YES|on|ON)
-    "$VENV_DIR/bin/python" -m pip install --upgrade nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
+    "$VENV_PYTHON" -m pip install --upgrade nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
     cuda_bundled=true
     ;;
 esac

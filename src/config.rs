@@ -336,8 +336,6 @@ pub fn is_vosk_model_dir(path: &Path) -> bool {
     path.is_dir()
         && path.join("am").join("final.mdl").is_file()
         && path.join("conf").join("model.conf").is_file()
-        && graph.join("phones.txt").is_file()
-        && graph.join("words.txt").is_file()
         && has_graph
 }
 
@@ -786,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn vosk_directory_requires_model_payload() {
+    fn vosk_directory_accepts_official_small_model_layout() {
         let root = std::env::temp_dir().join(format!("scribe-vosk-model-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("am")).unwrap();
@@ -794,12 +792,13 @@ mod tests {
         fs::create_dir_all(root.join("graph")).unwrap();
         fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
         fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
-        fs::write(root.join("graph").join("phones.txt"), b"phones").unwrap();
-        fs::write(root.join("graph").join("words.txt"), b"words").unwrap();
 
         assert!(!is_vosk_model_dir(&root));
 
-        fs::write(root.join("graph").join("HCLG.fst"), b"graph").unwrap();
+        fs::write(root.join("graph").join("HCLr.fst"), b"hclr").unwrap();
+        assert!(!is_vosk_model_dir(&root));
+
+        fs::write(root.join("graph").join("Gr.fst"), b"gr").unwrap();
 
         assert!(is_vosk_model_dir(&root));
         let _ = fs::remove_dir_all(root);

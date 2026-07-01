@@ -7,6 +7,7 @@ PROFILE="${SCRIBE_PROFILE:-debug}"
 DEST="${SCRIBE_VOSK_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/vosk}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="$DEST/venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER_SRC="$SCRIPT_DIR/vosk_runner.py"
 RUNNER_DST="$DEST/bin/vosk_runner.py"
 WRAPPER="$DEST/bin/scribe-vosk"
@@ -40,17 +41,20 @@ fi
 
 if [[ "${SCRIBE_REBUILD_VOSK_RUNTIME:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
   rm -rf "$VENV_DIR"
+elif [[ -d "$VENV_DIR" && ! -x "$VENV_PYTHON" ]]; then
+  echo "Vosk venv is incomplete; recreating $VENV_DIR" >&2
+  rm -rf "$VENV_DIR"
 fi
 
 mkdir -p "$DEST/bin"
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+if [[ ! -x "$VENV_PYTHON" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
 
-installed_vosk_version="$("$VENV_DIR/bin/python" - <<'PY'
+installed_vosk_version="$("$VENV_PYTHON" - <<'PY'
 try:
     from importlib.metadata import PackageNotFoundError, version
 except ImportError:
@@ -64,7 +68,7 @@ PY
 )"
 
 if [[ "$installed_vosk_version" != "$VOSK_VERSION" ]]; then
-  "$VENV_DIR/bin/python" -m pip install --upgrade "vosk==$VOSK_VERSION"
+  "$VENV_PYTHON" -m pip install --upgrade "vosk==$VOSK_VERSION"
 fi
 
 cp "$RUNNER_SRC" "$RUNNER_DST"
@@ -93,6 +97,7 @@ cat > "$DEST/runtime-manifest.json" <<EOF
   "runtime_id": "vosk",
   "backend": "Vosk",
   "runner": "bin/scribe-vosk",
+  "runner_revision": 2,
   "python": "venv/bin/python",
   "vosk_version": "$VOSK_VERSION",
   "model_source": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
