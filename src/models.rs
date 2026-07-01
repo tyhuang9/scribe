@@ -18,8 +18,9 @@ pub struct SttModelInfo {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ModelInstallStatus {
+    #[default]
     NotInstalled,
     Downloading {
         downloaded_bytes: u64,
@@ -62,12 +63,6 @@ impl ModelInstallStatus {
             Self::Missing => "Missing file".to_owned(),
             Self::Error(message) => format!("Error: {message}"),
         }
-    }
-}
-
-impl Default for ModelInstallStatus {
-    fn default() -> Self {
-        Self::NotInstalled
     }
 }
 
@@ -409,6 +404,7 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn model(
     id: &str,
     name: &str,

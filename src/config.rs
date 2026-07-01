@@ -181,13 +181,13 @@ pub fn cache_dir() -> Result<PathBuf> {
 pub fn load_config() -> Result<(AppConfig, PathBuf)> {
     let path = config_file_path()?;
     if !path.exists() {
-        if let Ok(legacy_path) = legacy_config_file_path() {
-            if legacy_path.exists() {
-                let mut config = read_config_file(&legacy_path)?;
-                normalize_config(&mut config);
-                save_config(&config)?;
-                return Ok((config, path));
-            }
+        if let Ok(legacy_path) = legacy_config_file_path()
+            && legacy_path.exists()
+        {
+            let mut config = read_config_file(&legacy_path)?;
+            normalize_config(&mut config);
+            save_config(&config)?;
+            return Ok((config, path));
         }
 
         let config = AppConfig::default();
@@ -205,7 +205,7 @@ fn legacy_config_file_path() -> Result<PathBuf> {
 }
 
 fn read_config_file(path: &PathBuf) -> Result<AppConfig> {
-    let content = fs::read_to_string(&path)
+    let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     serde_json::from_str(&content)
         .with_context(|| format!("failed to parse config {}", path.display()))
@@ -471,10 +471,10 @@ pub fn normalize_config(config: &mut AppConfig) {
         config.model_storage_dir = default_model_storage_dir();
     }
     apply_managed_model_metadata(config);
-    if let Some(device_name) = &config.audio_input_device_name {
-        if device_name.trim().is_empty() {
-            config.audio_input_device_name = None;
-        }
+    if let Some(device_name) = &config.audio_input_device_name
+        && device_name.trim().is_empty()
+    {
+        config.audio_input_device_name = None;
     }
     if config.whisper_gpu_device > 16 {
         config.whisper_gpu_device = 0;
@@ -748,8 +748,10 @@ mod tests {
 
     #[test]
     fn hotkey_mode_uses_stable_snake_case_names() {
-        let mut config = AppConfig::default();
-        config.hotkey_mode = HotkeyMode::HoldToTalk;
+        let config = AppConfig {
+            hotkey_mode: HotkeyMode::HoldToTalk,
+            ..Default::default()
+        };
 
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(serialized.contains(r#""hotkey_mode":"hold_to_talk""#));

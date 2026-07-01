@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
@@ -15,7 +13,6 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
-use serde::Deserialize;
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -23,9 +20,10 @@ use crate::benchmark::{
 };
 use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    format_bytes, sherpa_model_download_url, vosk_model_download_url, whisper_cpp_download_url,
+    format_bytes,
 };
 use crate::stt;
 use crate::text_output;
@@ -33,7 +31,6 @@ use crate::tray::{TrayCommand, TrayService};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
-const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -212,6 +209,33 @@ enum AppEvent {
         model_id: String,
         message: String,
     },
+}
+
+fn send_model_download_progress(
+    tx: &Sender<AppEvent>,
+    progress: managed_downloads::ModelDownloadProgress,
+) {
+    let _ = tx.send(AppEvent::ModelDownloadProgress {
+        model_id: progress.model_id,
+        downloaded_bytes: progress.downloaded_bytes,
+        total_bytes: progress.total_bytes,
+        bytes_per_second: progress.bytes_per_second,
+    });
+}
+
+fn send_model_download_result(
+    tx: &Sender<AppEvent>,
+    model_id: String,
+    result: Result<PathBuf, String>,
+) {
+    match result {
+        Ok(path) => {
+            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+        }
+        Err(message) => {
+            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,10 +545,10 @@ fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
     }
 
     let mut roots = Vec::new();
-    if let Ok(executable) = env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            roots.extend(parent.ancestors().map(Path::to_path_buf));
-        }
+    if let Ok(executable) = env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        roots.extend(parent.ancestors().map(Path::to_path_buf));
     }
     if let Ok(cwd) = env::current_dir() {
         roots.extend(cwd.ancestors().map(Path::to_path_buf));
@@ -821,13 +845,13 @@ impl LocalTranscriberApp {
     }
 
     fn stop_recording(&mut self) {
-        if let Some(active) = self.active_recording.as_mut() {
-            if !active.stop_requested {
-                active.session.stop();
-                active.stop_requested = true;
-                active.latency.stop_requested_at = Some(Instant::now());
-                self.status_message = "Stopping recording".to_owned();
-            }
+        if let Some(active) = self.active_recording.as_mut()
+            && !active.stop_requested
+        {
+            active.session.stop();
+            active.stop_requested = true;
+            active.latency.stop_requested_at = Some(Instant::now());
+            self.status_message = "Stopping recording".to_owned();
         }
     }
 
@@ -1443,22 +1467,16 @@ impl LocalTranscriberApp {
                     return;
                 };
                 thread::spawn(move || {
-                    let result = download_faster_whisper_model(
+                    let progress = |progress| send_model_download_progress(&tx, progress);
+                    let result = managed_downloads::download_faster_whisper_model(
                         &runtime,
                         &download_model,
                         &destination,
-                        &tx,
                         &model_id,
                         expected_total_bytes,
+                        &progress,
                     );
-                    match result {
-                        Ok(path) => {
-                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
-                        }
-                        Err(message) => {
-                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
-                        }
-                    }
+                    send_model_download_result(&tx, model_id, result);
                 });
             }
             "Vosk" => {
@@ -1470,22 +1488,16 @@ impl LocalTranscriberApp {
                     return;
                 };
                 thread::spawn(move || {
-                    let result = download_vosk_model(
+                    let progress = |progress| send_model_download_progress(&tx, progress);
+                    let result = managed_downloads::download_vosk_model(
                         &runtime,
                         &download_model,
                         &destination,
-                        &tx,
                         &model_id,
                         expected_total_bytes,
+                        &progress,
                     );
-                    match result {
-                        Ok(path) => {
-                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
-                        }
-                        Err(message) => {
-                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
-                        }
-                    }
+                    send_model_download_result(&tx, model_id, result);
                 });
             }
             "sherpa-onnx" | "Moonshine" | "Parakeet" => {
@@ -1502,43 +1514,30 @@ impl LocalTranscriberApp {
                 };
                 let model_for_download = model.clone();
                 thread::spawn(move || {
-                    let result = download_sherpa_model(
+                    let progress = |progress| send_model_download_progress(&tx, progress);
+                    let result = managed_downloads::download_sherpa_model(
                         &runtime,
                         &model_for_download,
                         &download_model,
                         &destination,
-                        &tx,
                         &model_id,
                         expected_total_bytes,
+                        &progress,
                     );
-                    match result {
-                        Ok(path) => {
-                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
-                        }
-                        Err(message) => {
-                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
-                        }
-                    }
+                    send_model_download_result(&tx, model_id, result);
                 });
             }
             "whisper.cpp" => {
-                let url = whisper_cpp_download_url(&download_model);
                 thread::spawn(move || {
-                    let result = download_model_file(
-                        &url,
+                    let progress = |progress| send_model_download_progress(&tx, progress);
+                    let result = managed_downloads::download_whisper_cpp_model(
+                        &download_model,
                         &destination,
-                        &tx,
                         &model_id,
                         expected_total_bytes,
+                        &progress,
                     );
-                    match result {
-                        Ok(path) => {
-                            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
-                        }
-                        Err(message) => {
-                            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
-                        }
-                    }
+                    send_model_download_result(&tx, model_id, result);
                 });
             }
             backend => {
@@ -1948,7 +1947,7 @@ impl LocalTranscriberApp {
                 ));
                 wrapped_label(
                     ui,
-                    mut_text(&format!(
+                    mut_text(format!(
                         "Storage: models in {} · runtimes in {}",
                         config::model_storage_dir(&self.config).display(),
                         config::runtime_storage_dir().display()
@@ -1970,7 +1969,7 @@ impl LocalTranscriberApp {
                             ui.label(body_strong(&format!("{} runtime", model.backend)));
                             wrapped_label(
                                 ui,
-                                mut_text(&runtime_detail_text(
+                                mut_text(runtime_detail_text(
                                     &self.config,
                                     &model,
                                     &runtime_status,
@@ -2399,39 +2398,38 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
-                if let Some(provider) = stt::provider_for_backend("whisper.cpp") {
-                    if provider.device_detection_supported {
-                        let devices = provider.detect_devices(&self.config);
-                        if devices.len() > 1 {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("GPU device");
-                                let mut selected_device =
-                                    self.config.whisper_gpu_device.to_string();
-                                ComboBox::from_id_source("transcription-device-picker")
-                                    .selected_text(
-                                        devices
-                                            .iter()
-                                            .find(|device| device.id == selected_device)
-                                            .map(|device| device.name.as_str())
-                                            .unwrap_or("Auto"),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for device in &devices {
-                                            ui.selectable_value(
-                                                &mut selected_device,
-                                                device.id.clone(),
-                                                &device.name,
-                                            );
-                                        }
-                                    });
-                                if let Ok(device_index) = selected_device.parse::<u32>() {
-                                    if device_index != self.config.whisper_gpu_device {
-                                        self.config.whisper_gpu_device = device_index;
-                                        self.save_config();
+                if let Some(provider) = stt::provider_for_backend("whisper.cpp")
+                    && provider.device_detection_supported
+                {
+                    let devices = provider.detect_devices(&self.config);
+                    if devices.len() > 1 {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("GPU device");
+                            let mut selected_device = self.config.whisper_gpu_device.to_string();
+                            ComboBox::from_id_source("transcription-device-picker")
+                                .selected_text(
+                                    devices
+                                        .iter()
+                                        .find(|device| device.id == selected_device)
+                                        .map(|device| device.name.as_str())
+                                        .unwrap_or("Auto"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for device in &devices {
+                                        ui.selectable_value(
+                                            &mut selected_device,
+                                            device.id.clone(),
+                                            &device.name,
+                                        );
                                     }
-                                }
-                            });
-                        }
+                                });
+                            if let Ok(device_index) = selected_device.parse::<u32>()
+                                && device_index != self.config.whisper_gpu_device
+                            {
+                                self.config.whisper_gpu_device = device_index;
+                                self.save_config();
+                            }
+                        });
                     }
                 }
             });
@@ -3481,10 +3479,11 @@ fn lerp_color(start: Color32, end: Color32, t: f64) -> Color32 {
 
 fn usable_width(ui: &Ui) -> f32 {
     let mut width = None;
-    if let Some(cap) = ui.data(|data| data.get_temp::<f32>(usable_width_cap_id())) {
-        if cap.is_finite() && cap > 0.0 {
-            width = Some(cap);
-        }
+    if let Some(cap) = ui.data(|data| data.get_temp::<f32>(usable_width_cap_id()))
+        && cap.is_finite()
+        && cap > 0.0
+    {
+        width = Some(cap);
     }
     let cursor_x = ui.next_widget_position().x;
     let available_rect = ui.available_rect_before_wrap();
@@ -4463,516 +4462,6 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
     })
 }
 
-fn download_model_file(
-    url: &str,
-    destination: &Path,
-    tx: &Sender<AppEvent>,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-) -> Result<PathBuf, String> {
-    if destination.exists() {
-        return Ok(destination.to_path_buf());
-    }
-
-    let partial_path = destination.with_extension("bin.partial");
-    let result = (|| {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-        }
-
-        let response = ureq::get(url)
-            .call()
-            .map_err(|err| format!("request failed for {url}: {err}"))?;
-        let total_bytes = response
-            .header("content-length")
-            .and_then(|value| value.parse::<u64>().ok())
-            .or(expected_total_bytes);
-        let mut reader = response.into_reader();
-        let mut file = fs::File::create(&partial_path)
-            .map_err(|err| format!("failed to create {}: {err}", partial_path.display()))?;
-        let mut downloaded_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        let started_at = Instant::now();
-        let mut last_progress_at = started_at;
-
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|err| format!("download read failed: {err}"))?;
-            if read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..read])
-                .map_err(|err| format!("failed to write {}: {err}", partial_path.display()))?;
-            downloaded_bytes += read as u64;
-            let now = Instant::now();
-            if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
-                last_progress_at = now;
-                let _ = tx.send(AppEvent::ModelDownloadProgress {
-                    model_id: model_id.to_owned(),
-                    downloaded_bytes,
-                    total_bytes,
-                    bytes_per_second: download_speed(downloaded_bytes, started_at, now),
-                });
-            }
-        }
-
-        let finished_at = Instant::now();
-        let _ = tx.send(AppEvent::ModelDownloadProgress {
-            model_id: model_id.to_owned(),
-            downloaded_bytes,
-            total_bytes,
-            bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
-        });
-        file.sync_all()
-            .map_err(|err| format!("failed to finish {}: {err}", partial_path.display()))?;
-        fs::rename(&partial_path, destination).map_err(|err| {
-            format!(
-                "failed to move {} to {}: {err}",
-                partial_path.display(),
-                destination.display()
-            )
-        })?;
-        Ok(destination.to_path_buf())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&partial_path);
-    }
-
-    result
-}
-
-fn download_faster_whisper_model(
-    runner: &Path,
-    model_name: &str,
-    destination: &Path,
-    tx: &Sender<AppEvent>,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-) -> Result<PathBuf, String> {
-    if destination.exists() {
-        if config::is_faster_whisper_model_dir(destination) {
-            return Ok(destination.to_path_buf());
-        }
-        let result = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        result.map_err(|err| {
-            format!(
-                "failed to replace incomplete faster-whisper model at {}: {err}",
-                destination.display()
-            )
-        })?;
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-
-    let started_at = Instant::now();
-    let mut child = Command::new(runner)
-        .args(["download-model", "--model", model_name, "--output"])
-        .arg(destination)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
-    let stdout = child.stdout.take().map(read_stream_to_string);
-    let stderr = child.stderr.take().map(read_stream_to_string);
-    let mut last_progress_at = started_at;
-    let mut last_downloaded_bytes = 0_u64;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
-        {
-            Some(status) => break status,
-            None => {
-                let now = Instant::now();
-                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
-                    last_progress_at = now;
-                    last_downloaded_bytes =
-                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-                    let _ = tx.send(AppEvent::ModelDownloadProgress {
-                        model_id: model_id.to_owned(),
-                        downloaded_bytes: last_downloaded_bytes,
-                        total_bytes: expected_total_bytes,
-                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
-                    });
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-    let finished_at = Instant::now();
-    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-    let _ = tx.send(AppEvent::ModelDownloadProgress {
-        model_id: model_id.to_owned(),
-        downloaded_bytes,
-        total_bytes: expected_total_bytes,
-        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
-    });
-    let stdout = join_stream_reader(stdout, "faster-whisper stdout")?;
-    let stderr = join_stream_reader(stderr, "faster-whisper stderr")?;
-
-    if !status.success() {
-        let _ = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        return Err(format!(
-            "faster-whisper model download failed with status {}: {}",
-            status,
-            stderr.trim()
-        ));
-    }
-
-    let runner_path =
-        parse_faster_whisper_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
-    let validated_path = if config::is_faster_whisper_model_dir(&runner_path)
-        && runner_path.starts_with(destination)
-    {
-        runner_path
-    } else if config::is_faster_whisper_model_dir(destination) {
-        destination.to_path_buf()
-    } else {
-        return Err(format!(
-            "faster-whisper runner finished but did not create a complete model at {}",
-            destination.display()
-        ));
-    };
-
-    Ok(validated_path)
-}
-
-fn download_vosk_model(
-    runner: &Path,
-    model_name: &str,
-    destination: &Path,
-    tx: &Sender<AppEvent>,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-) -> Result<PathBuf, String> {
-    if vosk_model_download_url(model_name).is_none() {
-        return Err(format!("unsupported Vosk model download: {model_name}"));
-    }
-    if destination.exists() {
-        if config::is_vosk_model_dir(destination) {
-            return Ok(destination.to_path_buf());
-        }
-        let result = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        result.map_err(|err| {
-            format!(
-                "failed to replace incomplete Vosk model at {}: {err}",
-                destination.display()
-            )
-        })?;
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-
-    let started_at = Instant::now();
-    let mut child = Command::new(runner)
-        .args(["download-model", "--model", model_name, "--output"])
-        .arg(destination)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
-    let stdout = child.stdout.take().map(read_stream_to_string);
-    let stderr = child.stderr.take().map(read_stream_to_string);
-    let mut last_progress_at = started_at;
-    let mut last_downloaded_bytes = 0_u64;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
-        {
-            Some(status) => break status,
-            None => {
-                let now = Instant::now();
-                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
-                    last_progress_at = now;
-                    last_downloaded_bytes =
-                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-                    let _ = tx.send(AppEvent::ModelDownloadProgress {
-                        model_id: model_id.to_owned(),
-                        downloaded_bytes: last_downloaded_bytes,
-                        total_bytes: expected_total_bytes,
-                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
-                    });
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-    let finished_at = Instant::now();
-    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-    let _ = tx.send(AppEvent::ModelDownloadProgress {
-        model_id: model_id.to_owned(),
-        downloaded_bytes,
-        total_bytes: expected_total_bytes,
-        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
-    });
-    let stdout = join_stream_reader(stdout, "Vosk stdout")?;
-    let stderr = join_stream_reader(stderr, "Vosk stderr")?;
-
-    if !status.success() {
-        let _ = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        return Err(format!(
-            "Vosk model download failed with status {}: {}",
-            status,
-            stderr.trim()
-        ));
-    }
-
-    let runner_path =
-        parse_vosk_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
-    let validated_path = if config::is_vosk_model_dir(&runner_path)
-        && (runner_path == destination || runner_path.starts_with(destination))
-    {
-        runner_path
-    } else if config::is_vosk_model_dir(destination) {
-        destination.to_path_buf()
-    } else {
-        return Err(format!(
-            "Vosk runner finished but did not create a complete model at {}",
-            destination.display()
-        ));
-    };
-
-    Ok(validated_path)
-}
-
-fn download_sherpa_model(
-    runner: &Path,
-    model: &SttModelInfo,
-    model_name: &str,
-    destination: &Path,
-    tx: &Sender<AppEvent>,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-) -> Result<PathBuf, String> {
-    if sherpa_model_download_url(model_name).is_none() {
-        return Err(format!(
-            "unsupported {} model download: {model_name}",
-            model.backend
-        ));
-    }
-    if destination.exists() {
-        if config::is_valid_model_install_path(model, destination) {
-            return Ok(destination.to_path_buf());
-        }
-        let result = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        result.map_err(|err| {
-            format!(
-                "failed to replace incomplete {} model at {}: {err}",
-                model.backend,
-                destination.display()
-            )
-        })?;
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-
-    let started_at = Instant::now();
-    let mut child = Command::new(runner)
-        .args(["download-model", "--model", model_name, "--output"])
-        .arg(destination)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {}: {err}", runner.display()))?;
-    let stdout = child.stdout.take().map(read_stream_to_string);
-    let stderr = child.stderr.take().map(read_stream_to_string);
-    let mut last_progress_at = started_at;
-    let mut last_downloaded_bytes = 0_u64;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("failed to poll {}: {err}", runner.display()))?
-        {
-            Some(status) => break status,
-            None => {
-                let now = Instant::now();
-                if now.duration_since(last_progress_at) >= DOWNLOAD_PROGRESS_INTERVAL {
-                    last_progress_at = now;
-                    last_downloaded_bytes =
-                        installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-                    let _ = tx.send(AppEvent::ModelDownloadProgress {
-                        model_id: model_id.to_owned(),
-                        downloaded_bytes: last_downloaded_bytes,
-                        total_bytes: expected_total_bytes,
-                        bytes_per_second: download_speed(last_downloaded_bytes, started_at, now),
-                    });
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-    let finished_at = Instant::now();
-    let downloaded_bytes = installed_path_size(destination).unwrap_or(last_downloaded_bytes);
-    let _ = tx.send(AppEvent::ModelDownloadProgress {
-        model_id: model_id.to_owned(),
-        downloaded_bytes,
-        total_bytes: expected_total_bytes,
-        bytes_per_second: download_speed(downloaded_bytes, started_at, finished_at),
-    });
-    let stdout = join_stream_reader(stdout, "sherpa-onnx stdout")?;
-    let stderr = join_stream_reader(stderr, "sherpa-onnx stderr")?;
-
-    if !status.success() {
-        let _ = if destination.is_dir() {
-            fs::remove_dir_all(destination)
-        } else {
-            fs::remove_file(destination)
-        };
-        return Err(format!(
-            "{} model download failed with status {}: {}",
-            model.backend,
-            status,
-            stderr.trim()
-        ));
-    }
-
-    let runner_path =
-        parse_sherpa_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
-    let validated_path = if config::is_valid_model_install_path(model, &runner_path)
-        && (runner_path == destination || runner_path.starts_with(destination))
-    {
-        runner_path
-    } else if config::is_valid_model_install_path(model, destination) {
-        destination.to_path_buf()
-    } else {
-        return Err(format!(
-            "{} runner finished but did not create a complete model at {}",
-            model.backend,
-            destination.display()
-        ));
-    };
-
-    Ok(validated_path)
-}
-
-fn read_stream_to_string<R>(mut reader: R) -> JoinHandle<Result<String, String>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut output = String::new();
-        reader
-            .read_to_string(&mut output)
-            .map_err(|err| format!("failed to read child process output: {err}"))?;
-        Ok(output)
-    })
-}
-
-fn join_stream_reader(
-    handle: Option<JoinHandle<Result<String, String>>>,
-    label: &str,
-) -> Result<String, String> {
-    match handle {
-        Some(handle) => handle
-            .join()
-            .map_err(|_| format!("{label} reader panicked"))?,
-        None => Ok(String::new()),
-    }
-}
-
-fn download_speed(downloaded_bytes: u64, started_at: Instant, measured_at: Instant) -> Option<u64> {
-    let elapsed = measured_at.duration_since(started_at).as_secs_f64();
-    if downloaded_bytes == 0 || elapsed <= 0.0 {
-        None
-    } else {
-        Some((downloaded_bytes as f64 / elapsed).round() as u64)
-    }
-}
-
-fn installed_path_size(path: &Path) -> Result<u64, String> {
-    if !path.exists() {
-        return Ok(0);
-    }
-
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-
-    let mut total = 0_u64;
-    let entries =
-        fs::read_dir(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| format!("failed to read entry in {}: {err}", path.display()))?;
-        total = total.saturating_add(installed_path_size(&entry.path())?);
-    }
-    Ok(total)
-}
-
-#[derive(Debug, Deserialize)]
-struct FasterWhisperDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_faster_whisper_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<FasterWhisperDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
-#[derive(Debug, Deserialize)]
-struct VoskDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_vosk_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<VoskDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
-#[derive(Debug, Deserialize)]
-struct SherpaDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_sherpa_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<SherpaDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -5817,19 +5306,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn parses_faster_whisper_download_path_from_runner_json() {
-        let path = parse_faster_whisper_download_path(
-            r#"{"model":"small.en","path":"/tmp/scribe-models/faster-whisper/small"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/scribe-models/faster-whisper/small")
-        );
-    }
-
-    #[test]
     fn download_progress_uses_known_total_for_fraction_and_labels() {
         let status = ModelInstallStatus::Downloading {
             downloaded_bytes: 256 * 1024 * 1024,
@@ -6271,29 +5747,6 @@ mod layout_tests {
 
         assert_eq!(status, ModelRuntimeStatus::MissingConfiguration);
         assert!(!setup_message_for_status(&status).contains("choose a whisper.cpp model"));
-    }
-
-    #[test]
-    fn parses_vosk_download_path_from_runner_json() {
-        let path = parse_vosk_download_path(
-            r#"{"model":"vosk-model-small-en-us-0.15","path":"/tmp/scribe-models/vosk/vosk_small_en"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(path, PathBuf::from("/tmp/scribe-models/vosk/vosk_small_en"));
-    }
-
-    #[test]
-    fn parses_sherpa_download_path_from_runner_json() {
-        let path = parse_sherpa_download_path(
-            r#"{"model":"sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27","path":"/tmp/scribe-models/moonshine/moonshine"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/scribe-models/moonshine/moonshine")
-        );
     }
 
     #[test]

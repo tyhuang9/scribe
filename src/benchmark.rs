@@ -571,8 +571,8 @@ fn levenshtein_distance<T: Eq>(left: &[T], right: &[T]) -> usize {
     for (row, row_values) in table.iter_mut().enumerate().take(rows) {
         row_values[0] = row;
     }
-    for col in 0..cols {
-        table[0][col] = col;
+    for (col, value) in table[0].iter_mut().enumerate().take(cols) {
+        *value = col;
     }
 
     for row in 1..rows {

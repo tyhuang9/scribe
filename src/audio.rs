@@ -176,12 +176,12 @@ fn record_to_wav(
 }
 
 fn select_input_device(host: &cpal::Host, input_device_name: Option<&str>) -> Result<cpal::Device> {
-    if let Some(target_name) = input_device_name.filter(|name| !name.trim().is_empty()) {
-        if let Ok(devices) = host.input_devices() {
-            for device in devices {
-                if device.name().ok().as_deref() == Some(target_name) {
-                    return Ok(device);
-                }
+    if let Some(target_name) = input_device_name.filter(|name| !name.trim().is_empty())
+        && let Ok(devices) = host.input_devices()
+    {
+        for device in devices {
+            if device.name().ok().as_deref() == Some(target_name) {
+                return Ok(device);
             }
         }
     }
@@ -198,35 +198,34 @@ fn select_input_device(host: &cpal::Host, input_device_name: Option<&str>) -> Re
 }
 
 fn write_f32(input: &[f32], writer: &SharedWavWriter) {
-    if let Ok(mut guard) = writer.lock() {
-        if let Some(writer) = guard.as_mut() {
-            for sample in input {
-                let sample = (*sample).clamp(-1.0, 1.0);
-                let sample = (sample * i16::MAX as f32) as i16;
-                let _ = writer.write_sample(sample);
-            }
+    if let Ok(mut guard) = writer.lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        for sample in input {
+            let sample = (*sample).clamp(-1.0, 1.0);
+            let sample = (sample * i16::MAX as f32) as i16;
+            let _ = writer.write_sample(sample);
         }
     }
 }
 
 fn write_i16(input: &[i16], writer: &SharedWavWriter) {
-    if let Ok(mut guard) = writer.lock() {
-        if let Some(writer) = guard.as_mut() {
-            for sample in input {
-                let _ = writer.write_sample(*sample);
-            }
+    if let Ok(mut guard) = writer.lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        for sample in input {
+            let _ = writer.write_sample(*sample);
         }
     }
 }
 
 fn write_u16(input: &[u16], writer: &SharedWavWriter) {
-    if let Ok(mut guard) = writer.lock() {
-        if let Some(writer) = guard.as_mut() {
-            for sample in input {
-                let centered = *sample as i32 - 32768;
-                let _ =
-                    writer.write_sample(centered.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
-            }
+    if let Ok(mut guard) = writer.lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        for sample in input {
+            let centered = *sample as i32 - 32768;
+            let _ = writer.write_sample(centered.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
     }
 }

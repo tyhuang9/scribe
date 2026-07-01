@@ -286,14 +286,12 @@ fn apply_whisper_environment(
         options.cuda_library_paths.clone()
     };
 
-    if options.compute_mode != WhisperComputeMode::Cpu {
-        if let Some(backend_path) =
+    if options.compute_mode != WhisperComputeMode::Cpu
+        && let Some(backend_path) =
             bundled_cuda_backend_path(executable_path).or_else(|| options.cuda_backend_path.clone())
-        {
-            if !backend_path.as_os_str().is_empty() {
-                command.env("GGML_BACKEND_PATH", backend_path);
-            }
-        }
+        && !backend_path.as_os_str().is_empty()
+    {
+        command.env("GGML_BACKEND_PATH", backend_path);
     }
 
     if let Some(library_path) = joined_library_path(
@@ -372,10 +370,11 @@ pub(crate) fn parse_final_text(stdout: &str) -> String {
 }
 
 fn strip_timestamp_prefix(line: &str) -> String {
-    if let Some(end) = line.find(']') {
-        if line.starts_with('[') && line[..=end].contains("-->") {
-            return line[end + 1..].trim().to_owned();
-        }
+    if let Some(end) = line.find(']')
+        && line.starts_with('[')
+        && line[..=end].contains("-->")
+    {
+        return line[end + 1..].trim().to_owned();
     }
     line.to_owned()
 }
@@ -499,8 +498,8 @@ mod tests {
         let paths = vec![PathBuf::from("/opt/cuda"), PathBuf::from("/opt/cublas")];
         let joined = joined_library_path(&paths).unwrap().unwrap();
 
-        assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cuda")));
-        assert!(env::split_paths(&joined).any(|path| path == PathBuf::from("/opt/cublas")));
+        assert!(env::split_paths(&joined).any(|path| path == *"/opt/cuda"));
+        assert!(env::split_paths(&joined).any(|path| path == *"/opt/cublas"));
     }
 
     #[test]

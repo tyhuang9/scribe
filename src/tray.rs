@@ -191,18 +191,17 @@ fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
 }
 
 fn tray_event_should_show(event: &TrayIconEvent) -> bool {
-    match event {
+    matches!(
+        event,
         TrayIconEvent::DoubleClick {
             button: MouseButton::Left,
             ..
-        } => true,
-        TrayIconEvent::Click {
+        } | TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
             ..
-        } => true,
-        _ => false,
-    }
+        }
+    )
 }
 
 fn recording_label(is_recording: bool) -> &'static str {

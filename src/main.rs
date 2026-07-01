@@ -4,6 +4,7 @@ mod benchmark;
 mod config;
 mod core;
 mod hotkey;
+mod managed_downloads;
 mod models;
 mod stt;
 mod text_output;
