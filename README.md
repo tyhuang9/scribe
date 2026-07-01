@@ -135,6 +135,11 @@ Managed model files live under the app data `models` directory. Managed runtime 
 
 Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, or `SCRIBE_VOSK_CLI` as fallback runtime paths.
 
+When running from a source checkout on Unix, the Models page can also use the
+checked-in `scripts/bundle-*-runtime.sh` helpers as a development fallback. If a
+packaged sidecar is not already staged, clicking `Install runtime` builds the
+runtime directly into Scribe's managed app-data runtime directory.
+
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
 ```bash

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -263,6 +264,20 @@ struct RuntimeActionState {
     disabled_tooltip: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeInstallSource {
+    Packaged(PathBuf),
+    DevelopmentScript(DevelopmentRuntimePackage),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DevelopmentRuntimePackage {
+    script: PathBuf,
+    destination_env: &'static str,
+    destination_root: PathBuf,
+    executable_path: PathBuf,
+}
+
 fn model_action_state(
     model: &SttModelInfo,
     install_status: &ModelInstallStatus,
@@ -359,7 +374,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
         };
     }
 
-    if packaged_runtime_path(config, model).is_some() {
+    if runtime_install_source(config, model).is_some() {
         RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: true,
@@ -370,7 +385,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
             kind: RuntimeActionKind::Install,
             enabled: false,
             disabled_tooltip: Some(format!(
-                "No packaged {} runtime was found. Install a build that bundles this runtime or configure a development runtime path.",
+                "No packaged {} runtime or local bundle script was found. Install a build that bundles this runtime.",
                 model.backend
             )),
         }
@@ -404,6 +419,89 @@ fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pat
         "Vosk" => stt::vosk::resolve_vosk_packaged_executable(config),
         _ => None,
     }
+}
+
+fn runtime_install_source(
+    config: &AppConfig,
+    model: &SttModelInfo,
+) -> Option<RuntimeInstallSource> {
+    packaged_runtime_path(config, model)
+        .map(RuntimeInstallSource::Packaged)
+        .or_else(|| {
+            development_runtime_package(config, model).map(RuntimeInstallSource::DevelopmentScript)
+        })
+}
+
+fn development_runtime_package(
+    _config: &AppConfig,
+    model: &SttModelInfo,
+) -> Option<DevelopmentRuntimePackage> {
+    let provider = stt::provider_for_backend(&model.backend)?;
+    let spec = development_runtime_spec(provider.runtime_id)?;
+    let script = find_development_bundle_script(spec.script_name)?;
+    let destination_root = config::runtime_storage_dir().join(provider.runtime_id);
+    Some(DevelopmentRuntimePackage {
+        script,
+        destination_env: spec.destination_env,
+        executable_path: destination_root.join(spec.executable_relative_path),
+        destination_root,
+    })
+}
+
+struct DevelopmentRuntimeSpec {
+    script_name: &'static str,
+    destination_env: &'static str,
+    executable_relative_path: &'static str,
+}
+
+fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> {
+    match runtime_id {
+        "whisper_cpp" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-whisper-runtime.sh",
+            destination_env: "SCRIBE_RUNTIME_DEST",
+            executable_relative_path: "bin/whisper-cli",
+        }),
+        "faster_whisper" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-faster-whisper-runtime.sh",
+            destination_env: "SCRIBE_FAST_WHISPER_RUNTIME_DEST",
+            executable_relative_path: "bin/scribe-faster-whisper",
+        }),
+        "vosk" => Some(DevelopmentRuntimeSpec {
+            script_name: "bundle-vosk-runtime.sh",
+            destination_env: "SCRIBE_VOSK_RUNTIME_DEST",
+            executable_relative_path: "bin/scribe-vosk",
+        }),
+        _ => None,
+    }
+}
+
+fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(executable) = env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            roots.extend(parent.ancestors().map(Path::to_path_buf));
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        roots.extend(cwd.ancestors().map(Path::to_path_buf));
+    }
+
+    let mut seen = Vec::<PathBuf>::new();
+    for root in roots {
+        if seen.iter().any(|seen_root| seen_root == &root) {
+            continue;
+        }
+        seen.push(root.clone());
+        let script = root.join("scripts").join(script_name);
+        if root.join("Cargo.toml").is_file() && script.is_file() {
+            return Some(script);
+        }
+    }
+    None
 }
 
 pub struct LocalTranscriberApp {
@@ -1406,16 +1504,24 @@ impl LocalTranscriberApp {
             return;
         }
 
-        let Some(packaged_path) = packaged_runtime_path(&self.config, model) else {
+        let Some(source) = runtime_install_source(&self.config, model) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
-                "No packaged {} runtime was found in this build.",
+                "No packaged {} runtime or local bundle script was found in this build.",
                 model.backend
             );
             return;
         };
 
-        let path = match install_runtime_files(provider.runtime_id, &packaged_path) {
+        let path = match source {
+            RuntimeInstallSource::Packaged(packaged_path) => {
+                install_runtime_files(provider.runtime_id, &packaged_path)
+            }
+            RuntimeInstallSource::DevelopmentScript(package) => {
+                build_development_runtime_package(&model.backend, package)
+            }
+        };
+        let path = match path {
             Ok(path) => path,
             Err(message) => {
                 self.status = TranscriptionStatus::Error;
@@ -3885,6 +3991,40 @@ fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool,
     Ok(true)
 }
 
+fn build_development_runtime_package(
+    backend: &str,
+    package: DevelopmentRuntimePackage,
+) -> Result<PathBuf, String> {
+    if let Some(parent) = package.destination_root.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    }
+
+    let output = Command::new(&package.script)
+        .env(package.destination_env, &package.destination_root)
+        .output()
+        .map_err(|err| format!("Could not run {}: {err}", package.script.display()))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Could not build {} runtime with {}: {}",
+            backend,
+            package.script.display(),
+            command_output_message(&output.stdout, &output.stderr)
+        ));
+    }
+
+    if !package.executable_path.exists() {
+        return Err(format!(
+            "{} runtime build finished but did not create {}.",
+            backend,
+            package.executable_path.display()
+        ));
+    }
+
+    Ok(package.executable_path)
+}
+
 fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result<PathBuf, String> {
     let Some(source_root) = runtime_package_root(packaged_executable) else {
         return Err(format!(
@@ -3924,6 +4064,19 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
         ));
     }
     Ok(installed_executable)
+}
+
+fn command_output_message(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    if stdout.is_empty() {
+        "process exited without an error message".to_owned()
+    } else {
+        stdout
+    }
 }
 
 fn runtime_package_root(executable: &Path) -> Option<PathBuf> {
@@ -4473,17 +4626,18 @@ fn download_vosk_model(
 
     let runner_path =
         parse_vosk_download_path(&stdout).unwrap_or_else(|| destination.to_path_buf());
-    let validated_path =
-        if config::is_vosk_model_dir(&runner_path) && runner_path.starts_with(destination) {
-            runner_path
-        } else if config::is_vosk_model_dir(destination) {
-            destination.to_path_buf()
-        } else {
-            return Err(format!(
-                "Vosk runner finished but did not create a complete model at {}",
-                destination.display()
-            ));
-        };
+    let validated_path = if config::is_vosk_model_dir(&runner_path)
+        && (runner_path == destination || runner_path.starts_with(destination))
+    {
+        runner_path
+    } else if config::is_vosk_model_dir(destination) {
+        destination.to_path_buf()
+    } else {
+        return Err(format!(
+            "Vosk runner finished but did not create a complete model at {}",
+            destination.display()
+        ));
+    };
 
     Ok(validated_path)
 }
@@ -5513,13 +5667,13 @@ mod layout_tests {
         faster_whisper.download_model = Some("tiny.en".to_owned());
         let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
 
-        assert_eq!(action.kind, RuntimeActionKind::Install);
-        assert!(!action.enabled);
-        assert!(
-            action
-                .disabled_tooltip
-                .as_deref()
-                .is_some_and(|tooltip| tooltip.contains("No packaged faster-whisper runtime"))
+        assert_eq!(
+            action,
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: true,
+                disabled_tooltip: None,
+            }
         );
 
         let mut vosk = test_model();
@@ -5527,6 +5681,16 @@ mod layout_tests {
         vosk.name = "Vosk small English".to_owned();
         vosk.backend = "Vosk".to_owned();
         vosk.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+
+        assert_eq!(
+            runtime_action_state(&AppConfig::default(), &vosk),
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        );
+
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
@@ -5543,6 +5707,55 @@ mod layout_tests {
                 disabled_tooltip: None,
             }
         );
+
+        let mut sherpa = test_model();
+        sherpa.backend = "sherpa-onnx".to_owned();
+        let unsupported_action = runtime_action_state(&AppConfig::default(), &sherpa);
+        assert_eq!(unsupported_action.kind, RuntimeActionKind::Install);
+        assert!(!unsupported_action.enabled);
+        assert!(
+            unsupported_action
+                .disabled_tooltip
+                .as_deref()
+                .is_some_and(|tooltip| tooltip.contains("installer is not bundled"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_runtime_script_installs_expected_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("scribe-runtime-script-test-{}", std::process::id()));
+        let script = root.join("bundle-test-runtime.sh");
+        let destination = root.join("runtime");
+        let executable = destination.join("bin").join("scribe-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"$SCRIBE_TEST_RUNTIME_DEST/bin\"\nprintf '#!/usr/bin/env bash\\n' > \"$SCRIBE_TEST_RUNTIME_DEST/bin/scribe-test\"\nchmod 755 \"$SCRIBE_TEST_RUNTIME_DEST/bin/scribe-test\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let installed = build_development_runtime_package(
+            "test",
+            DevelopmentRuntimePackage {
+                script,
+                destination_env: "SCRIBE_TEST_RUNTIME_DEST",
+                destination_root: destination,
+                executable_path: executable.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(installed, executable);
+        assert!(installed.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
