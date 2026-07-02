@@ -4,6 +4,19 @@ pub enum DeviceSupport {
     CpuAndGpu,
 }
 
+impl DeviceSupport {
+    pub fn supports_gpu(self) -> bool {
+        matches!(self, Self::CpuAndGpu)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CpuOnly => "CPU",
+            Self::CpuAndGpu => "CPU/GPU",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevelopmentRuntimeSpec {
     pub script_name: &'static str,

@@ -557,6 +557,32 @@ mod tests {
     }
 
     #[test]
+    fn faster_whisper_cpu_environment_skips_cuda_library_paths() {
+        let root = test_runtime_root("cpu-skips-cuda-library-paths");
+        let runtime_root = root.join("runtimes").join("faster_whisper");
+        let bin_dir = runtime_root.join("bin");
+        let cuda_dir = runtime_root.join("cuda_v12");
+        let executable = bin_dir.join(faster_whisper_runner_names()[0]);
+        write_test_runtime(&executable);
+        fs::create_dir_all(&cuda_dir).unwrap();
+
+        let mut command = Command::new("scribe-faster-whisper");
+        apply_faster_whisper_environment(
+            &mut command,
+            &executable,
+            &FasterWhisperOptions {
+                compute_mode: WhisperComputeMode::Cpu,
+                gpu_device: 0,
+                cuda_library_paths: vec![PathBuf::from("/opt/scribe-cuda")],
+            },
+        )
+        .unwrap();
+
+        assert!(command_env(&command, "LD_LIBRARY_PATH").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     #[ignore = "requires a local faster-whisper runner, downloaded model directory, and sample audio"]
     fn faster_whisper_smoke_uses_configured_runner() {
         let runner = env::var_os("SCRIBE_FASTER_WHISPER_CLI")

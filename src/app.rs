@@ -2367,6 +2367,8 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Performance"));
                 ui.add_space(8.0);
+                let active_device_support = selected_model_device_support(&self.config);
+                let prefer_gpu_available = active_device_support.supports_gpu();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Transcription device");
                     let mut compute_mode = self.config.whisper_compute_mode;
@@ -2374,7 +2376,11 @@ impl LocalTranscriberApp {
                         .selected_text(compute_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in WhisperComputeMode::ALL {
-                                ui.selectable_value(&mut compute_mode, mode, mode.label());
+                                let enabled =
+                                    mode != WhisperComputeMode::PreferGpu || prefer_gpu_available;
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    ui.selectable_value(&mut compute_mode, mode, mode.label());
+                                });
                             }
                         });
                     if compute_mode != self.config.whisper_compute_mode {
@@ -2382,6 +2388,15 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
+                if !prefer_gpu_available {
+                    ui.add_space(4.0);
+                    wrapped_label(
+                        ui,
+                        mut_text(
+                            "The active model backend is CPU-only. GPU mode is available for whisper.cpp and faster-whisper models.",
+                        ),
+                    );
+                }
                 if let Some(provider) = stt::provider_for_backend("whisper.cpp")
                     && provider.device_detection_supported
                 {
@@ -2866,6 +2881,11 @@ fn model_catalog_row(
                             badge(ui, &format!("Runtime {}", model.backend), ChipTone::Neutral);
                             badge(
                                 ui,
+                                &format!("Device {}", model_device_label(model)),
+                                ChipTone::Neutral,
+                            );
+                            badge(
+                                ui,
                                 &format!("Model {}", model_storage_estimate(model)),
                                 ChipTone::Neutral,
                             );
@@ -2936,6 +2956,11 @@ fn download_summary_row(ui: &mut Ui, model: &SttModelInfo, install_status: &Mode
                     wrapped_label(ui, body_strong(&model.name));
                     tag_row(ui, |ui| {
                         badge(ui, &model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &format!("Device {}", model_device_label(model)),
+                            ChipTone::Neutral,
+                        );
                         badge(
                             ui,
                             &install_status.label(),
@@ -3191,6 +3216,11 @@ fn playground_card_ui(
                     ui.add_space(8.0);
                     tag_row(ui, |ui| {
                         badge(ui, &card_state.model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &format!("Device {}", model_device_label(&card_state.model)),
+                            ChipTone::Neutral,
+                        );
                         badge(
                             ui,
                             &card_state.model.install_status.label(),
@@ -3976,6 +4006,21 @@ fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
 
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     runtime_catalog::model_storage_estimate(&model.id)
+}
+
+fn model_device_label(model: &SttModelInfo) -> &'static str {
+    runtime_catalog::backend_spec(&model.backend)
+        .map(|spec| spec.device_support.label())
+        .unwrap_or("Unknown")
+}
+
+fn selected_model_device_support(config: &AppConfig) -> runtime_catalog::DeviceSupport {
+    config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == config.selected_default_model)
+        .and_then(|model| runtime_catalog::backend_spec(&model.backend))
+        .map(|spec| spec.device_support)
+        .unwrap_or(runtime_catalog::DeviceSupport::CpuOnly)
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
@@ -5338,6 +5383,30 @@ mod layout_tests {
             model_download_total_bytes(&model),
             Some((3.1_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64)
         );
+    }
+
+    #[test]
+    fn device_labels_follow_backend_capabilities() {
+        let mut config = AppConfig {
+            selected_default_model: "faster_whisper_tiny_en".to_owned(),
+            ..AppConfig::default()
+        };
+        let faster_whisper = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_tiny_en")
+            .unwrap();
+
+        assert_eq!(model_device_label(&faster_whisper), "CPU/GPU");
+        assert!(selected_model_device_support(&config).supports_gpu());
+
+        config.selected_default_model = "vosk_small_en".to_owned();
+        let vosk = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "vosk_small_en")
+            .unwrap();
+
+        assert_eq!(model_device_label(&vosk), "CPU");
+        assert!(!selected_model_device_support(&config).supports_gpu());
     }
 
     #[test]

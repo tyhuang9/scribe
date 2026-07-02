@@ -82,9 +82,23 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 127
 fi
 
-NVIDIA_LIBRARY_PATH="$("$PYTHON" "$RUNNER" nvidia-library-path 2>/dev/null || true)"
-if [[ -n "$NVIDIA_LIBRARY_PATH" ]]; then
-  export LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+USE_NVIDIA_LIBRARY_PATH=1
+if [[ "${1:-}" == "transcribe" ]]; then
+  previous=""
+  for arg in "$@"; do
+    if [[ "$previous" == "--device-mode" && "$arg" == "cpu" ]]; then
+      USE_NVIDIA_LIBRARY_PATH=0
+      break
+    fi
+    previous="$arg"
+  done
+fi
+
+if [[ "$USE_NVIDIA_LIBRARY_PATH" == "1" ]]; then
+  NVIDIA_LIBRARY_PATH="$("$PYTHON" "$RUNNER" nvidia-library-path 2>/dev/null || true)"
+  if [[ -n "$NVIDIA_LIBRARY_PATH" ]]; then
+    export LD_LIBRARY_PATH="$NVIDIA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
 fi
 
 exec "$PYTHON" "$RUNNER" "$@"
