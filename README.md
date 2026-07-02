@@ -174,9 +174,11 @@ scripts/bundle-faster-whisper-runtime.sh
 ```
 
 The faster-whisper runtime is a generated Python virtual environment with a
-small Scribe runner. The runner downloads CTranslate2 faster-whisper model
-directories through faster-whisper's Hugging Face integration when a model is
-installed from the app.
+small Scribe runner. Python package versions are pinned by
+`scripts/runtime-dependencies.env`; release builds can override those pins with
+the matching `SCRIBE_*_VERSION` environment variables. The runner downloads
+CTranslate2 faster-whisper model directories through faster-whisper's Hugging
+Face integration when a model is installed from the app.
 
 To stage only the Vosk runtime during development:
 
@@ -200,10 +202,11 @@ scripts/bundle-moonshine-runtime.sh
 scripts/bundle-parakeet-runtime.sh
 ```
 
-These runtimes are generated Python virtual environments with `sherpa-onnx`,
-`sherpa-onnx-bin`, and `numpy` plus a small Scribe runner. Each backend gets a
-separate managed runtime directory and wrapper, but they share the same runner. The
-runner downloads official sherpa-onnx model archives for:
+These runtimes are generated Python virtual environments with pinned
+`sherpa-onnx`, `sherpa-onnx-bin`, and `numpy` dependencies plus a small Scribe
+runner. Each backend gets a separate managed runtime directory and wrapper, but
+they share the same runner. The runner downloads official sherpa-onnx model
+archives for:
 
 - `sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2`
 - `sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2`

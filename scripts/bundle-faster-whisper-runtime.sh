@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEPS_ENV="$SCRIPT_DIR/runtime-dependencies.env"
+if [[ -f "$DEPS_ENV" ]]; then
+  # shellcheck source=runtime-dependencies.env
+  source "$DEPS_ENV"
+fi
 PROFILE="${SCRIBE_PROFILE:-debug}"
 DEST="${SCRIBE_FAST_WHISPER_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/faster_whisper}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -11,6 +16,13 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER_SRC="$SCRIPT_DIR/faster_whisper_runner.py"
 RUNNER_DST="$DEST/bin/faster_whisper_runner.py"
 WRAPPER="$DEST/bin/scribe-faster-whisper"
+PIP_VERSION="${SCRIBE_PIP_VERSION:-${SCRIBE_PIP_VERSION_DEFAULT:-26.1.2}}"
+SETUPTOOLS_VERSION="${SCRIBE_SETUPTOOLS_VERSION:-${SCRIBE_SETUPTOOLS_VERSION_DEFAULT:-82.0.1}}"
+WHEEL_VERSION="${SCRIBE_WHEEL_VERSION:-${SCRIBE_WHEEL_VERSION_DEFAULT:-0.47.0}}"
+FASTER_WHISPER_VERSION="${SCRIBE_FASTER_WHISPER_VERSION:-${SCRIBE_FASTER_WHISPER_VERSION_DEFAULT:-1.2.1}}"
+NVIDIA_CUBLAS_CU12_VERSION="${SCRIBE_NVIDIA_CUBLAS_CU12_VERSION:-${SCRIBE_NVIDIA_CUBLAS_CU12_VERSION_DEFAULT:-12.9.2.10}}"
+NVIDIA_CUDNN_CU12_VERSION="${SCRIBE_NVIDIA_CUDNN_CU12_VERSION:-${SCRIBE_NVIDIA_CUDNN_CU12_VERSION_DEFAULT:-9.24.0.43}}"
+PLATFORM="$(uname -s)-$(uname -m)"
 
 usage() {
   cat <<EOF
@@ -21,7 +33,10 @@ Environment:
   SCRIBE_FAST_WHISPER_RUNTIME_DEST=/path       destination runtime directory
   PYTHON_BIN=/path/to/python3                  Python used to create the venv
   SCRIBE_REBUILD_FAST_WHISPER_RUNTIME=1        recreate the venv before install
+  SCRIBE_FASTER_WHISPER_VERSION=$FASTER_WHISPER_VERSION
   SCRIBE_BUNDLE_FAST_WHISPER_CUDA=1            include pip CUDA/cuDNN runtime libs
+  SCRIBE_NVIDIA_CUBLAS_CU12_VERSION=$NVIDIA_CUBLAS_CU12_VERSION
+  SCRIBE_NVIDIA_CUDNN_CU12_VERSION=$NVIDIA_CUDNN_CU12_VERSION
 
 Output:
   $DEST/bin/scribe-faster-whisper
@@ -51,16 +66,19 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade \
+  "pip==$PIP_VERSION" \
+  "setuptools==$SETUPTOOLS_VERSION" \
+  "wheel==$WHEEL_VERSION"
 
-if ! "$VENV_PYTHON" -c "import faster_whisper" >/dev/null 2>&1; then
-  "$VENV_PYTHON" -m pip install --upgrade faster-whisper
-fi
+"$VENV_PYTHON" -m pip install --upgrade "faster-whisper==$FASTER_WHISPER_VERSION"
 
 cuda_bundled=false
 case "${SCRIBE_BUNDLE_FAST_WHISPER_CUDA:-0}" in
   1|true|TRUE|yes|YES|on|ON)
-    "$VENV_PYTHON" -m pip install --upgrade nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
+    "$VENV_PYTHON" -m pip install --upgrade \
+      "nvidia-cublas-cu12==$NVIDIA_CUBLAS_CU12_VERSION" \
+      "nvidia-cudnn-cu12==$NVIDIA_CUDNN_CU12_VERSION"
     cuda_bundled=true
     ;;
 esac
@@ -107,11 +125,22 @@ chmod 755 "$WRAPPER"
 
 cat > "$DEST/runtime-manifest.json" <<EOF
 {
+  "manifest_version": 1,
   "runtime_id": "faster_whisper",
   "backend": "faster-whisper",
+  "version": "$FASTER_WHISPER_VERSION",
   "runner": "bin/scribe-faster-whisper",
   "python": "venv/bin/python",
-  "cuda_bundled": $cuda_bundled
+  "platform": "$PLATFORM",
+  "cuda_bundled": $cuda_bundled,
+  "dependencies": {
+    "pip": "$PIP_VERSION",
+    "setuptools": "$SETUPTOOLS_VERSION",
+    "wheel": "$WHEEL_VERSION",
+    "faster-whisper": "$FASTER_WHISPER_VERSION",
+    "nvidia-cublas-cu12": "$NVIDIA_CUBLAS_CU12_VERSION",
+    "nvidia-cudnn-cu12": "$NVIDIA_CUDNN_CU12_VERSION"
+  }
 }
 EOF
 

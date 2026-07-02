@@ -10,6 +10,7 @@ DEST="${SCRIBE_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/whisper_cpp}"
 INCLUDE_CUDA="${SCRIBE_BUNDLE_CUDA:-0}"
 BUILD_RUNTIME="${SCRIBE_BUILD_WHISPER_RUNTIME:-auto}"
 OLLAMA_LIB_DIR="${OLLAMA_LIB_DIR:-/usr/local/lib/ollama}"
+PLATFORM="$(uname -s)-$(uname -m)"
 
 usage() {
   cat <<'USAGE'
@@ -155,10 +156,12 @@ fi
 
 cat > "$DEST/runtime-manifest.json" <<MANIFEST
 {
+  "manifest_version": 1,
   "runtime_id": "whisper_cpp",
   "backend": "whisper.cpp",
   "source_bin": "$SOURCE_BIN",
   "whisper_cli": "bin/whisper-cli",
+  "platform": "$PLATFORM",
   "cuda_bundled": $cuda_bundled,
   "cuda_source": "$cuda_source"
 }

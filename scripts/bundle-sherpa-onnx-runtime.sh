@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEPS_ENV="$SCRIPT_DIR/runtime-dependencies.env"
+if [[ -f "$DEPS_ENV" ]]; then
+  # shellcheck source=runtime-dependencies.env
+  source "$DEPS_ENV"
+fi
 PROFILE="${SCRIBE_PROFILE:-debug}"
 RUNTIME_ID="${SCRIBE_SHERPA_FAMILY_RUNTIME_ID:-sherpa_onnx}"
 BACKEND="${SCRIBE_SHERPA_FAMILY_BACKEND:-sherpa-onnx}"
@@ -14,6 +19,13 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER_SRC="$SCRIPT_DIR/sherpa_onnx_runner.py"
 RUNNER_DST="$DEST/bin/sherpa_onnx_runner.py"
 WRAPPER="$DEST/bin/$WRAPPER_NAME"
+PIP_VERSION="${SCRIBE_PIP_VERSION:-${SCRIBE_PIP_VERSION_DEFAULT:-26.1.2}}"
+SETUPTOOLS_VERSION="${SCRIBE_SETUPTOOLS_VERSION:-${SCRIBE_SETUPTOOLS_VERSION_DEFAULT:-82.0.1}}"
+WHEEL_VERSION="${SCRIBE_WHEEL_VERSION:-${SCRIBE_WHEEL_VERSION_DEFAULT:-0.47.0}}"
+SHERPA_ONNX_VERSION="${SCRIBE_SHERPA_ONNX_VERSION:-${SCRIBE_SHERPA_ONNX_VERSION_DEFAULT:-1.13.3}}"
+SHERPA_ONNX_BIN_VERSION="${SCRIBE_SHERPA_ONNX_BIN_VERSION:-${SCRIBE_SHERPA_ONNX_BIN_VERSION_DEFAULT:-1.13.3}}"
+NUMPY_VERSION="${SCRIBE_NUMPY_VERSION:-${SCRIBE_NUMPY_VERSION_DEFAULT:-2.5.0}}"
+PLATFORM="$(uname -s)-$(uname -m)"
 
 usage() {
   cat <<EOF
@@ -28,8 +40,9 @@ Environment:
   SCRIBE_SHERPA_ONNX_RUNTIME_DEST=/path         sherpa-onnx destination alias
   PYTHON_BIN=/path/to/python3                   Python used to create the venv
   SCRIBE_REBUILD_SHERPA_ONNX_RUNTIME=1          recreate the venv before install
-  SCRIBE_SHERPA_ONNX_VERSION=1.13.3             optional pinned PyPI version
-  SCRIBE_NUMPY_VERSION=2.3.2                    optional pinned NumPy version
+  SCRIBE_SHERPA_ONNX_VERSION=$SHERPA_ONNX_VERSION
+  SCRIBE_SHERPA_ONNX_BIN_VERSION=$SHERPA_ONNX_BIN_VERSION
+  SCRIBE_NUMPY_VERSION=$NUMPY_VERSION
 
 Output:
   $DEST/bin/$WRAPPER_NAME
@@ -59,21 +72,15 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade \
+  "pip==$PIP_VERSION" \
+  "setuptools==$SETUPTOOLS_VERSION" \
+  "wheel==$WHEEL_VERSION"
 
-if [[ -n "${SCRIBE_SHERPA_ONNX_VERSION:-}" ]]; then
-  "$VENV_PYTHON" -m pip install --upgrade \
-    "sherpa-onnx==$SCRIBE_SHERPA_ONNX_VERSION" \
-    "sherpa-onnx-bin==$SCRIBE_SHERPA_ONNX_VERSION"
-elif ! "$VENV_PYTHON" -c "import sherpa_onnx" >/dev/null 2>&1; then
-  "$VENV_PYTHON" -m pip install --upgrade sherpa-onnx sherpa-onnx-bin
-fi
-
-if [[ -n "${SCRIBE_NUMPY_VERSION:-}" ]]; then
-  "$VENV_PYTHON" -m pip install --upgrade "numpy==$SCRIBE_NUMPY_VERSION"
-elif ! "$VENV_PYTHON" -c "import numpy" >/dev/null 2>&1; then
-  "$VENV_PYTHON" -m pip install --upgrade numpy
-fi
+"$VENV_PYTHON" -m pip install --upgrade \
+  "sherpa-onnx==$SHERPA_ONNX_VERSION" \
+  "sherpa-onnx-bin==$SHERPA_ONNX_BIN_VERSION" \
+  "numpy==$NUMPY_VERSION"
 
 cp "$RUNNER_SRC" "$RUNNER_DST"
 chmod 755 "$RUNNER_DST"
@@ -115,12 +122,23 @@ PY
 
 cat > "$DEST/runtime-manifest.json" <<EOF
 {
+  "manifest_version": 1,
   "runtime_id": "$RUNTIME_ID",
   "backend": "$BACKEND",
+  "version": "$SHERPA_ONNX_VERSION",
   "runner": "bin/$WRAPPER_NAME",
   "runner_revision": 2,
   "python": "venv/bin/python",
+  "platform": "$PLATFORM",
   "versions": $versions,
+  "dependencies": {
+    "pip": "$PIP_VERSION",
+    "setuptools": "$SETUPTOOLS_VERSION",
+    "wheel": "$WHEEL_VERSION",
+    "sherpa-onnx": "$SHERPA_ONNX_VERSION",
+    "sherpa-onnx-bin": "$SHERPA_ONNX_BIN_VERSION",
+    "numpy": "$NUMPY_VERSION"
+  },
   "model_sources": {
     "sherpa-onnx": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2",
     "Moonshine": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",

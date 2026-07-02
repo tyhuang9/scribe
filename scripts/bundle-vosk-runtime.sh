@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEPS_ENV="$SCRIPT_DIR/runtime-dependencies.env"
+if [[ -f "$DEPS_ENV" ]]; then
+  # shellcheck source=runtime-dependencies.env
+  source "$DEPS_ENV"
+fi
 PROFILE="${SCRIBE_PROFILE:-debug}"
 DEST="${SCRIBE_VOSK_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/vosk}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -11,7 +16,11 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 RUNNER_SRC="$SCRIPT_DIR/vosk_runner.py"
 RUNNER_DST="$DEST/bin/vosk_runner.py"
 WRAPPER="$DEST/bin/scribe-vosk"
-VOSK_VERSION="${SCRIBE_VOSK_VERSION:-0.3.45}"
+PIP_VERSION="${SCRIBE_PIP_VERSION:-${SCRIBE_PIP_VERSION_DEFAULT:-26.1.2}}"
+SETUPTOOLS_VERSION="${SCRIBE_SETUPTOOLS_VERSION:-${SCRIBE_SETUPTOOLS_VERSION_DEFAULT:-82.0.1}}"
+WHEEL_VERSION="${SCRIBE_WHEEL_VERSION:-${SCRIBE_WHEEL_VERSION_DEFAULT:-0.47.0}}"
+VOSK_VERSION="${SCRIBE_VOSK_VERSION:-${SCRIBE_VOSK_VERSION_DEFAULT:-0.3.45}}"
+PLATFORM="$(uname -s)-$(uname -m)"
 
 usage() {
   cat <<EOF
@@ -22,7 +31,7 @@ Environment:
   SCRIBE_VOSK_RUNTIME_DEST=/path           destination runtime directory
   PYTHON_BIN=/path/to/python3              Python used to create the venv
   SCRIBE_REBUILD_VOSK_RUNTIME=1            recreate the venv before install
-  SCRIBE_VOSK_VERSION=0.3.45               pinned PyPI vosk version
+  SCRIBE_VOSK_VERSION=$VOSK_VERSION               pinned PyPI vosk version
 
 Output:
   $DEST/bin/scribe-vosk
@@ -52,7 +61,10 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade \
+  "pip==$PIP_VERSION" \
+  "setuptools==$SETUPTOOLS_VERSION" \
+  "wheel==$WHEEL_VERSION"
 
 installed_vosk_version="$("$VENV_PYTHON" - <<'PY'
 try:
@@ -94,12 +106,20 @@ chmod 755 "$WRAPPER"
 
 cat > "$DEST/runtime-manifest.json" <<EOF
 {
+  "manifest_version": 1,
   "runtime_id": "vosk",
   "backend": "Vosk",
+  "version": "$VOSK_VERSION",
   "runner": "bin/scribe-vosk",
   "runner_revision": 3,
   "python": "venv/bin/python",
-  "vosk_version": "$VOSK_VERSION",
+  "platform": "$PLATFORM",
+  "dependencies": {
+    "pip": "$PIP_VERSION",
+    "setuptools": "$SETUPTOOLS_VERSION",
+    "wheel": "$WHEEL_VERSION",
+    "vosk": "$VOSK_VERSION"
+  },
   "model_source": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
 }
 EOF
