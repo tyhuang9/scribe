@@ -76,6 +76,25 @@ Use the in-app Start/Stop button, or opt in explicitly:
 SCRIBE_ENABLE_GLOBAL_HOTKEY=1 cargo run
 ```
 
+## Permissions And Input Automation
+
+Scribe should ask for OS-sensitive behavior at the feature level, not during
+runtime/model installation. New configs keep focused-app insertion disabled
+until the user enables it in Settings. Linux global hotkeys remain opt-in with
+`SCRIBE_ENABLE_GLOBAL_HOTKEY=1`.
+
+| Capability | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Microphone capture | Desktop/session prompt depends on the audio stack. | Requires macOS Microphone privacy access. | Uses the normal desktop audio capture path; no installer permission is expected. |
+| Global hotkeys | Disabled by default. A future Wayland-native path should use the [XDG Global Shortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html). | May require Input Monitoring depending on the global-hotkey backend and OS version. | Uses the system-wide [`RegisterHotKey`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey) API; no installer permission prompt is expected. |
+| Clipboard access | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. |
+| Focused-app insertion | Uses clipboard plus paste automation; Wayland falls back to clipboard-only. A portal-based input path would belong behind the [XDG Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html). | Requires user-granted Accessibility access when macOS blocks synthetic input. | Uses paste-key automation through [`SendInput`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput); it cannot reliably inject into higher-integrity/elevated apps. |
+
+Relevant Apple controls live in Privacy & Security, including
+[Microphone](https://support.apple.com/guide/mac-help/change-privacy-security-settings-on-mac-mchl211c911f/mac),
+Input Monitoring, and
+[Accessibility](https://support.apple.com/guide/mac-help/allow-accessibility-apps-to-access-your-mac-mh43185/mac).
+
 ## Run
 
 ```bash
@@ -135,10 +154,13 @@ Managed model files live under the app data `models` directory. Managed runtime 
 
 Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, `SCRIBE_VOSK_CLI`, `SCRIBE_SHERPA_ONNX_CLI`, `SCRIBE_MOONSHINE_CLI`, or `SCRIBE_PARAKEET_CLI` as fallback runtime paths.
 
-When running from a source checkout on Unix, the Models page can also use the
-checked-in `scripts/bundle-*-runtime.sh` helpers as a development fallback. If a
-packaged sidecar is not already staged, clicking `Install runtime` builds the
-runtime directly into Scribe's managed app-data runtime directory.
+When running a debug build from a source checkout on Unix, the Models page can
+also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
+fallback. If a packaged sidecar is not already staged, clicking `Install
+runtime` builds the runtime directly into Scribe's managed app-data runtime
+directory. Release builds do not use source-checkout scripts unless
+`SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit development or smoke
+testing.
 
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
@@ -158,7 +180,7 @@ The release bundle places whisper.cpp files under
 `target/release/runtimes/faster_whisper`, `target/release/runtimes/vosk`,
 `target/release/runtimes/sherpa_onnx`, `target/release/runtimes/moonshine`,
 and `target/release/runtimes/parakeet`. These are the same locations the app
-checks before falling back to user-managed or development runtime paths. Set
+checks before falling back to user-managed runtime paths. Set
 `SCRIBE_SKIP_FASTER_WHISPER=1`, `SCRIBE_SKIP_VOSK=1`,
 `SCRIBE_SKIP_SHERPA_ONNX=1`, `SCRIBE_SKIP_MOONSHINE=1`, or
 `SCRIBE_SKIP_PARAKEET=1` to omit a generated Python sidecar from a release
@@ -171,9 +193,21 @@ scripts/bundle-faster-whisper-runtime.sh
 ```
 
 The faster-whisper runtime is a generated Python virtual environment with a
-small Scribe runner. The runner downloads CTranslate2 faster-whisper model
-directories through faster-whisper's Hugging Face integration when a model is
-installed from the app.
+small Scribe runner. Python package versions are pinned by
+`scripts/runtime-dependencies.env`; release builds can override those pins with
+the matching `SCRIBE_*_VERSION` environment variables. The runner downloads
+CTranslate2 faster-whisper model directories through faster-whisper's Hugging
+Face integration when a model is installed from the app.
+
+To check whether pinned runtime dependencies have newer PyPI releases:
+
+```bash
+scripts/check-runtime-dependency-updates.py
+```
+
+The app itself does not install arbitrary latest PyPI packages on user machines.
+It asks users to update managed runtimes when installed runtime metadata is older
+than the version recorded in Scribe's runtime catalog.
 
 To stage only the Vosk runtime during development:
 
@@ -197,10 +231,11 @@ scripts/bundle-moonshine-runtime.sh
 scripts/bundle-parakeet-runtime.sh
 ```
 
-These runtimes are generated Python virtual environments with `sherpa-onnx`,
-`sherpa-onnx-bin`, and `numpy` plus a small Scribe runner. Each backend gets a
-separate managed runtime directory and wrapper, but they share the same runner. The
-runner downloads official sherpa-onnx model archives for:
+These runtimes are generated Python virtual environments with pinned
+`sherpa-onnx`, `sherpa-onnx-bin`, and `numpy` dependencies plus a small Scribe
+runner. Each backend gets a separate managed runtime directory and wrapper, but
+they share the same runner. The runner downloads official sherpa-onnx model
+archives for:
 
 - `sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2`
 - `sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2`

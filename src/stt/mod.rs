@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 
@@ -6,6 +7,7 @@ use crate::config::AppConfig;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, backend_capabilities,
 };
+use crate::runtime_catalog;
 
 pub mod faster_whisper;
 pub mod sherpa_onnx;
@@ -34,63 +36,25 @@ pub struct RuntimeDevice {
     pub name: String,
 }
 
-const PROVIDER_ADAPTERS: &[SttProviderAdapter] = &[
-    SttProviderAdapter {
-        backend: "whisper.cpp",
-        runtime_id: "whisper_cpp",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-    SttProviderAdapter {
-        backend: "Vosk",
-        runtime_id: "vosk",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-    SttProviderAdapter {
-        backend: "sherpa-onnx",
-        runtime_id: "sherpa_onnx",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-    SttProviderAdapter {
-        backend: "faster-whisper",
-        runtime_id: "faster_whisper",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-    SttProviderAdapter {
-        backend: "Moonshine",
-        runtime_id: "moonshine",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-    SttProviderAdapter {
-        backend: "Parakeet",
-        runtime_id: "parakeet",
-        model_install_supported: true,
-        runtime_install_supported: true,
-        transcription_supported: true,
-        device_detection_supported: false,
-    },
-];
-
 pub fn provider_adapters() -> &'static [SttProviderAdapter] {
-    PROVIDER_ADAPTERS
+    static PROVIDER_ADAPTERS: OnceLock<Vec<SttProviderAdapter>> = OnceLock::new();
+    PROVIDER_ADAPTERS.get_or_init(|| {
+        runtime_catalog::backend_specs()
+            .iter()
+            .map(|spec| SttProviderAdapter {
+                backend: spec.backend,
+                runtime_id: spec.runtime_id,
+                model_install_supported: spec.model_install_supported,
+                runtime_install_supported: spec.runtime_install_supported,
+                transcription_supported: spec.transcription_supported,
+                device_detection_supported: spec.device_detection_supported,
+            })
+            .collect()
+    })
 }
 
 pub fn provider_for_backend(backend: &str) -> Option<&'static SttProviderAdapter> {
-    PROVIDER_ADAPTERS
+    provider_adapters()
         .iter()
         .find(|provider| provider.backend == backend)
 }

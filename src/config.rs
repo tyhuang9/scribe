@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
+use crate::runtime_catalog;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -54,11 +56,82 @@ pub struct AppConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedModelInstall {
     pub path: PathBuf,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub installed_at_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedRuntimeInstall {
     pub path: PathBuf,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub installed_at_unix_seconds: Option<u64>,
+}
+
+impl ManagedModelInstall {
+    #[cfg(test)]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            ..Self::default()
+        }
+    }
+
+    pub fn app_managed(path: PathBuf, source: &str) -> Self {
+        Self {
+            path,
+            source: Some(source.to_owned()),
+            platform: Some(current_platform_key()),
+            installed_at_unix_seconds: current_unix_seconds(),
+            ..Self::default()
+        }
+    }
+}
+
+impl ManagedRuntimeInstall {
+    #[cfg(test)]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            ..Self::default()
+        }
+    }
+
+    pub fn app_managed(path: PathBuf, source: &str) -> Self {
+        Self {
+            path,
+            source: Some(source.to_owned()),
+            platform: Some(current_platform_key()),
+            installed_at_unix_seconds: current_unix_seconds(),
+            ..Self::default()
+        }
+    }
+}
+
+pub fn current_platform_key() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn current_unix_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,7 +222,7 @@ impl Default for AppConfig {
             debug_mode: false,
             max_recording_seconds: 30,
             close_to_tray: true,
-            auto_insert_transcript: true,
+            auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
             paste_delay_ms: default_paste_delay_ms(),
         }
@@ -443,20 +516,7 @@ pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf
 }
 
 pub fn runtime_id_for_backend(backend: &str) -> String {
-    backend
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
+    runtime_catalog::runtime_id_for_backend(backend)
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
@@ -562,10 +622,9 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
 
     for (id, path) in &config.model_paths {
         if path.exists() && path.starts_with(&storage_dir) {
-            config
-                .managed_models
-                .entry(id.clone())
-                .or_insert_with(|| ManagedModelInstall { path: path.clone() });
+            config.managed_models.entry(id.clone()).or_insert_with(|| {
+                ManagedModelInstall::app_managed(path.clone(), "legacy-model-path")
+            });
         }
     }
 
@@ -737,6 +796,7 @@ mod tests {
 
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
+        assert!(!config.auto_insert_transcript);
     }
 
     #[test]
@@ -984,6 +1044,54 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn legacy_managed_install_records_deserialize_with_empty_metadata() {
+        let model: ManagedModelInstall =
+            serde_json::from_str(r#"{"path":"/tmp/scribe/model.bin"}"#).unwrap();
+        let runtime: ManagedRuntimeInstall =
+            serde_json::from_str(r#"{"path":"/tmp/scribe/runtime/bin/runner"}"#).unwrap();
+
+        assert_eq!(model.path, PathBuf::from("/tmp/scribe/model.bin"));
+        assert!(model.source.is_none());
+        assert!(model.version.is_none());
+        assert!(model.sha256.is_none());
+        assert!(model.platform.is_none());
+        assert!(model.installed_at_unix_seconds.is_none());
+
+        assert_eq!(
+            runtime.path,
+            PathBuf::from("/tmp/scribe/runtime/bin/runner")
+        );
+        assert!(runtime.source.is_none());
+        assert!(runtime.version.is_none());
+        assert!(runtime.sha256.is_none());
+        assert!(runtime.platform.is_none());
+        assert!(runtime.installed_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn app_managed_install_records_include_source_and_platform() {
+        let model =
+            ManagedModelInstall::app_managed(PathBuf::from("/tmp/scribe/model.bin"), "download");
+        let runtime = ManagedRuntimeInstall::app_managed(
+            PathBuf::from("/tmp/scribe/runtime/bin/runner"),
+            "packaged-runtime",
+        );
+
+        assert_eq!(model.source.as_deref(), Some("download"));
+        assert_eq!(runtime.source.as_deref(), Some("packaged-runtime"));
+        assert_eq!(
+            model.platform.as_deref(),
+            Some(current_platform_key().as_str())
+        );
+        assert_eq!(
+            runtime.platform.as_deref(),
+            Some(current_platform_key().as_str())
+        );
+        assert!(model.installed_at_unix_seconds.is_some());
+        assert!(runtime.installed_at_unix_seconds.is_some());
     }
 
     #[test]

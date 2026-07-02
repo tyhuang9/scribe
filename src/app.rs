@@ -13,6 +13,7 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
+use serde::Deserialize;
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -25,6 +26,7 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
     format_bytes,
 };
+use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
 use crate::tray::{TrayCommand, TrayService};
@@ -262,6 +264,7 @@ impl ModelPrimaryAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeActionKind {
     Install,
+    Update,
     Uninstall,
 }
 
@@ -269,6 +272,7 @@ impl RuntimeActionKind {
     fn label(self) -> &'static str {
         match self {
             Self::Install => "Install Runtime",
+            Self::Update => "Update Runtime",
             Self::Uninstall => "Uninstall Runtime",
         }
     }
@@ -289,6 +293,16 @@ struct RuntimeActionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeVersionState {
+    NotTracked,
+    Current(String),
+    UpdateAvailable {
+        installed: Option<String>,
+        available: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInstallSource {
     Packaged(PathBuf),
     DevelopmentScript(DevelopmentRuntimePackage),
@@ -300,6 +314,13 @@ struct DevelopmentRuntimePackage {
     destination_env: &'static str,
     destination_root: PathBuf,
     executable_path: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeManifestMetadata {
+    version: Option<String>,
+    sha256: Option<String>,
+    checksum: Option<String>,
 }
 
 fn model_action_state(
@@ -391,6 +412,15 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
     }
 
     if has_managed_runtime_install(config, provider) {
+        if runtime_needs_update(config, provider) && runtime_install_source(config, model).is_some()
+        {
+            return RuntimeActionState {
+                kind: RuntimeActionKind::Update,
+                enabled: true,
+                disabled_tooltip: None,
+            };
+        }
+
         return RuntimeActionState {
             kind: RuntimeActionKind::Uninstall,
             enabled: true,
@@ -409,7 +439,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
             kind: RuntimeActionKind::Install,
             enabled: false,
             disabled_tooltip: Some(format!(
-                "No packaged {} runtime or local bundle script was found. Install a build that bundles this runtime.",
+                "No packaged {} runtime was found. Install a build that bundles this runtime.",
                 model.backend
             )),
         }
@@ -431,6 +461,43 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
 
 fn has_managed_runtime_install(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
     resolve_managed_runtime_executable(config, provider).is_some()
+}
+
+fn runtime_needs_update(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
+    matches!(
+        runtime_version_state(config, provider),
+        RuntimeVersionState::UpdateAvailable { .. }
+    )
+}
+
+fn runtime_version_state(
+    config: &AppConfig,
+    provider: &stt::SttProviderAdapter,
+) -> RuntimeVersionState {
+    let Some(available) = runtime_catalog::runtime_version_for_runtime_id(provider.runtime_id)
+    else {
+        return RuntimeVersionState::NotTracked;
+    };
+    let Some(install) = config.managed_runtimes.get(provider.runtime_id) else {
+        return RuntimeVersionState::NotTracked;
+    };
+    let installed = install
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty());
+
+    match installed {
+        Some(version) if version == available => RuntimeVersionState::Current(version.to_owned()),
+        Some(version) => RuntimeVersionState::UpdateAvailable {
+            installed: Some(version.to_owned()),
+            available: available.to_owned(),
+        },
+        None => RuntimeVersionState::UpdateAvailable {
+            installed: None,
+            available: available.to_owned(),
+        },
+    }
 }
 
 fn resolve_managed_runtime_executable(
@@ -486,7 +553,7 @@ fn development_runtime_package(
     model: &SttModelInfo,
 ) -> Option<DevelopmentRuntimePackage> {
     let provider = stt::provider_for_backend(&model.backend)?;
-    let spec = development_runtime_spec(provider.runtime_id)?;
+    let spec = runtime_catalog::development_runtime_spec(provider.runtime_id)?;
     let script = find_development_bundle_script(spec.script_name)?;
     let destination_root = config::runtime_storage_dir().join(provider.runtime_id);
     Some(DevelopmentRuntimePackage {
@@ -497,50 +564,11 @@ fn development_runtime_package(
     })
 }
 
-struct DevelopmentRuntimeSpec {
-    script_name: &'static str,
-    destination_env: &'static str,
-    executable_relative_path: &'static str,
-}
-
-fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> {
-    match runtime_id {
-        "whisper_cpp" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-whisper-runtime.sh",
-            destination_env: "SCRIBE_RUNTIME_DEST",
-            executable_relative_path: "bin/whisper-cli",
-        }),
-        "faster_whisper" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-faster-whisper-runtime.sh",
-            destination_env: "SCRIBE_FAST_WHISPER_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-faster-whisper",
-        }),
-        "vosk" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-vosk-runtime.sh",
-            destination_env: "SCRIBE_VOSK_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-vosk",
-        }),
-        "sherpa_onnx" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-sherpa-onnx-runtime.sh",
-            destination_env: "SCRIBE_SHERPA_ONNX_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-sherpa-onnx",
-        }),
-        "moonshine" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-moonshine-runtime.sh",
-            destination_env: "SCRIBE_MOONSHINE_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-moonshine",
-        }),
-        "parakeet" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-parakeet-runtime.sh",
-            destination_env: "SCRIBE_PARAKEET_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-parakeet",
-        }),
-        _ => None,
-    }
-}
-
 fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
     if !cfg!(unix) {
+        return None;
+    }
+    if !development_runtime_installs_enabled() {
         return None;
     }
 
@@ -566,6 +594,25 @@ fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn development_runtime_installs_enabled() -> bool {
+    let opt_in = env::var("SCRIBE_ALLOW_DEV_RUNTIME_INSTALL").ok();
+    development_runtime_installs_enabled_for(cfg!(debug_assertions), opt_in.as_deref())
+}
+
+fn development_runtime_installs_enabled_for(
+    debug_assertions: bool,
+    opt_in_value: Option<&str>,
+) -> bool {
+    debug_assertions || opt_in_value.is_some_and(env_flag_value_enabled)
+}
+
+fn env_flag_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub struct LocalTranscriberApp {
@@ -1108,9 +1155,10 @@ impl LocalTranscriberApp {
                         .into_iter()
                         .find(|model| model.id == model_id)
                     {
-                        self.config
-                            .managed_models
-                            .insert(model_id.clone(), config::ManagedModelInstall { path });
+                        self.config.managed_models.insert(
+                            model_id.clone(),
+                            config::ManagedModelInstall::app_managed(path, "managed-download"),
+                        );
                         self.record_packaged_runtime_metadata(&model);
                     }
                     self.save_config();
@@ -1586,19 +1634,21 @@ impl LocalTranscriberApp {
         let Some(source) = runtime_install_source(&self.config, model) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
-                "No packaged {} runtime or local bundle script was found in this build.",
+                "No packaged {} runtime was found in this build.",
                 model.backend
             );
             return;
         };
 
-        let path = match source {
-            RuntimeInstallSource::Packaged(packaged_path) => {
-                install_runtime_files(provider.runtime_id, &packaged_path)
-            }
-            RuntimeInstallSource::DevelopmentScript(package) => {
-                build_development_runtime_package(provider.runtime_id, &model.backend, package)
-            }
+        let (path, source_label) = match source {
+            RuntimeInstallSource::Packaged(packaged_path) => (
+                install_runtime_files(provider.runtime_id, &packaged_path),
+                "packaged-runtime",
+            ),
+            RuntimeInstallSource::DevelopmentScript(package) => (
+                build_development_runtime_package(provider.runtime_id, &model.backend, package),
+                "development-script",
+            ),
         };
         let path = match path {
             Ok(path) => path,
@@ -1611,7 +1661,7 @@ impl LocalTranscriberApp {
 
         self.config.managed_runtimes.insert(
             provider.runtime_id.to_owned(),
-            config::ManagedRuntimeInstall { path },
+            managed_runtime_install_record(path, source_label),
         );
         self.save_config();
         self.refresh_playground_runtime_statuses();
@@ -1654,7 +1704,7 @@ impl LocalTranscriberApp {
         if let Some(path) = packaged_runtime_path(&self.config, model) {
             self.config.managed_runtimes.insert(
                 provider.runtime_id.to_owned(),
-                config::ManagedRuntimeInstall { path },
+                managed_runtime_install_record(path, "packaged-runtime"),
             );
         }
     }
@@ -1992,6 +2042,10 @@ impl LocalTranscriberApp {
                                 &runtime_status.to_string(),
                                 runtime_chip_tone(&runtime_status),
                             );
+                            if let Some((label, tone)) = runtime_version_badge(&self.config, &model)
+                            {
+                                badge(ui, &label, tone);
+                            }
                             badge(
                                 ui,
                                 &format!("Runtime {}", runtime_storage_estimate(&model.backend)),
@@ -2005,7 +2059,9 @@ impl LocalTranscriberApp {
 
             if let Some((model, kind)) = runtime_action {
                 match kind {
-                    RuntimeActionKind::Install => self.install_runtime(&model),
+                    RuntimeActionKind::Install | RuntimeActionKind::Update => {
+                        self.install_runtime(&model)
+                    }
                     RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
                 }
             }
@@ -2310,24 +2366,26 @@ impl LocalTranscriberApp {
                     self.config.auto_insert_transcript = auto_insert;
                     self.save_config();
                 }
-                let mut restore_clipboard = self.config.restore_clipboard_after_insert;
-                if ui
-                    .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                    .changed()
-                {
-                    self.config.restore_clipboard_after_insert = restore_clipboard;
-                    self.save_config();
-                }
-                let mut paste_delay = self.config.paste_delay_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Paste delay ms");
+                ui.add_enabled_ui(self.config.auto_insert_transcript, |ui| {
+                    let mut restore_clipboard = self.config.restore_clipboard_after_insert;
                     if ui
-                        .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                        .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
                         .changed()
                     {
-                        self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                        self.config.restore_clipboard_after_insert = restore_clipboard;
                         self.save_config();
                     }
+                    let mut paste_delay = self.config.paste_delay_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Paste delay ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                            .changed()
+                        {
+                            self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                            self.save_config();
+                        }
+                    });
                 });
             });
 
@@ -2383,6 +2441,8 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Performance"));
                 ui.add_space(8.0);
+                let active_device_support = selected_model_device_support(&self.config);
+                let prefer_gpu_available = active_device_support.supports_gpu();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Transcription device");
                     let mut compute_mode = self.config.whisper_compute_mode;
@@ -2390,7 +2450,11 @@ impl LocalTranscriberApp {
                         .selected_text(compute_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in WhisperComputeMode::ALL {
-                                ui.selectable_value(&mut compute_mode, mode, mode.label());
+                                let enabled =
+                                    mode != WhisperComputeMode::PreferGpu || prefer_gpu_available;
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    ui.selectable_value(&mut compute_mode, mode, mode.label());
+                                });
                             }
                         });
                     if compute_mode != self.config.whisper_compute_mode {
@@ -2398,6 +2462,15 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
+                if !prefer_gpu_available {
+                    ui.add_space(4.0);
+                    wrapped_label(
+                        ui,
+                        mut_text(
+                            "The active model backend is CPU-only. GPU mode is available for whisper.cpp and faster-whisper models.",
+                        ),
+                    );
+                }
                 if let Some(provider) = stt::provider_for_backend("whisper.cpp")
                     && provider.device_detection_supported
                 {
@@ -2882,6 +2955,11 @@ fn model_catalog_row(
                             badge(ui, &format!("Runtime {}", model.backend), ChipTone::Neutral);
                             badge(
                                 ui,
+                                &format!("Device {}", model_device_label(model)),
+                                ChipTone::Neutral,
+                            );
+                            badge(
+                                ui,
                                 &format!("Model {}", model_storage_estimate(model)),
                                 ChipTone::Neutral,
                             );
@@ -2952,6 +3030,11 @@ fn download_summary_row(ui: &mut Ui, model: &SttModelInfo, install_status: &Mode
                     wrapped_label(ui, body_strong(&model.name));
                     tag_row(ui, |ui| {
                         badge(ui, &model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &format!("Device {}", model_device_label(model)),
+                            ChipTone::Neutral,
+                        );
                         badge(
                             ui,
                             &install_status.label(),
@@ -3207,6 +3290,11 @@ fn playground_card_ui(
                     ui.add_space(8.0);
                     tag_row(ui, |ui| {
                         badge(ui, &card_state.model.backend, ChipTone::Neutral);
+                        badge(
+                            ui,
+                            &format!("Device {}", model_device_label(&card_state.model)),
+                            ChipTone::Neutral,
+                        );
                         badge(
                             ui,
                             &card_state.model.install_status.label(),
@@ -3970,7 +4058,10 @@ fn runtime_detail_text(
         ModelRuntimeStatus::Error(message) => message.clone(),
         _ => setup_message_for_status(status),
     };
-    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}")
+    let version = runtime_version_detail(config, model)
+        .map(|detail| format!(" {detail}"))
+        .unwrap_or_default();
+    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}{version}")
 }
 
 fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
@@ -3991,62 +4082,73 @@ fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
 }
 
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
-    match model.id.as_str() {
-        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => "~75 MB",
-        "whisper_cpp_base_en" | "faster_whisper_base_en" => "~150 MB",
-        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => "~470 MB",
-        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => "~1.5 GB",
-        "faster_whisper_large_v3" => "~3.1 GB",
-        "faster_whisper_turbo" => "~1.6 GB",
-        "faster_whisper_distil_large_v3" => "~1.5 GB",
-        "vosk_small_en" => "~50 MB",
-        "sherpa_onnx_zipformer_small" => "~80 MB",
-        "moonshine" => "~35 MB",
-        "parakeet_0_6b" => "~640 MB",
-        _ => "varies",
-    }
+    runtime_catalog::model_storage_estimate(&model.id)
+}
+
+fn model_device_label(model: &SttModelInfo) -> &'static str {
+    runtime_catalog::backend_spec(&model.backend)
+        .map(|spec| spec.device_support.label())
+        .unwrap_or("Unknown")
+}
+
+fn selected_model_device_support(config: &AppConfig) -> runtime_catalog::DeviceSupport {
+    config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == config.selected_default_model)
+        .and_then(|model| runtime_catalog::backend_spec(&model.backend))
+        .map(|spec| spec.device_support)
+        .unwrap_or(runtime_catalog::DeviceSupport::CpuOnly)
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let gib = |value: f64| (value * GIB as f64).round() as u64;
-
-    match model.id.as_str() {
-        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => Some(75 * MIB),
-        "whisper_cpp_base_en" | "faster_whisper_base_en" => Some(150 * MIB),
-        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => Some(470 * MIB),
-        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => Some(gib(1.5)),
-        "faster_whisper_large_v3" => Some(gib(3.1)),
-        "faster_whisper_turbo" => Some(gib(1.6)),
-        "faster_whisper_distil_large_v3" => Some(gib(1.5)),
-        "vosk_small_en" => Some(40 * MIB),
-        "sherpa_onnx_zipformer_small" => Some(85 * MIB),
-        "moonshine" => Some(35 * MIB),
-        "parakeet_0_6b" => Some(650 * MIB),
-        _ => None,
-    }
+    runtime_catalog::model_download_total_bytes(&model.id)
 }
 
 fn runtime_storage_estimate(backend: &str) -> &'static str {
-    match backend {
-        "whisper.cpp" => "~20 MB+",
-        "faster-whisper" => "~450 MB+",
-        "Vosk" => "~20 MB+",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => "~100 MB+",
-        _ => "varies",
-    }
+    runtime_catalog::backend_spec(backend)
+        .map(|spec| spec.runtime_storage_estimate)
+        .unwrap_or("varies")
 }
 
 fn runtime_storage_detail(backend: &str) -> &'static str {
-    match backend {
-        "whisper.cpp" => "~20 MB for the CPU runtime; CUDA bundles are larger",
-        "faster-whisper" => "~450 MB for the CPU Python runtime; CUDA bundles are larger",
-        "Vosk" => "~20 MB for the pinned Python Vosk runtime",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-            "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate"
+    runtime_catalog::backend_spec(backend)
+        .map(|spec| spec.runtime_storage_detail)
+        .unwrap_or("varies")
+}
+
+fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(String, ChipTone)> {
+    let provider = stt::provider_for_backend(&model.backend)?;
+    match runtime_version_state(config, provider) {
+        RuntimeVersionState::NotTracked => None,
+        RuntimeVersionState::Current(version) => {
+            Some((format!("Version {version}"), ChipTone::Success))
         }
-        _ => "varies",
+        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => {
+            Some(("Update available".to_owned(), ChipTone::Warning))
+        }
+        RuntimeVersionState::UpdateAvailable { .. } => {
+            Some(("Version unknown".to_owned(), ChipTone::Warning))
+        }
+    }
+}
+
+fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<String> {
+    let provider = stt::provider_for_backend(&model.backend)?;
+    match runtime_version_state(config, provider) {
+        RuntimeVersionState::NotTracked => None,
+        RuntimeVersionState::Current(version) => Some(format!("Runtime version: {version}.")),
+        RuntimeVersionState::UpdateAvailable {
+            installed: Some(installed),
+            available,
+        } => Some(format!(
+            "Runtime update available: installed {installed}, available {available}."
+        )),
+        RuntimeVersionState::UpdateAvailable {
+            installed: None,
+            available,
+        } => Some(format!(
+            "Runtime version is unknown; update to the packaged {available} runtime."
+        )),
     }
 }
 
@@ -4169,6 +4271,28 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
         ));
     }
     Ok(installed_executable)
+}
+
+fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::ManagedRuntimeInstall {
+    let mut install = config::ManagedRuntimeInstall::app_managed(path.clone(), source);
+    if let Some(metadata) = runtime_manifest_metadata(&path) {
+        install.version = metadata
+            .version
+            .map(|version| version.trim().to_owned())
+            .filter(|version| !version.is_empty());
+        install.sha256 = metadata
+            .sha256
+            .or(metadata.checksum)
+            .map(|sha256| sha256.trim().to_owned())
+            .filter(|sha256| !sha256.is_empty());
+    }
+    install
+}
+
+fn runtime_manifest_metadata(executable: &Path) -> Option<RuntimeManifestMetadata> {
+    let manifest = runtime_package_root(executable)?.join("runtime-manifest.json");
+    let contents = fs::read_to_string(manifest).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn installed_runtime_executable_usable(runtime_id: &str, executable: &Path) -> bool {
@@ -5219,6 +5343,15 @@ mod layout_tests {
         executable
     }
 
+    fn managed_runtime_with_version(
+        path: PathBuf,
+        version: Option<&str>,
+    ) -> config::ManagedRuntimeInstall {
+        let mut install = config::ManagedRuntimeInstall::new(path);
+        install.version = version.map(str::to_owned);
+        install
+    }
+
     #[test]
     fn model_action_state_matches_install_select_uninstall_rules() {
         let mut whisper = test_model();
@@ -5397,6 +5530,30 @@ mod layout_tests {
     }
 
     #[test]
+    fn device_labels_follow_backend_capabilities() {
+        let mut config = AppConfig {
+            selected_default_model: "faster_whisper_tiny_en".to_owned(),
+            ..AppConfig::default()
+        };
+        let faster_whisper = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "faster_whisper_tiny_en")
+            .unwrap();
+
+        assert_eq!(model_device_label(&faster_whisper), "CPU/GPU");
+        assert!(selected_model_device_support(&config).supports_gpu());
+
+        config.selected_default_model = "vosk_small_en".to_owned();
+        let vosk = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "vosk_small_en")
+            .unwrap();
+
+        assert_eq!(model_device_label(&vosk), "CPU");
+        assert!(!selected_model_device_support(&config).supports_gpu());
+    }
+
+    #[test]
     fn vosk_small_en_has_progress_total_and_managed_download() {
         let model = config::configured_models(&AppConfig::default())
             .into_iter()
@@ -5465,9 +5622,7 @@ mod layout_tests {
         fs::write(&whisper_runtime, b"whisper runtime").unwrap();
         config.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: whisper_runtime,
-            },
+            managed_runtime_with_version(whisper_runtime, None),
         );
 
         assert_eq!(
@@ -5511,9 +5666,10 @@ mod layout_tests {
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: write_vosk_runtime(&runtime_root.join("vosk")),
-            },
+            managed_runtime_with_version(
+                write_vosk_runtime(&runtime_root.join("vosk")),
+                Some("0.3.45"),
+            ),
         );
 
         assert_eq!(
@@ -5563,13 +5719,14 @@ mod layout_tests {
             config.managed_runtimes.clear();
             config.managed_runtimes.insert(
                 runtime_id.to_owned(),
-                config::ManagedRuntimeInstall {
-                    path: write_sherpa_family_runtime(
+                managed_runtime_with_version(
+                    write_sherpa_family_runtime(
                         &runtime_root.join(runtime_id),
                         runtime_id,
                         wrapper,
                     ),
-                },
+                    Some("1.13.3"),
+                ),
             );
 
             assert_eq!(
@@ -5607,9 +5764,9 @@ mod layout_tests {
         let mut config = AppConfig::default();
         config.managed_runtimes.insert(
             "faster_whisper".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: PathBuf::from("/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper"),
-            },
+            config::ManagedRuntimeInstall::new(PathBuf::from(
+                "/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper",
+            )),
         );
         let mut model = test_model();
         model.backend = "faster-whisper".to_owned();
@@ -5623,9 +5780,10 @@ mod layout_tests {
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: write_vosk_runtime_with_revision(&runtime_root.join("vosk"), 2),
-            },
+            config::ManagedRuntimeInstall::new(write_vosk_runtime_with_revision(
+                &runtime_root.join("vosk"),
+                2,
+            )),
         );
         model.backend = "Vosk".to_owned();
         model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
@@ -5635,6 +5793,109 @@ mod layout_tests {
         assert_eq!(action.kind, RuntimeActionKind::Install);
         assert!(action.enabled);
         let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn runtime_version_state_detects_current_stale_and_unknown_installs() {
+        let provider = stt::provider_for_backend("Vosk").unwrap();
+        let mut config = AppConfig::default();
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.45")),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::Current("0.3.45".to_owned())
+        );
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.44")),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::UpdateAvailable {
+                installed: Some("0.3.44".to_owned()),
+                available: "0.3.45".to_owned(),
+            }
+        );
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), None),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::UpdateAvailable {
+                installed: None,
+                available: "0.3.45".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_action_state_offers_update_for_stale_version_when_source_exists() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+        let mut config = AppConfig::default();
+        let mut model = test_model();
+        model.id = "vosk_small_en".to_owned();
+        model.backend = "Vosk".to_owned();
+        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(
+                write_vosk_runtime(&runtime_root.join("vosk")),
+                Some("0.3.44"),
+            ),
+        );
+
+        let action = runtime_action_state(&config, &model);
+
+        if runtime_install_source(&config, &model).is_some() {
+            assert_eq!(action.kind, RuntimeActionKind::Update);
+        } else {
+            assert_eq!(action.kind, RuntimeActionKind::Uninstall);
+        }
+        assert!(action.enabled);
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn managed_runtime_install_record_reads_manifest_metadata() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+        let executable = runtime_root.join("bin").join("scribe-vosk");
+        let manifest = runtime_root.join("runtime-manifest.json");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"runtime").unwrap();
+        fs::write(
+            manifest,
+            r#"{"version":"0.3.45","sha256":"abc123","dependencies":{"vosk":"0.3.45"}}"#,
+        )
+        .unwrap();
+
+        let install = managed_runtime_install_record(executable, "packaged-runtime");
+
+        assert_eq!(install.version.as_deref(), Some("0.3.45"));
+        assert_eq!(install.sha256.as_deref(), Some("abc123"));
+        assert_eq!(install.source.as_deref(), Some("packaged-runtime"));
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn development_runtime_installs_require_debug_build_or_opt_in() {
+        assert!(development_runtime_installs_enabled_for(true, None));
+        assert!(!development_runtime_installs_enabled_for(false, None));
+        assert!(development_runtime_installs_enabled_for(false, Some("1")));
+        assert!(development_runtime_installs_enabled_for(
+            false,
+            Some("true")
+        ));
+        assert!(!development_runtime_installs_enabled_for(false, Some("0")));
     }
 
     #[cfg(unix)]
@@ -5790,15 +6051,11 @@ mod layout_tests {
         };
         config.managed_models.insert(
             "whisper_cpp_base_en".to_owned(),
-            config::ManagedModelInstall {
-                path: base_path.clone(),
-            },
+            config::ManagedModelInstall::new(base_path.clone()),
         );
         config.managed_models.insert(
             "whisper_cpp_small_en".to_owned(),
-            config::ManagedModelInstall {
-                path: small_path.clone(),
-            },
+            config::ManagedModelInstall::new(small_path.clone()),
         );
 
         let base_model = config::configured_models(&config)

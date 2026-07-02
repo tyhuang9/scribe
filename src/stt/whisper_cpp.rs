@@ -279,7 +279,8 @@ fn apply_whisper_environment(
     executable_path: &Path,
     options: &WhisperCppOptions,
 ) -> Result<()> {
-    let runtime_paths = bundled_runtime_library_paths(executable_path);
+    let include_cuda_paths = options.compute_mode != WhisperComputeMode::Cpu;
+    let runtime_paths = bundled_runtime_library_paths(executable_path, include_cuda_paths);
     let configured_paths = if options.compute_mode == WhisperComputeMode::Cpu {
         Vec::new()
     } else {
@@ -307,15 +308,17 @@ fn apply_whisper_environment(
     Ok(())
 }
 
-fn bundled_runtime_library_paths(executable_path: &Path) -> Vec<PathBuf> {
+fn bundled_runtime_library_paths(executable_path: &Path, include_cuda_paths: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(bin_dir) = executable_path.parent() {
         paths.push(bin_dir.to_path_buf());
         if let Some(runtime_root) = bin_dir.parent() {
             paths.push(runtime_root.join("lib"));
-            paths.push(runtime_root.join("cuda"));
-            paths.push(runtime_root.join("cuda_v13"));
-            paths.push(runtime_root.join("cuda_v12"));
+            if include_cuda_paths {
+                paths.push(runtime_root.join("cuda"));
+                paths.push(runtime_root.join("cuda_v13"));
+                paths.push(runtime_root.join("cuda_v12"));
+            }
         }
     }
     paths.into_iter().filter(|path| path.exists()).collect()
@@ -513,10 +516,44 @@ mod tests {
         let executable = bin_dir.join(whisper_cli_binary_names()[0]);
         write_test_runtime(&executable);
 
-        let paths = bundled_runtime_library_paths(&executable);
+        let paths = bundled_runtime_library_paths(&executable, true);
 
         assert!(paths.contains(&bin_dir));
         assert!(paths.contains(&cuda_dir));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn whisper_cpu_environment_excludes_bundled_cuda_paths() {
+        let root = test_runtime_root("cpu-excludes-cuda");
+        let runtime_root = root.join("runtimes").join("whisper_cpp");
+        let bin_dir = runtime_root.join("bin");
+        let lib_dir = runtime_root.join("lib");
+        let cuda_dir = runtime_root.join("cuda");
+        let cuda_backend = cuda_dir.join("libggml-cuda.so");
+        let executable = bin_dir.join(whisper_cli_binary_names()[0]);
+        write_test_runtime(&executable);
+        fs::create_dir_all(&lib_dir).unwrap();
+        write_test_runtime(&cuda_backend);
+
+        let mut command = Command::new("whisper-cli");
+        apply_whisper_environment(
+            &mut command,
+            &executable,
+            &WhisperCppOptions {
+                compute_mode: WhisperComputeMode::Cpu,
+                cuda_backend_path: Some(cuda_backend),
+                cuda_library_paths: vec![cuda_dir.clone()],
+                ..WhisperCppOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(command_env(&command, "GGML_BACKEND_PATH").is_none());
+        let library_path = command_env(&command, "LD_LIBRARY_PATH").unwrap();
+        assert!(env::split_paths(&library_path).any(|path| path == bin_dir));
+        assert!(env::split_paths(&library_path).any(|path| path == lib_dir));
+        assert!(!env::split_paths(&library_path).any(|path| path == cuda_dir));
         let _ = fs::remove_dir_all(root);
     }
 
