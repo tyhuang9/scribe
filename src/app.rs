@@ -25,6 +25,7 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
     format_bytes,
 };
+use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
 use crate::tray::{TrayCommand, TrayService};
@@ -486,7 +487,7 @@ fn development_runtime_package(
     model: &SttModelInfo,
 ) -> Option<DevelopmentRuntimePackage> {
     let provider = stt::provider_for_backend(&model.backend)?;
-    let spec = development_runtime_spec(provider.runtime_id)?;
+    let spec = runtime_catalog::development_runtime_spec(provider.runtime_id)?;
     let script = find_development_bundle_script(spec.script_name)?;
     let destination_root = config::runtime_storage_dir().join(provider.runtime_id);
     Some(DevelopmentRuntimePackage {
@@ -495,48 +496,6 @@ fn development_runtime_package(
         executable_path: destination_root.join(spec.executable_relative_path),
         destination_root,
     })
-}
-
-struct DevelopmentRuntimeSpec {
-    script_name: &'static str,
-    destination_env: &'static str,
-    executable_relative_path: &'static str,
-}
-
-fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> {
-    match runtime_id {
-        "whisper_cpp" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-whisper-runtime.sh",
-            destination_env: "SCRIBE_RUNTIME_DEST",
-            executable_relative_path: "bin/whisper-cli",
-        }),
-        "faster_whisper" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-faster-whisper-runtime.sh",
-            destination_env: "SCRIBE_FAST_WHISPER_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-faster-whisper",
-        }),
-        "vosk" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-vosk-runtime.sh",
-            destination_env: "SCRIBE_VOSK_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-vosk",
-        }),
-        "sherpa_onnx" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-sherpa-onnx-runtime.sh",
-            destination_env: "SCRIBE_SHERPA_ONNX_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-sherpa-onnx",
-        }),
-        "moonshine" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-moonshine-runtime.sh",
-            destination_env: "SCRIBE_MOONSHINE_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-moonshine",
-        }),
-        "parakeet" => Some(DevelopmentRuntimeSpec {
-            script_name: "bundle-parakeet-runtime.sh",
-            destination_env: "SCRIBE_PARAKEET_RUNTIME_DEST",
-            executable_relative_path: "bin/scribe-parakeet",
-        }),
-        _ => None,
-    }
 }
 
 fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
@@ -3991,63 +3950,23 @@ fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
 }
 
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
-    match model.id.as_str() {
-        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => "~75 MB",
-        "whisper_cpp_base_en" | "faster_whisper_base_en" => "~150 MB",
-        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => "~470 MB",
-        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => "~1.5 GB",
-        "faster_whisper_large_v3" => "~3.1 GB",
-        "faster_whisper_turbo" => "~1.6 GB",
-        "faster_whisper_distil_large_v3" => "~1.5 GB",
-        "vosk_small_en" => "~50 MB",
-        "sherpa_onnx_zipformer_small" => "~80 MB",
-        "moonshine" => "~35 MB",
-        "parakeet_0_6b" => "~640 MB",
-        _ => "varies",
-    }
+    runtime_catalog::model_storage_estimate(&model.id)
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let gib = |value: f64| (value * GIB as f64).round() as u64;
-
-    match model.id.as_str() {
-        "whisper_cpp_tiny_en" | "faster_whisper_tiny_en" => Some(75 * MIB),
-        "whisper_cpp_base_en" | "faster_whisper_base_en" => Some(150 * MIB),
-        "whisper_cpp_small_en" | "faster_whisper_small_en_gpu" => Some(470 * MIB),
-        "whisper_cpp_medium_en" | "faster_whisper_medium_en_gpu" => Some(gib(1.5)),
-        "faster_whisper_large_v3" => Some(gib(3.1)),
-        "faster_whisper_turbo" => Some(gib(1.6)),
-        "faster_whisper_distil_large_v3" => Some(gib(1.5)),
-        "vosk_small_en" => Some(40 * MIB),
-        "sherpa_onnx_zipformer_small" => Some(85 * MIB),
-        "moonshine" => Some(35 * MIB),
-        "parakeet_0_6b" => Some(650 * MIB),
-        _ => None,
-    }
+    runtime_catalog::model_download_total_bytes(&model.id)
 }
 
 fn runtime_storage_estimate(backend: &str) -> &'static str {
-    match backend {
-        "whisper.cpp" => "~20 MB+",
-        "faster-whisper" => "~450 MB+",
-        "Vosk" => "~20 MB+",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => "~100 MB+",
-        _ => "varies",
-    }
+    runtime_catalog::backend_spec(backend)
+        .map(|spec| spec.runtime_storage_estimate)
+        .unwrap_or("varies")
 }
 
 fn runtime_storage_detail(backend: &str) -> &'static str {
-    match backend {
-        "whisper.cpp" => "~20 MB for the CPU runtime; CUDA bundles are larger",
-        "faster-whisper" => "~450 MB for the CPU Python runtime; CUDA bundles are larger",
-        "Vosk" => "~20 MB for the pinned Python Vosk runtime",
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-            "~100 MB+ for the sherpa-onnx Python runtime; model archives are separate"
-        }
-        _ => "varies",
-    }
+    runtime_catalog::backend_spec(backend)
+        .map(|spec| spec.runtime_storage_detail)
+        .unwrap_or("varies")
 }
 
 fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<bool, String> {

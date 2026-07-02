@@ -7,6 +7,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
+use crate::runtime_catalog;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -443,20 +444,7 @@ pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf
 }
 
 pub fn runtime_id_for_backend(backend: &str) -> String {
-    backend
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
+    runtime_catalog::runtime_id_for_backend(backend)
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
