@@ -180,6 +180,16 @@ the matching `SCRIBE_*_VERSION` environment variables. The runner downloads
 CTranslate2 faster-whisper model directories through faster-whisper's Hugging
 Face integration when a model is installed from the app.
 
+To check whether pinned runtime dependencies have newer PyPI releases:
+
+```bash
+scripts/check-runtime-dependency-updates.py
+```
+
+The app itself does not install arbitrary latest PyPI packages on user machines.
+It asks users to update managed runtimes when installed runtime metadata is older
+than the version recorded in Scribe's runtime catalog.
+
 To stage only the Vosk runtime during development:
 
 ```bash
