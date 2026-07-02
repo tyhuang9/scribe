@@ -1089,9 +1089,10 @@ impl LocalTranscriberApp {
                         .into_iter()
                         .find(|model| model.id == model_id)
                     {
-                        self.config
-                            .managed_models
-                            .insert(model_id.clone(), config::ManagedModelInstall { path });
+                        self.config.managed_models.insert(
+                            model_id.clone(),
+                            config::ManagedModelInstall::app_managed(path, "managed-download"),
+                        );
                         self.record_packaged_runtime_metadata(&model);
                     }
                     self.save_config();
@@ -1573,13 +1574,15 @@ impl LocalTranscriberApp {
             return;
         };
 
-        let path = match source {
-            RuntimeInstallSource::Packaged(packaged_path) => {
-                install_runtime_files(provider.runtime_id, &packaged_path)
-            }
-            RuntimeInstallSource::DevelopmentScript(package) => {
-                build_development_runtime_package(provider.runtime_id, &model.backend, package)
-            }
+        let (path, source_label) = match source {
+            RuntimeInstallSource::Packaged(packaged_path) => (
+                install_runtime_files(provider.runtime_id, &packaged_path),
+                "packaged-runtime",
+            ),
+            RuntimeInstallSource::DevelopmentScript(package) => (
+                build_development_runtime_package(provider.runtime_id, &model.backend, package),
+                "development-script",
+            ),
         };
         let path = match path {
             Ok(path) => path,
@@ -1592,7 +1595,7 @@ impl LocalTranscriberApp {
 
         self.config.managed_runtimes.insert(
             provider.runtime_id.to_owned(),
-            config::ManagedRuntimeInstall { path },
+            config::ManagedRuntimeInstall::app_managed(path, source_label),
         );
         self.save_config();
         self.refresh_playground_runtime_statuses();
@@ -1635,7 +1638,7 @@ impl LocalTranscriberApp {
         if let Some(path) = packaged_runtime_path(&self.config, model) {
             self.config.managed_runtimes.insert(
                 provider.runtime_id.to_owned(),
-                config::ManagedRuntimeInstall { path },
+                config::ManagedRuntimeInstall::app_managed(path, "packaged-runtime"),
             );
         }
     }
@@ -5406,9 +5409,7 @@ mod layout_tests {
         fs::write(&whisper_runtime, b"whisper runtime").unwrap();
         config.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: whisper_runtime,
-            },
+            config::ManagedRuntimeInstall::new(whisper_runtime),
         );
 
         assert_eq!(
@@ -5452,9 +5453,7 @@ mod layout_tests {
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: write_vosk_runtime(&runtime_root.join("vosk")),
-            },
+            config::ManagedRuntimeInstall::new(write_vosk_runtime(&runtime_root.join("vosk"))),
         );
 
         assert_eq!(
@@ -5504,13 +5503,11 @@ mod layout_tests {
             config.managed_runtimes.clear();
             config.managed_runtimes.insert(
                 runtime_id.to_owned(),
-                config::ManagedRuntimeInstall {
-                    path: write_sherpa_family_runtime(
-                        &runtime_root.join(runtime_id),
-                        runtime_id,
-                        wrapper,
-                    ),
-                },
+                config::ManagedRuntimeInstall::new(write_sherpa_family_runtime(
+                    &runtime_root.join(runtime_id),
+                    runtime_id,
+                    wrapper,
+                )),
             );
 
             assert_eq!(
@@ -5548,9 +5545,9 @@ mod layout_tests {
         let mut config = AppConfig::default();
         config.managed_runtimes.insert(
             "faster_whisper".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: PathBuf::from("/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper"),
-            },
+            config::ManagedRuntimeInstall::new(PathBuf::from(
+                "/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper",
+            )),
         );
         let mut model = test_model();
         model.backend = "faster-whisper".to_owned();
@@ -5564,9 +5561,10 @@ mod layout_tests {
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
-            config::ManagedRuntimeInstall {
-                path: write_vosk_runtime_with_revision(&runtime_root.join("vosk"), 2),
-            },
+            config::ManagedRuntimeInstall::new(write_vosk_runtime_with_revision(
+                &runtime_root.join("vosk"),
+                2,
+            )),
         );
         model.backend = "Vosk".to_owned();
         model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
@@ -5743,15 +5741,11 @@ mod layout_tests {
         };
         config.managed_models.insert(
             "whisper_cpp_base_en".to_owned(),
-            config::ManagedModelInstall {
-                path: base_path.clone(),
-            },
+            config::ManagedModelInstall::new(base_path.clone()),
         );
         config.managed_models.insert(
             "whisper_cpp_small_en".to_owned(),
-            config::ManagedModelInstall {
-                path: small_path.clone(),
-            },
+            config::ManagedModelInstall::new(small_path.clone()),
         );
 
         let base_model = config::configured_models(&config)
