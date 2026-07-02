@@ -13,6 +13,7 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
+use serde::Deserialize;
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -263,6 +264,7 @@ impl ModelPrimaryAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeActionKind {
     Install,
+    Update,
     Uninstall,
 }
 
@@ -270,6 +272,7 @@ impl RuntimeActionKind {
     fn label(self) -> &'static str {
         match self {
             Self::Install => "Install Runtime",
+            Self::Update => "Update Runtime",
             Self::Uninstall => "Uninstall Runtime",
         }
     }
@@ -290,6 +293,16 @@ struct RuntimeActionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeVersionState {
+    NotTracked,
+    Current(String),
+    UpdateAvailable {
+        installed: Option<String>,
+        available: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInstallSource {
     Packaged(PathBuf),
     DevelopmentScript(DevelopmentRuntimePackage),
@@ -301,6 +314,13 @@ struct DevelopmentRuntimePackage {
     destination_env: &'static str,
     destination_root: PathBuf,
     executable_path: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeManifestMetadata {
+    version: Option<String>,
+    sha256: Option<String>,
+    checksum: Option<String>,
 }
 
 fn model_action_state(
@@ -392,6 +412,15 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
     }
 
     if has_managed_runtime_install(config, provider) {
+        if runtime_needs_update(config, provider) && runtime_install_source(config, model).is_some()
+        {
+            return RuntimeActionState {
+                kind: RuntimeActionKind::Update,
+                enabled: true,
+                disabled_tooltip: None,
+            };
+        }
+
         return RuntimeActionState {
             kind: RuntimeActionKind::Uninstall,
             enabled: true,
@@ -432,6 +461,43 @@ fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstal
 
 fn has_managed_runtime_install(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
     resolve_managed_runtime_executable(config, provider).is_some()
+}
+
+fn runtime_needs_update(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
+    matches!(
+        runtime_version_state(config, provider),
+        RuntimeVersionState::UpdateAvailable { .. }
+    )
+}
+
+fn runtime_version_state(
+    config: &AppConfig,
+    provider: &stt::SttProviderAdapter,
+) -> RuntimeVersionState {
+    let Some(available) = runtime_catalog::runtime_version_for_runtime_id(provider.runtime_id)
+    else {
+        return RuntimeVersionState::NotTracked;
+    };
+    let Some(install) = config.managed_runtimes.get(provider.runtime_id) else {
+        return RuntimeVersionState::NotTracked;
+    };
+    let installed = install
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty());
+
+    match installed {
+        Some(version) if version == available => RuntimeVersionState::Current(version.to_owned()),
+        Some(version) => RuntimeVersionState::UpdateAvailable {
+            installed: Some(version.to_owned()),
+            available: available.to_owned(),
+        },
+        None => RuntimeVersionState::UpdateAvailable {
+            installed: None,
+            available: available.to_owned(),
+        },
+    }
 }
 
 fn resolve_managed_runtime_executable(
@@ -1595,7 +1661,7 @@ impl LocalTranscriberApp {
 
         self.config.managed_runtimes.insert(
             provider.runtime_id.to_owned(),
-            config::ManagedRuntimeInstall::app_managed(path, source_label),
+            managed_runtime_install_record(path, source_label),
         );
         self.save_config();
         self.refresh_playground_runtime_statuses();
@@ -1638,7 +1704,7 @@ impl LocalTranscriberApp {
         if let Some(path) = packaged_runtime_path(&self.config, model) {
             self.config.managed_runtimes.insert(
                 provider.runtime_id.to_owned(),
-                config::ManagedRuntimeInstall::app_managed(path, "packaged-runtime"),
+                managed_runtime_install_record(path, "packaged-runtime"),
             );
         }
     }
@@ -1976,6 +2042,10 @@ impl LocalTranscriberApp {
                                 &runtime_status.to_string(),
                                 runtime_chip_tone(&runtime_status),
                             );
+                            if let Some((label, tone)) = runtime_version_badge(&self.config, &model)
+                            {
+                                badge(ui, &label, tone);
+                            }
                             badge(
                                 ui,
                                 &format!("Runtime {}", runtime_storage_estimate(&model.backend)),
@@ -1989,7 +2059,9 @@ impl LocalTranscriberApp {
 
             if let Some((model, kind)) = runtime_action {
                 match kind {
-                    RuntimeActionKind::Install => self.install_runtime(&model),
+                    RuntimeActionKind::Install | RuntimeActionKind::Update => {
+                        self.install_runtime(&model)
+                    }
                     RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
                 }
             }
@@ -3986,7 +4058,10 @@ fn runtime_detail_text(
         ModelRuntimeStatus::Error(message) => message.clone(),
         _ => setup_message_for_status(status),
     };
-    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}")
+    let version = runtime_version_detail(config, model)
+        .map(|detail| format!(" {detail}"))
+        .unwrap_or_default();
+    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}{version}")
 }
 
 fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
@@ -4039,6 +4114,42 @@ fn runtime_storage_detail(backend: &str) -> &'static str {
     runtime_catalog::backend_spec(backend)
         .map(|spec| spec.runtime_storage_detail)
         .unwrap_or("varies")
+}
+
+fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(String, ChipTone)> {
+    let provider = stt::provider_for_backend(&model.backend)?;
+    match runtime_version_state(config, provider) {
+        RuntimeVersionState::NotTracked => None,
+        RuntimeVersionState::Current(version) => {
+            Some((format!("Version {version}"), ChipTone::Success))
+        }
+        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => {
+            Some(("Update available".to_owned(), ChipTone::Warning))
+        }
+        RuntimeVersionState::UpdateAvailable { .. } => {
+            Some(("Version unknown".to_owned(), ChipTone::Warning))
+        }
+    }
+}
+
+fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<String> {
+    let provider = stt::provider_for_backend(&model.backend)?;
+    match runtime_version_state(config, provider) {
+        RuntimeVersionState::NotTracked => None,
+        RuntimeVersionState::Current(version) => Some(format!("Runtime version: {version}.")),
+        RuntimeVersionState::UpdateAvailable {
+            installed: Some(installed),
+            available,
+        } => Some(format!(
+            "Runtime update available: installed {installed}, available {available}."
+        )),
+        RuntimeVersionState::UpdateAvailable {
+            installed: None,
+            available,
+        } => Some(format!(
+            "Runtime version is unknown; update to the packaged {available} runtime."
+        )),
+    }
 }
 
 fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<bool, String> {
@@ -4160,6 +4271,28 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
         ));
     }
     Ok(installed_executable)
+}
+
+fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::ManagedRuntimeInstall {
+    let mut install = config::ManagedRuntimeInstall::app_managed(path.clone(), source);
+    if let Some(metadata) = runtime_manifest_metadata(&path) {
+        install.version = metadata
+            .version
+            .map(|version| version.trim().to_owned())
+            .filter(|version| !version.is_empty());
+        install.sha256 = metadata
+            .sha256
+            .or(metadata.checksum)
+            .map(|sha256| sha256.trim().to_owned())
+            .filter(|sha256| !sha256.is_empty());
+    }
+    install
+}
+
+fn runtime_manifest_metadata(executable: &Path) -> Option<RuntimeManifestMetadata> {
+    let manifest = runtime_package_root(executable)?.join("runtime-manifest.json");
+    let contents = fs::read_to_string(manifest).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn installed_runtime_executable_usable(runtime_id: &str, executable: &Path) -> bool {
@@ -5210,6 +5343,15 @@ mod layout_tests {
         executable
     }
 
+    fn managed_runtime_with_version(
+        path: PathBuf,
+        version: Option<&str>,
+    ) -> config::ManagedRuntimeInstall {
+        let mut install = config::ManagedRuntimeInstall::new(path);
+        install.version = version.map(str::to_owned);
+        install
+    }
+
     #[test]
     fn model_action_state_matches_install_select_uninstall_rules() {
         let mut whisper = test_model();
@@ -5480,7 +5622,7 @@ mod layout_tests {
         fs::write(&whisper_runtime, b"whisper runtime").unwrap();
         config.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
-            config::ManagedRuntimeInstall::new(whisper_runtime),
+            managed_runtime_with_version(whisper_runtime, None),
         );
 
         assert_eq!(
@@ -5524,7 +5666,10 @@ mod layout_tests {
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
             "vosk".to_owned(),
-            config::ManagedRuntimeInstall::new(write_vosk_runtime(&runtime_root.join("vosk"))),
+            managed_runtime_with_version(
+                write_vosk_runtime(&runtime_root.join("vosk")),
+                Some("0.3.45"),
+            ),
         );
 
         assert_eq!(
@@ -5574,11 +5719,14 @@ mod layout_tests {
             config.managed_runtimes.clear();
             config.managed_runtimes.insert(
                 runtime_id.to_owned(),
-                config::ManagedRuntimeInstall::new(write_sherpa_family_runtime(
-                    &runtime_root.join(runtime_id),
-                    runtime_id,
-                    wrapper,
-                )),
+                managed_runtime_with_version(
+                    write_sherpa_family_runtime(
+                        &runtime_root.join(runtime_id),
+                        runtime_id,
+                        wrapper,
+                    ),
+                    Some("1.13.3"),
+                ),
             );
 
             assert_eq!(
@@ -5644,6 +5792,97 @@ mod layout_tests {
 
         assert_eq!(action.kind, RuntimeActionKind::Install);
         assert!(action.enabled);
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn runtime_version_state_detects_current_stale_and_unknown_installs() {
+        let provider = stt::provider_for_backend("Vosk").unwrap();
+        let mut config = AppConfig::default();
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.45")),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::Current("0.3.45".to_owned())
+        );
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.44")),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::UpdateAvailable {
+                installed: Some("0.3.44".to_owned()),
+                available: "0.3.45".to_owned(),
+            }
+        );
+
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), None),
+        );
+        assert_eq!(
+            runtime_version_state(&config, provider),
+            RuntimeVersionState::UpdateAvailable {
+                installed: None,
+                available: "0.3.45".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_action_state_offers_update_for_stale_version_when_source_exists() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+        let mut config = AppConfig::default();
+        let mut model = test_model();
+        model.id = "vosk_small_en".to_owned();
+        model.backend = "Vosk".to_owned();
+        model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(
+                write_vosk_runtime(&runtime_root.join("vosk")),
+                Some("0.3.44"),
+            ),
+        );
+
+        let action = runtime_action_state(&config, &model);
+
+        if runtime_install_source(&config, &model).is_some() {
+            assert_eq!(action.kind, RuntimeActionKind::Update);
+        } else {
+            assert_eq!(action.kind, RuntimeActionKind::Uninstall);
+        }
+        assert!(action.enabled);
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn managed_runtime_install_record_reads_manifest_metadata() {
+        let runtime_root =
+            std::env::temp_dir().join(format!("scribe-runtime-manifest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime_root);
+        let executable = runtime_root.join("bin").join("scribe-vosk");
+        let manifest = runtime_root.join("runtime-manifest.json");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"runtime").unwrap();
+        fs::write(
+            manifest,
+            r#"{"version":"0.3.45","sha256":"abc123","dependencies":{"vosk":"0.3.45"}}"#,
+        )
+        .unwrap();
+
+        let install = managed_runtime_install_record(executable, "packaged-runtime");
+
+        assert_eq!(install.version.as_deref(), Some("0.3.45"));
+        assert_eq!(install.sha256.as_deref(), Some("abc123"));
+        assert_eq!(install.source.as_deref(), Some("packaged-runtime"));
         let _ = fs::remove_dir_all(runtime_root);
     }
 

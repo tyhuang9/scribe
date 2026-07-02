@@ -28,6 +28,7 @@ pub struct DevelopmentRuntimeSpec {
 pub struct BackendSpec {
     pub backend: &'static str,
     pub runtime_id: &'static str,
+    pub runtime_version: Option<&'static str>,
     pub model_install_supported: bool,
     pub runtime_install_supported: bool,
     pub transcription_supported: bool,
@@ -54,6 +55,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "whisper.cpp",
         runtime_id: "whisper_cpp",
+        runtime_version: None,
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -70,6 +72,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "Vosk",
         runtime_id: "vosk",
+        runtime_version: Some("0.3.45"),
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -86,6 +89,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "sherpa-onnx",
         runtime_id: "sherpa_onnx",
+        runtime_version: Some("1.13.3"),
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -102,6 +106,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "faster-whisper",
         runtime_id: "faster_whisper",
+        runtime_version: Some("1.2.1"),
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -118,6 +123,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "Moonshine",
         runtime_id: "moonshine",
+        runtime_version: Some("1.13.3"),
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -134,6 +140,7 @@ const BACKENDS: &[BackendSpec] = &[
     BackendSpec {
         backend: "Parakeet",
         runtime_id: "parakeet",
+        runtime_version: Some("1.13.3"),
         model_install_supported: true,
         runtime_install_supported: true,
         transcription_supported: true,
@@ -203,6 +210,10 @@ pub fn runtime_id_for_backend(backend: &str) -> String {
         .unwrap_or_else(|| slug_runtime_id(backend))
 }
 
+pub fn runtime_version_for_runtime_id(runtime_id: &str) -> Option<&'static str> {
+    backend_spec_for_runtime_id(runtime_id).and_then(|spec| spec.runtime_version)
+}
+
 pub fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> {
     backend_spec_for_runtime_id(runtime_id).and_then(|spec| spec.development_runtime)
 }
@@ -244,6 +255,7 @@ fn slug_runtime_id(backend: &str) -> String {
 mod tests {
     use super::*;
     use crate::models;
+    use std::collections::HashMap;
 
     #[test]
     fn catalog_backends_have_registry_specs() {
@@ -261,6 +273,46 @@ mod tests {
         assert_eq!(runtime_id_for_backend("whisper.cpp"), "whisper_cpp");
         assert_eq!(runtime_id_for_backend("sherpa-onnx"), "sherpa_onnx");
         assert_eq!(runtime_id_for_backend("faster-whisper"), "faster_whisper");
+    }
+
+    #[test]
+    fn runtime_versions_follow_script_dependency_defaults() {
+        let defaults = dependency_defaults();
+
+        assert_eq!(
+            runtime_version_for_runtime_id("faster_whisper"),
+            defaults
+                .get("SCRIBE_FASTER_WHISPER_VERSION_DEFAULT")
+                .map(String::as_str)
+        );
+        assert_eq!(
+            runtime_version_for_runtime_id("vosk"),
+            defaults
+                .get("SCRIBE_VOSK_VERSION_DEFAULT")
+                .map(String::as_str)
+        );
+        for runtime_id in ["sherpa_onnx", "moonshine", "parakeet"] {
+            assert_eq!(
+                runtime_version_for_runtime_id(runtime_id),
+                defaults
+                    .get("SCRIBE_SHERPA_ONNX_VERSION_DEFAULT")
+                    .map(String::as_str)
+            );
+        }
+    }
+
+    fn dependency_defaults() -> HashMap<String, String> {
+        include_str!("../scripts/runtime-dependencies.env")
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_owned(), value.to_owned()))
+            })
+            .collect()
     }
 
     #[test]
