@@ -84,6 +84,7 @@ pub struct ManagedRuntimeInstall {
 }
 
 impl ManagedModelInstall {
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -103,6 +104,7 @@ impl ManagedModelInstall {
 }
 
 impl ManagedRuntimeInstall {
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
