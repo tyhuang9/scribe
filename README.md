@@ -135,10 +135,13 @@ Managed model files live under the app data `models` directory. Managed runtime 
 
 Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, `SCRIBE_VOSK_CLI`, `SCRIBE_SHERPA_ONNX_CLI`, `SCRIBE_MOONSHINE_CLI`, or `SCRIBE_PARAKEET_CLI` as fallback runtime paths.
 
-When running from a source checkout on Unix, the Models page can also use the
-checked-in `scripts/bundle-*-runtime.sh` helpers as a development fallback. If a
-packaged sidecar is not already staged, clicking `Install runtime` builds the
-runtime directly into Scribe's managed app-data runtime directory.
+When running a debug build from a source checkout on Unix, the Models page can
+also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
+fallback. If a packaged sidecar is not already staged, clicking `Install
+runtime` builds the runtime directly into Scribe's managed app-data runtime
+directory. Release builds do not use source-checkout scripts unless
+`SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit development or smoke
+testing.
 
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
@@ -158,7 +161,7 @@ The release bundle places whisper.cpp files under
 `target/release/runtimes/faster_whisper`, `target/release/runtimes/vosk`,
 `target/release/runtimes/sherpa_onnx`, `target/release/runtimes/moonshine`,
 and `target/release/runtimes/parakeet`. These are the same locations the app
-checks before falling back to user-managed or development runtime paths. Set
+checks before falling back to user-managed runtime paths. Set
 `SCRIBE_SKIP_FASTER_WHISPER=1`, `SCRIBE_SKIP_VOSK=1`,
 `SCRIBE_SKIP_SHERPA_ONNX=1`, `SCRIBE_SKIP_MOONSHINE=1`, or
 `SCRIBE_SKIP_PARAKEET=1` to omit a generated Python sidecar from a release

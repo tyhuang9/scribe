@@ -410,7 +410,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
             kind: RuntimeActionKind::Install,
             enabled: false,
             disabled_tooltip: Some(format!(
-                "No packaged {} runtime or local bundle script was found. Install a build that bundles this runtime.",
+                "No packaged {} runtime was found. Install a build that bundles this runtime.",
                 model.backend
             )),
         }
@@ -502,6 +502,9 @@ fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
     if !cfg!(unix) {
         return None;
     }
+    if !development_runtime_installs_enabled() {
+        return None;
+    }
 
     let mut roots = Vec::new();
     if let Ok(executable) = env::current_exe()
@@ -525,6 +528,25 @@ fn find_development_bundle_script(script_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn development_runtime_installs_enabled() -> bool {
+    let opt_in = env::var("SCRIBE_ALLOW_DEV_RUNTIME_INSTALL").ok();
+    development_runtime_installs_enabled_for(cfg!(debug_assertions), opt_in.as_deref())
+}
+
+fn development_runtime_installs_enabled_for(
+    debug_assertions: bool,
+    opt_in_value: Option<&str>,
+) -> bool {
+    debug_assertions || opt_in_value.is_some_and(env_flag_value_enabled)
+}
+
+fn env_flag_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub struct LocalTranscriberApp {
@@ -1545,7 +1567,7 @@ impl LocalTranscriberApp {
         let Some(source) = runtime_install_source(&self.config, model) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!(
-                "No packaged {} runtime or local bundle script was found in this build.",
+                "No packaged {} runtime was found in this build.",
                 model.backend
             );
             return;
@@ -5554,6 +5576,18 @@ mod layout_tests {
         assert_eq!(action.kind, RuntimeActionKind::Install);
         assert!(action.enabled);
         let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn development_runtime_installs_require_debug_build_or_opt_in() {
+        assert!(development_runtime_installs_enabled_for(true, None));
+        assert!(!development_runtime_installs_enabled_for(false, None));
+        assert!(development_runtime_installs_enabled_for(false, Some("1")));
+        assert!(development_runtime_installs_enabled_for(
+            false,
+            Some("true")
+        ));
+        assert!(!development_runtime_installs_enabled_for(false, Some("0")));
     }
 
     #[cfg(unix)]
