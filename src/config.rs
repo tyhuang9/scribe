@@ -220,7 +220,7 @@ impl Default for AppConfig {
             debug_mode: false,
             max_recording_seconds: 30,
             close_to_tray: true,
-            auto_insert_transcript: true,
+            auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
             paste_delay_ms: default_paste_delay_ms(),
         }
@@ -794,6 +794,7 @@ mod tests {
 
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
+        assert!(!config.auto_insert_transcript);
     }
 
     #[test]

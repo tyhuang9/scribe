@@ -2294,24 +2294,26 @@ impl LocalTranscriberApp {
                     self.config.auto_insert_transcript = auto_insert;
                     self.save_config();
                 }
-                let mut restore_clipboard = self.config.restore_clipboard_after_insert;
-                if ui
-                    .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                    .changed()
-                {
-                    self.config.restore_clipboard_after_insert = restore_clipboard;
-                    self.save_config();
-                }
-                let mut paste_delay = self.config.paste_delay_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Paste delay ms");
+                ui.add_enabled_ui(self.config.auto_insert_transcript, |ui| {
+                    let mut restore_clipboard = self.config.restore_clipboard_after_insert;
                     if ui
-                        .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                        .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
                         .changed()
                     {
-                        self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                        self.config.restore_clipboard_after_insert = restore_clipboard;
                         self.save_config();
                     }
+                    let mut paste_delay = self.config.paste_delay_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Paste delay ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                            .changed()
+                        {
+                            self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                            self.save_config();
+                        }
+                    });
                 });
             });
 
