@@ -76,6 +76,25 @@ Use the in-app Start/Stop button, or opt in explicitly:
 SCRIBE_ENABLE_GLOBAL_HOTKEY=1 cargo run
 ```
 
+## Permissions And Input Automation
+
+Scribe should ask for OS-sensitive behavior at the feature level, not during
+runtime/model installation. New configs keep focused-app insertion disabled
+until the user enables it in Settings. Linux global hotkeys remain opt-in with
+`SCRIBE_ENABLE_GLOBAL_HOTKEY=1`.
+
+| Capability | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Microphone capture | Desktop/session prompt depends on the audio stack. | Requires macOS Microphone privacy access. | Uses the normal desktop audio capture path; no installer permission is expected. |
+| Global hotkeys | Disabled by default. A future Wayland-native path should use the [XDG Global Shortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html). | May require Input Monitoring depending on the global-hotkey backend and OS version. | Uses the system-wide [`RegisterHotKey`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey) API; no installer permission prompt is expected. |
+| Clipboard access | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. |
+| Focused-app insertion | Uses clipboard plus paste automation; Wayland falls back to clipboard-only. A portal-based input path would belong behind the [XDG Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html). | Requires user-granted Accessibility access when macOS blocks synthetic input. | Uses paste-key automation through [`SendInput`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput); it cannot reliably inject into higher-integrity/elevated apps. |
+
+Relevant Apple controls live in Privacy & Security, including
+[Microphone](https://support.apple.com/guide/mac-help/change-privacy-security-settings-on-mac-mchl211c911f/mac),
+Input Monitoring, and
+[Accessibility](https://support.apple.com/guide/mac-help/allow-accessibility-apps-to-access-your-mac-mh43185/mac).
+
 ## Run
 
 ```bash
