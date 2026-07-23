@@ -5352,19 +5352,19 @@ mod layout_tests {
     }
 
     fn expected_runtime_install_action(backend: &str) -> RuntimeActionState {
-        if cfg!(windows) {
+        if cfg!(unix) {
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        } else {
             RuntimeActionState {
                 kind: RuntimeActionKind::Install,
                 enabled: false,
                 disabled_tooltip: Some(format!(
                     "No packaged {backend} runtime was found. Install a build that bundles this runtime."
                 )),
-            }
-        } else {
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: true,
-                disabled_tooltip: None,
             }
         }
     }
