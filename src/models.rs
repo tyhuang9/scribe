@@ -28,8 +28,10 @@ pub enum ModelInstallStatus {
         #[serde(default)]
         bytes_per_second: Option<u64>,
     },
+    InstallingRuntime,
     Installed,
     Missing,
+    RuntimeError(String),
     Error(String),
 }
 
@@ -59,8 +61,10 @@ impl ModelInstallStatus {
                     None => progress,
                 }
             }
+            Self::InstallingRuntime => "Preparing backend runtime".to_owned(),
             Self::Installed => "Installed".to_owned(),
             Self::Missing => "Missing file".to_owned(),
+            Self::RuntimeError(message) => format!("Runtime error: {message}"),
             Self::Error(message) => format!("Error: {message}"),
         }
     }
@@ -499,6 +503,10 @@ mod tests {
         assert_eq!(status.label(), "Downloading 25%");
         assert!(ModelInstallStatus::Installed.is_runnable());
         assert!(!ModelInstallStatus::NotInstalled.is_runnable());
+        assert_eq!(
+            ModelInstallStatus::InstallingRuntime.label(),
+            "Preparing backend runtime"
+        );
     }
 
     #[test]

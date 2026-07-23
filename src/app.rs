@@ -5,7 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -211,6 +211,16 @@ enum AppEvent {
         model_id: String,
         message: String,
     },
+    RuntimeInstallDone {
+        runtime_id: String,
+        backend: String,
+        replacement: RuntimeReplacement,
+        source_label: &'static str,
+    },
+    RuntimeInstallFailed {
+        runtime_id: String,
+        message: String,
+    },
 }
 
 fn send_model_download_progress(
@@ -245,6 +255,7 @@ enum ModelPrimaryAction {
     Install,
     Retry,
     Installing,
+    Repair,
     Select,
     Active,
 }
@@ -255,6 +266,7 @@ impl ModelPrimaryAction {
             Self::Install => "Install",
             Self::Retry => "Retry",
             Self::Installing => "Installing",
+            Self::Repair => "Repair",
             Self::Select => "Select",
             Self::Active => "Active",
         }
@@ -268,13 +280,31 @@ enum RuntimeActionKind {
     Uninstall,
 }
 
-impl RuntimeActionKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Install => "Install Runtime",
-            Self::Update => "Update Runtime",
-            Self::Uninstall => "Uninstall Runtime",
+fn runtime_action_label(kind: RuntimeActionKind, backend: &str, busy: bool) -> String {
+    if busy {
+        return format!("Preparing {backend} runtime");
+    }
+    let action = match kind {
+        RuntimeActionKind::Install => "Install",
+        RuntimeActionKind::Update => "Update",
+        RuntimeActionKind::Uninstall => "Remove",
+    };
+    format!("{action} {backend} runtime")
+}
+
+fn model_primary_action_label(
+    action: ModelPrimaryAction,
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+) -> String {
+    match action {
+        ModelPrimaryAction::Repair => format!("Repair {} runtime", model.backend),
+        ModelPrimaryAction::Installing
+            if matches!(install_status, ModelInstallStatus::InstallingRuntime) =>
+        {
+            format!("Preparing {} runtime", model.backend)
         }
+        _ => action.label().to_owned(),
     }
 }
 
@@ -290,6 +320,122 @@ struct RuntimeActionState {
     kind: RuntimeActionKind,
     enabled: bool,
     disabled_tooltip: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RuntimeInstallJob {
+    download_model_ids: Vec<String>,
+    repair_model_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeConsumerActivity {
+    recording: bool,
+    transcribing: bool,
+    playground_jobs: bool,
+    model_download: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimePersistenceTransition {
+    Persisted(RuntimeInstallJob),
+    Failed {
+        job: RuntimeInstallJob,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeJobIntent {
+    DownloadModel(String),
+    RepairModel(String),
+    Maintenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeReplacement {
+    installed_path: PathBuf,
+    target_root: PathBuf,
+    backup_root: Option<PathBuf>,
+}
+
+fn queue_runtime_model(model_ids: &mut Vec<String>, model_id: String) -> bool {
+    if model_ids.iter().any(|queued| queued == &model_id) {
+        false
+    } else {
+        model_ids.push(model_id);
+        true
+    }
+}
+
+fn apply_runtime_record(
+    config: &mut AppConfig,
+    runtime_id: &str,
+    install: config::ManagedRuntimeInstall,
+) -> Option<config::ManagedRuntimeInstall> {
+    config
+        .managed_runtimes
+        .insert(runtime_id.to_owned(), install)
+}
+
+fn rollback_runtime_record(
+    config: &mut AppConfig,
+    runtime_id: &str,
+    previous: Option<config::ManagedRuntimeInstall>,
+) {
+    match previous {
+        Some(install) => {
+            config
+                .managed_runtimes
+                .insert(runtime_id.to_owned(), install);
+        }
+        None => {
+            config.managed_runtimes.remove(runtime_id);
+        }
+    }
+}
+
+fn persist_runtime_install(
+    config: &mut AppConfig,
+    runtime_id: &str,
+    install: config::ManagedRuntimeInstall,
+    job: RuntimeInstallJob,
+    persist: impl FnOnce(&AppConfig) -> Result<(), String>,
+) -> RuntimePersistenceTransition {
+    let previous_runtime = apply_runtime_record(config, runtime_id, install);
+    config::normalize_config(config);
+    match persist(config) {
+        Ok(()) => RuntimePersistenceTransition::Persisted(job),
+        Err(err) => {
+            rollback_runtime_record(config, runtime_id, previous_runtime);
+            RuntimePersistenceTransition::Failed {
+                job,
+                message: format!("Failed to persist the installed runtime: {err}"),
+            }
+        }
+    }
+}
+
+fn runtime_metadata_matches(
+    config: &AppConfig,
+    runtime_id: &str,
+    install: &config::ManagedRuntimeInstall,
+) -> bool {
+    config.managed_runtimes.get(runtime_id) == Some(install)
+}
+
+fn missing_runtime_source_message(backend: &str) -> String {
+    format!(
+        "This build does not include the {backend} backend runtime. Install a packaged or staged build that includes it."
+    )
+}
+
+fn should_activate_installed_model(active_model_is_runnable: bool) -> bool {
+    !active_model_is_runnable
+}
+
+fn runtime_needs_preparation(status: &ModelRuntimeStatus) -> bool {
+    status != &ModelRuntimeStatus::Ready
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,30 +469,49 @@ struct RuntimeManifestMetadata {
     checksum: Option<String>,
 }
 
+#[cfg(test)]
 fn model_action_state(
     model: &SttModelInfo,
     install_status: &ModelInstallStatus,
     selected: bool,
 ) -> ModelActionState {
+    model_action_state_with_runtime(model, install_status, selected, true)
+}
+
+fn model_action_state_with_runtime(
+    model: &SttModelInfo,
+    install_status: &ModelInstallStatus,
+    selected: bool,
+    runtime_ready: bool,
+) -> ModelActionState {
     match install_status {
         ModelInstallStatus::Installed => ModelActionState {
-            primary: if selected {
+            primary: if !runtime_ready {
+                ModelPrimaryAction::Repair
+            } else if selected {
                 ModelPrimaryAction::Active
             } else {
                 ModelPrimaryAction::Select
             },
-            primary_enabled: !selected,
+            primary_enabled: !selected || !runtime_ready,
             show_uninstall: supports_managed_uninstall(model, install_status),
         },
-        ModelInstallStatus::Downloading { .. } => ModelActionState {
-            primary: ModelPrimaryAction::Installing,
-            primary_enabled: false,
-            show_uninstall: false,
-        },
+        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
+            ModelActionState {
+                primary: ModelPrimaryAction::Installing,
+                primary_enabled: false,
+                show_uninstall: false,
+            }
+        }
         ModelInstallStatus::Error(_) => ModelActionState {
             primary: ModelPrimaryAction::Retry,
             primary_enabled: supports_managed_install(model),
             show_uninstall: false,
+        },
+        ModelInstallStatus::RuntimeError(_) => ModelActionState {
+            primary: ModelPrimaryAction::Repair,
+            primary_enabled: true,
+            show_uninstall: true,
         },
         ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => ModelActionState {
             primary: ModelPrimaryAction::Install,
@@ -370,7 +535,7 @@ fn model_primary_disabled_tooltip(
         ModelPrimaryAction::Active if selected => {
             Some("This model is already the active transcription model.".to_owned())
         }
-        ModelPrimaryAction::Installing => Some("This model is still downloading.".to_owned()),
+        ModelPrimaryAction::Installing => Some("This model is still being installed.".to_owned()),
         ModelPrimaryAction::Install | ModelPrimaryAction::Retry
             if !supports_managed_install(model) =>
         {
@@ -384,6 +549,12 @@ fn model_primary_disabled_tooltip(
             _ => Some("Retry is not available for this model.".to_owned()),
         },
         ModelPrimaryAction::Select => Some("Install this model before selecting it.".to_owned()),
+        ModelPrimaryAction::Repair => match install_status {
+            ModelInstallStatus::RuntimeError(message) => {
+                Some(format!("Runtime repair failed: {message}"))
+            }
+            _ => Some("The backend runtime is not ready for this installed model.".to_owned()),
+        },
         ModelPrimaryAction::Install => {
             Some("This model does not have a managed installer.".to_owned())
         }
@@ -391,7 +562,103 @@ fn model_primary_disabled_tooltip(
     }
 }
 
+#[cfg(test)]
 fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
+    runtime_action_state_with_busy(config, model, false)
+}
+
+#[cfg(test)]
+fn runtime_action_state_with_busy(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    busy: bool,
+) -> RuntimeActionState {
+    runtime_action_state_with_activity(config, model, busy, RuntimeConsumerActivity::default())
+}
+
+fn runtime_action_state_with_activity(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    busy: bool,
+    activity: RuntimeConsumerActivity,
+) -> RuntimeActionState {
+    let state = runtime_action_state_inner(config, model);
+    restrict_runtime_action(state, &model.backend, busy, activity)
+}
+
+fn restrict_runtime_action(
+    mut state: RuntimeActionState,
+    backend: &str,
+    busy: bool,
+    activity: RuntimeConsumerActivity,
+) -> RuntimeActionState {
+    if busy {
+        state.enabled = false;
+        state.disabled_tooltip = Some(format!(
+            "The shared {} runtime is already being prepared.",
+            backend
+        ));
+    } else if matches!(
+        state.kind,
+        RuntimeActionKind::Update | RuntimeActionKind::Uninstall
+    ) && let Some(reason) = runtime_consumer_block_reason(backend, activity)
+    {
+        state.enabled = false;
+        state.disabled_tooltip = Some(reason);
+    }
+    state
+}
+
+fn runtime_consumer_block_reason(
+    backend: &str,
+    activity: RuntimeConsumerActivity,
+) -> Option<String> {
+    if activity.recording {
+        Some(format!(
+            "Stop the active recording before changing the shared {backend} runtime."
+        ))
+    } else if activity.transcribing {
+        Some(format!(
+            "Wait for transcription to finish before changing the shared {backend} runtime."
+        ))
+    } else if activity.playground_jobs {
+        Some(format!(
+            "Wait for Playground jobs to finish before changing the shared {backend} runtime."
+        ))
+    } else if activity.model_download {
+        Some(format!(
+            "Wait for the {backend} model download to finish before changing its runtime."
+        ))
+    } else {
+        None
+    }
+}
+
+fn model_download_uses_runtime(
+    config: &AppConfig,
+    model_downloads: &HashMap<String, ModelInstallStatus>,
+    runtime_id: &str,
+) -> bool {
+    config::configured_models(config).into_iter().any(|model| {
+        matches!(
+            model_downloads.get(&model.id),
+            Some(ModelInstallStatus::Downloading { .. })
+        ) && stt::provider_for_backend(&model.backend)
+            .is_some_and(|provider| provider.runtime_id == runtime_id)
+    })
+}
+
+fn apply_runtime_uninstall_result(
+    config: &mut AppConfig,
+    runtime_id: &str,
+    removal: Result<bool, String>,
+) -> Result<bool, String> {
+    let removed_files = removal?;
+    config.managed_runtimes.remove(runtime_id);
+    Ok(removed_files)
+}
+
+fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
     let Some(provider) = stt::provider_for_backend(&model.backend) else {
         return RuntimeActionState {
             kind: RuntimeActionKind::Install,
@@ -411,9 +678,22 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
         };
     }
 
+    runtime_action_state_for_source(
+        config,
+        model,
+        provider,
+        runtime_install_source(config, model).is_some(),
+    )
+}
+
+fn runtime_action_state_for_source(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    provider: &stt::SttProviderAdapter,
+    source_available: bool,
+) -> RuntimeActionState {
     if has_managed_runtime_install(config, provider) {
-        if runtime_needs_update(config, provider) && runtime_install_source(config, model).is_some()
-        {
+        if runtime_needs_update(config, provider) && source_available {
             return RuntimeActionState {
                 kind: RuntimeActionKind::Update,
                 enabled: true,
@@ -428,7 +708,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
         };
     }
 
-    if runtime_install_source(config, model).is_some() {
+    if source_available {
         RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: true,
@@ -438,10 +718,7 @@ fn runtime_action_state(config: &AppConfig, model: &SttModelInfo) -> RuntimeActi
         RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
-            disabled_tooltip: Some(format!(
-                "No packaged {} runtime was found. Install a build that bundles this runtime.",
-                model.backend
-            )),
+            disabled_tooltip: Some(missing_runtime_source_message(&model.backend)),
         }
     }
 }
@@ -541,11 +818,46 @@ fn runtime_install_source(
     config: &AppConfig,
     model: &SttModelInfo,
 ) -> Option<RuntimeInstallSource> {
-    packaged_runtime_path(config, model)
+    runtime_install_source_from_candidates(
+        config,
+        model,
+        packaged_runtime_path(config, model),
+        development_runtime_package(config, model),
+    )
+}
+
+fn runtime_install_source_from_candidates(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    packaged: Option<PathBuf>,
+    development: Option<DevelopmentRuntimePackage>,
+) -> Option<RuntimeInstallSource> {
+    packaged
+        .filter(|path| runtime_source_is_staged(config, model, path))
         .map(RuntimeInstallSource::Packaged)
-        .or_else(|| {
-            development_runtime_package(config, model).map(RuntimeInstallSource::DevelopmentScript)
-        })
+        .or_else(|| development.map(RuntimeInstallSource::DevelopmentScript))
+}
+
+fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Path) -> bool {
+    if path_is_within(path, &config::runtime_storage_dir()) {
+        return false;
+    }
+
+    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        return false;
+    };
+    let Some(current) = config.managed_runtimes.get(provider.runtime_id) else {
+        return true;
+    };
+
+    runtime_package_root(path) != runtime_package_root(&current.path)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => path.starts_with(root),
+    }
 }
 
 fn development_runtime_package(
@@ -628,6 +940,7 @@ pub struct LocalTranscriberApp {
     audio_devices: Vec<String>,
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
+    runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -670,6 +983,7 @@ impl LocalTranscriberApp {
             audio_devices: Vec::new(),
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
+            runtime_jobs: HashMap::new(),
             playground_cards: cards_from_config(&config),
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
@@ -779,10 +1093,13 @@ impl LocalTranscriberApp {
                 self.status,
                 TranscriptionStatus::Listening | TranscriptionStatus::Transcribing
             )
-            || self
-                .model_downloads
-                .values()
-                .any(|status| matches!(status, ModelInstallStatus::Downloading { .. }))
+            || self.model_downloads.values().any(|status| {
+                matches!(
+                    status,
+                    ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
+                )
+            })
+            || !self.runtime_jobs.is_empty()
     }
 
     fn apply_playground_action(&mut self, action: PlaygroundAction) {
@@ -1155,11 +1472,20 @@ impl LocalTranscriberApp {
                         .into_iter()
                         .find(|model| model.id == model_id)
                     {
+                        let active_model_is_runnable =
+                            self.selected_model().is_some_and(|active| {
+                                runtime_status_for_model(&self.config, &active)
+                                    == ModelRuntimeStatus::Ready
+                            });
                         self.config.managed_models.insert(
                             model_id.clone(),
                             config::ManagedModelInstall::app_managed(path, "managed-download"),
                         );
-                        self.record_packaged_runtime_metadata(&model);
+                        set_model_enabled(&mut self.config, &model_id, true);
+                        if should_activate_installed_model(active_model_is_runnable) {
+                            self.config.selected_default_model = model_id.clone();
+                            self.config.last_used_backend = model.backend;
+                        }
                     }
                     self.save_config();
                     self.status = TranscriptionStatus::Idle;
@@ -1181,6 +1507,80 @@ impl LocalTranscriberApp {
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Download failed: {message}");
                 }
+                AppEvent::RuntimeInstallDone {
+                    runtime_id,
+                    backend,
+                    replacement,
+                    source_label,
+                } => {
+                    let installed_path = replacement.installed_path.clone();
+                    let new_runtime = managed_runtime_install_record(installed_path, source_label);
+                    let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
+                    let job = match persist_runtime_install(
+                        &mut self.config,
+                        &runtime_id,
+                        new_runtime.clone(),
+                        job,
+                        |config| config::save_config(config).map_err(|err| err.to_string()),
+                    ) {
+                        RuntimePersistenceTransition::Persisted(job) => job,
+                        RuntimePersistenceTransition::Failed { job, message } => {
+                            let rollback_message = match replacement.rollback() {
+                                Ok(()) => message,
+                                Err(rollback_err) => format!("{message}. {rollback_err}"),
+                            };
+                            for model_id in job.download_model_ids {
+                                self.model_downloads.insert(
+                                    model_id,
+                                    ModelInstallStatus::Error(rollback_message.clone()),
+                                );
+                            }
+                            for model_id in job.repair_model_ids {
+                                self.model_downloads.insert(
+                                    model_id,
+                                    ModelInstallStatus::RuntimeError(rollback_message.clone()),
+                                );
+                            }
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = rollback_message;
+                            continue;
+                        }
+                    };
+                    let cleanup_warning = replacement.commit().err();
+                    if self.config_path.is_none() {
+                        self.config_path = config::config_file_path().ok();
+                    }
+                    debug_assert!(runtime_metadata_matches(
+                        &self.config,
+                        &runtime_id,
+                        &new_runtime,
+                    ));
+                    self.refresh_playground_runtime_statuses();
+                    for model_id in job.repair_model_ids {
+                        self.model_downloads.remove(&model_id);
+                    }
+                    for model_id in job.download_model_ids {
+                        if let Some(model) = config::configured_models(&self.config)
+                            .into_iter()
+                            .find(|model| model.id == model_id)
+                        {
+                            self.start_model_download_only(&model);
+                        }
+                    }
+                    self.status = TranscriptionStatus::Idle;
+                    self.status_message = cleanup_warning.map_or_else(
+                        || format!("{backend} runtime is ready."),
+                        |warning| {
+                            format!(
+                                "{backend} runtime is ready. Old runtime backup cleanup warning: {warning}"
+                            )
+                        },
+                    );
+                }
+                AppEvent::RuntimeInstallFailed {
+                    runtime_id,
+                    message,
+                } => self.fail_runtime_job(&runtime_id, message),
             }
         }
     }
@@ -1466,7 +1866,37 @@ impl LocalTranscriberApp {
             .unwrap_or_else(|| model.install_status.clone())
     }
 
+    fn runtime_consumer_activity(&self, runtime_id: &str) -> RuntimeConsumerActivity {
+        RuntimeConsumerActivity {
+            recording: self.active_recording.is_some(),
+            transcribing: self.status == TranscriptionStatus::Transcribing,
+            playground_jobs: self.playground_pending > 0,
+            model_download: model_download_uses_runtime(
+                &self.config,
+                &self.model_downloads,
+                runtime_id,
+            ),
+        }
+    }
+
     fn start_model_download(&mut self, model: &SttModelInfo) {
+        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+            self.fail_model_install(
+                &model.id,
+                format!("{} is not a supported STT backend.", model.backend),
+            );
+            return;
+        };
+
+        if !runtime_needs_preparation(&provider.runtime_status(&self.config)) {
+            self.start_model_download_only(model);
+            return;
+        }
+
+        self.request_runtime_install(model, RuntimeJobIntent::DownloadModel(model.id.clone()));
+    }
+
+    fn start_model_download_only(&mut self, model: &SttModelInfo) {
         let Some(download_model) = model.download_model.clone() else {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!("{} does not have a supported download.", model.name);
@@ -1601,6 +2031,7 @@ impl LocalTranscriberApp {
         self.model_downloads.remove(&model.id);
         self.config.managed_models.remove(&model.id);
         self.config.model_paths.remove(&model.id);
+        set_model_enabled(&mut self.config, &model.id, false);
 
         if self.config.selected_default_model == model.id {
             select_first_installed_model(&mut self.config);
@@ -1615,7 +2046,7 @@ impl LocalTranscriberApp {
         };
     }
 
-    fn install_runtime(&mut self, model: &SttModelInfo) {
+    fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
         let Some(provider) = stt::provider_for_backend(&model.backend) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!("{} is not a supported STT backend.", model.backend);
@@ -1632,41 +2063,118 @@ impl LocalTranscriberApp {
         }
 
         let Some(source) = runtime_install_source(&self.config, model) else {
+            let message = missing_runtime_source_message(&model.backend);
+            match intent {
+                RuntimeJobIntent::DownloadModel(model_id) => {
+                    self.model_downloads
+                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                }
+                RuntimeJobIntent::RepairModel(model_id) => {
+                    self.model_downloads
+                        .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
+                }
+                RuntimeJobIntent::Maintenance => {}
+            }
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!(
-                "No packaged {} runtime was found in this build.",
-                model.backend
-            );
+            self.status_message = message;
             return;
         };
 
-        let (path, source_label) = match source {
-            RuntimeInstallSource::Packaged(packaged_path) => (
-                install_runtime_files(provider.runtime_id, &packaged_path),
-                "packaged-runtime",
-            ),
-            RuntimeInstallSource::DevelopmentScript(package) => (
-                build_development_runtime_package(provider.runtime_id, &model.backend, package),
-                "development-script",
-            ),
-        };
-        let path = match path {
-            Ok(path) => path,
-            Err(message) => {
-                self.status = TranscriptionStatus::Error;
-                self.status_message = message;
-                return;
+        if let Some(job) = self.runtime_jobs.get_mut(provider.runtime_id) {
+            let queued_model_id = match intent {
+                RuntimeJobIntent::DownloadModel(model_id) => {
+                    queue_runtime_model(&mut job.download_model_ids, model_id.clone())
+                        .then_some(model_id)
+                }
+                RuntimeJobIntent::RepairModel(model_id) => {
+                    queue_runtime_model(&mut job.repair_model_ids, model_id.clone())
+                        .then_some(model_id)
+                }
+                RuntimeJobIntent::Maintenance => None,
+            };
+            if let Some(model_id) = queued_model_id {
+                self.model_downloads
+                    .insert(model_id, ModelInstallStatus::InstallingRuntime);
             }
-        };
+            return;
+        }
 
-        self.config.managed_runtimes.insert(
-            provider.runtime_id.to_owned(),
-            managed_runtime_install_record(path, source_label),
-        );
-        self.save_config();
-        self.refresh_playground_runtime_statuses();
+        let mut job = RuntimeInstallJob::default();
+        let queued_model_id = match intent {
+            RuntimeJobIntent::DownloadModel(model_id) => {
+                queue_runtime_model(&mut job.download_model_ids, model_id.clone());
+                Some(model_id)
+            }
+            RuntimeJobIntent::RepairModel(model_id) => {
+                queue_runtime_model(&mut job.repair_model_ids, model_id.clone());
+                Some(model_id)
+            }
+            RuntimeJobIntent::Maintenance => None,
+        };
+        if let Some(model_id) = queued_model_id {
+            self.model_downloads
+                .insert(model_id.clone(), ModelInstallStatus::InstallingRuntime);
+        }
+        self.runtime_jobs
+            .insert(provider.runtime_id.to_owned(), job);
         self.status = TranscriptionStatus::Idle;
-        self.status_message = format!("Installed {} runtime.", model.backend);
+        self.status_message = format!("Preparing {} runtime...", model.backend);
+
+        let tx = self.tx.clone();
+        let runtime_id = provider.runtime_id.to_owned();
+        let backend = model.backend.clone();
+        thread::spawn(move || {
+            let (result, source_label) = match source {
+                RuntimeInstallSource::Packaged(packaged_path) => (
+                    install_runtime_files(&runtime_id, &packaged_path),
+                    "packaged-runtime",
+                ),
+                RuntimeInstallSource::DevelopmentScript(package) => (
+                    build_development_runtime_package(&runtime_id, &backend, package),
+                    "development-script",
+                ),
+            };
+            match result {
+                Ok(replacement) => {
+                    let _ = tx.send(AppEvent::RuntimeInstallDone {
+                        runtime_id,
+                        backend,
+                        replacement,
+                        source_label,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(AppEvent::RuntimeInstallFailed {
+                        runtime_id,
+                        message,
+                    });
+                }
+            }
+        });
+    }
+
+    fn fail_model_install(&mut self, model_id: &str, message: String) {
+        self.model_downloads.insert(
+            model_id.to_owned(),
+            ModelInstallStatus::Error(message.clone()),
+        );
+        self.status = TranscriptionStatus::Error;
+        self.status_message = message;
+    }
+
+    fn fail_runtime_job(&mut self, runtime_id: &str, message: String) {
+        if let Some(job) = self.runtime_jobs.remove(runtime_id) {
+            for model_id in job.download_model_ids {
+                self.model_downloads
+                    .insert(model_id, ModelInstallStatus::Error(message.clone()));
+            }
+            for model_id in job.repair_model_ids {
+                self.model_downloads
+                    .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
+            }
+        }
+        self.status = TranscriptionStatus::Error;
+        self.status_message = format!("Runtime installation failed: {message}");
     }
 
     fn uninstall_runtime(&mut self, model: &SttModelInfo) {
@@ -1677,35 +2185,28 @@ impl LocalTranscriberApp {
         };
 
         let removal = uninstall_runtime_files(&self.config, provider.runtime_id);
-        self.config.managed_runtimes.remove(provider.runtime_id);
+        let removed_files =
+            match apply_runtime_uninstall_result(&mut self.config, provider.runtime_id, removal) {
+                Ok(removed_files) => removed_files,
+                Err(message) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        format!("Could not uninstall {} runtime. {message}", model.backend);
+                    return;
+                }
+            };
         self.save_config();
         self.refresh_playground_runtime_statuses();
         self.status = TranscriptionStatus::Idle;
-        self.status_message = match removal {
-            Ok(true) => format!("Uninstalled {} runtime.", model.backend),
-            Ok(false) => format!("Removed {} runtime from Scribe.", model.backend),
-            Err(message) => format!("Removed {} runtime from Scribe. {message}", model.backend),
+        self.status_message = match removed_files {
+            true => format!("Uninstalled {} runtime.", model.backend),
+            false => format!("Removed {} runtime from Scribe.", model.backend),
         };
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
         for card in &mut self.playground_cards {
             card.status = runtime_status_for_model(&self.config, &card.model);
-        }
-    }
-
-    fn record_packaged_runtime_metadata(&mut self, model: &SttModelInfo) {
-        let Some(provider) = stt::provider_for_backend(&model.backend) else {
-            return;
-        };
-        if !provider.runtime_install_supported {
-            return;
-        }
-        if let Some(path) = packaged_runtime_path(&self.config, model) {
-            self.config.managed_runtimes.insert(
-                provider.runtime_id.to_owned(),
-                managed_runtime_install_record(path, "packaged-runtime"),
-            );
         }
     }
 }
@@ -1990,10 +2491,11 @@ impl LocalTranscriberApp {
             }
 
             let mut runtime_action = None;
-            panel(ui, |ui| {
-                ui.label(section_heading("Runtimes"));
+            let runtime_maintenance = egui::CollapsingHeader::new("Runtime maintenance")
+                .default_open(false)
+                .show(ui, |ui| panel(ui, |ui| {
                 ui.label(mut_text(
-                    "Install each backend runtime independently. Model rows show the runtime they use and estimated storage.",
+                    "Install, update, or remove backend runtimes. Models prepare a missing runtime automatically.",
                 ));
                 wrapped_label(
                     ui,
@@ -2005,7 +2507,14 @@ impl LocalTranscriberApp {
                 );
                 ui.add_space(8.0);
                 for model in runtime_representative_models(&self.config) {
-                    let runtime_status = stt::provider_for_backend(&model.backend)
+                    let provider = stt::provider_for_backend(&model.backend);
+                    let runtime_busy = provider.is_some_and(|provider| {
+                        self.runtime_jobs.contains_key(provider.runtime_id)
+                    });
+                    let consumer_activity = provider
+                        .map(|provider| self.runtime_consumer_activity(provider.runtime_id))
+                        .unwrap_or_default();
+                    let runtime_status = provider
                         .map(|provider| provider.runtime_status(&self.config))
                         .unwrap_or_else(|| {
                             ModelRuntimeStatus::Error(format!(
@@ -2013,7 +2522,12 @@ impl LocalTranscriberApp {
                                 model.backend
                             ))
                         });
-                    let action_state = runtime_action_state(&self.config, &model);
+                    let action_state = runtime_action_state_with_activity(
+                        &self.config,
+                        &model,
+                        runtime_busy,
+                        consumer_activity,
+                    );
                     ui.horizontal_wrapped(|ui| {
                         ui.vertical(|ui| {
                             ui.label(body_strong(&format!("{} runtime", model.backend)));
@@ -2027,13 +2541,22 @@ impl LocalTranscriberApp {
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                            let runtime_button = small_button(ui, action_state.kind.label());
+                            let label = runtime_action_label(
+                                action_state.kind,
+                                &model.backend,
+                                runtime_busy,
+                            );
+                            let runtime_button = small_button(ui, &label);
                             let response = add_enabled_button(
                                 ui,
                                 action_state.enabled,
                                 runtime_button,
                                 action_state.disabled_tooltip.as_deref(),
-                            );
+                            )
+                            .on_hover_text(format!(
+                                "Manage the shared {} backend runtime used by {} models.",
+                                model.backend, model.backend
+                            ));
                             if response.clicked() {
                                 runtime_action = Some((model.clone(), action_state.kind));
                             }
@@ -2055,12 +2578,13 @@ impl LocalTranscriberApp {
                     });
                     ui.add_space(6.0);
                 }
-            });
+            }));
+            set_collapsing_header_accessibility(ui.ctx(), &runtime_maintenance);
 
             if let Some((model, kind)) = runtime_action {
                 match kind {
                     RuntimeActionKind::Install | RuntimeActionKind::Update => {
-                        self.install_runtime(&model)
+                        self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
                     }
                     RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
                 }
@@ -2082,7 +2606,16 @@ impl LocalTranscriberApp {
             for model in models {
                 let selected = self.config.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
-                let action_state = model_action_state(&model, &install_status, selected);
+                let runtime_ready =
+                    stt::provider_for_backend(&model.backend).is_some_and(|provider| {
+                        provider.runtime_status(&self.config) == ModelRuntimeStatus::Ready
+                    });
+                let action_state = model_action_state_with_runtime(
+                    &model,
+                    &install_status,
+                    selected,
+                    runtime_ready,
+                );
                 let primary_disabled_tooltip = model_primary_disabled_tooltip(
                     &model,
                     &install_status,
@@ -2094,24 +2627,38 @@ impl LocalTranscriberApp {
                 let mut uninstall = false;
 
                 model_catalog_row(ui, &model, &install_status, selected, |ui| {
+                    let primary_label =
+                        model_primary_action_label(action_state.primary, &model, &install_status);
                     let primary_button = match action_state.primary {
                         ModelPrimaryAction::Select | ModelPrimaryAction::Active => {
-                            primary_small_button(ui, action_state.primary.label())
+                            primary_small_button(ui, &primary_label)
                         }
-                        _ => small_button(ui, action_state.primary.label()),
+                        _ => small_button(ui, &primary_label),
                     };
-                    if add_enabled_button(
+                    let primary_response = add_enabled_button(
                         ui,
                         action_state.primary_enabled,
                         primary_button,
                         primary_disabled_tooltip.as_deref(),
                     )
-                    .clicked()
-                    {
+                    .on_hover_text(match action_state.primary {
+                        ModelPrimaryAction::Repair => format!(
+                            "Prepare the shared {} runtime for {} without downloading the model again.",
+                            model.backend, model.name
+                        ),
+                        _ => format!("{} for {}.", primary_label, model.name),
+                    });
+                    if primary_response.clicked() {
                         match action_state.primary {
                             ModelPrimaryAction::Select => select_default = true,
                             ModelPrimaryAction::Install | ModelPrimaryAction::Retry => {
                                 start_install = true;
+                            }
+                            ModelPrimaryAction::Repair => {
+                                self.request_runtime_install(
+                                    &model,
+                                    RuntimeJobIntent::RepairModel(model.id.clone()),
+                                );
                             }
                             ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
                         }
@@ -2134,13 +2681,6 @@ impl LocalTranscriberApp {
                 }
                 ui.add_space(8.0);
             }
-
-            empty_import_panel(ui, |ui| {
-                if ui.add(small_button(ui, "Import Custom Model")).clicked() {
-                    self.status_message =
-                        "Custom model import is not available in this build.".to_owned();
-                }
-            });
         });
     }
 
@@ -2757,7 +3297,14 @@ fn page(
             });
             if !status_message.trim().is_empty() {
                 ui.add_space(2.0);
-                ui.label(mut_text(status_message));
+                let response = ui.add(
+                    egui::Label::new(mut_text(status_message))
+                        .wrap(true)
+                        .sense(egui::Sense::hover()),
+                );
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                });
             }
             ui.add_space(14.0);
             let body_width = usable_width(ui);
@@ -2945,14 +3492,17 @@ fn model_catalog_row(
                             ui.add_space(4.0);
                             wrapped_label(ui, mut_text(&detail));
                         }
-                        if matches!(install_status, ModelInstallStatus::Downloading { .. }) {
+                        if matches!(
+                            install_status,
+                            ModelInstallStatus::Downloading { .. }
+                                | ModelInstallStatus::InstallingRuntime
+                        ) {
                             ui.add_space(8.0);
                             download_progress_bar(ui, install_status);
                         }
                         ui.add_space(8.0);
                         tag_row(ui, |ui| {
                             badge(ui, &model.backend, ChipTone::Neutral);
-                            badge(ui, &format!("Runtime {}", model.backend), ChipTone::Neutral);
                             badge(
                                 ui,
                                 &format!("Device {}", model_device_label(model)),
@@ -3011,8 +3561,10 @@ fn current_download_rows(
         .collect::<Vec<_>>();
 
     rows.sort_by_key(|(_, status)| match status {
+        ModelInstallStatus::InstallingRuntime => 0,
         ModelInstallStatus::Downloading { .. } => 0,
         ModelInstallStatus::Error(_) => 1,
+        ModelInstallStatus::RuntimeError(_) => 1,
         ModelInstallStatus::Installed => 2,
         ModelInstallStatus::Missing => 3,
         ModelInstallStatus::NotInstalled => 4,
@@ -3052,41 +3604,38 @@ fn download_summary_row(ui: &mut Ui, model: &SttModelInfo, install_status: &Mode
 fn download_progress_bar(ui: &mut Ui, install_status: &ModelInstallStatus) {
     let progress = download_progress_fraction(install_status);
     let text = download_progress_bar_text(install_status);
-    wrapped_label(ui, body_strong(&text));
-    ui.add_space(4.0);
-    paint_download_progress_track(ui, progress);
+    let indeterminate = progress.is_none()
+        && matches!(
+            install_status,
+            ModelInstallStatus::InstallingRuntime | ModelInstallStatus::Downloading { .. }
+        );
+    let response = ui.add(
+        egui::ProgressBar::new(progress.unwrap_or_default())
+            .desired_width(usable_width(ui).max(1.0))
+            .desired_height(18.0)
+            .text(text)
+            .animate(indeterminate),
+    );
+    if indeterminate {
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.clear_numeric_value();
+            builder.clear_min_numeric_value();
+            builder.clear_max_numeric_value();
+        });
+    }
     if let Some(detail) = download_progress_detail(install_status) {
         ui.add_space(4.0);
         wrapped_label(ui, mut_text(detail));
     }
 }
 
-fn paint_download_progress_track(ui: &mut Ui, progress: Option<f32>) {
-    let colors = ui_palette(ui);
-    let width = usable_width(ui).max(1.0);
-    let height = 14.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
-    let track_fill = if ui.visuals().dark_mode {
-        Color32::from_rgb(35, 41, 52)
-    } else {
-        Color32::from_rgb(229, 231, 235)
-    };
-
-    ui.painter()
-        .rect_filled(rect, Rounding::same(7.0), track_fill);
-
-    if let Some(progress) = progress {
-        let fill_width = (rect.width() * progress.clamp(0.0, 1.0)).clamp(0.0, rect.width());
-        if fill_width > 0.0 {
-            let mut fill_rect = rect;
-            fill_rect.max.x = fill_rect.min.x + fill_width;
-            ui.painter()
-                .rect_filled(fill_rect, Rounding::same(7.0), colors.accent);
-        }
-    }
-
-    ui.painter()
-        .rect_stroke(rect, Rounding::same(7.0), Stroke::new(1.0, colors.border));
+fn set_collapsing_header_accessibility<R>(
+    ctx: &egui::Context,
+    response: &egui::containers::CollapsingResponse<R>,
+) {
+    ctx.accesskit_node_builder(response.header_response.id, |builder| {
+        builder.set_expanded(response.body_response.is_some());
+    });
 }
 
 fn download_progress_fraction(install_status: &ModelInstallStatus) -> Option<f32> {
@@ -3115,8 +3664,10 @@ fn download_progress_bar_text(install_status: &ModelInstallStatus) -> String {
             format!("{percent:.0}% Completed")
         }
         ModelInstallStatus::Downloading { .. } => "Downloading".to_owned(),
+        ModelInstallStatus::InstallingRuntime => "Preparing runtime".to_owned(),
         ModelInstallStatus::Installed => "100% Completed".to_owned(),
         ModelInstallStatus::Error(_) => "Failed".to_owned(),
+        ModelInstallStatus::RuntimeError(_) => "Runtime repair failed".to_owned(),
         ModelInstallStatus::Missing => "Missing".to_owned(),
         ModelInstallStatus::NotInstalled => "Not installed".to_owned(),
     }
@@ -3146,30 +3697,14 @@ fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<Strin
             })
         }
         ModelInstallStatus::Installed => Some("Installed".to_owned()),
+        ModelInstallStatus::InstallingRuntime => {
+            Some("Preparing the shared backend runtime before downloading this model.".to_owned())
+        }
         ModelInstallStatus::Error(message) => Some(message.clone()),
+        ModelInstallStatus::RuntimeError(message) => Some(message.clone()),
         ModelInstallStatus::Missing => Some("Missing file".to_owned()),
         ModelInstallStatus::NotInstalled => None,
     }
-}
-
-fn empty_import_panel(ui: &mut Ui, actions: impl FnOnce(&mut Ui)) {
-    let colors = ui_palette(ui);
-    full_width_frame(
-        ui,
-        Frame::none()
-            .fill(colors.panel_bg)
-            .stroke(Stroke::new(1.0, colors.border_strong))
-            .rounding(Rounding::same(6.0))
-            .inner_margin(Margin::same(18.0)),
-        |ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(section_heading("Custom Model"));
-                ui.label(mut_text("Custom imports are planned for a later build."));
-                ui.add_space(8.0);
-                actions(ui);
-            });
-        },
-    );
 }
 
 fn playground_drag_handle(
@@ -3839,7 +4374,7 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             Stroke::new(1.0, Color32::from_rgb(34, 105, 70)),
         ),
         ChipTone::Success => (
-            colors.success,
+            Color32::from_rgb(22, 101, 52),
             Color32::from_rgb(240, 253, 244),
             Stroke::new(1.0, Color32::from_rgb(187, 247, 208)),
         ),
@@ -3849,7 +4384,7 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             Stroke::new(1.0, Color32::from_rgb(117, 83, 25)),
         ),
         ChipTone::Warning => (
-            colors.warning,
+            Color32::from_rgb(146, 64, 14),
             Color32::from_rgb(254, 252, 232),
             Stroke::new(1.0, Color32::from_rgb(254, 240, 138)),
         ),
@@ -3859,7 +4394,7 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             Stroke::new(1.0, Color32::from_rgb(127, 45, 55)),
         ),
         ChipTone::Error => (
-            colors.error,
+            Color32::from_rgb(185, 28, 28),
             Color32::from_rgb(254, 242, 242),
             Stroke::new(1.0, Color32::from_rgb(254, 202, 202)),
         ),
@@ -3869,7 +4404,7 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
             Stroke::new(1.0, Color32::from_rgb(42, 86, 143)),
         ),
         ChipTone::Active => (
-            colors.accent,
+            Color32::from_rgb(29, 78, 216),
             Color32::from_rgb(219, 234, 254),
             Stroke::new(1.0, Color32::from_rgb(191, 219, 254)),
         ),
@@ -3879,8 +4414,12 @@ fn chip_colors(ui: &Ui, tone: ChipTone) -> (Color32, Color32, Stroke) {
 fn install_chip_tone(status: &ModelInstallStatus) -> ChipTone {
     match status {
         ModelInstallStatus::Installed => ChipTone::Success,
-        ModelInstallStatus::Downloading { .. } => ChipTone::Active,
-        ModelInstallStatus::Missing | ModelInstallStatus::Error(_) => ChipTone::Error,
+        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
+            ChipTone::Active
+        }
+        ModelInstallStatus::Missing
+        | ModelInstallStatus::Error(_)
+        | ModelInstallStatus::RuntimeError(_) => ChipTone::Error,
         ModelInstallStatus::NotInstalled => ChipTone::Warning,
     }
 }
@@ -3998,11 +4537,7 @@ fn model_install_detail(
     model: &SttModelInfo,
     install_status: &ModelInstallStatus,
 ) -> Option<String> {
-    let base = format!(
-        "Runtime: {} · Model storage: {}",
-        model.backend,
-        model_storage_estimate(model)
-    );
+    let base = format!("Model storage: {}", model_storage_estimate(model));
     match install_status {
         ModelInstallStatus::NotInstalled if !supports_managed_install(model) => {
             Some(format!("{base} · Installer unavailable in this build."))
@@ -4010,10 +4545,16 @@ fn model_install_detail(
         ModelInstallStatus::Downloading { .. } => {
             Some(format!("{base} · {}", install_status.label()))
         }
+        ModelInstallStatus::InstallingRuntime => {
+            Some(format!("{base} · {}", install_status.label()))
+        }
         ModelInstallStatus::Missing => Some(format!(
             "{base} · The configured model path is missing or incomplete. Reinstall to use this model."
         )),
         ModelInstallStatus::Error(message) => Some(format!("{base} · Install failed: {message}")),
+        ModelInstallStatus::RuntimeError(message) => {
+            Some(format!("{base} · Runtime repair failed: {message}"))
+        }
         ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => Some(base),
     }
 }
@@ -4123,9 +4664,15 @@ fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(St
         RuntimeVersionState::Current(version) => {
             Some((format!("Version {version}"), ChipTone::Success))
         }
-        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => {
-            Some(("Update available".to_owned(), ChipTone::Warning))
-        }
+        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => Some((
+            if runtime_install_source(config, model).is_some() {
+                "Update available"
+            } else {
+                "Update not staged"
+            }
+            .to_owned(),
+            ChipTone::Warning,
+        )),
         RuntimeVersionState::UpdateAvailable { .. } => {
             Some(("Version unknown".to_owned(), ChipTone::Warning))
         }
@@ -4140,15 +4687,23 @@ fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<St
         RuntimeVersionState::UpdateAvailable {
             installed: Some(installed),
             available,
-        } => Some(format!(
-            "Runtime update available: installed {installed}, available {available}."
-        )),
+        } => Some(if runtime_install_source(config, model).is_some() {
+            format!("Runtime update available: installed {installed}, available {available}.")
+        } else {
+            format!(
+                "Installed runtime {installed} is usable. This build does not include staged runtime {available} for an explicit update."
+            )
+        }),
         RuntimeVersionState::UpdateAvailable {
             installed: None,
             available,
-        } => Some(format!(
-            "Runtime version is unknown; update to the packaged {available} runtime."
-        )),
+        } => Some(if runtime_install_source(config, model).is_some() {
+            format!("Runtime version is unknown; update to the staged {available} runtime.")
+        } else {
+            format!(
+                "Runtime version is unknown. This build does not include staged runtime {available} for an explicit update."
+            )
+        }),
     }
 }
 
@@ -4195,7 +4750,38 @@ fn build_development_runtime_package(
     runtime_id: &str,
     backend: &str,
     package: DevelopmentRuntimePackage,
-) -> Result<PathBuf, String> {
+) -> Result<RuntimeReplacement, String> {
+    let relative_executable = package
+        .executable_path
+        .strip_prefix(&package.destination_root)
+        .map_err(|_| {
+            format!(
+                "Runtime executable {} is outside destination {}.",
+                package.executable_path.display(),
+                package.destination_root.display()
+            )
+        })?
+        .to_path_buf();
+    let stage_root = runtime_transaction_path(&package.destination_root, "installing");
+    let staged_package = DevelopmentRuntimePackage {
+        script: package.script,
+        destination_env: package.destination_env,
+        executable_path: stage_root.join(&relative_executable),
+        destination_root: stage_root.clone(),
+    };
+    remove_path_if_exists(&stage_root)?;
+    if let Err(message) = build_development_runtime_into(runtime_id, backend, &staged_package) {
+        let _ = remove_path_if_exists(&stage_root);
+        return Err(message);
+    }
+    activate_staged_runtime(&package.destination_root, &stage_root, &relative_executable)
+}
+
+fn build_development_runtime_into(
+    runtime_id: &str,
+    backend: &str,
+    package: &DevelopmentRuntimePackage,
+) -> Result<(), String> {
     if let Some(parent) = package.destination_root.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
@@ -4223,10 +4809,25 @@ fn build_development_runtime_package(
         ));
     }
 
-    Ok(package.executable_path)
+    Ok(())
 }
 
-fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result<PathBuf, String> {
+fn install_runtime_files(
+    runtime_id: &str,
+    packaged_executable: &Path,
+) -> Result<RuntimeReplacement, String> {
+    install_runtime_files_to(
+        runtime_id,
+        packaged_executable,
+        &config::runtime_storage_dir().join(runtime_id),
+    )
+}
+
+fn install_runtime_files_to(
+    runtime_id: &str,
+    packaged_executable: &Path,
+    target_root: &Path,
+) -> Result<RuntimeReplacement, String> {
     let Some(source_root) = runtime_package_root(packaged_executable) else {
         return Err(format!(
             "Could not determine runtime package root for {}.",
@@ -4243,34 +4844,116 @@ fn install_runtime_files(runtime_id: &str, packaged_executable: &Path) -> Result
             )
         })?
         .to_path_buf();
-    let target_root = config::runtime_storage_dir().join(runtime_id);
     if source_root == target_root {
-        if installed_runtime_executable_usable(runtime_id, packaged_executable) {
-            return Ok(packaged_executable.to_path_buf());
-        }
-        return Err(format!(
-            "Runtime install found an unusable runtime at {}.",
-            packaged_executable.display()
-        ));
+        return Err("The managed runtime cannot be used as its own update source.".to_owned());
     }
 
-    if target_root.exists() {
-        let result = if target_root.is_dir() {
-            fs::remove_dir_all(&target_root)
-        } else {
-            fs::remove_file(&target_root)
-        };
-        result.map_err(|err| format!("Could not replace {}: {err}", target_root.display()))?;
+    let stage_root = runtime_transaction_path(target_root, "installing");
+    remove_path_if_exists(&stage_root)?;
+    if let Err(message) = copy_dir_all(&source_root, &stage_root) {
+        let _ = remove_path_if_exists(&stage_root);
+        return Err(message);
     }
-    copy_dir_all(&source_root, &target_root)?;
-    let installed_executable = target_root.join(relative_executable);
-    if !installed_runtime_executable_usable(runtime_id, &installed_executable) {
+    let staged_executable = stage_root.join(&relative_executable);
+    if !installed_runtime_executable_usable(runtime_id, &staged_executable) {
+        let _ = remove_path_if_exists(&stage_root);
         return Err(format!(
             "Runtime install did not create a usable runtime at {}.",
-            installed_executable.display()
+            staged_executable.display()
         ));
     }
-    Ok(installed_executable)
+    activate_staged_runtime(target_root, &stage_root, &relative_executable)
+}
+
+fn activate_staged_runtime(
+    target_root: &Path,
+    stage_root: &Path,
+    relative_executable: &Path,
+) -> Result<RuntimeReplacement, String> {
+    let parent = target_root
+        .parent()
+        .ok_or_else(|| format!("Runtime target {} has no parent.", target_root.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+
+    let backup_root = runtime_transaction_path(target_root, "backup");
+    remove_path_if_exists(&backup_root)?;
+    let previous = if target_root.exists() {
+        fs::rename(target_root, &backup_root).map_err(|err| {
+            format!(
+                "Could not preserve existing runtime {}: {err}",
+                target_root.display()
+            )
+        })?;
+        Some(backup_root)
+    } else {
+        None
+    };
+
+    if let Err(err) = fs::rename(stage_root, target_root) {
+        let restore_error = previous.as_ref().and_then(|backup_root| {
+            fs::rename(backup_root, target_root)
+                .err()
+                .map(|restore_err| format!(" Previous runtime restore also failed: {restore_err}"))
+        });
+        let _ = remove_path_if_exists(stage_root);
+        return Err(format!(
+            "Could not activate staged runtime {}: {err}",
+            stage_root.display()
+        ) + restore_error.as_deref().unwrap_or_default());
+    }
+
+    Ok(RuntimeReplacement {
+        installed_path: target_root.join(relative_executable),
+        target_root: target_root.to_path_buf(),
+        backup_root: previous,
+    })
+}
+
+impl RuntimeReplacement {
+    fn commit(self) -> Result<(), String> {
+        if let Some(backup_root) = self.backup_root {
+            remove_path_if_exists(&backup_root)?;
+        }
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<(), String> {
+        remove_path_if_exists(&self.target_root)?;
+        if let Some(backup_root) = self.backup_root {
+            fs::rename(&backup_root, &self.target_root).map_err(|err| {
+                format!(
+                    "Could not restore previous runtime {}: {err}",
+                    self.target_root.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn runtime_transaction_path(target_root: &Path, phase: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = target_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("runtime");
+    target_root.with_file_name(format!(".{name}.{phase}-{}-{nonce}", std::process::id()))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let result = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|err| format!("Could not remove {}: {err}", path.display()))
 }
 
 fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::ManagedRuntimeInstall {
@@ -4480,9 +5163,11 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     match provider.model_install_status(model) {
         ModelInstallStatus::Installed => provider.runtime_status(config),
         ModelInstallStatus::Downloading { .. } => ModelRuntimeStatus::Downloading,
+        ModelInstallStatus::InstallingRuntime => ModelRuntimeStatus::Downloading,
         ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
         ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
         ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message),
+        ModelInstallStatus::RuntimeError(message) => ModelRuntimeStatus::Error(message),
     }
 }
 
@@ -4685,6 +5370,49 @@ mod layout_tests {
         assert_eq!(visuals.window_fill, dark.card_bg);
         assert_eq!(visuals.extreme_bg_color, dark.panel_bg);
         assert_ne!(visuals.panel_fill, light.panel_fill);
+    }
+
+    #[test]
+    fn light_theme_status_badges_meet_aa_text_contrast() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut combinations = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for tone in [
+                    ChipTone::Success,
+                    ChipTone::Warning,
+                    ChipTone::Active,
+                    ChipTone::Error,
+                ] {
+                    let (text, fill, _) = chip_colors(ui, tone);
+                    combinations.push((text, fill));
+                }
+            });
+        });
+
+        for (text, fill) in combinations {
+            let ratio = contrast_ratio(text, fill);
+            assert!(ratio >= 4.5, "contrast ratio was {ratio:.2}");
+        }
+    }
+
+    fn contrast_ratio(a: Color32, b: Color32) -> f64 {
+        let a = relative_luminance(a);
+        let b = relative_luminance(b);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    fn relative_luminance(color: Color32) -> f64 {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
     }
 
     #[test]
@@ -5250,6 +5978,7 @@ mod layout_tests {
             audio_devices: Vec::new(),
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
+            runtime_jobs: HashMap::new(),
             playground_cards: cards_from_config(&config),
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
@@ -5362,9 +6091,7 @@ mod layout_tests {
             RuntimeActionState {
                 kind: RuntimeActionKind::Install,
                 enabled: false,
-                disabled_tooltip: Some(format!(
-                    "No packaged {backend} runtime was found. Install a build that bundles this runtime."
-                )),
+                disabled_tooltip: Some(missing_runtime_source_message(backend)),
             }
         }
     }
@@ -5434,6 +6161,439 @@ mod layout_tests {
     }
 
     #[test]
+    fn installed_model_with_missing_runtime_offers_repair() {
+        let model = test_model();
+        assert_eq!(
+            model_action_state_with_runtime(&model, &ModelInstallStatus::Installed, true, false),
+            ModelActionState {
+                primary: ModelPrimaryAction::Repair,
+                primary_enabled: true,
+                show_uninstall: true,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_jobs_dedupe_queued_models_and_failure_message_explains_packaging() {
+        let mut job = RuntimeInstallJob::default();
+        assert!(queue_runtime_model(
+            &mut job.download_model_ids,
+            "model-a".to_owned()
+        ));
+        assert!(!queue_runtime_model(
+            &mut job.download_model_ids,
+            "model-a".to_owned()
+        ));
+        assert!(queue_runtime_model(
+            &mut job.download_model_ids,
+            "model-b".to_owned()
+        ));
+        assert_eq!(job.download_model_ids, ["model-a", "model-b"]);
+        assert!(queue_runtime_model(
+            &mut job.repair_model_ids,
+            "installed-model".to_owned()
+        ));
+        assert_eq!(job.repair_model_ids, ["installed-model"]);
+        assert!(missing_runtime_source_message("Vosk").contains("packaged or staged build"));
+    }
+
+    #[test]
+    fn managed_runtime_is_never_selected_as_packaged_source_across_backends() {
+        for (backend, runtime_id, executable) in [
+            ("whisper.cpp", "whisper_cpp", "bin/whisper-cli"),
+            (
+                "faster-whisper",
+                "faster_whisper",
+                "bin/scribe-faster-whisper",
+            ),
+            ("Vosk", "vosk", "bin/scribe-vosk"),
+            ("sherpa-onnx", "sherpa_onnx", "bin/scribe-sherpa-onnx"),
+        ] {
+            let current = PathBuf::from("C:/managed-runtimes")
+                .join(runtime_id)
+                .join(executable);
+            let staged = PathBuf::from("C:/staged-runtimes")
+                .join(runtime_id)
+                .join(executable);
+            let mut config = AppConfig::default();
+            config.managed_runtimes.insert(
+                runtime_id.to_owned(),
+                config::ManagedRuntimeInstall::new(current.clone()),
+            );
+            let mut model = test_model();
+            model.backend = backend.to_owned();
+
+            assert_eq!(
+                runtime_install_source_from_candidates(&config, &model, Some(current), None),
+                None,
+                "{backend} must not update from its managed install"
+            );
+            assert!(matches!(
+                runtime_install_source_from_candidates(&config, &model, Some(staged), None),
+                Some(RuntimeInstallSource::Packaged(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_runtime_without_newer_source_does_not_offer_update() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "scribe-runtime-no-update-source-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&runtime_root);
+        let executable = write_vosk_runtime(&runtime_root.join("vosk"));
+        let mut config = AppConfig::default();
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            managed_runtime_with_version(executable, Some("0.3.44")),
+        );
+        let mut model = test_model();
+        model.backend = "Vosk".to_owned();
+        let provider = stt::provider_for_backend("Vosk").unwrap();
+
+        let action = runtime_action_state_for_source(&config, &model, provider, false);
+
+        assert_eq!(action.kind, RuntimeActionKind::Uninstall);
+        assert!(action.enabled);
+        let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    #[test]
+    fn failed_staged_validation_preserves_previous_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-transaction-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target_root = root.join("managed-vosk");
+        let previous_executable = write_vosk_runtime(&target_root);
+        fs::write(target_root.join("previous.marker"), b"previous").unwrap();
+        let invalid_source = root.join("invalid-source");
+        let invalid_executable = invalid_source
+            .join("bin")
+            .join(runtime_wrapper_name("scribe-vosk"));
+        fs::create_dir_all(invalid_executable.parent().unwrap()).unwrap();
+        fs::write(&invalid_executable, b"invalid").unwrap();
+
+        let result = install_runtime_files_to("vosk", &invalid_executable, &target_root);
+
+        assert!(result.is_err());
+        assert!(target_root.join("previous.marker").is_file());
+        assert!(stt::vosk::is_vosk_runtime_usable(&previous_executable));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_record_and_files_roll_back_together_before_continuation() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-transaction-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target_root = root.join("managed-vosk");
+        let previous_executable = write_vosk_runtime(&target_root);
+        fs::write(target_root.join("previous.marker"), b"previous").unwrap();
+        let source_root = root.join("staged-vosk");
+        let source_executable = write_vosk_runtime(&source_root);
+        fs::write(source_root.join("new.marker"), b"new").unwrap();
+
+        let replacement =
+            install_runtime_files_to("vosk", &source_executable, &target_root).unwrap();
+        let mut config = AppConfig::default();
+        let mut previous_record = config::ManagedRuntimeInstall::new(previous_executable.clone());
+        previous_record.source = Some("previous".to_owned());
+        config
+            .managed_runtimes
+            .insert("vosk".to_owned(), previous_record.clone());
+        let mut new_record = config::ManagedRuntimeInstall::new(replacement.installed_path.clone());
+        new_record.source = Some("replacement".to_owned());
+        assert!(!runtime_metadata_matches(&config, "vosk", &new_record));
+        let replaced = apply_runtime_record(&mut config, "vosk", new_record.clone());
+        assert!(runtime_metadata_matches(&config, "vosk", &new_record));
+
+        rollback_runtime_record(&mut config, "vosk", replaced);
+        replacement.rollback().unwrap();
+
+        assert_eq!(config.managed_runtimes.get("vosk"), Some(&previous_record));
+        assert!(target_root.join("previous.marker").is_file());
+        assert!(!target_root.join("new.marker").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_persistence_gates_download_continuation() {
+        let mut config = AppConfig::default();
+        let previous = config::ManagedRuntimeInstall::new(PathBuf::from("previous-runtime"));
+        config
+            .managed_runtimes
+            .insert("vosk".to_owned(), previous.clone());
+        let replacement = config::ManagedRuntimeInstall::new(PathBuf::from("replacement-runtime"));
+        let job = RuntimeInstallJob {
+            download_model_ids: vec!["queued-model".to_owned()],
+            repair_model_ids: Vec::new(),
+        };
+        let persistence_attempted = std::cell::Cell::new(false);
+
+        let failed = persist_runtime_install(
+            &mut config,
+            "vosk",
+            replacement.clone(),
+            job.clone(),
+            |saved| {
+                persistence_attempted.set(true);
+                assert!(runtime_metadata_matches(saved, "vosk", &replacement));
+                Err("disk full".to_owned())
+            },
+        );
+
+        assert!(persistence_attempted.get());
+        assert_eq!(config.managed_runtimes.get("vosk"), Some(&previous));
+        assert!(matches!(
+            failed,
+            RuntimePersistenceTransition::Failed {
+                job: RuntimeInstallJob {
+                    download_model_ids,
+                    ..
+                },
+                ..
+            } if download_model_ids == ["queued-model"]
+        ));
+
+        persistence_attempted.set(false);
+        let persisted =
+            persist_runtime_install(&mut config, "vosk", replacement.clone(), job, |saved| {
+                assert!(runtime_metadata_matches(saved, "vosk", &replacement));
+                persistence_attempted.set(true);
+                Ok(())
+            });
+        assert!(persistence_attempted.get());
+        assert!(matches!(
+            persisted,
+            RuntimePersistenceTransition::Persisted(RuntimeInstallJob {
+                download_model_ids,
+                ..
+            }) if download_model_ids == ["queued-model"]
+        ));
+    }
+
+    #[test]
+    fn runtime_uninstall_error_preserves_managed_metadata() {
+        let mut config = AppConfig::default();
+        let install = config::ManagedRuntimeInstall::new(PathBuf::from("managed-runtime"));
+        config
+            .managed_runtimes
+            .insert("vosk".to_owned(), install.clone());
+
+        assert!(
+            apply_runtime_uninstall_result(
+                &mut config,
+                "vosk",
+                Err("runtime is locked".to_owned()),
+            )
+            .is_err()
+        );
+        assert_eq!(config.managed_runtimes.get("vosk"), Some(&install));
+
+        assert_eq!(
+            apply_runtime_uninstall_result(&mut config, "vosk", Ok(false)),
+            Ok(false)
+        );
+        assert!(!config.managed_runtimes.contains_key("vosk"));
+    }
+
+    #[test]
+    fn model_install_activation_only_replaces_an_unrunnable_active_model() {
+        assert!(!should_activate_installed_model(true));
+        assert!(should_activate_installed_model(false));
+    }
+
+    #[test]
+    fn playground_membership_adds_once_and_uninstall_cleanup_removes_model() {
+        let mut config = AppConfig::default();
+        set_model_enabled(&mut config, "whisper_cpp_tiny_en", true);
+        set_model_enabled(&mut config, "whisper_cpp_tiny_en", true);
+        assert_eq!(config.playground_enabled_models, ["whisper_cpp_tiny_en"]);
+        set_model_enabled(&mut config, "whisper_cpp_tiny_en", false);
+        assert!(config.playground_enabled_models.is_empty());
+    }
+
+    #[test]
+    fn runtime_ready_bypasses_preparation_and_failures_fan_out_to_queued_models() {
+        assert!(!runtime_needs_preparation(&ModelRuntimeStatus::Ready));
+        assert!(runtime_needs_preparation(
+            &ModelRuntimeStatus::MissingConfiguration
+        ));
+
+        let mut app = test_app();
+        app.runtime_jobs.insert(
+            "whisper_cpp".to_owned(),
+            RuntimeInstallJob {
+                download_model_ids: vec!["model-a".to_owned(), "model-b".to_owned()],
+                repair_model_ids: vec!["installed-model".to_owned()],
+            },
+        );
+        app.fail_runtime_job("whisper_cpp", "runtime copy failed".to_owned());
+        assert_eq!(
+            app.model_downloads.get("model-a"),
+            Some(&ModelInstallStatus::Error("runtime copy failed".to_owned()))
+        );
+        assert_eq!(
+            app.model_downloads.get("model-b"),
+            Some(&ModelInstallStatus::Error("runtime copy failed".to_owned()))
+        );
+        assert_eq!(
+            app.model_downloads.get("installed-model"),
+            Some(&ModelInstallStatus::RuntimeError(
+                "runtime copy failed".to_owned()
+            ))
+        );
+        assert!(!app.runtime_jobs.contains_key("whisper_cpp"));
+    }
+
+    #[test]
+    fn busy_runtime_disables_maintenance_and_repair_keeps_model_installed() {
+        let model = test_model();
+        let busy = runtime_action_state_with_busy(&AppConfig::default(), &model, true);
+        assert!(!busy.enabled);
+        assert!(
+            busy.disabled_tooltip
+                .as_deref()
+                .is_some_and(|message| message.contains("already being prepared"))
+        );
+        assert_eq!(
+            model_action_state_with_runtime(
+                &model,
+                &ModelInstallStatus::RuntimeError("failed".to_owned()),
+                true,
+                false,
+            ),
+            ModelActionState {
+                primary: ModelPrimaryAction::Repair,
+                primary_enabled: true,
+                show_uninstall: true,
+            }
+        );
+        assert_eq!(
+            model_primary_action_label(
+                ModelPrimaryAction::Repair,
+                &model,
+                &ModelInstallStatus::RuntimeError("failed".to_owned()),
+            ),
+            "Repair whisper.cpp runtime"
+        );
+    }
+
+    #[test]
+    fn active_runtime_consumers_disable_update_and_remove_actions() {
+        let update = RuntimeActionState {
+            kind: RuntimeActionKind::Update,
+            enabled: true,
+            disabled_tooltip: None,
+        };
+        for (activity, expected) in [
+            (
+                RuntimeConsumerActivity {
+                    recording: true,
+                    ..Default::default()
+                },
+                "active recording",
+            ),
+            (
+                RuntimeConsumerActivity {
+                    transcribing: true,
+                    ..Default::default()
+                },
+                "transcription",
+            ),
+            (
+                RuntimeConsumerActivity {
+                    playground_jobs: true,
+                    ..Default::default()
+                },
+                "Playground jobs",
+            ),
+            (
+                RuntimeConsumerActivity {
+                    model_download: true,
+                    ..Default::default()
+                },
+                "model download",
+            ),
+        ] {
+            let blocked = restrict_runtime_action(update.clone(), "Vosk", false, activity);
+            assert!(!blocked.enabled);
+            assert!(
+                blocked
+                    .disabled_tooltip
+                    .as_deref()
+                    .is_some_and(|tooltip| tooltip.contains(expected))
+            );
+        }
+
+        let remove = RuntimeActionState {
+            kind: RuntimeActionKind::Uninstall,
+            ..update.clone()
+        };
+        assert!(
+            !restrict_runtime_action(
+                remove,
+                "Vosk",
+                false,
+                RuntimeConsumerActivity {
+                    recording: true,
+                    ..Default::default()
+                },
+            )
+            .enabled
+        );
+        let install = RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            ..update
+        };
+        assert!(
+            restrict_runtime_action(
+                install,
+                "Vosk",
+                false,
+                RuntimeConsumerActivity {
+                    recording: true,
+                    ..Default::default()
+                },
+            )
+            .enabled
+        );
+    }
+
+    #[test]
+    fn model_download_activity_matches_the_shared_runtime() {
+        let config = AppConfig::default();
+        let model = config::configured_models(&config)
+            .into_iter()
+            .find(|model| stt::provider_for_backend(&model.backend).is_some())
+            .unwrap();
+        let runtime_id = stt::provider_for_backend(&model.backend)
+            .unwrap()
+            .runtime_id;
+        let mut downloads = HashMap::new();
+        downloads.insert(
+            model.id,
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 1,
+                total_bytes: None,
+                bytes_per_second: None,
+            },
+        );
+
+        assert!(model_download_uses_runtime(&config, &downloads, runtime_id));
+        assert!(!model_download_uses_runtime(
+            &config,
+            &downloads,
+            "different-runtime"
+        ));
+    }
+
+    #[test]
     fn disabled_model_actions_explain_why_they_are_disabled() {
         let whisper = test_model();
         let active_state = model_action_state(&whisper, &ModelInstallStatus::Installed, true);
@@ -5481,7 +6641,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn download_progress_bar_paints_proportional_fill_in_full_track() {
+    fn semantic_progress_bar_paints_proportional_fill_in_full_track() {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
@@ -5510,12 +6670,16 @@ mod layout_tests {
             },
         );
 
-        let track_fill = Color32::from_rgb(229, 231, 235);
+        let track_fill = ThemePalette::light().panel_bg;
         let track = output
             .shapes
             .iter()
             .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) if rect.fill == track_fill => Some(rect.rect),
+                egui::Shape::Rect(rect)
+                    if rect.fill == track_fill && (rect.rect.height() - 18.0).abs() < 0.1 =>
+                {
+                    Some(rect.rect)
+                }
                 _ => None,
             })
             .max_by(|a, b| a.width().total_cmp(&b.width()))
@@ -5524,7 +6688,10 @@ mod layout_tests {
             .shapes
             .iter()
             .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) if rect.fill == ThemePalette::light().accent => {
+                egui::Shape::Rect(rect)
+                    if rect.fill == ThemePalette::light().accent
+                        && (rect.rect.height() - 18.0).abs() < 0.1 =>
+                {
                     Some(rect.rect)
                 }
                 _ => None,
@@ -5539,6 +6706,62 @@ mod layout_tests {
             fill.width(),
             track.width()
         );
+    }
+
+    #[test]
+    fn indeterminate_progress_has_no_accessible_numeric_value() {
+        for status in [
+            ModelInstallStatus::InstallingRuntime,
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 1024,
+                total_bytes: None,
+                bytes_per_second: None,
+            },
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    download_progress_bar(ui, &status);
+                });
+            });
+            let update = output.platform_output.accesskit_update.unwrap();
+            let progress = update
+                .nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.role() == egui::accesskit::Role::ProgressIndicator)
+                .unwrap();
+
+            assert_eq!(progress.numeric_value(), None);
+            assert_eq!(progress.min_numeric_value(), None);
+            assert_eq!(progress.max_numeric_value(), None);
+        }
+    }
+
+    #[test]
+    fn collapsing_header_exposes_expanded_accessibility_state() {
+        for open in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = egui::CollapsingHeader::new("Runtime maintenance")
+                        .default_open(open)
+                        .show(ui, |ui| ui.label("Runtime controls"));
+                    set_collapsing_header_accessibility(ctx, &response);
+                });
+            });
+            let update = output.platform_output.accesskit_update.unwrap();
+            let header = update
+                .nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.name() == Some("Runtime maintenance"))
+                .unwrap();
+
+            assert_eq!(header.is_expanded(), Some(open));
+        }
     }
 
     #[test]
@@ -5945,8 +7168,9 @@ mod layout_tests {
         )
         .unwrap();
 
-        assert_eq!(installed, executable);
-        assert!(installed.exists());
+        assert_eq!(installed.installed_path, executable);
+        assert!(installed.installed_path.exists());
+        installed.commit().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
