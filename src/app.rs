@@ -3050,6 +3050,7 @@ impl LocalTranscriberApp {
             .collapsible(false)
             .resizable(true)
             .default_width(480.0)
+            .min_width(432.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -3059,7 +3060,10 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let select_all =
-                        ui.add_enabled(!busy, small_button(ui, "Select all installed models"));
+                        ui.add_enabled(
+                            !busy && !installed_models.is_empty(),
+                            small_button(ui, "Select all installed models"),
+                        );
                     if request_initial_focus {
                         select_all.request_focus();
                     }
@@ -3077,44 +3081,54 @@ impl LocalTranscriberApp {
                     }
                 });
                 ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for model in &installed_models {
-                            ui.horizontal_wrapped(|ui| {
-                                let mut selected = draft.iter().any(|id| id == &model.id);
-                                let readiness = runtime_status_for_model(&self.config, model);
-                                let checkbox = ui.add_enabled(
-                                    !busy,
-                                    egui::Checkbox::new(&mut selected, &model.name),
-                                );
-                                checkbox.widget_info(|| {
-                                    let mut info = egui::WidgetInfo::selected(
-                                        egui::WidgetType::Checkbox,
-                                        selected,
-                                        format!(
-                                            "{}; backend {}; readiness {}",
-                                            model.name, model.backend, readiness
-                                        ),
+                if installed_models.is_empty() {
+                    ui.label(
+                        "No installed models yet. Install a model from Models, then return here to select it.",
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for model in &installed_models {
+                                ui.horizontal_wrapped(|ui| {
+                                    let mut selected = draft.iter().any(|id| id == &model.id);
+                                    let readiness = runtime_status_for_model(&self.config, model);
+                                    let checkbox = ui.add_enabled(
+                                        !busy,
+                                        egui::Checkbox::new(&mut selected, &model.name),
                                     );
-                                    info.enabled = !busy;
-                                    info
-                                });
-                                checkbox.on_hover_text(
-                                    "Include this model in the next Playground test.",
-                                );
-                                if selected {
-                                    if !draft.iter().any(|id| id == &model.id) {
-                                        draft.push(model.id.clone());
+                                    checkbox.widget_info(|| {
+                                        let mut info = egui::WidgetInfo::selected(
+                                            egui::WidgetType::Checkbox,
+                                            selected,
+                                            format!(
+                                                "{}; backend {}; readiness {}",
+                                                model.name, model.backend, readiness
+                                            ),
+                                        );
+                                        info.enabled = !busy;
+                                        info
+                                    });
+                                    checkbox.on_hover_text(
+                                        "Include this model in the next Playground test.",
+                                    );
+                                    if selected {
+                                        if !draft.iter().any(|id| id == &model.id) {
+                                            draft.push(model.id.clone());
+                                        }
+                                    } else {
+                                        draft.retain(|id| id != &model.id);
                                     }
-                                } else {
-                                    draft.retain(|id| id != &model.id);
-                                }
-                                badge(ui, &model.backend, ChipTone::Neutral);
-                                badge(ui, &readiness.to_string(), runtime_chip_tone(&readiness));
-                            });
-                        }
-                    });
+                                    badge(ui, &model.backend, ChipTone::Neutral);
+                                    badge(
+                                        ui,
+                                        &readiness.to_string(),
+                                        runtime_chip_tone(&readiness),
+                                    );
+                                });
+                            }
+                        });
+                }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -6843,6 +6857,54 @@ mod layout_tests {
 
         assert!(app.playground_selector_draft.is_none());
         assert!(app.config.playground_selected_models.is_empty());
+    }
+
+    #[test]
+    fn selector_empty_state_explains_how_to_install_models() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+            "scribe-selector-empty-state-{}",
+            std::process::id()
+        ));
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models.clear();
+        app.open_playground_selector(None);
+
+        let output = render_selector(&ctx, &mut app, Vec::new());
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some(
+                "No installed models yet. Install a model from Models, then return here to select it.",
+            )
+        }));
+    }
+
+    #[test]
+    fn selector_window_honors_minimum_content_width() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir =
+            std::env::temp_dir().join(format!("scribe-selector-min-width-{}", std::process::id()));
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models.clear();
+        app.open_playground_selector(None);
+
+        render_selector(&ctx, &mut app, Vec::new());
+
+        let selector_rect = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("Choose models to test")))
+            .expect("selector window should have an area rect after rendering");
+        assert!(
+            selector_rect.width() >= 432.0,
+            "selector width {} should honor the 432 px minimum",
+            selector_rect.width()
+        );
     }
 
     #[test]
