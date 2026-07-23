@@ -3082,9 +3082,9 @@ impl LocalTranscriberApp {
                 });
                 ui.add_space(8.0);
                 if installed_models.is_empty() {
-                    ui.label(
+                    ui.label(mut_text(
                         "No installed models yet. Install a model from Models, then return here to select it.",
-                    );
+                    ));
                 } else {
                     egui::ScrollArea::vertical()
                         .max_height(320.0)
