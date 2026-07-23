@@ -842,6 +842,9 @@ fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Pat
     if path_is_within(path, &config::runtime_storage_dir()) {
         return false;
     }
+    let Some(package_root) = runtime_package_root(path) else {
+        return false;
+    };
 
     let Some(provider) = stt::provider_for_backend(&model.backend) else {
         return false;
@@ -850,7 +853,7 @@ fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Pat
         return true;
     };
 
-    runtime_package_root(path) != runtime_package_root(&current.path)
+    Some(package_root) != runtime_package_root(&current.path)
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -4849,6 +4852,7 @@ fn install_runtime_files_to(
     }
 
     let stage_root = runtime_transaction_path(target_root, "installing");
+    validate_runtime_copy_paths(&source_root, target_root, &stage_root)?;
     remove_path_if_exists(&stage_root)?;
     if let Err(message) = copy_dir_all(&source_root, &stage_root) {
         let _ = remove_path_if_exists(&stage_root);
@@ -5003,13 +5007,99 @@ fn command_output_message(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 fn runtime_package_root(executable: &Path) -> Option<PathBuf> {
+    let metadata = fs::symlink_metadata(executable).ok()?;
+    if runtime_entry_is_link(&metadata) || !metadata.is_file() {
+        return None;
+    }
     let parent = executable.parent()?;
     if parent.file_name().is_some_and(|name| name == "bin") {
         parent.parent().map(Path::to_path_buf)
-    } else if executable.is_dir() {
-        Some(executable.to_path_buf())
     } else {
-        parent.parent().map(Path::to_path_buf)
+        None
+    }
+}
+
+fn validate_runtime_copy_paths(
+    source_root: &Path,
+    target_root: &Path,
+    stage_root: &Path,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source_root)
+        .map_err(|err| format!("Could not inspect {}: {err}", source_root.display()))?;
+    if runtime_entry_is_link(&metadata) {
+        return Err(format!(
+            "Runtime package root {} cannot be a symbolic link or reparse point.",
+            source_root.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Runtime package root {} is not a directory.",
+            source_root.display()
+        ));
+    }
+
+    let canonical_source = canonicalize_runtime_path(source_root)?;
+    for (label, path) in [("target", target_root), ("staging target", stage_root)] {
+        let canonical_path = canonicalize_runtime_path(path)?;
+        if canonical_path == canonical_source
+            || canonical_path.starts_with(&canonical_source)
+            || canonical_source.starts_with(&canonical_path)
+        {
+            return Err(format!(
+                "Runtime package {} cannot overlap the managed runtime {label} {}.",
+                source_root.display(),
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_runtime_path(path: &Path) -> Result<PathBuf, String> {
+    let mut unresolved = Vec::new();
+    let mut current = path;
+    loop {
+        match current.canonicalize() {
+            Ok(mut canonical) => {
+                for component in unresolved.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = current.file_name().ok_or_else(|| {
+                    format!("Could not resolve runtime path {}: {err}", path.display())
+                })?;
+                unresolved.push(name.to_os_string());
+                current = current.parent().ok_or_else(|| {
+                    format!("Could not resolve runtime path {}: {err}", path.display())
+                })?;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Could not resolve runtime path {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn runtime_entry_is_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -5022,12 +5112,17 @@ fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
         let entry = entry.map_err(|err| format!("Could not read {}: {err}", source.display()))?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
-        let file_type = entry
-            .file_type()
+        let metadata = fs::symlink_metadata(&source_path)
             .map_err(|err| format!("Could not inspect {}: {err}", source_path.display()))?;
-        if file_type.is_dir() {
+        if runtime_entry_is_link(&metadata) {
+            return Err(format!(
+                "Runtime package entry {} cannot be a symbolic link or reparse point.",
+                source_path.display()
+            ));
+        }
+        if metadata.is_dir() {
             copy_dir_all(&source_path, &target_path)?;
-        } else {
+        } else if metadata.is_file() {
             fs::copy(&source_path, &target_path).map_err(|err| {
                 format!(
                     "Could not copy {} to {}: {err}",
@@ -5035,6 +5130,11 @@ fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
                     target_path.display()
                 )
             })?;
+        } else {
+            return Err(format!(
+                "Runtime package entry {} is not a regular file or directory.",
+                source_path.display()
+            ));
         }
     }
     Ok(())
@@ -6198,7 +6298,213 @@ mod layout_tests {
     }
 
     #[test]
+    fn runtime_package_root_requires_an_explicit_bin_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-package-root-layout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let packaged = root
+            .join("package")
+            .join("bin")
+            .join(runtime_wrapper_name("scribe-vosk"));
+        let direct_directory = root.join("scribe-vosk-directory");
+        fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        fs::create_dir_all(&direct_directory).unwrap();
+        fs::write(&packaged, b"runtime").unwrap();
+
+        assert_eq!(runtime_package_root(&packaged), Some(root.join("package")));
+        assert_eq!(runtime_package_root(&direct_directory), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_rejects_a_direct_sibling_executable_without_copying_its_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-direct-sibling-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join(runtime_wrapper_name("scribe-vosk"));
+        let unrelated = root.join("unrelated.marker");
+        let target = root.join("managed");
+        fs::write(&executable, b"standalone executable").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        let err = install_runtime_files_to("vosk", &executable, &target).unwrap_err();
+
+        assert!(err.contains("determine runtime package root"));
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
+        assert!(!target.exists());
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".managed.installing-")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_rejects_target_and_stage_nested_in_source_package() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-nested-target-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("package");
+        let executable = write_vosk_runtime(&source_root);
+        let package_marker = source_root.join("package.marker");
+        let target = source_root.join("managed");
+        let previous_marker = target.join("previous.marker");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&package_marker, b"package").unwrap();
+        fs::write(&previous_marker, b"previous").unwrap();
+
+        let err = install_runtime_files_to("vosk", &executable, &target).unwrap_err();
+
+        assert!(err.contains("cannot overlap the managed runtime"));
+        assert!(executable.is_file());
+        assert_eq!(fs::read(&package_marker).unwrap(), b"package");
+        assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
+        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".managed.installing-")
+        }));
+
+        let missing_stage = source_root.join(".outside-managed.installing-test");
+        let stage_err = validate_runtime_copy_paths(
+            &source_root,
+            &root.join("outside-managed"),
+            &missing_stage,
+        )
+        .unwrap_err();
+        assert!(stage_err.contains("staging target"));
+        assert!(!missing_stage.exists());
+
+        let missing = source_root.join("missing");
+        fs::create_dir_all(&missing).unwrap();
+        let aliased_target = missing.join("..").join("aliased-managed");
+        let alias_err = install_runtime_files_to("vosk", &executable, &aliased_target).unwrap_err();
+        assert!(alias_err.contains("cannot overlap the managed runtime"));
+        assert_eq!(fs::read(&package_marker).unwrap(), b"package");
+        assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
+        assert!(!source_root.join("aliased-managed").exists());
+        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".aliased-managed.installing-")
+                || name.starts_with(".aliased-managed.backup-")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_rejects_target_ancestor_before_mutating_its_tree() {
+        let target = std::env::temp_dir().join(format!(
+            "scribe-runtime-target-ancestor-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&target);
+        let source_root = target.join("package");
+        let executable = write_vosk_runtime(&source_root);
+        let package_marker = source_root.join("package.marker");
+        let sibling_marker = target.join("sibling.marker");
+        fs::write(&package_marker, b"package").unwrap();
+        fs::write(&sibling_marker, b"sibling").unwrap();
+
+        let err = match install_runtime_files_to("vosk", &executable, &target) {
+            Err(err) => err,
+            Ok(replacement) => {
+                replacement.rollback().unwrap();
+                let _ = fs::remove_dir_all(&target);
+                panic!("ancestor target was activated before overlap rejection");
+            }
+        };
+
+        assert!(err.contains("cannot overlap the managed runtime"));
+        assert!(target.is_dir());
+        assert!(executable.is_file());
+        assert_eq!(fs::read(package_marker).unwrap(), b"package");
+        assert_eq!(fs::read(sibling_marker).unwrap(), b"sibling");
+        let transaction_prefix = format!(".{}.", target.file_name().unwrap().to_string_lossy());
+        assert!(
+            !fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .any(|entry| {
+                    let name = entry.unwrap().file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&transaction_prefix)
+                        && (name.contains(".installing-") || name.contains(".backup-"))
+                })
+        );
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn runtime_install_copies_an_explicit_bin_package_layout() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-runtime-bin-package-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("package");
+        let executable = write_vosk_runtime(&source_root);
+        fs::write(source_root.join("package.marker"), b"package").unwrap();
+        let target = root.join("managed");
+
+        let replacement = install_runtime_files_to("vosk", &executable, &target).unwrap();
+
+        assert_eq!(
+            replacement.installed_path,
+            target.join("bin").join(runtime_wrapper_name("scribe-vosk"))
+        );
+        assert_eq!(fs::read(target.join("package.marker")).unwrap(), b"package");
+        replacement.commit().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_install_rejects_package_root_and_recursive_entry_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-package-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("package");
+        let executable = write_vosk_runtime(&source_root);
+        let linked_root = root.join("linked-package");
+        symlink(&source_root, &linked_root).unwrap();
+        let linked_executable = linked_root
+            .join("bin")
+            .join(runtime_wrapper_name("scribe-vosk"));
+
+        let root_err =
+            install_runtime_files_to("vosk", &linked_executable, &root.join("managed-from-link"))
+                .unwrap_err();
+        assert!(root_err.contains("symbolic link or reparse point"));
+
+        symlink(&executable, source_root.join("linked-entry")).unwrap();
+        let entry_err =
+            install_runtime_files_to("vosk", &executable, &root.join("managed")).unwrap_err();
+        assert!(entry_err.contains("symbolic link or reparse point"));
+        assert!(!root.join("managed").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn managed_runtime_is_never_selected_as_packaged_source_across_backends() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-source-selection-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
         for (backend, runtime_id, executable) in [
             ("whisper.cpp", "whisper_cpp", "bin/whisper-cli"),
             (
@@ -6209,12 +6515,18 @@ mod layout_tests {
             ("Vosk", "vosk", "bin/scribe-vosk"),
             ("sherpa-onnx", "sherpa_onnx", "bin/scribe-sherpa-onnx"),
         ] {
-            let current = PathBuf::from("C:/managed-runtimes")
+            let current = root
+                .join("managed-runtimes")
                 .join(runtime_id)
                 .join(executable);
-            let staged = PathBuf::from("C:/staged-runtimes")
+            let staged = root
+                .join("staged-runtimes")
                 .join(runtime_id)
                 .join(executable);
+            fs::create_dir_all(current.parent().unwrap()).unwrap();
+            fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            fs::write(&current, b"current").unwrap();
+            fs::write(&staged, b"staged").unwrap();
             let mut config = AppConfig::default();
             config.managed_runtimes.insert(
                 runtime_id.to_owned(),
@@ -6233,6 +6545,7 @@ mod layout_tests {
                 Some(RuntimeInstallSource::Packaged(_))
             ));
         }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
