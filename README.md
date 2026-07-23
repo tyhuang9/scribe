@@ -1,6 +1,6 @@
 # Scribe
 
-Scribe is a lightweight local-first desktop speech-to-text app built with Rust and egui/eframe. It does not use Tauri, Electron, React, a Python server, cloud STT, account sync, or any always-running model process.
+Scribe is a lightweight local-first desktop speech-to-text app built with Rust and egui/eframe. It does not use Tauri, Electron, React, cloud STT, an account or sync service, a Python server, any always-running model process, or a plugin system.
 
 The app shell stays small and only invokes an STT runtime when the user records audio and starts transcription.
 
@@ -11,7 +11,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet backend integration through bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
+- Six runnable local STT backends: `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet. They use bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
+- Experimental sherpa-onnx-family support (sherpa-onnx, Moonshine, and Parakeet) runs through managed, short-lived Python sidecars and currently provides batch transcription only; streaming needs a future backend API.
 - Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper, Vosk, sherpa-onnx, Moonshine, and Parakeet model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
@@ -158,9 +159,12 @@ When running a debug build from a source checkout on Unix, the Models page can
 also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
 fallback. If a packaged sidecar is not already staged, clicking `Install
 runtime` builds the runtime directly into Scribe's managed app-data runtime
-directory. Release builds do not use source-checkout scripts unless
-`SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit development or smoke
-testing.
+directory. This source-checkout bundle-script fallback is Unix-only: Windows
+builds need packaged sidecars staged next to the executable, or explicit
+development runtime paths through the corresponding `SCRIBE_*_CLI` environment
+variables. Release builds do not use source-checkout scripts unless
+`SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit Unix development or
+smoke testing.
 
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
@@ -327,7 +331,8 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 
 ## Notes
 
-- sherpa-onnx, Moonshine, and Parakeet use managed sherpa-onnx Python sidecars in this build. They currently run batch transcription only; true streaming partial transcription still needs a `SttBackend` streaming API.
+- sherpa-onnx, Moonshine, and Parakeet use experimental, managed sherpa-onnx Python sidecars in this build. The sidecars are short-lived local processes and currently run batch transcription only; true streaming partial transcription still needs a `SttBackend` streaming API.
+- Scribe has no cleanup/reasoning pipeline today. If one is added later, it must be local, optional, and off by default, and it must never send audio or text to a cloud service.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.

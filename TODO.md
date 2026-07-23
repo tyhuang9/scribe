@@ -1,5 +1,10 @@
 # TODO
 
+## Runtime Portability
+
+- Make cross-platform runtime tests and CI green for all six local backends, including packaged sidecar discovery, managed runtime install/update/uninstall, and the Unix-only source-checkout fallback.
+- Produce Windows release runtime packages for whisper.cpp and the faster-whisper, Vosk, and sherpa-onnx-family Python sidecars, with documented staging and smoke tests.
+
 ## MVP Hardening
 
 - Expand first-run setup with richer validation and recovery guidance.
@@ -9,7 +14,7 @@
 
 ## STT Backends
 
-- Add installer/package integration around staged whisper.cpp runtime sidecars.
+- Verify staged whisper.cpp runtime sidecars in cross-platform CI; installer/package integration and release artifact publishing remain incomplete.
 - Harden Vosk release packaging with recorded model/runtime SHA256 checksums.
 - Add checksum verification for sherpa-onnx, Moonshine, and Parakeet model archives and runtime packages.
 - Add sherpa-onnx streaming runtime support once `SttBackend` exposes partial transcription events.
@@ -23,7 +28,7 @@
 - Add streaming partial transcription events to `SttBackend`.
 - Add VAD for auto-stop and silence trimming.
 - Add voice commands such as "scratch that".
-- Add an optional local cleanup/reasoning pass for punctuation and formatting.
+- Add an optional local-only cleanup/reasoning pass for punctuation and formatting; keep it off by default and never send audio or text to a cloud service.
 
 ## Model Management
 

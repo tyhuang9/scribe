@@ -29,7 +29,7 @@ Scribe should feel like a native utility, not a dashboard. The default Transcrib
 ## Product Rules
 
 - Visible product name is `Scribe`.
-- Local-first contract stays explicit: no cloud STT, no account/sync, no always-on listener, no Python server, no reasoning cleanup pipeline, and no plugin system.
-- `whisper.cpp` is the only runnable backend in this phase.
-- Other catalog backends remain planned/experimental until adapters are implemented.
+- Local-first contract stays explicit: no cloud STT, no account/sync service, no always-on listener or model process, no Python server, and no plugin system. Any future cleanup/reasoning pass must be local, optional, and off by default; it must never use a cloud service.
+- Six local backends are runnable in the current build: `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet.
+- The sherpa-onnx family is experimental and uses managed, short-lived Python sidecars for batch transcription only. Streaming requires a future `SttBackend` streaming API.
 - Errors should use plain language and keep the transcript visible when insertion fails.
