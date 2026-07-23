@@ -5298,7 +5298,7 @@ mod layout_tests {
     }
 
     fn write_vosk_runtime_with_revision(root: &Path, runner_revision: u32) -> PathBuf {
-        let executable = root.join("bin").join("scribe-vosk");
+        let executable = root.join("bin").join(runtime_wrapper_name("scribe-vosk"));
         let runner = root.join("bin").join("vosk_runner.py");
         let manifest = root.join("runtime-manifest.json");
         let python = if cfg!(windows) {
@@ -5320,7 +5320,7 @@ mod layout_tests {
     }
 
     fn write_sherpa_family_runtime(root: &Path, runtime_id: &str, wrapper: &str) -> PathBuf {
-        let executable = root.join("bin").join(wrapper);
+        let executable = root.join("bin").join(runtime_wrapper_name(wrapper));
         let runner = root.join("bin").join("sherpa_onnx_runner.py");
         let manifest = root.join("runtime-manifest.json");
         let python = if cfg!(windows) {
@@ -5341,6 +5341,32 @@ mod layout_tests {
         .unwrap();
         fs::write(python, b"python").unwrap();
         executable
+    }
+
+    fn runtime_wrapper_name(wrapper: &str) -> String {
+        if cfg!(windows) {
+            format!("{wrapper}.bat")
+        } else {
+            wrapper.to_owned()
+        }
+    }
+
+    fn expected_runtime_install_action(backend: &str) -> RuntimeActionState {
+        if cfg!(windows) {
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: false,
+                disabled_tooltip: Some(format!(
+                    "No packaged {backend} runtime was found. Install a build that bundles this runtime."
+                )),
+            }
+        } else {
+            RuntimeActionState {
+                kind: RuntimeActionKind::Install,
+                enabled: true,
+                disabled_tooltip: None,
+            }
+        }
     }
 
     fn managed_runtime_with_version(
@@ -5641,11 +5667,7 @@ mod layout_tests {
 
         assert_eq!(
             action,
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: true,
-                disabled_tooltip: None,
-            }
+            expected_runtime_install_action(&faster_whisper.backend)
         );
 
         let mut vosk = test_model();
@@ -5656,11 +5678,7 @@ mod layout_tests {
 
         assert_eq!(
             runtime_action_state(&AppConfig::default(), &vosk),
-            RuntimeActionState {
-                kind: RuntimeActionKind::Install,
-                enabled: true,
-                disabled_tooltip: None,
-            }
+            expected_runtime_install_action(&vosk.backend)
         );
 
         config.managed_runtimes.clear();
@@ -5708,11 +5726,7 @@ mod layout_tests {
 
             assert_eq!(
                 runtime_action_state(&AppConfig::default(), &model),
-                RuntimeActionState {
-                    kind: RuntimeActionKind::Install,
-                    enabled: true,
-                    disabled_tooltip: None,
-                },
+                expected_runtime_install_action(&model.backend),
                 "{backend} should be installable"
             );
 
@@ -5775,7 +5789,7 @@ mod layout_tests {
         let action = runtime_action_state(&config, &model);
 
         assert_eq!(action.kind, RuntimeActionKind::Install);
-        assert!(action.enabled);
+        assert_eq!(action, expected_runtime_install_action(&model.backend));
 
         config.managed_runtimes.clear();
         config.managed_runtimes.insert(
@@ -5791,7 +5805,7 @@ mod layout_tests {
         let action = runtime_action_state(&config, &model);
 
         assert_eq!(action.kind, RuntimeActionKind::Install);
-        assert!(action.enabled);
+        assert_eq!(action, expected_runtime_install_action(&model.backend));
         let _ = fs::remove_dir_all(runtime_root);
     }
 

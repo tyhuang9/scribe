@@ -581,7 +581,11 @@ mod tests {
         manifest_contents: &str,
     ) -> PathBuf {
         let spec = runtime_spec_for_runtime_id(runtime_id).unwrap();
-        let executable = root.join("bin").join(spec.wrapper_name);
+        let executable = root.join("bin").join(if cfg!(windows) {
+            format!("{}.bat", spec.wrapper_name)
+        } else {
+            spec.wrapper_name.to_owned()
+        });
         let runner = root.join("bin").join("sherpa_onnx_runner.py");
         let manifest = root.join("runtime-manifest.json");
         let python = root.join(venv_python_relative_path());
