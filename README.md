@@ -149,7 +149,7 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp, faster-whisper, Vosk, sherpa-onnx, Moonshine, or Parakeet model, select the active model, or uninstall models to free storage. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. The Models view shows the runtime each model uses plus rough model/runtime storage estimates before install.
+Open `Models` to install a local whisper.cpp, faster-whisper, Vosk, sherpa-onnx, Moonshine, or Parakeet model, select the active model, or uninstall models to free storage. One click prepares a missing shared backend runtime from the packaged/staged runtime included with the build, persists it, then downloads the requested model. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. Use the default-collapsed `Runtime maintenance` section only for explicit updates or removal.
 
 Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
 
@@ -160,7 +160,7 @@ also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
 fallback. If a packaged sidecar is not already staged, clicking `Install
 runtime` builds the runtime directly into Scribe's managed app-data runtime
 directory. This source-checkout bundle-script fallback is Unix-only: Windows
-builds need packaged sidecars staged next to the executable, or explicit
+development builds need packaged sidecars staged next to the executable, or explicit
 development runtime paths through the corresponding `SCRIBE_*_CLI` environment
 variables. Release builds do not use source-checkout scripts unless
 `SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit Unix development or
