@@ -5,3 +5,11 @@
 /graphify-out/
 /.graphify/
 /.graphify-cache/
+
+# Exact Stitch HTML exports contain remote CDN/runtime behavior and stay local-only.
+/.stitch/designs/selected-transcribe-mock.html
+/.stitch/designs/transcribe-glassmorphic.html
+/.stitch/designs/models-glassmorphic.html
+/.stitch/designs/playground-glassmorphic.html
+/.stitch/designs/settings-glassmorphic.html
+/.stitch/designs/technical-spec-glassmorphic.html

@@ -1,0 +1,60 @@
+{
+  "project": {
+    "id": "projects/13126365166628126458",
+    "title": "Scribe Design System",
+    "designSystemAssets": [
+      {"id":"assets/3f60fe50faff4db39642a14bedc39ec8","title":"Scribe Light"},
+      {"id":"assets/65933eb1011d45848d199c91bd3d16a3","title":"Scribe Dark"}
+    ],
+    "designSystemMutation": "none - existing assets reused"
+  },
+  "deliveryStatus": "official-refined-exports-downloaded",
+  "generatedAt": "2026-07-24",
+  "nativeVerification": {
+    "primaryWindow": "1100x760",
+    "minimumWindow": "840x600",
+    "railWidthLogicalPx": 60,
+    "source": "src/main.rs"
+  },
+  "exportPolicy": {
+    "officialHtml": "exact remote evidence; local-only; explicitly gitignored; do not modify or sanitize",
+    "officialPng": "directional visual evidence; committable",
+    "localPreview": "exploratory or documentation-only; never supersedes official product-screen PNG exports"
+  },
+  "originalRemoteScreens": [
+    {"title":"Transcribe","id":"e05f98545dd1490c9578567559f3d4cb"},
+    {"title":"Models","id":"39e1a0b32d104cf8992c2b5aba61a703"},
+    {"title":"Model Playground","id":"b919023851904475aef0e0921b1189e7"},
+    {"title":"Settings","id":"91ff94dd323d4b07913d40b666282906"},
+    {"title":"Technical Spec","id":"7a36dfc4a9d1453aa615579d3d089b98"},
+    {"title":"DESIGN.md","id":"1857109608861779355"}
+  ],
+  "explorations": [
+    {"localId":"transcribe-mock-a","stitchScreenId":"not-recorded","title":"Soft Neumorphic Utility","deviceType":"DESKTOP","html":"designs/transcribe-mock-a.html","png":"designs/transcribe-mock-a.png","status":"exploratory-local-reference"},
+    {"localId":"transcribe-mock-b","sourceDirectionScreenId":"365f1f7e48474c8289a76ccd176d841c","title":"Synthetic local mock B - cropped interaction-band","deviceType":"DESKTOP","html":"designs/transcribe-mock-b.html","png":"designs/transcribe-mock-b.png","status":"exploratory-local-cropped-not-final"},
+    {"localId":"transcribe-mock-c","stitchScreenId":"not-recorded","title":"Balanced Hybrid","deviceType":"DESKTOP","html":"designs/transcribe-mock-c.html","png":"designs/transcribe-mock-c.png","status":"exploratory-local-reference"}
+  ],
+  "currentRefinedScreens": [
+    {"title":"Transcribe","stitchScreenId":"cbf3135cee1e471188c1878899b7bd92","priorScreenId":"e05f98545dd1490c9578567559f3d4cb","officialHtml":"designs/transcribe-glassmorphic.html","officialPng":"designs/transcribe-glassmorphic.png","evidence":"official-png-directional-native-contract-in-design-md"},
+    {"title":"Models","stitchScreenId":"02ed23fa3f7c4e3ab07a5b41c15b5874","priorScreenId":"39e1a0b32d104cf8992c2b5aba61a703","officialHtml":"designs/models-glassmorphic.html","officialPng":"designs/models-glassmorphic.png","evidence":"official-png-directional-native-contract-in-design-md"},
+    {"title":"Model Playground","stitchScreenId":"ee630cfaae244502b5d6153287fcbd38","priorScreenId":"b919023851904475aef0e0921b1189e7","officialHtml":"designs/playground-glassmorphic.html","officialPng":"designs/playground-glassmorphic.png","evidence":"official-png-directional-native-contract-in-design-md"},
+    {"title":"Settings","stitchScreenId":"b292391685814750b4e4b8eeccdf0bf4","priorScreenId":"91ff94dd323d4b07913d40b666282906","officialHtml":"designs/settings-glassmorphic.html","officialPng":"designs/settings-glassmorphic.png","evidence":"official-png-directional-native-contract-in-design-md"},
+    {"title":"Technical Spec","stitchScreenId":"6e5286e5a23b4dc6abfb9cfd1aa91875","priorScreenId":"7a36dfc4a9d1453aa615579d3d089b98","officialHtml":"designs/technical-spec-glassmorphic.html","localPreviewHtml":"designs/technical-spec.html","localPreviewPng":"designs/technical-spec.png","evidence":"official-html-local-only-plus-corrected-local-png-preview"}
+  ],
+  "selectedRemoteMock": {
+    "remoteScreenId": "365f1f7e48474c8289a76ccd176d841c",
+    "remoteTitle": "Transcribe - Glassmorphic Variant",
+    "officialHtml": "designs/selected-transcribe-mock.html",
+    "officialPng": "designs/selected-transcribe-mock.png",
+    "status": "full-official-remote-exploration-not-final",
+    "rationale": "The variant establishes the compact 60 px icon rail, quiet model/hotkey context, centered tactile record control, and dominant recessed transcript well. Glass separates the shell while neumorphism remains limited to tactile affordances."
+  },
+  "aiOutputComponents": {
+    "selectedVariantDescription": "Compact icon rail, translucent/tinted shell over cool canvas, compact model/hotkey header, centered tactile recording control, and large subtly recessed transcript well.",
+    "otherMockDescriptions": ["Soft Neumorphic Utility", "Balanced Hybrid"],
+    "initialSuggestions": ["Add a listening state", "Generate a neumorphic Models screen", "Generate a dark mode variant"],
+    "finalDirection": "Glass shell, compact rail, selective recessed wells, explicit Transcribe states, and an egui-specific technical specification.",
+    "finalSuggestions": ["Dark mode", "Transcription pulse", "Runtime disclosure detail"]
+  },
+  "stitchPrompts": "prompts.md"
+}
