@@ -66,7 +66,7 @@ Text must meet WCAG 2.1 AA contrast on its actual surface. Status always combine
 - Model setup is progressive: Install can prepare a local shared runtime then download the model. Runtime maintenance remains collapsed.
 - Playground selection is drafted until Apply. It uses a pointer shield, initial focus, Cancel/Escape, and opener-focus restoration. Empty selection is valid but cannot run.
 - Settings save immediately with quiet inline "Saved" feedback. Toggle/radio state is communicated by text, icon, and position.
-- Decorative transitions are 120-180 ms, opacity/transform only, ease-out. Operational recording/transcription progress may animate when paired with text. Decorative perpetual motion is banned; a reduced-motion product setting is a later follow-up, not part of this visual branch.
+- Decorative transitions are 120-180 ms, opacity/transform only, ease-out. Operational recording/transcription progress may animate when paired with text. Decorative perpetual motion is banned. The native-motion experiment honors `SCRIBE_REDUCED_MOTION=1` (also `true`, `yes`, or `on`) at startup to disable record-control interpolation without persisted configuration; a discoverable in-product setting remains a later follow-up.
 
 ## 7. Accessibility and native egui constraints
 

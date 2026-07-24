@@ -33,6 +33,9 @@ use crate::tray::{TrayCommand, TrayService};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
+const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
+const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
+const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -933,6 +936,15 @@ fn env_flag_value_enabled(value: &str) -> bool {
     )
 }
 
+fn reduced_motion_enabled() -> bool {
+    let value = env::var("SCRIBE_REDUCED_MOTION").ok();
+    reduced_motion_enabled_for(value.as_deref())
+}
+
+fn reduced_motion_enabled_for(value: Option<&str>) -> bool {
+    value.is_some_and(env_flag_value_enabled)
+}
+
 pub struct LocalTranscriberApp {
     config: AppConfig,
     config_path: Option<PathBuf>,
@@ -964,6 +976,7 @@ pub struct LocalTranscriberApp {
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
     last_tray_state: Option<TrayUiState>,
+    reduced_motion: bool,
     quit_requested: bool,
 }
 
@@ -1017,6 +1030,7 @@ impl LocalTranscriberApp {
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
+            reduced_motion: reduced_motion_enabled(),
             quit_requested: false,
         };
 
@@ -2452,6 +2466,7 @@ impl LocalTranscriberApp {
                             record_button(ui, listening),
                             disabled_tooltip.as_deref(),
                         );
+                        paint_record_motion(ui, &response, listening, self.reduced_motion);
                         response.widget_info(|| {
                             egui::WidgetInfo::labeled(egui::WidgetType::Button, button_text)
                         });
@@ -4734,6 +4749,88 @@ fn record_button<'a>(ui: &Ui, listening: bool) -> FocusableButton<'a> {
     }
 }
 
+fn paint_record_motion(ui: &Ui, response: &egui::Response, listening: bool, reduced_motion: bool) {
+    if !response.enabled() || !ui.is_rect_visible(response.rect) {
+        return;
+    }
+
+    let state_progress = record_motion_progress(
+        ui.ctx(),
+        response.id.with("recording-state"),
+        listening,
+        reduced_motion,
+        RECORD_STATE_MOTION_SECONDS,
+    );
+    let hover_progress = record_motion_progress(
+        ui.ctx(),
+        response.id.with("hover"),
+        response.hovered(),
+        reduced_motion,
+        RECORD_HOVER_MOTION_SECONDS,
+    );
+    let press_progress = record_motion_progress(
+        ui.ctx(),
+        response.id.with("press"),
+        response.is_pointer_button_down_on(),
+        reduced_motion,
+        RECORD_PRESS_MOTION_SECONDS,
+    );
+
+    let colors = ui_palette(ui);
+    let hover = ease_out_cubic(hover_progress);
+    let press = ease_out_cubic(press_progress);
+    let base_radius = response.rect.width().min(response.rect.height()) * 0.5;
+
+    if hover > 0.0 || press > 0.0 {
+        ui.painter().circle_stroke(
+            response.rect.center(),
+            base_radius - press * 1.25,
+            Stroke::new(
+                1.0 + press,
+                colors
+                    .accent
+                    .gamma_multiply((0.22 + hover * 0.38).clamp(0.0, 1.0)),
+            ),
+        );
+    }
+
+    let pulse = bounded_transition_pulse(state_progress);
+    if pulse > 0.0 {
+        ui.painter().circle_stroke(
+            response.rect.center(),
+            base_radius + 4.0 + pulse * 2.0,
+            Stroke::new(
+                1.0 + pulse * 0.75,
+                colors.accent.gamma_multiply(pulse * 0.42),
+            ),
+        );
+    }
+}
+
+fn record_motion_progress(
+    ctx: &egui::Context,
+    id: egui::Id,
+    target: bool,
+    reduced_motion: bool,
+    duration_seconds: f32,
+) -> f32 {
+    if reduced_motion {
+        if target { 1.0 } else { 0.0 }
+    } else {
+        ctx.animate_bool_with_time(id, target, duration_seconds)
+    }
+}
+
+fn ease_out_cubic(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    1.0 - (1.0 - value).powi(3)
+}
+
+fn bounded_transition_pulse(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    4.0 * progress * (1.0 - progress)
+}
+
 fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> FocusableButton<'a> {
     let colors = ui_palette(ui);
     FocusableButton {
@@ -5897,6 +5994,34 @@ mod layout_tests {
     }
 
     #[test]
+    fn reduced_motion_env_parser_accepts_only_explicit_opt_in_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(reduced_motion_enabled_for(Some(value)), "{value}");
+        }
+        for value in ["0", "false", "no", "off", "", "sometimes"] {
+            assert!(!reduced_motion_enabled_for(Some(value)), "{value}");
+        }
+        assert!(!reduced_motion_enabled_for(None));
+    }
+
+    #[test]
+    fn record_motion_curves_are_bounded_and_settle_at_their_endpoints() {
+        assert_eq!(ease_out_cubic(-1.0), 0.0);
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert_eq!(ease_out_cubic(2.0), 1.0);
+        assert_eq!(bounded_transition_pulse(0.0), 0.0);
+        assert_eq!(bounded_transition_pulse(0.5), 1.0);
+        assert_eq!(bounded_transition_pulse(1.0), 0.0);
+
+        for step in 0..=100 {
+            let progress = step as f32 / 100.0;
+            assert!((0.0..=1.0).contains(&ease_out_cubic(progress)));
+            assert!((0.0..=1.0).contains(&bounded_transition_pulse(progress)));
+        }
+    }
+
+    #[test]
     fn model_catalog_row_paints_within_viewport_at_minimum_and_wide_widths() {
         for width in [840.0, 1440.0, 4096.0] {
             let output = render_model_catalog_row(width);
@@ -6315,6 +6440,42 @@ mod layout_tests {
             },
         );
         assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
+    }
+
+    #[test]
+    fn record_motion_repaints_only_until_the_transition_settles() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let _ = render_record_motion_frame(&ctx, false, false, 0.0);
+        let transition = render_record_motion_frame(&ctx, true, false, 1.0 / 60.0);
+        assert_eq!(root_repaint_delay(&transition), Duration::ZERO);
+
+        for frame in 2..=20 {
+            let _ = render_record_motion_frame(&ctx, true, false, f64::from(frame) / 60.0);
+        }
+        let settled = render_record_motion_frame(&ctx, true, false, 21.0 / 60.0);
+        assert_eq!(root_repaint_delay(&settled), Duration::MAX);
+
+        let stopping = render_record_motion_frame(&ctx, false, false, 22.0 / 60.0);
+        assert_eq!(root_repaint_delay(&stopping), Duration::ZERO);
+        for frame in 23..=41 {
+            let _ = render_record_motion_frame(&ctx, false, false, f64::from(frame) / 60.0);
+        }
+        let stopped = render_record_motion_frame(&ctx, false, false, 42.0 / 60.0);
+        assert_eq!(root_repaint_delay(&stopped), Duration::MAX);
+    }
+
+    #[test]
+    fn reduced_motion_bypasses_interpolation_and_follow_up_repaints() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+        let _ = render_record_motion_frame(&ctx, false, true, 0.0);
+        let output = render_record_motion_frame(&ctx, true, true, 1.0 / 60.0);
+        assert_eq!(root_repaint_delay(&output), Duration::MAX);
     }
 
     #[test]
@@ -6855,6 +7016,39 @@ mod layout_tests {
         })
     }
 
+    fn render_record_motion_frame(
+        ctx: &egui::Context,
+        listening: bool,
+        reduced_motion: bool,
+        time: f64,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(180.0, 120.0),
+                )),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.add(record_button(ui, listening));
+                    paint_record_motion(ui, &response, listening, reduced_motion);
+                });
+            },
+        )
+    }
+
+    fn root_repaint_delay(output: &egui::FullOutput) -> Duration {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay
+    }
+
     fn render_accessible_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
         render_accessible_app_tab_at_size(tab, width, 760.0)
     }
@@ -7072,6 +7266,7 @@ mod layout_tests {
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
+            reduced_motion: false,
             quit_requested: false,
         }
     }
