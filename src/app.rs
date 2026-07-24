@@ -2305,7 +2305,6 @@ impl eframe::App for LocalTranscriberApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx, frame);
-        let colors = theme_palette(ctx);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
@@ -2317,33 +2316,7 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_events();
         self.sync_tray_state();
 
-        egui::SidePanel::left("navigation")
-            .frame(
-                Frame::none()
-                    .fill(colors.sidebar_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .inner_margin(Margin::symmetric(14.0, 16.0)),
-            )
-            .resizable(false)
-            .exact_width(200.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Scribe")
-                        .font(FontId::proportional(20.0))
-                        .color(colors.primary)
-                        .strong(),
-                );
-                ui.label(RichText::new("Local-First STT").small().weak());
-                ui.add_space(22.0);
-                nav_button(ui, &mut self.current_tab, Tab::Transcribe);
-                nav_button(ui, &mut self.current_tab, Tab::Models);
-                nav_button(ui, &mut self.current_tab, Tab::Playground);
-                nav_button(ui, &mut self.current_tab, Tab::Settings);
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    sidebar_link(ui, "Privacy");
-                    sidebar_link(ui, "Help");
-                });
-            });
+        navigation_rail(ctx, &mut self.current_tab);
 
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
@@ -2378,11 +2351,10 @@ impl LocalTranscriberApp {
             let hotkey = self.config.hotkey.clone();
             let mut requested_tab = None;
 
-            ui.columns(2, |columns| {
-                summary_card(
-                    &mut columns[0],
-                    "Current Model",
-                    |ui| {
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(label_caps("Current Model"));
                         if let Some((name, backend, install_status)) = &selected_model_summary {
                             ui.label(body_strong(name));
                             ui.horizontal_wrapped(|ui| {
@@ -2396,26 +2368,20 @@ impl LocalTranscriberApp {
                         } else {
                             ui.label(body_strong("No model selected"));
                         }
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Change")).clicked() {
-                            requested_tab = Some(Tab::Models);
-                        }
-                    },
-                );
-
-                summary_card(
-                    &mut columns[1],
-                    "Hotkey",
-                    |ui| {
+                    });
+                    ui.add_space(12.0);
+                    if ui.add(small_button(ui, "Change")).clicked() {
+                        requested_tab = Some(Tab::Models);
+                    }
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.label(label_caps("Hotkey"));
                         ui.label(body_strong(&hotkey));
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Edit")).clicked() {
-                            requested_tab = Some(Tab::Settings);
-                        }
-                    },
-                );
+                    });
+                    if ui.add(small_button(ui, "Edit")).clicked() {
+                        requested_tab = Some(Tab::Settings);
+                    }
+                });
             });
             if let Some(tab) = requested_tab {
                 self.current_tab = tab;
@@ -2458,72 +2424,80 @@ impl LocalTranscriberApp {
             }
 
             ui.add_space(12.0);
-            recessed_panel(ui, 110.0, |ui| {
-                ui.vertical_centered(|ui| {
-                    let listening = self.active_recording.is_some();
-                    let button_text = if listening {
-                        "Stop Listening"
-                    } else {
-                        "Start Listening"
-                    };
-                    let disabled_tooltip = if listening || ready {
-                        None
-                    } else {
-                        Some(
-                            runtime_status
-                                .as_ref()
-                                .map(setup_message_for_status)
-                                .unwrap_or_else(|| {
-                                    "Choose or install a local model before transcribing."
-                                        .to_owned()
-                                }),
-                        )
-                    };
-                    let record_button = primary_button(ui, button_text);
-                    if add_enabled_button(
-                        ui,
-                        listening || ready,
-                        record_button,
-                        disabled_tooltip.as_deref(),
-                    )
-                    .clicked()
-                    {
-                        self.toggle_recording();
-                    }
-                    ui.add_space(8.0);
-                    if let Some(active) = &self.active_recording {
-                        let elapsed = active.started_at.elapsed().as_secs_f32();
-                        let total = active.max_duration_seconds.max(1) as f32;
-                        ui.add(
-                            egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
-                                .desired_width(220.0)
-                                .text(recording_timer_text(active)),
+            recessed_panel(ui, 132.0, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        let listening = self.active_recording.is_some();
+                        let button_text = if listening {
+                            "Stop Listening"
+                        } else {
+                            "Start Listening"
+                        };
+                        let disabled_tooltip = if listening || ready {
+                            None
+                        } else {
+                            Some(
+                                runtime_status
+                                    .as_ref()
+                                    .map(setup_message_for_status)
+                                    .unwrap_or_else(|| {
+                                        "Choose or install a local model before transcribing."
+                                            .to_owned()
+                                    }),
+                            )
+                        };
+                        let response = add_enabled_button(
+                            ui,
+                            listening || ready,
+                            record_button(ui, listening),
+                            disabled_tooltip.as_deref(),
                         );
-                    } else if ready {
-                        ui.label(
-                            RichText::new("System audio & microphone active")
-                                .small()
-                                .weak(),
-                        );
-                    }
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, button_text)
+                        });
+                        response.clone().on_hover_text(button_text);
+                        if response.clicked() {
+                            self.toggle_recording();
+                        }
+                        ui.add_space(8.0);
+                        if let Some(active) = &self.active_recording {
+                            let elapsed = active.started_at.elapsed().as_secs_f32();
+                            let total = active.max_duration_seconds.max(1) as f32;
+                            ui.add(
+                                egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
+                                    .desired_width(220.0)
+                                    .text(recording_timer_text(active)),
+                            );
+                        } else if ready {
+                            ui.label(
+                                RichText::new("Ready to listen - system audio & microphone active")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
                 });
             });
 
             ui.add_space(12.0);
-            transcript_panel(ui, status, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(section_heading("Transcript"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ready_dot(ui, self.status);
-                    });
-                });
+            transcript_panel(ui, |ui| {
+                let label_id = ui
+                    .horizontal(|ui| {
+                        let label = ui.label(section_heading("Transcript"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ready_dot(ui, self.status);
+                        });
+                        label.id
+                    })
+                    .inner;
                 ui.add_space(10.0);
-                ui.add(
+                let response = ui.add(
                     TextEdit::multiline(&mut self.transcript)
                         .desired_rows(14)
                         .desired_width(usable_width(ui))
                         .hint_text("Your transcription appears here..."),
                 );
+                set_control_accessibility(ui, &response, label_id, "Transcript");
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(small_button(ui, "Clear")).clicked() {
@@ -2585,7 +2559,7 @@ impl LocalTranscriberApp {
                 wrapped_label(
                     ui,
                     mut_text(format!(
-                        "Storage: models in {} · runtimes in {}",
+                        "Storage: models in {} | runtimes in {}",
                         config::model_storage_dir(&self.config).display(),
                         config::runtime_storage_dir().display()
                     )),
@@ -3189,11 +3163,11 @@ impl LocalTranscriberApp {
                     }
                     let mut paste_delay = self.config.paste_delay_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Paste delay ms");
-                        if ui
-                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
-                            .changed()
-                        {
+                        let label = ui.label("Paste delay ms");
+                        let response =
+                            ui.add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000));
+                        set_control_accessibility(ui, &response, label.id, "Paste delay ms");
+                        if response.changed() {
                             self.config.paste_delay_ms = paste_delay.max(1) as u64;
                             self.save_config();
                         }
@@ -3206,11 +3180,12 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Shortcuts"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Record toggle");
-                    ui.add(
+                    let label = ui.label("Record toggle");
+                    let response = ui.add(
                         TextEdit::singleline(&mut self.hotkey_input)
                             .desired_width(width_before_trailing(ui, 154.0, 96.0)),
                     );
+                    set_control_accessibility(ui, &response, label.id, "Record toggle hotkey");
                     if ui.add(small_button(ui, "Apply")).clicked() {
                         self.apply_hotkey();
                     }
@@ -3231,8 +3206,8 @@ impl LocalTranscriberApp {
                 });
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.hotkey_mode;
-                    ui.label("Hotkey mode");
-                    ComboBox::from_id_source("hotkey-mode")
+                    let label = ui.label("Hotkey mode");
+                    let response = ComboBox::from_id_source("hotkey-mode")
                         .selected_text(self.config.hotkey_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in HotkeyMode::ALL {
@@ -3242,7 +3217,9 @@ impl LocalTranscriberApp {
                                     mode.label(),
                                 );
                             }
-                        });
+                        })
+                        .response;
+                    set_control_accessibility(ui, &response, label.id, "Hotkey mode");
                     if before != self.config.hotkey_mode {
                         self.save_config();
                     }
@@ -3256,9 +3233,9 @@ impl LocalTranscriberApp {
                 let active_device_support = selected_model_device_support(&self.config);
                 let prefer_gpu_available = active_device_support.supports_gpu();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Transcription device");
+                    let label = ui.label("Transcription device");
                     let mut compute_mode = self.config.whisper_compute_mode;
-                    ComboBox::from_id_source("transcription-device-mode")
+                    let response = ComboBox::from_id_source("transcription-device-mode")
                         .selected_text(compute_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in WhisperComputeMode::ALL {
@@ -3268,7 +3245,9 @@ impl LocalTranscriberApp {
                                     ui.selectable_value(&mut compute_mode, mode, mode.label());
                                 });
                             }
-                        });
+                        })
+                        .response;
+                    set_control_accessibility(ui, &response, label.id, "Transcription device");
                     if compute_mode != self.config.whisper_compute_mode {
                         self.config.whisper_compute_mode = compute_mode;
                         self.save_config();
@@ -3289,9 +3268,9 @@ impl LocalTranscriberApp {
                     let devices = provider.detect_devices(&self.config);
                     if devices.len() > 1 {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label("GPU device");
+                            let label = ui.label("GPU device");
                             let mut selected_device = self.config.whisper_gpu_device.to_string();
-                            ComboBox::from_id_source("transcription-device-picker")
+                            let response = ComboBox::from_id_source("transcription-device-picker")
                                 .selected_text(
                                     devices
                                         .iter()
@@ -3307,7 +3286,9 @@ impl LocalTranscriberApp {
                                             &device.name,
                                         );
                                     }
-                                });
+                                })
+                                .response;
+                            set_control_accessibility(ui, &response, label.id, "GPU device");
                             if let Ok(device_index) = selected_device.parse::<u32>()
                                 && device_index != self.config.whisper_gpu_device
                             {
@@ -3325,8 +3306,8 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.audio_input_device_name.clone();
-                    ui.label("Microphone");
-                    ComboBox::from_id_source("audio-input-device")
+                    let label = ui.label("Microphone");
+                    let response = ComboBox::from_id_source("audio-input-device")
                         .selected_text(
                             self.config
                                 .audio_input_device_name
@@ -3346,7 +3327,9 @@ impl LocalTranscriberApp {
                                     device,
                                 );
                             }
-                        });
+                        })
+                        .response;
+                    set_control_accessibility(ui, &response, label.id, "Microphone");
                     if before != self.config.audio_input_device_name {
                         self.save_config();
                     }
@@ -3356,11 +3339,11 @@ impl LocalTranscriberApp {
                 });
                 let mut max_duration = self.config.max_recording_seconds as i32;
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Max recording seconds");
-                    if ui
-                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
-                        .changed()
-                    {
+                    let label = ui.label("Max recording seconds");
+                    let response =
+                        ui.add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600));
+                    set_control_accessibility(ui, &response, label.id, "Max recording seconds");
+                    if response.changed() {
                         self.config.max_recording_seconds = max_duration.max(1) as u32;
                         self.save_config();
                     }
@@ -3373,8 +3356,8 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.theme_mode;
-                    ui.label("Theme");
-                    ComboBox::from_id_source("theme-mode")
+                    let label = ui.label("Theme");
+                    let response = ComboBox::from_id_source("theme-mode")
                         .selected_text(self.config.theme_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in ThemeMode::ALL {
@@ -3384,7 +3367,9 @@ impl LocalTranscriberApp {
                                     mode.label(),
                                 );
                             }
-                        });
+                        })
+                        .response;
+                    set_control_accessibility(ui, &response, label.id, "Theme");
                     if before != self.config.theme_mode {
                         self.save_config();
                     }
@@ -3450,44 +3435,44 @@ impl ThemePalette {
 
     fn light() -> Self {
         Self {
-            shell_bg: Color32::from_rgb(247, 249, 251),
-            content_bg: Color32::from_rgb(247, 249, 251),
-            sidebar_bg: Color32::WHITE,
-            card_bg: Color32::WHITE,
-            panel_bg: Color32::from_rgb(248, 250, 252),
-            active_card_bg: Color32::from_rgb(239, 246, 255),
-            text: Color32::from_rgb(29, 33, 42),
-            muted_text: Color32::from_rgb(85, 95, 109),
-            border: Color32::from_rgb(226, 232, 240),
-            border_strong: Color32::from_rgb(203, 213, 225),
-            primary: Color32::from_rgb(6, 10, 18),
-            accent: Color32::from_rgb(37, 99, 235),
-            success: Color32::from_rgb(22, 163, 74),
-            warning: Color32::from_rgb(202, 138, 4),
-            error: Color32::from_rgb(220, 38, 38),
-            primary_button_bg: Color32::from_rgb(6, 10, 18),
+            shell_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 184),
+            content_bg: Color32::from_rgb(238, 242, 246),
+            sidebar_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 196),
+            card_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 232),
+            panel_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 184),
+            active_card_bg: Color32::from_rgba_unmultiplied(224, 235, 252, 224),
+            text: Color32::from_rgb(24, 33, 43),
+            muted_text: Color32::from_rgb(94, 107, 120),
+            border: Color32::from_rgba_unmultiplied(121, 139, 157, 66),
+            border_strong: Color32::from_rgba_unmultiplied(92, 110, 128, 104),
+            primary: Color32::from_rgb(24, 33, 43),
+            accent: Color32::from_rgb(50, 105, 199),
+            success: Color32::from_rgb(47, 125, 88),
+            warning: Color32::from_rgb(154, 106, 24),
+            error: Color32::from_rgb(180, 65, 66),
+            primary_button_bg: Color32::from_rgb(50, 105, 199),
             primary_button_text: Color32::WHITE,
         }
     }
 
     fn dark() -> Self {
         Self {
-            shell_bg: Color32::from_rgb(15, 18, 24),
-            content_bg: Color32::from_rgb(15, 18, 24),
-            sidebar_bg: Color32::from_rgb(20, 24, 32),
-            card_bg: Color32::from_rgb(26, 31, 41),
-            panel_bg: Color32::from_rgb(22, 27, 36),
-            active_card_bg: Color32::from_rgb(25, 42, 68),
-            text: Color32::from_rgb(236, 241, 247),
-            muted_text: Color32::from_rgb(156, 166, 179),
-            border: Color32::from_rgb(53, 61, 76),
-            border_strong: Color32::from_rgb(76, 86, 104),
-            primary: Color32::from_rgb(247, 250, 252),
-            accent: Color32::from_rgb(96, 165, 250),
-            success: Color32::from_rgb(74, 222, 128),
-            warning: Color32::from_rgb(251, 191, 36),
-            error: Color32::from_rgb(248, 113, 113),
-            primary_button_bg: Color32::from_rgb(37, 99, 235),
+            shell_bg: Color32::from_rgba_unmultiplied(28, 38, 50, 238),
+            content_bg: Color32::from_rgb(20, 27, 36),
+            sidebar_bg: Color32::from_rgba_unmultiplied(31, 42, 54, 220),
+            card_bg: Color32::from_rgba_unmultiplied(37, 49, 63, 238),
+            panel_bg: Color32::from_rgba_unmultiplied(31, 42, 54, 220),
+            active_card_bg: Color32::from_rgba_unmultiplied(42, 67, 103, 230),
+            text: Color32::from_rgb(232, 238, 245),
+            muted_text: Color32::from_rgb(174, 186, 199),
+            border: Color32::from_rgba_unmultiplied(157, 177, 197, 82),
+            border_strong: Color32::from_rgba_unmultiplied(195, 211, 226, 118),
+            primary: Color32::from_rgb(232, 238, 245),
+            accent: Color32::from_rgb(112, 164, 235),
+            success: Color32::from_rgb(104, 198, 145),
+            warning: Color32::from_rgb(232, 181, 83),
+            error: Color32::from_rgb(239, 126, 127),
+            primary_button_bg: Color32::from_rgb(50, 105, 199),
             primary_button_text: Color32::WHITE,
         }
     }
@@ -3514,7 +3499,7 @@ fn configure_stitch_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(10.0, 6.0);
-    style.spacing.interact_size = Vec2::new(24.0, 28.0);
+    style.spacing.interact_size = Vec2::new(32.0, 36.0);
     style.text_styles.insert(
         TextStyle::Heading,
         FontId::new(24.0, FontFamily::Proportional),
@@ -3540,6 +3525,34 @@ fn paint_viewport_background(ctx: &egui::Context) {
         0.0,
         colors.content_bg,
     );
+}
+
+fn navigation_rail(ctx: &egui::Context, current_tab: &mut Tab) {
+    let colors = theme_palette(ctx);
+    egui::SidePanel::left("navigation")
+        .frame(
+            Frame::none()
+                .fill(colors.sidebar_bg)
+                .stroke(Stroke::new(1.0, colors.border))
+                .inner_margin(Margin::symmetric(8.0, 12.0)),
+        )
+        .resizable(false)
+        .exact_width(60.0)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("S")
+                        .font(FontId::proportional(20.0))
+                        .color(colors.primary)
+                        .strong(),
+                );
+            });
+            ui.add_space(20.0);
+            nav_button(ui, current_tab, Tab::Transcribe);
+            nav_button(ui, current_tab, Tab::Models);
+            nav_button(ui, current_tab, Tab::Playground);
+            nav_button(ui, current_tab, Tab::Settings);
+        });
 }
 
 fn page(
@@ -3580,7 +3593,7 @@ fn page(
             }
             ui.add_space(14.0);
             let body_width = usable_width(ui);
-            ScrollArea::vertical()
+            let _scroll_output = ScrollArea::vertical()
                 .id_source(("page-scroll", title))
                 .max_width(body_width)
                 .min_scrolled_width(body_width)
@@ -3591,6 +3604,17 @@ fn page(
                         add_contents(ui);
                     });
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(("test-page-scroll-metrics", title)),
+                    (
+                        _scroll_output.id,
+                        _scroll_output.content_size.y,
+                        _scroll_output.inner_rect.height(),
+                    ),
+                );
+            });
         },
     );
 }
@@ -3598,7 +3622,20 @@ fn page(
 fn content_panel_frame(ctx: &egui::Context) -> Frame {
     let colors = theme_palette(ctx);
     Frame::none()
-        .fill(colors.content_bg)
+        .fill(colors.shell_bg)
+        .stroke(Stroke::new(1.0, colors.border))
+        .rounding(Rounding::same(14.0))
+        .shadow(egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 2.0),
+            blur: 6.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(if ctx.style().visuals.dark_mode {
+                72
+            } else {
+                24
+            }),
+        })
+        .outer_margin(Margin::same(8.0))
         .inner_margin(Margin::symmetric(24.0, 0.0))
 }
 
@@ -3611,7 +3648,7 @@ fn card_frame(ui: &Ui) -> Frame {
     Frame::none()
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(6.0))
+        .rounding(Rounding::same(10.0))
         .inner_margin(Margin::same(14.0))
 }
 
@@ -3630,7 +3667,7 @@ fn model_card_frame(ui: &Ui, selected: bool) -> Frame {
     Frame::none()
         .fill(fill)
         .stroke(stroke)
-        .rounding(Rounding::same(6.0))
+        .rounding(Rounding::same(10.0))
         .inner_margin(Margin::same(14.0))
 }
 
@@ -3670,11 +3707,19 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
 
 fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
     ui.vertical(|ui| {
-        ui.label(label_caps("Search"));
-        ui.add_sized(
-            [190.0, 28.0],
+        let label = ui.label(label_caps("Search"));
+        let response = ui.add_sized(
+            [190.0, 36.0],
             TextEdit::singleline(search).hint_text("Search models..."),
         );
+        set_control_accessibility(ui, &response, label.id, "Search models");
+    });
+}
+
+fn set_control_accessibility(ui: &Ui, response: &egui::Response, label_id: egui::Id, name: &str) {
+    response.clone().labelled_by(label_id);
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name(name);
     });
 }
 
@@ -3685,8 +3730,8 @@ fn model_backend_filter_control(
     backends: &[String],
 ) {
     ui.vertical(|ui| {
-        ui.label(label_caps("Filter Backend"));
-        ComboBox::from_id_source(id_source)
+        let label = ui.label(label_caps("Filter Backend"));
+        let response = ComboBox::from_id_source(id_source)
             .selected_text(if selected_backend == "All" {
                 "All Backends"
             } else {
@@ -3698,46 +3743,65 @@ fn model_backend_filter_control(
                 for backend in backends {
                     ui.selectable_value(selected_backend, backend.clone(), backend);
                 }
-            });
+            })
+            .response;
+        set_control_accessibility(ui, &response, label.id, "Filter model backend");
     });
 }
 
-fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
+fn recessed_panel(
+    ui: &mut Ui,
+    min_height: f32,
+    add_contents: impl FnOnce(&mut Ui),
+) -> egui::InnerResponse<()> {
     let colors = ui_palette(ui);
-    full_width_frame(
+    let response = full_width_frame(
         ui,
         Frame::none()
             .fill(colors.panel_bg)
             .stroke(Stroke::new(1.0, colors.border_strong))
-            .rounding(Rounding::same(8.0))
+            .rounding(Rounding::same(12.0))
             .inner_margin(Margin::same(18.0)),
         |ui| {
             ui.set_min_height(min_height);
-            ui.centered_and_justified(add_contents);
+            add_contents(ui);
         },
     );
+    let rect = response.response.rect;
+    let (highlight, shade) = recessed_edge_colors(ui.visuals().dark_mode);
+    ui.painter().line_segment(
+        [
+            rect.left_top() + Vec2::new(10.0, 0.5),
+            rect.right_top() + Vec2::new(-10.0, 0.5),
+        ],
+        Stroke::new(1.0, highlight),
+    );
+    ui.painter().line_segment(
+        [
+            rect.left_bottom() + Vec2::new(10.0, -0.5),
+            rect.right_bottom() + Vec2::new(-10.0, -0.5),
+        ],
+        Stroke::new(1.0, shade),
+    );
+    response
 }
 
-fn transcript_panel(ui: &mut Ui, _status: TranscriptionStatus, add_contents: impl FnOnce(&mut Ui)) {
-    card(ui, add_contents);
+fn recessed_edge_colors(dark_mode: bool) -> (Color32, Color32) {
+    if dark_mode {
+        (
+            Color32::from_rgba_unmultiplied(205, 220, 235, 28),
+            Color32::from_rgba_unmultiplied(4, 9, 15, 92),
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(255, 255, 255, 214),
+            Color32::from_rgba_unmultiplied(92, 110, 128, 44),
+        )
+    }
 }
 
-fn summary_card(
-    ui: &mut Ui,
-    title: &str,
-    body: impl FnOnce(&mut Ui),
-    actions: impl FnOnce(&mut Ui),
-) {
-    full_width_frame(ui, card_frame(ui), |ui| {
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.label(label_caps(title));
-                ui.add_space(6.0);
-                body(ui);
-            });
-            ui.with_layout(Layout::right_to_left(Align::TOP), actions);
-        });
-    });
+fn transcript_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    recessed_panel(ui, 0.0, add_contents);
 }
 
 fn model_catalog_row(
@@ -3964,7 +4028,7 @@ fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<Strin
                 _ => format_bytes(*downloaded_bytes),
             };
             Some(match bytes_per_second.filter(|speed| *speed > 0) {
-                Some(speed) => format!("{transferred} · {}/s", format_bytes(speed)),
+                Some(speed) => format!("{transferred} | {}/s", format_bytes(speed)),
                 None => transferred,
             })
         }
@@ -4496,76 +4560,212 @@ fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
         .min(available - trailing_width)
 }
 
+fn paint_focus_ring(ui: &Ui, response: &egui::Response, rounding: f32) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            Rounding::same(rounding + 2.0),
+            Stroke::new(2.0, ui_palette(ui).accent),
+        );
+    }
+}
+
+struct FocusableButton<'a> {
+    button: Button<'a>,
+    rounding: f32,
+}
+
+impl egui::Widget for FocusableButton<'_> {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let response = ui.add(self.button);
+        paint_focus_ring(ui, &response, self.rounding);
+        response
+    }
+}
+
 fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab) {
     let colors = ui_palette(ui);
     let selected = *current_tab == tab;
     let response = ui.add_sized(
-        [ui.available_width(), 34.0],
-        Button::new(RichText::new(tab.label()).color(if selected {
-            colors.text
+        [ui.available_width(), 40.0],
+        Button::new("")
+            .fill(if selected {
+                colors.active_card_bg
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(if selected {
+                Stroke::new(1.0, colors.accent)
+            } else {
+                Stroke::NONE
+            })
+            .rounding(Rounding::same(8.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, selected, tab.label())
+    });
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(
+                egui::pos2(response.rect.left() + 3.0, response.rect.center().y),
+                Vec2::new(3.0, 14.0),
+            ),
+            Rounding::same(1.5),
+            colors.accent,
+        );
+    }
+    paint_nav_icon(
+        ui.painter(),
+        response.rect.center(),
+        tab,
+        if selected {
+            colors.accent
         } else {
             colors.muted_text
-        }))
-        .fill(if selected {
-            colors.card_bg
-        } else {
-            colors.shell_bg
-        })
-        .stroke(if selected {
-            Stroke::new(1.0, colors.border_strong)
-        } else {
-            Stroke::NONE
-        })
-        .rounding(Rounding::same(6.0)),
+        },
     );
+    paint_focus_ring(ui, &response, 8.0);
+    response.clone().on_hover_text(tab.label());
     if response.clicked() {
         *current_tab = tab;
     }
 }
 
-fn sidebar_link(ui: &mut Ui, label: &str) {
-    ui.label(RichText::new(label).small().weak());
+fn paint_nav_icon(painter: &egui::Painter, center: egui::Pos2, tab: Tab, color: Color32) {
+    let stroke = Stroke::new(1.8, color);
+    match tab {
+        Tab::Transcribe => {
+            painter.circle_stroke(center + Vec2::new(0.0, -3.0), 4.0, stroke);
+            painter.line_segment(
+                [
+                    center + Vec2::new(-6.0, -2.0),
+                    center + Vec2::new(-6.0, 0.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(6.0, -2.0), center + Vec2::new(6.0, 0.0)],
+                stroke,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    center + Vec2::new(-6.0, 0.0),
+                    center + Vec2::new(-4.0, 4.0),
+                    center + Vec2::new(0.0, 5.5),
+                    center + Vec2::new(4.0, 4.0),
+                    center + Vec2::new(6.0, 0.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [center + Vec2::new(0.0, 5.5), center + Vec2::new(0.0, 8.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(-4.0, 8.0), center + Vec2::new(4.0, 8.0)],
+                stroke,
+            );
+        }
+        Tab::Models => {
+            let points = vec![
+                center + Vec2::new(0.0, -8.0),
+                center + Vec2::new(7.0, -4.0),
+                center + Vec2::new(7.0, 4.0),
+                center + Vec2::new(0.0, 8.0),
+                center + Vec2::new(-7.0, 4.0),
+                center + Vec2::new(-7.0, -4.0),
+            ];
+            painter.add(egui::Shape::closed_line(points, stroke));
+            painter.line_segment([center + Vec2::new(-7.0, -4.0), center], stroke);
+            painter.line_segment([center, center + Vec2::new(7.0, -4.0)], stroke);
+            painter.line_segment([center, center + Vec2::new(0.0, 8.0)], stroke);
+        }
+        Tab::Playground => {
+            painter.line_segment(
+                [
+                    center + Vec2::new(-3.5, -8.0),
+                    center + Vec2::new(3.5, -8.0),
+                ],
+                stroke,
+            );
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + Vec2::new(-2.5, -8.0),
+                    center + Vec2::new(-2.5, -2.0),
+                    center + Vec2::new(-7.0, 7.0),
+                    center + Vec2::new(7.0, 7.0),
+                    center + Vec2::new(2.5, -2.0),
+                    center + Vec2::new(2.5, -8.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [center + Vec2::new(-5.0, 3.0), center + Vec2::new(5.0, 3.0)],
+                stroke,
+            );
+        }
+        Tab::Settings => {
+            for (y, knob_x) in [(-6.0, -3.0), (0.0, 4.0), (6.0, -1.0)] {
+                painter.line_segment(
+                    [center + Vec2::new(-8.0, y), center + Vec2::new(8.0, y)],
+                    stroke,
+                );
+                painter.circle_filled(center + Vec2::new(knob_x, y), 2.4, color);
+            }
+        }
+    }
 }
 
-fn primary_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+fn record_button<'a>(ui: &Ui, listening: bool) -> FocusableButton<'a> {
     let colors = ui_palette(ui);
-    Button::new(
-        RichText::new(label)
-            .color(colors.primary_button_text)
-            .strong(),
-    )
-    .fill(colors.primary_button_bg)
-    .stroke(Stroke::new(1.0, colors.primary_button_bg))
-    .rounding(Rounding::same(24.0))
-    .min_size(Vec2::new(190.0, 46.0))
+    let label = if listening { "STOP" } else { "REC" };
+    FocusableButton {
+        button: Button::new(
+            RichText::new(label)
+                .size(11.0)
+                .color(colors.primary_button_text)
+                .strong(),
+        )
+        .fill(colors.primary_button_bg)
+        .stroke(Stroke::new(1.0, colors.primary_button_bg))
+        .rounding(Rounding::same(28.0))
+        .min_size(Vec2::splat(56.0)),
+        rounding: 28.0,
+    }
 }
 
-fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> FocusableButton<'a> {
     let colors = ui_palette(ui);
-    Button::new(
-        RichText::new(label)
-            .color(colors.primary_button_text)
-            .strong(),
-    )
-    .fill(colors.primary_button_bg)
-    .stroke(Stroke::new(1.0, colors.primary_button_bg))
-    .rounding(Rounding::same(5.0))
-    .min_size(Vec2::new(72.0, 30.0))
+    FocusableButton {
+        button: Button::new(
+            RichText::new(label)
+                .color(colors.primary_button_text)
+                .strong(),
+        )
+        .fill(colors.primary_button_bg)
+        .stroke(Stroke::new(1.0, colors.primary_button_bg))
+        .rounding(Rounding::same(8.0))
+        .min_size(Vec2::new(72.0, 40.0)),
+        rounding: 8.0,
+    }
 }
 
-fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
+fn small_button<'a>(ui: &Ui, label: &'a str) -> FocusableButton<'a> {
     let colors = ui_palette(ui);
-    Button::new(RichText::new(label).color(colors.text))
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border_strong))
-        .rounding(Rounding::same(5.0))
-        .min_size(Vec2::new(68.0, 30.0))
+    FocusableButton {
+        button: Button::new(RichText::new(label).color(colors.text))
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0, colors.border_strong))
+            .rounding(Rounding::same(8.0))
+            .min_size(Vec2::new(68.0, 36.0)),
+        rounding: 8.0,
+    }
 }
 
 fn add_enabled_button<'a>(
     ui: &mut Ui,
     enabled: bool,
-    button: Button<'a>,
+    button: FocusableButton<'a>,
     disabled_tooltip: Option<&str>,
 ) -> egui::Response {
     let response = ui.add_enabled(enabled, button);
@@ -4809,6 +5009,7 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     let colors = ThemePalette::from_visuals(&visuals);
     visuals.override_text_color = Some(colors.text);
     visuals.selection.bg_fill = colors.accent;
+    visuals.selection.stroke = Stroke::new(2.0, colors.accent);
     visuals.hyperlink_color = colors.accent;
     visuals.panel_fill = colors.content_bg;
     visuals.window_fill = colors.card_bg;
@@ -4818,7 +5019,16 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     visuals.widgets.inactive.bg_fill = colors.card_bg;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.border);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.border_strong);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, colors.accent);
+    visuals.widgets.active.bg_stroke = Stroke::new(2.0, colors.accent);
+    visuals.window_rounding = Rounding::same(12.0);
+    visuals.window_stroke = Stroke::new(1.0, colors.border_strong);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 3.0),
+        blur: 12.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(if visuals.dark_mode { 96 } else { 38 }),
+    };
+    visuals.popup_shadow = visuals.window_shadow;
     visuals
 }
 
@@ -4829,20 +5039,20 @@ fn model_install_detail(
     let base = format!("Model storage: {}", model_storage_estimate(model));
     match install_status {
         ModelInstallStatus::NotInstalled if !supports_managed_install(model) => {
-            Some(format!("{base} · Installer unavailable in this build."))
+            Some(format!("{base} | Installer unavailable in this build."))
         }
         ModelInstallStatus::Downloading { .. } => {
-            Some(format!("{base} · {}", install_status.label()))
+            Some(format!("{base} | {}", install_status.label()))
         }
         ModelInstallStatus::InstallingRuntime => {
-            Some(format!("{base} · {}", install_status.label()))
+            Some(format!("{base} | {}", install_status.label()))
         }
         ModelInstallStatus::Missing => Some(format!(
-            "{base} · The configured model path is missing or incomplete. Reinstall to use this model."
+            "{base} | The configured model path is missing or incomplete. Reinstall to use this model."
         )),
-        ModelInstallStatus::Error(message) => Some(format!("{base} · Install failed: {message}")),
+        ModelInstallStatus::Error(message) => Some(format!("{base} | Install failed: {message}")),
         ModelInstallStatus::RuntimeError(message) => {
-            Some(format!("{base} · Runtime repair failed: {message}"))
+            Some(format!("{base} | Runtime repair failed: {message}"))
         }
         ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => Some(base),
     }
@@ -5714,16 +5924,113 @@ mod layout_tests {
 
     #[test]
     fn app_shell_pages_paint_within_viewport_at_minimum_and_wide_widths() {
-        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
-            for width in [840.0, 1440.0, 4096.0] {
-                let output = render_app_tab(tab, width);
+        for tab in [Tab::Models, Tab::Playground, Tab::Settings] {
+            for (width, height) in [
+                (840.0, 600.0),
+                (1100.0, 760.0),
+                (1440.0, 760.0),
+                (4096.0, 760.0),
+            ] {
+                let output = render_app_tab_at_size(tab, width, height);
                 let max_painted_x = max_visible_painted_x(&output);
 
                 assert!(
                     max_painted_x <= width + 1.0,
-                    "{tab:?} painted beyond viewport: max_x={max_painted_x}, width={width}"
+                    "{tab:?} painted beyond viewport: max_x={max_painted_x}, size={width}x{height}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn app_tab_interaction_rects_stay_within_minimum_width() {
+        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
+            let output = render_accessible_app_tab_at_size(tab, 840.0, 600.0);
+            let update = output.platform_output.accesskit_update.unwrap();
+            for (_, node) in &update.nodes {
+                if node.supports_action(egui::accesskit::Action::Focus)
+                    && let Some(bounds) = node.bounds()
+                {
+                    assert!(
+                        bounds.x0 >= -1.0 && bounds.x1 <= 841.0,
+                        "{tab:?} has an interaction rect outside 840px: {bounds:?}"
+                    );
+                    assert!(
+                        bounds.x1 > bounds.x0,
+                        "{tab:?} has an empty interaction rect"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn below_fold_controls_are_scroll_reachable_at_minimum_size() {
+        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_stitch_style(&ctx);
+            ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+            let mut app = test_app();
+            app.current_tab = tab;
+
+            let initial = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 600.0, Vec::new());
+            let update = initial.platform_output.accesskit_update.as_ref().unwrap();
+            let below_fold = update
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.supports_action(egui::accesskit::Action::Focus))
+                .filter_map(|(id, node)| node.bounds().map(|bounds| (*id, bounds)))
+                .filter(|(_, bounds)| bounds.y0 >= 600.0)
+                .max_by(|(_, left), (_, right)| left.y0.total_cmp(&right.y0));
+
+            let (target_id, initial_bounds) = below_fold
+                .unwrap_or_else(|| panic!("{tab:?} did not expose a below-fold focusable control"));
+
+            let page_title = match tab {
+                Tab::Transcribe => "Transcribe",
+                Tab::Models => "Models Catalog",
+                Tab::Playground => "Model Playground",
+                Tab::Settings => "Settings",
+            };
+            let scroll_metrics = ctx
+                .data_mut(|data| {
+                    data.get_temp::<(egui::Id, f32, f32)>(egui::Id::new((
+                        "test-page-scroll-metrics",
+                        page_title,
+                    )))
+                })
+                .unwrap_or_else(|| panic!("missing {tab:?} page scroll metrics"));
+            assert!(
+                scroll_metrics.1 > scroll_metrics.2,
+                "{tab:?} has a below-fold control without overflowing its page scroll area"
+            );
+            let mut state = egui::scroll_area::State::load(&ctx, scroll_metrics.0)
+                .unwrap_or_else(|| panic!("missing {tab:?} page scroll state"));
+            state.offset.y = scroll_metrics.1 - scroll_metrics.2;
+            state.store(&ctx, scroll_metrics.0);
+
+            let scrolled =
+                render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 600.0, Vec::new());
+            let scrolled_bounds = scrolled
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == target_id)
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("missing scrolled {tab:?} control"));
+
+            assert!(
+                scrolled_bounds.y0 < initial_bounds.y0,
+                "{tab:?} below-fold control did not move upward: {initial_bounds:?} -> {scrolled_bounds:?}"
+            );
+            assert!(
+                scrolled_bounds.y0 < 600.0 && scrolled_bounds.y1 > 0.0,
+                "{tab:?} below-fold control is not reachable after scrolling: {scrolled_bounds:?}"
+            );
         }
     }
 
@@ -5773,6 +6080,32 @@ mod layout_tests {
     }
 
     #[test]
+    fn light_and_dark_glass_surfaces_keep_text_contrast_after_compositing() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            let shell = source_over_color(palette.shell_bg, palette.content_bg);
+            let card = source_over_color(palette.card_bg, shell);
+            let panel = source_over_color(palette.panel_bg, shell);
+
+            for surface in [card, panel] {
+                assert!(contrast_ratio(palette.text, surface) >= 4.5);
+                assert!(contrast_ratio(palette.muted_text, surface) >= 4.5);
+            }
+            assert!(contrast_ratio(palette.primary_button_text, palette.primary_button_bg) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn linear_premultiplied_source_over_matches_known_half_alpha_mix() {
+        let foreground = egui::Rgba::from_rgba_unmultiplied(1.0, 0.0, 0.0, 0.5);
+        let background = egui::Rgba::from_rgb(0.0, 0.0, 1.0);
+        let result = source_over_rgba(foreground, background).to_array();
+
+        for (actual, expected) in result.into_iter().zip([0.5, 0.0, 0.5, 1.0]) {
+            assert!((actual - expected).abs() <= f32::EPSILON);
+        }
+    }
+
+    #[test]
     fn light_theme_status_badges_meet_aa_text_contrast() {
         let ctx = egui::Context::default();
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
@@ -5813,6 +6146,14 @@ mod layout_tests {
             }
         };
         0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn source_over_color(foreground: Color32, background: Color32) -> Color32 {
+        source_over_rgba(foreground.into(), background.into()).into()
+    }
+
+    fn source_over_rgba(foreground: egui::Rgba, background: egui::Rgba) -> egui::Rgba {
+        foreground + background.multiply(1.0 - foreground.a())
     }
 
     #[test]
@@ -6072,6 +6413,225 @@ mod layout_tests {
     }
 
     #[test]
+    fn recessed_surface_stays_within_its_allocated_width() {
+        for width in [840.0, 1440.0] {
+            let (output, rect) = render_recessed_surface(width);
+            assert!(rect.min.x >= 0.0);
+            assert!(rect.max.x <= width + 1.0);
+            assert!(rect.width() > 0.0);
+
+            let (highlight, shade) = recessed_edge_colors(false);
+            let edge = |color| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| match &clipped.shape {
+                        egui::Shape::LineSegment { points, stroke } if stroke.color == color => {
+                            Some(*points)
+                        }
+                        _ => None,
+                    })
+                    .expect("recessed edge should be painted")
+            };
+            let top = edge(highlight);
+            let bottom = edge(shade);
+            assert!((top[0].y - (rect.top() + 0.5)).abs() <= f32::EPSILON);
+            assert!((bottom[0].y - (rect.bottom() - 0.5)).abs() <= f32::EPSILON);
+            for points in [top, bottom] {
+                assert!((points[0].x - (rect.left() + 10.0)).abs() <= f32::EPSILON);
+                assert!((points[1].x - (rect.right() - 10.0)).abs() <= f32::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_navigation_exposes_named_tab_buttons() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut current_tab = Tab::Transcribe;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(840.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| navigation_rail(ctx, &mut current_tab),
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
+            assert!(
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(tab.label())),
+                "missing accessible navigation label for {}",
+                tab.label()
+            );
+        }
+    }
+
+    #[test]
+    fn transcribe_editor_and_actions_keep_top_flow_geometry_at_minimum_width() {
+        let output = render_accessible_app_tab(Tab::Transcribe, 840.0);
+        let update = output.platform_output.accesskit_update.unwrap();
+        let find_bounds = |role, name| {
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.role() == role && node.name() == Some(name))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("missing {name} {role:?}"))
+        };
+        let editor = find_bounds(egui::accesskit::Role::MultilineTextInput, "Transcript");
+        let header = find_bounds(egui::accesskit::Role::StaticText, "Transcript");
+        let copy = find_bounds(egui::accesskit::Role::Button, "Copy");
+        let clear = find_bounds(egui::accesskit::Role::Button, "Clear");
+
+        assert!(
+            editor.x1 - editor.x0 >= 600.0,
+            "transcript editor is too narrow: {editor:?}"
+        );
+        assert!(editor.x0 >= 60.0 && editor.x1 <= 840.0);
+        assert!(header.y1 <= editor.y0);
+        assert!(copy.y0 >= editor.y1 && clear.y0 >= editor.y1);
+        assert!(copy.x0 >= editor.x0 && clear.x1 <= editor.x1);
+
+        let editor_node = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::MultilineTextInput
+                    && node.name() == Some("Transcript")
+            })
+            .map(|(_, node)| node)
+            .unwrap();
+        assert!(!editor_node.labelled_by().is_empty());
+    }
+
+    #[test]
+    fn custom_control_targets_use_stable_heights() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut heights = Vec::new();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 180.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        heights.push(ui.add(primary_small_button(ui, "Primary")).rect.height());
+                        heights.push(ui.add(small_button(ui, "Secondary")).rect.height());
+                        heights.push(ui.add(record_button(ui, false)).rect.height());
+                        let mut value = String::new();
+                        heights.push(
+                            ui.add_sized([120.0, 36.0], TextEdit::singleline(&mut value))
+                                .rect
+                                .height(),
+                        );
+                        heights.push(
+                            ComboBox::from_id_source("control-height-combo")
+                                .selected_text("Value")
+                                .show_ui(ui, |_| {})
+                                .response
+                                .rect
+                                .height(),
+                        );
+                    });
+                });
+            },
+        );
+
+        assert!((heights[0] - 40.0).abs() <= 0.1);
+        assert!((heights[1] - 36.0).abs() <= 0.1);
+        assert!((heights[2] - 56.0).abs() <= 0.1);
+        assert!((heights[3] - 36.0).abs() <= 0.1);
+        assert!((heights[4] - 36.0).abs() <= 0.1);
+    }
+
+    #[test]
+    fn focused_text_input_paints_the_two_pixel_accent_stroke() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let visuals = stitch_visuals(ThemeMode::Light);
+        let expected_stroke = Stroke::new(2.0, ThemePalette::light().accent);
+        assert_eq!(visuals.selection.stroke, expected_stroke);
+        ctx.set_visuals(visuals);
+
+        let input_id = egui::Id::new("focused-text-input-stroke");
+        ctx.memory_mut(|memory| memory.request_focus(input_id));
+        let mut value = String::new();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_sized([220.0, 36.0], TextEdit::singleline(&mut value).id(input_id));
+                });
+            },
+        );
+
+        assert!(output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Rect(rect) if rect.stroke == expected_stroke
+            )
+        }));
+    }
+
+    #[test]
+    fn key_form_controls_have_accessible_roles_names_and_labels() {
+        let transcribe = render_accessible_app_tab(Tab::Transcribe, 840.0);
+        assert_named_control(
+            &transcribe,
+            egui::accesskit::Role::MultilineTextInput,
+            "Transcript",
+        );
+        let models = render_accessible_app_tab(Tab::Models, 840.0);
+        assert_named_control(&models, egui::accesskit::Role::TextInput, "Search models");
+        let settings = render_accessible_app_tab(Tab::Settings, 840.0);
+        for (role, name) in [
+            (egui::accesskit::Role::SpinButton, "Paste delay ms"),
+            (egui::accesskit::Role::TextInput, "Record toggle hotkey"),
+            (egui::accesskit::Role::ComboBox, "Hotkey mode"),
+            (egui::accesskit::Role::ComboBox, "Transcription device"),
+            (egui::accesskit::Role::ComboBox, "Microphone"),
+            (egui::accesskit::Role::SpinButton, "Max recording seconds"),
+            (egui::accesskit::Role::ComboBox, "Theme"),
+        ] {
+            assert_named_control(&settings, role, name);
+        }
+        let hotkey = settings
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::TextInput
+                    && node.name() == Some("Record toggle hotkey")
+            })
+            .map(|(_, node)| node)
+            .unwrap();
+        assert!(hotkey.value().is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
     fn playground_result_editor_keeps_fixed_layout_height() {
         let allocated_height = render_playground_result_editor_height(960.0);
 
@@ -6189,6 +6749,34 @@ mod layout_tests {
         })
     }
 
+    fn render_recessed_surface(width: f32) -> (egui::FullOutput, egui::Rect) {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut surface_rect = egui::Rect::NOTHING;
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let mut current_tab = Tab::Transcribe;
+                show_test_navigation(ctx, &mut current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        surface_rect = recessed_panel(ui, 120.0, |_| {}).response.rect;
+                    });
+            },
+        );
+
+        (output, surface_rect)
+    }
+
     fn render_playground_result_editor_height(width: f32) -> f32 {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
@@ -6239,7 +6827,7 @@ mod layout_tests {
         })
     }
 
-    fn render_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
+    fn render_app_tab_at_size(tab: Tab, width: f32, height: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
@@ -6247,7 +6835,7 @@ mod layout_tests {
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(width, 760.0),
+                egui::vec2(width, height),
             )),
             ..Default::default()
         };
@@ -6265,6 +6853,65 @@ mod layout_tests {
                     Tab::Settings => app.ui_settings(ui),
                 });
         })
+    }
+
+    fn render_accessible_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
+        render_accessible_app_tab_at_size(tab, width, 760.0)
+    }
+
+    fn render_accessible_app_tab_at_size(tab: Tab, width: f32, height: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = tab;
+
+        render_accessible_app_tab_frame(&ctx, &mut app, width, height, Vec::new())
+    }
+
+    fn render_accessible_app_tab_frame(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| match app.current_tab {
+                        Tab::Transcribe => app.ui_transcribe(ui),
+                        Tab::Models => app.ui_models(ui),
+                        Tab::Playground => app.ui_playground(ui),
+                        Tab::Settings => app.ui_settings(ui),
+                    });
+            },
+        )
+    }
+
+    fn assert_named_control(output: &egui::FullOutput, role: egui::accesskit::Role, name: &str) {
+        let node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == role && node.name() == Some(name))
+            .map(|(_, node)| node)
+            .unwrap_or_else(|| panic!("missing accessible {role:?} named {name}"));
+        assert!(!node.labelled_by().is_empty());
     }
 
     fn selector_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
@@ -6363,23 +7010,7 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        let colors = theme_palette(ctx);
-        egui::SidePanel::left("test-navigation")
-            .frame(
-                Frame::none()
-                    .fill(colors.sidebar_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .inner_margin(Margin::symmetric(14.0, 16.0)),
-            )
-            .resizable(false)
-            .exact_width(200.0)
-            .show(ctx, |ui| {
-                ui.label("Scribe");
-                nav_button(ui, current_tab, Tab::Transcribe);
-                nav_button(ui, current_tab, Tab::Models);
-                nav_button(ui, current_tab, Tab::Playground);
-                nav_button(ui, current_tab, Tab::Settings);
-            });
+        navigation_rail(ctx, current_tab);
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
@@ -7589,7 +8220,7 @@ mod layout_tests {
         assert_eq!(download_progress_bar_text(&status), "25% Completed");
         assert_eq!(
             download_progress_detail(&status),
-            Some("256 MB / 1.0 GB · 4 MB/s".to_owned())
+            Some("256 MB / 1.0 GB | 4 MB/s".to_owned())
         );
     }
 
