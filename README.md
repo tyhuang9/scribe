@@ -102,6 +102,16 @@ Input Monitoring, and
 cargo run
 ```
 
+The native recording control uses short, bounded state, hover, and press
+transitions. To make those transitions immediate for the current process, set
+the reduced-motion override before starting Scribe:
+
+```bash
+SCRIBE_REDUCED_MOTION=1 cargo run
+```
+
+The override is read once at startup and is not written to the Scribe config.
+
 On Linux, the app defaults to software rendering to avoid common EGL/Mesa driver
 crashes in lightweight desktop or WSL-style environments. To opt back into GPU
 rendering:
