@@ -6,6 +6,7 @@ mod core;
 mod hotkey;
 mod managed_downloads;
 mod models;
+mod runtime_artifacts;
 mod runtime_catalog;
 mod stt;
 mod text_output;

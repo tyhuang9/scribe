@@ -322,6 +322,9 @@ fn is_runtime_usable_for_spec(spec: SherpaRuntimeSpec, path: &Path) -> bool {
     let Some(runtime_root) = packaged_runtime_root(path) else {
         return false;
     };
+    if crate::runtime_artifacts::is_portable_runtime_entrypoint(spec.runtime_id, path) {
+        return true;
+    }
     runtime_root
         .join("bin")
         .join("sherpa_onnx_runner.py")
@@ -560,6 +563,39 @@ mod tests {
             "scribe-sherpa-runtime-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn portable_standalone_runtime_does_not_require_a_venv() {
+        let runtime_id = "sherpa_onnx";
+        let spec = runtime_spec_for_runtime_id(runtime_id).unwrap();
+        let root = temp_root("portable-standalone");
+        let name = if cfg!(windows) {
+            format!("{}.exe", spec.wrapper_name)
+        } else {
+            spec.wrapper_name.to_owned()
+        };
+        let executable = root.join("bin").join(&name);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"standalone").unwrap();
+        fs::write(
+            root.join("runtime-manifest.json"),
+            serde_json::json!({
+                "manifest_version": 1,
+                "runtime_id": runtime_id,
+                "version": "1.13.3",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "device": "cpu",
+                "entrypoint": format!("bin/{name}"),
+                "portable": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(is_sherpa_family_runtime_usable(runtime_id, &executable));
+        assert!(!root.join(venv_python_relative_path()).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn write_packaged_runtime(root: &Path, runtime_id: &str) -> PathBuf {

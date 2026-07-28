@@ -1,13 +1,16 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 
 use crate::config::{self, AppConfig, WhisperComputeMode};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
+use crate::runtime_artifacts::{self, RuntimeDevicePack};
 
 use super::SttBackend;
 
@@ -141,10 +144,23 @@ impl SttBackend for WhisperCppBackend {
 }
 
 pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
-    resolve_whisper_cpp_executable_from_candidates(
-        bundled_runtime_root(),
-        managed_runtime_roots(config),
-        dev_runtime_paths(config),
+    let bundled = bundled_runtime_root()
+        .into_iter()
+        .flat_map(|root| whisper_runtime_candidates(&root))
+        .find(|path| path.exists());
+    let managed_gpu = verified_managed_gpu_executable(config);
+    let (cpu_dev, gpu_dev) = development_runtime_paths(config);
+
+    let bundled_gpu = bundled
+        .as_ref()
+        .is_some_and(|path| runtime_manifest_gpu_capable(path));
+    select_compute_runtime(
+        config.whisper_compute_mode,
+        bundled,
+        bundled_gpu,
+        managed_gpu,
+        first_existing_path(cpu_dev),
+        first_existing_path(gpu_dev),
     )
 }
 
@@ -169,15 +185,74 @@ fn managed_runtime_roots(config: &AppConfig) -> Vec<PathBuf> {
         .collect()
 }
 
-fn dev_runtime_paths(config: &AppConfig) -> Vec<PathBuf> {
-    [
+fn development_runtime_paths(config: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if !cfg!(unix)
+        || (!cfg!(debug_assertions) && env::var_os("SCRIBE_ALLOW_DEV_RUNTIME_INSTALL").is_none())
+    {
+        return (Vec::new(), Vec::new());
+    }
+    let cpu = [
         env::var_os("SCRIBE_WHISPER_CPP_CLI").map(PathBuf::from),
-        env::var_os("SCRIBE_WHISPER_CUDA_CLI").map(PathBuf::from),
         config.whisper_executable_path.clone(),
     ]
     .into_iter()
     .flatten()
-    .collect()
+    .collect();
+    let gpu = env::var_os("SCRIBE_WHISPER_CUDA_CLI")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    (cpu, gpu)
+}
+
+fn verified_managed_gpu_executable(config: &AppConfig) -> Option<PathBuf> {
+    let install = config.managed_runtimes.get("whisper_cpp")?;
+    let artifact =
+        runtime_artifacts::embedded_artifact("whisper_cpp", RuntimeDevicePack::Gpu).ok()??;
+    if !runtime_artifacts::managed_install_matches_artifact(install, &artifact) {
+        return None;
+    }
+    resolve_whisper_cpp_executable_from_candidates([], managed_runtime_roots(config), [])
+}
+
+fn select_compute_runtime(
+    mode: WhisperComputeMode,
+    bundled: Option<PathBuf>,
+    bundled_gpu_capable: bool,
+    managed_gpu: Option<PathBuf>,
+    cpu_development: Option<PathBuf>,
+    gpu_development: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match mode {
+        WhisperComputeMode::Cpu => bundled.or(cpu_development),
+        WhisperComputeMode::Auto => managed_gpu.or(bundled).or(cpu_development),
+        WhisperComputeMode::PreferGpu => bundled
+            .filter(|_| bundled_gpu_capable)
+            .or(managed_gpu)
+            .or(gpu_development),
+    }
+}
+
+#[derive(Deserialize)]
+struct WhisperRuntimeManifest {
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    cuda_bundled: bool,
+}
+
+fn runtime_manifest_gpu_capable(executable: &Path) -> bool {
+    let Some(root) = executable
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    fs::read_to_string(root.join("runtime-manifest.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<WhisperRuntimeManifest>(&contents).ok())
+        .is_some_and(|manifest| manifest.cuda_bundled || manifest.device.as_deref() == Some("gpu"))
 }
 
 pub(crate) fn resolve_whisper_cpp_executable_from_candidates(
@@ -644,6 +719,100 @@ mod tests {
 
         assert_eq!(resolved, Some(managed_runtime));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compute_policy_uses_gpu_only_when_selected_and_verified() {
+        let bundled = PathBuf::from("bundled-cpu");
+        let managed_gpu = PathBuf::from("managed-gpu");
+        let cpu_dev = PathBuf::from("cpu-dev");
+        let gpu_dev = PathBuf::from("gpu-dev");
+
+        assert_eq!(
+            select_compute_runtime(
+                WhisperComputeMode::Cpu,
+                Some(bundled.clone()),
+                false,
+                Some(managed_gpu.clone()),
+                Some(cpu_dev.clone()),
+                Some(gpu_dev.clone()),
+            ),
+            Some(bundled.clone())
+        );
+        assert_eq!(
+            select_compute_runtime(
+                WhisperComputeMode::Auto,
+                Some(bundled.clone()),
+                false,
+                Some(managed_gpu.clone()),
+                Some(cpu_dev.clone()),
+                Some(gpu_dev.clone()),
+            ),
+            Some(managed_gpu.clone())
+        );
+        assert_eq!(
+            select_compute_runtime(
+                WhisperComputeMode::Auto,
+                Some(bundled.clone()),
+                false,
+                None,
+                Some(cpu_dev.clone()),
+                Some(gpu_dev.clone()),
+            ),
+            Some(bundled.clone())
+        );
+        assert_eq!(
+            select_compute_runtime(
+                WhisperComputeMode::PreferGpu,
+                Some(bundled),
+                false,
+                None,
+                Some(cpu_dev),
+                Some(gpu_dev.clone()),
+            ),
+            Some(gpu_dev)
+        );
+        assert_eq!(
+            select_compute_runtime(
+                WhisperComputeMode::PreferGpu,
+                Some(PathBuf::from("bundled-cpu")),
+                false,
+                None,
+                Some(PathBuf::from("cpu-dev")),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_gpu_requires_exact_trusted_artifact_metadata() {
+        let artifact = runtime_artifacts::RuntimeArtifact {
+            runtime_id: "whisper_cpp".to_owned(),
+            version: "1.2.3".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            device: RuntimeDevicePack::Gpu,
+            url: "https://github.com/scribe-runtime-tests/whisper.zip".to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            unpacked_size_bytes: 1,
+            entrypoint: PathBuf::from("bin/whisper-cli"),
+        };
+        let mut install = config::ManagedRuntimeInstall::new(PathBuf::from("whisper-cli"));
+        install.source = Some(artifact.url.clone());
+        install.version = Some(artifact.version.clone());
+        install.sha256 = Some(artifact.sha256.clone());
+        install.platform = Some(format!("{}-{}", artifact.os, artifact.arch));
+        install.device = Some("gpu".to_owned());
+
+        assert!(runtime_artifacts::managed_install_matches_artifact(
+            &install, &artifact
+        ));
+        install.sha256 = Some("b".repeat(64));
+        assert!(!runtime_artifacts::managed_install_matches_artifact(
+            &install, &artifact
+        ));
     }
 
     fn test_runtime_root(name: &str) -> PathBuf {

@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +26,7 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
     format_bytes,
 };
+use crate::runtime_artifacts::{self, RuntimeArtifact, RuntimeDevicePack};
 use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
@@ -221,7 +222,7 @@ enum AppEvent {
         runtime_id: String,
         backend: String,
         replacement: RuntimeReplacement,
-        source_label: &'static str,
+        install: config::ManagedRuntimeInstall,
     },
     RuntimeInstallFailed {
         runtime_id: String,
@@ -430,9 +431,11 @@ fn runtime_metadata_matches(
     config.managed_runtimes.get(runtime_id) == Some(install)
 }
 
-fn missing_runtime_source_message(backend: &str) -> String {
+fn missing_runtime_source_message(backend: &str, device: RuntimeDevicePack) -> String {
     format!(
-        "This build does not include the {backend} backend runtime. Install a packaged or staged build that includes it."
+        "No trusted {device} runtime artifact for {backend} is published for {}. Use a release bundle that includes it, or ask the release operator to publish and embed matching metadata.",
+        config::current_platform_key(),
+        device = device.as_str().to_uppercase(),
     )
 }
 
@@ -457,6 +460,7 @@ enum RuntimeVersionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInstallSource {
     Packaged(PathBuf),
+    Remote(RuntimeArtifact),
     DevelopmentScript(DevelopmentRuntimePackage),
 }
 
@@ -473,6 +477,9 @@ struct RuntimeManifestMetadata {
     version: Option<String>,
     sha256: Option<String>,
     checksum: Option<String>,
+    platform: Option<String>,
+    device: Option<String>,
+    cuda_bundled: Option<bool>,
 }
 
 #[cfg(test)]
@@ -684,12 +691,17 @@ fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> Runti
         };
     }
 
-    runtime_action_state_for_source(
-        config,
-        model,
-        provider,
-        runtime_install_source(config, model).is_some(),
-    )
+    match runtime_install_source(config, model) {
+        Ok(source) => runtime_action_state_for_source(config, model, provider, source.is_some()),
+        Err(_) if has_managed_runtime_install(config, provider) => {
+            runtime_action_state_for_source(config, model, provider, false)
+        }
+        Err(message) => RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: false,
+            disabled_tooltip: Some(format!("Trusted runtime catalog unavailable: {message}")),
+        },
+    }
 }
 
 fn runtime_action_state_for_source(
@@ -724,7 +736,10 @@ fn runtime_action_state_for_source(
         RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
-            disabled_tooltip: Some(missing_runtime_source_message(&model.backend)),
+            disabled_tooltip: Some(missing_runtime_source_message(
+                &model.backend,
+                runtime_device_pack(config, model),
+            )),
         }
     }
 }
@@ -757,8 +772,17 @@ fn runtime_version_state(
     config: &AppConfig,
     provider: &stt::SttProviderAdapter,
 ) -> RuntimeVersionState {
-    let Some(available) = runtime_catalog::runtime_version_for_runtime_id(provider.runtime_id)
-    else {
+    let available = runtime_artifacts::embedded_artifact(
+        provider.runtime_id,
+        runtime_version_device_pack(config, provider),
+    )
+    .ok()
+    .flatten()
+    .map(|artifact| artifact.version)
+    .or_else(|| {
+        runtime_catalog::runtime_version_for_runtime_id(provider.runtime_id).map(str::to_owned)
+    });
+    let Some(available) = available else {
         return RuntimeVersionState::NotTracked;
     };
     let Some(install) = config.managed_runtimes.get(provider.runtime_id) else {
@@ -774,13 +798,20 @@ fn runtime_version_state(
         Some(version) if version == available => RuntimeVersionState::Current(version.to_owned()),
         Some(version) => RuntimeVersionState::UpdateAvailable {
             installed: Some(version.to_owned()),
-            available: available.to_owned(),
+            available,
         },
         None => RuntimeVersionState::UpdateAvailable {
             installed: None,
-            available: available.to_owned(),
+            available,
         },
     }
+}
+
+fn runtime_version_device_pack(
+    config: &AppConfig,
+    provider: &stt::SttProviderAdapter,
+) -> RuntimeDevicePack {
+    runtime_device_pack_for_provider(config, provider)
 }
 
 fn resolve_managed_runtime_executable(
@@ -823,25 +854,74 @@ fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pat
 fn runtime_install_source(
     config: &AppConfig,
     model: &SttModelInfo,
-) -> Option<RuntimeInstallSource> {
-    runtime_install_source_from_candidates(
+) -> Result<Option<RuntimeInstallSource>, String> {
+    let device = runtime_device_pack(config, model);
+    let remote = runtime_artifacts::embedded_artifact(
+        &runtime_catalog::runtime_id_for_backend(&model.backend),
+        device,
+    )?;
+    Ok(runtime_install_source_from_candidates(
         config,
         model,
-        packaged_runtime_path(config, model),
+        packaged_runtime_path(config, model).filter(|path| packaged_runtime_device(path) == device),
+        remote,
         development_runtime_package(config, model),
-    )
+    ))
 }
 
 fn runtime_install_source_from_candidates(
     config: &AppConfig,
     model: &SttModelInfo,
     packaged: Option<PathBuf>,
+    remote: Option<RuntimeArtifact>,
     development: Option<DevelopmentRuntimePackage>,
 ) -> Option<RuntimeInstallSource> {
     packaged
         .filter(|path| runtime_source_is_staged(config, model, path))
         .map(RuntimeInstallSource::Packaged)
+        .or_else(|| remote.map(RuntimeInstallSource::Remote))
         .or_else(|| development.map(RuntimeInstallSource::DevelopmentScript))
+}
+
+fn runtime_device_pack(config: &AppConfig, model: &SttModelInfo) -> RuntimeDevicePack {
+    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        return RuntimeDevicePack::Cpu;
+    };
+    runtime_device_pack_for_provider(config, provider)
+}
+
+fn runtime_device_pack_for_provider(
+    config: &AppConfig,
+    provider: &stt::SttProviderAdapter,
+) -> RuntimeDevicePack {
+    let supports_gpu = runtime_catalog::backend_spec_for_runtime_id(provider.runtime_id)
+        .is_some_and(|spec| spec.device_support.supports_gpu());
+    let maintaining_gpu = config.whisper_compute_mode == WhisperComputeMode::Auto
+        && config
+            .managed_runtimes
+            .get(provider.runtime_id)
+            .is_some_and(|install| install.device.as_deref() == Some("gpu"));
+    if supports_gpu
+        && (config.whisper_compute_mode == WhisperComputeMode::PreferGpu || maintaining_gpu)
+    {
+        RuntimeDevicePack::Gpu
+    } else {
+        RuntimeDevicePack::Cpu
+    }
+}
+
+fn packaged_runtime_device(path: &Path) -> RuntimeDevicePack {
+    runtime_manifest_metadata(path)
+        .and_then(|metadata| {
+            metadata.device.or_else(|| {
+                metadata
+                    .cuda_bundled
+                    .map(|cuda| if cuda { "gpu" } else { "cpu" }.to_owned())
+            })
+        })
+        .filter(|device| device.eq_ignore_ascii_case("gpu"))
+        .map(|_| RuntimeDevicePack::Gpu)
+        .unwrap_or(RuntimeDevicePack::Cpu)
 }
 
 fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Path) -> bool {
@@ -1568,10 +1648,9 @@ impl LocalTranscriberApp {
                     runtime_id,
                     backend,
                     replacement,
-                    source_label,
+                    install,
                 } => {
-                    let installed_path = replacement.installed_path.clone();
-                    let new_runtime = managed_runtime_install_record(installed_path, source_label);
+                    let new_runtime = install;
                     let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
                     let job = match persist_runtime_install(
                         &mut self.config,
@@ -2161,22 +2240,33 @@ impl LocalTranscriberApp {
             return;
         }
 
-        let Some(source) = runtime_install_source(&self.config, model) else {
-            let message = missing_runtime_source_message(&model.backend);
-            match intent {
-                RuntimeJobIntent::DownloadModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
+        let source = match runtime_install_source(&self.config, model) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                let message = missing_runtime_source_message(
+                    &model.backend,
+                    runtime_device_pack(&self.config, model),
+                );
+                match intent {
+                    RuntimeJobIntent::DownloadModel(model_id) => {
+                        self.model_downloads
+                            .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                    }
+                    RuntimeJobIntent::RepairModel(model_id) => {
+                        self.model_downloads
+                            .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
+                    }
+                    RuntimeJobIntent::Maintenance => {}
                 }
-                RuntimeJobIntent::RepairModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
-                }
-                RuntimeJobIntent::Maintenance => {}
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
             }
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Trusted runtime catalog unavailable: {message}");
+                return;
+            }
         };
 
         if let Some(job) = self.runtime_jobs.get_mut(provider.runtime_id) {
@@ -2223,23 +2313,35 @@ impl LocalTranscriberApp {
         let runtime_id = provider.runtime_id.to_owned();
         let backend = model.backend.clone();
         thread::spawn(move || {
-            let (result, source_label) = match source {
+            let (result, source, artifact) = match source {
                 RuntimeInstallSource::Packaged(packaged_path) => (
                     install_runtime_files(&runtime_id, &packaged_path),
                     "packaged-runtime",
+                    None,
+                ),
+                RuntimeInstallSource::Remote(artifact) => (
+                    install_remote_runtime_artifact(&runtime_id, &artifact),
+                    "trusted-release-artifact",
+                    Some(artifact),
                 ),
                 RuntimeInstallSource::DevelopmentScript(package) => (
                     build_development_runtime_package(&runtime_id, &backend, package),
                     "development-script",
+                    None,
                 ),
             };
             match result {
                 Ok(replacement) => {
+                    let install = managed_runtime_install_record(
+                        replacement.installed_path.clone(),
+                        source,
+                        artifact.as_ref(),
+                    );
                     let _ = tx.send(AppEvent::RuntimeInstallDone {
                         runtime_id,
                         backend,
                         replacement,
-                        source_label,
+                        install,
                     });
                 }
                 Err(message) => {
@@ -5261,7 +5363,7 @@ fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(St
             Some((format!("Version {version}"), ChipTone::Success))
         }
         RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => Some((
-            if runtime_install_source(config, model).is_some() {
+            if runtime_install_source(config, model).is_ok_and(|source| source.is_some()) {
                 "Update available"
             } else {
                 "Update not staged"
@@ -5283,23 +5385,27 @@ fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<St
         RuntimeVersionState::UpdateAvailable {
             installed: Some(installed),
             available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime update available: installed {installed}, available {available}.")
-        } else {
-            format!(
-                "Installed runtime {installed} is usable. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
+        } => Some(
+            if runtime_install_source(config, model).is_ok_and(|source| source.is_some()) {
+                format!("Runtime update available: installed {installed}, available {available}.")
+            } else {
+                format!(
+                    "Installed runtime {installed} is usable. This build does not include staged runtime {available} for an explicit update."
+                )
+            },
+        ),
         RuntimeVersionState::UpdateAvailable {
             installed: None,
             available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime version is unknown; update to the staged {available} runtime.")
-        } else {
-            format!(
-                "Runtime version is unknown. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
+        } => Some(
+            if runtime_install_source(config, model).is_ok_and(|source| source.is_some()) {
+                format!("Runtime version is unknown; update to the staged {available} runtime.")
+            } else {
+                format!(
+                    "Runtime version is unknown. This build does not include staged runtime {available} for an explicit update."
+                )
+            },
+        ),
     }
 }
 
@@ -5417,6 +5523,71 @@ fn install_runtime_files(
         packaged_executable,
         &config::runtime_storage_dir().join(runtime_id),
     )
+}
+
+fn install_remote_runtime_artifact(
+    runtime_id: &str,
+    artifact: &RuntimeArtifact,
+) -> Result<RuntimeReplacement, String> {
+    let target_root = config::runtime_storage_dir().join(runtime_id);
+    let staged = runtime_artifacts::download_and_stage(artifact, &target_root)?;
+    if !installed_runtime_executable_usable(runtime_id, &staged.entrypoint) {
+        let _ = remove_path_if_exists(&staged.root);
+        return Err(format!(
+            "Verified runtime artifact did not create a usable entrypoint at {}.",
+            staged.entrypoint.display()
+        ));
+    }
+    if let Err(message) = smoke_validate_runtime(&staged.entrypoint) {
+        let _ = remove_path_if_exists(&staged.root);
+        return Err(message);
+    }
+    activate_staged_runtime(&target_root, &staged.root, &artifact.entrypoint)
+}
+
+fn smoke_validate_runtime(executable: &Path) -> Result<(), String> {
+    let mut child = Command::new(executable)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "Could not start verified runtime {} for smoke validation: {err}",
+                executable.display()
+            )
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not poll runtime smoke validation: {err}"));
+            }
+        };
+        if let Some(status) = status {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Verified runtime {} failed its --help smoke validation with status {status}.",
+                    executable.display()
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Verified runtime {} timed out during --help smoke validation.",
+                executable.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn install_runtime_files_to(
@@ -5553,8 +5724,20 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     result.map_err(|err| format!("Could not remove {}: {err}", path.display()))
 }
 
-fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::ManagedRuntimeInstall {
+fn managed_runtime_install_record(
+    path: PathBuf,
+    source: &str,
+    artifact: Option<&RuntimeArtifact>,
+) -> config::ManagedRuntimeInstall {
     let mut install = config::ManagedRuntimeInstall::app_managed(path.clone(), source);
+    if let Some(artifact) = artifact {
+        install.source = Some(artifact.url.clone());
+        install.version = Some(artifact.version.clone());
+        install.sha256 = Some(artifact.sha256.clone());
+        install.platform = Some(format!("{}-{}", artifact.os, artifact.arch));
+        install.device = Some(artifact.device.as_str().to_owned());
+        return install;
+    }
     if let Some(metadata) = runtime_manifest_metadata(&path) {
         install.version = metadata
             .version
@@ -5565,6 +5748,23 @@ fn managed_runtime_install_record(path: PathBuf, source: &str) -> config::Manage
             .or(metadata.checksum)
             .map(|sha256| sha256.trim().to_owned())
             .filter(|sha256| !sha256.is_empty());
+        install.platform = metadata
+            .platform
+            .map(|platform| platform.trim().to_owned())
+            .filter(|platform| !platform.is_empty())
+            .or(install.platform);
+        install.device = metadata
+            .device
+            .map(|device| device.trim().to_ascii_lowercase())
+            .filter(|device| matches!(device.as_str(), "cpu" | "gpu"))
+            .or_else(|| {
+                metadata
+                    .cuda_bundled
+                    .map(|cuda| if cuda { "gpu" } else { "cpu" }.to_owned())
+            });
+    }
+    if install.device.is_none() {
+        install.device = Some("cpu".to_owned());
     }
     install
 }
@@ -7359,7 +7559,10 @@ mod layout_tests {
             RuntimeActionState {
                 kind: RuntimeActionKind::Install,
                 enabled: false,
-                disabled_tooltip: Some(missing_runtime_source_message(backend)),
+                disabled_tooltip: Some(missing_runtime_source_message(
+                    backend,
+                    RuntimeDevicePack::Cpu,
+                )),
             }
         }
     }
@@ -7462,7 +7665,10 @@ mod layout_tests {
             "installed-model".to_owned()
         ));
         assert_eq!(job.repair_model_ids, ["installed-model"]);
-        assert!(missing_runtime_source_message("Vosk").contains("packaged or staged build"));
+        assert!(
+            missing_runtime_source_message("Vosk", RuntimeDevicePack::Cpu)
+                .contains("No trusted CPU runtime artifact")
+        );
     }
 
     #[test]
@@ -7704,12 +7910,12 @@ mod layout_tests {
             model.backend = backend.to_owned();
 
             assert_eq!(
-                runtime_install_source_from_candidates(&config, &model, Some(current), None),
+                runtime_install_source_from_candidates(&config, &model, Some(current), None, None),
                 None,
                 "{backend} must not update from its managed install"
             );
             assert!(matches!(
-                runtime_install_source_from_candidates(&config, &model, Some(staged), None),
+                runtime_install_source_from_candidates(&config, &model, Some(staged), None, None),
                 Some(RuntimeInstallSource::Packaged(_))
             ));
         }
@@ -7763,6 +7969,11 @@ mod layout_tests {
         assert!(target_root.join("previous.marker").is_file());
         assert!(stt::vosk::is_vosk_runtime_usable(&previous_executable));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_smoke_validation_executes_help_successfully() {
+        smoke_validate_runtime(&std::env::current_exe().unwrap()).unwrap();
     }
 
     #[test]
@@ -8851,6 +9062,29 @@ mod layout_tests {
     }
 
     #[test]
+    fn auto_maintains_an_existing_stale_gpu_pack_without_requesting_gpu_for_cpu_only_setup() {
+        let mut config = AppConfig::default();
+        let model = test_model();
+        assert_eq!(runtime_device_pack(&config, &model), RuntimeDevicePack::Cpu);
+
+        let mut stale_gpu = config::ManagedRuntimeInstall::new(PathBuf::from("managed-gpu"));
+        stale_gpu.source = Some("https://previous-release.invalid/whisper.zip".to_owned());
+        stale_gpu.version = Some("old-version".to_owned());
+        stale_gpu.sha256 = Some("a".repeat(64));
+        stale_gpu.platform = Some(config::current_platform_key());
+        stale_gpu.device = Some("gpu".to_owned());
+        config
+            .managed_runtimes
+            .insert("whisper_cpp".to_owned(), stale_gpu);
+
+        assert_eq!(runtime_device_pack(&config, &model), RuntimeDevicePack::Gpu);
+        assert_eq!(
+            runtime_version_device_pack(&config, stt::provider_for_backend("whisper.cpp").unwrap()),
+            RuntimeDevicePack::Gpu
+        );
+    }
+
+    #[test]
     fn runtime_action_state_offers_update_for_stale_version_when_source_exists() {
         let runtime_root =
             std::env::temp_dir().join(format!("scribe-runtime-update-{}", std::process::id()));
@@ -8870,7 +9104,7 @@ mod layout_tests {
 
         let action = runtime_action_state(&config, &model);
 
-        if runtime_install_source(&config, &model).is_some() {
+        if runtime_install_source(&config, &model).is_ok_and(|source| source.is_some()) {
             assert_eq!(action.kind, RuntimeActionKind::Update);
         } else {
             assert_eq!(action.kind, RuntimeActionKind::Uninstall);
@@ -8894,7 +9128,7 @@ mod layout_tests {
         )
         .unwrap();
 
-        let install = managed_runtime_install_record(executable, "packaged-runtime");
+        let install = managed_runtime_install_record(executable, "packaged-runtime", None);
 
         assert_eq!(install.version.as_deref(), Some("0.3.45"));
         assert_eq!(install.sha256.as_deref(), Some("abc123"));

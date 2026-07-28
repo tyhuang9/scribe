@@ -280,6 +280,9 @@ pub(crate) fn is_faster_whisper_runtime_usable(path: &Path) -> bool {
     let Some(runtime_root) = packaged_runtime_root(path) else {
         return false;
     };
+    if crate::runtime_artifacts::is_portable_runtime_entrypoint("faster_whisper", path) {
+        return true;
+    }
     runtime_root
         .join("bin")
         .join("faster_whisper_runner.py")
@@ -620,6 +623,32 @@ mod tests {
             "scribe-faster-whisper-runtime-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn portable_standalone_runtime_does_not_require_a_venv() {
+        let root = test_runtime_root("portable-standalone");
+        let executable = root.join("bin").join(faster_whisper_runner_names()[0]);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"standalone").unwrap();
+        fs::write(
+            root.join("runtime-manifest.json"),
+            serde_json::json!({
+                "manifest_version": 1,
+                "runtime_id": "faster_whisper",
+                "version": "1.2.1",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "device": "cpu",
+                "entrypoint": format!("bin/{}", faster_whisper_runner_names()[0]),
+                "portable": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(is_faster_whisper_runtime_usable(&executable));
+        assert!(!root.join(venv_python_relative_path()).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn write_test_runtime(path: &Path) {

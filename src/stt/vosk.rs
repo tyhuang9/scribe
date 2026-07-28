@@ -257,6 +257,9 @@ pub(crate) fn is_vosk_runtime_usable(path: &Path) -> bool {
     let Some(runtime_root) = packaged_runtime_root(path) else {
         return false;
     };
+    if crate::runtime_artifacts::is_portable_runtime_entrypoint("vosk", path) {
+        return true;
+    }
     runtime_root.join("bin").join("vosk_runner.py").is_file()
         && runtime_root.join(venv_python_relative_path()).is_file()
         && vosk_manifest_has_supported_runner(&runtime_root)
@@ -440,6 +443,32 @@ mod tests {
 
     fn test_runtime_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("scribe-vosk-runtime-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn portable_standalone_runtime_does_not_require_a_venv() {
+        let root = test_runtime_root("portable-standalone");
+        let executable = root.join("bin").join(vosk_runner_names()[0]);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"standalone").unwrap();
+        fs::write(
+            root.join("runtime-manifest.json"),
+            serde_json::json!({
+                "manifest_version": 1,
+                "runtime_id": "vosk",
+                "version": "0.3.45",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "device": "cpu",
+                "entrypoint": format!("bin/{}", vosk_runner_names()[0]),
+                "portable": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(is_vosk_runtime_usable(&executable));
+        assert!(!root.join(venv_python_relative_path()).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn write_test_runtime(path: &Path) {

@@ -80,6 +80,8 @@ pub struct ManagedRuntimeInstall {
     #[serde(default)]
     pub platform: Option<String>,
     #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
     pub installed_at_unix_seconds: Option<u64>,
 }
 
