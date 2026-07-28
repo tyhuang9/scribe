@@ -2565,6 +2565,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "url",
+ "windows-sys 0.59.0",
  "winit",
  "zip",
 ]

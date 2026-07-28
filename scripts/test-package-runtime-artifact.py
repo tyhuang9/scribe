@@ -55,6 +55,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
     def write_entrypoint(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
+            # The packager executes this renamed native image directly with --help and closed stdin.
             comspec = os.environ.get("COMSPEC")
             if not comspec or not Path(comspec).is_file():
                 self.skipTest("COMSPEC is unavailable for the native Windows fixture")

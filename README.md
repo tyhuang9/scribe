@@ -208,6 +208,8 @@ scripts/build-release-bundle.sh --mode standard
 
 `package-runtime-artifact.py` rejects links, raw virtual environments, missing/mismatched manifests, duplicate target tuples, cross-target packaging, and oversized packages. It runs the target-native entrypoint with `--help` before publishing. Parallel packaging jobs write independent catalog fragments; the explicit merge step rejects duplicate tuples and publishes one deterministic catalog. Release CI must upload the generated ZIPs at the catalog URLs; this repository does not claim that artifact hosting already exists.
 
+Runtime activation and configuration replacement are journaled for process-crash recovery. For power-loss durability, Scribe flushes file contents and containing-directory metadata on Unix and uses write-through moves on Windows; Windows removals first move entries to ignored same-directory tombstones with write-through before reclaiming them. A successful durability barrier permits transaction cleanup. If a post-commit barrier fails, Scribe reports a warning and retains the journal and backup so startup can finish or roll back from the configuration that actually survived. These guarantees depend on the filesystem and storage hardware honoring `fsync`/write-through requests.
+
 To stage only the faster-whisper runtime during development:
 
 ```bash

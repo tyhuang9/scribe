@@ -22,6 +22,7 @@ use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
 use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
+use crate::durable_fs;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
 use crate::models::{
@@ -347,7 +348,10 @@ struct RuntimeConsumerActivity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimePersistenceTransition {
-    Persisted(RuntimeInstallJob),
+    Persisted {
+        job: RuntimeInstallJob,
+        durability_warning: Option<String>,
+    },
     Failed {
         job: RuntimeInstallJob,
         message: String,
@@ -369,6 +373,12 @@ struct RuntimeReplacement {
     runtime_id: String,
     persistence_install: Option<Option<config::ManagedRuntimeInstall>>,
     _lock: RuntimeInstallLock,
+}
+
+#[derive(Debug)]
+struct RuntimeUninstallOutcome {
+    removed_files: bool,
+    durability_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -439,15 +449,18 @@ fn persist_runtime_install(
     runtime_id: &str,
     install: config::ManagedRuntimeInstall,
     job: RuntimeInstallJob,
-    persist: impl FnOnce(&AppConfig) -> Result<AppConfig, String>,
+    persist: impl FnOnce(&AppConfig) -> Result<config::ConfigSaveOutcome, String>,
 ) -> RuntimePersistenceTransition {
     let mut candidate = config.clone();
     apply_runtime_record(&mut candidate, runtime_id, install);
     config::normalize_config(&mut candidate);
     match persist(&candidate) {
         Ok(committed) => {
-            *config = committed;
-            RuntimePersistenceTransition::Persisted(job)
+            *config = committed.config;
+            RuntimePersistenceTransition::Persisted {
+                job,
+                durability_warning: committed.durability_warning,
+            }
         }
         Err(err) => RuntimePersistenceTransition::Failed {
             job,
@@ -1193,11 +1206,14 @@ impl LocalTranscriberApp {
         }
         match config::save_config_merging_managed_runtimes(&self.config) {
             Ok(committed) => {
-                self.config = committed;
+                self.config = committed.config;
                 if self.config_path.is_none() {
                     self.config_path = config::config_file_path().ok();
                 }
-                self.status_message = "Settings saved".to_owned();
+                self.status_message = committed.durability_warning.map_or_else(
+                    || "Settings saved".to_owned(),
+                    |warning| format!("Settings saved with a durability warning: {warning}"),
+                );
             }
             Err(err) => {
                 self.status = TranscriptionStatus::Error;
@@ -1711,7 +1727,7 @@ impl LocalTranscriberApp {
                         self.status_message = rollback_message;
                         continue;
                     }
-                    let job = match persist_runtime_install(
+                    let (job, config_durability_warning) = match persist_runtime_install(
                         &mut self.config,
                         &runtime_id,
                         new_runtime.clone(),
@@ -1724,7 +1740,10 @@ impl LocalTranscriberApp {
                             .map_err(|err| err.to_string())
                         },
                     ) {
-                        RuntimePersistenceTransition::Persisted(job) => job,
+                        RuntimePersistenceTransition::Persisted {
+                            job,
+                            durability_warning,
+                        } => (job, durability_warning),
                         RuntimePersistenceTransition::Failed { job, message } => {
                             let rollback_message = match replacement.rollback() {
                                 Ok(()) => message,
@@ -1747,7 +1766,9 @@ impl LocalTranscriberApp {
                             continue;
                         }
                     };
-                    let cleanup_warning = replacement.commit().err();
+                    let config_durability_pending = config_durability_warning.is_some();
+                    let cleanup_warning =
+                        finalize_runtime_transaction(*replacement, config_durability_warning);
                     if self.config_path.is_none() {
                         self.config_path = config::config_file_path().ok();
                     }
@@ -1769,13 +1790,21 @@ impl LocalTranscriberApp {
                         }
                     }
                     self.status = TranscriptionStatus::Idle;
-                    self.status_message = cleanup_warning.map_or_else(
-                        || format!("{backend} runtime is ready."),
-                        |warning| {
+                    self.status_message = if config_durability_pending {
+                        cleanup_warning.map(|warning| {
+                            format!(
+                                "{backend} runtime is ready, but configuration durability is unconfirmed; startup recovery will verify it: {warning}"
+                            )
+                        })
+                    } else {
+                        cleanup_warning.map(|warning| {
                             format!(
                                 "{backend} runtime is ready. Old runtime backup cleanup warning: {warning}"
                             )
-                        },
+                        })
+                    }
+                    .unwrap_or_else(
+                        || format!("{backend} runtime is ready."),
                     );
                 }
                 AppEvent::RuntimeInstallFailed {
@@ -2450,25 +2479,29 @@ impl LocalTranscriberApp {
             return;
         };
 
-        let removed_files =
-            match uninstall_runtime_transaction(&mut self.config, provider.runtime_id) {
-                Ok(removed_files) => removed_files,
-                Err(message) => {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message =
-                        format!("Could not uninstall {} runtime. {message}", model.backend);
-                    return;
-                }
-            };
+        let outcome = match uninstall_runtime_transaction(&mut self.config, provider.runtime_id) {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    format!("Could not uninstall {} runtime. {message}", model.backend);
+                return;
+            }
+        };
         if self.config_path.is_none() {
             self.config_path = config::config_file_path().ok();
         }
         self.refresh_playground_runtime_statuses();
         self.status = TranscriptionStatus::Idle;
-        self.status_message = match removed_files {
+        let success = match outcome.removed_files {
             true => format!("Uninstalled {} runtime.", model.backend),
             false => format!("Removed {} runtime from Scribe.", model.backend),
         };
+        self.status_message = outcome
+            .durability_warning
+            .map_or(success.clone(), |warning| {
+                format!("{success} Durability warning; startup recovery will verify it: {warning}")
+            });
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
@@ -5577,7 +5610,10 @@ fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<boo
     Ok(removed_any)
 }
 
-fn uninstall_runtime_transaction(config: &mut AppConfig, runtime_id: &str) -> Result<bool, String> {
+fn uninstall_runtime_transaction(
+    config: &mut AppConfig,
+    runtime_id: &str,
+) -> Result<RuntimeUninstallOutcome, String> {
     let target_root = config::runtime_storage_dir().join(runtime_id);
     uninstall_runtime_transaction_at(config, runtime_id, &target_root, |candidate| {
         config::save_config_with_runtime_update(candidate, Some((runtime_id, None)))
@@ -5589,8 +5625,8 @@ fn uninstall_runtime_transaction_at(
     config: &mut AppConfig,
     runtime_id: &str,
     target_root: &Path,
-    persist: impl FnOnce(&AppConfig) -> Result<AppConfig, String>,
-) -> Result<bool, String> {
+    persist: impl FnOnce(&AppConfig) -> Result<config::ConfigSaveOutcome, String>,
+) -> Result<RuntimeUninstallOutcome, String> {
     let install_lock = acquire_runtime_install_lock(runtime_id, target_root)?;
     let backup_root = runtime_transaction_path(target_root, "backup");
     let removed_files = target_root.exists();
@@ -5604,8 +5640,7 @@ fn uninstall_runtime_transaction_at(
             new_install: None,
         };
         write_runtime_journal(target_root, &journal)?;
-        if let Err(err) = fs::rename(target_root, &backup_root) {
-            let _ = remove_runtime_journal(target_root);
+        if let Err(err) = durable_fs::rename(target_root, &backup_root, false) {
             return Err(format!(
                 "Could not stage runtime removal {}: {err}",
                 target_root.display()
@@ -5613,9 +5648,6 @@ fn uninstall_runtime_transaction_at(
         }
         journal.phase = RuntimeTransactionPhase::BackedUp;
         if let Err(message) = write_runtime_journal(target_root, &journal) {
-            if fs::rename(&backup_root, target_root).is_ok() {
-                let _ = remove_runtime_journal(target_root);
-            }
             return Err(format!("Could not record runtime removal: {message}"));
         }
         Some(backup_root)
@@ -5636,9 +5668,13 @@ fn uninstall_runtime_transaction_at(
     }
     match persist(config) {
         Ok(committed) => {
-            *config = committed;
-            let _ = removal.commit();
-            Ok(removed_files)
+            *config = committed.config;
+            let durability_warning =
+                finalize_runtime_transaction(removal, committed.durability_warning);
+            Ok(RuntimeUninstallOutcome {
+                removed_files,
+                durability_warning,
+            })
         }
         Err(err) => {
             let message = format!("Failed to persist runtime removal: {err}");
@@ -5881,8 +5917,7 @@ fn activate_staged_runtime(
     };
     write_runtime_journal(target_root, &journal)?;
     let previous = if target_root.exists() {
-        if let Err(err) = fs::rename(target_root, &backup_root) {
-            let _ = remove_runtime_journal(target_root);
+        if let Err(err) = durable_fs::rename(target_root, &backup_root, false) {
             return Err(format!(
                 "Could not preserve existing runtime {}: {err}",
                 target_root.display()
@@ -5894,43 +5929,19 @@ fn activate_staged_runtime(
     };
     journal.phase = RuntimeTransactionPhase::BackedUp;
     if let Err(message) = write_runtime_journal(target_root, &journal) {
-        let restored = previous
-            .as_ref()
-            .is_none_or(|backup_root| fs::rename(backup_root, target_root).is_ok());
-        if restored {
-            let _ = remove_path_if_exists(stage_root);
-            let _ = remove_runtime_journal(target_root);
-        }
         return Err(format!(
             "Could not record the prepared runtime transaction: {message}"
         ));
     }
 
-    if let Err(err) = fs::rename(stage_root, target_root) {
-        let restore_error = previous.as_ref().and_then(|backup_root| {
-            fs::rename(backup_root, target_root)
-                .err()
-                .map(|restore_err| format!(" Previous runtime restore also failed: {restore_err}"))
-        });
-        let _ = remove_path_if_exists(stage_root);
-        if restore_error.is_none() {
-            let _ = remove_runtime_journal(target_root);
-        }
+    if let Err(err) = durable_fs::rename(stage_root, target_root, false) {
         return Err(format!(
             "Could not activate staged runtime {}: {err}",
             stage_root.display()
-        ) + restore_error.as_deref().unwrap_or_default());
+        ));
     }
     journal.phase = RuntimeTransactionPhase::Activated;
     if let Err(message) = write_runtime_journal(target_root, &journal) {
-        let removed_new = remove_path_if_exists(target_root).is_ok();
-        let restored = removed_new
-            && previous
-                .as_ref()
-                .is_none_or(|backup_root| fs::rename(backup_root, target_root).is_ok());
-        if restored {
-            let _ = remove_runtime_journal(target_root);
-        }
         return Err(format!(
             "Could not record the activated runtime transaction: {message}"
         ));
@@ -6013,6 +6024,16 @@ impl RuntimeReplacement {
             self._lock.previous_install.as_ref(),
         )?;
         remove_runtime_journal(&self.target_root)
+    }
+}
+
+fn finalize_runtime_transaction(
+    replacement: RuntimeReplacement,
+    config_durability_warning: Option<String>,
+) -> Option<String> {
+    match config_durability_warning {
+        Some(warning) => Some(warning),
+        None => replacement.commit().err(),
     }
 }
 
@@ -6255,7 +6276,7 @@ fn restore_runtime_backup(
             ));
         }
         remove_path_if_exists(target_root)?;
-        fs::rename(backup_root, target_root).map_err(|err| {
+        durable_fs::rename(backup_root, target_root, false).map_err(|err| {
             format!(
                 "Could not restore previous runtime {}: {err}",
                 target_root.display()
@@ -6389,8 +6410,7 @@ fn write_runtime_journal(
     file.sync_all()
         .map_err(|err| format!("Could not sync runtime transaction: {err}"))?;
     drop(file);
-    remove_path_if_exists(&path)?;
-    fs::rename(&next, &path).map_err(|err| {
+    durable_fs::rename(&next, &path, true).map_err(|err| {
         format!(
             "Could not publish runtime transaction {}: {err}",
             path.display()
@@ -6412,15 +6432,7 @@ fn runtime_transaction_path(target_root: &Path, phase: &str) -> PathBuf {
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let result = if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    };
-    result.map_err(|err| format!("Could not remove {}: {err}", path.display()))
+    durable_fs::remove(path).map_err(|err| format!("Could not remove {}: {err}", path.display()))
 }
 
 fn managed_runtime_install_record(
@@ -9483,6 +9495,49 @@ mod layout_tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn config_durability_warning_leaves_runtime_transaction_for_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-durability-warning-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let stage = runtime_transaction_path(&target, "installing");
+        let previous_executable = write_vosk_runtime(&target);
+        let previous = config::ManagedRuntimeInstall::new(previous_executable);
+        let lock = acquire_runtime_install_lock_with_timeout(
+            "vosk",
+            &target,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let staged_executable = write_vosk_runtime(&stage);
+        let relative_executable = staged_executable
+            .strip_prefix(&stage)
+            .unwrap()
+            .to_path_buf();
+        let mut replacement =
+            activate_staged_runtime("vosk", &target, &stage, &relative_executable, lock).unwrap();
+        let current = config::ManagedRuntimeInstall::new(target.join(relative_executable));
+        replacement.prepare_persistence(Some(&current)).unwrap();
+
+        let warning = finalize_runtime_transaction(
+            replacement,
+            Some("injected config directory sync failure".to_owned()),
+        )
+        .unwrap();
+
+        assert!(warning.contains("injected"));
+        assert!(runtime_transaction_exists_for_test(&target));
+        assert!(runtime_transaction_path(&target, "backup").exists());
+        recover_runtime_transaction("vosk", &target, Some(&current)).unwrap();
+        assert!(!runtime_transaction_exists_for_test(&target));
+        assert!(!runtime_transaction_path(&target, "backup").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn runtime_transaction_exists_for_test(target: &Path) -> bool {
         runtime_transaction_path(target, "transaction").exists()
             || runtime_transaction_path(target, "transaction.next").exists()
@@ -9713,15 +9768,21 @@ mod layout_tests {
             persist_runtime_install(&mut config, "vosk", replacement.clone(), job, |saved| {
                 assert!(runtime_metadata_matches(saved, "vosk", &replacement));
                 persistence_attempted.set(true);
-                Ok(saved.clone())
+                Ok(config::ConfigSaveOutcome {
+                    config: saved.clone(),
+                    durability_warning: None,
+                })
             });
         assert!(persistence_attempted.get());
         assert!(matches!(
             persisted,
-            RuntimePersistenceTransition::Persisted(RuntimeInstallJob {
-                download_model_ids,
-                ..
-            }) if download_model_ids == ["queued-model"]
+            RuntimePersistenceTransition::Persisted {
+                job: RuntimeInstallJob {
+                    download_model_ids,
+                    ..
+                },
+                durability_warning: None,
+            } if download_model_ids == ["queued-model"]
         ));
     }
 
@@ -9807,16 +9868,56 @@ mod layout_tests {
         let removed = uninstall_runtime_transaction_at(&mut config, "vosk", &target, |candidate| {
             let mut committed = candidate.clone();
             committed.managed_runtimes.remove("vosk");
-            Ok(committed)
+            Ok(config::ConfigSaveOutcome {
+                config: committed,
+                durability_warning: None,
+            })
         })
         .unwrap();
 
-        assert!(removed);
+        assert!(removed.removed_files);
+        assert!(removed.durability_warning.is_none());
         assert!(!target.exists());
         assert!(!config.managed_runtimes.contains_key("vosk"));
         assert!(config.managed_runtimes.contains_key("sherpa_onnx"));
         assert!(!runtime_transaction_exists_for_test(&target));
         assert!(!runtime_transaction_path(&target, "backup").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_uninstall_config_warning_defers_cleanup_to_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-uninstall-warning-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let executable = write_vosk_runtime(&target);
+        let mut config = AppConfig::default();
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            config::ManagedRuntimeInstall::new(executable),
+        );
+
+        let outcome = uninstall_runtime_transaction_at(&mut config, "vosk", &target, |candidate| {
+            let mut committed = candidate.clone();
+            committed.managed_runtimes.remove("vosk");
+            Ok(config::ConfigSaveOutcome {
+                config: committed,
+                durability_warning: Some("injected config directory sync failure".to_owned()),
+            })
+        })
+        .unwrap();
+
+        assert!(outcome.removed_files);
+        assert!(outcome.durability_warning.unwrap().contains("injected"));
+        assert!(!target.exists());
+        assert!(runtime_transaction_path(&target, "backup").exists());
+        assert!(runtime_transaction_exists_for_test(&target));
+        recover_runtime_transaction("vosk", &target, None).unwrap();
+        assert!(!runtime_transaction_path(&target, "backup").exists());
+        assert!(!runtime_transaction_exists_for_test(&target));
         let _ = fs::remove_dir_all(root);
     }
 

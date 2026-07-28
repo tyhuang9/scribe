@@ -3,6 +3,7 @@ mod audio;
 mod benchmark;
 mod config;
 mod core;
+mod durable_fs;
 mod hotkey;
 mod managed_downloads;
 mod models;

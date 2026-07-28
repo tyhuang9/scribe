@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::durable_fs;
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
 
@@ -270,12 +271,12 @@ pub fn load_config() -> Result<(AppConfig, PathBuf)> {
         {
             let mut config = read_config_file(&legacy_path)?;
             normalize_config(&mut config);
-            save_config_file_locked(&path, &config, &lock)?;
+            ensure_config_save_durable(save_config_file_locked(&path, &config, &lock)?)?;
             return Ok((config, path));
         }
 
         let config = AppConfig::default();
-        save_config_file_locked(&path, &config, &lock)?;
+        ensure_config_save_durable(save_config_file_locked(&path, &config, &lock)?)?;
         return Ok((config, path));
     }
 
@@ -293,14 +294,21 @@ fn read_config_file(path: &PathBuf) -> Result<AppConfig> {
         .with_context(|| format!("failed to parse config {}", path.display()))
 }
 
-pub(crate) fn save_config_merging_managed_runtimes(config: &AppConfig) -> Result<AppConfig> {
+pub(crate) struct ConfigSaveOutcome {
+    pub(crate) config: AppConfig,
+    pub(crate) durability_warning: Option<String>,
+}
+
+pub(crate) fn save_config_merging_managed_runtimes(
+    config: &AppConfig,
+) -> Result<ConfigSaveOutcome> {
     save_config_with_runtime_update(config, None)
 }
 
 pub(crate) fn save_config_with_runtime_update(
     config: &AppConfig,
     runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
-) -> Result<AppConfig> {
+) -> Result<ConfigSaveOutcome> {
     let path = config_file_path()?;
     save_config_with_runtime_update_at(&path, config, runtime_update)
 }
@@ -309,7 +317,7 @@ fn save_config_with_runtime_update_at(
     path: &Path,
     config: &AppConfig,
     runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
-) -> Result<AppConfig> {
+) -> Result<ConfigSaveOutcome> {
     let lock = lock_config_path(path, Duration::from_secs(10))?;
     let persisted = recover_config_file(path)?.unwrap_or_default();
     let mut merged = config.clone();
@@ -327,8 +335,20 @@ fn save_config_with_runtime_update_at(
         }
     }
     normalize_config(&mut merged);
-    save_config_file_locked(path, &merged, &lock)?;
-    Ok(merged)
+    let durability_warning = save_config_file_locked(path, &merged, &lock)?;
+    Ok(ConfigSaveOutcome {
+        config: merged,
+        durability_warning,
+    })
+}
+
+fn ensure_config_save_durable(warning: Option<String>) -> Result<()> {
+    match warning {
+        Some(warning) => Err(anyhow!(
+            "configuration was published but its durability could not be confirmed: {warning}"
+        )),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
@@ -385,11 +405,12 @@ fn recover_config_file(path: &Path) -> Result<Option<AppConfig>> {
     });
     let current = read_valid_config(path);
     if let Some(config) = current {
-        let _ = fs::remove_file(&backup);
+        durable_fs::remove(&backup)
+            .with_context(|| format!("failed to durably remove {}", backup.display()))?;
         for temporary in temporary_paths {
-            let _ = fs::remove_file(temporary);
+            durable_fs::remove(&temporary)
+                .with_context(|| format!("failed to durably remove {}", temporary.display()))?;
         }
-        let _ = sync_config_directory(path);
         return Ok(Some(config));
     }
 
@@ -397,17 +418,17 @@ fn recover_config_file(path: &Path) -> Result<Option<AppConfig>> {
         if path.exists() {
             preserve_invalid_config(path)?;
         }
-        fs::rename(&backup, path).with_context(|| {
+        durable_fs::rename(&backup, path, false).with_context(|| {
             format!(
-                "failed to restore config {} from {}",
+                "failed to durably restore config {} from {}",
                 path.display(),
                 backup.display()
             )
         })?;
         for temporary in temporary_paths {
-            let _ = fs::remove_file(temporary);
+            durable_fs::remove(&temporary)
+                .with_context(|| format!("failed to durably remove {}", temporary.display()))?;
         }
-        let _ = sync_config_directory(path);
         return Ok(Some(config));
     }
 
@@ -418,19 +439,19 @@ fn recover_config_file(path: &Path) -> Result<Option<AppConfig>> {
         if path.exists() {
             preserve_invalid_config(path)?;
         }
-        fs::rename(&temporary, path).with_context(|| {
+        durable_fs::rename(&temporary, path, false).with_context(|| {
             format!(
-                "failed to recover config {} from {}",
+                "failed to durably recover config {} from {}",
                 path.display(),
                 temporary.display()
             )
         })?;
         for candidate in temporary_paths {
             if candidate != temporary {
-                let _ = fs::remove_file(candidate);
+                durable_fs::remove(&candidate)
+                    .with_context(|| format!("failed to durably remove {}", candidate.display()))?;
             }
         }
-        let _ = sync_config_directory(path);
         return Ok(Some(config));
     }
 
@@ -441,7 +462,27 @@ fn recover_config_file(path: &Path) -> Result<Option<AppConfig>> {
     }
 }
 
-fn save_config_file_locked(path: &Path, config: &AppConfig, _lock: &ConfigFileLock) -> Result<()> {
+fn save_config_file_locked(
+    path: &Path,
+    config: &AppConfig,
+    lock: &ConfigFileLock,
+) -> Result<Option<String>> {
+    save_config_file_locked_with(
+        path,
+        config,
+        lock,
+        durable_fs::rename_with_outcome,
+        durable_fs::remove,
+    )
+}
+
+fn save_config_file_locked_with(
+    path: &Path,
+    config: &AppConfig,
+    _lock: &ConfigFileLock,
+    mut rename: impl FnMut(&Path, &Path, bool) -> io::Result<Option<io::Error>>,
+    mut remove: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<Option<String>> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("config path {} has no parent", path.display()))?;
@@ -465,29 +506,73 @@ fn save_config_file_locked(path: &Path, config: &AppConfig, _lock: &ConfigFileLo
     drop(file);
 
     let backup = config_sibling_path(path, "backup");
-    let _ = fs::remove_file(&backup);
+    remove(&backup).with_context(|| {
+        format!(
+            "failed to durably remove stale config backup {}",
+            backup.display()
+        )
+    })?;
     let had_previous = path.exists();
     if had_previous {
-        fs::rename(path, &backup).with_context(|| {
+        let backup_warning = rename(path, &backup, false).with_context(|| {
             format!(
                 "failed to preserve config {} as {}",
                 path.display(),
                 backup.display()
             )
         })?;
-    }
-    if let Err(err) = fs::rename(&temporary, path) {
-        if had_previous && fs::rename(&backup, path).is_ok() {
-            let _ = fs::remove_file(&temporary);
+        if let Some(backup_warning) = backup_warning {
+            let restore_warning = rename(&backup, path, false).with_context(|| {
+                format!(
+                    "failed to restore config {} after its backup durability barrier failed: {backup_warning}",
+                    path.display()
+                )
+            })?;
+            if let Some(restore_warning) = restore_warning {
+                return Err(anyhow!(
+                    "config backup durability failed ({backup_warning}) and restoring the old config was not durably confirmed ({restore_warning})"
+                ));
+            }
+            return Err(anyhow!(
+                "config backup durability failed; the old config was restored: {backup_warning}"
+            ));
         }
-        return Err(err).with_context(|| format!("failed to publish config {}", path.display()));
     }
 
-    // The new path is the commit point. Cleanup failures leave recoverable state.
-    let _ = sync_config_directory(path);
-    let _ = fs::remove_file(&backup);
-    let _ = sync_config_directory(path);
-    Ok(())
+    let publish = match rename(&temporary, path, false) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if had_previous {
+                let restore_warning = rename(&backup, path, false).with_context(|| {
+                    format!(
+                        "failed to restore config {} after publication failed: {err}",
+                        path.display()
+                    )
+                })?;
+                if let Some(restore_warning) = restore_warning {
+                    return Err(anyhow!(
+                        "config publication failed ({err}) and restoring the old config was not durably confirmed ({restore_warning})"
+                    ));
+                }
+            }
+            return Err(err)
+                .with_context(|| format!("failed to publish config {}", path.display()));
+        }
+    };
+    if let Some(warning) = publish {
+        return Ok(Some(format!(
+            "config {} was published, but syncing its containing directory failed: {warning}",
+            path.display()
+        )));
+    }
+
+    if let Err(error) = remove(&backup) {
+        return Ok(Some(format!(
+            "config {} is durable, but its old backup could not be durably removed: {error}",
+            path.display()
+        )));
+    }
+    Ok(None)
 }
 
 fn read_valid_config(path: &Path) -> Option<AppConfig> {
@@ -518,9 +603,9 @@ fn preserve_invalid_config(path: &Path) -> Result<()> {
         .unwrap_or_default()
         .as_nanos();
     let corrupt = config_sibling_path(path, &format!("corrupt-{}-{nonce:020}", std::process::id()));
-    fs::rename(path, &corrupt).with_context(|| {
+    durable_fs::rename(path, &corrupt, false).with_context(|| {
         format!(
-            "failed to preserve invalid config {} as {}",
+            "failed to durably preserve invalid config {} as {}",
             path.display(),
             corrupt.display()
         )
@@ -550,18 +635,6 @@ fn config_temporary_paths(path: &Path) -> Result<Vec<PathBuf>> {
                 .is_some_and(|name| name.starts_with(&prefix))
         })
         .collect())
-}
-
-#[cfg(unix)]
-fn sync_config_directory(path: &Path) -> Result<()> {
-    File::open(path.parent().expect("config path has parent"))?
-        .sync_all()
-        .context("failed to sync config directory")
-}
-
-#[cfg(not(unix))]
-fn sync_config_directory(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
@@ -1088,6 +1161,91 @@ mod tests {
     }
 
     #[test]
+    fn config_publish_sync_failure_reports_committed_and_preserves_backup() {
+        let path = config_test_path("committed-warning");
+        let root = path.parent().unwrap();
+        let backup = config_sibling_path(&path, "backup");
+        let old = AppConfig {
+            hotkey: "old".to_owned(),
+            ..AppConfig::default()
+        };
+        let new = AppConfig {
+            hotkey: "new".to_owned(),
+            ..AppConfig::default()
+        };
+        write_config_candidate(&path, &old);
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        let mut rename_count = 0;
+
+        let warning = save_config_file_locked_with(
+            &path,
+            &new,
+            &lock,
+            |source, destination, _| {
+                rename_count += 1;
+                fs::rename(source, destination)?;
+                Ok((rename_count == 2).then(|| io::Error::other("injected directory sync")))
+            },
+            |candidate| {
+                if candidate.exists() {
+                    fs::remove_file(candidate)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(warning.contains("published"));
+        assert_eq!(read_config_file(&path).unwrap().hotkey, "new");
+        assert_eq!(read_config_file(&backup).unwrap().hotkey, "old");
+        drop(lock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_precommit_sync_failure_durably_restores_old_config() {
+        let path = config_test_path("precommit-restore");
+        let root = path.parent().unwrap();
+        let old = AppConfig {
+            hotkey: "old".to_owned(),
+            ..AppConfig::default()
+        };
+        let new = AppConfig {
+            hotkey: "new".to_owned(),
+            ..AppConfig::default()
+        };
+        write_config_candidate(&path, &old);
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        let mut rename_count = 0;
+
+        let error = save_config_file_locked_with(
+            &path,
+            &new,
+            &lock,
+            |source, destination, _| {
+                rename_count += 1;
+                fs::rename(source, destination)?;
+                Ok((rename_count == 1).then(|| io::Error::other("injected directory sync")))
+            },
+            |candidate| {
+                if candidate.exists() {
+                    fs::remove_file(candidate)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("old config was restored"));
+        assert_eq!(read_config_file(&path).unwrap().hotkey, "old");
+        assert!(!config_sibling_path(&path, "backup").exists());
+        drop(lock);
+        assert_eq!(recover_config_file(&path).unwrap().unwrap().hotkey, "old");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn merged_config_save_preserves_other_process_runtime_records() {
         let path = config_test_path("merge-runtimes");
         let root = path.parent().unwrap();
@@ -1097,7 +1255,11 @@ mod tests {
             ManagedRuntimeInstall::new(PathBuf::from("vosk/bin/runtime")),
         );
         let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
-        save_config_file_locked(&path, &first, &lock).unwrap();
+        assert!(
+            save_config_file_locked(&path, &first, &lock)
+                .unwrap()
+                .is_none()
+        );
         drop(lock);
 
         let stale_second = AppConfig::default();
@@ -1109,10 +1271,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(merged.managed_runtimes.contains_key("vosk"));
-        assert_eq!(merged.managed_runtimes.get("sherpa_onnx"), Some(&sherpa));
+        assert!(merged.config.managed_runtimes.contains_key("vosk"));
+        assert_eq!(
+            merged.config.managed_runtimes.get("sherpa_onnx"),
+            Some(&sherpa)
+        );
         let persisted = read_config_file(&path).unwrap();
-        assert_eq!(persisted.managed_runtimes, merged.managed_runtimes);
+        assert_eq!(persisted.managed_runtimes, merged.config.managed_runtimes);
         let _ = fs::remove_dir_all(root);
     }
 
