@@ -3054,7 +3054,6 @@ impl LocalTranscriberApp {
                     ComboBox::from_id_source("playground-ranking-mode")
                         .selected_text(self.playground_ranking_mode.label())
                         .width(130.0)
-                        .wrap(true)
                         .show_ui(ui, |ui| {
                             for mode in RankingMode::ALL {
                                 ui.selectable_value(
@@ -3210,7 +3209,7 @@ impl LocalTranscriberApp {
         let selector_height = selector_max_size.y.min(440.0);
         let selector_pos = egui::pos2(
             screen_rect.center().x - selector_width * 0.5,
-            screen_rect.center().y - selector_height * 0.5,
+            screen_rect.top() + selector_margin,
         );
         egui::Area::new(egui::Id::new("playground-selector-shield"))
             .order(egui::Order::Background)
@@ -3218,7 +3217,9 @@ impl LocalTranscriberApp {
             .movable(false)
             .show(ctx, |ui| {
                 let shield_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
-                ui.allocate_rect(shield_rect, egui::Sense::click_and_drag());
+                let mut shield_sense = egui::Sense::click_and_drag();
+                shield_sense.focusable = false;
+                ui.allocate_rect(shield_rect, shield_sense);
                 ui.painter().rect_filled(
                     shield_rect,
                     Rounding::ZERO,
@@ -3272,7 +3273,8 @@ impl LocalTranscriberApp {
                         ),
                     );
                 } else {
-                    egui::ScrollArea::vertical()
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let selector_scroll = egui::ScrollArea::vertical()
                         .max_height(320.0)
                         .show(ui, |ui| {
                             for model in &installed_models {
@@ -3314,6 +3316,17 @@ impl LocalTranscriberApp {
                                 });
                             }
                         });
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("test-selector-scroll-metrics"),
+                            (
+                                selector_scroll.id,
+                                selector_scroll.content_size.y,
+                                selector_scroll.inner_rect.height(),
+                            ),
+                        );
+                    });
                 }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3418,7 +3431,7 @@ impl LocalTranscriberApp {
                     let label = ui.label("Hotkey mode");
                     let response = ComboBox::from_id_source("hotkey-mode")
                         .selected_text(self.config.hotkey_mode.label())
-                        .wrap(true)
+                        .width(170.0)
                         .show_ui(ui, |ui| {
                             for mode in HotkeyMode::ALL {
                                 ui.selectable_value(
@@ -3447,7 +3460,7 @@ impl LocalTranscriberApp {
                     let mut compute_mode = self.config.whisper_compute_mode;
                     let response = ComboBox::from_id_source("transcription-device-mode")
                         .selected_text(compute_mode.label())
-                        .wrap(true)
+                        .width(160.0)
                         .show_ui(ui, |ui| {
                             for mode in WhisperComputeMode::ALL {
                                 let enabled =
@@ -3490,9 +3503,12 @@ impl LocalTranscriberApp {
                                         .unwrap_or("Auto"),
                                 )
                                 .wrap(true)
+                                .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
                                 .show_ui(ui, |ui| {
+                                    prepare_dynamic_combo_popup(ui);
                                     for device in &devices {
-                                        ui.selectable_value(
+                                        selectable_dynamic_combo_value(
+                                            ui,
                                             &mut selected_device,
                                             device.id.clone(),
                                             &device.name,
@@ -3527,14 +3543,18 @@ impl LocalTranscriberApp {
                                 .unwrap_or("OS default"),
                         )
                         .wrap(true)
+                        .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
+                            prepare_dynamic_combo_popup(ui);
+                            selectable_dynamic_combo_value(
+                                ui,
                                 &mut self.config.audio_input_device_name,
                                 None,
                                 "OS default",
                             );
                             for device in &self.audio_devices {
-                                ui.selectable_value(
+                                selectable_dynamic_combo_value(
+                                    ui,
                                     &mut self.config.audio_input_device_name,
                                     Some(device.clone()),
                                     device,
@@ -3572,7 +3592,7 @@ impl LocalTranscriberApp {
                     let label = ui.label("Theme");
                     let response = ComboBox::from_id_source("theme-mode")
                         .selected_text(self.config.theme_mode.label())
-                        .wrap(true)
+                        .width(140.0)
                         .show_ui(ui, |ui| {
                             for mode in ThemeMode::ALL {
                                 ui.selectable_value(
@@ -3953,16 +3973,49 @@ fn model_backend_filter_control(
                 selected_backend.as_str()
             })
             .width(150.0)
-            .wrap(true)
+            .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
             .show_ui(ui, |ui| {
-                ui.selectable_value(selected_backend, "All".to_owned(), "All backends");
+                prepare_dynamic_combo_popup(ui);
+                selectable_dynamic_combo_value(
+                    ui,
+                    selected_backend,
+                    "All".to_owned(),
+                    "All backends",
+                );
                 for backend in backends {
-                    ui.selectable_value(selected_backend, backend.clone(), backend);
+                    selectable_dynamic_combo_value(ui, selected_backend, backend.clone(), backend);
                 }
             })
             .response;
         set_control_accessibility(ui, &response, label.id, "Filter model backend");
     });
+}
+
+const DYNAMIC_COMBO_POPUP_MAX_WIDTH: f32 = 480.0;
+const DYNAMIC_COMBO_POPUP_MAX_HEIGHT: f32 = 320.0;
+
+fn prepare_dynamic_combo_popup(ui: &mut Ui) {
+    let available_screen_width = (ui.ctx().screen_rect().width() - 32.0).max(1.0);
+    let popup_width = available_screen_width.min(DYNAMIC_COMBO_POPUP_MAX_WIDTH);
+    ui.set_max_width(popup_width);
+    ui.set_width(popup_width);
+    ui.style_mut().wrap = Some(true);
+}
+
+fn selectable_dynamic_combo_value<T>(ui: &mut Ui, current: &mut T, value: T, label: &str)
+where
+    T: Clone + PartialEq,
+{
+    let selected = current == &value;
+    let response = ui.add(
+        Button::new(label)
+            .selected(selected)
+            .wrap(true)
+            .min_size(Vec2::new(ui.available_width().max(1.0), 36.0)),
+    );
+    if response.clicked() {
+        *current = value;
+    }
 }
 
 fn recessed_panel(
@@ -4270,8 +4323,10 @@ fn playground_drag_handle(
     let dragging = ui.ctx().is_being_dragged(drag_id);
     let size = Vec2::new(ui.available_width().max(24.0), 34.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let mut drag_sense = egui::Sense::drag();
+    drag_sense.focusable = false;
     let response = ui
-        .interact(rect, drag_id, egui::Sense::drag())
+        .interact(rect, drag_id, drag_sense)
         .on_hover_cursor(egui::CursorIcon::Grab)
         .on_hover_text("Drag to reorder this model");
     response.dnd_set_drag_payload(payload);
@@ -6795,7 +6850,10 @@ mod layout_tests {
 
                 assert_no_visible_horizontal_overflow(&output, width, tab);
                 assert_focusable_bounds_within_viewport(&output, width, tab);
-                assert_accessible_text_contains(&output, &long_layout_copy());
+                for sentinel in adversarial_sentinels_for_tab(tab) {
+                    assert_accessible_text_contains(&output, &sentinel);
+                    assert_target_text_is_not_horizontally_clipped(&output, &sentinel);
+                }
 
                 let page_title = match tab {
                     Tab::Transcribe => "Transcribe",
@@ -6817,6 +6875,20 @@ mod layout_tests {
                         "long device selector was squeezed instead of using readable width: {microphone:?}"
                     );
                 }
+                if tab == Tab::Playground {
+                    assert!(
+                        output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()
+                            .is_some_and(|update| update.nodes.iter().any(|(_, node)| {
+                                node.role() == egui::accesskit::Role::Button
+                                    && node.name().is_some_and(|name| name.starts_with("Move "))
+                                    && node.supports_action(egui::accesskit::Action::Focus)
+                            })),
+                        "Playground move controls must remain keyboard-focusable"
+                    );
+                }
             }
         }
     }
@@ -6830,36 +6902,58 @@ mod layout_tests {
             ctx.set_visuals(stitch_visuals(ThemeMode::Light));
 
             let mut app = adversarial_test_app();
+            let selector_root = install_runnable_selector_models(&mut app);
             app.current_tab = Tab::Playground;
             app.open_playground_selector(None);
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, height),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    show_test_navigation(ctx, &mut app.current_tab);
-                    egui::CentralPanel::default()
-                        .frame(content_panel_frame(ctx))
-                        .show(ctx, |ui| app.ui_playground(ui));
-                },
-            );
+            let _opening_frame =
+                render_accessible_app_tab_frame(&ctx, &mut app, width, height, Vec::new());
+            let output = render_accessible_app_tab_frame(&ctx, &mut app, width, height, Vec::new());
 
             assert_no_visible_horizontal_overflow(&output, width, Tab::Playground);
             let selector_rect = ctx
                 .memory(|memory| memory.area_rect(egui::Id::new("Choose models to test")))
                 .expect("selector should create a window area");
             assert!(
-                selector_rect.min.x >= -1.0 && selector_rect.max.x <= width + 1.0,
-                "selector window overflowed at {width}px: {selector_rect:?}"
+                selector_rect.min.x >= -1.0
+                    && selector_rect.max.x <= width + 1.0
+                    && selector_rect.min.y >= -1.0
+                    && selector_rect.max.y <= height + 1.0,
+                "selector window overflowed at {width}x{height}: {selector_rect:?}"
             );
             assert_focusable_bounds_within_viewport(&output, width, Tab::Playground);
             assert_accessible_text_contains(
                 &output,
                 "Only installed models can be selected for Playground tests.",
+            );
+            assert_target_text_is_not_horizontally_clipped(
+                &output,
+                "Only installed models can be selected for Playground tests.",
+            );
+            let apply_bounds = accessible_bounds(
+                &output,
+                egui::accesskit::Role::Button,
+                "Apply model selection",
+            );
+            let cancel_bounds = accessible_bounds(
+                &output,
+                egui::accesskit::Role::Button,
+                "Cancel model selection",
+            );
+            for (name, bounds) in [
+                ("Apply model selection", apply_bounds),
+                ("Cancel model selection", cancel_bounds),
+            ] {
+                assert_accesskit_rect_within_viewport(bounds, width, height, name);
+                assert!(
+                    bounds.y1 <= f64::from(height),
+                    "selector footer {name} is not visible at {width}x{height}: {bounds:?}"
+                );
+            }
+            let (_, selector_content_height, selector_viewport_height) =
+                selector_scroll_metrics(&ctx);
+            assert!(
+                selector_content_height > selector_viewport_height,
+                "selector should scroll its runnable model list at {width}x{height}"
             );
             assert!(
                 output
@@ -6872,6 +6966,104 @@ mod layout_tests {
                     })),
                 "selector apply button should remain exposed to AccessKit at {width}x{height}"
             );
+            let _ = fs::remove_dir_all(selector_root);
+        }
+    }
+
+    #[test]
+    fn opened_dynamic_combo_popups_wrap_option_copy_within_target_viewports() {
+        for (width, height) in [(840.0, 600.0), (1100.0, 760.0)] {
+            for (id_source, control_name, selected_wraps, option_sentinel) in [
+                (
+                    "test-long-microphone-popup",
+                    "Microphone",
+                    true,
+                    long_layout_sentinel("microphone-option"),
+                ),
+                (
+                    "test-long-gpu-popup",
+                    "GPU device",
+                    true,
+                    long_layout_sentinel("gpu-option"),
+                ),
+                (
+                    "test-long-backend-popup",
+                    "Filter model backend",
+                    false,
+                    long_layout_sentinel("backend-option"),
+                ),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                configure_stitch_style(&ctx);
+                ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+
+                let options = if selected_wraps {
+                    vec![
+                        option_sentinel.clone(),
+                        format!("secondary-{}", long_layout_sentinel("popup-option")),
+                    ]
+                } else {
+                    vec![
+                        "All backends".to_owned(),
+                        option_sentinel.clone(),
+                        format!("secondary-{}", long_layout_sentinel("popup-option")),
+                    ]
+                };
+                let mut selected = if selected_wraps {
+                    options[0].clone()
+                } else {
+                    "All backends".to_owned()
+                };
+                let _closed = render_test_dynamic_combo_popup(
+                    &ctx,
+                    id_source,
+                    control_name,
+                    selected_wraps,
+                    &mut selected,
+                    &options,
+                    egui::vec2(width, height),
+                );
+                let combo_id = test_dynamic_combo_id(&ctx);
+                ctx.memory_mut(|memory| {
+                    memory.open_popup(combo_id.with("popup"));
+                });
+                let _opening_frame = render_test_dynamic_combo_popup(
+                    &ctx,
+                    id_source,
+                    control_name,
+                    selected_wraps,
+                    &mut selected,
+                    &options,
+                    egui::vec2(width, height),
+                );
+                let opened = render_test_dynamic_combo_popup(
+                    &ctx,
+                    id_source,
+                    control_name,
+                    selected_wraps,
+                    &mut selected,
+                    &options,
+                    egui::vec2(width, height),
+                );
+
+                assert_no_visible_horizontal_overflow(&opened, width, Tab::Settings);
+                assert_focusable_bounds_within_viewport(&opened, width, Tab::Settings);
+                assert_accessible_text_contains(&opened, &option_sentinel);
+                let option_bounds =
+                    accessible_bounds(&opened, egui::accesskit::Role::Button, &option_sentinel);
+                assert_accesskit_rect_within_viewport(
+                    option_bounds,
+                    width,
+                    height,
+                    &format!("{control_name} option"),
+                );
+                assert!(
+                    option_bounds.y1 - option_bounds.y0 >= 36.0,
+                    "{control_name} option lost its minimum target height: {option_bounds:?}"
+                );
+                assert_target_text_is_not_horizontally_clipped(&opened, &option_sentinel);
+            }
         }
     }
 
@@ -7935,9 +8127,11 @@ mod layout_tests {
         update
             .nodes
             .iter()
-            .find(|(_, node)| node.name() == Some(name))
+            .find(|(_, node)| {
+                node.name() == Some(name) && node.role() != egui::accesskit::Role::StaticText
+            })
             .map(|(id, _)| *id)
-            .unwrap()
+            .unwrap_or_else(|| panic!("missing interactive control {name:?} in AccessKit update"))
     }
 
     fn accesskit_control_id_with_prefix(
@@ -8031,14 +8225,18 @@ mod layout_tests {
             .as_ref()
             .expect("AccessKit should be enabled for layout assertions");
         for (_, node) in &update.nodes {
-            // egui exposes the window-area bookkeeping node as an unnamed, zero-size
-            // focus target. It is not a user control; check the concrete controls below.
-            if node.role() == egui::accesskit::Role::Unknown && node.name().is_none() {
-                continue;
-            }
             if node.supports_action(egui::accesskit::Action::Focus)
                 && let Some(bounds) = node.bounds()
             {
+                // egui's window-area bookkeeping node is an unnamed, zero-sized
+                // focus target. Do not exempt any non-zero or named node.
+                if node.role() == egui::accesskit::Role::Unknown
+                    && node.name().is_none()
+                    && bounds.x0 == bounds.x1
+                    && bounds.y0 == bounds.y1
+                {
+                    continue;
+                }
                 assert!(
                     bounds.x0 >= -1.0
                         && bounds.x1 <= f64::from(width + 1.0)
@@ -8057,12 +8255,74 @@ mod layout_tests {
             .accesskit_update
             .as_ref()
             .expect("AccessKit should be enabled for text assertions");
+        let found = update.nodes.iter().any(|(_, node)| {
+            node.name().is_some_and(|name| name.contains(expected))
+                || node.value().is_some_and(|value| value.contains(expected))
+        });
+        let names = (!found).then(|| {
+            update
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| node.name())
+                .collect::<Vec<_>>()
+        });
         assert!(
-            update.nodes.iter().any(|(_, node)| {
-                node.name().is_some_and(|name| name.contains(expected))
-                    || node.value().is_some_and(|value| value.contains(expected))
-            }),
-            "missing accessible long text containing {expected:?}"
+            found,
+            "missing accessible long text containing {expected:?}; nodes={names:?}"
+        );
+    }
+
+    fn assert_target_text_is_not_horizontally_clipped(output: &egui::FullOutput, expected: &str) {
+        let target_shapes = output
+            .shapes
+            .iter()
+            .flat_map(|clipped| {
+                target_text_shape_bounds(&clipped.shape, clipped.clip_rect, expected)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !target_shapes.is_empty(),
+            "target text was not painted: {expected:?}"
+        );
+        for (bounds, clip_rect) in target_shapes {
+            assert!(
+                bounds.min.x >= clip_rect.min.x - 1.0 && bounds.max.x <= clip_rect.max.x + 1.0,
+                "target text was horizontally clipped instead of wrapped: {expected:?}; bounds={bounds:?}; clip={clip_rect:?}"
+            );
+        }
+    }
+
+    fn target_text_shape_bounds(
+        shape: &egui::Shape,
+        clip_rect: egui::Rect,
+        expected: &str,
+    ) -> Vec<(egui::Rect, egui::Rect)> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().replace('\n', "").contains(expected) => {
+                vec![(text.visual_bounding_rect(), clip_rect)]
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .flat_map(|shape| target_text_shape_bounds(shape, clip_rect, expected))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn assert_accesskit_rect_within_viewport(
+        bounds: egui::accesskit::Rect,
+        width: f32,
+        height: f32,
+        name: &str,
+    ) {
+        assert!(
+            bounds.x0 >= -1.0
+                && bounds.y0 >= -1.0
+                && bounds.x1 <= f64::from(width + 1.0)
+                && bounds.y1 <= f64::from(height + 1.0)
+                && bounds.x1 > bounds.x0
+                && bounds.y1 > bounds.y0,
+            "{name} exceeds the {width}x{height} viewport: {bounds:?}"
         );
     }
 
@@ -8095,44 +8355,213 @@ mod layout_tests {
         .unwrap_or_else(|| panic!("missing page scroll metrics for {title}"))
     }
 
-    fn long_layout_copy() -> String {
-        format!(
-            "C:\\Scribe\\runtime-cache\\{}",
-            "unbroken-runtime-path-segment-".repeat(18)
+    fn selector_scroll_metrics(ctx: &egui::Context) -> (egui::Id, f32, f32) {
+        ctx.data_mut(|data| {
+            data.get_temp::<(egui::Id, f32, f32)>(egui::Id::new("test-selector-scroll-metrics"))
+        })
+        .expect("missing selector scroll metrics")
+    }
+
+    fn render_test_dynamic_combo_popup(
+        ctx: &egui::Context,
+        id_source: &'static str,
+        control_name: &str,
+        selected_wraps: bool,
+        selected: &mut String,
+        options: &[String],
+        viewport_size: Vec2,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport_size)),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let label = ui.label(control_name);
+                    let response = if selected_wraps {
+                        ComboBox::from_id_source(id_source)
+                            .selected_text(selected.as_str())
+                            .wrap(true)
+                            .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
+                            .show_ui(ui, |ui| {
+                                prepare_dynamic_combo_popup(ui);
+                                for option in options {
+                                    selectable_dynamic_combo_value(
+                                        ui,
+                                        selected,
+                                        option.clone(),
+                                        option,
+                                    );
+                                }
+                            })
+                            .response
+                    } else {
+                        ComboBox::from_id_source(id_source)
+                            .selected_text(selected.as_str())
+                            .width(150.0)
+                            .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
+                            .show_ui(ui, |ui| {
+                                prepare_dynamic_combo_popup(ui);
+                                for option in options {
+                                    selectable_dynamic_combo_value(
+                                        ui,
+                                        selected,
+                                        option.clone(),
+                                        option,
+                                    );
+                                }
+                            })
+                            .response
+                    };
+                    set_control_accessibility(ui, &response, label.id, control_name);
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("test-dynamic-combo-id"), response.id);
+                    });
+                });
+            },
         )
+    }
+
+    fn test_dynamic_combo_id(ctx: &egui::Context) -> egui::Id {
+        ctx.data_mut(|data| data.get_temp(egui::Id::new("test-dynamic-combo-id")))
+            .expect("dynamic combo should record its popup trigger id")
+    }
+
+    fn long_layout_sentinel(region: &str) -> String {
+        format!("SCRIBE-{region}-{}", "unbroken-text-segment-".repeat(18))
+    }
+
+    fn adversarial_sentinels_for_tab(tab: Tab) -> Vec<String> {
+        let status = long_layout_sentinel("status");
+        match tab {
+            Tab::Transcribe => vec![status],
+            Tab::Models => vec![status, long_layout_sentinel("model-runtime")],
+            Tab::Playground => vec![
+                status,
+                long_layout_sentinel("playground-model"),
+                long_layout_sentinel("playground-result"),
+            ],
+            Tab::Settings => vec![status],
+        }
+    }
+
+    fn install_runnable_selector_models(app: &mut LocalTranscriberApp) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-selector-runnable-models-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        for model in crate::models::default_model_catalog() {
+            let path = write_runnable_selector_model(&root, &model);
+            app.config.model_paths.insert(model.id, path);
+        }
+        root
+    }
+
+    fn write_runnable_selector_model(root: &Path, model: &SttModelInfo) -> PathBuf {
+        let model_root = root.join(&model.id);
+        match model.backend.as_str() {
+            "whisper.cpp" => {
+                let path = root.join(format!("{}.bin", model.id));
+                fs::write(&path, b"model").unwrap();
+                path
+            }
+            "faster-whisper" => {
+                fs::create_dir_all(&model_root).unwrap();
+                fs::write(model_root.join("model.bin"), b"model").unwrap();
+                fs::write(model_root.join("config.json"), b"{}").unwrap();
+                model_root
+            }
+            "Vosk" => {
+                fs::create_dir_all(model_root.join("am")).unwrap();
+                fs::create_dir_all(model_root.join("conf")).unwrap();
+                fs::create_dir_all(model_root.join("graph")).unwrap();
+                fs::write(model_root.join("am").join("final.mdl"), b"model").unwrap();
+                fs::write(model_root.join("conf").join("model.conf"), b"model").unwrap();
+                fs::write(model_root.join("graph").join("HCLG.fst"), b"model").unwrap();
+                model_root
+            }
+            "sherpa-onnx" => {
+                fs::create_dir_all(&model_root).unwrap();
+                for file in [
+                    "tokens.txt",
+                    "encoder-epoch-99-avg-1.int8.onnx",
+                    "decoder-epoch-99-avg-1.int8.onnx",
+                    "joiner-epoch-99-avg-1.int8.onnx",
+                ] {
+                    fs::write(model_root.join(file), b"model").unwrap();
+                }
+                model_root
+            }
+            "Moonshine" => {
+                fs::create_dir_all(&model_root).unwrap();
+                for file in [
+                    "tokens.txt",
+                    "encoder_model.ort",
+                    "decoder_model_merged.ort",
+                ] {
+                    fs::write(model_root.join(file), b"model").unwrap();
+                }
+                model_root
+            }
+            "Parakeet" => {
+                fs::create_dir_all(&model_root).unwrap();
+                for file in [
+                    "tokens.txt",
+                    "encoder.int8.onnx",
+                    "decoder.int8.onnx",
+                    "joiner.int8.onnx",
+                ] {
+                    fs::write(model_root.join(file), b"model").unwrap();
+                }
+                model_root
+            }
+            _ => unreachable!("catalog backend should have a selector test fixture"),
+        }
     }
 
     fn adversarial_test_app() -> LocalTranscriberApp {
         let mut app = test_app();
-        let long_copy = long_layout_copy();
-        let long_device = format!("Studio USB input device {long_copy}");
+        let status_sentinel = long_layout_sentinel("status");
+        let path_sentinel = long_layout_sentinel("storage-path");
+        let device_sentinel = long_layout_sentinel("microphone");
+        let long_device = format!("Studio USB input device {device_sentinel}");
         let mut playground_model = test_model();
         playground_model.id = "adversarial-model".to_owned();
-        playground_model.name = format!("Local model {long_copy}");
-        playground_model.backend = format!("runtime backend {long_copy}");
+        playground_model.name = format!("Local model {}", long_layout_sentinel("playground-model"));
+        playground_model.backend = format!("runtime backend {path_sentinel}");
         playground_model.description = format!(
-            "A deliberately long model description keeps the runtime failure and path readable: {long_copy}"
+            "A deliberately long model description keeps the runtime failure and path readable: {}",
+            long_layout_sentinel("playground-description")
         );
 
         app.status = TranscriptionStatus::Error;
         app.status_message = format!(
-            "Runtime preparation failed while validating {long_copy}. Review the full path before retrying."
+            "Runtime preparation failed while validating {status_sentinel}. Review the full path before retrying."
         );
         app.model_downloads.insert(
             "whisper_cpp_base_en".to_owned(),
             ModelInstallStatus::RuntimeError(format!(
-                "The managed runtime reported an actionable setup failure at {long_copy}."
+                "The managed runtime reported an actionable setup failure at {}.",
+                long_layout_sentinel("model-runtime")
             )),
         );
         app.audio_devices = vec![long_device.clone()];
         app.config.audio_input_device_name = Some(long_device);
-        app.config.model_storage_dir = PathBuf::from(&long_copy);
+        app.config.model_storage_dir = PathBuf::from(&path_sentinel);
         app.playground_cards = vec![PlaygroundCardState {
             model: playground_model,
             status: ModelRuntimeStatus::Error(format!(
-                "The selected runtime returned a detailed error for {long_copy}."
+                "The selected runtime returned a detailed error for {}.",
+                long_layout_sentinel("playground-runtime")
             )),
-            transcript: format!("A long playground result remains scrollable: {long_copy}"),
+            transcript: format!(
+                "A long playground result remains scrollable: {}",
+                long_layout_sentinel("playground-result")
+            ),
             latency_ms: Some(1_234),
             audio_duration_ms: None,
             peak_ram_mb: None,
