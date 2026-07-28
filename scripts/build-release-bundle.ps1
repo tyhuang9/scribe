@@ -15,11 +15,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PortableRuntimes = if ($null -eq $PortableRuntimes) { @{} } else { $PortableRuntimes }
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scribeDir = Split-Path -Parent $scriptDir
 $releaseDir = Join-Path $scribeDir 'target\release'
 $runtimeDir = Join-Path $releaseDir 'runtimes\whisper_cpp'
 $runtimeBin = Join-Path $runtimeDir 'bin'
+$platformArchitecture = switch ([string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+    'X64' { 'x86_64' }
+    'Arm64' { 'aarch64' }
+    default { throw 'Unsupported or unavailable Windows release architecture.' }
+}
 
 if ($WhisperSourceCommit -notmatch '^[0-9a-f]{40,64}$') {
     throw 'WhisperSourceCommit must be a lowercase 40-64 character commit digest.'
@@ -30,7 +36,7 @@ if ($WhisperVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$') {
 if ($CatalogPath) {
     $resolvedCatalog = (Resolve-Path -LiteralPath $CatalogPath).Path
     $catalog = Get-Content -LiteralPath $resolvedCatalog -Raw | ConvertFrom-Json
-    if ($catalog.schema_version -ne 1 -or -not $catalog.catalog_version -or $catalog.artifacts.Count -eq 0) {
+    if ($catalog.schema_version -ne 1 -or -not $catalog.catalog_version -or @($catalog.artifacts).Count -eq 0) {
         throw 'Release runtime catalog must use schema 1 and contain at least one real artifact.'
     }
     $env:SCRIBE_RUNTIME_ARTIFACT_CATALOG = $resolvedCatalog
@@ -70,16 +76,11 @@ function Assert-PortableRuntime([string]$Path, [string]$RuntimeId, [string]$Devi
         throw "Portable runtime is missing runtime-manifest.json: $Path"
     }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
-        'X64' { 'x86_64' }
-        'Arm64' { 'aarch64' }
-        default { throw 'Unsupported Windows release architecture.' }
-    }
     if ($manifest.manifest_version -ne 1 -or $manifest.runtime_id -ne $RuntimeId -or
-        $manifest.platform -ne "windows-$architecture" -or $manifest.device -ne $Device -or
+        $manifest.platform -ne "windows-$platformArchitecture" -or $manifest.device -ne $Device -or
         $manifest.entrypoint -ne $Entrypoint -or $manifest.portable -ne $true -or
         -not $manifest.version) {
-        throw "Portable runtime manifest does not match $RuntimeId/windows-$architecture/$Device/$Entrypoint."
+        throw "Portable runtime manifest does not match $RuntimeId/windows-$platformArchitecture/$Device/$Entrypoint."
     }
     if (-not (Test-Path -LiteralPath (Join-Path $Path $Entrypoint) -PathType Leaf)) {
         throw "Portable runtime entrypoint is missing: $Entrypoint"
@@ -142,7 +143,7 @@ $manifestJson = @{
     version = $WhisperVersion
     source_commit = $WhisperSourceCommit
     whisper_cli = 'bin/whisper-cli.exe'
-    platform = "windows-$(switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) { 'X64' { 'x86_64' } 'Arm64' { 'aarch64' } default { throw 'Unsupported Windows release architecture.' } })"
+    platform = "windows-$platformArchitecture"
     device = $device
     entrypoint = 'bin/whisper-cli.exe'
     cuda_bundled = ($device -eq 'gpu')
