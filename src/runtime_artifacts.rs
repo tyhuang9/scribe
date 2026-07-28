@@ -223,10 +223,14 @@ fn validate_https_url(url: &str) -> Result<(), String> {
         return Err("runtime artifact URL must use HTTPS".to_owned());
     }
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
     let reserved_host = host == "localhost"
         || host.ends_with(".localhost")
-        || host == "127.0.0.1"
-        || host == "::1"
+        || loopback
         || host.ends_with(".invalid")
         || host.ends_with(".test")
         || host.ends_with(".example")
@@ -470,7 +474,8 @@ fn extract_archive(
     fs::create_dir(stage_root)
         .map_err(|err| format!("could not create {}: {err}", stage_root.display()))?;
     let mut names = HashSet::new();
-    let mut unpacked = 0_u64;
+    let mut declared_unpacked = 0_u64;
+    let mut extracted_unpacked = 0_u64;
     let maximum_unpacked = artifact.unpacked_size_bytes;
     let mut found_entrypoint = false;
 
@@ -507,10 +512,11 @@ fn extract_archive(
                 "runtime archive entry {name:?} is a link or special file"
             ));
         }
-        unpacked = unpacked
-            .checked_add(entry.size())
+        let declared_size = entry.size();
+        declared_unpacked = declared_unpacked
+            .checked_add(declared_size)
             .ok_or_else(|| "runtime artifact unpacked size overflowed".to_owned())?;
-        if unpacked > maximum_unpacked {
+        if declared_unpacked > maximum_unpacked {
             return Err(format!(
                 "runtime artifact exceeds the allowed unpacked size of {maximum_unpacked} bytes"
             ));
@@ -518,6 +524,11 @@ fn extract_archive(
 
         let destination = stage_root.join(&relative);
         if entry.is_dir() {
+            if declared_size != 0 {
+                return Err(format!(
+                    "runtime archive directory {name:?} declares non-zero content"
+                ));
+            }
             fs::create_dir_all(&destination)
                 .map_err(|err| format!("could not create {}: {err}", destination.display()))?;
             continue;
@@ -531,8 +542,14 @@ fn extract_archive(
             .create_new(true)
             .open(&destination)
             .map_err(|err| format!("could not create {}: {err}", destination.display()))?;
-        std::io::copy(&mut entry, &mut output)
-            .map_err(|err| format!("could not extract {}: {err}", destination.display()))?;
+        copy_archive_entry_bounded(
+            &mut entry,
+            &mut output,
+            &name,
+            declared_size,
+            &mut extracted_unpacked,
+            maximum_unpacked,
+        )?;
         output
             .sync_all()
             .map_err(|err| format!("could not finish {}: {err}", destination.display()))?;
@@ -558,13 +575,55 @@ fn extract_archive(
             artifact.entrypoint.display()
         ));
     }
-    if unpacked != artifact.unpacked_size_bytes {
+    if declared_unpacked != artifact.unpacked_size_bytes
+        || extracted_unpacked != artifact.unpacked_size_bytes
+    {
         return Err(format!(
-            "runtime artifact unpacked size mismatch: expected {} bytes, extracted {unpacked}",
-            artifact.unpacked_size_bytes
+            "runtime artifact unpacked size mismatch: expected {} bytes, declared {declared_unpacked}, extracted {extracted_unpacked}",
+            artifact.unpacked_size_bytes,
         ));
     }
     validate_extracted_manifest(artifact, stage_root)?;
+    Ok(())
+}
+
+fn copy_archive_entry_bounded(
+    mut reader: impl Read,
+    mut output: impl Write,
+    name: &str,
+    declared_size: u64,
+    extracted_total: &mut u64,
+    maximum_total: u64,
+) -> Result<(), String> {
+    let mut extracted_entry = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("could not read runtime archive entry {name:?}: {err}"))?;
+        if count == 0 {
+            break;
+        }
+        extracted_entry = extracted_entry
+            .checked_add(count as u64)
+            .ok_or_else(|| "runtime archive entry size overflowed".to_owned())?;
+        *extracted_total = extracted_total
+            .checked_add(count as u64)
+            .ok_or_else(|| "runtime artifact unpacked size overflowed".to_owned())?;
+        if extracted_entry > declared_size || *extracted_total > maximum_total {
+            return Err(format!(
+                "runtime archive entry {name:?} exceeds its declared or allowed unpacked size"
+            ));
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|err| format!("could not write runtime archive entry {name:?}: {err}"))?;
+    }
+    if extracted_entry != declared_size {
+        return Err(format!(
+            "runtime archive entry {name:?} size mismatch: declared {declared_size}, extracted {extracted_entry}"
+        ));
+    }
     Ok(())
 }
 
@@ -814,6 +873,9 @@ mod tests {
         let reserved_url = artifact("vosk", "windows", "x86_64", "cpu")
             .replace("github.com", "artifacts.example.invalid");
         assert!(RuntimeArtifactCatalog::parse(&catalog_json(&reserved_url)).is_err());
+        let loopback_url =
+            artifact("vosk", "windows", "x86_64", "cpu").replace("github.com", "127.1.2.3");
+        assert!(RuntimeArtifactCatalog::parse(&catalog_json(&loopback_url)).is_err());
         let query_url =
             artifact("vosk", "windows", "x86_64", "cpu").replace("vosk.zip", "vosk.zip?mutable=1");
         assert!(RuntimeArtifactCatalog::parse(&catalog_json(&query_url)).is_err());
@@ -878,6 +940,36 @@ mod tests {
         assert!(error.contains("deadline"));
         assert!(transaction_files(target.parent().unwrap(), "whisper_cpp").is_empty());
         fs::remove_dir_all(target.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn bounded_extraction_enforces_actual_entry_and_total_bytes() {
+        let mut total = 0;
+        let mut output = Vec::new();
+        let oversized_entry = copy_archive_entry_bounded(
+            Cursor::new(b"five!"),
+            &mut output,
+            "oversized",
+            4,
+            &mut total,
+            10,
+        )
+        .unwrap_err();
+        assert!(oversized_entry.contains("declared or allowed"));
+        assert!(output.is_empty());
+
+        let mut total = 0;
+        copy_archive_entry_bounded(Cursor::new(b"abc"), Vec::new(), "first", 3, &mut total, 4)
+            .unwrap();
+        let total_error =
+            copy_archive_entry_bounded(Cursor::new(b"de"), Vec::new(), "second", 2, &mut total, 4)
+                .unwrap_err();
+        assert!(total_error.contains("declared or allowed"));
+
+        let short =
+            copy_archive_entry_bounded(Cursor::new(b"abc"), Vec::new(), "short", 4, &mut 0, 10)
+                .unwrap_err();
+        assert!(short.contains("size mismatch"));
     }
 
     #[test]

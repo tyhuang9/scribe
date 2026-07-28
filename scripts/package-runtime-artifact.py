@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -51,6 +52,10 @@ def parse_args() -> argparse.Namespace:
 def validate_base_url(value: str) -> str:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
     if (
         parsed.scheme != "https"
         or not host
@@ -59,10 +64,15 @@ def validate_base_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
         or host == "localhost"
+        or host.endswith(".localhost")
+        or loopback
         or host.endswith(".invalid")
         or host.endswith(".test")
         or host.endswith(".example")
-        or host in {"example.com", "example.net", "example.org"}
+        or any(
+            host == reserved or host.endswith(f".{reserved}")
+            for reserved in ("example.com", "example.net", "example.org")
+        )
     ):
         raise ValueError("release base URL must be a real immutable HTTPS release directory")
     return value.rstrip("/")
@@ -70,7 +80,23 @@ def validate_base_url(value: str) -> str:
 
 def normalized_entrypoint(value: str) -> PurePosixPath:
     path = PurePosixPath(value)
-    if not value or "\\" in value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+    }
+    parts = value.split("/")
+    if (
+        not value
+        or "\\" in value
+        or path.is_absolute()
+        or any(
+            part in {"", ".", ".."}
+            or ":" in part
+            or part.endswith((" ", "."))
+            or any(ord(character) < 32 or ord(character) == 127 for character in part)
+            or part.split(".", 1)[0].upper() in reserved
+            for part in parts
+        )
+    ):
         raise ValueError("entrypoint must be a normalized relative POSIX path")
     return path
 
@@ -91,6 +117,10 @@ def runtime_files(root: Path) -> list[Path]:
                 raise ValueError("raw Python virtual environments are development-only")
             if not path.is_file():
                 raise ValueError(f"runtime contains a non-regular file: {path}")
+            try:
+                normalized_entrypoint(path.relative_to(root).as_posix())
+            except ValueError as error:
+                raise ValueError(f"runtime contains an unsafe portable path: {path}: {error}") from error
             files.append(path)
     files.sort(key=lambda path: path.relative_to(root).as_posix())
     if not files or len(files) > MAX_ENTRIES:
@@ -119,12 +149,9 @@ def validate_manifest(root: Path, args: argparse.Namespace, entrypoint: PurePosi
 
 def smoke_validate(root: Path, entrypoint: PurePosixPath) -> None:
     executable = root / Path(*entrypoint.parts)
-    command = [str(executable), "--help"]
-    if os.name == "nt" and executable.suffix.lower() in {".bat", ".cmd"}:
-        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(executable), "--help"]
     try:
         result = subprocess.run(
-            command,
+            [str(executable), "--help"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -234,6 +261,8 @@ def main() -> int:
         raise ValueError("runtime artifacts must be packaged and smoke-tested on their target OS and architecture")
     base_url = validate_base_url(args.release_base_url)
     entrypoint = normalized_entrypoint(args.entrypoint)
+    if args.os == "windows" and entrypoint.suffix.lower() != ".exe":
+        raise ValueError("Windows runtime entrypoints must be native .exe files")
     files = runtime_files(args.runtime_dir)
     if args.runtime_dir / Path(*entrypoint.parts) not in files:
         raise ValueError("entrypoint is not a regular file in the runtime directory")

@@ -143,10 +143,14 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
 fn validate_url(value: &str) -> Result<(), String> {
     let parsed = url::Url::parse(value).map_err(|err| format!("invalid URL: {err}"))?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
     let reserved = host == "localhost"
         || host.ends_with(".localhost")
-        || host == "127.0.0.1"
-        || host == "::1"
+        || loopback
         || host.ends_with(".invalid")
         || host.ends_with(".test")
         || host.ends_with(".example")

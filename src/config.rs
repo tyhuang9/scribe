@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -255,24 +259,27 @@ pub fn cache_dir() -> Result<PathBuf> {
 
 pub fn load_config() -> Result<(AppConfig, PathBuf)> {
     let path = config_file_path()?;
+    let lock = lock_config_path(&path, Duration::from_secs(10))?;
+    if let Some(mut config) = recover_config_file(&path)? {
+        normalize_config(&mut config);
+        return Ok((config, path));
+    }
     if !path.exists() {
         if let Ok(legacy_path) = legacy_config_file_path()
             && legacy_path.exists()
         {
             let mut config = read_config_file(&legacy_path)?;
             normalize_config(&mut config);
-            save_config(&config)?;
+            save_config_file_locked(&path, &config, &lock)?;
             return Ok((config, path));
         }
 
         let config = AppConfig::default();
-        save_config(&config)?;
+        save_config_file_locked(&path, &config, &lock)?;
         return Ok((config, path));
     }
 
-    let mut config = read_config_file(&path)?;
-    normalize_config(&mut config);
-    Ok((config, path))
+    read_config_file(&path).map(|config| (config, path))
 }
 
 fn legacy_config_file_path() -> Result<PathBuf> {
@@ -286,15 +293,274 @@ fn read_config_file(path: &PathBuf) -> Result<AppConfig> {
         .with_context(|| format!("failed to parse config {}", path.display()))
 }
 
-pub fn save_config(config: &AppConfig) -> Result<()> {
+pub(crate) fn save_config_merging_managed_runtimes(config: &AppConfig) -> Result<AppConfig> {
+    save_config_with_runtime_update(config, None)
+}
+
+pub(crate) fn save_config_with_runtime_update(
+    config: &AppConfig,
+    runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
+) -> Result<AppConfig> {
     let path = config_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    save_config_with_runtime_update_at(&path, config, runtime_update)
+}
+
+fn save_config_with_runtime_update_at(
+    path: &Path,
+    config: &AppConfig,
+    runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
+) -> Result<AppConfig> {
+    let lock = lock_config_path(path, Duration::from_secs(10))?;
+    let persisted = recover_config_file(path)?.unwrap_or_default();
+    let mut merged = config.clone();
+    merged.managed_runtimes = persisted.managed_runtimes;
+    if let Some((runtime_id, install)) = runtime_update {
+        match install {
+            Some(install) => {
+                merged
+                    .managed_runtimes
+                    .insert(runtime_id.to_owned(), install);
+            }
+            None => {
+                merged.managed_runtimes.remove(runtime_id);
+            }
+        }
+    }
+    normalize_config(&mut merged);
+    save_config_file_locked(path, &merged, &lock)?;
+    Ok(merged)
+}
+
+#[derive(Debug)]
+struct ConfigFileLock {
+    _file: File,
+}
+
+fn lock_config_path(path: &Path, timeout: Duration) -> Result<ConfigFileLock> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let lock_path = config_sibling_path(path, "lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open config lock {}", lock_path.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ConfigFileLock { _file: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(anyhow!(
+                    "another Scribe process is saving the configuration"
+                ));
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(anyhow!("failed to lock {}: {err}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn recover_config_file(path: &Path) -> Result<Option<AppConfig>> {
+    let backup = config_sibling_path(path, "backup");
+    let mut temporary_paths = config_temporary_paths(path)?;
+    temporary_paths.sort_by_key(|candidate| {
+        (
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit('-').next())
+                .and_then(|value| value.parse::<u128>().ok())
+                .unwrap_or_default(),
+            candidate.clone(),
+        )
+    });
+    let current = read_valid_config(path);
+    if let Some(config) = current {
+        let _ = fs::remove_file(&backup);
+        for temporary in temporary_paths {
+            let _ = fs::remove_file(temporary);
+        }
+        let _ = sync_config_directory(path);
+        return Ok(Some(config));
     }
 
-    let content = serde_json::to_string_pretty(config)?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    if let Some(config) = read_valid_config(&backup) {
+        if path.exists() {
+            preserve_invalid_config(path)?;
+        }
+        fs::rename(&backup, path).with_context(|| {
+            format!(
+                "failed to restore config {} from {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        for temporary in temporary_paths {
+            let _ = fs::remove_file(temporary);
+        }
+        let _ = sync_config_directory(path);
+        return Ok(Some(config));
+    }
+
+    let valid_temporary = temporary_paths.iter().rev().find_map(|candidate| {
+        read_valid_config(candidate).map(|config| (candidate.clone(), config))
+    });
+    if let Some((temporary, config)) = valid_temporary {
+        if path.exists() {
+            preserve_invalid_config(path)?;
+        }
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to recover config {} from {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        for candidate in temporary_paths {
+            if candidate != temporary {
+                let _ = fs::remove_file(candidate);
+            }
+        }
+        let _ = sync_config_directory(path);
+        return Ok(Some(config));
+    }
+
+    if path.exists() {
+        read_config_file(&path.to_path_buf()).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn save_config_file_locked(path: &Path, config: &AppConfig, _lock: &ConfigFileLock) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let content = serde_json::to_vec_pretty(config)?;
+    let temporary = unique_config_temporary_path(path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(&content)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to finish {}", temporary.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+
+    let backup = config_sibling_path(path, "backup");
+    let _ = fs::remove_file(&backup);
+    let had_previous = path.exists();
+    if had_previous {
+        fs::rename(path, &backup).with_context(|| {
+            format!(
+                "failed to preserve config {} as {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&temporary, path) {
+        if had_previous && fs::rename(&backup, path).is_ok() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return Err(err).with_context(|| format!("failed to publish config {}", path.display()));
+    }
+
+    // The new path is the commit point. Cleanup failures leave recoverable state.
+    let _ = sync_config_directory(path);
+    let _ = fs::remove_file(&backup);
+    let _ = sync_config_directory(path);
+    Ok(())
+}
+
+fn read_valid_config(path: &Path) -> Option<AppConfig> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+fn config_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    path.with_file_name(format!(".{name}.{suffix}"))
+}
+
+fn unique_config_temporary_path(path: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    config_sibling_path(path, &format!("tmp-{}-{nonce:020}", std::process::id()))
+}
+
+fn preserve_invalid_config(path: &Path) -> Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let corrupt = config_sibling_path(path, &format!("corrupt-{}-{nonce:020}", std::process::id()));
+    fs::rename(path, &corrupt).with_context(|| {
+        format!(
+            "failed to preserve invalid config {} as {}",
+            path.display(),
+            corrupt.display()
+        )
+    })
+}
+
+fn config_temporary_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let Some(parent) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let prefix = format!(".{name}.tmp-");
+    Ok(fs::read_dir(parent)
+        .with_context(|| format!("failed to inspect config directory {}", parent.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn sync_config_directory(path: &Path) -> Result<()> {
+    File::open(path.parent().expect("config path has parent"))?
+        .sync_all()
+        .context("failed to sync config directory")
+}
+
+#[cfg(not(unix))]
+fn sync_config_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -736,6 +1002,155 @@ fn first_non_empty_path(paths: impl IntoIterator<Item = Option<PathBuf>>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "scribe-config-integrity-{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("config.json")
+    }
+
+    fn write_config_candidate(path: &Path, config: &AppConfig) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(config).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_recovery_handles_each_publication_phase() {
+        for phase in [
+            "before_backup",
+            "after_backup",
+            "after_publish",
+            "truncated_temp",
+            "invalid_current",
+        ] {
+            let path = config_test_path(phase);
+            let root = path.parent().unwrap();
+            let backup = config_sibling_path(&path, "backup");
+            let temporary = unique_config_temporary_path(&path);
+            let old = AppConfig {
+                hotkey: "Ctrl+Alt+1".to_owned(),
+                ..AppConfig::default()
+            };
+            let new = AppConfig {
+                hotkey: "Ctrl+Alt+2".to_owned(),
+                ..AppConfig::default()
+            };
+            match phase {
+                "before_backup" => {
+                    write_config_candidate(&path, &old);
+                    write_config_candidate(&temporary, &new);
+                }
+                "after_backup" => {
+                    write_config_candidate(&backup, &old);
+                    write_config_candidate(&temporary, &new);
+                }
+                "after_publish" => {
+                    write_config_candidate(&backup, &old);
+                    write_config_candidate(&path, &new);
+                }
+                "truncated_temp" => {
+                    write_config_candidate(&backup, &old);
+                    fs::write(&temporary, b"{").unwrap();
+                }
+                "invalid_current" => {
+                    fs::create_dir_all(root).unwrap();
+                    fs::write(&path, b"{").unwrap();
+                    write_config_candidate(&backup, &old);
+                    write_config_candidate(&temporary, &new);
+                }
+                _ => unreachable!(),
+            }
+
+            let recovered = recover_config_file(&path).unwrap().unwrap();
+
+            let expected = if phase == "after_publish" { &new } else { &old };
+            assert_eq!(recovered.hotkey, expected.hotkey);
+            assert_eq!(read_config_file(&path).unwrap().hotkey, expected.hotkey);
+            assert!(!backup.exists());
+            assert!(config_temporary_paths(&path).unwrap().is_empty());
+            assert_eq!(
+                fs::read_dir(root)
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+                    .count(),
+                usize::from(phase == "invalid_current")
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn merged_config_save_preserves_other_process_runtime_records() {
+        let path = config_test_path("merge-runtimes");
+        let root = path.parent().unwrap();
+        let mut first = AppConfig::default();
+        first.managed_runtimes.insert(
+            "vosk".to_owned(),
+            ManagedRuntimeInstall::new(PathBuf::from("vosk/bin/runtime")),
+        );
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        save_config_file_locked(&path, &first, &lock).unwrap();
+        drop(lock);
+
+        let stale_second = AppConfig::default();
+        let sherpa = ManagedRuntimeInstall::new(PathBuf::from("sherpa/bin/runtime"));
+        let merged = save_config_with_runtime_update_at(
+            &path,
+            &stale_second,
+            Some(("sherpa_onnx", Some(sherpa.clone()))),
+        )
+        .unwrap();
+
+        assert!(merged.managed_runtimes.contains_key("vosk"));
+        assert_eq!(merged.managed_runtimes.get("sherpa_onnx"), Some(&sherpa));
+        let persisted = read_config_file(&path).unwrap();
+        assert_eq!(persisted.managed_runtimes, merged.managed_runtimes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_chooses_newest_valid_temp_across_process_ids() {
+        let path = config_test_path("temp-order");
+        let root = path.parent().unwrap();
+        let older = config_sibling_path(&path, "tmp-99999-00000000000000000001");
+        let newer = config_sibling_path(&path, "tmp-1-00000000000000000002");
+        let old = AppConfig {
+            hotkey: "older".to_owned(),
+            ..AppConfig::default()
+        };
+        let new = AppConfig {
+            hotkey: "newer".to_owned(),
+            ..AppConfig::default()
+        };
+        write_config_candidate(&older, &old);
+        write_config_candidate(&newer, &new);
+
+        let recovered = recover_config_file(&path).unwrap().unwrap();
+
+        assert_eq!(recovered.hotkey, "newer");
+        assert!(config_temporary_paths(&path).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_lock_is_exclusive_and_released() {
+        let path = config_test_path("lock");
+        let root = path.parent().unwrap();
+        let first = lock_config_path(&path, Duration::from_millis(10)).unwrap();
+        let error = lock_config_path(&path, Duration::from_millis(10)).unwrap_err();
+        assert!(error.to_string().contains("another Scribe process"));
+        drop(first);
+        lock_config_path(&path, Duration::from_millis(10)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn old_config_without_playground_order_normalizes() {

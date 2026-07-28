@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 import platform
 from pathlib import Path, PurePath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.runtime = self.root / "runtime"
-        self.entrypoint_relative = "bin/scribe-vosk.cmd" if sys.platform == "win32" else "bin/scribe-vosk"
+        self.entrypoint_relative = "bin/scribe-vosk.exe" if sys.platform == "win32" else "bin/scribe-vosk"
         self.entrypoint = self.runtime / Path(*PurePath(self.entrypoint_relative).parts)
         self.write_entrypoint(self.entrypoint)
         self.write_manifest("vosk")
@@ -53,7 +55,10 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
     def write_entrypoint(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
-            path.write_text("@exit /b 0\r\n", encoding="utf-8")
+            comspec = os.environ.get("COMSPEC")
+            if not comspec or not Path(comspec).is_file():
+                self.skipTest("COMSPEC is unavailable for the native Windows fixture")
+            shutil.copy2(comspec, path)
         else:
             path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             path.chmod(0o755)
@@ -131,7 +136,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
     def test_parallel_packagers_emit_fragments_then_merge_deterministically(self):
         second_runtime = self.root / "runtime-sherpa"
         second_relative = (
-            "bin/scribe-sherpa-onnx.cmd" if sys.platform == "win32" else "bin/scribe-sherpa-onnx"
+            "bin/scribe-sherpa-onnx.exe" if sys.platform == "win32" else "bin/scribe-sherpa-onnx"
         )
         self.write_entrypoint(second_runtime / Path(*PurePath(second_relative).parts))
         (second_runtime / "runtime-manifest.json").write_text(
@@ -169,6 +174,26 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             [artifact["runtime_id"] for artifact in catalog["artifacts"]],
             ["sherpa_onnx", "vosk"],
         )
+
+    def test_rejects_nonportable_member_paths_and_reserved_host_variants(self):
+        unsafe = self.runtime / "bin" / "NUL.txt"
+        unsafe.write_text("reserved", encoding="utf-8")
+        invalid_path = subprocess.run(self.command(), capture_output=True, text=True, check=False)
+        self.assertNotEqual(invalid_path.returncode, 0)
+        self.assertIn("unsafe portable path", invalid_path.stderr)
+        unsafe.unlink()
+
+        for host in [
+            "https://cdn.example.com/releases",
+            "https://runtime.dev.localhost/releases",
+            "https://127.1.2.3/releases",
+            "https://[::1]/releases",
+        ]:
+            result = subprocess.run(
+                self.command(host), capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0, host)
+            self.assertIn("real immutable HTTPS", result.stderr)
 
 
 if __name__ == "__main__":

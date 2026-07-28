@@ -223,7 +223,7 @@ enum AppEvent {
     RuntimeInstallDone {
         runtime_id: String,
         backend: String,
-        replacement: RuntimeReplacement,
+        replacement: Box<RuntimeReplacement>,
         install: config::ManagedRuntimeInstall,
     },
     RuntimeInstallFailed {
@@ -367,6 +367,7 @@ struct RuntimeReplacement {
     target_root: PathBuf,
     backup_root: Option<PathBuf>,
     runtime_id: String,
+    persistence_install: Option<Option<config::ManagedRuntimeInstall>>,
     _lock: RuntimeInstallLock,
 }
 
@@ -415,6 +416,7 @@ fn apply_runtime_record(
         .insert(runtime_id.to_owned(), install)
 }
 
+#[cfg(test)]
 fn rollback_runtime_record(
     config: &mut AppConfig,
     runtime_id: &str,
@@ -437,19 +439,20 @@ fn persist_runtime_install(
     runtime_id: &str,
     install: config::ManagedRuntimeInstall,
     job: RuntimeInstallJob,
-    persist: impl FnOnce(&AppConfig) -> Result<(), String>,
+    persist: impl FnOnce(&AppConfig) -> Result<AppConfig, String>,
 ) -> RuntimePersistenceTransition {
-    let previous_runtime = apply_runtime_record(config, runtime_id, install);
-    config::normalize_config(config);
-    match persist(config) {
-        Ok(()) => RuntimePersistenceTransition::Persisted(job),
-        Err(err) => {
-            rollback_runtime_record(config, runtime_id, previous_runtime);
-            RuntimePersistenceTransition::Failed {
-                job,
-                message: format!("Failed to persist the installed runtime: {err}"),
-            }
+    let mut candidate = config.clone();
+    apply_runtime_record(&mut candidate, runtime_id, install);
+    config::normalize_config(&mut candidate);
+    match persist(&candidate) {
+        Ok(committed) => {
+            *config = committed;
+            RuntimePersistenceTransition::Persisted(job)
         }
+        Err(err) => RuntimePersistenceTransition::Failed {
+            job,
+            message: format!("Failed to persist the installed runtime: {err}"),
+        },
     }
 }
 
@@ -691,6 +694,7 @@ fn model_download_uses_runtime(
     })
 }
 
+#[cfg(test)]
 fn apply_runtime_uninstall_result(
     config: &mut AppConfig,
     runtime_id: &str,
@@ -1103,9 +1107,7 @@ impl LocalTranscriberApp {
             ),
         };
         config::normalize_config(&mut config);
-        if config_path.is_some()
-            && let Err(message) = recover_managed_runtime_transactions(&mut config)
-        {
+        if let Err(message) = recover_managed_runtime_transactions(&mut config) {
             status_message = format!("{status_message} Runtime recovery warning: {message}");
         }
         cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
@@ -1189,8 +1191,9 @@ impl LocalTranscriberApp {
             self.refresh_playground_cards_from_config();
             return;
         }
-        match config::save_config(&self.config) {
-            Ok(()) => {
+        match config::save_config_merging_managed_runtimes(&self.config) {
+            Ok(committed) => {
+                self.config = committed;
                 if self.config_path.is_none() {
                     self.config_path = config::config_file_path().ok();
                 }
@@ -1687,10 +1690,7 @@ impl LocalTranscriberApp {
                 } => {
                     let new_runtime = install;
                     let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
-                    let previous_runtime = self.config.managed_runtimes.get(&runtime_id).cloned();
-                    if let Err(message) =
-                        replacement.prepare_persistence(previous_runtime.as_ref(), &new_runtime)
-                    {
+                    if let Err(message) = replacement.prepare_persistence(Some(&new_runtime)) {
                         let rollback_message = match replacement.rollback() {
                             Ok(()) => message,
                             Err(rollback_err) => format!("{message}. {rollback_err}"),
@@ -1716,7 +1716,13 @@ impl LocalTranscriberApp {
                         &runtime_id,
                         new_runtime.clone(),
                         job,
-                        |config| config::save_config(config).map_err(|err| err.to_string()),
+                        |candidate| {
+                            config::save_config_with_runtime_update(
+                                candidate,
+                                Some((&runtime_id, Some(new_runtime.clone()))),
+                            )
+                            .map_err(|err| err.to_string())
+                        },
                     ) {
                         RuntimePersistenceTransition::Persisted(job) => job,
                         RuntimePersistenceTransition::Failed { job, message } => {
@@ -2399,7 +2405,7 @@ impl LocalTranscriberApp {
                     let _ = tx.send(AppEvent::RuntimeInstallDone {
                         runtime_id,
                         backend,
-                        replacement,
+                        replacement: Box::new(replacement),
                         install,
                     });
                 }
@@ -2444,9 +2450,8 @@ impl LocalTranscriberApp {
             return;
         };
 
-        let removal = uninstall_runtime_files(&self.config, provider.runtime_id);
         let removed_files =
-            match apply_runtime_uninstall_result(&mut self.config, provider.runtime_id, removal) {
+            match uninstall_runtime_transaction(&mut self.config, provider.runtime_id) {
                 Ok(removed_files) => removed_files,
                 Err(message) => {
                     self.status = TranscriptionStatus::Error;
@@ -2455,7 +2460,9 @@ impl LocalTranscriberApp {
                     return;
                 }
             };
-        self.save_config();
+        if self.config_path.is_none() {
+            self.config_path = config::config_file_path().ok();
+        }
         self.refresh_playground_runtime_statuses();
         self.status = TranscriptionStatus::Idle;
         self.status_message = match removed_files {
@@ -5570,27 +5577,77 @@ fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<boo
     Ok(removed_any)
 }
 
-fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool, String> {
-    let Some(install) = config.managed_runtimes.get(runtime_id) else {
-        return Ok(false);
-    };
-    let Some(target) =
-        runtime_uninstall_target(&config::runtime_storage_dir(), runtime_id, &install.path)
-    else {
-        return Ok(false);
-    };
-    let _lock = acquire_runtime_install_lock(runtime_id, &target)?;
-    if !target.exists() {
-        return Ok(false);
-    }
+fn uninstall_runtime_transaction(config: &mut AppConfig, runtime_id: &str) -> Result<bool, String> {
+    let target_root = config::runtime_storage_dir().join(runtime_id);
+    uninstall_runtime_transaction_at(config, runtime_id, &target_root, |candidate| {
+        config::save_config_with_runtime_update(candidate, Some((runtime_id, None)))
+            .map_err(|err| err.to_string())
+    })
+}
 
-    let result = if target.is_dir() {
-        fs::remove_dir_all(&target)
+fn uninstall_runtime_transaction_at(
+    config: &mut AppConfig,
+    runtime_id: &str,
+    target_root: &Path,
+    persist: impl FnOnce(&AppConfig) -> Result<AppConfig, String>,
+) -> Result<bool, String> {
+    let install_lock = acquire_runtime_install_lock(runtime_id, target_root)?;
+    let backup_root = runtime_transaction_path(target_root, "backup");
+    let removed_files = target_root.exists();
+    let previous = if removed_files {
+        let mut journal = RuntimeTransactionJournal {
+            version: 1,
+            runtime_id: runtime_id.to_owned(),
+            phase: RuntimeTransactionPhase::Prepared,
+            had_previous_runtime: true,
+            previous_install: install_lock.previous_install.clone(),
+            new_install: None,
+        };
+        write_runtime_journal(target_root, &journal)?;
+        if let Err(err) = fs::rename(target_root, &backup_root) {
+            let _ = remove_runtime_journal(target_root);
+            return Err(format!(
+                "Could not stage runtime removal {}: {err}",
+                target_root.display()
+            ));
+        }
+        journal.phase = RuntimeTransactionPhase::BackedUp;
+        if let Err(message) = write_runtime_journal(target_root, &journal) {
+            if fs::rename(&backup_root, target_root).is_ok() {
+                let _ = remove_runtime_journal(target_root);
+            }
+            return Err(format!("Could not record runtime removal: {message}"));
+        }
+        Some(backup_root)
     } else {
-        fs::remove_file(&target)
+        None
     };
-    result.map_err(|err| format!("Could not delete {}: {err}", target.display()))?;
-    Ok(true)
+    let mut removal = RuntimeReplacement {
+        installed_path: target_root.to_path_buf(),
+        target_root: target_root.to_path_buf(),
+        backup_root: previous,
+        runtime_id: runtime_id.to_owned(),
+        persistence_install: None,
+        _lock: install_lock,
+    };
+    if let Err(message) = removal.prepare_persistence(None) {
+        let rollback_error = removal.rollback().err();
+        return Err(message + rollback_error.as_deref().unwrap_or_default());
+    }
+    match persist(config) {
+        Ok(committed) => {
+            *config = committed;
+            let _ = removal.commit();
+            Ok(removed_files)
+        }
+        Err(err) => {
+            let message = format!("Failed to persist runtime removal: {err}");
+            match removal.rollback() {
+                Ok(()) => Err(message),
+                Err(rollback) => Err(format!("{message}. {rollback}")),
+            }
+        }
+    }
 }
 
 fn build_development_runtime_package(
@@ -5837,10 +5894,13 @@ fn activate_staged_runtime(
     };
     journal.phase = RuntimeTransactionPhase::BackedUp;
     if let Err(message) = write_runtime_journal(target_root, &journal) {
-        if let Some(backup_root) = previous.as_ref() {
-            let _ = fs::rename(backup_root, target_root);
+        let restored = previous
+            .as_ref()
+            .is_none_or(|backup_root| fs::rename(backup_root, target_root).is_ok());
+        if restored {
+            let _ = remove_path_if_exists(stage_root);
+            let _ = remove_runtime_journal(target_root);
         }
-        let _ = remove_runtime_journal(target_root);
         return Err(format!(
             "Could not record the prepared runtime transaction: {message}"
         ));
@@ -5853,7 +5913,9 @@ fn activate_staged_runtime(
                 .map(|restore_err| format!(" Previous runtime restore also failed: {restore_err}"))
         });
         let _ = remove_path_if_exists(stage_root);
-        let _ = remove_runtime_journal(target_root);
+        if restore_error.is_none() {
+            let _ = remove_runtime_journal(target_root);
+        }
         return Err(format!(
             "Could not activate staged runtime {}: {err}",
             stage_root.display()
@@ -5861,11 +5923,14 @@ fn activate_staged_runtime(
     }
     journal.phase = RuntimeTransactionPhase::Activated;
     if let Err(message) = write_runtime_journal(target_root, &journal) {
-        let _ = remove_path_if_exists(target_root);
-        if let Some(backup_root) = previous.as_ref() {
-            let _ = fs::rename(backup_root, target_root);
+        let removed_new = remove_path_if_exists(target_root).is_ok();
+        let restored = removed_new
+            && previous
+                .as_ref()
+                .is_none_or(|backup_root| fs::rename(backup_root, target_root).is_ok());
+        if restored {
+            let _ = remove_runtime_journal(target_root);
         }
-        let _ = remove_runtime_journal(target_root);
         return Err(format!(
             "Could not record the activated runtime transaction: {message}"
         ));
@@ -5876,6 +5941,7 @@ fn activate_staged_runtime(
         target_root: target_root.to_path_buf(),
         backup_root: previous,
         runtime_id: runtime_id.to_owned(),
+        persistence_install: None,
         _lock: install_lock,
     })
 }
@@ -5883,8 +5949,7 @@ fn activate_staged_runtime(
 impl RuntimeReplacement {
     fn prepare_persistence(
         &mut self,
-        previous_install: Option<&config::ManagedRuntimeInstall>,
-        new_install: &config::ManagedRuntimeInstall,
+        new_install: Option<&config::ManagedRuntimeInstall>,
     ) -> Result<(), String> {
         write_runtime_journal(
             &self.target_root,
@@ -5893,18 +5958,51 @@ impl RuntimeReplacement {
                 runtime_id: self.runtime_id.clone(),
                 phase: RuntimeTransactionPhase::AwaitingPersistence,
                 had_previous_runtime: self.backup_root.is_some(),
-                previous_install: previous_install.cloned(),
-                new_install: Some(new_install.clone()),
+                previous_install: self._lock.previous_install.clone(),
+                new_install: new_install.cloned(),
             },
-        )
+        )?;
+        self.persistence_install = Some(new_install.cloned());
+        Ok(())
     }
 
     fn commit(self) -> Result<(), String> {
-        remove_runtime_journal(&self.target_root)?;
+        match self.persistence_install.as_ref() {
+            Some(Some(install)) => {
+                if install.path != self.installed_path
+                    || !installed_runtime_executable_usable(&self.runtime_id, &install.path)
+                {
+                    return Err(format!(
+                        "Refusing to finalize an invalid {} runtime at {}.",
+                        self.runtime_id,
+                        install.path.display()
+                    ));
+                }
+            }
+            Some(None) if self.target_root.exists() => {
+                return Err(format!(
+                    "Refusing to finalize {} runtime removal while {} still exists.",
+                    self.runtime_id,
+                    self.target_root.display()
+                ));
+            }
+            None if !installed_runtime_executable_usable(
+                &self.runtime_id,
+                &self.installed_path,
+            ) =>
+            {
+                return Err(format!(
+                    "Refusing to finalize an invalid {} runtime at {}.",
+                    self.runtime_id,
+                    self.installed_path.display()
+                ));
+            }
+            _ => {}
+        }
         if let Some(backup_root) = self.backup_root {
             remove_path_if_exists(&backup_root)?;
         }
-        Ok(())
+        remove_runtime_journal(&self.target_root)
     }
 
     fn rollback(self) -> Result<(), String> {
@@ -5922,6 +6020,15 @@ fn acquire_runtime_install_lock(
     runtime_id: &str,
     target_root: &Path,
 ) -> Result<RuntimeInstallLock, String> {
+    #[cfg(test)]
+    if !target_root.starts_with(config::runtime_storage_dir()) {
+        return acquire_runtime_install_lock_with_timeout(
+            runtime_id,
+            target_root,
+            None,
+            Duration::from_secs(10),
+        );
+    }
     let file = lock_runtime_install(target_root, Duration::from_secs(10), runtime_id)?;
     let (mut persisted, _) = config::load_config()
         .map_err(|err| format!("Could not load configuration for runtime recovery: {err}"))?;
@@ -6027,8 +6134,17 @@ fn recover_runtime_transaction(
         match journal.phase {
             RuntimeTransactionPhase::AwaitingPersistence => {
                 if current_install == journal.new_install.as_ref() {
-                    remove_runtime_journal(target_root)?;
+                    if !runtime_committed_state_is_valid(
+                        runtime_id,
+                        target_root,
+                        journal.new_install.as_ref(),
+                    ) {
+                        return Err(format!(
+                            "Committed {runtime_id} runtime files do not match the transaction journal."
+                        ));
+                    }
                     remove_path_if_exists(&backup_root)?;
+                    remove_runtime_journal(target_root)?;
                 } else if current_install == journal.previous_install.as_ref() {
                     recover_runtime_rollback(runtime_id, target_root, &backup_root, &journal)?;
                     remove_runtime_journal(target_root)?;
@@ -6067,17 +6183,30 @@ fn recover_runtime_transaction(
             }
         }
     } else if backup_root.exists() {
-        if target_root.exists() {
-            remove_path_if_exists(&backup_root)?;
-        } else {
-            restore_runtime_backup(runtime_id, target_root, Some(&backup_root), current_install)?;
-        }
+        return Err(format!(
+            "Found an unjournaled {runtime_id} runtime backup at {}; preserving it for manual recovery.",
+            backup_root.display()
+        ));
     }
     remove_path_if_exists(&runtime_transaction_path(target_root, "installing"))?;
     remove_path_if_exists(
         &runtime_transaction_path(target_root, "download").with_extension("zip.partial"),
     )?;
     Ok(())
+}
+
+fn runtime_committed_state_is_valid(
+    runtime_id: &str,
+    target_root: &Path,
+    install: Option<&config::ManagedRuntimeInstall>,
+) -> bool {
+    match install {
+        Some(install) => {
+            install.path.starts_with(target_root)
+                && installed_runtime_executable_usable(runtime_id, &install.path)
+        }
+        None => !target_root.exists(),
+    }
 }
 
 fn recover_runtime_rollback(
@@ -6183,15 +6312,35 @@ fn read_runtime_journal(
     target_root: &Path,
 ) -> Result<Option<RuntimeTransactionJournal>, String> {
     let next = runtime_transaction_path(target_root, "transaction.next");
-    let path = if next.exists() {
-        next
-    } else {
-        runtime_transaction_path(target_root, "transaction")
-    };
-    if !path.exists() {
+    let current = runtime_transaction_path(target_root, "transaction");
+    if next.exists() {
+        match parse_runtime_journal(&next) {
+            Ok(journal) => {
+                validate_runtime_journal_identity(runtime_id, &next, &journal)?;
+                return Ok(Some(journal));
+            }
+            Err(next_error) if current.exists() => {
+                return parse_runtime_journal(&current)
+                    .and_then(|journal| {
+                        validate_runtime_journal_identity(runtime_id, &current, &journal)?;
+                        Ok(journal)
+                    })
+                    .map(Some)
+                    .map_err(|current_error| format!("{next_error} {current_error}"));
+            }
+            Err(next_error) => return Err(next_error),
+        }
+    }
+    if !current.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path).map_err(|err| {
+    let journal = parse_runtime_journal(&current)?;
+    validate_runtime_journal_identity(runtime_id, &current, &journal)?;
+    Ok(Some(journal))
+}
+
+fn parse_runtime_journal(path: &Path) -> Result<RuntimeTransactionJournal, String> {
+    let contents = fs::read_to_string(path).map_err(|err| {
         format!(
             "Could not read runtime transaction {}: {err}",
             path.display()
@@ -6199,13 +6348,21 @@ fn read_runtime_journal(
     })?;
     let journal: RuntimeTransactionJournal = serde_json::from_str(&contents)
         .map_err(|err| format!("Runtime transaction {} is invalid: {err}", path.display()))?;
+    Ok(journal)
+}
+
+fn validate_runtime_journal_identity(
+    runtime_id: &str,
+    path: &Path,
+    journal: &RuntimeTransactionJournal,
+) -> Result<(), String> {
     if journal.version != 1 || journal.runtime_id != runtime_id {
         return Err(format!(
             "Runtime transaction {} has an unexpected identity.",
             path.display()
         ));
     }
-    Ok(Some(journal))
+    Ok(())
 }
 
 fn write_runtime_journal(
@@ -6475,6 +6632,7 @@ fn copy_dir_all(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn runtime_uninstall_target(
     storage_dir: &Path,
     runtime_id: &str,
@@ -9185,6 +9343,64 @@ mod layout_tests {
     }
 
     #[test]
+    fn runtime_journal_falls_back_only_for_truncated_next_file() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-journal-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        fs::create_dir_all(&root).unwrap();
+        let current = RuntimeTransactionJournal {
+            version: 1,
+            runtime_id: "vosk".to_owned(),
+            phase: RuntimeTransactionPhase::Prepared,
+            had_previous_runtime: false,
+            previous_install: None,
+            new_install: None,
+        };
+        write_runtime_journal(&target, &current).unwrap();
+        let next = runtime_transaction_path(&target, "transaction.next");
+        fs::write(&next, b"{").unwrap();
+
+        assert_eq!(
+            read_runtime_journal("vosk", &target).unwrap(),
+            Some(current.clone())
+        );
+
+        let wrong_identity = RuntimeTransactionJournal {
+            runtime_id: "sherpa_onnx".to_owned(),
+            ..current
+        };
+        fs::write(&next, serde_json::to_vec(&wrong_identity).unwrap()).unwrap();
+        let error = read_runtime_journal("vosk", &target).unwrap_err();
+        assert!(error.contains("unexpected identity"));
+        assert!(next.exists());
+        assert!(runtime_transaction_path(&target, "transaction").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_recovery_preserves_unjournaled_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-unjournaled-backup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let backup = runtime_transaction_path(&target, "backup");
+        write_vosk_runtime(&target);
+        write_vosk_runtime(&backup);
+
+        let error = recover_runtime_transaction("vosk", &target, None).unwrap_err();
+
+        assert!(error.contains("unjournaled"));
+        assert!(target.exists());
+        assert!(backup.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_recovery_cleans_stale_stage_and_partial_download() {
         let root = std::env::temp_dir().join(format!(
             "scribe-runtime-stale-cleanup-{}",
@@ -9227,6 +9443,43 @@ mod layout_tests {
         drop(first);
         acquire_runtime_install_lock_with_timeout("vosk", &target, None, Duration::from_millis(10))
             .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_journal_uses_the_record_loaded_under_the_runtime_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-locked-record-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let executable = write_vosk_runtime(&target);
+        let mut locked_previous = config::ManagedRuntimeInstall::new(executable.clone());
+        locked_previous.source = Some("fresh-persisted".to_owned());
+        let lock = acquire_runtime_install_lock_with_timeout(
+            "vosk",
+            &target,
+            Some(&locked_previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut replacement = RuntimeReplacement {
+            installed_path: executable.clone(),
+            target_root: target.clone(),
+            backup_root: None,
+            runtime_id: "vosk".to_owned(),
+            persistence_install: None,
+            _lock: lock,
+        };
+        let mut new = config::ManagedRuntimeInstall::new(executable);
+        new.source = Some("new".to_owned());
+
+        replacement.prepare_persistence(Some(&new)).unwrap();
+
+        let journal = read_runtime_journal("vosk", &target).unwrap().unwrap();
+        assert_eq!(journal.previous_install, Some(locked_previous));
+        replacement.rollback().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9460,7 +9713,7 @@ mod layout_tests {
             persist_runtime_install(&mut config, "vosk", replacement.clone(), job, |saved| {
                 assert!(runtime_metadata_matches(saved, "vosk", &replacement));
                 persistence_attempted.set(true);
-                Ok(())
+                Ok(saved.clone())
             });
         assert!(persistence_attempted.get());
         assert!(matches!(
@@ -9495,6 +9748,76 @@ mod layout_tests {
             Ok(false)
         );
         assert!(!config.managed_runtimes.contains_key("vosk"));
+    }
+
+    #[test]
+    fn runtime_uninstall_holds_lock_and_rolls_files_back_when_persistence_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-uninstall-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let executable = write_vosk_runtime(&target);
+        let mut config = AppConfig::default();
+        let install = config::ManagedRuntimeInstall::new(executable.clone());
+        config
+            .managed_runtimes
+            .insert("vosk".to_owned(), install.clone());
+
+        let error = uninstall_runtime_transaction_at(&mut config, "vosk", &target, |_| {
+            let lock_error = acquire_runtime_install_lock_with_timeout(
+                "vosk",
+                &target,
+                None,
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+            assert!(lock_error.contains("Another Scribe process"));
+            Err("disk full".to_owned())
+        })
+        .unwrap_err();
+
+        assert!(error.contains("disk full"));
+        assert!(executable.exists());
+        assert_eq!(config.managed_runtimes.get("vosk"), Some(&install));
+        assert!(!runtime_transaction_exists_for_test(&target));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_uninstall_commits_files_and_merged_metadata_together() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-uninstall-commit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let executable = write_vosk_runtime(&target);
+        let mut config = AppConfig::default();
+        config.managed_runtimes.insert(
+            "vosk".to_owned(),
+            config::ManagedRuntimeInstall::new(executable),
+        );
+        config.managed_runtimes.insert(
+            "sherpa_onnx".to_owned(),
+            config::ManagedRuntimeInstall::new(PathBuf::from("sherpa/bin/runtime")),
+        );
+
+        let removed = uninstall_runtime_transaction_at(&mut config, "vosk", &target, |candidate| {
+            let mut committed = candidate.clone();
+            committed.managed_runtimes.remove("vosk");
+            Ok(committed)
+        })
+        .unwrap();
+
+        assert!(removed);
+        assert!(!target.exists());
+        assert!(!config.managed_runtimes.contains_key("vosk"));
+        assert!(config.managed_runtimes.contains_key("sherpa_onnx"));
+        assert!(!runtime_transaction_exists_for_test(&target));
+        assert!(!runtime_transaction_path(&target, "backup").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
