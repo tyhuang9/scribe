@@ -3,14 +3,43 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-WHISPER_DIR="${WHISPER_DIR:-$(cd "$SCRIBE_DIR/../whisper.cpp" && pwd)}"
-WHISPER_BUILD_DIR="${WHISPER_BUILD_DIR:-${BUILD_DIR:-$WHISPER_DIR/build-dl-ollama}}"
+WHISPER_DIR="${WHISPER_DIR:-$SCRIBE_DIR/../whisper.cpp}"
+WHISPER_BUILD_DIR_INPUT="${WHISPER_BUILD_DIR:-${BUILD_DIR:-}}"
+WHISPER_BUILD_DIR="${WHISPER_BUILD_DIR_INPUT:-$WHISPER_DIR/build-dl-ollama}"
 PROFILE="${SCRIBE_PROFILE:-debug}"
 DEST="${SCRIBE_RUNTIME_DEST:-$SCRIBE_DIR/target/$PROFILE/runtimes/whisper_cpp}"
 INCLUDE_CUDA="${SCRIBE_BUNDLE_CUDA:-0}"
 BUILD_RUNTIME="${SCRIBE_BUILD_WHISPER_RUNTIME:-auto}"
 OLLAMA_LIB_DIR="${OLLAMA_LIB_DIR:-/usr/local/lib/ollama}"
-PLATFORM="$(uname -s)-$(uname -m)"
+case "$(uname -s)" in
+  Linux) PLATFORM_OS=linux ;;
+  Darwin) PLATFORM_OS=macos ;;
+  *) echo "Unsupported release OS: $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) PLATFORM_ARCH=x86_64 ;;
+  arm64|aarch64) PLATFORM_ARCH=aarch64 ;;
+  *) echo "Unsupported release architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+PLATFORM="$PLATFORM_OS-$PLATFORM_ARCH"
+SOURCE_VERSION="${WHISPER_SOURCE_VERSION:-}"
+SOURCE_COMMIT="${WHISPER_SOURCE_COMMIT:-}"
+
+if [[ "$PROFILE" == "release" ]]; then
+  if [[ -z "$WHISPER_BUILD_DIR_INPUT" || -z "$SOURCE_VERSION" || -z "$SOURCE_COMMIT" ]]; then
+    echo "Release bundling requires WHISPER_BUILD_DIR, WHISPER_SOURCE_VERSION, and WHISPER_SOURCE_COMMIT from a pinned CI build." >&2
+    exit 1
+  fi
+  if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40,64}$ ]]; then
+    echo "WHISPER_SOURCE_COMMIT must be a lowercase 40-64 character commit digest." >&2
+    exit 1
+  fi
+  if [[ ! "$SOURCE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]]; then
+    echo "WHISPER_SOURCE_VERSION is not a safe immutable version identifier." >&2
+    exit 1
+  fi
+  BUILD_RUNTIME=0
+fi
 
 usage() {
   cat <<'USAGE'
@@ -154,18 +183,28 @@ if truthy "$INCLUDE_CUDA"; then
   cuda_bundled=true
 fi
 
-cat > "$DEST/runtime-manifest.json" <<MANIFEST
-{
-  "manifest_version": 1,
-  "runtime_id": "whisper_cpp",
-  "backend": "whisper.cpp",
-  "source_bin": "$SOURCE_BIN",
-  "whisper_cli": "bin/whisper-cli",
-  "platform": "$PLATFORM",
-  "cuda_bundled": $cuda_bundled,
-  "cuda_source": "$cuda_source"
+device=cpu
+if [[ "$cuda_bundled" == "true" ]]; then
+  device=gpu
+fi
+python3 - "$DEST/runtime-manifest.json" "$SOURCE_VERSION" "$SOURCE_COMMIT" "$PLATFORM" "$device" <<'PY'
+import json, pathlib, sys
+path, version, commit, platform, device = sys.argv[1:]
+manifest = {
+    "manifest_version": 1,
+    "runtime_id": "whisper_cpp",
+    "backend": "whisper.cpp",
+    "version": version,
+    "source_commit": commit,
+    "whisper_cli": "bin/whisper-cli",
+    "entrypoint": "bin/whisper-cli",
+    "platform": platform,
+    "device": device,
+    "cuda_bundled": device == "gpu",
+    "portable": True,
 }
-MANIFEST
+pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
 
 echo "Bundled whisper.cpp runtime: $DEST"
 if [[ "$cuda_bundled" == "true" ]]; then

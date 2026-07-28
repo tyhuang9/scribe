@@ -159,11 +159,11 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp, faster-whisper, Vosk, sherpa-onnx, Moonshine, or Parakeet model, select the active model, or uninstall models to free storage. One click prepares a missing shared backend runtime from the packaged/staged runtime included with the build, persists it, then downloads the requested model. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. Use the default-collapsed `Runtime maintenance` section only for explicit updates or removal.
+Open `Models` to install a local model, select it, or uninstall it. The standard release always includes the small CPU whisper.cpp runtime. Other backends and GPU packs are optional downloads only when the build embeds trusted release metadata for the current OS, architecture, and device pack. If a release has no matching metadata, the action is disabled; Scribe does not guess a URL or trust mutable remote metadata.
 
 Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
 
-Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, `SCRIBE_VOSK_CLI`, `SCRIBE_SHERPA_ONNX_CLI`, `SCRIBE_MOONSHINE_CLI`, or `SCRIBE_PARAKEET_CLI` as fallback runtime paths.
+Runtime discovery is internal. CPU mode uses bundled whisper.cpp CPU. Auto uses an installed GPU pack only when its version, SHA-256, platform, and device metadata exactly match the catalog embedded in this build, then falls back to bundled CPU. Prefer GPU requires a verified GPU pack (or explicit GPU product) and never silently selects the CPU bundle. Unix development builds can still use `SCRIBE_*_CLI` paths as development fallbacks.
 
 When running a debug build from a source checkout on Unix, the Models page can
 also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
@@ -183,22 +183,26 @@ scripts/bundle-whisper-runtime.sh
 ```
 
 By default this copies the CPU-capable whisper.cpp sidecar into
-`target/debug/runtimes/whisper_cpp`. For a release build, run:
+`target/debug/runtimes/whisper_cpp`. Release CI first packages each optional portable runtime and builds a catalog containing its real immutable URL, SHA-256, and exact sizes:
 
 ```bash
-scripts/build-release-bundle.sh
+python3 scripts/package-runtime-artifact.py \
+  --runtime-dir /ci/portable/vosk --runtime-id vosk --version 0.3.45 \
+  --os linux --arch x86_64 --device cpu --entrypoint bin/scribe-vosk \
+  --release-base-url "$RELEASE_BASE_URL" \
+  --catalog-version 1.0.0 --output-dir dist/artifacts \
+  --catalog dist/runtime-artifacts.json
+
+WHISPER_BUILD_DIR=/ci/whisper-build \
+WHISPER_SOURCE_VERSION=1.7.6 \
+WHISPER_SOURCE_COMMIT=<lowercase-full-commit> \
+SCRIBE_RUNTIME_ARTIFACT_CATALOG=dist/runtime-artifacts.json \
+scripts/build-release-bundle.sh --mode standard
 ```
 
-The release bundle places whisper.cpp files under
-`target/release/runtimes/whisper_cpp` and stages Python sidecars under
-`target/release/runtimes/faster_whisper`, `target/release/runtimes/vosk`,
-`target/release/runtimes/sherpa_onnx`, `target/release/runtimes/moonshine`,
-and `target/release/runtimes/parakeet`. These are the same locations the app
-checks before falling back to user-managed runtime paths. Set
-`SCRIBE_SKIP_FASTER_WHISPER=1`, `SCRIBE_SKIP_VOSK=1`,
-`SCRIBE_SKIP_SHERPA_ONNX=1`, `SCRIBE_SKIP_MOONSHINE=1`, or
-`SCRIBE_SKIP_PARAKEET=1` to omit a generated Python sidecar from a release
-bundle.
+`RELEASE_BASE_URL` must be the real immutable release directory; the packager rejects reserved placeholder hosts. `build.rs` embeds `SCRIBE_RUNTIME_ARTIFACT_CATALOG` before Cargo compiles the app. The standard product contains only bundled CPU whisper.cpp. `--mode offline-cpu` is a separate all-CPU product requiring relocatable platform-CI runtime inputs. `--mode gpu` is a separate whisper.cpp GPU product. `scripts/build-release-bundle.ps1` provides the equivalent Windows flow with `-WhisperBuildDir`, pinned provenance, and `-CatalogPath`. An explicit `SCRIBE_ALLOW_EMPTY_RUNTIME_CATALOG=1` or `-AllowEmptyCatalog` produces a CPU-only release; it is not the hybrid release default.
+
+`package-runtime-artifact.py` rejects links, raw virtual environments, missing/mismatched manifests, duplicate target tuples, cross-target packaging, and oversized packages. It runs the target-native entrypoint with `--help` before publishing. Release CI must upload the generated ZIPs at the catalog URLs; this repository does not claim that artifact hosting already exists.
 
 To stage only the faster-whisper runtime during development:
 
@@ -206,8 +210,8 @@ To stage only the faster-whisper runtime during development:
 scripts/bundle-faster-whisper-runtime.sh
 ```
 
-The faster-whisper runtime is a generated Python virtual environment with a
-small Scribe runner. Python package versions are pinned by
+The development faster-whisper runtime is a generated Python virtual environment with a
+small Scribe runner and is not a portable production artifact. Python package versions are pinned by
 `scripts/runtime-dependencies.env`; release builds can override those pins with
 the matching `SCRIBE_*_VERSION` environment variables. The runner downloads
 CTranslate2 faster-whisper model directories through faster-whisper's Hugging
@@ -219,7 +223,7 @@ To check whether pinned runtime dependencies have newer PyPI releases:
 scripts/check-runtime-dependency-updates.py
 ```
 
-The app itself does not install arbitrary latest PyPI packages on user machines.
+Production Python runtimes must instead be built as relocatable standalone packages by target-platform CI. The app itself does not install arbitrary latest PyPI packages on user machines.
 It asks users to update managed runtimes when installed runtime metadata is older
 than the version recorded in Scribe's runtime catalog.
 

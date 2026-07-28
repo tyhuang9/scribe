@@ -3,7 +3,7 @@
 ## Runtime Portability
 
 - Make cross-platform runtime tests and CI green for all six local backends, including packaged sidecar discovery, managed runtime install/update/uninstall, and the Unix-only source-checkout fallback.
-- Produce Windows release runtime packages for whisper.cpp and the faster-whisper, Vosk, and sherpa-onnx-family Python sidecars, with documented staging and smoke tests.
+- Run the portable packager in Windows/Linux/macOS CI and publish its immutable ZIPs/catalog at a real HTTPS release origin; no hosted artifact records are checked in yet.
 
 ## MVP Hardening
 
@@ -14,12 +14,11 @@
 
 ## STT Backends
 
-- Verify staged whisper.cpp runtime sidecars in cross-platform CI; installer/package integration and release artifact publishing remain incomplete.
+- Verify pinned whisper.cpp sidecars and portable manifest validation in cross-platform CI; artifact hosting remains incomplete.
 - Harden Vosk release packaging with recorded model/runtime SHA256 checksums.
 - Add checksum verification for sherpa-onnx, Moonshine, and Parakeet model archives and runtime packages.
 - Add sherpa-onnx streaming runtime support once `SttBackend` exposes partial transcription events.
-- Add production packaging hardening for generated faster-whisper Python sidecars.
-- Add production packaging hardening for generated sherpa-onnx-family Python sidecars.
+- Build relocatable faster-whisper and sherpa-family standalone packages in platform CI; raw generated virtual environments remain development-only.
 - Add a native whisper.cpp library backend to avoid child-process overhead.
 - Expand backend capability flags for timestamps, language selection, and streaming options.
 
@@ -32,7 +31,7 @@
 
 ## Model Management
 
-- Add production runtime package manifests and hosted downloads.
+- Publish production runtime archives and the release-generated trusted catalog from CI.
 - Add checksum verification for downloaded whisper.cpp models.
 - Add local model inventory scanning.
 - Add disk usage reporting.
