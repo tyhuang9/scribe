@@ -3323,7 +3323,8 @@ impl LocalTranscriberApp {
                             (
                                 selector_scroll.id,
                                 selector_scroll.content_size.y,
-                                selector_scroll.inner_rect.height(),
+                                selector_scroll.inner_rect,
+                                selector_scroll.state.offset.y,
                             ),
                         );
                     });
@@ -4007,12 +4008,7 @@ where
     T: Clone + PartialEq,
 {
     let selected = current == &value;
-    let response = ui.add(
-        Button::new(label)
-            .selected(selected)
-            .wrap(true)
-            .min_size(Vec2::new(ui.available_width().max(1.0), 36.0)),
-    );
+    let response = ui.add(egui::SelectableLabel::new(selected, label));
     if response.clicked() {
         *current = value;
     }
@@ -6949,12 +6945,44 @@ mod layout_tests {
                     "selector footer {name} is not visible at {width}x{height}: {bounds:?}"
                 );
             }
-            let (_, selector_content_height, selector_viewport_height) =
+            let (_, selector_content_height, selector_viewport, initial_scroll_offset) =
                 selector_scroll_metrics(&ctx);
             assert!(
-                selector_content_height > selector_viewport_height,
+                selector_content_height > selector_viewport.height(),
                 "selector should scroll its runnable model list at {width}x{height}"
             );
+            assert_eq!(
+                initial_scroll_offset, 0.0,
+                "selector should start at the first runnable model"
+            );
+            let last_model_name = crate::models::default_model_catalog()
+                .into_iter()
+                .last()
+                .expect("model catalog should not be empty")
+                .name;
+            let _scrolled = render_accessible_app_tab_frame(
+                &ctx,
+                &mut app,
+                width,
+                height,
+                vec![
+                    egui::Event::PointerMoved(selector_viewport.center()),
+                    egui::Event::Scroll(egui::vec2(0.0, -10_000.0)),
+                ],
+            );
+            let (_, _, _, scrolled_offset) = selector_scroll_metrics(&ctx);
+            assert!(
+                scrolled_offset > 0.0,
+                "selector did not respond to a downward scroll at {width}x{height}"
+            );
+            let max_scroll_offset = selector_content_height - selector_viewport.height();
+            assert!(
+                scrolled_offset >= max_scroll_offset - 1.0,
+                "selector did not reach its final model at {width}x{height}: offset={scrolled_offset}, max={max_scroll_offset}"
+            );
+            let scrolled_output =
+                render_accessible_app_tab_frame(&ctx, &mut app, width, height, Vec::new());
+            assert_target_text_is_not_horizontally_clipped(&scrolled_output, &last_model_name);
             assert!(
                 output
                     .platform_output
@@ -6998,16 +7026,14 @@ mod layout_tests {
                 configure_stitch_style(&ctx);
                 ctx.set_visuals(stitch_visuals(ThemeMode::Light));
 
+                let alternate_option = format!("Alternate test option for {control_name}");
                 let options = if selected_wraps {
-                    vec![
-                        option_sentinel.clone(),
-                        format!("secondary-{}", long_layout_sentinel("popup-option")),
-                    ]
+                    vec![option_sentinel.clone(), alternate_option.clone()]
                 } else {
                     vec![
                         "All backends".to_owned(),
                         option_sentinel.clone(),
-                        format!("secondary-{}", long_layout_sentinel("popup-option")),
+                        alternate_option.clone(),
                     ]
                 };
                 let mut selected = if selected_wraps {
@@ -7022,7 +7048,7 @@ mod layout_tests {
                     selected_wraps,
                     &mut selected,
                     &options,
-                    egui::vec2(width, height),
+                    dynamic_combo_raw_input(egui::vec2(width, height), Vec::new()),
                 );
                 let combo_id = test_dynamic_combo_id(&ctx);
                 ctx.memory_mut(|memory| {
@@ -7035,7 +7061,7 @@ mod layout_tests {
                     selected_wraps,
                     &mut selected,
                     &options,
-                    egui::vec2(width, height),
+                    dynamic_combo_raw_input(egui::vec2(width, height), Vec::new()),
                 );
                 let opened = render_test_dynamic_combo_popup(
                     &ctx,
@@ -7044,14 +7070,17 @@ mod layout_tests {
                     selected_wraps,
                     &mut selected,
                     &options,
-                    egui::vec2(width, height),
+                    dynamic_combo_raw_input(egui::vec2(width, height), Vec::new()),
                 );
 
                 assert_no_visible_horizontal_overflow(&opened, width, Tab::Settings);
                 assert_focusable_bounds_within_viewport(&opened, width, Tab::Settings);
                 assert_accessible_text_contains(&opened, &option_sentinel);
-                let option_bounds =
-                    accessible_bounds(&opened, egui::accesskit::Role::Button, &option_sentinel);
+                let option_bounds = accessible_bounds(
+                    &opened,
+                    egui::accesskit::Role::ToggleButton,
+                    &option_sentinel,
+                );
                 assert_accesskit_rect_within_viewport(
                     option_bounds,
                     width,
@@ -7063,6 +7092,39 @@ mod layout_tests {
                     "{control_name} option lost its minimum target height: {option_bounds:?}"
                 );
                 assert_target_text_is_not_horizontally_clipped(&opened, &option_sentinel);
+
+                let selected_before_activation = selected.clone();
+                assert_accessible_selected_option(&opened, &selected_before_activation);
+                let alternate_id = accesskit_control_id(&opened, &alternate_option);
+                let _activated = render_test_dynamic_combo_popup(
+                    &ctx,
+                    id_source,
+                    control_name,
+                    selected_wraps,
+                    &mut selected,
+                    &options,
+                    dynamic_combo_raw_input(
+                        egui::vec2(width, height),
+                        vec![egui::Event::AccessKitActionRequest(
+                            egui::accesskit::ActionRequest {
+                                action: egui::accesskit::Action::Default,
+                                target: alternate_id,
+                                data: None,
+                            },
+                        )],
+                    ),
+                );
+                assert_eq!(selected, alternate_option);
+                let after_activation = render_test_dynamic_combo_popup(
+                    &ctx,
+                    id_source,
+                    control_name,
+                    selected_wraps,
+                    &mut selected,
+                    &options,
+                    dynamic_combo_raw_input(egui::vec2(width, height), Vec::new()),
+                );
+                assert_accessible_selected_option(&after_activation, &selected);
             }
         }
     }
@@ -8272,6 +8334,32 @@ mod layout_tests {
         );
     }
 
+    fn assert_accessible_selected_option(output: &egui::FullOutput, expected: &str) {
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("AccessKit should be enabled for option assertions");
+        let node = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::ToggleButton && node.name() == Some(expected)
+            })
+            .map(|(_, node)| node)
+            .unwrap_or_else(|| panic!("missing selectable option {expected:?}"));
+        assert_eq!(
+            node.checked(),
+            Some(egui::accesskit::Checked::True),
+            "current option {expected:?} must expose selected state"
+        );
+        assert_eq!(
+            node.default_action_verb(),
+            Some(egui::accesskit::DefaultActionVerb::Click),
+            "current option {expected:?} must remain activatable"
+        );
+    }
+
     fn assert_target_text_is_not_horizontally_clipped(output: &egui::FullOutput, expected: &str) {
         let target_shapes = output
             .shapes
@@ -8355,9 +8443,11 @@ mod layout_tests {
         .unwrap_or_else(|| panic!("missing page scroll metrics for {title}"))
     }
 
-    fn selector_scroll_metrics(ctx: &egui::Context) -> (egui::Id, f32, f32) {
+    fn selector_scroll_metrics(ctx: &egui::Context) -> (egui::Id, f32, egui::Rect, f32) {
         ctx.data_mut(|data| {
-            data.get_temp::<(egui::Id, f32, f32)>(egui::Id::new("test-selector-scroll-metrics"))
+            data.get_temp::<(egui::Id, f32, egui::Rect, f32)>(egui::Id::new(
+                "test-selector-scroll-metrics",
+            ))
         })
         .expect("missing selector scroll metrics")
     }
@@ -8369,58 +8459,60 @@ mod layout_tests {
         selected_wraps: bool,
         selected: &mut String,
         options: &[String],
-        viewport_size: Vec2,
+        raw_input: egui::RawInput,
     ) -> egui::FullOutput {
-        ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport_size)),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let label = ui.label(control_name);
-                    let response = if selected_wraps {
-                        ComboBox::from_id_source(id_source)
-                            .selected_text(selected.as_str())
-                            .wrap(true)
-                            .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
-                            .show_ui(ui, |ui| {
-                                prepare_dynamic_combo_popup(ui);
-                                for option in options {
-                                    selectable_dynamic_combo_value(
-                                        ui,
-                                        selected,
-                                        option.clone(),
-                                        option,
-                                    );
-                                }
-                            })
-                            .response
-                    } else {
-                        ComboBox::from_id_source(id_source)
-                            .selected_text(selected.as_str())
-                            .width(150.0)
-                            .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
-                            .show_ui(ui, |ui| {
-                                prepare_dynamic_combo_popup(ui);
-                                for option in options {
-                                    selectable_dynamic_combo_value(
-                                        ui,
-                                        selected,
-                                        option.clone(),
-                                        option,
-                                    );
-                                }
-                            })
-                            .response
-                    };
-                    set_control_accessibility(ui, &response, label.id, control_name);
-                    ctx.data_mut(|data| {
-                        data.insert_temp(egui::Id::new("test-dynamic-combo-id"), response.id);
-                    });
+        ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let label = ui.label(control_name);
+                let response = if selected_wraps {
+                    ComboBox::from_id_source(id_source)
+                        .selected_text(selected.as_str())
+                        .wrap(true)
+                        .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
+                        .show_ui(ui, |ui| {
+                            prepare_dynamic_combo_popup(ui);
+                            for option in options {
+                                selectable_dynamic_combo_value(
+                                    ui,
+                                    selected,
+                                    option.clone(),
+                                    option,
+                                );
+                            }
+                        })
+                        .response
+                } else {
+                    ComboBox::from_id_source(id_source)
+                        .selected_text(selected.as_str())
+                        .width(150.0)
+                        .height(DYNAMIC_COMBO_POPUP_MAX_HEIGHT)
+                        .show_ui(ui, |ui| {
+                            prepare_dynamic_combo_popup(ui);
+                            for option in options {
+                                selectable_dynamic_combo_value(
+                                    ui,
+                                    selected,
+                                    option.clone(),
+                                    option,
+                                );
+                            }
+                        })
+                        .response
+                };
+                set_control_accessibility(ui, &response, label.id, control_name);
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("test-dynamic-combo-id"), response.id);
                 });
-            },
-        )
+            });
+        })
+    }
+
+    fn dynamic_combo_raw_input(viewport_size: Vec2, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport_size)),
+            events,
+            ..Default::default()
+        }
     }
 
     fn test_dynamic_combo_id(ctx: &egui::Context) -> egui::Id {
