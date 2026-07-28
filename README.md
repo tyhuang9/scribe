@@ -193,16 +193,20 @@ python3 scripts/package-runtime-artifact.py \
   --catalog-version 1.0.0 --output-dir dist/artifacts \
   --catalog dist/runtime-artifacts.json
 
+# Run once after all platform packagers finish writing parallel-safe fragments.
+python3 scripts/package-runtime-artifact.py --merge-catalog-fragments \
+  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
+
 WHISPER_BUILD_DIR=/ci/whisper-build \
 WHISPER_SOURCE_VERSION=1.7.6 \
-WHISPER_SOURCE_COMMIT=<lowercase-full-commit> \
+WHISPER_SOURCE_COMMIT="${PINNED_WHISPER_COMMIT:?set PINNED_WHISPER_COMMIT to the audited lowercase full commit}" \
 SCRIBE_RUNTIME_ARTIFACT_CATALOG=dist/runtime-artifacts.json \
 scripts/build-release-bundle.sh --mode standard
 ```
 
 `RELEASE_BASE_URL` must be the real immutable release directory; the packager rejects reserved placeholder hosts. `build.rs` embeds `SCRIBE_RUNTIME_ARTIFACT_CATALOG` before Cargo compiles the app. The standard product contains only bundled CPU whisper.cpp. `--mode offline-cpu` is a separate all-CPU product requiring relocatable platform-CI runtime inputs. `--mode gpu` is a separate whisper.cpp GPU product. `scripts/build-release-bundle.ps1` provides the equivalent Windows flow with `-WhisperBuildDir`, pinned provenance, and `-CatalogPath`. An explicit `SCRIBE_ALLOW_EMPTY_RUNTIME_CATALOG=1` or `-AllowEmptyCatalog` produces a CPU-only release; it is not the hybrid release default.
 
-`package-runtime-artifact.py` rejects links, raw virtual environments, missing/mismatched manifests, duplicate target tuples, cross-target packaging, and oversized packages. It runs the target-native entrypoint with `--help` before publishing. Release CI must upload the generated ZIPs at the catalog URLs; this repository does not claim that artifact hosting already exists.
+`package-runtime-artifact.py` rejects links, raw virtual environments, missing/mismatched manifests, duplicate target tuples, cross-target packaging, and oversized packages. It runs the target-native entrypoint with `--help` before publishing. Parallel packaging jobs write independent catalog fragments; the explicit merge step rejects duplicate tuples and publishes one deterministic catalog. Release CI must upload the generated ZIPs at the catalog URLs; this repository does not claim that artifact hosting already exists.
 
 To stage only the faster-whisper runtime during development:
 

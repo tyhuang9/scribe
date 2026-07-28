@@ -3,7 +3,7 @@
 import hashlib
 import json
 import platform
-from pathlib import Path
+from pathlib import Path, PurePath
 import subprocess
 import sys
 import tempfile
@@ -26,10 +26,9 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.runtime = self.root / "runtime"
-        self.entrypoint = self.runtime / "bin" / "scribe-vosk"
-        self.entrypoint.parent.mkdir(parents=True)
-        self.entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        self.entrypoint.chmod(0o755)
+        self.entrypoint_relative = "bin/scribe-vosk.cmd" if sys.platform == "win32" else "bin/scribe-vosk"
+        self.entrypoint = self.runtime / Path(*PurePath(self.entrypoint_relative).parts)
+        self.write_entrypoint(self.entrypoint)
         self.write_manifest("vosk")
 
     def tearDown(self):
@@ -44,12 +43,20 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
                     "version": "0.3.45",
                     "platform": f"{NATIVE_OS}-{NATIVE_ARCH}",
                     "device": "cpu",
-                    "entrypoint": "bin/scribe-vosk",
+                    "entrypoint": self.entrypoint_relative,
                     "portable": True,
                 }
             ),
             encoding="utf-8",
         )
+
+    def write_entrypoint(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            path.write_text("@exit /b 0\r\n", encoding="utf-8")
+        else:
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
 
     def command(self, base_url="https://downloads.acme.dev/releases/scribe/1.0.0"):
         return [
@@ -68,7 +75,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             "--device",
             "cpu",
             "--entrypoint",
-            "bin/scribe-vosk",
+            self.entrypoint_relative,
             "--release-base-url",
             base_url,
             "--catalog-version",
@@ -79,10 +86,23 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             str(self.root / "catalog.json"),
         ]
 
+    def merge_command(self):
+        return [
+            sys.executable,
+            str(SCRIPT),
+            "--merge-catalog-fragments",
+            "--catalog-version",
+            "1.0.0",
+            "--catalog",
+            str(self.root / "catalog.json"),
+        ]
+
     def test_packages_smoke_validated_runtime_with_real_sizes_and_checksum(self):
         result = subprocess.run(self.command(), capture_output=True, text=True, check=False)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        merge = subprocess.run(self.merge_command(), capture_output=True, text=True, check=False)
+        self.assertEqual(merge.returncode, 0, merge.stderr)
         output = json.loads(result.stdout)
         archive = Path(output["archive"])
         catalog = json.loads((self.root / "catalog.json").read_text(encoding="utf-8"))
@@ -91,7 +111,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         self.assertEqual(artifact["unpacked_size_bytes"], sum(path.stat().st_size for path in self.runtime.rglob("*") if path.is_file()))
         self.assertEqual(artifact["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
         with zipfile.ZipFile(archive) as packaged:
-            self.assertEqual(sorted(packaged.namelist()), ["bin/scribe-vosk", "runtime-manifest.json"])
+            self.assertEqual(sorted(packaged.namelist()), [self.entrypoint_relative, "runtime-manifest.json"])
 
     def test_rejects_placeholder_host_and_manifest_mismatch(self):
         placeholder = subprocess.run(
@@ -107,6 +127,48 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         mismatch = subprocess.run(self.command(), capture_output=True, text=True, check=False)
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("manifest does not match", mismatch.stderr)
+
+    def test_parallel_packagers_emit_fragments_then_merge_deterministically(self):
+        second_runtime = self.root / "runtime-sherpa"
+        second_relative = (
+            "bin/scribe-sherpa-onnx.cmd" if sys.platform == "win32" else "bin/scribe-sherpa-onnx"
+        )
+        self.write_entrypoint(second_runtime / Path(*PurePath(second_relative).parts))
+        (second_runtime / "runtime-manifest.json").write_text(
+            json.dumps(
+                {
+                    "manifest_version": 1,
+                    "runtime_id": "sherpa_onnx",
+                    "version": "0.3.45",
+                    "platform": f"{NATIVE_OS}-{NATIVE_ARCH}",
+                    "device": "cpu",
+                    "entrypoint": second_relative,
+                    "portable": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        second_command = self.command()
+        second_command[second_command.index("--runtime-dir") + 1] = str(second_runtime)
+        second_command[second_command.index("--runtime-id") + 1] = "sherpa_onnx"
+        second_command[second_command.index("--entrypoint") + 1] = second_relative
+
+        first = subprocess.Popen(self.command(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        second = subprocess.Popen(second_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first_stdout, first_stderr = first.communicate()
+        second_stdout, second_stderr = second.communicate()
+        self.assertEqual(first.returncode, 0, first_stderr)
+        self.assertEqual(second.returncode, 0, second_stderr)
+        self.assertTrue(first_stdout)
+        self.assertTrue(second_stdout)
+
+        merge = subprocess.run(self.merge_command(), capture_output=True, text=True, check=False)
+        self.assertEqual(merge.returncode, 0, merge.stderr)
+        catalog = json.loads((self.root / "catalog.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [artifact["runtime_id"] for artifact in catalog["artifacts"]],
+            ["sherpa_onnx", "vosk"],
+        )
 
 
 if __name__ == "__main__":

@@ -35,6 +35,9 @@ if ($CatalogPath) {
     }
     $env:SCRIBE_RUNTIME_ARTIFACT_CATALOG = $resolvedCatalog
 }
+elseif ($AllowEmptyCatalog) {
+    Remove-Item Env:SCRIBE_RUNTIME_ARTIFACT_CATALOG -ErrorAction SilentlyContinue
+}
 elseif (-not $AllowEmptyCatalog) {
     throw 'Provide -CatalogPath from package-runtime-artifact.py, or explicitly use -AllowEmptyCatalog for a CPU-only release.'
 }

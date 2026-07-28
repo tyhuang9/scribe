@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -13,7 +15,7 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
     Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
@@ -359,11 +361,39 @@ enum RuntimeJobIntent {
     Maintenance,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct RuntimeReplacement {
     installed_path: PathBuf,
     target_root: PathBuf,
     backup_root: Option<PathBuf>,
+    runtime_id: String,
+    _lock: RuntimeInstallLock,
+}
+
+#[derive(Debug)]
+struct RuntimeInstallLock {
+    _file: File,
+    previous_install: Option<config::ManagedRuntimeInstall>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeTransactionPhase {
+    Prepared,
+    BackedUp,
+    Activated,
+    AwaitingPersistence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeTransactionJournal {
+    version: u32,
+    runtime_id: String,
+    phase: RuntimeTransactionPhase,
+    had_previous_runtime: bool,
+    previous_install: Option<config::ManagedRuntimeInstall>,
+    new_install: Option<config::ManagedRuntimeInstall>,
 }
 
 fn queue_runtime_model(model_ids: &mut Vec<String>, model_id: String) -> bool {
@@ -1064,7 +1094,7 @@ impl LocalTranscriberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_stitch_style(&cc.egui_ctx);
 
-        let (mut config, config_path, status_message) = match config::load_config() {
+        let (mut config, config_path, mut status_message) = match config::load_config() {
             Ok((config, path)) => (config, Some(path), "Ready".to_owned()),
             Err(err) => (
                 AppConfig::default(),
@@ -1073,6 +1103,11 @@ impl LocalTranscriberApp {
             ),
         };
         config::normalize_config(&mut config);
+        if config_path.is_some()
+            && let Err(message) = recover_managed_runtime_transactions(&mut config)
+        {
+            status_message = format!("{status_message} Runtime recovery warning: {message}");
+        }
         cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
             config.theme_mode,
             cc.integration_info.system_theme,
@@ -1647,11 +1682,35 @@ impl LocalTranscriberApp {
                 AppEvent::RuntimeInstallDone {
                     runtime_id,
                     backend,
-                    replacement,
+                    mut replacement,
                     install,
                 } => {
                     let new_runtime = install;
                     let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
+                    let previous_runtime = self.config.managed_runtimes.get(&runtime_id).cloned();
+                    if let Err(message) =
+                        replacement.prepare_persistence(previous_runtime.as_ref(), &new_runtime)
+                    {
+                        let rollback_message = match replacement.rollback() {
+                            Ok(()) => message,
+                            Err(rollback_err) => format!("{message}. {rollback_err}"),
+                        };
+                        for model_id in job.download_model_ids {
+                            self.model_downloads.insert(
+                                model_id,
+                                ModelInstallStatus::Error(rollback_message.clone()),
+                            );
+                        }
+                        for model_id in job.repair_model_ids {
+                            self.model_downloads.insert(
+                                model_id,
+                                ModelInstallStatus::RuntimeError(rollback_message.clone()),
+                            );
+                        }
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = rollback_message;
+                        continue;
+                    }
                     let job = match persist_runtime_install(
                         &mut self.config,
                         &runtime_id,
@@ -5435,6 +5494,7 @@ fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool,
     else {
         return Ok(false);
     };
+    let _lock = acquire_runtime_install_lock(runtime_id, &target)?;
     if !target.exists() {
         return Ok(false);
     }
@@ -5453,6 +5513,7 @@ fn build_development_runtime_package(
     backend: &str,
     package: DevelopmentRuntimePackage,
 ) -> Result<RuntimeReplacement, String> {
+    let install_lock = acquire_runtime_install_lock(runtime_id, &package.destination_root)?;
     let relative_executable = package
         .executable_path
         .strip_prefix(&package.destination_root)
@@ -5476,7 +5537,13 @@ fn build_development_runtime_package(
         let _ = remove_path_if_exists(&stage_root);
         return Err(message);
     }
-    activate_staged_runtime(&package.destination_root, &stage_root, &relative_executable)
+    activate_staged_runtime(
+        runtime_id,
+        &package.destination_root,
+        &stage_root,
+        &relative_executable,
+        install_lock,
+    )
 }
 
 fn build_development_runtime_into(
@@ -5530,6 +5597,7 @@ fn install_remote_runtime_artifact(
     artifact: &RuntimeArtifact,
 ) -> Result<RuntimeReplacement, String> {
     let target_root = config::runtime_storage_dir().join(runtime_id);
+    let install_lock = acquire_runtime_install_lock(runtime_id, &target_root)?;
     let staged = runtime_artifacts::download_and_stage(artifact, &target_root)?;
     if !installed_runtime_executable_usable(runtime_id, &staged.entrypoint) {
         let _ = remove_path_if_exists(&staged.root);
@@ -5542,7 +5610,13 @@ fn install_remote_runtime_artifact(
         let _ = remove_path_if_exists(&staged.root);
         return Err(message);
     }
-    activate_staged_runtime(&target_root, &staged.root, &artifact.entrypoint)
+    activate_staged_runtime(
+        runtime_id,
+        &target_root,
+        &staged.root,
+        &artifact.entrypoint,
+        install_lock,
+    )
 }
 
 fn smoke_validate_runtime(executable: &Path) -> Result<(), String> {
@@ -5615,6 +5689,7 @@ fn install_runtime_files_to(
         return Err("The managed runtime cannot be used as its own update source.".to_owned());
     }
 
+    let install_lock = acquire_runtime_install_lock(runtime_id, target_root)?;
     let stage_root = runtime_transaction_path(target_root, "installing");
     validate_runtime_copy_paths(&source_root, target_root, &stage_root)?;
     remove_path_if_exists(&stage_root)?;
@@ -5630,13 +5705,21 @@ fn install_runtime_files_to(
             staged_executable.display()
         ));
     }
-    activate_staged_runtime(target_root, &stage_root, &relative_executable)
+    activate_staged_runtime(
+        runtime_id,
+        target_root,
+        &stage_root,
+        &relative_executable,
+        install_lock,
+    )
 }
 
 fn activate_staged_runtime(
+    runtime_id: &str,
     target_root: &Path,
     stage_root: &Path,
     relative_executable: &Path,
+    install_lock: RuntimeInstallLock,
 ) -> Result<RuntimeReplacement, String> {
     let parent = target_root
         .parent()
@@ -5646,17 +5729,37 @@ fn activate_staged_runtime(
 
     let backup_root = runtime_transaction_path(target_root, "backup");
     remove_path_if_exists(&backup_root)?;
+    let mut journal = RuntimeTransactionJournal {
+        version: 1,
+        runtime_id: runtime_id.to_owned(),
+        phase: RuntimeTransactionPhase::Prepared,
+        had_previous_runtime: target_root.exists(),
+        previous_install: install_lock.previous_install.clone(),
+        new_install: None,
+    };
+    write_runtime_journal(target_root, &journal)?;
     let previous = if target_root.exists() {
-        fs::rename(target_root, &backup_root).map_err(|err| {
-            format!(
+        if let Err(err) = fs::rename(target_root, &backup_root) {
+            let _ = remove_runtime_journal(target_root);
+            return Err(format!(
                 "Could not preserve existing runtime {}: {err}",
                 target_root.display()
-            )
-        })?;
-        Some(backup_root)
+            ));
+        }
+        Some(backup_root.clone())
     } else {
         None
     };
+    journal.phase = RuntimeTransactionPhase::BackedUp;
+    if let Err(message) = write_runtime_journal(target_root, &journal) {
+        if let Some(backup_root) = previous.as_ref() {
+            let _ = fs::rename(backup_root, target_root);
+        }
+        let _ = remove_runtime_journal(target_root);
+        return Err(format!(
+            "Could not record the prepared runtime transaction: {message}"
+        ));
+    }
 
     if let Err(err) = fs::rename(stage_root, target_root) {
         let restore_error = previous.as_ref().and_then(|backup_root| {
@@ -5665,21 +5768,54 @@ fn activate_staged_runtime(
                 .map(|restore_err| format!(" Previous runtime restore also failed: {restore_err}"))
         });
         let _ = remove_path_if_exists(stage_root);
+        let _ = remove_runtime_journal(target_root);
         return Err(format!(
             "Could not activate staged runtime {}: {err}",
             stage_root.display()
         ) + restore_error.as_deref().unwrap_or_default());
+    }
+    journal.phase = RuntimeTransactionPhase::Activated;
+    if let Err(message) = write_runtime_journal(target_root, &journal) {
+        let _ = remove_path_if_exists(target_root);
+        if let Some(backup_root) = previous.as_ref() {
+            let _ = fs::rename(backup_root, target_root);
+        }
+        let _ = remove_runtime_journal(target_root);
+        return Err(format!(
+            "Could not record the activated runtime transaction: {message}"
+        ));
     }
 
     Ok(RuntimeReplacement {
         installed_path: target_root.join(relative_executable),
         target_root: target_root.to_path_buf(),
         backup_root: previous,
+        runtime_id: runtime_id.to_owned(),
+        _lock: install_lock,
     })
 }
 
 impl RuntimeReplacement {
+    fn prepare_persistence(
+        &mut self,
+        previous_install: Option<&config::ManagedRuntimeInstall>,
+        new_install: &config::ManagedRuntimeInstall,
+    ) -> Result<(), String> {
+        write_runtime_journal(
+            &self.target_root,
+            &RuntimeTransactionJournal {
+                version: 1,
+                runtime_id: self.runtime_id.clone(),
+                phase: RuntimeTransactionPhase::AwaitingPersistence,
+                had_previous_runtime: self.backup_root.is_some(),
+                previous_install: previous_install.cloned(),
+                new_install: Some(new_install.clone()),
+            },
+        )
+    }
+
     fn commit(self) -> Result<(), String> {
+        remove_runtime_journal(&self.target_root)?;
         if let Some(backup_root) = self.backup_root {
             remove_path_if_exists(&backup_root)?;
         }
@@ -5687,29 +5823,349 @@ impl RuntimeReplacement {
     }
 
     fn rollback(self) -> Result<(), String> {
-        remove_path_if_exists(&self.target_root)?;
-        if let Some(backup_root) = self.backup_root {
-            fs::rename(&backup_root, &self.target_root).map_err(|err| {
-                format!(
-                    "Could not restore previous runtime {}: {err}",
-                    self.target_root.display()
-                )
-            })?;
-        }
-        Ok(())
+        restore_runtime_backup(
+            &self.runtime_id,
+            &self.target_root,
+            self.backup_root.as_deref(),
+            self._lock.previous_install.as_ref(),
+        )?;
+        remove_runtime_journal(&self.target_root)
     }
 }
 
+fn acquire_runtime_install_lock(
+    runtime_id: &str,
+    target_root: &Path,
+) -> Result<RuntimeInstallLock, String> {
+    let file = lock_runtime_install(target_root, Duration::from_secs(10), runtime_id)?;
+    let (mut persisted, _) = config::load_config()
+        .map_err(|err| format!("Could not load configuration for runtime recovery: {err}"))?;
+    config::normalize_config(&mut persisted);
+    let current_install = persisted
+        .managed_runtimes
+        .get(runtime_id)
+        .filter(|install| install.path.starts_with(target_root))
+        .cloned();
+    recover_runtime_transaction(runtime_id, target_root, current_install.as_ref())?;
+    Ok(RuntimeInstallLock {
+        _file: file,
+        previous_install: current_install,
+    })
+}
+
+#[cfg(test)]
+fn acquire_runtime_install_lock_with_timeout(
+    runtime_id: &str,
+    target_root: &Path,
+    current_install: Option<&config::ManagedRuntimeInstall>,
+    timeout: Duration,
+) -> Result<RuntimeInstallLock, String> {
+    let file = lock_runtime_install(target_root, timeout, runtime_id)?;
+    recover_runtime_transaction(runtime_id, target_root, current_install)?;
+    Ok(RuntimeInstallLock {
+        _file: file,
+        previous_install: current_install.cloned(),
+    })
+}
+
+fn lock_runtime_install(
+    target_root: &Path,
+    timeout: Duration,
+    runtime_id: &str,
+) -> Result<File, String> {
+    let parent = target_root
+        .parent()
+        .ok_or_else(|| format!("Runtime target {} has no parent.", target_root.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    let lock_path = runtime_transaction_path(target_root, "lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|err| format!("Could not open runtime lock {}: {err}", lock_path.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "Another Scribe process is installing the {runtime_id} runtime."
+                ));
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(format!(
+                    "Could not lock runtime transaction {}: {err}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+    Ok(file)
+}
+
+fn recover_managed_runtime_transactions(config: &mut AppConfig) -> Result<(), String> {
+    let storage = config::runtime_storage_dir();
+    let mut errors = Vec::new();
+    for spec in runtime_catalog::backend_specs() {
+        let target = storage.join(spec.runtime_id);
+        if !runtime_recovery_needed(&target) {
+            continue;
+        }
+        if let Err(message) = acquire_runtime_install_lock(spec.runtime_id, &target) {
+            errors.push(format!("{}: {message}", spec.runtime_id));
+        }
+    }
+    if errors.is_empty() {
+        let (mut persisted, _) = config::load_config()
+            .map_err(|err| format!("Could not reload configuration after recovery: {err}"))?;
+        config::normalize_config(&mut persisted);
+        *config = persisted;
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn recover_runtime_transaction(
+    runtime_id: &str,
+    target_root: &Path,
+    current_install: Option<&config::ManagedRuntimeInstall>,
+) -> Result<(), String> {
+    let backup_root = runtime_transaction_path(target_root, "backup");
+    if let Some(journal) = read_runtime_journal(runtime_id, target_root)? {
+        match journal.phase {
+            RuntimeTransactionPhase::AwaitingPersistence => {
+                if current_install == journal.new_install.as_ref() {
+                    remove_runtime_journal(target_root)?;
+                    remove_path_if_exists(&backup_root)?;
+                } else if current_install == journal.previous_install.as_ref() {
+                    recover_runtime_rollback(runtime_id, target_root, &backup_root, &journal)?;
+                    remove_runtime_journal(target_root)?;
+                } else {
+                    return Err(format!(
+                        "Runtime transaction metadata for {runtime_id} does not match the persisted configuration."
+                    ));
+                }
+            }
+            RuntimeTransactionPhase::Prepared => {
+                if backup_root.exists() {
+                    restore_runtime_backup(
+                        runtime_id,
+                        target_root,
+                        Some(&backup_root),
+                        journal.previous_install.as_ref(),
+                    )?;
+                } else if journal.had_previous_runtime
+                    && (!target_root.exists()
+                        || !runtime_backup_is_usable(
+                            runtime_id,
+                            target_root,
+                            target_root,
+                            journal.previous_install.as_ref(),
+                        ))
+                {
+                    return Err(format!(
+                        "The previous {runtime_id} runtime is missing during recovery."
+                    ));
+                }
+                remove_runtime_journal(target_root)?;
+            }
+            RuntimeTransactionPhase::BackedUp | RuntimeTransactionPhase::Activated => {
+                recover_runtime_rollback(runtime_id, target_root, &backup_root, &journal)?;
+                remove_runtime_journal(target_root)?;
+            }
+        }
+    } else if backup_root.exists() {
+        if target_root.exists() {
+            remove_path_if_exists(&backup_root)?;
+        } else {
+            restore_runtime_backup(runtime_id, target_root, Some(&backup_root), current_install)?;
+        }
+    }
+    remove_path_if_exists(&runtime_transaction_path(target_root, "installing"))?;
+    remove_path_if_exists(
+        &runtime_transaction_path(target_root, "download").with_extension("zip.partial"),
+    )?;
+    Ok(())
+}
+
+fn recover_runtime_rollback(
+    runtime_id: &str,
+    target_root: &Path,
+    backup_root: &Path,
+    journal: &RuntimeTransactionJournal,
+) -> Result<(), String> {
+    if backup_root.exists() {
+        return restore_runtime_backup(
+            runtime_id,
+            target_root,
+            Some(backup_root),
+            journal.previous_install.as_ref(),
+        );
+    }
+    if journal.had_previous_runtime {
+        if target_root.exists()
+            && runtime_backup_is_usable(
+                runtime_id,
+                target_root,
+                target_root,
+                journal.previous_install.as_ref(),
+            )
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "The previous {runtime_id} runtime backup is missing or invalid."
+        ));
+    }
+    remove_path_if_exists(target_root)
+}
+
+fn restore_runtime_backup(
+    runtime_id: &str,
+    target_root: &Path,
+    backup_root: Option<&Path>,
+    previous_install: Option<&config::ManagedRuntimeInstall>,
+) -> Result<(), String> {
+    if let Some(backup_root) = backup_root {
+        if !runtime_backup_is_usable(runtime_id, target_root, backup_root, previous_install) {
+            return Err(format!(
+                "Refusing to restore an invalid {runtime_id} runtime backup at {}.",
+                backup_root.display()
+            ));
+        }
+        remove_path_if_exists(target_root)?;
+        fs::rename(backup_root, target_root).map_err(|err| {
+            format!(
+                "Could not restore previous runtime {}: {err}",
+                target_root.display()
+            )
+        })?;
+    } else {
+        remove_path_if_exists(target_root)?;
+    }
+    Ok(())
+}
+
+fn runtime_backup_is_usable(
+    runtime_id: &str,
+    target_root: &Path,
+    backup_root: &Path,
+    previous_install: Option<&config::ManagedRuntimeInstall>,
+) -> bool {
+    if let Some(relative) =
+        previous_install.and_then(|install| install.path.strip_prefix(target_root).ok())
+    {
+        return installed_runtime_executable_usable(runtime_id, &backup_root.join(relative));
+    }
+    let Some(spec) = runtime_catalog::backend_spec_for_runtime_id(runtime_id) else {
+        return false;
+    };
+    let Some(runtime) = spec.development_runtime else {
+        return backup_root.is_dir();
+    };
+    let candidate = backup_root.join(runtime.executable_relative_path);
+    if installed_runtime_executable_usable(runtime_id, &candidate) {
+        return true;
+    }
+    #[cfg(windows)]
+    for extension in ["exe", "bat"] {
+        if installed_runtime_executable_usable(runtime_id, &candidate.with_extension(extension)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn runtime_recovery_needed(target_root: &Path) -> bool {
+    runtime_transaction_path(target_root, "transaction").exists()
+        || runtime_transaction_path(target_root, "transaction.next").exists()
+        || runtime_transaction_path(target_root, "backup").exists()
+        || runtime_transaction_path(target_root, "installing").exists()
+        || runtime_transaction_path(target_root, "download")
+            .with_extension("zip.partial")
+            .exists()
+}
+
+fn read_runtime_journal(
+    runtime_id: &str,
+    target_root: &Path,
+) -> Result<Option<RuntimeTransactionJournal>, String> {
+    let next = runtime_transaction_path(target_root, "transaction.next");
+    let path = if next.exists() {
+        next
+    } else {
+        runtime_transaction_path(target_root, "transaction")
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "Could not read runtime transaction {}: {err}",
+            path.display()
+        )
+    })?;
+    let journal: RuntimeTransactionJournal = serde_json::from_str(&contents)
+        .map_err(|err| format!("Runtime transaction {} is invalid: {err}", path.display()))?;
+    if journal.version != 1 || journal.runtime_id != runtime_id {
+        return Err(format!(
+            "Runtime transaction {} has an unexpected identity.",
+            path.display()
+        ));
+    }
+    Ok(Some(journal))
+}
+
+fn write_runtime_journal(
+    target_root: &Path,
+    journal: &RuntimeTransactionJournal,
+) -> Result<(), String> {
+    let path = runtime_transaction_path(target_root, "transaction");
+    let next = runtime_transaction_path(target_root, "transaction.next");
+    remove_path_if_exists(&next)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&next)
+        .map_err(|err| {
+            format!(
+                "Could not create runtime transaction {}: {err}",
+                next.display()
+            )
+        })?;
+    serde_json::to_writer(&mut file, journal)
+        .map_err(|err| format!("Could not serialize runtime transaction: {err}"))?;
+    file.write_all(b"\n")
+        .map_err(|err| format!("Could not write runtime transaction: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("Could not sync runtime transaction: {err}"))?;
+    drop(file);
+    remove_path_if_exists(&path)?;
+    fs::rename(&next, &path).map_err(|err| {
+        format!(
+            "Could not publish runtime transaction {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn remove_runtime_journal(target_root: &Path) -> Result<(), String> {
+    remove_path_if_exists(&runtime_transaction_path(target_root, "transaction.next"))?;
+    remove_path_if_exists(&runtime_transaction_path(target_root, "transaction"))
+}
+
 fn runtime_transaction_path(target_root: &Path, phase: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     let name = target_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("runtime");
-    target_root.with_file_name(format!(".{name}.{phase}-{}-{nonce}", std::process::id()))
+    target_root.with_file_name(format!(".{name}.{phase}"))
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), String> {
@@ -7711,13 +8167,7 @@ mod layout_tests {
         assert!(err.contains("determine runtime package root"));
         assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
         assert!(!target.exists());
-        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".managed.installing-")
-        }));
+        assert!(!runtime_mutation_artifacts_exist_for_test(&target));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7743,13 +8193,7 @@ mod layout_tests {
         assert!(executable.is_file());
         assert_eq!(fs::read(&package_marker).unwrap(), b"package");
         assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
-        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".managed.installing-")
-        }));
+        assert!(!runtime_mutation_artifacts_exist_for_test(&target));
 
         let missing_stage = source_root.join(".outside-managed.installing-test");
         let stage_err = validate_runtime_copy_paths(
@@ -7769,12 +8213,7 @@ mod layout_tests {
         assert_eq!(fs::read(&package_marker).unwrap(), b"package");
         assert_eq!(fs::read(&previous_marker).unwrap(), b"previous");
         assert!(!source_root.join("aliased-managed").exists());
-        assert!(!fs::read_dir(&source_root).unwrap().any(|entry| {
-            let name = entry.unwrap().file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(".aliased-managed.installing-")
-                || name.starts_with(".aliased-managed.backup-")
-        }));
+        assert!(!runtime_mutation_artifacts_exist_for_test(&aliased_target));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7806,17 +8245,7 @@ mod layout_tests {
         assert!(executable.is_file());
         assert_eq!(fs::read(package_marker).unwrap(), b"package");
         assert_eq!(fs::read(sibling_marker).unwrap(), b"sibling");
-        let transaction_prefix = format!(".{}.", target.file_name().unwrap().to_string_lossy());
-        assert!(
-            !fs::read_dir(target.parent().unwrap())
-                .unwrap()
-                .any(|entry| {
-                    let name = entry.unwrap().file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with(&transaction_prefix)
-                        && (name.contains(".installing-") || name.contains(".backup-"))
-                })
-        );
+        assert!(!runtime_mutation_artifacts_exist_for_test(&target));
         let _ = fs::remove_dir_all(target);
     }
 
@@ -7839,6 +8268,202 @@ mod layout_tests {
         assert_eq!(fs::read(target.join("package.marker")).unwrap(), b"package");
         replacement.commit().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_recovery_restores_after_each_activation_rename() {
+        for (case, phase, activate_new) in [
+            (
+                "after-backup-rename",
+                RuntimeTransactionPhase::Prepared,
+                false,
+            ),
+            (
+                "after-stage-rename",
+                RuntimeTransactionPhase::BackedUp,
+                true,
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "scribe-runtime-recovery-{case}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let target = root.join("vosk");
+            let stage = runtime_transaction_path(&target, "installing");
+            let backup = runtime_transaction_path(&target, "backup");
+            let old_executable = write_vosk_runtime_with_revision(&target, 3);
+            write_vosk_runtime_with_revision(&stage, 4);
+            let previous = config::ManagedRuntimeInstall::new(old_executable);
+            write_runtime_journal(
+                &target,
+                &RuntimeTransactionJournal {
+                    version: 1,
+                    runtime_id: "vosk".to_owned(),
+                    phase,
+                    had_previous_runtime: true,
+                    previous_install: Some(previous.clone()),
+                    new_install: None,
+                },
+            )
+            .unwrap();
+            fs::rename(&target, &backup).unwrap();
+            if activate_new {
+                fs::rename(&stage, &target).unwrap();
+            }
+
+            recover_runtime_transaction("vosk", &target, Some(&previous)).unwrap();
+
+            assert_eq!(
+                fs::read_to_string(target.join("runtime-manifest.json")).unwrap(),
+                r#"{"runner_revision":3}"#
+            );
+            assert!(!backup.exists());
+            assert!(!stage.exists());
+            assert!(!runtime_transaction_exists_for_test(&target));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn runtime_recovery_uses_persisted_metadata_to_finalize_or_roll_back() {
+        for persisted_new in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "scribe-runtime-persistence-recovery-{persisted_new}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let target = root.join("vosk");
+            let backup = runtime_transaction_path(&target, "backup");
+            let old_executable = write_vosk_runtime_with_revision(&backup, 3);
+            let new_executable = write_vosk_runtime_with_revision(&target, 4);
+            let mut previous = config::ManagedRuntimeInstall::new(
+                target.join(old_executable.strip_prefix(&backup).unwrap()),
+            );
+            previous.source = Some("old".to_owned());
+            let mut new = config::ManagedRuntimeInstall::new(new_executable);
+            new.source = Some("new".to_owned());
+            write_runtime_journal(
+                &target,
+                &RuntimeTransactionJournal {
+                    version: 1,
+                    runtime_id: "vosk".to_owned(),
+                    phase: RuntimeTransactionPhase::AwaitingPersistence,
+                    had_previous_runtime: true,
+                    previous_install: Some(previous.clone()),
+                    new_install: Some(new.clone()),
+                },
+            )
+            .unwrap();
+
+            let persisted = if persisted_new { &new } else { &previous };
+            recover_runtime_transaction("vosk", &target, Some(persisted)).unwrap();
+
+            let expected_revision = if persisted_new { 4 } else { 3 };
+            assert_eq!(
+                fs::read_to_string(target.join("runtime-manifest.json")).unwrap(),
+                format!(r#"{{"runner_revision":{expected_revision}}}"#)
+            );
+            assert!(!backup.exists());
+            assert!(!runtime_transaction_exists_for_test(&target));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn runtime_recovery_is_idempotent_after_backup_restore() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-idempotent-recovery-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let executable = write_vosk_runtime_with_revision(&target, 3);
+        let mut previous = config::ManagedRuntimeInstall::new(executable.clone());
+        previous.source = Some("old".to_owned());
+        let mut new = config::ManagedRuntimeInstall::new(executable);
+        new.source = Some("new".to_owned());
+        write_runtime_journal(
+            &target,
+            &RuntimeTransactionJournal {
+                version: 1,
+                runtime_id: "vosk".to_owned(),
+                phase: RuntimeTransactionPhase::AwaitingPersistence,
+                had_previous_runtime: true,
+                previous_install: Some(previous.clone()),
+                new_install: Some(new),
+            },
+        )
+        .unwrap();
+
+        recover_runtime_transaction("vosk", &target, Some(&previous)).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("runtime-manifest.json")).unwrap(),
+            r#"{"runner_revision":3}"#
+        );
+        assert!(!runtime_transaction_exists_for_test(&target));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_recovery_cleans_stale_stage_and_partial_download() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-stale-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let stage = runtime_transaction_path(&target, "installing");
+        let partial = runtime_transaction_path(&target, "download").with_extension("zip.partial");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(&partial, b"partial").unwrap();
+
+        recover_runtime_transaction("vosk", &target, None).unwrap();
+
+        assert!(!stage.exists());
+        assert!(!partial.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_lock_is_exclusive_and_released_with_the_guard() {
+        let root = std::env::temp_dir().join(format!("scribe-runtime-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let target = root.join("vosk");
+        let first = acquire_runtime_install_lock_with_timeout(
+            "vosk",
+            &target,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let error = acquire_runtime_install_lock_with_timeout(
+            "vosk",
+            &target,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(error.contains("Another Scribe process"));
+        drop(first);
+        acquire_runtime_install_lock_with_timeout("vosk", &target, None, Duration::from_millis(10))
+            .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn runtime_transaction_exists_for_test(target: &Path) -> bool {
+        runtime_transaction_path(target, "transaction").exists()
+            || runtime_transaction_path(target, "transaction.next").exists()
+    }
+
+    fn runtime_mutation_artifacts_exist_for_test(target: &Path) -> bool {
+        runtime_transaction_exists_for_test(target)
+            || runtime_transaction_path(target, "installing").exists()
+            || runtime_transaction_path(target, "backup").exists()
+            || runtime_transaction_path(target, "download")
+                .with_extension("zip.partial")
+                .exists()
     }
 
     #[cfg(unix)]

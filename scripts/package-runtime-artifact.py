@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package one portable runtime and update a build-embedded artifact catalog."""
+"""Package one portable runtime and emit a parallel-safe catalog fragment."""
 
 from __future__ import annotations
 
@@ -33,16 +33,17 @@ GPU_RUNTIME_IDS = {"whisper_cpp", "faster_whisper"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runtime-dir", required=True, type=Path)
-    parser.add_argument("--runtime-id", required=True, choices=sorted(RUNTIME_IDS))
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--os", required=True, choices=("linux", "macos", "windows"))
-    parser.add_argument("--arch", required=True, choices=("x86_64", "aarch64"))
-    parser.add_argument("--device", required=True, choices=("cpu", "gpu"))
-    parser.add_argument("--entrypoint", required=True)
-    parser.add_argument("--release-base-url", required=True)
+    parser.add_argument("--merge-catalog-fragments", action="store_true")
+    parser.add_argument("--runtime-dir", type=Path)
+    parser.add_argument("--runtime-id", choices=sorted(RUNTIME_IDS))
+    parser.add_argument("--version")
+    parser.add_argument("--os", choices=("linux", "macos", "windows"))
+    parser.add_argument("--arch", choices=("x86_64", "aarch64"))
+    parser.add_argument("--device", choices=("cpu", "gpu"))
+    parser.add_argument("--entrypoint")
+    parser.add_argument("--release-base-url")
     parser.add_argument("--catalog-version", required=True)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--catalog", required=True, type=Path)
     return parser.parse_args()
 
@@ -118,9 +119,12 @@ def validate_manifest(root: Path, args: argparse.Namespace, entrypoint: PurePosi
 
 def smoke_validate(root: Path, entrypoint: PurePosixPath) -> None:
     executable = root / Path(*entrypoint.parts)
+    command = [str(executable), "--help"]
+    if os.name == "nt" and executable.suffix.lower() in {".bat", ".cmd"}:
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(executable), "--help"]
     try:
         result = subprocess.run(
-            [str(executable), "--help"],
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -159,21 +163,69 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_catalog(path: Path, version: str) -> dict:
-    if not path.exists():
-        return {"schema_version": 1, "catalog_version": version, "artifacts": []}
-    catalog = json.loads(path.read_text(encoding="utf-8"))
-    if catalog.get("schema_version") != 1 or not isinstance(catalog.get("artifacts"), list):
-        raise ValueError("existing catalog has an unsupported schema")
-    if catalog.get("catalog_version") != version:
-        raise ValueError("existing catalog version does not match --catalog-version")
-    return catalog
+def fragment_directory(catalog: Path) -> Path:
+    return catalog.with_suffix(catalog.suffix + ".d")
+
+
+def write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            json.dump(value, target, indent=2)
+            target.write("\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def merge_catalog_fragments(catalog: Path, version: str) -> None:
+    artifacts = []
+    keys = set()
+    fragments = sorted(fragment_directory(catalog).glob("*.json"))
+    if not fragments:
+        raise ValueError(f"no catalog fragments found for {catalog}")
+    for fragment in fragments:
+        artifact = json.loads(fragment.read_text(encoding="utf-8"))
+        key = tuple(artifact.get(field) for field in ("runtime_id", "os", "arch", "device"))
+        if None in key or key in keys:
+            raise ValueError(f"duplicate or invalid artifact tuple in {fragment}: {key}")
+        keys.add(key)
+        artifacts.append(artifact)
+    artifacts.sort(key=lambda item: (item["runtime_id"], item["os"], item["arch"], item["device"]))
+    write_json_atomic(
+        catalog,
+        {"schema_version": 1, "catalog_version": version, "artifacts": artifacts},
+    )
 
 
 def main() -> int:
     args = parse_args()
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", args.version) or not args.catalog_version.strip():
-        raise ValueError("version values cannot be empty")
+    if not args.catalog_version.strip():
+        raise ValueError("catalog version cannot be empty")
+    if args.merge_catalog_fragments:
+        merge_catalog_fragments(args.catalog, args.catalog_version)
+        print(json.dumps({"catalog": str(args.catalog)}))
+        return 0
+    required = {
+        "--runtime-dir": args.runtime_dir,
+        "--runtime-id": args.runtime_id,
+        "--version": args.version,
+        "--os": args.os,
+        "--arch": args.arch,
+        "--device": args.device,
+        "--entrypoint": args.entrypoint,
+        "--release-base-url": args.release_base_url,
+        "--output-dir": args.output_dir,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(f"packaging mode requires: {', '.join(missing)}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", args.version):
+        raise ValueError("runtime version is invalid")
     if args.device == "gpu" and args.runtime_id not in GPU_RUNTIME_IDS:
         raise ValueError(f"{args.runtime_id} does not support GPU packs")
     native_os = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(sys.platform)
@@ -198,7 +250,6 @@ def main() -> int:
     os.close(descriptor)
     temporary = Path(temporary_name)
     temporary.unlink()
-    catalog_tmp = args.catalog.with_suffix(args.catalog.suffix + ".tmp")
     archive_published = False
     try:
         unpacked_size = write_archive(args.runtime_dir, files, temporary)
@@ -214,20 +265,10 @@ def main() -> int:
             "unpacked_size_bytes": unpacked_size,
             "entrypoint": entrypoint.as_posix(),
         }
-        catalog = load_catalog(args.catalog, args.catalog_version)
-        key = (args.runtime_id, args.os, args.arch, args.device)
-        if any(
-            (item.get("runtime_id"), item.get("os"), item.get("arch"), item.get("device")) == key
-            for item in catalog["artifacts"]
-        ):
-            raise ValueError(f"catalog already contains artifact tuple {key}")
-        catalog["artifacts"].append(artifact)
-        catalog["artifacts"].sort(key=lambda item: (item["runtime_id"], item["os"], item["arch"], item["device"]))
-        args.catalog.parent.mkdir(parents=True, exist_ok=True)
-        catalog_tmp.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, archive_path)
+        os.link(temporary, archive_path)
         archive_published = True
-        os.replace(catalog_tmp, args.catalog)
+        fragment = fragment_directory(args.catalog) / f"{archive_name}.json"
+        write_json_atomic(fragment, artifact)
         archive_published = False
     except Exception:
         if archive_published:
@@ -235,9 +276,8 @@ def main() -> int:
         raise
     finally:
         temporary.unlink(missing_ok=True)
-        catalog_tmp.unlink(missing_ok=True)
 
-    print(json.dumps({"archive": str(archive_path), "catalog": str(args.catalog), **artifact}))
+    print(json.dumps({"archive": str(archive_path), "fragment": str(fragment), **artifact}))
     return 0
 
 

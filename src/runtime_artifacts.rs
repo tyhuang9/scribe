@@ -3,6 +3,9 @@ use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +17,7 @@ const EMBEDDED_CATALOG_JSON: &str =
     include_str!(concat!(env!("OUT_DIR"), "/runtime-artifacts.json"));
 const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -318,6 +322,7 @@ pub(crate) fn download_and_stage(
     artifact: &RuntimeArtifact,
     target_root: &Path,
 ) -> Result<StagedRuntimeArtifact, String> {
+    let deadline = Instant::now() + MAX_DOWNLOAD_DURATION;
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(15))
@@ -345,13 +350,28 @@ pub(crate) fn download_and_stage(
             ));
         }
     }
-    stage_from_reader(artifact, target_root, response.into_reader())
+    stage_from_reader_until(
+        artifact,
+        target_root,
+        response.into_reader(),
+        Some(deadline),
+    )
 }
 
+#[cfg(test)]
 fn stage_from_reader(
     artifact: &RuntimeArtifact,
     target_root: &Path,
+    reader: impl Read,
+) -> Result<StagedRuntimeArtifact, String> {
+    stage_from_reader_until(artifact, target_root, reader, None)
+}
+
+fn stage_from_reader_until(
+    artifact: &RuntimeArtifact,
+    target_root: &Path,
     mut reader: impl Read,
+    deadline: Option<Instant>,
 ) -> Result<StagedRuntimeArtifact, String> {
     let parent = target_root
         .parent()
@@ -373,9 +393,21 @@ fn stage_from_reader(
         let mut downloaded = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(format!(
+                    "runtime artifact download exceeded the {} minute deadline",
+                    MAX_DOWNLOAD_DURATION.as_secs() / 60
+                ));
+            }
             let count = reader
                 .read(&mut buffer)
                 .map_err(|err| format!("runtime artifact download failed: {err}"))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(format!(
+                    "runtime artifact download exceeded the {} minute deadline",
+                    MAX_DOWNLOAD_DURATION.as_secs() / 60
+                ));
+            }
             if count == 0 {
                 break;
             }
@@ -610,15 +642,11 @@ fn validate_archive_entry_count(count: usize) -> Result<(), String> {
 }
 
 fn transaction_path(target_root: &Path, phase: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     let name = target_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("runtime");
-    target_root.with_file_name(format!(".{name}.{phase}-{}-{nonce}", std::process::id()))
+    target_root.with_file_name(format!(".{name}.{phase}"))
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), String> {
@@ -834,6 +862,21 @@ mod tests {
             transaction_files(target.parent().unwrap(), "whisper_cpp"),
             [staged.root.clone()]
         );
+        fs::remove_dir_all(target.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn overall_download_deadline_aborts_and_cleans_partial_state() {
+        let bytes = archive(&[("bin/whisper-cli", b"runtime")]);
+        let artifact = test_artifact(&bytes, bytes.len() as u64, 7);
+        let target = temp_target("deadline").join("whisper_cpp");
+
+        let error =
+            stage_from_reader_until(&artifact, &target, Cursor::new(bytes), Some(Instant::now()))
+                .unwrap_err();
+
+        assert!(error.contains("deadline"));
+        assert!(transaction_files(target.parent().unwrap(), "whisper_cpp").is_empty());
         fs::remove_dir_all(target.parent().unwrap()).unwrap();
     }
 
