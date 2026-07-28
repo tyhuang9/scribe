@@ -1,9 +1,12 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use std::cell::Cell;
+
+static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn rename(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
     if let Some(error) = rename_with_outcome(source, destination, replace)? {
@@ -27,7 +30,7 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
 
 pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
     if path.is_dir() {
-        return Ok(());
+        return sync_existing_directory(path);
     }
 
     let mut missing = Vec::new();
@@ -42,11 +45,73 @@ pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
         })?;
     }
 
-    fs::create_dir_all(path)?;
-    for directory in &missing {
-        sync_directory(directory)?;
+    if !current.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is not a directory", current.display()),
+        ));
     }
-    sync_directory(current)
+    sync_existing_directory(current)?;
+
+    for directory in missing.iter().rev() {
+        create_directory_durably(directory)?;
+    }
+    Ok(())
+}
+
+fn create_directory_durably(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no containing directory", path.display()),
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("directory");
+    let temporary = parent.join(format!(".{name}.creating-{}", path_nonce()));
+    fs::create_dir(&temporary)?;
+    if let Err(error) = sync_directory(&temporary) {
+        let _ = remove(&temporary);
+        return Err(error);
+    }
+    match rename(&temporary, path, false) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {
+            let _ = remove(&temporary);
+            sync_existing_directory(path)
+        }
+        Err(error) => {
+            let _ = remove(&temporary);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_existing_directory(path: &Path) -> io::Result<()> {
+    sync_directory(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_existing_directory(_path: &Path) -> io::Result<()> {
+    // Directories created by this helper become visible only through a
+    // MOVEFILE_WRITE_THROUGH rename, so a visible destination is already sealed.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_existing_directory(path: &Path) -> io::Result<()> {
+    sync_directory(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn sync_tree(root: &Path) -> io::Result<()> {
@@ -114,16 +179,8 @@ fn sync_directory_platform(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn sync_directory_platform(path: &Path) -> io::Result<()> {
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let barrier = path.join(format!(
-        ".scribe-directory-sync-{}-{nonce:020}",
-        std::process::id()
-    ));
+    let barrier = path.join(format!(".scribe-directory-sync-{}", windows_path_nonce()));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -169,7 +226,7 @@ enum SyncTreeFailureKind {
 
 #[cfg(test)]
 thread_local! {
-    static SYNC_TREE_FAILURE: Cell<Option<SyncTreeFailureKind>> = const { Cell::new(None) };
+    static SYNC_TREE_FAILURE: Cell<Option<(SyncTreeFailureKind, usize)>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -184,20 +241,33 @@ impl Drop for SyncTreeFailureGuard {
 
 #[cfg(test)]
 pub(crate) fn inject_sync_tree_failure(kind: SyncTreeFailureKind) -> SyncTreeFailureGuard {
-    SYNC_TREE_FAILURE.set(Some(kind));
+    inject_sync_tree_failure_after(kind, 0)
+}
+
+#[cfg(test)]
+fn inject_sync_tree_failure_after(
+    kind: SyncTreeFailureKind,
+    matching_calls_before_failure: usize,
+) -> SyncTreeFailureGuard {
+    SYNC_TREE_FAILURE.set(Some((kind, matching_calls_before_failure)));
     SyncTreeFailureGuard
 }
 
 #[cfg(test)]
 fn maybe_inject_sync_tree_failure(kind: SyncTreeFailureKind) -> io::Result<()> {
-    if SYNC_TREE_FAILURE.get() == Some(kind) {
-        return Err(io::Error::other(format!(
-            "injected staged {} sync failure",
-            match kind {
-                SyncTreeFailureKind::File => "file",
-                SyncTreeFailureKind::Directory => "directory",
-            }
-        )));
+    if let Some((expected, remaining)) = SYNC_TREE_FAILURE.get()
+        && expected == kind
+    {
+        if remaining == 0 {
+            return Err(io::Error::other(format!(
+                "injected staged {} sync failure",
+                match kind {
+                    SyncTreeFailureKind::File => "file",
+                    SyncTreeFailureKind::Directory => "directory",
+                }
+            )));
+        }
+        SYNC_TREE_FAILURE.set(Some((expected, remaining - 1)));
     }
     Ok(())
 }
@@ -290,27 +360,30 @@ fn remove_platform(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn remove_platform(path: &Path) -> io::Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     if !path.exists() {
         return Ok(());
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("metadata");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tombstone = path.with_file_name(format!(
-        ".{name}.removed-{}-{nonce:020}",
-        std::process::id()
-    ));
+    let tombstone = path.with_file_name(format!(".scribe-removed-{}", windows_path_nonce()));
     rename_platform(path, &tombstone, false)?;
     // The write-through rename is the logical deletion barrier; reclamation can be retried later.
     let _ = remove_now(&tombstone);
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_path_nonce() -> String {
+    path_nonce()
+}
+
+fn path_nonce() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = PATH_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{timestamp:020}-{sequence:016x}", std::process::id())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -358,6 +431,34 @@ mod tests {
         drop(injected);
 
         assert!(error.to_string().contains("injected staged directory"));
+        assert!(!root.join("one").exists());
+        assert!(!target.exists());
+
+        create_dir_all(&target).unwrap();
+
+        assert!(target.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_creation_reseals_an_existing_retry_target() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-durable-create-existing-retry-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("one");
+        fs::create_dir(&target).unwrap();
+        let injected = inject_sync_tree_failure(SyncTreeFailureKind::Directory);
+
+        create_dir_all(&target).unwrap_err();
+        drop(injected);
+        assert!(target.is_dir());
+
+        create_dir_all(&target).unwrap();
+
         assert!(target.is_dir());
         let _ = fs::remove_dir_all(root);
     }
