@@ -380,7 +380,7 @@ fn stage_from_reader_until(
     let parent = target_root
         .parent()
         .ok_or_else(|| format!("runtime target {} has no parent", target_root.display()))?;
-    fs::create_dir_all(parent)
+    crate::durable_fs::create_dir_all(parent)
         .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
     let archive_path = transaction_path(target_root, "download").with_extension("zip.partial");
     let stage_root = transaction_path(target_root, "installing");

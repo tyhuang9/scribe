@@ -360,7 +360,7 @@ fn lock_config_path(path: &Path, timeout: Duration) -> Result<ConfigFileLock> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("config path {} has no parent", path.display()))?;
-    fs::create_dir_all(parent)
+    durable_fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     let lock_path = config_sibling_path(path, "lock");
     let file = OpenOptions::new()
@@ -486,7 +486,7 @@ fn save_config_file_locked_with(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("config path {} has no parent", path.display()))?;
-    fs::create_dir_all(parent)
+    durable_fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     let content = serde_json::to_vec_pretty(config)?;
     let temporary = unique_config_temporary_path(path);

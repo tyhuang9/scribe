@@ -5730,7 +5730,7 @@ fn build_development_runtime_into(
     package: &DevelopmentRuntimePackage,
 ) -> Result<(), String> {
     if let Some(parent) = package.destination_root.parent() {
-        fs::create_dir_all(parent)
+        durable_fs::create_dir_all(parent)
             .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
     }
 
@@ -5899,10 +5899,16 @@ fn activate_staged_runtime(
     relative_executable: &Path,
     install_lock: RuntimeInstallLock,
 ) -> Result<RuntimeReplacement, String> {
+    durable_fs::sync_tree(stage_root).map_err(|err| {
+        format!(
+            "Could not make staged runtime {} durable before activation: {err}",
+            stage_root.display()
+        )
+    })?;
     let parent = target_root
         .parent()
         .ok_or_else(|| format!("Runtime target {} has no parent.", target_root.display()))?;
-    fs::create_dir_all(parent)
+    durable_fs::create_dir_all(parent)
         .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
 
     let backup_root = runtime_transaction_path(target_root, "backup");
@@ -6089,7 +6095,7 @@ fn lock_runtime_install(
     let parent = target_root
         .parent()
         .ok_or_else(|| format!("Runtime target {} has no parent.", target_root.display()))?;
-    fs::create_dir_all(parent)
+    durable_fs::create_dir_all(parent)
         .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
     let lock_path = runtime_transaction_path(target_root, "lock");
     let file = OpenOptions::new()
@@ -9216,6 +9222,54 @@ mod layout_tests {
         assert_eq!(fs::read(target.join("package.marker")).unwrap(), b"package");
         replacement.commit().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_activation_does_not_start_when_stage_sync_fails() {
+        for failure in [
+            durable_fs::SyncTreeFailureKind::File,
+            durable_fs::SyncTreeFailureKind::Directory,
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "scribe-runtime-stage-sync-{failure:?}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let target = root.join("vosk");
+            let stage = runtime_transaction_path(&target, "installing");
+            write_vosk_runtime_with_revision(&target, 3);
+            let lock = acquire_runtime_install_lock_with_timeout(
+                "vosk",
+                &target,
+                None,
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            let staged_executable = write_vosk_runtime_with_revision(&stage, 4);
+            let relative_executable = staged_executable
+                .strip_prefix(&stage)
+                .unwrap()
+                .to_path_buf();
+            let injected = durable_fs::inject_sync_tree_failure(failure);
+
+            let error =
+                activate_staged_runtime("vosk", &target, &stage, &relative_executable, lock)
+                    .unwrap_err();
+            drop(injected);
+
+            assert!(error.contains("durable before activation"));
+            assert_eq!(
+                fs::read_to_string(target.join("runtime-manifest.json")).unwrap(),
+                r#"{"runner_revision":3}"#
+            );
+            assert_eq!(
+                fs::read_to_string(stage.join("runtime-manifest.json")).unwrap(),
+                r#"{"runner_revision":4}"#
+            );
+            assert!(!runtime_transaction_exists_for_test(&target));
+            assert!(!runtime_transaction_path(&target, "backup").exists());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

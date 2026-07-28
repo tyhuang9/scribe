@@ -2,6 +2,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 pub(crate) fn rename(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
     if let Some(error) = rename_with_outcome(source, destination, replace)? {
         return Err(error);
@@ -22,8 +25,193 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
     remove_platform(path)
 }
 
+pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no existing ancestor", path.display()),
+            )
+        })?;
+    }
+
+    fs::create_dir_all(path)?;
+    for directory in &missing {
+        sync_directory(directory)?;
+    }
+    sync_directory(current)
+}
+
+pub(crate) fn sync_tree(root: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    sync_tree_inner(root)
+}
+
+fn sync_tree_inner(directory: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            sync_tree_inner(&path)?;
+        } else if metadata.is_file() {
+            sync_regular_file(&path)?;
+        } else if !metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not a regular file, directory, or symlink",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    sync_directory(directory)
+}
+
+fn sync_regular_file(path: &Path) -> io::Result<()> {
+    maybe_inject_sync_tree_failure(SyncTreeFailureKind::File)?;
+    sync_regular_file_platform(path)
+}
+
+#[cfg(windows)]
+fn sync_regular_file_platform(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(windows))]
+fn sync_regular_file_platform(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    maybe_inject_sync_tree_failure(SyncTreeFailureKind::Directory)?;
+    sync_directory_platform(path)
+}
+
 #[cfg(unix)]
-fn rename_platform(source: &Path, destination: &Path, _replace: bool) -> io::Result<()> {
+fn sync_directory_platform(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory_platform(path: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let barrier = path.join(format!(
+        ".scribe-directory-sync-{}-{nonce:020}",
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&barrier)?;
+        file.write_all(b"sync")?;
+        file.sync_all()?;
+        drop(file);
+        // The write-through rename used by remove() is the unprivileged Windows
+        // directory metadata barrier after child files have been flushed.
+        remove(&barrier)
+    })();
+    if result.is_err() {
+        let _ = remove_now(&barrier);
+    }
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory_platform(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "durable directory synchronization is not supported for {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyncTreeFailureKind {
+    File,
+    Directory,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+enum SyncTreeFailureKind {
+    File,
+    Directory,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_TREE_FAILURE: Cell<Option<SyncTreeFailureKind>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct SyncTreeFailureGuard;
+
+#[cfg(test)]
+impl Drop for SyncTreeFailureGuard {
+    fn drop(&mut self) {
+        SYNC_TREE_FAILURE.set(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_sync_tree_failure(kind: SyncTreeFailureKind) -> SyncTreeFailureGuard {
+    SYNC_TREE_FAILURE.set(Some(kind));
+    SyncTreeFailureGuard
+}
+
+#[cfg(test)]
+fn maybe_inject_sync_tree_failure(kind: SyncTreeFailureKind) -> io::Result<()> {
+    if SYNC_TREE_FAILURE.get() == Some(kind) {
+        return Err(io::Error::other(format!(
+            "injected staged {} sync failure",
+            match kind {
+                SyncTreeFailureKind::File => "file",
+                SyncTreeFailureKind::Directory => "directory",
+            }
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_inject_sync_tree_failure(_kind: SyncTreeFailureKind) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rename_platform(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    if !replace {
+        ensure_destination_absent(destination)?;
+    }
     fs::rename(source, destination)
 }
 
@@ -57,8 +245,23 @@ fn rename_platform(source: &Path, destination: &Path, replace: bool) -> io::Resu
 }
 
 #[cfg(not(any(unix, windows)))]
-fn rename_platform(source: &Path, destination: &Path, _replace: bool) -> io::Result<()> {
+fn rename_platform(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    if !replace {
+        ensure_destination_absent(destination)?;
+    }
     fs::rename(source, destination)
+}
+
+#[cfg(not(windows))]
+fn ensure_destination_absent(destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", destination.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -134,4 +337,64 @@ fn parent(path: &Path) -> io::Result<&Path> {
             format!("{} has no containing directory", path.display()),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_directory_creation_propagates_sync_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-durable-create-dir-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("one").join("two");
+        let injected = inject_sync_tree_failure(SyncTreeFailureKind::Directory);
+
+        let error = create_dir_all(&target).unwrap_err();
+        drop(injected);
+
+        assert!(error.to_string().contains("injected staged directory"));
+        assert!(target.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_directory_creation_persists_each_new_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-durable-create-dir-success-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("one").join("two");
+
+        create_dir_all(&target).unwrap();
+
+        assert!(target.is_dir());
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_an_existing_destination() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-durable-no-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+
+        let error = rename(&source, &destination, false).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"destination");
+        let _ = fs::remove_dir_all(root);
+    }
 }
