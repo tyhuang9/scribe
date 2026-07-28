@@ -860,7 +860,7 @@ mod tests {
         assert_eq!(fs::read(&staged.entrypoint).unwrap(), b"runtime");
         assert_eq!(
             transaction_files(target.parent().unwrap(), "whisper_cpp"),
-            [staged.root.clone()]
+            std::slice::from_ref(&staged.root)
         );
         fs::remove_dir_all(target.parent().unwrap()).unwrap();
     }

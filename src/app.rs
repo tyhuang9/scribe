@@ -5968,6 +5968,7 @@ fn lock_runtime_install(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|err| format!("Could not open runtime lock {}: {err}", lock_path.display()))?;
     let deadline = Instant::now() + timeout;
