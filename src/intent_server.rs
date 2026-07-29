@@ -1655,6 +1655,23 @@ mod tests {
         assert!(started.elapsed() <= STOP_GRACE + Duration::from_secs(2));
     }
 
+    #[test]
+    fn managed_child_contains_an_immediate_descendant() {
+        let marker = std::env::temp_dir().join(format!(
+            "scribe-intent-descendant-{}-{}.marker",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut child = helper_child_with_descendant(&marker);
+        thread::sleep(Duration::from_millis(250));
+
+        child.stop();
+        thread::sleep(Duration::from_millis(1_250));
+
+        assert!(!marker.exists(), "contained descendant survived shutdown");
+    }
+
     fn helper_child() -> ManagedChild {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -1670,10 +1687,48 @@ mod tests {
         ManagedChild::spawn_command(command).unwrap()
     }
 
+    fn helper_child_with_descendant(marker: &Path) -> ManagedChild {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                OsString::from("--exact"),
+                OsString::from("intent_server::tests::helper_process"),
+                OsString::from("--nocapture"),
+            ])
+            .env("SCRIBE_INTENT_SERVER_HELPER", "1")
+            .env("SCRIBE_INTENT_DESCENDANT_MARKER", marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        ManagedChild::spawn_command(command).unwrap()
+    }
+
     #[test]
     fn helper_process() {
         if std::env::var_os("SCRIBE_INTENT_SERVER_HELPER").is_some() {
+            if let Some(marker) = std::env::var_os("SCRIBE_INTENT_DESCENDANT_MARKER") {
+                let mut descendant = Command::new(std::env::current_exe().unwrap());
+                descendant
+                    .args([
+                        OsString::from("--exact"),
+                        OsString::from("intent_server::tests::descendant_process"),
+                        OsString::from("--nocapture"),
+                    ])
+                    .env("SCRIBE_INTENT_DESCENDANT_PROCESS", marker)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let _ = descendant.spawn();
+            }
             thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn descendant_process() {
+        if let Some(marker) = std::env::var_os("SCRIBE_INTENT_DESCENDANT_PROCESS") {
+            thread::sleep(Duration::from_millis(750));
+            let _ = std::fs::write(marker, b"survived");
         }
     }
 }
