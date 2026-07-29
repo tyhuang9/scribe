@@ -37,7 +37,7 @@ fi
 
 if [[ "${SCRIBE_BUILD_VOICE_AI:-0}" == "1" ]]; then
   if [[ -z "${SCRIBE_RUNTIME_ARTIFACT_CATALOG:-}" ]]; then
-    echo "Voice-AI releases require a schema-2 catalog with a pinned llama runtime and both mirrored Qwen tiers." >&2
+    echo "Voice-AI releases require a schema-2 catalog with the exact official pinned llama runtime and both official revision-pinned Qwen tiers." >&2
     exit 1
   fi
   export SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS=1
@@ -177,5 +177,5 @@ else
   echo "  contents:            explicit GPU product; faster-whisper is included only when a portable CI input was supplied"
 fi
 if [[ "${SCRIBE_BUILD_VOICE_AI:-0}" == "1" ]]; then
-  echo "  voice AI:            pinned CPU llama runtime and both direct mirrored Qwen tiers"
+  echo "  voice AI catalog:    exact official pinned llama runtime and Qwen sources; bundle remains whisper.cpp-only"
 fi

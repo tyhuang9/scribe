@@ -224,47 +224,34 @@ The reserved English commands are `scratch that`, `undo that`, `start over`, `ne
 
 Final results carry a recording session ID. Stale transcription or edit events are ignored, preview text cannot execute commands, and external output happens at most once. While an edit or review is active, the transcript is read-only so a late result cannot overwrite a manual change. AI ambiguity, invalid output, timeout, cancellation, or failure preserves the original transcript and suppresses automatic insertion until the user chooses Retry, Use original, or Copy. Delayed Windows insertion also requires the original top-level window, process instance, focused child control, document title, and caret identity to remain unchanged at the clipboard and paste boundaries. Scribe retains the original only in memory until the next recording or exit.
 
-Voice-AI release metadata is intentionally separate from the bundled whisper runtime. Release CI must obtain the exact audited upstream llama.cpp b9637 ZIP/license and Qwen GGUF files, publish byte-identical artifacts at an immutable Scribe-controlled HTTPS base URL, then build a schema-2 catalog:
+Voice-AI release metadata is intentionally separate from the bundled whisper runtime. The checked-in schema-2 catalog points directly to these immutable official artifacts:
+
+- llama.cpp b9637 Windows x64 CPU ZIP: `https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip` (16,906,751 bytes; SHA-256 `f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e`).
+- Compact model: `https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf` (804,753,088 bytes; SHA-256 `12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735`).
+- Balanced model: `https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf` (1,834,426,016 bytes; SHA-256 `061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a`).
+
+Scribe disables environment proxy discovery and automatic redirects for these downloads. It manually follows at most three validated HTTPS redirects: the exact GitHub URL may redirect only to `release-assets.githubusercontent.com`, and each exact revision-pinned Hugging Face URL may redirect only to a label-boundary `*.cdn.hf.co` host. Credentials, fragments, non-default ports, unexpected origins, malformed lengths, and unapproved redirect chains are rejected. Downloads are streamed into transaction-owned staging paths and must match the catalog byte count and SHA-256 before activation. The official flat llama.cpp ZIP is normalized into Scribe's strict runtime layout with the pinned MIT license and generated runtime manifest.
+
+`-VoiceAi` and `SCRIBE_BUILD_VOICE_AI=1` validate that the embedded catalog contains the exact pinned runtime and both exact model sources. They do not copy voice-AI artifacts into the product. The standard release bundle physically contains only `runtimes/whisper_cpp`; the llama.cpp runtime and selected Qwen model remain explicit, post-install downloads.
+
+The fixed real-model corpus is an ignored, manual benchmark. It verifies the exact source archive, installed runtime manifest, license, `llama-server.exe`, model bytes, per-case three-minute limit, prompt-leak protection, and review handling for unsafe instructions. The previously observed useful semantic rewrite rates (Compact 55%, Balanced 60%) are informational; deterministic command recognition is tested separately.
 
 ```powershell
-python scripts/prepare-llama-runtime.py `
-  --archive dist/upstream/llama-b9637-bin-win-cpu-x64.zip `
-  --license-file dist/upstream/llama.cpp-LICENSE `
-  --output-dir dist/portable/voice-intent-llama
+$env:SCRIBE_INTENT_LLAMA_SERVER = 'C:\verified\voice-intent-llama\bin\llama-server.exe'
+$env:SCRIBE_INTENT_LLAMA_ARCHIVE = 'C:\verified\llama-b9637-bin-win-cpu-x64.zip'
+$env:SCRIBE_INTENT_COMPACT_MODEL = 'C:\verified\Qwen3-0.6B-Q8_0.gguf'
+$env:SCRIBE_INTENT_BALANCED_MODEL = 'C:\verified\Qwen3-1.7B-Q8_0.gguf'
 
-python scripts/package-runtime-artifact.py `
-  --runtime-dir dist/portable/voice-intent-llama `
-  --runtime-id voice_intent_llama_cpp --version b9637 `
-  --os windows --arch x86_64 --device cpu `
-  --entrypoint bin/llama-server.exe `
-  --release-base-url $env:RELEASE_BASE_URL `
-  --catalog-version 1.0.0 --output-dir dist/artifacts `
-  --catalog dist/runtime-artifacts.json
-
-python scripts/package-runtime-artifact.py --merge-catalog-fragments `
-  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
-
-python scripts/package-intent-model-artifact.py --tier compact `
-  --model-file dist/upstream/Qwen3-0.6B-Q8_0.gguf `
-  --release-base-url $env:RELEASE_BASE_URL --output-dir dist/artifacts `
-  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
-
-python scripts/package-intent-model-artifact.py --tier balanced `
-  --model-file dist/upstream/Qwen3-1.7B-Q8_0.gguf `
-  --release-base-url $env:RELEASE_BASE_URL --output-dir dist/artifacts `
-  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
-
-python scripts/package-intent-model-artifact.py --verify-ready `
-  --os windows --arch x86_64 `
-  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
-
-.\scripts\build-release-bundle.ps1 -Mode Standard -VoiceAi `
-  -WhisperBuildDir C:\ci\whisper-build -WhisperVersion 1.7.6 `
-  -WhisperSourceCommit $env:PINNED_WHISPER_COMMIT `
-  -CatalogPath dist/runtime-artifacts.json
+cargo test --test intent_server_real_corpus -- --ignored --nocapture --test-threads=1
 ```
 
-The checked-in development catalog deliberately has no runtime or model download URL. `-VoiceAi` and `SCRIBE_BUILD_VOICE_AI=1` fail the build unless the current platform runtime and both exact model tiers are present. Hugging Face redirects are not embedded or followed by the app.
+The app download-path smoke streams and verifies all three official sources (about 2.7 GB total) into a temporary root and removes them afterward:
+
+```powershell
+$env:SCRIBE_RUN_OFFICIAL_ARTIFACT_SMOKE = '1'
+cargo test official_voice_artifact_downloads_smoke -- --ignored --nocapture --test-threads=1
+Remove-Item Env:SCRIBE_RUN_OFFICIAL_ARTIFACT_SMOKE
+```
 
 To stage only the faster-whisper runtime during development:
 

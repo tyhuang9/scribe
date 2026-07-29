@@ -51,7 +51,7 @@ elseif (-not $AllowEmptyCatalog) {
 
 if ($VoiceAi) {
     if (-not $CatalogPath) {
-        throw 'VoiceAi releases require a schema-2 catalog with a pinned llama runtime and both mirrored Qwen tiers.'
+        throw 'VoiceAi releases require a schema-2 catalog with the exact official pinned llama runtime and both official revision-pinned Qwen tiers.'
     }
     $env:SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS = '1'
 }
@@ -184,5 +184,5 @@ if ($Mode -eq 'Standard') {
     Write-Host 'Standard contains only bundled CPU whisper.cpp; optional runtimes need an embedded trusted catalog.'
 }
 if ($VoiceAi) {
-    Write-Host 'Voice AI catalog verified: pinned CPU llama runtime and both direct mirrored Qwen tiers are embedded.'
+    Write-Host 'Voice AI catalog verified: exact official CPU llama runtime and both official revision-pinned Qwen sources are embedded; the standard bundle still contains only whisper.cpp.'
 }
