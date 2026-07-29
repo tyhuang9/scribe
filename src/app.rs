@@ -4260,11 +4260,10 @@ impl LocalTranscriberApp {
                             if let Some(display) = self.voice_edit_display.as_ref()
                                 && display.applied_edit_count > 0
                             {
-                                badge(
-                                    ui,
-                                    &format!("{} edits", display.applied_edit_count),
-                                    ChipTone::Neutral,
-                                );
+                                ui.label(mut_text(format!(
+                                    "{} edits applied",
+                                    display.applied_edit_count
+                                )));
                             }
                         });
                         label.id

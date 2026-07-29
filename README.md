@@ -7,7 +7,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 ## Current Features
 
 - Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
-- Local JSON config for hotkey, active model, Playground ordering, managed model/runtime metadata, performance mode, theme mode, audio input device, and max recording duration.
+- Local JSON config for hotkey, active model, Playground ordering, managed model/runtime metadata, performance mode, theme mode, audio input device, recording duration, live preview, and opt-in voice editing.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default; users can type or capture a supported standard key combination and choose toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
@@ -17,6 +17,8 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
+- Optional current-recording voice commands with deterministic destructive edits and on-demand local Qwen rewriting. Ordinary dictation never starts the editor model.
+- Raw, read-only whisper.cpp live preview while recording; commands are evaluated only after authoritative final transcription.
 - Model metadata for:
   - whisper.cpp tiny.en
   - whisper.cpp base.en
@@ -214,6 +216,56 @@ scripts/build-release-bundle.sh --mode standard
 
 Runtime activation and configuration replacement are journaled for process-crash recovery. Before activation, Scribe flushes every staged runtime file and its directory tree from the leaves through the staging root. For power-loss durability, Scribe flushes file contents and containing-directory metadata on Unix and uses write-through moves on Windows; Windows removals first move entries to ignored same-directory tombstones with write-through before reclaiming them. A successful durability barrier permits transaction cleanup. If a post-commit barrier fails, Scribe reports a warning and retains the journal and backup so startup can finish or roll back from the configuration that actually survived. These guarantees depend on the filesystem and storage hardware honoring `fsync`/write-through requests.
 
+### Current-recording voice editor
+
+Voice editing is off by default and currently available on Windows x64. Settings offers Compact Qwen3 0.6B Q8 and Balanced Qwen3 1.7B Q8. The standard release bundle still contains only the CPU whisper.cpp STT runtime; the pinned llama.cpp runtime and selected Qwen model are downloaded only after an explicit Install action.
+
+The reserved English commands are `scratch that`, `undo that`, `start over`, `new line`, `new paragraph`, `replace X with Y`, `make that ...`, `rewrite that ...`, and `turn that into ...`. Prefix a reserved phrase with `literal` to dictate it. Deterministic commands run locally without AI. Only an explicit rewrite command starts an ephemeral `llama-server`, which exits after its bounded request.
+
+Final results carry a recording session ID. Stale transcription or edit events are ignored, preview text cannot execute commands, and external output happens at most once. AI ambiguity, invalid output, timeout, or failure preserves the original transcript and suppresses automatic insertion until the user chooses Retry, Use original, or Copy. Scribe retains the original only in memory until the next recording or exit.
+
+Voice-AI release metadata is intentionally separate from the bundled whisper runtime. Release CI must obtain the exact audited upstream llama.cpp b9637 ZIP/license and Qwen GGUF files, publish byte-identical artifacts at an immutable Scribe-controlled HTTPS base URL, then build a schema-2 catalog:
+
+```powershell
+python scripts/prepare-llama-runtime.py `
+  --archive dist/upstream/llama-b9637-bin-win-cpu-x64.zip `
+  --license-file dist/upstream/llama.cpp-LICENSE `
+  --output-dir dist/portable/voice-intent-llama
+
+python scripts/package-runtime-artifact.py `
+  --runtime-dir dist/portable/voice-intent-llama `
+  --runtime-id voice_intent_llama_cpp --version b9637 `
+  --os windows --arch x86_64 --device cpu `
+  --entrypoint bin/llama-server.exe `
+  --release-base-url $env:RELEASE_BASE_URL `
+  --catalog-version 1.0.0 --output-dir dist/artifacts `
+  --catalog dist/runtime-artifacts.json
+
+python scripts/package-runtime-artifact.py --merge-catalog-fragments `
+  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
+
+python scripts/package-intent-model-artifact.py --tier compact `
+  --model-file dist/upstream/Qwen3-0.6B-Q8_0.gguf `
+  --release-base-url $env:RELEASE_BASE_URL --output-dir dist/artifacts `
+  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
+
+python scripts/package-intent-model-artifact.py --tier balanced `
+  --model-file dist/upstream/Qwen3-1.7B-Q8_0.gguf `
+  --release-base-url $env:RELEASE_BASE_URL --output-dir dist/artifacts `
+  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
+
+python scripts/package-intent-model-artifact.py --verify-ready `
+  --os windows --arch x86_64 `
+  --catalog-version 1.0.0 --catalog dist/runtime-artifacts.json
+
+.\scripts\build-release-bundle.ps1 -Mode Standard -VoiceAi `
+  -WhisperBuildDir C:\ci\whisper-build -WhisperVersion 1.7.6 `
+  -WhisperSourceCommit $env:PINNED_WHISPER_COMMIT `
+  -CatalogPath dist/runtime-artifacts.json
+```
+
+The checked-in development catalog deliberately has no runtime or model download URL. `-VoiceAi` and `SCRIBE_BUILD_VOICE_AI=1` fail the build unless the current platform runtime and both exact model tiers are present. Hugging Face redirects are not embedded or followed by the app.
+
 To stage only the faster-whisper runtime during development:
 
 ```bash
@@ -346,6 +398,8 @@ The config stores:
 - last used backend
 - deprecated path/debug fields for migration compatibility
 - max recording duration
+- live transcription preview toggle
+- voice editing toggle and Compact/Balanced tier
 - close-to-tray behavior
 - automatic focused-app transcript insertion
 - clipboard restore after insertion
@@ -356,7 +410,7 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 ## Notes
 
 - sherpa-onnx, Moonshine, and Parakeet use experimental, managed sherpa-onnx Python sidecars in this build. The sidecars are short-lived local processes and currently run batch transcription only; true streaming partial transcription still needs a `SttBackend` streaming API.
-- Scribe has no cleanup/reasoning pipeline today. If one is added later, it must be local, optional, and off by default, and it must never send audio or text to a cloud service.
+- Voice editing is local, optional, and off by default. Normal dictation bypasses it; only exact command candidates enter the deterministic editor or short-lived local rewrite process.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
 - Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
@@ -376,6 +430,8 @@ The main modules are:
 - `src/config.rs`: local JSON config loading/saving.
 - `src/core.rs`: testable recording/transcription workflow reducer.
 - `src/hotkey.rs`: global hotkey parsing and registration.
+- `src/intent_server.rs`: authenticated, bounded, one-shot llama.cpp rewrite transaction.
+- `src/live_preview.rs`: raw provisional whisper.cpp preview state and overlap merging.
 - `src/models.rs`: shared STT model/result/status structs.
 - `src/stt/mod.rs`: backend trait and dispatch.
 - `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
@@ -383,3 +439,4 @@ The main modules are:
 - `src/stt/sherpa_onnx.rs`: sherpa-onnx-family child-process integration for sherpa-onnx, Moonshine, and Parakeet.
 - `src/text_output.rs`: focused-app transcript insertion through clipboard plus paste automation.
 - `src/tray.rs`: tray icon, tray menu, and tray command mapping.
+- `src/voice_editor.rs`: deterministic current-recording command parser and edit evaluator.

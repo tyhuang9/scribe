@@ -49,7 +49,7 @@ Text must meet WCAG 2.1 AA contrast on its actual surface. Status always combine
 - **Glass shell:** 1 px Hairline border, 16 px radius, 12-16 px blur only when OS compositing supports it. Fallback is Quiet Surface.
 - **Panels:** 10 px radius, quiet/translucent fill, 1 px Hairline. Use only a very low diffuse dialog shadow.
 - **Listening control:** centered 56 px circular or softly rounded tactile control plane; shallow two-sided inset. It is the one prominent physical affordance and must not glow.
-- **Transcript well:** largest page region; subtly recessed with a visible editing boundary. Copy/Clear stay subordinate at the lower edge.
+- **Transcript well:** largest page region; subtly recessed with a visible editing boundary. Copy/Clear stay subordinate at the lower edge. A completed voice-edit result may add compact Undo, Redo, and View original actions on the same wrapped action row.
 - **Primary button:** Scribe Blue fill, white label, 40 px min height except the 56 px record control. Active state translates 1 px down; disabled state explains why.
 - **Secondary/row actions:** transparent or Quiet Surface, 1 px Hairline, 32-36 px height. Destructive actions other than the current transcript Clear behavior remain visually separated.
 - **Navigation:** icon target is 40 x 40 px, with an accessible name and tooltip. Selected state uses a quiet blue-tinted inset, not a floating pill.
@@ -60,9 +60,13 @@ Text must meet WCAG 2.1 AA contrast on its actual surface. Status always combine
 
 ## 6. Interaction, states, and motion
 
-- Listening has explicit ready, recording, stopping, transcribing, completed, and error states. Record/stop is never ambiguous.
+- Listening has explicit ready, recording, stopping, transcribing, editing, completed, and error states. Record/stop is never ambiguous.
 - Start is disabled until a runnable local model/runtime exists. Its explanation directs people to Models and never suggests cloud sign-in.
 - Copy and Clear act only on the transcript. Clear immediately empties the transcript in the current product; this visual branch does not change that behavior or add a confirmation. Auto-insert errors keep the transcript visible.
+- Live preview is visually provisional and read-only. It never exposes edit actions and is replaced by the authoritative final result.
+- Voice editing is an opt-in Recording subsection with a binary toggle, exclusive Compact/Balanced radios, readiness, verified download progress, and Install/Remove commands. It must fit the existing Settings card and wrap at the 840 px minimum viewport.
+- Successful edits show a quiet applied-count label. Ambiguous or failed edits preserve the original in a single review panel with Retry, Use original, and Copy; review never triggers automatic insertion.
+- Undo, Redo, and View original change only Scribe's displayed transcript. They never imply that text already pasted into another application was recalled.
 - Model setup is progressive: Install can prepare a local shared runtime then download the model. Runtime maintenance remains collapsed.
 - Playground selection is drafted until Apply. It uses a pointer shield, initial focus, Cancel/Escape, and opener-focus restoration. Empty selection is valid but cannot run.
 - Settings save immediately with quiet inline "Saved" feedback. Toggle/radio state is communicated by text, icon, and position.
