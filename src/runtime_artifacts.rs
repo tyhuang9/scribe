@@ -2030,6 +2030,19 @@ pub(crate) fn managed_install_matches_artifact(
         && install.device.as_deref() == Some(artifact.device.as_str())
 }
 
+pub(crate) fn managed_model_install_matches_artifact(
+    install: &config::ManagedModelInstall,
+    artifact: &IntentModelArtifact,
+) -> bool {
+    let Some(url) = artifact.url.as_deref() else {
+        return false;
+    };
+    install.source.as_deref() == Some(url)
+        && install.version.as_deref() == Some(artifact.version.as_str())
+        && install.sha256.as_deref() == Some(artifact.sha256.as_str())
+        && install.platform.as_deref() == Some(config::current_platform_key().as_str())
+}
+
 fn validate_archive_entry_count(count: usize) -> Result<(), String> {
     const MAX_ARCHIVE_ENTRIES: usize = 100_000;
     if count > MAX_ARCHIVE_ENTRIES {
@@ -2178,9 +2191,55 @@ mod tests {
         path: PathBuf,
     ) -> config::ManagedModelInstall {
         let mut install = config::ManagedModelInstall::app_managed(path, "test-release");
+        install.source = model.url.clone();
         install.version = Some(model.version.clone());
         install.sha256 = Some(model.sha256.clone());
         install
+    }
+
+    #[test]
+    fn managed_model_install_must_match_approved_artifact_metadata() {
+        let model = test_intent_model(b"model", 5);
+        let mut install = test_model_install(&model, PathBuf::from("voice.gguf"));
+
+        assert!(managed_model_install_matches_artifact(&install, &model));
+
+        install.sha256 = Some("0".repeat(64));
+        assert!(!managed_model_install_matches_artifact(&install, &model));
+        install.sha256 = Some(model.sha256.clone());
+        install.version = Some("stale-version".to_owned());
+        assert!(!managed_model_install_matches_artifact(&install, &model));
+        install.version = Some(model.version.clone());
+        install.platform = Some("linux-x86_64".to_owned());
+        assert!(!managed_model_install_matches_artifact(&install, &model));
+    }
+
+    #[test]
+    fn managed_runtime_install_must_match_approved_artifact_metadata() {
+        let artifact = test_artifact(b"runtime", 7, 7);
+        let mut install =
+            config::ManagedRuntimeInstall::app_managed(PathBuf::from("runtime"), &artifact.url);
+        install.version = Some(artifact.version.clone());
+        install.sha256 = Some(artifact.sha256.clone());
+        install.platform = Some(format!("{}-{}", artifact.os, artifact.arch));
+        install.device = Some(artifact.device.as_str().to_owned());
+
+        assert!(managed_install_matches_artifact(&install, &artifact));
+
+        install.device = Some("gpu".to_owned());
+        assert!(!managed_install_matches_artifact(&install, &artifact));
+        install.device = Some(artifact.device.as_str().to_owned());
+        install.source = Some("https://example.com/stale-runtime.zip".to_owned());
+        assert!(!managed_install_matches_artifact(&install, &artifact));
+    }
+
+    #[test]
+    fn unpublished_model_artifact_never_matches_an_install() {
+        let mut model = test_intent_model(b"model", 5);
+        let install = test_model_install(&model, PathBuf::from("voice.gguf"));
+        model.url = None;
+
+        assert!(!managed_model_install_matches_artifact(&install, &model));
     }
 
     fn commit_test_model(

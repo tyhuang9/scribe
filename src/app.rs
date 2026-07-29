@@ -1438,25 +1438,37 @@ fn resolve_voice_editing_artifacts_for_tier(
         return Err("Local voice rewriting is currently supported only on Windows x64".to_owned());
     }
     let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
-    let runtime = config
-        .managed_runtimes
-        .get(runtime_id)
-        .map(|install| install.path.clone())
-        .ok_or_else(|| {
-            "Install the local voice editor runtime before using AI rewrites".to_owned()
-        })?;
+    let runtime_install = config.managed_runtimes.get(runtime_id).ok_or_else(|| {
+        "Install the local voice editor runtime before using AI rewrites".to_owned()
+    })?;
+    let runtime_artifact =
+        runtime_artifacts::embedded_artifact(runtime_id, RuntimeDevicePack::Cpu)?.ok_or_else(
+            || "This build does not publish an approved local voice editor runtime".to_owned(),
+        )?;
+    let runtime = runtime_install.path.clone();
     let runtime_root = config::runtime_storage_dir().join(runtime_id);
-    if !managed_voice_artifact_is_safe(&runtime, &runtime_root) {
+    if !runtime_artifacts::managed_install_matches_artifact(runtime_install, &runtime_artifact)
+        || !managed_voice_artifact_is_safe(&runtime, &runtime_root)
+    {
         return Err("The installed local voice editor runtime is missing or invalid".to_owned());
     }
 
-    let model = config
+    let model_install = config
         .managed_models
         .get(tier.model_id())
-        .map(|install| install.path.clone())
         .ok_or_else(|| format!("Install the {} voice editing model first", tier.label()))?;
+    let model_artifact = runtime_artifacts::embedded_intent_model(intent_model_tier(tier))?
+        .ok_or_else(|| {
+            format!(
+                "This build does not publish an approved {} voice editing model",
+                tier.label()
+            )
+        })?;
+    let model = model_install.path.clone();
     let model_root = config::model_storage_dir(config);
-    if !managed_voice_artifact_is_safe(&model, &model_root) {
+    if !runtime_artifacts::managed_model_install_matches_artifact(model_install, &model_artifact)
+        || !managed_voice_artifact_is_safe(&model, &model_root)
+    {
         return Err(format!(
             "The installed {} voice editing model is missing or invalid",
             tier.label()
