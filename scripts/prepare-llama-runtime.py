@@ -26,6 +26,7 @@ LICENSE_SIZE = 1_078
 LICENSE_SHA256 = "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
 ENTRYPOINT = "bin/llama-server.exe"
 ATTESTATION_FILENAME = ".scribe-llama-runtime-attestation.json"
+SOURCE_ARCHIVE_FILENAME = ".scribe-llama-runtime-source.zip"
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +155,8 @@ def write_attestation(output_dir: Path) -> None:
             raise ValueError(f"prepared runtime contains a non-regular entry: {path}")
         if not path.is_file():
             continue
+        if path.relative_to(output_dir).as_posix() == SOURCE_ARCHIVE_FILENAME:
+            continue
         digest, size = hash_and_size(path)
         files.append(
             {
@@ -194,7 +197,10 @@ def main() -> int:
         raise ValueError(f"refusing to overwrite runtime output: {args.output_dir}")
     args.output_dir.mkdir(parents=True)
     try:
-        with zipfile.ZipFile(args.archive) as archive:
+        verified_archive = args.output_dir / SOURCE_ARCHIVE_FILENAME
+        copy_file_no_replace(args.archive, verified_archive)
+        verify_file(verified_archive, UPSTREAM_SIZE, UPSTREAM_SHA256, "copied llama.cpp archive")
+        with zipfile.ZipFile(verified_archive) as archive:
             for info in selected_payload(archive):
                 write_member(archive, info, args.output_dir / "bin" / info.filename)
         copy_file_no_replace(args.license_file, args.output_dir / "LICENSE.llama.cpp")

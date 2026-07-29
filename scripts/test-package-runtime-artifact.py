@@ -30,6 +30,7 @@ NATIVE_ARCH = {
 
 class RuntimeArtifactPackagerTests(unittest.TestCase):
     def setUp(self):
+        self.original_voice_provenance = MODULE.VOICE_RUNTIME_PROVENANCE.copy()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.runtime = self.root / "runtime"
@@ -39,6 +40,8 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         self.write_manifest("vosk")
 
     def tearDown(self):
+        MODULE.VOICE_RUNTIME_PROVENANCE.clear()
+        MODULE.VOICE_RUNTIME_PROVENANCE.update(self.original_voice_provenance)
         self.temporary.cleanup()
 
     def write_manifest(self, runtime_id, version="0.3.45"):
@@ -52,17 +55,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             "portable": True,
         }
         if runtime_id == "voice_intent_llama_cpp":
-            manifest.update(
-                {
-                    "upstream_repository": "ggml-org/llama.cpp",
-                    "upstream_revision": "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
-                    "upstream_asset": "llama-b9637-bin-win-cpu-x64.zip",
-                    "upstream_sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
-                    "upstream_size_bytes": 16_906_751,
-                    "license": "MIT",
-                    "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
-                }
-            )
+            manifest.update(MODULE.VOICE_RUNTIME_PROVENANCE)
         (self.runtime / "runtime-manifest.json").write_text(
             json.dumps(manifest),
             encoding="utf-8",
@@ -83,6 +76,11 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
     def write_voice_attestation(self):
         files = []
         for path in sorted(candidate for candidate in self.runtime.rglob("*") if candidate.is_file()):
+            if path.name in (
+                MODULE.VOICE_RUNTIME_ATTESTATION,
+                MODULE.VOICE_RUNTIME_SOURCE_ARCHIVE,
+            ):
+                continue
             digest, size = MODULE.hash_and_size(path)
             files.append(
                 {
@@ -104,6 +102,28 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         (self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION).write_text(
             json.dumps(attestation), encoding="utf-8"
         )
+
+    def prepare_fake_voice_runtime(self):
+        shutil.rmtree(self.runtime)
+        self.entrypoint_relative = "bin/llama-server.exe"
+        self.entrypoint = self.runtime / "bin" / "llama-server.exe"
+        self.write_entrypoint(self.entrypoint)
+        dll = self.runtime / "bin" / "ggml.dll"
+        dll.write_bytes(b"MZfixture-dll")
+        license_file = self.runtime / "LICENSE.llama.cpp"
+        license_file.write_bytes(b"L" * MODULE.VOICE_RUNTIME_LICENSE_SIZE)
+        source_archive = self.runtime / MODULE.VOICE_RUNTIME_SOURCE_ARCHIVE
+        with zipfile.ZipFile(source_archive, "w") as archive:
+            archive.write(self.entrypoint, "llama-server.exe")
+            archive.write(dll, "ggml.dll")
+        source_digest, source_size = MODULE.hash_and_size(source_archive)
+        MODULE.VOICE_RUNTIME_PROVENANCE["upstream_sha256"] = source_digest
+        MODULE.VOICE_RUNTIME_PROVENANCE["upstream_size_bytes"] = source_size
+        MODULE.VOICE_RUNTIME_PROVENANCE["license_sha256"] = hashlib.sha256(
+            license_file.read_bytes()
+        ).hexdigest()
+        self.write_manifest("voice_intent_llama_cpp", "b9637")
+        self.write_voice_attestation()
 
     def command(self, base_url="https://downloads.acme.dev/releases/scribe/1.0.0"):
         return [
@@ -161,6 +181,8 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             self.assertEqual(sorted(packaged.namelist()), [self.entrypoint_relative, "runtime-manifest.json"])
 
     def test_packages_voice_intent_llama_as_a_cpu_only_auxiliary_runtime(self):
+        if (NATIVE_OS, NATIVE_ARCH) == ("windows", "x86_64"):
+            self.skipTest("positive packaging requires the pinned upstream llama archive")
         self.write_manifest("voice_intent_llama_cpp", "b9637")
         self.write_voice_attestation()
         command = self.command()
@@ -169,43 +191,19 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
 
         result = subprocess.run(command, capture_output=True, text=True, check=False)
 
-        if (NATIVE_OS, NATIVE_ARCH) != ("windows", "x86_64"):
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Windows x86_64 CPU-only", result.stderr)
-            return
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        fragment = json.loads(Path(json.loads(result.stdout)["fragment"]).read_text(encoding="utf-8"))
-        self.assertEqual(fragment["runtime_id"], "voice_intent_llama_cpp")
-        self.assertEqual(fragment["device"], "cpu")
-        self.assertEqual(
-            fragment["upstream_revision"],
-            "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
-        )
-        self.assertEqual(
-            fragment["upstream_sha256"],
-            "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
-        )
-        self.assertEqual(
-            fragment["license_sha256"],
-            "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
-        )
-
-        gpu = command.copy()
-        gpu[gpu.index("--device") + 1] = "gpu"
-        rejected = subprocess.run(gpu, capture_output=True, text=True, check=False)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("does not support GPU", rejected.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Windows x86_64 CPU-only", result.stderr)
 
     def test_voice_runtime_rejects_missing_or_mismatched_preparation_attestation(self):
-        self.write_manifest("voice_intent_llama_cpp", "b9637")
+        self.prepare_fake_voice_runtime()
         entrypoint = MODULE.normalized_entrypoint(self.entrypoint_relative)
+        attestation_path = self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION
+        attestation_path.unlink()
         files = MODULE.runtime_files(self.runtime)
         with self.assertRaisesRegex(ValueError, "attestation is required"):
             MODULE.verify_voice_runtime_attestation(self.runtime, files, entrypoint)
 
         self.write_voice_attestation()
-        attestation_path = self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION
         attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
         attestation["upstream_revision"] = "a" * 40
         attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
@@ -222,6 +220,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             self.runtime, files, entrypoint
         )
         self.assertNotIn(self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION, payload)
+        self.assertNotIn(self.runtime / MODULE.VOICE_RUNTIME_SOURCE_ARCHIVE, payload)
         self.assertEqual(
             set(attested_files),
             {path.relative_to(self.runtime).as_posix() for path in payload},
@@ -237,6 +236,13 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
                 attested_files,
             )
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            MODULE.verify_voice_runtime_attestation(
+                self.runtime, MODULE.runtime_files(self.runtime), entrypoint
+            )
+
+        attestation_path.unlink()
+        self.write_voice_attestation()
+        with self.assertRaisesRegex(ValueError, "not authenticated by the pinned source archive"):
             MODULE.verify_voice_runtime_attestation(
                 self.runtime, MODULE.runtime_files(self.runtime), entrypoint
             )

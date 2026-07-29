@@ -1299,6 +1299,13 @@ impl LocalTranscriberApp {
     }
 
     fn save_config(&mut self) {
+        self.save_config_with_model_updates(&[]);
+    }
+
+    fn save_config_with_model_updates(
+        &mut self,
+        model_updates: &[(&str, Option<config::ManagedModelInstall>)],
+    ) {
         config::normalize_config(&mut self.config);
         #[cfg(test)]
         if self.config_path.is_none() {
@@ -1306,7 +1313,12 @@ impl LocalTranscriberApp {
             self.refresh_playground_cards_from_config();
             return;
         }
-        match config::save_config_merging_managed_runtimes(&self.config) {
+        let save = if model_updates.is_empty() {
+            config::save_config_merging_managed_runtimes(&self.config)
+        } else {
+            config::save_config_with_managed_updates(&self.config, model_updates, None)
+        };
+        match save {
             Ok(committed) => {
                 self.config = committed.config;
                 if self.config_path.is_none() {
@@ -2011,6 +2023,7 @@ impl LocalTranscriberApp {
                 AppEvent::ModelDownloadDone { model_id, path } => {
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
+                    let mut managed_update = None;
                     if let Some(model) = config::configured_models(&self.config)
                         .into_iter()
                         .find(|model| model.id == model_id)
@@ -2020,17 +2033,23 @@ impl LocalTranscriberApp {
                                 runtime_status_for_model(&self.config, &active)
                                     == ModelRuntimeStatus::Ready
                             });
-                        self.config.managed_models.insert(
-                            model_id.clone(),
-                            config::ManagedModelInstall::app_managed(path, "managed-download"),
-                        );
+                        let install =
+                            config::ManagedModelInstall::app_managed(path, "managed-download");
+                        self.config
+                            .managed_models
+                            .insert(model_id.clone(), install.clone());
+                        managed_update = Some(install);
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.selected_default_model = model_id.clone();
                             self.config.last_used_backend = model.backend;
                         }
                     }
-                    self.save_config();
+                    if let Some(install) = managed_update {
+                        self.save_config_with_model_updates(&[(model_id.as_str(), Some(install))]);
+                    } else {
+                        self.save_config();
+                    }
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = match config::configured_models(&self.config)
                         .into_iter()
@@ -2717,7 +2736,7 @@ impl LocalTranscriberApp {
             select_first_installed_model(&mut self.config);
         }
 
-        self.save_config();
+        self.save_config_with_model_updates(&[(model.id.as_str(), None)]);
         self.status = TranscriptionStatus::Idle;
         self.status_message = match removal {
             Ok(true) => format!("Uninstalled {}.", model.name),

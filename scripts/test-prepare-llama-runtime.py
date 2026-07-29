@@ -80,6 +80,7 @@ class PrepareLlamaRuntimeTests(unittest.TestCase):
             server.write_bytes(b"MZserver")
             license_file = root / "LICENSE.llama.cpp"
             license_file.write_bytes(b"license")
+            (root / MODULE.SOURCE_ARCHIVE_FILENAME).write_bytes(b"verified source")
             MODULE.write_manifest(root)
 
             MODULE.write_attestation(root)

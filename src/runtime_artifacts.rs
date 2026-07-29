@@ -129,6 +129,8 @@ struct IntentModelTransactionJournal {
     model_id: String,
     phase: IntentModelTransactionPhase,
     had_previous_model: bool,
+    previous_sha256: Option<String>,
+    previous_size_bytes: Option<u64>,
     previous_install: Option<config::ManagedModelInstall>,
     new_install: Option<config::ManagedModelInstall>,
     expected_sha256: Option<String>,
@@ -146,6 +148,8 @@ pub(crate) struct IntentModelReplacement {
     pub(crate) installed_path: PathBuf,
     model_id: String,
     backup_path: Option<PathBuf>,
+    previous_sha256: Option<String>,
+    previous_size_bytes: Option<u64>,
     expected_sha256: Option<String>,
     expected_size_bytes: Option<u64>,
     persistence_install: Option<Option<config::ManagedModelInstall>>,
@@ -862,10 +866,12 @@ impl IntentModelReplacement {
         write_intent_model_journal(
             &self.installed_path,
             &IntentModelTransactionJournal {
-                version: 1,
+                version: 2,
                 model_id: self.model_id.clone(),
                 phase: IntentModelTransactionPhase::AwaitingPersistence,
                 had_previous_model: self.backup_path.is_some(),
+                previous_sha256: self.previous_sha256.clone(),
+                previous_size_bytes: self.previous_size_bytes,
                 previous_install: self._lock.previous_install.clone(),
                 new_install: new_install.cloned(),
                 expected_sha256: self.expected_sha256.clone(),
@@ -1071,11 +1077,18 @@ fn publish_intent_model_transaction(
         ));
     }
     let had_previous_model = target.exists();
+    let previous_fingerprint = had_previous_model
+        .then(|| intent_model_file_fingerprint(&target))
+        .transpose()?;
     let mut journal = IntentModelTransactionJournal {
-        version: 1,
+        version: 2,
         model_id: model.model_id.clone(),
         phase: IntentModelTransactionPhase::Prepared,
         had_previous_model,
+        previous_sha256: previous_fingerprint
+            .as_ref()
+            .map(|(sha256, _)| sha256.clone()),
+        previous_size_bytes: previous_fingerprint.as_ref().map(|(_, size)| *size),
         previous_install: install_lock.previous_install.clone(),
         new_install: None,
         expected_sha256: expected.as_ref().map(|(sha256, _)| sha256.clone()),
@@ -1141,6 +1154,10 @@ fn publish_intent_model_transaction(
         installed_path: target,
         model_id: model.model_id.clone(),
         backup_path: had_previous_model.then_some(backup),
+        previous_sha256: previous_fingerprint
+            .as_ref()
+            .map(|(sha256, _)| sha256.clone()),
+        previous_size_bytes: previous_fingerprint.map(|(_, size)| size),
         expected_sha256: expected.as_ref().map(|(sha256, _)| sha256.clone()),
         expected_size_bytes: expected.map(|(_, size)| size),
         persistence_install: None,
@@ -1298,7 +1315,20 @@ fn recover_intent_model_rollback(
     journal: &IntentModelTransactionJournal,
 ) -> Result<(), String> {
     if journal.had_previous_model {
-        rollback_intent_model_files(target, Some(backup), true)
+        if backup.exists() {
+            rollback_intent_model_files(target, Some(backup), true)
+        } else if intent_model_file_matches(
+            target,
+            journal.previous_size_bytes,
+            journal.previous_sha256.as_deref(),
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the previous voice intent model backup {} is missing and the restored target does not match its recorded fingerprint",
+                backup.display()
+            ))
+        }
     } else {
         rollback_intent_model_files(target, None, false)
     }
@@ -1348,6 +1378,42 @@ fn intent_model_file_matches(
         }
     }
     format!("{:x}", hasher.finalize()) == expected_sha256
+}
+
+fn intent_model_file_fingerprint(path: &Path) -> Result<(String, u64), String> {
+    let mut file = File::open(path).map_err(|err| {
+        format!(
+            "could not open voice intent model {}: {err}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|err| {
+        format!(
+            "could not inspect voice intent model {}: {err}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "voice intent model {} is not a regular file",
+            path.display()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|err| {
+            format!(
+                "could not hash voice intent model {}: {err}",
+                path.display()
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), metadata.len()))
 }
 
 fn read_intent_model_journal(
@@ -1402,7 +1468,11 @@ fn validate_intent_model_journal(
     path: &Path,
     journal: &IntentModelTransactionJournal,
 ) -> Result<(), String> {
-    if journal.version != 1 || journal.model_id != model_id {
+    if journal.version != 2
+        || journal.model_id != model_id
+        || journal.had_previous_model
+            != (journal.previous_sha256.is_some() && journal.previous_size_bytes.is_some())
+    {
         return Err(format!(
             "voice intent model transaction {} has an unexpected identity",
             path.display()
@@ -2590,6 +2660,51 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&target).unwrap(), old);
         assert!(!intent_model_transaction_path(&target, "backup").exists());
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_finishes_rollback_after_backup_was_already_restored() {
+        let old = b"previous verified gguf";
+        let new = b"replacement verified gguf";
+        let model = test_intent_model(new, new.len() as u64);
+        let root = temp_target("model-rollback-idempotent");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+        let previous = config::ManagedModelInstall::new(target.clone());
+        let lock = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let partial = unique_intent_model_partial_path(&target);
+        fs::write(&partial, new).unwrap();
+        let mut replacement =
+            publish_verified_intent_model(&model, target.clone(), partial, lock, |_| Ok(()))
+                .unwrap();
+        let install = test_model_install(&model, target.clone());
+        replacement.prepare_persistence(Some(&install)).unwrap();
+        drop(replacement);
+
+        let backup = intent_model_transaction_path(&target, "backup");
+        rollback_intent_model_files(&target, Some(&backup), true).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert!(!backup.exists());
+        assert!(intent_model_transaction_path(&target, "transaction").exists());
+
+        let recovered = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert!(!intent_model_transaction_path(&target, "transaction").exists());
         drop(recovered);
         fs::remove_dir_all(root).unwrap();
     }

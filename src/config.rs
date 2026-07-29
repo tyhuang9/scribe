@@ -354,6 +354,7 @@ fn save_config_merging_managed_runtimes_at(
     let lock = lock_config_path(path, Duration::from_secs(10))?;
     let persisted = recover_config_file(path)?.unwrap_or_default();
     let mut merged = config.clone();
+    merged.managed_models = persisted.managed_models;
     merged.managed_runtimes = persisted.managed_runtimes;
     normalize_config(&mut merged);
     let durability_warning = save_config_file_locked(path, &merged, &lock)?;
@@ -1355,6 +1356,38 @@ mod tests {
         );
         let persisted = read_config_file(&path).unwrap();
         assert_eq!(persisted.managed_runtimes, merged.config.managed_runtimes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_save_preserves_model_records_committed_by_another_writer() {
+        let path = config_test_path("ordinary-save-preserves-models");
+        let root = path.parent().unwrap();
+        let model = ManagedModelInstall::new(root.join("voice.gguf"));
+        let mut committed = AppConfig {
+            model_storage_dir: root.to_path_buf(),
+            ..AppConfig::default()
+        };
+        committed
+            .managed_models
+            .insert("voice".to_owned(), model.clone());
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        save_config_file_locked(&path, &committed, &lock).unwrap();
+        drop(lock);
+
+        let stale = AppConfig {
+            hotkey: "Ctrl+Shift+V".to_owned(),
+            model_storage_dir: root.to_path_buf(),
+            ..AppConfig::default()
+        };
+        let merged = save_config_merging_managed_runtimes_at(&path, &stale).unwrap();
+
+        assert_eq!(merged.config.hotkey, "Ctrl+Shift+V");
+        assert_eq!(merged.config.managed_models.get("voice"), Some(&model));
+        assert_eq!(
+            read_config_file(&path).unwrap().managed_models.get("voice"),
+            Some(&model)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

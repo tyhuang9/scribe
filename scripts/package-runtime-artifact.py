@@ -41,6 +41,8 @@ VOICE_RUNTIME_PROVENANCE = {
     "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
 }
 VOICE_RUNTIME_ATTESTATION = ".scribe-llama-runtime-attestation.json"
+VOICE_RUNTIME_SOURCE_ARCHIVE = ".scribe-llama-runtime-source.zip"
+VOICE_RUNTIME_LICENSE_SIZE = 1_078
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,8 +166,13 @@ def verify_voice_runtime_attestation(
     root: Path, files: list[Path], entrypoint: PurePosixPath
 ) -> tuple[list[Path], dict[str, tuple[str, int]]]:
     attestation_path = root / VOICE_RUNTIME_ATTESTATION
+    source_archive = root / VOICE_RUNTIME_SOURCE_ARCHIVE
     if attestation_path not in files:
         raise ValueError("prepared llama runtime attestation is required")
+    if source_archive not in files:
+        raise ValueError("verified pinned llama source archive is required")
+    if entrypoint.as_posix() != "bin/llama-server.exe":
+        raise ValueError("prepared llama runtime must use bin/llama-server.exe")
     try:
         attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -208,7 +215,7 @@ def verify_voice_runtime_attestation(
         ):
             raise ValueError("prepared llama runtime attestation has an invalid file digest")
         expected_files[relative_name] = (digest, size)
-    payload = [path for path in files if path != attestation_path]
+    payload = [path for path in files if path not in (attestation_path, source_archive)]
     actual_names = {path.relative_to(root).as_posix() for path in payload}
     if actual_names != set(expected_files):
         raise ValueError("prepared llama runtime files do not match the attestation")
@@ -216,7 +223,69 @@ def verify_voice_runtime_attestation(
         relative = path.relative_to(root).as_posix()
         if hash_and_size(path) != expected_files[relative]:
             raise ValueError(f"prepared llama runtime file digest mismatch: {relative}")
+    authenticated_files = authenticated_voice_runtime_files(source_archive)
+    if set(expected_files) != {
+        *authenticated_files,
+        "LICENSE.llama.cpp",
+        "runtime-manifest.json",
+    }:
+        raise ValueError("prepared llama runtime contains files not authenticated by its sources")
+    for relative, fingerprint in authenticated_files.items():
+        if expected_files.get(relative) != fingerprint:
+            raise ValueError(
+                f"prepared llama runtime file is not authenticated by the pinned source archive: {relative}"
+            )
+    license_fingerprint = expected_files.get("LICENSE.llama.cpp")
+    if license_fingerprint != (
+        VOICE_RUNTIME_PROVENANCE["license_sha256"],
+        VOICE_RUNTIME_LICENSE_SIZE,
+    ):
+        raise ValueError("prepared llama runtime license does not match the pinned license")
     return payload, expected_files
+
+
+def authenticated_voice_runtime_files(source_archive: Path) -> dict[str, tuple[str, int]]:
+    if hash_and_size(source_archive) != (
+        VOICE_RUNTIME_PROVENANCE["upstream_sha256"],
+        VOICE_RUNTIME_PROVENANCE["upstream_size_bytes"],
+    ):
+        raise ValueError("llama source archive does not match the pinned upstream bytes")
+    authenticated = {}
+    try:
+        with zipfile.ZipFile(source_archive) as archive:
+            for info in archive.infolist():
+                name = info.filename
+                path = PurePosixPath(name)
+                if (
+                    info.is_dir()
+                    or path.is_absolute()
+                    or len(path.parts) != 1
+                    or path.parts[0] in (".", "..")
+                    or "\\" in name
+                ):
+                    continue
+                folded = name.casefold()
+                if folded != "llama-server.exe" and not folded.endswith(".dll"):
+                    continue
+                relative = f"bin/{name}"
+                if relative.casefold() in {candidate.casefold() for candidate in authenticated}:
+                    raise ValueError("pinned llama source archive has duplicate runtime files")
+                digest = hashlib.sha256()
+                size = 0
+                with archive.open(info) as source:
+                    while chunk := source.read(1024 * 1024):
+                        size += len(chunk)
+                        digest.update(chunk)
+                if size != info.file_size:
+                    raise ValueError(f"pinned llama source entry size mismatch: {name}")
+                authenticated[relative] = (digest.hexdigest(), size)
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"pinned llama source archive is invalid: {error}") from error
+    if "bin/llama-server.exe" not in authenticated or not any(
+        relative.casefold().endswith(".dll") for relative in authenticated
+    ):
+        raise ValueError("pinned llama source archive lacks the required runtime files")
+    return authenticated
 
 
 def smoke_validate(root: Path, entrypoint: PurePosixPath) -> None:
