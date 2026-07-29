@@ -804,15 +804,15 @@ fn next_trigger(text: &str, from: usize) -> Option<TriggerMatch> {
 fn trigger_at(text: &str, index: usize) -> Option<TriggerMatch> {
     if let Some(literal_end) = match_word(text, index, "literal") {
         let command_start = skip_ascii_whitespace(text, literal_end);
-        if command_start > literal_end {
-            if let Some(command) = command_at(text, command_start) {
-                let literal = trim_command_spacing(&text[command_start..command.end]);
-                return Some(TriggerMatch {
-                    start: index,
-                    end: command.end,
-                    kind: TriggerKind::Literal(literal),
-                });
-            }
+        if command_start > literal_end
+            && let Some(command) = command_at(text, command_start)
+        {
+            let literal = trim_command_spacing(&text[command_start..command.end]);
+            return Some(TriggerMatch {
+                start: index,
+                end: command.end,
+                kind: TriggerKind::Literal(literal),
+            });
         }
     }
     command_at(text, index)
@@ -976,7 +976,7 @@ fn rfind_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
                 .get(*index..index.saturating_add(needle.len()))
                 .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
         })
-        .last()
+        .next_back()
 }
 
 #[cfg(test)]
