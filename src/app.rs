@@ -59,6 +59,7 @@ const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SEMANTIC_EDIT_CANDIDATES: usize = 4;
+const VOICE_EDIT_TRANSACTION_DURATION: Duration = Duration::from_secs(3 * 60);
 const FINALIZING_PREVIEW_MESSAGE: &str = "Finishing live preview; final transcription starts next.";
 const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
     (30, "0.5 minutes"),
@@ -2396,11 +2397,20 @@ impl LocalTranscriberApp {
         match thread::Builder::new()
             .name("voice-edit-transaction".to_owned())
             .spawn(move || {
+                let transaction_deadline = Instant::now() + VOICE_EDIT_TRANSACTION_DURATION;
                 let outcome = resolve_voice_edit_plan_with(&worker_plan, |candidate| {
                     if worker_cancellation.is_cancelled() {
                         return VoiceEditDecision::RequireReview {
                             candidate_id: candidate.id,
                             reason: "Voice edit was cancelled".to_owned(),
+                        };
+                    }
+                    let remaining = transaction_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return VoiceEditDecision::RequireReview {
+                            candidate_id: candidate.id,
+                            reason: "Voice editing reached its three-minute transaction limit"
+                                .to_owned(),
                         };
                     }
                     let request = IntentTransactionRequest {
@@ -2411,6 +2421,7 @@ impl LocalTranscriberApp {
                         candidate_id: candidate.id,
                         target_text: candidate.target_text.clone(),
                         instruction: candidate.instruction.clone(),
+                        max_duration: remaining,
                     };
                     intent_decision_from_result(
                         candidate.id,
