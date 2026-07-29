@@ -1366,6 +1366,7 @@ impl LocalTranscriberApp {
                 TranscriptionStatus::Listening
                     | TranscriptionStatus::Finalizing
                     | TranscriptionStatus::Transcribing
+                    | TranscriptionStatus::Editing
             )
             || self.model_downloads.values().any(|status| {
                 matches!(
@@ -1454,7 +1455,9 @@ impl LocalTranscriberApp {
         }
         if matches!(
             self.status,
-            TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+            TranscriptionStatus::Finalizing
+                | TranscriptionStatus::Transcribing
+                | TranscriptionStatus::Editing
         ) || self.pending_final_transcription.is_some()
             || self.live_preview.has_in_flight_job()
         {
@@ -2543,7 +2546,9 @@ impl LocalTranscriberApp {
             recording: self.active_recording.is_some(),
             transcribing: matches!(
                 self.status,
-                TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+                TranscriptionStatus::Finalizing
+                    | TranscriptionStatus::Transcribing
+                    | TranscriptionStatus::Editing
             ),
             playground_jobs: self.playground_pending > 0,
             model_download: model_download_uses_runtime(
@@ -3061,7 +3066,9 @@ impl LocalTranscriberApp {
                         let finalizing = !listening
                             && (matches!(
                                 self.status,
-                                TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+                                TranscriptionStatus::Finalizing
+                                    | TranscriptionStatus::Transcribing
+                                    | TranscriptionStatus::Editing
                             ) || self.pending_final_transcription.is_some()
                                 || self.live_preview.has_in_flight_job());
                         let disabled_tooltip = if finalizing {
@@ -5755,6 +5762,7 @@ fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
         TranscriptionStatus::Listening => ChipTone::Active,
         TranscriptionStatus::Finalizing => ChipTone::Warning,
         TranscriptionStatus::Transcribing => ChipTone::Warning,
+        TranscriptionStatus::Editing => ChipTone::Warning,
         TranscriptionStatus::Error => ChipTone::Error,
     };
     badge(ui, &status.to_string(), tone);

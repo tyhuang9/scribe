@@ -51,6 +51,10 @@ pub struct AppConfig {
     pub max_recording_seconds: u32,
     #[serde(default, alias = "live_whisper_preview")]
     pub live_transcription_enabled: bool,
+    #[serde(default)]
+    pub voice_editing_enabled: bool,
+    #[serde(default)]
+    pub voice_editing_model_tier: VoiceEditingModelTier,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default = "default_true")]
@@ -198,6 +202,32 @@ pub enum HotkeyMode {
     HoldToTalk,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEditingModelTier {
+    Compact,
+    #[default]
+    Balanced,
+}
+
+impl VoiceEditingModelTier {
+    pub const ALL: [Self; 2] = [Self::Compact, Self::Balanced];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Balanced => "Balanced",
+        }
+    }
+
+    pub fn model_id(self) -> &'static str {
+        match self {
+            Self::Compact => "qwen3_0_6b_q8_0",
+            Self::Balanced => "qwen3_1_7b_q8_0",
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -221,6 +251,8 @@ impl Default for AppConfig {
             debug_mode: false,
             max_recording_seconds: default_max_recording_seconds(),
             live_transcription_enabled: false,
+            voice_editing_enabled: false,
+            voice_editing_model_tier: VoiceEditingModelTier::Balanced,
             close_to_tray: true,
             auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
@@ -1365,6 +1397,11 @@ mod tests {
         assert!(config.model_storage_dir.ends_with("models"));
         assert_eq!(config.max_recording_seconds, 30);
         assert!(!config.live_transcription_enabled);
+        assert!(!config.voice_editing_enabled);
+        assert_eq!(
+            config.voice_editing_model_tier,
+            VoiceEditingModelTier::Balanced
+        );
     }
 
     #[test]
@@ -1375,6 +1412,11 @@ mod tests {
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(!config.auto_insert_transcript);
         assert!(!config.live_transcription_enabled);
+        assert!(!config.voice_editing_enabled);
+        assert_eq!(
+            config.voice_editing_model_tier,
+            VoiceEditingModelTier::Balanced
+        );
         assert_eq!(config.max_recording_seconds, 600);
     }
 
@@ -1421,6 +1463,41 @@ mod tests {
         let migrated = serde_json::to_value(migrated).unwrap();
         assert_eq!(migrated["live_transcription_enabled"], true);
         assert!(migrated.get("live_whisper_preview").is_none());
+    }
+
+    #[test]
+    fn voice_editing_is_opt_in_and_model_tiers_have_stable_names() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("voice_editing_enabled");
+        legacy.remove("voice_editing_model_tier");
+        let restored: AppConfig =
+            serde_json::from_value(serde_json::Value::Object(legacy.clone())).unwrap();
+        assert!(!restored.voice_editing_enabled);
+        assert_eq!(
+            restored.voice_editing_model_tier,
+            VoiceEditingModelTier::Balanced
+        );
+
+        let compact = AppConfig {
+            voice_editing_enabled: true,
+            voice_editing_model_tier: VoiceEditingModelTier::Compact,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&compact).unwrap();
+        assert_eq!(serialized["voice_editing_enabled"], true);
+        assert_eq!(serialized["voice_editing_model_tier"], "compact");
+        let restored: AppConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            restored.voice_editing_model_tier,
+            VoiceEditingModelTier::Compact
+        );
+        assert_eq!(VoiceEditingModelTier::ALL.len(), 2);
+        assert_eq!(VoiceEditingModelTier::Compact.label(), "Compact");
+        assert_eq!(
+            VoiceEditingModelTier::Balanced.model_id(),
+            "qwen3_1_7b_q8_0"
+        );
     }
 
     #[test]

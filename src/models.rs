@@ -120,6 +120,7 @@ pub enum TranscriptionStatus {
     Listening,
     Finalizing,
     Transcribing,
+    Editing,
     Error,
 }
 
@@ -130,6 +131,7 @@ impl fmt::Display for TranscriptionStatus {
             Self::Listening => write!(f, "Listening"),
             Self::Finalizing => write!(f, "Finalizing"),
             Self::Transcribing => write!(f, "Transcribing"),
+            Self::Editing => write!(f, "Editing"),
             Self::Error => write!(f, "Error"),
         }
     }
