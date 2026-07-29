@@ -971,12 +971,11 @@ fn rfind_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     haystack
         .char_indices()
         .map(|(index, _)| index)
-        .filter(|index| {
+        .rfind(|index| {
             haystack
                 .get(*index..index.saturating_add(needle.len()))
                 .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
         })
-        .next_back()
 }
 
 #[cfg(test)]
