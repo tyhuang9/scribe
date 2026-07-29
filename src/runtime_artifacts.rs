@@ -589,6 +589,7 @@ pub(crate) fn embedded_intent_model(
     Ok(catalog.intent_model(tier).cloned())
 }
 
+#[allow(dead_code)]
 pub(crate) fn download_and_stage_intent_model(
     model: &IntentModelArtifact,
     managed_root: &Path,
@@ -665,6 +666,7 @@ fn stage_intent_model_from_reader(
     stage_intent_model_from_reader_until(model, managed_root, reader, None)
 }
 
+#[allow(dead_code)]
 fn stage_intent_model_from_reader_until(
     model: &IntentModelArtifact,
     managed_root: &Path,
@@ -815,6 +817,7 @@ fn check_download_deadline(deadline: Option<Instant>, name: &str) -> Result<(), 
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn download_and_stage(
     artifact: &RuntimeArtifact,
     target_root: &Path,
@@ -873,6 +876,7 @@ fn stage_from_reader(
     stage_from_reader_until(artifact, target_root, reader, None)
 }
 
+#[allow(dead_code)]
 fn stage_from_reader_until(
     artifact: &RuntimeArtifact,
     target_root: &Path,
