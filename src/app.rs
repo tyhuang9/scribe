@@ -404,7 +404,7 @@ enum AppEvent {
     VoiceEditorInstallDone {
         runtime_replacement: Option<Box<RuntimeReplacement>>,
         runtime_install: Option<config::ManagedRuntimeInstall>,
-        model: IntentModelArtifact,
+        model: Box<IntentModelArtifact>,
         model_replacement: Option<Box<IntentModelReplacement>>,
         model_install: Option<config::ManagedModelInstall>,
     },
@@ -2850,7 +2850,7 @@ impl LocalTranscriberApp {
                 let _ = tx.send(AppEvent::VoiceEditorInstallDone {
                     runtime_replacement: runtime_replacement.map(Box::new),
                     runtime_install,
-                    model: model_artifact,
+                    model: Box::new(model_artifact),
                     model_replacement,
                     model_install,
                 });
@@ -3229,7 +3229,7 @@ impl LocalTranscriberApp {
                 } => self.finish_voice_editor_install(
                     runtime_replacement,
                     runtime_install,
-                    model,
+                    *model,
                     model_replacement,
                     model_install,
                 ),
