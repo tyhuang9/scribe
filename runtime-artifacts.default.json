@@ -1,5 +1,33 @@
 {
-  "schema_version": 1,
-  "catalog_version": "development-empty",
-  "artifacts": []
+  "schema_version": 2,
+  "catalog_version": "voice-intent-foundation-1",
+  "artifacts": [],
+  "intent_models": [
+    {
+      "runtime_id": "voice_intent_llama_cpp",
+      "tier": "compact",
+      "model_id": "qwen3_0_6b_q8_0",
+      "version": "Qwen3-0.6B",
+      "upstream_repository": "Qwen/Qwen3-0.6B-GGUF",
+      "upstream_revision": "ef4088322893040952513f532f736ddeab518403",
+      "upstream_filename": "Qwen3-0.6B-Q8_0.gguf",
+      "license": "Apache-2.0",
+      "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+      "size_bytes": 639446688,
+      "managed_relative_path": "voice-intent/Qwen3-0.6B-Q8_0.gguf"
+    },
+    {
+      "runtime_id": "voice_intent_llama_cpp",
+      "tier": "balanced",
+      "model_id": "qwen3_1_7b_q8_0",
+      "version": "Qwen3-1.7B",
+      "upstream_repository": "Qwen/Qwen3-1.7B-GGUF",
+      "upstream_revision": "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+      "upstream_filename": "Qwen3-1.7B-Q8_0.gguf",
+      "license": "Apache-2.0",
+      "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+      "size_bytes": 1834426016,
+      "managed_relative_path": "voice-intent/Qwen3-1.7B-Q8_0.gguf"
+    }
+  ]
 }

@@ -18,6 +18,7 @@ const EMBEDDED_CATALOG_JSON: &str =
 const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+pub(crate) const VOICE_INTENT_LLAMA_CPP_RUNTIME_ID: &str = "voice_intent_llama_cpp";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,6 +57,31 @@ pub(crate) struct StagedRuntimeArtifact {
     pub(crate) entrypoint: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum IntentModelTier {
+    Compact,
+    Balanced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IntentModelArtifact {
+    pub(crate) runtime_id: String,
+    pub(crate) tier: IntentModelTier,
+    pub(crate) model_id: String,
+    pub(crate) version: String,
+    pub(crate) upstream_repository: String,
+    pub(crate) upstream_revision: String,
+    pub(crate) upstream_filename: String,
+    pub(crate) license: String,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) managed_relative_path: PathBuf,
+}
+
 #[derive(Deserialize)]
 struct RuntimeArtifactManifest {
     manifest_version: u32,
@@ -73,6 +99,8 @@ pub(crate) struct RuntimeArtifactCatalog {
     schema_version: u32,
     catalog_version: String,
     artifacts: Vec<RuntimeArtifact>,
+    #[serde(default)]
+    intent_models: Vec<IntentModelArtifact>,
 }
 
 impl RuntimeArtifactCatalog {
@@ -98,8 +126,12 @@ impl RuntimeArtifactCatalog {
         })
     }
 
+    pub(crate) fn intent_model(&self, tier: IntentModelTier) -> Option<&IntentModelArtifact> {
+        self.intent_models.iter().find(|model| model.tier == tier)
+    }
+
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(format!(
                 "unsupported runtime artifact catalog schema {}",
                 self.schema_version
@@ -107,6 +139,11 @@ impl RuntimeArtifactCatalog {
         }
         if self.catalog_version.trim().is_empty() {
             return Err("runtime artifact catalog version is empty".to_owned());
+        }
+        if self.schema_version == 1 && !self.intent_models.is_empty() {
+            return Err(
+                "runtime artifact catalog schema 1 cannot contain voice intent models".to_owned(),
+            );
         }
 
         let mut keys = HashSet::new();
@@ -128,6 +165,16 @@ impl RuntimeArtifactCatalog {
                 ));
             }
         }
+        let mut model_ids = HashSet::new();
+        let mut model_tiers = HashSet::new();
+        for model in &self.intent_models {
+            model.validate()?;
+            if !model_ids.insert(model.model_id.as_str())
+                || !model_tiers.insert((model.runtime_id.as_str(), model.tier))
+            {
+                return Err("duplicate voice intent model id or runtime/tier tuple".to_owned());
+            }
+        }
         Ok(())
     }
 }
@@ -139,7 +186,7 @@ impl RuntimeArtifact {
                 .runtime_id
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            || runtime_catalog::backend_spec_for_runtime_id(&self.runtime_id).is_none()
+            || runtime_device_support(&self.runtime_id).is_none()
         {
             return Err(format!(
                 "unsupported runtime artifact id {:?}",
@@ -166,9 +213,11 @@ impl RuntimeArtifact {
                 self.arch
             ));
         }
-        let backend = runtime_catalog::backend_spec_for_runtime_id(&self.runtime_id)
-            .expect("validated runtime id has a backend");
-        if self.device == RuntimeDevicePack::Gpu && !backend.device_support.supports_gpu() {
+        if self.device == RuntimeDevicePack::Gpu
+            && !runtime_device_support(&self.runtime_id)
+                .expect("validated runtime id has device support")
+                .supports_gpu()
+        {
             return Err(format!(
                 "{} does not support a GPU runtime artifact",
                 self.runtime_id
@@ -214,6 +263,128 @@ impl RuntimeArtifact {
             .map_err(|err| format!("{} artifact entrypoint {err}", self.runtime_id))?;
         Ok(())
     }
+}
+
+impl IntentModelArtifact {
+    fn validate(&self) -> Result<(), String> {
+        if self.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID {
+            return Err(format!(
+                "unsupported voice intent runtime id {:?}",
+                self.runtime_id
+            ));
+        }
+        validate_safe_identifier(&self.model_id, "voice intent model id")?;
+        validate_immutable_identifier(&self.version, "voice intent model version")?;
+        validate_upstream_repository(&self.upstream_repository)?;
+        if self.upstream_revision.len() != 40
+            || !self
+                .upstream_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "voice intent model upstream revision must be a pinned lowercase Git revision"
+                    .to_owned(),
+            );
+        }
+        validate_relative_entrypoint(Path::new(&self.upstream_filename))
+            .map_err(|err| format!("voice intent model upstream filename {err}"))?;
+        validate_gguf_path(
+            Path::new(&self.upstream_filename),
+            "voice intent model upstream filename",
+        )?;
+        validate_immutable_identifier(&self.license, "voice intent model license")?;
+        if let Some(url) = &self.url {
+            validate_https_url(url)?;
+        }
+        validate_sha256(&self.sha256, "voice intent model")?;
+        if self.size_bytes == 0 || self.size_bytes > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "voice intent model {} exceeds the {} byte limit",
+                self.model_id, MAX_ARCHIVE_BYTES
+            ));
+        }
+        validate_relative_entrypoint(&self.managed_relative_path)
+            .map_err(|err| format!("voice intent model managed path {err}"))?;
+        validate_gguf_path(
+            &self.managed_relative_path,
+            "voice intent model managed path",
+        )?;
+        Ok(())
+    }
+}
+
+fn runtime_device_support(runtime_id: &str) -> Option<runtime_catalog::DeviceSupport> {
+    runtime_catalog::backend_spec_for_runtime_id(runtime_id)
+        .map(|backend| backend.device_support)
+        .or_else(|| {
+            (runtime_id == VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
+                .then_some(runtime_catalog::DeviceSupport::CpuOnly)
+        })
+}
+
+fn validate_safe_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!("{label} is unsafe"));
+    }
+    Ok(())
+}
+
+fn validate_immutable_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        return Err(format!("{label} is unsafe"));
+    }
+    Ok(())
+}
+
+fn validate_upstream_repository(value: &str) -> Result<(), String> {
+    let mut parts = value.split('/');
+    let (Some(owner), Some(repository), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("voice intent model upstream repository is invalid".to_owned());
+    };
+    if owner.is_empty()
+        || repository.is_empty()
+        || !owner
+            .bytes()
+            .chain(repository.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("voice intent model upstream repository is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{label} SHA-256 must be 64 lowercase hexadecimal characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gguf_path(path: &Path, label: &str) -> Result<(), String> {
+    if path
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(format!("{label} must end in .gguf"));
+    }
+    Ok(())
 }
 
 fn validate_https_url(url: &str) -> Result<(), String> {
@@ -320,6 +491,187 @@ pub(crate) fn embedded_artifact(
             device,
         )
         .cloned())
+}
+
+#[allow(dead_code)]
+pub(crate) fn embedded_intent_model(
+    tier: IntentModelTier,
+) -> Result<Option<IntentModelArtifact>, String> {
+    static CATALOG: OnceLock<Result<RuntimeArtifactCatalog, String>> = OnceLock::new();
+    let catalog = CATALOG
+        .get_or_init(|| RuntimeArtifactCatalog::parse(EMBEDDED_CATALOG_JSON))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    Ok(catalog.intent_model(tier).cloned())
+}
+
+pub(crate) fn download_and_stage_intent_model(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+) -> Result<PathBuf, String> {
+    model.validate()?;
+    let url = model.url.as_deref().ok_or_else(|| {
+        format!(
+            "voice intent model {} has no release URL; this catalog only records immutable upstream provenance",
+            model.model_id
+        )
+    })?;
+    let deadline = Instant::now() + MAX_DOWNLOAD_DURATION;
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .build();
+    let response = agent
+        .get(url)
+        .call()
+        .map_err(|err| format!("voice intent model request failed: {err}"))?;
+    validate_model_response(&response, model)?;
+    stage_intent_model_from_reader_until(
+        model,
+        managed_root,
+        response.into_reader(),
+        Some(deadline),
+    )
+}
+
+fn validate_model_response(
+    response: &ureq::Response,
+    model: &IntentModelArtifact,
+) -> Result<(), String> {
+    if response
+        .header("content-encoding")
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        return Err("voice intent model response must not use content encoding".to_owned());
+    }
+    if let Some(length) = response.header("content-length") {
+        let length = length
+            .parse::<u64>()
+            .map_err(|_| "voice intent model Content-Length is invalid".to_owned())?;
+        if length != model.size_bytes {
+            return Err(format!(
+                "voice intent model Content-Length mismatch: expected {}, received {length}",
+                model.size_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn stage_intent_model_from_reader(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+    reader: impl Read,
+) -> Result<PathBuf, String> {
+    stage_intent_model_from_reader_until(model, managed_root, reader, None)
+}
+
+fn stage_intent_model_from_reader_until(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+    mut reader: impl Read,
+    deadline: Option<Instant>,
+) -> Result<PathBuf, String> {
+    model.validate()?;
+    let target = managed_root.join(&model.managed_relative_path);
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "voice intent model target {} has no parent",
+            target.display()
+        )
+    })?;
+    crate::durable_fs::create_dir_all(parent)
+        .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    let partial = target.with_file_name(format!(
+        ".{}.partial",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model")
+    ));
+
+    let mut owns_partial = false;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .map_err(|err| {
+                format!(
+                    "could not exclusively create voice intent model partial {}: {err}",
+                    partial.display()
+                )
+            })?;
+        owns_partial = true;
+        let mut hasher = Sha256::new();
+        let mut downloaded = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            check_download_deadline(deadline, "voice intent model")?;
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|err| format!("voice intent model download failed: {err}"))?;
+            check_download_deadline(deadline, "voice intent model")?;
+            if count == 0 {
+                break;
+            }
+            downloaded = downloaded
+                .checked_add(count as u64)
+                .ok_or_else(|| "voice intent model size overflowed".to_owned())?;
+            if downloaded > model.size_bytes {
+                return Err(format!(
+                    "voice intent model size mismatch: expected {} bytes, received more",
+                    model.size_bytes
+                ));
+            }
+            hasher.update(&buffer[..count]);
+            file.write_all(&buffer[..count])
+                .map_err(|err| format!("could not write {}: {err}", partial.display()))?;
+        }
+        file.sync_all()
+            .map_err(|err| format!("could not finish {}: {err}", partial.display()))?;
+        if downloaded != model.size_bytes {
+            return Err(format!(
+                "voice intent model size mismatch: expected {} bytes, received {downloaded}",
+                model.size_bytes
+            ));
+        }
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        if actual_sha256 != model.sha256 {
+            return Err(format!(
+                "voice intent model checksum mismatch: expected {}, received {actual_sha256}",
+                model.sha256
+            ));
+        }
+        drop(file);
+        crate::durable_fs::rename(&partial, &target, false).map_err(|err| {
+            format!(
+                "could not atomically activate voice intent model {}: {err}",
+                target.display()
+            )
+        })?;
+        Ok(target.clone())
+    })();
+
+    if result.is_err() && owns_partial && partial.exists() {
+        let _ = crate::durable_fs::remove(&partial);
+    }
+    result
+}
+
+fn check_download_deadline(deadline: Option<Instant>, name: &str) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(format!(
+            "{name} download exceeded the {} minute deadline",
+            MAX_DOWNLOAD_DURATION.as_secs() / 60
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn download_and_stage(
@@ -739,6 +1091,23 @@ mod tests {
         )
     }
 
+    fn intent_catalog_json(models: &str) -> String {
+        format!(
+            r#"{{"schema_version":2,"catalog_version":"2026.07.29","artifacts":[],"intent_models":[{models}]}}"#
+        )
+    }
+
+    fn intent_model(tier: &str, model_id: &str, url: Option<&str>) -> String {
+        let url = url
+            .map(|url| format!(r#","url":"{url}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"runtime_id":"voice_intent_llama_cpp","tier":"{tier}","model_id":"{model_id}","version":"Qwen3-0.6B","upstream_repository":"Qwen/Qwen3-0.6B-GGUF","upstream_revision":"{}","upstream_filename":"Qwen3-0.6B-Q8_0.gguf","license":"Apache-2.0"{url},"sha256":"{}","size_bytes":4,"managed_relative_path":"voice-intent/{model_id}.gguf"}}"#,
+            "a".repeat(40),
+            "a".repeat(64),
+        )
+    }
+
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, contents) in entries {
@@ -775,6 +1144,23 @@ mod tests {
             size_bytes: expected_size,
             unpacked_size_bytes: unpacked_size,
             entrypoint: PathBuf::from("bin/whisper-cli"),
+        }
+    }
+
+    fn test_intent_model(bytes: &[u8], expected_size: u64) -> IntentModelArtifact {
+        IntentModelArtifact {
+            runtime_id: VOICE_INTENT_LLAMA_CPP_RUNTIME_ID.to_owned(),
+            tier: IntentModelTier::Balanced,
+            model_id: "qwen3_1_7b_q8_0".to_owned(),
+            version: "Qwen3-1.7B".to_owned(),
+            upstream_repository: "Qwen/Qwen3-1.7B-GGUF".to_owned(),
+            upstream_revision: "a".repeat(40),
+            upstream_filename: "Qwen3-1.7B-Q8_0.gguf".to_owned(),
+            license: "Apache-2.0".to_owned(),
+            url: Some("https://github.com/scribe-runtime-tests/Qwen3-1.7B-Q8_0.gguf".to_owned()),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            size_bytes: expected_size,
+            managed_relative_path: PathBuf::from("voice-intent/Qwen3-1.7B-Q8_0.gguf"),
         }
     }
 
@@ -817,6 +1203,199 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn checked_in_catalog_pins_voice_intent_tiers_without_registering_an_stt_provider() {
+        let catalog =
+            RuntimeArtifactCatalog::parse(include_str!("../runtime-artifacts.default.json"))
+                .unwrap();
+        let compact = catalog.intent_model(IntentModelTier::Compact).unwrap();
+        let balanced = catalog.intent_model(IntentModelTier::Balanced).unwrap();
+
+        assert_eq!(compact.runtime_id, VOICE_INTENT_LLAMA_CPP_RUNTIME_ID);
+        assert_eq!(compact.version, "Qwen3-0.6B");
+        assert_eq!(compact.size_bytes, 639_446_688);
+        assert_eq!(
+            compact.sha256,
+            "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+        );
+        assert_eq!(
+            compact.upstream_revision,
+            "ef4088322893040952513f532f736ddeab518403"
+        );
+        assert_eq!(balanced.version, "Qwen3-1.7B");
+        assert_eq!(balanced.size_bytes, 1_834_426_016);
+        assert_eq!(
+            balanced.sha256,
+            "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a"
+        );
+        assert_eq!(
+            balanced.upstream_revision,
+            "90862c4b9d2787eaed51d12237eafdfe7c5f6077"
+        );
+        assert_eq!(compact.license, "Apache-2.0");
+        assert_eq!(balanced.license, "Apache-2.0");
+        assert!(compact.url.is_none() && balanced.url.is_none());
+        assert!(
+            runtime_catalog::backend_spec_for_runtime_id(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_catalogs_but_requires_schema_two_for_intent_models() {
+        assert!(
+            RuntimeArtifactCatalog::parse(
+                r#"{"schema_version":1,"catalog_version":"legacy","artifacts":[]}"#
+            )
+            .is_ok()
+        );
+        let model = intent_model("compact", "qwen3_0_6b_q8_0", None);
+        let legacy =
+            intent_catalog_json(&model).replace("\"schema_version\":2", "\"schema_version\":1");
+        assert!(RuntimeArtifactCatalog::parse(&legacy).is_err());
+    }
+
+    #[test]
+    fn intent_catalog_rejects_unknown_duplicate_and_mutable_models() {
+        let compact = intent_model("compact", "qwen3_0_6b_q8_0", None);
+        let balanced = intent_model("balanced", "qwen3_1_7b_q8_0", None);
+        assert!(
+            RuntimeArtifactCatalog::parse(&intent_catalog_json(&format!("{compact},{compact}")))
+                .is_err()
+        );
+        assert!(
+            RuntimeArtifactCatalog::parse(&intent_catalog_json(&format!("{compact},{balanced}")))
+                .is_ok()
+        );
+        for invalid in [
+            compact.replace("voice_intent_llama_cpp", "unknown"),
+            compact.replace("\"tier\":\"compact\"", "\"tier\":\"gpu\""),
+            intent_model(
+                "compact",
+                "qwen3_0_6b_q8_0",
+                Some("http://github.com/release.gguf"),
+            ),
+            intent_model(
+                "compact",
+                "qwen3_0_6b_q8_0",
+                Some("https://github.com/release.gguf?mutable=1"),
+            ),
+        ] {
+            assert!(RuntimeArtifactCatalog::parse(&intent_catalog_json(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn auxiliary_runtime_is_cpu_only_without_expanding_the_stt_catalog() {
+        assert!(
+            RuntimeArtifactCatalog::parse(&catalog_json(&artifact(
+                VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+                "windows",
+                "x86_64",
+                "cpu"
+            )))
+            .is_ok()
+        );
+        assert!(
+            RuntimeArtifactCatalog::parse(&catalog_json(&artifact(
+                VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+                "windows",
+                "x86_64",
+                "gpu"
+            )))
+            .is_err()
+        );
+        assert!(
+            runtime_catalog::backend_specs()
+                .iter()
+                .all(|spec| spec.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
+        );
+    }
+
+    #[test]
+    fn raw_gguf_staging_verifies_size_hash_exclusivity_and_cleanup() {
+        let bytes = b"verified gguf bytes";
+        let root = temp_target("model-success");
+        let staged = stage_intent_model_from_reader(
+            &test_intent_model(bytes, bytes.len() as u64),
+            &root,
+            Cursor::new(bytes),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        assert!(
+            !root
+                .join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        for (name, model) in [
+            (
+                "hash",
+                IntentModelArtifact {
+                    sha256: "0".repeat(64),
+                    ..test_intent_model(bytes, bytes.len() as u64)
+                },
+            ),
+            (
+                "truncated",
+                test_intent_model(bytes, bytes.len() as u64 + 1),
+            ),
+            ("oversize", test_intent_model(bytes, bytes.len() as u64 - 1)),
+        ] {
+            let root = temp_target(name);
+            assert!(stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).is_err());
+            assert!(!root.join("voice-intent/Qwen3-1.7B-Q8_0.gguf").exists());
+            assert!(
+                !root
+                    .join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial")
+                    .exists()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let root = temp_target("exclusive-partial");
+        let partial = root.join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial");
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::write(&partial, b"owned by another download").unwrap();
+        let error = stage_intent_model_from_reader(
+            &test_intent_model(bytes, bytes.len() as u64),
+            &root,
+            Cursor::new(bytes),
+        )
+        .unwrap_err();
+        assert!(error.contains("exclusively create"));
+        assert_eq!(fs::read(&partial).unwrap(), b"owned by another download");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raw_gguf_staging_honors_deadlines_and_requires_a_release_url() {
+        let bytes = b"verified gguf bytes";
+        let root = temp_target("model-deadline");
+        let error = stage_intent_model_from_reader_until(
+            &test_intent_model(bytes, bytes.len() as u64),
+            &root,
+            Cursor::new(bytes),
+            Some(Instant::now()),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"));
+        assert!(
+            !root
+                .join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let mut no_release = test_intent_model(bytes, bytes.len() as u64);
+        no_release.url = None;
+        let error =
+            download_and_stage_intent_model(&no_release, &temp_target("no-release")).unwrap_err();
+        assert!(error.contains("no release URL"));
     }
 
     #[test]

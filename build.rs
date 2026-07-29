@@ -14,6 +14,7 @@ const RUNTIME_IDS: &[&str] = &[
     "sherpa_onnx",
     "moonshine",
     "parakeet",
+    "voice_intent_llama_cpp",
 ];
 
 #[derive(Deserialize)]
@@ -22,6 +23,8 @@ struct Catalog {
     schema_version: u32,
     catalog_version: String,
     artifacts: Vec<Artifact>,
+    #[serde(default)]
+    intent_models: Vec<IntentModel>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +40,24 @@ struct Artifact {
     size_bytes: u64,
     unpacked_size_bytes: u64,
     entrypoint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentModel {
+    runtime_id: String,
+    tier: String,
+    model_id: String,
+    version: String,
+    upstream_repository: String,
+    upstream_revision: String,
+    upstream_filename: String,
+    license: String,
+    #[serde(default)]
+    url: Option<String>,
+    sha256: String,
+    size_bytes: u64,
+    managed_relative_path: String,
 }
 
 fn main() {
@@ -71,7 +92,7 @@ fn main() {
 
 fn validate_catalog(contents: &str) -> Result<(), String> {
     let catalog: Catalog = serde_json::from_str(contents).map_err(|err| err.to_string())?;
-    if catalog.schema_version != 1 || catalog.catalog_version.trim().is_empty() {
+    if !matches!(catalog.schema_version, 1 | 2) || catalog.catalog_version.trim().is_empty() {
         return Err("unsupported schema or empty catalog version".to_owned());
     }
     let mut keys = HashSet::new();
@@ -136,6 +157,121 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
                 artifact.runtime_id
             ));
         }
+    }
+    if catalog.schema_version == 1 && !catalog.intent_models.is_empty() {
+        return Err("schema version 1 cannot contain voice intent models".to_owned());
+    }
+    let mut intent_model_ids = HashSet::new();
+    let mut intent_model_tiers = HashSet::new();
+    for model in catalog.intent_models {
+        if model.runtime_id != "voice_intent_llama_cpp" {
+            return Err(format!(
+                "unsupported intent runtime id {:?}",
+                model.runtime_id
+            ));
+        }
+        if !matches!(model.tier.as_str(), "compact" | "balanced") {
+            return Err(format!("unsupported intent model tier {:?}", model.tier));
+        }
+        validate_identifier(&model.model_id, "intent model id")?;
+        validate_immutable_identifier(&model.version, "intent model version")?;
+        validate_repository(&model.upstream_repository)?;
+        if model.upstream_revision.len() != 40
+            || !model
+                .upstream_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "intent model upstream revision must be a pinned lowercase Git revision".to_owned(),
+            );
+        }
+        validate_entrypoint(&model.upstream_filename)?;
+        validate_gguf_path(&model.upstream_filename, "intent model upstream filename")?;
+        validate_immutable_identifier(&model.license, "intent model license")?;
+        if let Some(url) = &model.url {
+            validate_url(url)?;
+        }
+        validate_sha256(&model.sha256, "intent model")?;
+        if model.size_bytes == 0 || model.size_bytes > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "invalid size limit for intent model {}",
+                model.model_id
+            ));
+        }
+        validate_entrypoint(&model.managed_relative_path)?;
+        validate_gguf_path(&model.managed_relative_path, "intent model managed path")?;
+        if !intent_model_ids.insert(model.model_id.clone())
+            || !intent_model_tiers.insert((model.runtime_id, model.tier))
+        {
+            return Err("duplicate intent model id or runtime/tier tuple".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!("{label} is unsafe"));
+    }
+    Ok(())
+}
+
+fn validate_immutable_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+    {
+        return Err(format!("{label} is unsafe"));
+    }
+    Ok(())
+}
+
+fn validate_repository(value: &str) -> Result<(), String> {
+    let mut parts = value.split('/');
+    let Some(owner) = parts.next() else {
+        return Err("intent model upstream repository is invalid".to_owned());
+    };
+    let Some(repository) = parts.next() else {
+        return Err("intent model upstream repository is invalid".to_owned());
+    };
+    if parts.next().is_some()
+        || owner.is_empty()
+        || repository.is_empty()
+        || !owner
+            .bytes()
+            .chain(repository.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("intent model upstream repository is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("invalid SHA-256 for {label}"));
+    }
+    Ok(())
+}
+
+fn validate_gguf_path(value: &str, label: &str) -> Result<(), String> {
+    if value
+        .rsplit_once('.')
+        .is_none_or(|(_, extension)| !extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(format!("{label} must end in .gguf"));
     }
     Ok(())
 }
