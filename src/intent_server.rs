@@ -147,6 +147,7 @@ pub struct IntentFailure {
     pub candidate_id: u64,
     pub kind: IntentFailureKind,
     pub message: String,
+    pub child_output: Option<ChildOutputMetadata>,
 }
 
 pub type IntentTransactionResult = Result<IntentOutcome, IntentFailure>;
@@ -299,14 +300,23 @@ pub fn run_intent_transaction(
             }
         };
         let _ = http_worker.join();
-        let content =
-            response.map_err(|message| failure(ids, IntentFailureKind::Request, message))?;
+        let content = response.map_err(|error| {
+            let kind = if error.timed_out {
+                IntentFailureKind::RequestTimeout
+            } else {
+                IntentFailureKind::Request
+            };
+            failure(ids, kind, error.message)
+        })?;
         parse_model_response(&content, ids)
             .map_err(|message| failure(ids, IntentFailureKind::InvalidResponse, message))
     })();
 
-    child.stop();
-    result
+    let metadata = child.stop();
+    result.map_err(|mut error| {
+        error.child_output = Some(metadata);
+        error
+    })
 }
 
 fn validate_request(request: &IntentTransactionRequest) -> Result<(), String> {
@@ -524,7 +534,7 @@ fn send_completion(
     bearer: &str,
     body: &[u8],
     timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, HttpFailure> {
     let url = format!("http://{LOOPBACK}:{port}/v1/chat/completions");
     let authorization = format!("Bearer {bearer}");
     let response = http_agent(timeout)
@@ -533,27 +543,70 @@ fn send_completion(
         .set("Content-Type", "application/json")
         .set("Accept", "application/json")
         .send_bytes(body)
-        .map_err(|err| format!("private edit HTTP request failed: {err}"))?;
+        .map_err(HttpFailure::from_ureq)?;
     if !is_json_content_type(response.header("Content-Type")) {
-        return Err("private edit response did not have JSON content type".to_owned());
+        return Err(HttpFailure::request(
+            "private edit response did not have JSON content type",
+        ));
     }
     if response
         .header("Content-Length")
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_RESPONSE_BYTES)
     {
-        return Err("private edit response exceeded the byte limit".to_owned());
+        return Err(HttpFailure::request(
+            "private edit response exceeded the byte limit",
+        ));
     }
     let mut bytes = Vec::new();
     response
         .into_reader()
         .take((MAX_RESPONSE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|err| format!("could not read private edit response: {err}"))?;
+        .map_err(|err| HttpFailure {
+            timed_out: err.kind() == io::ErrorKind::TimedOut,
+            message: format!("could not read private edit response: {err}"),
+        })?;
     if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err("private edit response exceeded the byte limit".to_owned());
+        return Err(HttpFailure::request(
+            "private edit response exceeded the byte limit",
+        ));
     }
     Ok(bytes)
+}
+
+#[derive(Debug)]
+struct HttpFailure {
+    timed_out: bool,
+    message: String,
+}
+
+impl HttpFailure {
+    fn request(message: impl Into<String>) -> Self {
+        Self {
+            timed_out: false,
+            message: message.into(),
+        }
+    }
+
+    fn from_ureq(error: ureq::Error) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut timed_out = false;
+        while let Some(current) = source {
+            if current
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+            {
+                timed_out = true;
+                break;
+            }
+            source = current.source();
+        }
+        Self {
+            timed_out,
+            message: format!("private edit HTTP request failed: {error}"),
+        }
+    }
 }
 
 fn is_json_content_type(value: Option<&str>) -> bool {
@@ -658,6 +711,7 @@ fn failure(
         candidate_id,
         kind,
         message: message.into(),
+        child_output: None,
     }
 }
 
@@ -1200,7 +1254,7 @@ mod tests {
 
         let error =
             send_completion(port, "wrong-token", b"{}", Duration::from_secs(2)).unwrap_err();
-        assert!(error.contains("401"));
+        assert!(error.message.contains("401"));
         let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
@@ -1214,6 +1268,7 @@ mod tests {
         assert!(
             send_completion(wrong_type_port, "token", b"{}", Duration::from_secs(2))
                 .unwrap_err()
+                .message
                 .contains("content type")
         );
 
@@ -1226,6 +1281,7 @@ mod tests {
         assert!(
             send_completion(oversized_port, "token", b"{}", Duration::from_secs(2))
                 .unwrap_err()
+                .message
                 .contains("byte limit")
         );
     }
@@ -1238,6 +1294,19 @@ mod tests {
             let _ = listener.accept();
         });
         assert!(send_completion(port, "token", b"{}", Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn http_timeout_is_classified_separately() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            thread::sleep(Duration::from_millis(500));
+        });
+        let error = send_completion(port, "token", b"{}", Duration::from_millis(50)).unwrap_err();
+        assert!(error.timed_out);
     }
 
     #[test]
