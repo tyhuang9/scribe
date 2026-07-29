@@ -3553,6 +3553,25 @@ impl LocalTranscriberApp {
                         config::normalize_recording_duration(self.config.max_recording_seconds);
                     self.save_config();
                 }
+
+                ui.add_space(10.0);
+                let mut live_preview = self.config.live_whisper_preview;
+                if ui
+                    .checkbox(
+                        &mut live_preview,
+                        "Show provisional whisper.cpp preview while recording",
+                    )
+                    .changed()
+                {
+                    self.config.live_whisper_preview = live_preview;
+                    self.save_config();
+                }
+                wrapped_label(
+                    ui,
+                    mut_text(
+                        "Off by default. Transcribe runs a local 5-second whisper.cpp job at a time, which may repeatedly load the model and use extra CPU or GPU. Other backends and Model Playground remain batch-only.",
+                    ),
+                );
             });
 
             ui.add_space(12.0);
