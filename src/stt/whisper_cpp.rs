@@ -226,6 +226,9 @@ fn run_preview_command_in(
     command
         .stdout(stdout.child_stdio()?)
         .stderr(stderr.child_stdio()?);
+    // The supported managed whisper-cli is invoked directly (without a shell or
+    // launcher) and does not spawn descendants. If that runtime contract changes,
+    // this path must add platform process-group/job containment before adoption.
     let child = command.spawn();
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = child.context("failed to start whisper.cpp preview")?;
