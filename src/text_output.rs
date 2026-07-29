@@ -33,6 +33,7 @@ impl TextOutputOptions {
 pub enum CapturedOutputTarget {
     #[cfg(target_os = "windows")]
     Windows(WindowsOutputTarget),
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     CopyOnly,
 }
 
