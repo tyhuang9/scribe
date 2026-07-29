@@ -11,6 +11,10 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use fs2::FileExt;
 
 use crate::config;
+use crate::live_preview::{
+    MAX_PENDING_PREVIEW_CHUNKS, PREVIEW_CHUNK_DURATION_MS, PREVIEW_CHUNK_OVERLAP_MS,
+    PreviewArtifact, PreviewSessionId,
+};
 
 const WAV_HEADER_BYTES: u64 = 44;
 const WAV_BYTES_PER_SAMPLE: u64 = 2;
@@ -30,6 +34,7 @@ pub struct RecordingSession {
     pub audio_path: PathBuf,
     stop_tx: Sender<()>,
     finished_rx: Receiver<Result<PathBuf, String>>,
+    preview_rx: Receiver<PreviewArtifact>,
     completion_reported: AtomicBool,
 }
 
@@ -53,6 +58,10 @@ impl RecordingSession {
             self.completion_reported.store(true, Ordering::Release);
         }
         completion
+    }
+
+    pub fn try_preview_chunk(&self) -> Option<PreviewArtifact> {
+        self.preview_rx.try_recv().ok()
     }
 }
 
@@ -84,11 +93,13 @@ pub fn wav_duration_ms(path: &Path) -> Option<u128> {
 pub fn start_recording(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
+    preview_session_id: Option<PreviewSessionId>,
 ) -> Result<RecordingSession> {
     let (audio_path, audio_file) = temp_wav_file()?;
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
     let (started_tx, started_rx) = bounded::<Result<(), String>>(1);
+    let (preview_tx, preview_rx) = bounded::<PreviewArtifact>(MAX_PENDING_PREVIEW_CHUNKS);
     let worker_path = audio_path.clone();
 
     thread::spawn(move || {
@@ -100,6 +111,7 @@ pub fn start_recording(
             max_duration_seconds,
             input_device_name,
             started_tx,
+            preview_session_id.map(|session_id| (session_id, preview_tx)),
         );
         if let Err(err) = &result {
             let _ = startup_error_tx.try_send(Err(err.to_string()));
@@ -122,6 +134,7 @@ pub fn start_recording(
             audio_path,
             stop_tx,
             finished_rx,
+            preview_rx,
             completion_reported: AtomicBool::new(false),
         }),
         Err(message) => Err(anyhow!(message)),
@@ -182,6 +195,177 @@ fn create_recording_file(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+struct PreviewChunkFile {
+    path: PathBuf,
+    writer: hound::WavWriter<BufWriter<File>>,
+    samples_written: u64,
+}
+
+struct PreviewChunkWriter {
+    recording_path: PathBuf,
+    session_id: PreviewSessionId,
+    spec: hound::WavSpec,
+    preview_tx: Sender<PreviewArtifact>,
+    current: Option<PreviewChunkFile>,
+    overlap: Vec<i16>,
+    chunk_samples: u64,
+    overlap_samples: usize,
+    next_sequence: u64,
+}
+
+impl PreviewChunkWriter {
+    fn new(
+        recording_path: PathBuf,
+        session_id: PreviewSessionId,
+        spec: hound::WavSpec,
+        preview_tx: Sender<PreviewArtifact>,
+    ) -> Result<Self> {
+        preview_chunk_path(&recording_path, 0)?;
+        let samples_per_ms = u64::from(spec.sample_rate)
+            .checked_mul(u64::from(spec.channels))
+            .ok_or_else(|| anyhow!("live preview sample rate overflowed"))?;
+        let chunk_samples = samples_per_ms
+            .checked_mul(PREVIEW_CHUNK_DURATION_MS)
+            .map(|samples| samples / 1_000)
+            .filter(|samples| *samples > 0)
+            .ok_or_else(|| anyhow!("live preview chunk size is invalid"))?;
+        let overlap_samples = samples_per_ms
+            .checked_mul(PREVIEW_CHUNK_OVERLAP_MS)
+            .map(|samples| samples / 1_000)
+            .and_then(|samples| usize::try_from(samples).ok())
+            .filter(|samples| *samples > 0 && (*samples as u64) < chunk_samples)
+            .ok_or_else(|| anyhow!("live preview overlap size is invalid"))?;
+
+        Ok(Self {
+            recording_path,
+            session_id,
+            spec,
+            preview_tx,
+            current: None,
+            overlap: Vec::with_capacity(overlap_samples),
+            chunk_samples,
+            overlap_samples,
+            next_sequence: 0,
+        })
+    }
+
+    fn write_samples(&mut self, mut samples: &[i16]) -> Result<()> {
+        while !samples.is_empty() {
+            self.ensure_current_chunk()?;
+            let current = self.current.as_mut().expect("preview chunk should be open");
+            let remaining = self.chunk_samples - current.samples_written;
+            let take = samples.len().min(remaining as usize);
+            let (chunk, rest) = samples.split_at(take);
+            write_samples(&mut current.writer, chunk.iter().copied())
+                .context("failed to write live preview chunk")?;
+            current.samples_written += take as u64;
+            self.remember_overlap(chunk);
+            samples = rest;
+
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.samples_written == self.chunk_samples)
+            {
+                self.finalize_current_chunk()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_current_chunk(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            return Ok(());
+        }
+
+        let path = preview_chunk_path(&self.recording_path, self.next_sequence)?;
+        let file = create_recording_file(&path)
+            .with_context(|| format!("failed to reserve live preview chunk {}", path.display()))?;
+        let mut writer = hound::WavWriter::new(BufWriter::new(file), self.spec)
+            .with_context(|| format!("failed to create live preview chunk {}", path.display()))?;
+        if let Err(error) = write_samples(&mut writer, self.overlap.iter().copied()) {
+            drop(writer);
+            remove_file_best_effort(&path, "incomplete live preview chunk");
+            return Err(error).context("failed to seed live preview overlap");
+        }
+        self.current = Some(PreviewChunkFile {
+            path,
+            writer,
+            samples_written: self.overlap.len() as u64,
+        });
+        Ok(())
+    }
+
+    fn remember_overlap(&mut self, samples: &[i16]) {
+        if samples.len() >= self.overlap_samples {
+            self.overlap.clear();
+            self.overlap
+                .extend_from_slice(&samples[samples.len() - self.overlap_samples..]);
+            return;
+        }
+        let excess = self
+            .overlap
+            .len()
+            .saturating_add(samples.len())
+            .saturating_sub(self.overlap_samples);
+        if excess > 0 {
+            self.overlap.drain(..excess);
+        }
+        self.overlap.extend_from_slice(samples);
+    }
+
+    fn finalize_current_chunk(&mut self) -> Result<()> {
+        let current = self
+            .current
+            .take()
+            .expect("completed preview chunk should be open");
+        let path = current.path;
+        if let Err(error) = current.writer.finalize() {
+            remove_file_best_effort(&path, "incomplete live preview chunk");
+            return Err(error).context("failed to finalize live preview chunk");
+        }
+
+        let artifact = PreviewArtifact::new(self.session_id, self.next_sequence, path);
+        self.next_sequence += 1;
+        if let Err(error) = self.preview_tx.try_send(artifact) {
+            match error {
+                crossbeam_channel::TrySendError::Full(artifact)
+                | crossbeam_channel::TrySendError::Disconnected(artifact) => drop(artifact),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PreviewChunkWriter {
+    fn drop(&mut self) {
+        if let Some(current) = self.current.take() {
+            drop(current.writer);
+            remove_file_best_effort(&current.path, "incomplete live preview chunk");
+        }
+    }
+}
+
+fn preview_chunk_path(recording_path: &Path, sequence: u64) -> Result<PathBuf> {
+    let name = recording_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("recording path has no UTF-8 file name"))?;
+    let stem = name
+        .strip_prefix("recording-")
+        .and_then(|name| name.strip_suffix(".wav"))
+        .ok_or_else(|| anyhow!("recording path is not owned by Scribe"))?;
+    let parts = stem.split('-').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(anyhow!("recording path is not an owned session recording"));
+    }
+    Ok(recording_path.with_file_name(format!("recording-{stem}-chunk-{sequence}.wav")))
+}
+
 fn record_to_wav(
     path: PathBuf,
     audio_file: File,
@@ -189,6 +373,7 @@ fn record_to_wav(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
     started_tx: Sender<Result<(), String>>,
+    preview: Option<(PreviewSessionId, Sender<PreviewArtifact>)>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = select_input_device(&host, input_device_name.as_deref())?;
@@ -214,6 +399,15 @@ fn record_to_wav(
     };
     let mut writer = hound::WavWriter::new(BufWriter::new(audio_file), wav_spec)
         .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut preview_writer = preview.and_then(|(session_id, preview_tx)| {
+        match PreviewChunkWriter::new(path.clone(), session_id, wav_spec, preview_tx) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                eprintln!("live preview disabled for this recording: {error}");
+                None
+            }
+        }
+    });
     let (sample_tx, sample_rx) = bounded::<Vec<i16>>(AUDIO_QUEUE_CAPACITY);
     let (callback_error_tx, callback_error_rx) = bounded::<String>(1);
     let stream = match sample_format {
@@ -281,9 +475,15 @@ fn record_to_wav(
         }
         match sample_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(samples) => {
-                if let Err(err) = write_samples(&mut writer, samples) {
+                if let Err(err) = write_samples(&mut writer, samples.iter().copied()) {
                     callback_error = Some(format!("failed to write recording audio: {err}"));
                     break;
+                }
+                if let Some(preview) = preview_writer.as_mut()
+                    && let Err(error) = preview.write_samples(&samples)
+                {
+                    eprintln!("live preview disabled for this recording: {error}");
+                    preview_writer = None;
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -295,6 +495,8 @@ fn record_to_wav(
     }
 
     drop(stream);
+    // Stop/limit completion never publishes a partial or queued final chunk.
+    drop(preview_writer);
     if callback_error.is_none() {
         callback_error = callback_error_rx.try_recv().ok();
     }
@@ -879,6 +1081,7 @@ mod tests {
             audio_path: PathBuf::from("recording-1.wav"),
             stop_tx,
             finished_rx,
+            preview_rx: bounded(1).1,
             completion_reported: AtomicBool::new(false),
         };
 
@@ -936,5 +1139,132 @@ mod tests {
             limit
         ));
         assert!(recording_limit_reached(Duration::from_secs(60), limit));
+    }
+
+    #[test]
+    fn preview_chunks_are_finalized_readable_and_overlap_by_500_ms() {
+        let dir = test_dir("preview-readable");
+        fs::create_dir_all(&dir).unwrap();
+        let recording = dir.join("recording-1-2-3.wav");
+        let (preview_tx, preview_rx) = bounded(MAX_PENDING_PREVIEW_CHUNKS);
+        let mut chunks = PreviewChunkWriter::new(
+            recording,
+            PreviewSessionId::next(),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 10,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+            preview_tx,
+        )
+        .unwrap();
+        let samples = (0_i16..95).collect::<Vec<_>>();
+
+        chunks.write_samples(&samples).unwrap();
+        let first = preview_rx.try_recv().unwrap();
+        let second = preview_rx.try_recv().unwrap();
+
+        assert_eq!(
+            first.path().file_name().unwrap(),
+            "recording-1-2-3-chunk-0.wav"
+        );
+        assert_eq!(
+            second.path().file_name().unwrap(),
+            "recording-1-2-3-chunk-1.wav"
+        );
+        let read = |path: &Path| {
+            hound::WavReader::open(path)
+                .unwrap()
+                .into_samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(read(first.path()), (0_i16..50).collect::<Vec<_>>());
+        assert_eq!(read(second.path()), (45_i16..95).collect::<Vec<_>>());
+        assert_eq!(chunks.overlap.len(), 5);
+
+        drop(first);
+        drop(second);
+        drop(chunks);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_requires_a_full_five_second_chunk_and_cleans_partial_audio() {
+        let dir = test_dir("preview-minimum");
+        fs::create_dir_all(&dir).unwrap();
+        let recording = dir.join("recording-1-2-3.wav");
+        let partial_path = dir.join("recording-1-2-3-chunk-0.wav");
+        let (preview_tx, preview_rx) = bounded(MAX_PENDING_PREVIEW_CHUNKS);
+        let mut chunks = PreviewChunkWriter::new(
+            recording,
+            PreviewSessionId::next(),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 10,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+            preview_tx,
+        )
+        .unwrap();
+
+        chunks.write_samples(&vec![1; 49]).unwrap();
+        assert!(preview_rx.try_recv().is_err());
+        assert!(partial_path.exists());
+        drop(chunks);
+        assert!(!partial_path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_publication_is_bounded_and_drops_excess_artifacts() {
+        let dir = test_dir("preview-bounded");
+        fs::create_dir_all(&dir).unwrap();
+        let recording = dir.join("recording-1-2-3.wav");
+        let (preview_tx, preview_rx) = bounded(MAX_PENDING_PREVIEW_CHUNKS);
+        let mut chunks = PreviewChunkWriter::new(
+            recording,
+            PreviewSessionId::next(),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 10,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+            preview_tx,
+        )
+        .unwrap();
+
+        chunks.write_samples(&vec![1; 140]).unwrap();
+
+        assert_eq!(preview_rx.len(), MAX_PENDING_PREVIEW_CHUNKS);
+        assert!(!dir.join("recording-1-2-3-chunk-2.wav").exists());
+        drop(chunks);
+        drop(preview_rx);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_chunk_paths_accept_only_exact_owned_session_names() {
+        assert_eq!(
+            preview_chunk_path(Path::new("recording-123-4-5.wav"), 6)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "recording-123-4-5-chunk-6.wav"
+        );
+        for path in [
+            "recording-123.wav",
+            "recording-1-2.wav",
+            "recording-1-2-3-chunk-4.wav",
+            "other-1-2-3.wav",
+            "recording-1-2-../../secret.wav",
+        ] {
+            assert!(preview_chunk_path(Path::new(path), 0).is_err(), "{path}");
+        }
     }
 }

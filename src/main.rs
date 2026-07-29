@@ -10,6 +10,7 @@ mod config;
 mod core;
 mod durable_fs;
 mod hotkey;
+mod live_preview;
 mod managed_downloads;
 mod models;
 mod runtime_artifacts;

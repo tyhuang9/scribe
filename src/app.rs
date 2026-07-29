@@ -1390,6 +1390,7 @@ impl LocalTranscriberApp {
         match audio::start_recording(
             self.config.max_recording_seconds,
             self.config.audio_input_device_name.clone(),
+            None,
         ) {
             Ok(session) => {
                 latency.recorder_started_at = Some(Instant::now());
