@@ -814,16 +814,21 @@ fn stage_intent_model_from_reader_until_with_progress(
         publish_verified_intent_model(model, target, partial.clone(), install_lock, |_| Ok(()))
     })();
 
-    if result.is_err() && owns_partial && partial.exists() {
-        if let Err(cleanup) = crate::durable_fs::remove(&partial) {
-            return Err(format!(
-                "{}. Could not clean owned partial {}: {cleanup}",
-                result.unwrap_err(),
-                partial.display()
-            ));
+    match result {
+        Err(error) => {
+            if owns_partial
+                && partial.exists()
+                && let Err(cleanup) = crate::durable_fs::remove(&partial)
+            {
+                return Err(format!(
+                    "{error}. Could not clean owned partial {}: {cleanup}",
+                    partial.display()
+                ));
+            }
+            Err(error)
         }
+        success => success,
     }
-    result
 }
 
 impl IntentModelReplacement {
@@ -929,12 +934,12 @@ fn acquire_intent_model_install_lock(
 ) -> Result<IntentModelInstallLock, String> {
     #[cfg(test)]
     {
-        return acquire_intent_model_install_lock_with_timeout(
+        acquire_intent_model_install_lock_with_timeout(
             model,
             managed_root,
             None,
             INTENT_MODEL_LOCK_TIMEOUT,
-        );
+        )
     }
     #[cfg(not(test))]
     {
