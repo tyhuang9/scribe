@@ -1376,6 +1376,13 @@ fn voice_edit_review_outcome(plan: &VoiceEditPlan, reason: String) -> VoiceEditO
 fn resolve_voice_editing_artifacts(
     config: &AppConfig,
 ) -> Result<(PathBuf, PathBuf, IntentTier), String> {
+    resolve_voice_editing_artifacts_for_tier(config, config.voice_editing_model_tier)
+}
+
+fn resolve_voice_editing_artifacts_for_tier(
+    config: &AppConfig,
+    tier: VoiceEditingModelTier,
+) -> Result<(PathBuf, PathBuf, IntentTier), String> {
     if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         return Err("Local voice rewriting is currently supported only on Windows x64".to_owned());
     }
@@ -1392,7 +1399,6 @@ fn resolve_voice_editing_artifacts(
         return Err("The installed local voice editor runtime is missing or invalid".to_owned());
     }
 
-    let tier = config.voice_editing_model_tier;
     let model = config
         .managed_models
         .get(tier.model_id())
@@ -1434,6 +1440,19 @@ fn voice_editor_release_artifacts_available(tier: VoiceEditingModelTier) -> bool
             .is_ok_and(|model| model.is_some_and(|model| model.url.is_some()))
 }
 
+fn known_voice_editor_model_paths(config: &AppConfig) -> Vec<PathBuf> {
+    let root = config::model_storage_dir(config);
+    VoiceEditingModelTier::ALL
+        .iter()
+        .filter_map(|tier| {
+            runtime_artifacts::embedded_intent_model(intent_model_tier(*tier))
+                .ok()
+                .flatten()
+                .map(|model| root.join(model.managed_relative_path))
+        })
+        .collect()
+}
+
 fn managed_voice_artifact_is_safe(path: &Path, root: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
@@ -1463,6 +1482,8 @@ pub struct LocalTranscriberApp {
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     next_recording_session_id: u64,
     current_recording_session_id: Option<RecordingSessionId>,
+    current_voice_editing_enabled: bool,
+    current_voice_editing_model_tier: Option<VoiceEditingModelTier>,
     authoritative_result_session_id: Option<RecordingSessionId>,
     output_completed_session_id: Option<RecordingSessionId>,
     captured_output_target: Option<Result<text_output::CapturedOutputTarget, String>>,
@@ -1541,6 +1562,8 @@ impl LocalTranscriberApp {
             runtime_jobs: HashMap::new(),
             next_recording_session_id: 1,
             current_recording_session_id: None,
+            current_voice_editing_enabled: false,
+            current_voice_editing_model_tier: None,
             authoritative_result_session_id: None,
             output_completed_session_id: None,
             captured_output_target: None,
@@ -1858,6 +1881,9 @@ impl LocalTranscriberApp {
                 let path = session.audio_path.display().to_string();
                 if source == RecordingSource::Transcribe {
                     self.current_recording_session_id = Some(session_id);
+                    self.current_voice_editing_enabled = self.config.voice_editing_enabled;
+                    self.current_voice_editing_model_tier =
+                        Some(self.config.voice_editing_model_tier);
                     self.authoritative_result_session_id = None;
                     self.output_completed_session_id = None;
                     self.captured_output_target = captured_output_target;
@@ -2296,7 +2322,7 @@ impl LocalTranscriberApp {
         }
         let completion_message = transcription_completion_message(&result);
 
-        if !self.config.voice_editing_enabled {
+        if !self.current_voice_editing_enabled {
             self.transcript = result.text;
             self.voice_edit_display = None;
             self.status = TranscriptionStatus::Idle;
@@ -2332,8 +2358,11 @@ impl LocalTranscriberApp {
     }
 
     fn dispatch_voice_edit(&mut self, session_id: RecordingSessionId, plan: VoiceEditPlan) {
+        let selected_tier = self
+            .current_voice_editing_model_tier
+            .unwrap_or(self.config.voice_editing_model_tier);
         let (executable_path, model_path, tier) =
-            match resolve_voice_editing_artifacts(&self.config) {
+            match resolve_voice_editing_artifacts_for_tier(&self.config, selected_tier) {
                 Ok(paths) => paths,
                 Err(message) => {
                     self.finish_voice_edit(session_id, voice_edit_review_outcome(&plan, message));
@@ -2755,7 +2784,7 @@ impl LocalTranscriberApp {
         }
         let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
         let model_ids = VoiceEditingModelTier::ALL.map(VoiceEditingModelTier::model_id);
-        let model_paths = model_ids
+        let mut model_paths = model_ids
             .iter()
             .filter_map(|model_id| {
                 self.config
@@ -2764,6 +2793,11 @@ impl LocalTranscriberApp {
                     .map(|install| install.path.clone())
             })
             .collect::<Vec<_>>();
+        for path in known_voice_editor_model_paths(&self.config) {
+            if !model_paths.contains(&path) {
+                model_paths.push(path);
+            }
+        }
         let target_root = config::runtime_storage_dir().join(runtime_id);
         let result = uninstall_runtime_transaction_at(
             &mut self.config,
@@ -2781,15 +2815,22 @@ impl LocalTranscriberApp {
         match result {
             Ok(outcome) => {
                 let mut warnings = Vec::new();
+                let removal_is_durable = outcome.durability_warning.is_none();
                 if let Some(warning) = outcome.durability_warning {
                     warnings.push(warning);
+                    warnings.push(
+                        "Model files were retained until removal can be confirmed after restart"
+                            .to_owned(),
+                    );
                 }
-                for path in model_paths {
-                    let model_root = config::model_storage_dir(&self.config);
-                    if managed_voice_artifact_is_safe(&path, &model_root)
-                        && let Err(error) = durable_fs::remove(&path)
-                    {
-                        warnings.push(format!("Could not remove {}: {error}", path.display()));
+                if removal_is_durable {
+                    for path in model_paths {
+                        let model_root = config::model_storage_dir(&self.config);
+                        if managed_voice_artifact_is_safe(&path, &model_root)
+                            && let Err(error) = durable_fs::remove(&path)
+                        {
+                            warnings.push(format!("Could not remove {}: {error}", path.display()));
+                        }
                     }
                 }
                 self.voice_editor_install_error = None;
@@ -2898,13 +2939,12 @@ impl LocalTranscriberApp {
         } else {
             TranscriptionStatus::Idle
         };
+        let installed_tier = match model.tier {
+            IntentModelTier::Compact => "Compact",
+            IntentModelTier::Balanced => "Balanced",
+        };
         self.status_message = durability_warning.map_or_else(
-            || {
-                format!(
-                    "The {} local voice editor is installed and ready.",
-                    self.config.voice_editing_model_tier.label()
-                )
-            },
+            || format!("The {installed_tier} local voice editor is installed and ready."),
             |warning| {
                 format!(
                     "Voice editor installed, but durability is unconfirmed; startup recovery will verify it: {warning}"
@@ -5189,16 +5229,22 @@ impl LocalTranscriberApp {
                 ui.horizontal_wrapped(|ui| {
                     let label = ui.label("Local model");
                     let before = self.config.voice_editing_model_tier;
-                    let compact = ui.radio_value(
-                        &mut self.config.voice_editing_model_tier,
-                        VoiceEditingModelTier::Compact,
-                        "Compact",
-                    );
-                    let balanced = ui.radio_value(
-                        &mut self.config.voice_editing_model_tier,
-                        VoiceEditingModelTier::Balanced,
-                        "Balanced",
-                    );
+                    let (compact, balanced) = ui
+                        .add_enabled_ui(self.voice_editor_install_worker.is_none(), |ui| {
+                            (
+                                ui.radio_value(
+                                    &mut self.config.voice_editing_model_tier,
+                                    VoiceEditingModelTier::Compact,
+                                    "Compact",
+                                ),
+                                ui.radio_value(
+                                    &mut self.config.voice_editing_model_tier,
+                                    VoiceEditingModelTier::Balanced,
+                                    "Balanced",
+                                ),
+                            )
+                        })
+                        .inner;
                     let group = [compact.id, balanced.id];
                     set_radio_accessibility(
                         ui,
@@ -5226,7 +5272,10 @@ impl LocalTranscriberApp {
                     .contains_key(runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
                     || VoiceEditingModelTier::ALL
                         .iter()
-                        .any(|tier| self.config.managed_models.contains_key(tier.model_id()));
+                        .any(|tier| self.config.managed_models.contains_key(tier.model_id()))
+                    || known_voice_editor_model_paths(&self.config)
+                        .iter()
+                        .any(|path| path.is_file());
                 let published =
                     voice_editor_release_artifacts_available(self.config.voice_editing_model_tier);
                 ui.add_space(8.0);
@@ -9891,6 +9940,7 @@ mod layout_tests {
     fn deterministic_edit_to_empty_suppresses_all_output() {
         let mut app = test_app();
         app.config.voice_editing_enabled = true;
+        app.current_voice_editing_enabled = true;
         app.config.auto_insert_transcript = true;
         app.current_recording_session_id = Some(RecordingSessionId(7));
 
@@ -9910,6 +9960,7 @@ mod layout_tests {
     fn missing_rewrite_runtime_preserves_original_for_explicit_review() {
         let mut app = test_app();
         app.config.voice_editing_enabled = true;
+        app.current_voice_editing_enabled = true;
         app.config.auto_insert_transcript = true;
         app.current_recording_session_id = Some(RecordingSessionId(8));
 
@@ -9929,6 +9980,7 @@ mod layout_tests {
     fn invalid_deterministic_command_preserves_original_for_review() {
         let mut app = test_app();
         app.config.voice_editing_enabled = true;
+        app.current_voice_editing_enabled = true;
         app.current_recording_session_id = Some(RecordingSessionId(9));
 
         app.handle_authoritative_transcription(
@@ -11557,6 +11609,8 @@ mod layout_tests {
             runtime_jobs: HashMap::new(),
             next_recording_session_id: 1,
             current_recording_session_id: None,
+            current_voice_editing_enabled: false,
+            current_voice_editing_model_tier: None,
             authoritative_result_session_id: None,
             output_completed_session_id: None,
             captured_output_target: None,
