@@ -108,7 +108,10 @@ pub fn start_recording(
         if result.is_err() {
             remove_file_best_effort(&worker_path, "incomplete recording");
         }
-        let _ = finished_tx.send(result.map(|_| worker_path).map_err(|err| err.to_string()));
+        send_recording_completion(
+            &finished_tx,
+            result.map(|_| worker_path).map_err(|err| err.to_string()),
+        );
     });
 
     match started_rx
@@ -326,6 +329,15 @@ fn remove_file_best_effort(path: &Path, description: &str) {
         && error.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!("failed to remove {description} {}: {error}", path.display());
+    }
+}
+
+fn send_recording_completion(
+    finished_tx: &Sender<Result<PathBuf, String>>,
+    completion: Result<PathBuf, String>,
+) {
+    if let Err(crossbeam_channel::SendError(Ok(path))) = finished_tx.send(completion) {
+        remove_file_best_effort(&path, "orphaned completed recording");
     }
 }
 
@@ -872,6 +884,21 @@ mod tests {
 
         assert!(session.try_finish().unwrap().is_err());
         assert!(session.try_finish().is_none());
+    }
+
+    #[test]
+    fn dropped_completion_receiver_deletes_successful_recording() {
+        let dir = test_dir("dropped-completion");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recording-1-2-3.wav");
+        fs::write(&path, b"completed wav").unwrap();
+        let (finished_tx, finished_rx) = bounded(1);
+        drop(finished_rx);
+
+        send_recording_completion(&finished_tx, Ok(path.clone()));
+
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
