@@ -3,7 +3,7 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -36,6 +36,7 @@ pub struct RecordingSession {
     finished_rx: Receiver<Result<PathBuf, String>>,
     preview_rx: Receiver<PreviewArtifact>,
     completion_reported: AtomicBool,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl RecordingSession {
@@ -62,6 +63,27 @@ impl RecordingSession {
 
     pub fn try_preview_chunk(&self) -> Option<PreviewArtifact> {
         self.preview_rx.try_recv().ok()
+    }
+
+    pub fn shutdown(&mut self, timeout: Duration) -> Option<Result<PathBuf, String>> {
+        self.stop();
+        let started = Instant::now();
+        let completion = if self.completion_reported.load(Ordering::Acquire) {
+            None
+        } else {
+            self.finished_rx.recv_timeout(timeout).ok().inspect(|_| {
+                self.completion_reported.store(true, Ordering::Release);
+            })
+        };
+        if let Some(worker) = self.worker.take() {
+            while !worker.is_finished() && started.elapsed() < timeout {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+        completion
     }
 }
 
@@ -100,9 +122,10 @@ pub fn start_recording(
     let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
     let (started_tx, started_rx) = bounded::<Result<(), String>>(1);
     let (preview_tx, preview_rx) = bounded::<PreviewArtifact>(MAX_PENDING_PREVIEW_CHUNKS);
+    let preview_evict_rx = preview_rx.clone();
     let worker_path = audio_path.clone();
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let startup_error_tx = started_tx.clone();
         let result = record_to_wav(
             worker_path.clone(),
@@ -111,7 +134,7 @@ pub fn start_recording(
             max_duration_seconds,
             input_device_name,
             started_tx,
-            preview_session_id.map(|session_id| (session_id, preview_tx)),
+            preview_session_id.map(|session_id| (session_id, preview_tx, preview_evict_rx)),
         );
         if let Err(err) = &result {
             let _ = startup_error_tx.try_send(Err(err.to_string()));
@@ -136,8 +159,12 @@ pub fn start_recording(
             finished_rx,
             preview_rx,
             completion_reported: AtomicBool::new(false),
+            worker: Some(worker),
         }),
-        Err(message) => Err(anyhow!(message)),
+        Err(message) => {
+            let _ = worker.join();
+            Err(anyhow!(message))
+        }
     }
 }
 
@@ -206,6 +233,7 @@ struct PreviewChunkWriter {
     session_id: PreviewSessionId,
     spec: hound::WavSpec,
     preview_tx: Sender<PreviewArtifact>,
+    preview_evict_rx: Receiver<PreviewArtifact>,
     current: Option<PreviewChunkFile>,
     overlap: Vec<i16>,
     chunk_samples: u64,
@@ -219,6 +247,7 @@ impl PreviewChunkWriter {
         session_id: PreviewSessionId,
         spec: hound::WavSpec,
         preview_tx: Sender<PreviewArtifact>,
+        preview_evict_rx: Receiver<PreviewArtifact>,
     ) -> Result<Self> {
         preview_chunk_path(&recording_path, 0)?;
         let samples_per_ms = u64::from(spec.sample_rate)
@@ -241,6 +270,7 @@ impl PreviewChunkWriter {
             session_id,
             spec,
             preview_tx,
+            preview_evict_rx,
             current: None,
             overlap: Vec::with_capacity(overlap_samples),
             chunk_samples,
@@ -336,10 +366,25 @@ impl PreviewChunkWriter {
 
         let artifact = PreviewArtifact::new(self.session_id, self.next_sequence, path);
         self.next_sequence += 1;
-        if let Err(error) = self.preview_tx.try_send(artifact) {
-            match error {
-                crossbeam_channel::TrySendError::Full(artifact)
-                | crossbeam_channel::TrySendError::Disconnected(artifact) => drop(artifact),
+        let mut newest = artifact;
+        loop {
+            match self.preview_tx.try_send(newest) {
+                Ok(()) => break,
+                Err(crossbeam_channel::TrySendError::Disconnected(artifact)) => {
+                    drop(artifact);
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Full(artifact)) => {
+                    newest = artifact;
+                    match self.preview_evict_rx.try_recv() {
+                        Ok(oldest) => drop(oldest),
+                        Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            drop(newest);
+                            break;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -382,7 +427,11 @@ fn record_to_wav(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
     started_tx: Sender<Result<(), String>>,
-    preview: Option<(PreviewSessionId, Sender<PreviewArtifact>)>,
+    preview: Option<(
+        PreviewSessionId,
+        Sender<PreviewArtifact>,
+        Receiver<PreviewArtifact>,
+    )>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = select_input_device(&host, input_device_name.as_deref())?;
@@ -408,15 +457,22 @@ fn record_to_wav(
     };
     let mut writer = hound::WavWriter::new(BufWriter::new(audio_file), wav_spec)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut preview_writer = preview.and_then(|(session_id, preview_tx)| {
-        match PreviewChunkWriter::new(path.clone(), session_id, wav_spec, preview_tx) {
-            Ok(writer) => Some(writer),
-            Err(error) => {
-                eprintln!("live preview disabled for this recording: {error}");
-                None
-            }
-        }
-    });
+    let mut preview_writer =
+        preview.and_then(
+            |(session_id, preview_tx, preview_evict_rx)| match PreviewChunkWriter::new(
+                path.clone(),
+                session_id,
+                wav_spec,
+                preview_tx,
+                preview_evict_rx,
+            ) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    eprintln!("live preview disabled for this recording: {error}");
+                    None
+                }
+            },
+        );
     let (sample_tx, sample_rx) = bounded::<Vec<i16>>(AUDIO_QUEUE_CAPACITY);
     let (callback_error_tx, callback_error_rx) = bounded::<String>(1);
     let stream = match sample_format {
@@ -1092,6 +1148,7 @@ mod tests {
             finished_rx,
             preview_rx: bounded(1).1,
             completion_reported: AtomicBool::new(false),
+            worker: None,
         };
 
         assert!(session.try_finish().unwrap().is_err());
@@ -1166,6 +1223,7 @@ mod tests {
                 sample_format: hound::SampleFormat::Int,
             },
             preview_tx,
+            preview_rx.clone(),
         )
         .unwrap();
         let samples = (0_i16..95).collect::<Vec<_>>();
@@ -1217,6 +1275,7 @@ mod tests {
                 sample_format: hound::SampleFormat::Int,
             },
             preview_tx,
+            preview_rx.clone(),
         )
         .unwrap();
 
@@ -1229,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_publication_is_bounded_and_drops_excess_artifacts() {
+    fn preview_publication_is_bounded_and_keeps_the_latest_artifacts() {
         let dir = test_dir("preview-bounded");
         fs::create_dir_all(&dir).unwrap();
         let recording = dir.join("recording-1-2-3.wav");
@@ -1244,13 +1303,24 @@ mod tests {
                 sample_format: hound::SampleFormat::Int,
             },
             preview_tx,
+            preview_rx.clone(),
         )
         .unwrap();
 
         chunks.write_samples(&[1; 140]).unwrap();
 
         assert_eq!(preview_rx.len(), MAX_PENDING_PREVIEW_CHUNKS);
-        assert!(!dir.join("recording-1-2-3-chunk-2.wav").exists());
+        assert!(!dir.join("recording-1-2-3-chunk-0.wav").exists());
+        let queued = preview_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|artifact| artifact.key().sequence)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(queued.iter().all(|artifact| artifact.path().exists()));
+        drop(queued);
         drop(chunks);
         drop(preview_rx);
         assert!(fs::read_dir(&dir).unwrap().next().is_none());

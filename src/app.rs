@@ -44,6 +44,7 @@ const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
+const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
     (30, "0.5 minutes"),
     (60, "1 minute"),
@@ -1139,6 +1140,7 @@ pub struct LocalTranscriberApp {
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
     live_preview: LivePreviewState,
+    preview_worker: Option<thread::JoinHandle<()>>,
     pending_final_transcription: Option<PendingFinalTranscription>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1211,6 +1213,7 @@ impl LocalTranscriberApp {
             status_message,
             active_recording: None,
             live_preview: LivePreviewState::default(),
+            preview_worker: None,
             pending_final_transcription: None,
             tx,
             rx,
@@ -1447,7 +1450,7 @@ impl LocalTranscriberApp {
         self.live_preview.final_wins();
         let preview_enabled = recording_model.as_ref().is_some_and(|model| {
             live_preview::is_live_preview_eligible(
-                self.config.live_whisper_preview,
+                self.config.live_transcription_enabled,
                 source == RecordingSource::Transcribe,
                 &model.backend,
                 true,
@@ -1569,6 +1572,10 @@ impl LocalTranscriberApp {
     }
 
     fn dispatch_live_preview(&mut self) {
+        self.join_finished_preview_worker();
+        if self.preview_worker.is_some() {
+            return;
+        }
         let Some(model) = self.active_recording.as_ref().and_then(|active| {
             active
                 .preview_session_id
@@ -1584,35 +1591,84 @@ impl LocalTranscriberApp {
         let cancellation = job.cancellation();
         let config = self.config.clone();
         let tx = self.tx.clone();
-        thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if cancellation.is_cancelled() {
-                    return Err("live preview was cancelled".to_owned());
-                }
-                stt::transcribe_preview_with_config(
-                    &config,
-                    job.path().to_path_buf(),
-                    model,
-                    &cancellation,
-                )
-                .map(|result| PreviewTranscript {
-                    text: result.text,
-                    segments: result
-                        .segments
-                        .into_iter()
-                        .map(|segment| PreviewSegment {
-                            start_ms: segment.start_ms,
-                            end_ms: segment.end_ms,
-                            text: segment.text,
-                        })
-                        .collect(),
-                })
-                .map_err(|error| error.to_string())
-            }))
-            .unwrap_or_else(|_| Err("live preview worker stopped unexpectedly".to_owned()));
-            drop(job);
-            let _ = tx.send(AppEvent::LivePreviewFinished { key, result });
-        });
+        let worker = thread::Builder::new()
+            .name("live-whisper-preview".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if cancellation.is_cancelled() {
+                        return Err("live preview was cancelled".to_owned());
+                    }
+                    stt::transcribe_preview_with_config(
+                        &config,
+                        job.path().to_path_buf(),
+                        model,
+                        &cancellation,
+                    )
+                    .map(|result| PreviewTranscript {
+                        text: result.text,
+                        segments: result
+                            .segments
+                            .into_iter()
+                            .map(|segment| PreviewSegment {
+                                start_ms: segment.start_ms,
+                                end_ms: segment.end_ms,
+                                text: segment.text,
+                            })
+                            .collect(),
+                    })
+                    .map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("live preview worker stopped unexpectedly".to_owned()));
+                drop(job);
+                let _ = tx.send(AppEvent::LivePreviewFinished { key, result });
+            });
+        match worker {
+            Ok(worker) => self.preview_worker = Some(worker),
+            Err(error) => {
+                let _ = self.live_preview.complete(
+                    key,
+                    Err(format!("failed to start live preview worker: {error}")),
+                );
+            }
+        }
+    }
+
+    fn join_finished_preview_worker(&mut self) {
+        if self
+            .preview_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.preview_worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+
+    fn shutdown_background_work(&mut self) {
+        if let Some(active) = self.active_recording.as_mut() {
+            active.session.stop();
+        }
+        self.live_preview.final_wins();
+        let started = Instant::now();
+        if let Some(worker) = self.preview_worker.take() {
+            while !worker.is_finished() && started.elapsed() < BACKGROUND_SHUTDOWN_TIMEOUT {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!("live preview worker did not retire before shutdown timeout");
+            }
+        }
+
+        if let Some(mut active) = self.active_recording.take() {
+            let completed = active.session.shutdown(BACKGROUND_SHUTDOWN_TIMEOUT);
+            if let Some(Ok(path)) = completed {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_file(&active.session.audio_path);
+        }
+        self.pending_final_transcription = None;
     }
 
     fn maybe_dispatch_pending_final(&mut self) {
@@ -2744,6 +2800,10 @@ impl eframe::App for LocalTranscriberApp {
 
         ctx.request_repaint_after(self.next_repaint_delay());
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown_background_work();
+    }
 }
 
 impl LocalTranscriberApp {
@@ -3775,7 +3835,7 @@ impl LocalTranscriberApp {
                 }
 
                 ui.add_space(10.0);
-                let mut live_preview = self.config.live_whisper_preview;
+                let mut live_preview = self.config.live_transcription_enabled;
                 if ui
                     .checkbox(
                         &mut live_preview,
@@ -3783,7 +3843,7 @@ impl LocalTranscriberApp {
                     )
                     .changed()
                 {
-                    self.config.live_whisper_preview = live_preview;
+                    self.config.live_transcription_enabled = live_preview;
                     self.save_config();
                 }
                 wrapped_label(
@@ -8299,6 +8359,41 @@ mod layout_tests {
     }
 
     #[test]
+    fn shutdown_cancels_and_joins_preview_worker_and_cleans_owned_artifacts() {
+        let mut app = test_app();
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "shutdown"));
+        let job = app.live_preview.take_next_job().unwrap();
+        let preview_path = job.path().to_path_buf();
+        let cancellation = job.cancellation();
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retired_signal = retired.clone();
+        app.preview_worker = Some(thread::spawn(move || {
+            while !cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(job);
+            retired_signal.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        let final_path = test_preview_path("shutdown-final");
+        fs::write(&final_path, b"full wav").unwrap();
+        app.pending_final_transcription = Some(PendingFinalTranscription::new(
+            final_path.clone(),
+            test_model(),
+            LatencyTrace::started_now(),
+        ));
+
+        app.shutdown_background_work();
+
+        assert!(retired.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.preview_worker.is_none());
+        assert!(!preview_path.exists());
+        assert!(!final_path.exists());
+        assert!(app.pending_final_transcription.is_none());
+    }
+
+    #[test]
     fn provisional_preview_is_exposed_as_read_only_static_text() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -9582,6 +9677,7 @@ mod layout_tests {
             status_message: "Ready".to_owned(),
             active_recording: None,
             live_preview: LivePreviewState::default(),
+            preview_worker: None,
             pending_final_transcription: None,
             tx,
             rx,

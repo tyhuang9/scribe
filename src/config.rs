@@ -49,8 +49,8 @@ pub struct AppConfig {
     pub debug_mode: bool,
     #[serde(default = "default_max_recording_seconds")]
     pub max_recording_seconds: u32,
-    #[serde(default)]
-    pub live_whisper_preview: bool,
+    #[serde(default, alias = "live_whisper_preview")]
+    pub live_transcription_enabled: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default = "default_true")]
@@ -220,7 +220,7 @@ impl Default for AppConfig {
             last_used_backend: "whisper.cpp".to_owned(),
             debug_mode: false,
             max_recording_seconds: default_max_recording_seconds(),
-            live_whisper_preview: false,
+            live_transcription_enabled: false,
             close_to_tray: true,
             auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
@@ -1364,7 +1364,7 @@ mod tests {
         assert!(!config.model_storage_dir.as_os_str().is_empty());
         assert!(config.model_storage_dir.ends_with("models"));
         assert_eq!(config.max_recording_seconds, 30);
-        assert!(!config.live_whisper_preview);
+        assert!(!config.live_transcription_enabled);
     }
 
     #[test]
@@ -1374,7 +1374,7 @@ mod tests {
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(!config.auto_insert_transcript);
-        assert!(!config.live_whisper_preview);
+        assert!(!config.live_transcription_enabled);
         assert_eq!(config.max_recording_seconds, 600);
     }
 
@@ -1400,15 +1400,27 @@ mod tests {
     }
 
     #[test]
-    fn live_whisper_preview_is_opt_in_and_uses_a_stable_config_key() {
+    fn live_transcription_is_opt_in_and_migrates_the_legacy_key() {
         let mut config = AppConfig::default();
-        assert!(!config.live_whisper_preview);
-        config.live_whisper_preview = true;
+        assert!(!config.live_transcription_enabled);
+        config.live_transcription_enabled = true;
 
         let serialized = serde_json::to_value(&config).unwrap();
-        assert_eq!(serialized["live_whisper_preview"], true);
+        assert_eq!(serialized["live_transcription_enabled"], true);
+        assert!(serialized.get("live_whisper_preview").is_none());
         let restored: AppConfig = serde_json::from_value(serialized).unwrap();
-        assert!(restored.live_whisper_preview);
+        assert!(restored.live_transcription_enabled);
+
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("live_transcription_enabled");
+        legacy.insert("live_whisper_preview".to_owned(), true.into());
+        let legacy = serde_json::Value::Object(legacy.clone());
+        let migrated: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(migrated.live_transcription_enabled);
+        let migrated = serde_json::to_value(migrated).unwrap();
+        assert_eq!(migrated["live_transcription_enabled"], true);
+        assert!(migrated.get("live_whisper_preview").is_none());
     }
 
     #[test]
