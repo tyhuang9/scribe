@@ -40,13 +40,14 @@ const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
-const RECORDING_DURATION_PRESETS: [(u32, &str); 6] = [
+const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
     (30, "30 seconds"),
     (60, "1 minute"),
     (5 * 60, "5 minutes"),
-    (15 * 60, "15 minutes"),
+    (10 * 60, "10 minutes"),
     (30 * 60, "30 minutes"),
     (60 * 60, "60 minutes"),
+    (120 * 60, "120 minutes"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3449,6 +3450,81 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
+                ui.label(section_heading("Recording"));
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let before = self.config.hotkey_mode;
+                    ui.label("Hotkey behavior");
+                    ui.selectable_value(
+                        &mut self.config.hotkey_mode,
+                        HotkeyMode::Toggle,
+                        "Press once",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.hotkey_mode,
+                        HotkeyMode::HoldToTalk,
+                        "Hold",
+                    );
+                    if before != self.config.hotkey_mode {
+                        self.save_config();
+                    }
+                });
+                wrapped_label(
+                    ui,
+                    mut_text("Press once to start or stop, or hold the hotkey while speaking."),
+                );
+                ui.add_space(8.0);
+
+                let before = self.config.max_recording_seconds;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Duration preset");
+                    let response = ComboBox::from_id_source("recording-duration-preset")
+                        .selected_text(format_recording_duration(self.config.max_recording_seconds))
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for (seconds, text) in RECORDING_DURATION_PRESETS {
+                                ui.selectable_value(
+                                    &mut self.config.max_recording_seconds,
+                                    seconds,
+                                    text,
+                                );
+                            }
+                        })
+                        .response;
+                    set_control_accessibility(ui, &response, label.id, "Recording duration preset");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let mut minutes = recording_duration_minutes(self.config.max_recording_seconds);
+                    let label = ui.label("Custom duration");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut minutes)
+                            .clamp_range(0.5..=120.0)
+                            .speed(0.5)
+                            .max_decimals(2)
+                            .suffix(" minutes"),
+                    );
+                    set_control_accessibility(
+                        ui,
+                        &response,
+                        label.id,
+                        "Custom recording duration in minutes",
+                    );
+                    if response.changed() {
+                        self.config.max_recording_seconds = recording_duration_seconds(minutes);
+                    }
+                    if self.active_recording.is_some() {
+                        ui.label("Applies next time.");
+                    }
+                });
+                if before != self.config.max_recording_seconds {
+                    self.config.max_recording_seconds =
+                        config::normalize_recording_duration(self.config.max_recording_seconds);
+                    self.save_config();
+                }
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
                 ui.label(section_heading("Shortcuts"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
@@ -3474,27 +3550,6 @@ impl LocalTranscriberApp {
                     {
                         self.capturing_hotkey = true;
                         self.status_message = "Press the new hotkey combination.".to_owned();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.hotkey_mode;
-                    let label = ui.label("Hotkey mode");
-                    let response = ComboBox::from_id_source("hotkey-mode")
-                        .selected_text(self.config.hotkey_mode.label())
-                        .width(170.0)
-                        .show_ui(ui, |ui| {
-                            for mode in HotkeyMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.hotkey_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        })
-                        .response;
-                    set_control_accessibility(ui, &response, label.id, "Hotkey mode");
-                    if before != self.config.hotkey_mode {
-                        self.save_config();
                     }
                 });
             });
@@ -3620,51 +3675,6 @@ impl LocalTranscriberApp {
                         self.refresh_audio_devices();
                     }
                 });
-                let before = self.config.max_recording_seconds;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Maximum recording duration");
-                    let response = ComboBox::from_id_source("recording-duration-preset")
-                        .selected_text(format_recording_duration(self.config.max_recording_seconds))
-                        .width(140.0)
-                        .show_ui(ui, |ui| {
-                            for (seconds, text) in RECORDING_DURATION_PRESETS {
-                                ui.selectable_value(
-                                    &mut self.config.max_recording_seconds,
-                                    seconds,
-                                    text,
-                                );
-                            }
-                        })
-                        .response;
-                    set_control_accessibility(
-                        ui,
-                        &response,
-                        label.id,
-                        "Maximum recording duration preset",
-                    );
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Custom duration");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut self.config.max_recording_seconds)
-                            .clamp_range(1..=config::MAX_RECORDING_SECONDS)
-                            .suffix(" seconds"),
-                    );
-                    set_control_accessibility(
-                        ui,
-                        &response,
-                        label.id,
-                        "Custom recording duration in seconds",
-                    );
-                    if self.active_recording.is_some() {
-                        ui.label("Applies to the next recording.");
-                    }
-                });
-                if before != self.config.max_recording_seconds {
-                    self.config.max_recording_seconds =
-                        config::normalize_recording_duration(self.config.max_recording_seconds);
-                    self.save_config();
-                }
             });
 
             ui.add_space(12.0);
@@ -5370,6 +5380,14 @@ fn format_recording_duration(seconds: u32) -> String {
     }
 }
 
+fn recording_duration_minutes(seconds: u32) -> f64 {
+    seconds as f64 / 60.0
+}
+
+fn recording_duration_seconds(minutes: f64) -> u32 {
+    (minutes.clamp(0.5, 120.0) * 60.0).round() as u32
+}
+
 fn tray_ui_state(is_recording: bool, transcript: &str) -> TrayUiState {
     TrayUiState {
         is_recording,
@@ -6996,6 +7014,19 @@ mod layout_tests {
         assert_eq!(format_recording_duration(60), "1 minute");
         assert_eq!(format_recording_duration(125), "2m 5s");
         assert_eq!(format_recording_duration(3_600), "60 minutes");
+        assert_eq!(format_recording_duration(7_200), "120 minutes");
+    }
+
+    #[test]
+    fn recording_duration_minutes_round_trip_exact_saved_seconds() {
+        for seconds in [30, 60, 125, 600, 7_200] {
+            assert_eq!(
+                recording_duration_seconds(recording_duration_minutes(seconds)),
+                seconds
+            );
+        }
+        assert_eq!(recording_duration_seconds(0.1), 30);
+        assert_eq!(recording_duration_seconds(121.0), 7_200);
     }
 
     #[test]
@@ -8115,12 +8146,11 @@ mod layout_tests {
         for (role, name) in [
             (egui::accesskit::Role::SpinButton, "Paste delay ms"),
             (egui::accesskit::Role::TextInput, "Record toggle hotkey"),
-            (egui::accesskit::Role::ComboBox, "Hotkey mode"),
             (egui::accesskit::Role::ComboBox, "Transcription device"),
             (egui::accesskit::Role::ComboBox, "Microphone"),
             (
                 egui::accesskit::Role::SpinButton,
-                "Custom recording duration in seconds",
+                "Custom recording duration in minutes",
             ),
             (egui::accesskit::Role::ComboBox, "Theme"),
         ] {

@@ -196,17 +196,6 @@ pub enum HotkeyMode {
     HoldToTalk,
 }
 
-impl HotkeyMode {
-    pub const ALL: [HotkeyMode; 2] = [HotkeyMode::Toggle, HotkeyMode::HoldToTalk];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Toggle => "Toggle record",
-            Self::HoldToTalk => "Hold to talk",
-        }
-    }
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -899,7 +888,7 @@ fn default_true() -> bool {
     true
 }
 
-pub const MAX_RECORDING_SECONDS: u32 = 60 * 60;
+pub const MAX_RECORDING_SECONDS: u32 = 120 * 60;
 
 pub fn normalize_recording_duration(seconds: u32) -> u32 {
     if seconds == 0 {
@@ -910,7 +899,7 @@ pub fn normalize_recording_duration(seconds: u32) -> u32 {
 }
 
 fn default_max_recording_seconds() -> u32 {
-    30
+    10 * 60
 }
 
 fn default_legacy_whisper_compute_mode() -> WhisperComputeMode {
@@ -1371,6 +1360,7 @@ mod tests {
         assert!(config.audio_input_device_name.is_none());
         assert!(!config.model_storage_dir.as_os_str().is_empty());
         assert!(config.model_storage_dir.ends_with("models"));
+        assert_eq!(config.max_recording_seconds, 30);
     }
 
     #[test]
@@ -1380,6 +1370,7 @@ mod tests {
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(!config.auto_insert_transcript);
+        assert_eq!(config.max_recording_seconds, 600);
     }
 
     #[test]
@@ -1390,11 +1381,13 @@ mod tests {
             .unwrap()
             .remove("max_recording_seconds");
         let missing: AppConfig = serde_json::from_value(serialized).unwrap();
-        assert_eq!(missing.max_recording_seconds, 30);
+        assert_eq!(missing.max_recording_seconds, 600);
 
-        assert_eq!(normalize_recording_duration(0), 30);
+        assert_eq!(normalize_recording_duration(0), 600);
         assert_eq!(normalize_recording_duration(1), 1);
+        assert_eq!(normalize_recording_duration(30), 30);
         assert_eq!(normalize_recording_duration(600), 600);
+        assert_eq!(normalize_recording_duration(7_200), 7_200);
         assert_eq!(
             normalize_recording_duration(u32::MAX),
             MAX_RECORDING_SECONDS
