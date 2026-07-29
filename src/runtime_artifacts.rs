@@ -20,6 +20,18 @@ const MAX_UNPACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 pub(crate) const VOICE_INTENT_LLAMA_CPP_RUNTIME_ID: &str = "voice_intent_llama_cpp";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DownloadProgress {
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) total_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloadControl {
+    Continue,
+    Cancel,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RuntimeDevicePack {
@@ -581,6 +593,16 @@ pub(crate) fn download_and_stage_intent_model(
     model: &IntentModelArtifact,
     managed_root: &Path,
 ) -> Result<PathBuf, String> {
+    download_and_stage_intent_model_with_progress(model, managed_root, |_| {
+        DownloadControl::Continue
+    })
+}
+
+pub(crate) fn download_and_stage_intent_model_with_progress(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+    on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
+) -> Result<PathBuf, String> {
     model.validate()?;
     let url = model.url.as_deref().ok_or_else(|| {
         format!(
@@ -601,11 +623,12 @@ pub(crate) fn download_and_stage_intent_model(
         .call()
         .map_err(|err| format!("voice intent model request failed: {err}"))?;
     validate_model_response(&response, model)?;
-    stage_intent_model_from_reader_until(
+    stage_intent_model_from_reader_until_with_progress(
         model,
         managed_root,
         response.into_reader(),
         Some(deadline),
+        on_progress,
     )
 }
 
@@ -645,8 +668,24 @@ fn stage_intent_model_from_reader(
 fn stage_intent_model_from_reader_until(
     model: &IntentModelArtifact,
     managed_root: &Path,
+    reader: impl Read,
+    deadline: Option<Instant>,
+) -> Result<PathBuf, String> {
+    stage_intent_model_from_reader_until_with_progress(
+        model,
+        managed_root,
+        reader,
+        deadline,
+        |_| DownloadControl::Continue,
+    )
+}
+
+fn stage_intent_model_from_reader_until_with_progress(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
     mut reader: impl Read,
     deadline: Option<Instant>,
+    mut on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
 ) -> Result<PathBuf, String> {
     model.validate()?;
     let target = managed_root.join(&model.managed_relative_path);
@@ -682,6 +721,12 @@ fn stage_intent_model_from_reader_until(
         let mut hasher = Sha256::new();
         let mut downloaded = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
+        report_download_progress(
+            &mut on_progress,
+            downloaded,
+            model.size_bytes,
+            "voice intent model",
+        )?;
         loop {
             check_download_deadline(deadline, "voice intent model")?;
             let count = reader
@@ -703,6 +748,12 @@ fn stage_intent_model_from_reader_until(
             hasher.update(&buffer[..count]);
             file.write_all(&buffer[..count])
                 .map_err(|err| format!("could not write {}: {err}", partial.display()))?;
+            report_download_progress(
+                &mut on_progress,
+                downloaded,
+                model.size_bytes,
+                "voice intent model",
+            )?;
         }
         file.sync_all()
             .map_err(|err| format!("could not finish {}: {err}", partial.display()))?;
@@ -735,6 +786,21 @@ fn stage_intent_model_from_reader_until(
     result
 }
 
+fn report_download_progress(
+    on_progress: &mut impl FnMut(DownloadProgress) -> DownloadControl,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    name: &str,
+) -> Result<(), String> {
+    match on_progress(DownloadProgress {
+        downloaded_bytes,
+        total_bytes,
+    }) {
+        DownloadControl::Continue => Ok(()),
+        DownloadControl::Cancel => Err(format!("{name} download cancelled")),
+    }
+}
+
 fn check_download_deadline(deadline: Option<Instant>, name: &str) -> Result<(), String> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         Err(format!(
@@ -749,6 +815,14 @@ fn check_download_deadline(deadline: Option<Instant>, name: &str) -> Result<(), 
 pub(crate) fn download_and_stage(
     artifact: &RuntimeArtifact,
     target_root: &Path,
+) -> Result<StagedRuntimeArtifact, String> {
+    download_and_stage_with_progress(artifact, target_root, |_| DownloadControl::Continue)
+}
+
+pub(crate) fn download_and_stage_with_progress(
+    artifact: &RuntimeArtifact,
+    target_root: &Path,
+    on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
 ) -> Result<StagedRuntimeArtifact, String> {
     let deadline = Instant::now() + MAX_DOWNLOAD_DURATION;
     let agent = ureq::AgentBuilder::new()
@@ -778,11 +852,12 @@ pub(crate) fn download_and_stage(
             ));
         }
     }
-    stage_from_reader_until(
+    stage_from_reader_until_with_progress(
         artifact,
         target_root,
         response.into_reader(),
         Some(deadline),
+        on_progress,
     )
 }
 
@@ -798,8 +873,20 @@ fn stage_from_reader(
 fn stage_from_reader_until(
     artifact: &RuntimeArtifact,
     target_root: &Path,
+    reader: impl Read,
+    deadline: Option<Instant>,
+) -> Result<StagedRuntimeArtifact, String> {
+    stage_from_reader_until_with_progress(artifact, target_root, reader, deadline, |_| {
+        DownloadControl::Continue
+    })
+}
+
+fn stage_from_reader_until_with_progress(
+    artifact: &RuntimeArtifact,
+    target_root: &Path,
     mut reader: impl Read,
     deadline: Option<Instant>,
+    mut on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
 ) -> Result<StagedRuntimeArtifact, String> {
     let parent = target_root
         .parent()
@@ -820,6 +907,12 @@ fn stage_from_reader_until(
         let mut hasher = Sha256::new();
         let mut downloaded = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
+        report_download_progress(
+            &mut on_progress,
+            downloaded,
+            artifact.size_bytes,
+            "runtime artifact",
+        )?;
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(format!(
@@ -852,6 +945,12 @@ fn stage_from_reader_until(
             archive
                 .write_all(&buffer[..count])
                 .map_err(|err| format!("could not write {}: {err}", archive_path.display()))?;
+            report_download_progress(
+                &mut on_progress,
+                downloaded,
+                artifact.size_bytes,
+                "runtime artifact",
+            )?;
         }
         archive
             .sync_all()
@@ -1512,6 +1611,67 @@ mod tests {
     }
 
     #[test]
+    fn raw_gguf_staging_reports_progress_and_cancellation_cleans_partial() {
+        let bytes = b"verified gguf bytes";
+        let model = test_intent_model(bytes, bytes.len() as u64);
+        let progress_root = temp_target("model-progress");
+        let mut updates = Vec::new();
+
+        let staged = stage_intent_model_from_reader_until_with_progress(
+            &model,
+            &progress_root,
+            Cursor::new(bytes),
+            None,
+            |progress| {
+                updates.push(progress);
+                DownloadControl::Continue
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            updates,
+            [
+                DownloadProgress {
+                    downloaded_bytes: 0,
+                    total_bytes: bytes.len() as u64,
+                },
+                DownloadProgress {
+                    downloaded_bytes: bytes.len() as u64,
+                    total_bytes: bytes.len() as u64,
+                },
+            ]
+        );
+        assert_eq!(fs::read(staged).unwrap(), bytes);
+        fs::remove_dir_all(progress_root).unwrap();
+
+        let cancel_root = temp_target("model-cancel");
+        let error = stage_intent_model_from_reader_until_with_progress(
+            &model,
+            &cancel_root,
+            Cursor::new(bytes),
+            None,
+            |progress| {
+                if progress.downloaded_bytes > 0 {
+                    DownloadControl::Cancel
+                } else {
+                    DownloadControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
+        assert!(!cancel_root.join(&model.managed_relative_path).exists());
+        assert!(
+            !cancel_root
+                .join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial")
+                .exists()
+        );
+        fs::remove_dir_all(cancel_root).unwrap();
+    }
+
+    #[test]
     fn selects_exact_runtime_platform_and_device_tuple() {
         let json = catalog_json(
             &[
@@ -1630,6 +1790,47 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.contains("deadline"));
+        assert!(transaction_files(target.parent().unwrap(), "whisper_cpp").is_empty());
+        fs::remove_dir_all(target.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn runtime_staging_reports_progress_and_cancellation_cleans_transactions() {
+        let bytes = archive(&[("bin/whisper-cli", b"runtime")]);
+        let artifact = test_artifact(&bytes, bytes.len() as u64, 7);
+        let target = temp_target("runtime-cancel").join("whisper_cpp");
+        let mut updates = Vec::new();
+
+        let error = stage_from_reader_until_with_progress(
+            &artifact,
+            &target,
+            Cursor::new(&bytes),
+            None,
+            |progress| {
+                updates.push(progress);
+                if progress.downloaded_bytes > 0 {
+                    DownloadControl::Cancel
+                } else {
+                    DownloadControl::Continue
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
+        assert_eq!(
+            updates,
+            [
+                DownloadProgress {
+                    downloaded_bytes: 0,
+                    total_bytes: bytes.len() as u64,
+                },
+                DownloadProgress {
+                    downloaded_bytes: bytes.len() as u64,
+                    total_bytes: bytes.len() as u64,
+                },
+            ]
+        );
         assert!(transaction_files(target.parent().unwrap(), "whisper_cpp").is_empty());
         fs::remove_dir_all(target.parent().unwrap()).unwrap();
     }
