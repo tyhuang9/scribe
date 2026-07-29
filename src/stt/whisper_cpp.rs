@@ -1489,6 +1489,7 @@ mod tests {
             size_bytes: 1,
             unpacked_size_bytes: 1,
             entrypoint: PathBuf::from("bin/whisper-cli"),
+            archive_layout: Default::default(),
             upstream_repository: None,
             upstream_revision: None,
             upstream_asset: None,

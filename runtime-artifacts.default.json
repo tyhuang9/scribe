@@ -1,7 +1,28 @@
 {
   "schema_version": 2,
-  "catalog_version": "voice-intent-foundation-1",
-  "artifacts": [],
+  "catalog_version": "voice-intent-official-artifacts-1",
+  "artifacts": [
+    {
+      "runtime_id": "voice_intent_llama_cpp",
+      "version": "b9637",
+      "os": "windows",
+      "arch": "x86_64",
+      "device": "cpu",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip",
+      "sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+      "size_bytes": 16906751,
+      "unpacked_size_bytes": 43983896,
+      "entrypoint": "bin/llama-server.exe",
+      "archive_layout": "upstream_llama_cpp_flat_zip_v1",
+      "upstream_repository": "ggml-org/llama.cpp",
+      "upstream_revision": "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+      "upstream_asset": "llama-b9637-bin-win-cpu-x64.zip",
+      "upstream_sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+      "upstream_size_bytes": 16906751,
+      "license": "MIT",
+      "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  ],
   "intent_models": [
     {
       "runtime_id": "voice_intent_llama_cpp",
@@ -13,6 +34,7 @@
       "upstream_filename": "Qwen3-0.6B-Q8_0.gguf",
       "license": "Apache-2.0",
       "license_sha256": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+      "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf",
       "sha256": "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
       "size_bytes": 804753088,
       "managed_relative_path": "voice-intent/Qwen3-0.6B-Q8_0.gguf"
@@ -27,6 +49,7 @@
       "upstream_filename": "Qwen3-1.7B-Q8_0.gguf",
       "license": "Apache-2.0",
       "license_sha256": "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
       "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
       "size_bytes": 1834426016,
       "managed_relative_path": "voice-intent/Qwen3-1.7B-Q8_0.gguf"

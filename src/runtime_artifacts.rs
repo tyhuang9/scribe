@@ -20,7 +20,16 @@ const EMBEDDED_CATALOG_JSON: &str =
 const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_REDIRECTS: usize = 3;
+const MAX_REDIRECT_LOCATION_BYTES: usize = 8 * 1024;
 pub(crate) const VOICE_INTENT_LLAMA_CPP_RUNTIME_ID: &str = "voice_intent_llama_cpp";
+const LLAMA_CPP_OFFICIAL_URL: &str =
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip";
+const LLAMA_CPP_UPSTREAM_ENTRY_COUNT: usize = 51;
+const LLAMA_CPP_UPSTREAM_UNPACKED_SIZE: u64 = 43_983_896;
+const LLAMA_CPP_SELECTED_DLL_COUNT: usize = 29;
+const LLAMA_CPP_SELECTED_PAYLOAD_SIZE: u64 = 42_545_688;
+const LLAMA_CPP_LICENSE: &[u8] = include_bytes!("../assets/licenses/llama.cpp-MIT.txt");
 const INTENT_MODEL_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 static INTENT_MODEL_PARTIAL_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -66,6 +75,8 @@ pub(crate) struct RuntimeArtifact {
     pub(crate) unpacked_size_bytes: u64,
     pub(crate) entrypoint: PathBuf,
     #[serde(default)]
+    pub(crate) archive_layout: ArchiveLayout,
+    #[serde(default)]
     pub(crate) upstream_repository: Option<String>,
     #[serde(default)]
     pub(crate) upstream_revision: Option<String>,
@@ -79,6 +90,14 @@ pub(crate) struct RuntimeArtifact {
     pub(crate) license: Option<String>,
     #[serde(default)]
     pub(crate) license_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArchiveLayout {
+    #[default]
+    ScribePortableZipV1,
+    UpstreamLlamaCppFlatZipV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,7 +175,8 @@ pub(crate) struct IntentModelReplacement {
     _lock: IntentModelInstallLock,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeArtifactManifest {
     manifest_version: u32,
     runtime_id: String,
@@ -257,6 +277,7 @@ impl RuntimeArtifactCatalog {
         let mut model_tiers = HashSet::new();
         for model in &self.intent_models {
             model.validate()?;
+            model.validate_approved_catalog_identity()?;
             if !model_ids.insert(model.model_id.as_str())
                 || !model_tiers.insert((model.runtime_id.as_str(), model.tier))
             {
@@ -364,7 +385,9 @@ impl RuntimeArtifact {
             self.license_sha256.as_deref(),
         );
         if self.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID {
-            if provenance == (None, None, None, None, None, None, None) {
+            if provenance == (None, None, None, None, None, None, None)
+                && self.archive_layout == ArchiveLayout::ScribePortableZipV1
+            {
                 return Ok(());
             }
             return Err(
@@ -384,6 +407,12 @@ impl RuntimeArtifact {
             || self.os != "windows"
             || self.arch != "x86_64"
             || self.device != RuntimeDevicePack::Cpu
+            || self.url != LLAMA_CPP_OFFICIAL_URL
+            || self.sha256 != "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e"
+            || self.size_bytes != 16_906_751
+            || self.unpacked_size_bytes != LLAMA_CPP_UPSTREAM_UNPACKED_SIZE
+            || self.entrypoint != Path::new("bin/llama-server.exe")
+            || self.archive_layout != ArchiveLayout::UpstreamLlamaCppFlatZipV1
             || provenance != expected
         {
             return Err(
@@ -441,6 +470,56 @@ impl IntentModelArtifact {
             &self.managed_relative_path,
             "voice intent model managed path",
         )?;
+        Ok(())
+    }
+
+    fn validate_approved_catalog_identity(&self) -> Result<(), String> {
+        let expected = match self.tier {
+            IntentModelTier::Compact => (
+                "qwen3_0_6b_q8_0",
+                "Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B-GGUF",
+                "ef4088322893040952513f532f736ddeab518403",
+                "Qwen3-0.6B-Q8_0.gguf",
+                "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf",
+                804_753_088_u64,
+                "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
+                "voice-intent/Qwen3-0.6B-Q8_0.gguf",
+            ),
+            IntentModelTier::Balanced => (
+                "qwen3_1_7b_q8_0",
+                "Qwen3-1.7B",
+                "Qwen/Qwen3-1.7B-GGUF",
+                "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+                "Qwen3-1.7B-Q8_0.gguf",
+                "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
+                1_834_426_016_u64,
+                "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+                "voice-intent/Qwen3-1.7B-Q8_0.gguf",
+            ),
+        };
+        if self.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID
+            || self.model_id != expected.0
+            || self.version != expected.1
+            || self.upstream_repository != expected.2
+            || self.upstream_revision != expected.3
+            || self.upstream_filename != expected.4
+            || self.url.as_deref() != Some(expected.5)
+            || self.size_bytes != expected.6
+            || self.sha256 != expected.7
+            || self.managed_relative_path != Path::new(expected.8)
+            || self.license != "Apache-2.0"
+            || self.license_sha256
+                != "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
+        {
+            return Err(format!(
+                "{} voice intent model must match the approved Qwen artifact",
+                match self.tier {
+                    IntentModelTier::Compact => "compact",
+                    IntentModelTier::Balanced => "balanced",
+                }
+            ));
+        }
         Ok(())
     }
 }
@@ -659,49 +738,20 @@ pub(crate) fn download_and_stage_intent_model_with_progress(
         )
     })?;
     let deadline = Instant::now() + MAX_DOWNLOAD_DURATION;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .try_proxy_from_env(false)
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(60))
-        .timeout_write(Duration::from_secs(60))
-        .build();
-    let response = agent
-        .get(url)
-        .call()
-        .map_err(|err| format!("voice intent model request failed: {err}"))?;
-    validate_model_response(&response, model)?;
+    let response = request_official_artifact(
+        url,
+        OfficialDownloadPolicy::HuggingFaceModel,
+        model.size_bytes,
+        "voice intent model",
+        deadline,
+    )?;
     stage_intent_model_from_reader_until_with_progress(
         model,
         managed_root,
-        response.into_reader(),
+        response.body,
         Some(deadline),
         on_progress,
     )
-}
-
-fn validate_model_response(
-    response: &ureq::Response,
-    model: &IntentModelArtifact,
-) -> Result<(), String> {
-    if response
-        .header("content-encoding")
-        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
-    {
-        return Err("voice intent model response must not use content encoding".to_owned());
-    }
-    if let Some(length) = response.header("content-length") {
-        let length = length
-            .parse::<u64>()
-            .map_err(|_| "voice intent model Content-Length is invalid".to_owned())?;
-        if length != model.size_bytes {
-            return Err(format!(
-                "voice intent model Content-Length mismatch: expected {}, received {length}",
-                model.size_bytes
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1621,6 +1671,225 @@ fn check_download_deadline(deadline: Option<Instant>, name: &str) -> Result<(), 
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfficialDownloadPolicy {
+    CatalogArtifact,
+    LlamaCppRuntime,
+    HuggingFaceModel,
+}
+
+struct ArtifactHttpResponse {
+    status: u16,
+    locations: Vec<String>,
+    content_encoding: Option<String>,
+    content_length: Option<String>,
+    content_type: Option<String>,
+    body: Box<dyn Read + Send + Sync>,
+}
+
+fn request_official_artifact(
+    initial_url: &str,
+    policy: OfficialDownloadPolicy,
+    expected_size: u64,
+    label: &str,
+    deadline: Instant,
+) -> Result<ArtifactHttpResponse, String> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .build();
+    follow_artifact_redirects_with(initial_url, policy, expected_size, label, deadline, |url| {
+        let response = match agent
+            .get(url.as_str())
+            .set("Accept-Encoding", "identity")
+            .call()
+        {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(_)) => {
+                return Err(format!("{label} request failed"));
+            }
+        };
+        Ok(ArtifactHttpResponse {
+            status: response.status(),
+            locations: response
+                .all("location")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            content_encoding: response.header("content-encoding").map(ToOwned::to_owned),
+            content_length: response.header("content-length").map(ToOwned::to_owned),
+            content_type: response.header("content-type").map(ToOwned::to_owned),
+            body: response.into_reader(),
+        })
+    })
+}
+
+fn follow_artifact_redirects_with(
+    initial_url: &str,
+    policy: OfficialDownloadPolicy,
+    expected_size: u64,
+    label: &str,
+    deadline: Instant,
+    mut request: impl FnMut(&url::Url) -> Result<ArtifactHttpResponse, String>,
+) -> Result<ArtifactHttpResponse, String> {
+    let mut current =
+        url::Url::parse(initial_url).map_err(|_| format!("{label} origin URL is invalid"))?;
+    validate_download_origin(&current, policy, label)?;
+    let mut visited = HashSet::new();
+    visited.insert(current.as_str().to_owned());
+
+    for hop in 0..=MAX_REDIRECTS {
+        check_download_deadline(Some(deadline), label)?;
+        let response = request(&current)?;
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if hop == MAX_REDIRECTS {
+                return Err(format!("{label} exceeded the redirect limit"));
+            }
+            if response.locations.len() != 1 {
+                return Err(format!(
+                    "{label} redirect must provide exactly one Location header"
+                ));
+            }
+            let location = &response.locations[0];
+            if location.is_empty() || location.len() > MAX_REDIRECT_LOCATION_BYTES {
+                return Err(format!("{label} redirect Location is invalid"));
+            }
+            let next = current
+                .join(location)
+                .map_err(|_| format!("{label} redirect Location is invalid"))?;
+            validate_download_redirect(&current, &next, policy, label)?;
+            if !visited.insert(next.as_str().to_owned()) {
+                return Err(format!("{label} redirect loop detected"));
+            }
+            current = next;
+            continue;
+        }
+        if response.status != 200 {
+            return Err(format!(
+                "{label} request returned status {} after {hop} redirects",
+                response.status
+            ));
+        }
+        validate_download_response(&response, expected_size, label)?;
+        return Ok(response);
+    }
+    Err(format!("{label} exceeded the redirect limit"))
+}
+
+fn validate_download_origin(
+    url: &url::Url,
+    policy: OfficialDownloadPolicy,
+    label: &str,
+) -> Result<(), String> {
+    validate_download_url(url, false, label)?;
+    let matches = match policy {
+        OfficialDownloadPolicy::CatalogArtifact => true,
+        OfficialDownloadPolicy::LlamaCppRuntime => url.as_str() == LLAMA_CPP_OFFICIAL_URL,
+        OfficialDownloadPolicy::HuggingFaceModel => matches!(
+            url.as_str(),
+            "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf"
+                | "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf"
+        ),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("{label} origin URL is not approved"))
+    }
+}
+
+fn validate_download_redirect(
+    _current: &url::Url,
+    next: &url::Url,
+    policy: OfficialDownloadPolicy,
+    label: &str,
+) -> Result<(), String> {
+    let host = next.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = match policy {
+        OfficialDownloadPolicy::CatalogArtifact => false,
+        OfficialDownloadPolicy::LlamaCppRuntime => host == "release-assets.githubusercontent.com",
+        OfficialDownloadPolicy::HuggingFaceModel => {
+            host.len() > ".cdn.hf.co".len() && host.ends_with(".cdn.hf.co")
+        }
+    };
+    validate_download_url(next, allowed, label)?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!("{label} redirect target is not approved"))
+    }
+}
+
+fn validate_download_url(url: &url::Url, allow_query: bool, label: &str) -> Result<(), String> {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    if url.scheme() != "https"
+        || host.is_empty()
+        || loopback
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".invalid")
+        || host.ends_with(".test")
+        || host.ends_with(".example")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || url.fragment().is_some()
+        || (!allow_query && url.query().is_some())
+    {
+        return Err(format!("{label} download URL is unsafe"));
+    }
+    Ok(())
+}
+
+fn validate_download_response(
+    response: &ArtifactHttpResponse,
+    expected_size: u64,
+    label: &str,
+) -> Result<(), String> {
+    if response
+        .content_encoding
+        .as_deref()
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        return Err(format!("{label} response must not use content encoding"));
+    }
+    if let Some(length) = response.content_length.as_deref() {
+        let length = length
+            .parse::<u64>()
+            .map_err(|_| format!("{label} Content-Length is invalid"))?;
+        if length != expected_size {
+            return Err(format!(
+                "{label} Content-Length mismatch: expected {expected_size}, received {length}"
+            ));
+        }
+    }
+    if response
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| {
+            let media_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            media_type.starts_with("text/")
+                || matches!(media_type.as_str(), "application/json" | "application/xml")
+        })
+    {
+        return Err(format!("{label} response has a non-binary content type"));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub(crate) fn download_and_stage(
     artifact: &RuntimeArtifact,
@@ -1635,37 +1904,21 @@ pub(crate) fn download_and_stage_with_progress(
     on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
 ) -> Result<StagedRuntimeArtifact, String> {
     let deadline = Instant::now() + MAX_DOWNLOAD_DURATION;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(std::time::Duration::from_secs(15))
-        .timeout_read(std::time::Duration::from_secs(60))
-        .timeout_write(std::time::Duration::from_secs(60))
-        .build();
-    let response = agent
-        .get(&artifact.url)
-        .call()
-        .map_err(|err| format!("runtime artifact request failed: {err}"))?;
-    if response
-        .header("content-encoding")
-        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
-    {
-        return Err("runtime artifact response must not use content encoding".to_owned());
-    }
-    if let Some(length) = response.header("content-length") {
-        let length = length
-            .parse::<u64>()
-            .map_err(|_| "runtime artifact Content-Length is invalid".to_owned())?;
-        if length != artifact.size_bytes {
-            return Err(format!(
-                "runtime artifact Content-Length mismatch: expected {}, received {length}",
-                artifact.size_bytes
-            ));
-        }
-    }
+    let policy = match artifact.archive_layout {
+        ArchiveLayout::UpstreamLlamaCppFlatZipV1 => OfficialDownloadPolicy::LlamaCppRuntime,
+        ArchiveLayout::ScribePortableZipV1 => OfficialDownloadPolicy::CatalogArtifact,
+    };
+    let response = request_official_artifact(
+        &artifact.url,
+        policy,
+        artifact.size_bytes,
+        "runtime artifact",
+        deadline,
+    )?;
     stage_from_reader_until_with_progress(
         artifact,
         target_root,
-        response.into_reader(),
+        response.body,
         Some(deadline),
         on_progress,
     )
@@ -1802,6 +2055,21 @@ fn extract_archive(
     reader: impl Read + Seek,
     stage_root: &Path,
 ) -> Result<(), String> {
+    match artifact.archive_layout {
+        ArchiveLayout::ScribePortableZipV1 => {
+            extract_scribe_portable_archive(artifact, reader, stage_root)
+        }
+        ArchiveLayout::UpstreamLlamaCppFlatZipV1 => {
+            extract_upstream_llama_cpp_archive(artifact, reader, stage_root)
+        }
+    }
+}
+
+fn extract_scribe_portable_archive(
+    artifact: &RuntimeArtifact,
+    reader: impl Read + Seek,
+    stage_root: &Path,
+) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|err| format!("runtime artifact is not a readable ZIP archive: {err}"))?;
     validate_archive_entry_count(archive.len())?;
@@ -1919,6 +2187,218 @@ fn extract_archive(
     }
     validate_extracted_manifest(artifact, stage_root)?;
     Ok(())
+}
+
+fn extract_upstream_llama_cpp_archive(
+    artifact: &RuntimeArtifact,
+    reader: impl Read + Seek,
+    stage_root: &Path,
+) -> Result<(), String> {
+    extract_upstream_llama_cpp_archive_with_expectations(
+        artifact,
+        reader,
+        stage_root,
+        LlamaArchiveExpectations {
+            entry_count: LLAMA_CPP_UPSTREAM_ENTRY_COUNT,
+            unpacked_size: LLAMA_CPP_UPSTREAM_UNPACKED_SIZE,
+            dll_count: LLAMA_CPP_SELECTED_DLL_COUNT,
+            payload_size: LLAMA_CPP_SELECTED_PAYLOAD_SIZE,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct LlamaArchiveExpectations {
+    entry_count: usize,
+    unpacked_size: u64,
+    dll_count: usize,
+    payload_size: u64,
+}
+
+fn extract_upstream_llama_cpp_archive_with_expectations(
+    artifact: &RuntimeArtifact,
+    reader: impl Read + Seek,
+    stage_root: &Path,
+    expected: LlamaArchiveExpectations,
+) -> Result<(), String> {
+    if artifact.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID
+        || artifact.archive_layout != ArchiveLayout::UpstreamLlamaCppFlatZipV1
+    {
+        return Err(
+            "the upstream llama.cpp layout is reserved for the approved voice runtime".to_owned(),
+        );
+    }
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|err| format!("llama.cpp artifact is not a readable ZIP archive: {err}"))?;
+    if archive.len() != expected.entry_count {
+        return Err(format!(
+            "llama.cpp archive entry count mismatch: expected {}, received {}",
+            expected.entry_count,
+            archive.len()
+        ));
+    }
+    fs::create_dir(stage_root)
+        .map_err(|err| format!("could not create {}: {err}", stage_root.display()))?;
+    let bin_root = stage_root.join("bin");
+    fs::create_dir(&bin_root)
+        .map_err(|err| format!("could not create {}: {err}", bin_root.display()))?;
+
+    let mut names = HashSet::new();
+    let mut declared_unpacked = 0_u64;
+    let mut extracted_payload = 0_u64;
+    let mut found_server = false;
+    let mut dll_count = 0_usize;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("could not inspect llama.cpp archive entry {index}: {err}"))?;
+        let name = entry.name().to_owned();
+        let relative = Path::new(&name);
+        if name.is_empty()
+            || !name.is_ascii()
+            || name.contains(['/', '\\'])
+            || validate_relative_entrypoint(relative).is_err()
+            || relative.components().count() != 1
+            || entry.is_dir()
+            || entry.encrypted()
+        {
+            return Err(format!("unsafe llama.cpp archive entry {name:?}"));
+        }
+        let folded = name.to_ascii_lowercase();
+        if !names.insert(folded.clone()) {
+            return Err(format!("duplicate llama.cpp archive entry {name:?}"));
+        }
+        let unix_type = entry.unix_mode().unwrap_or(0) & 0o170000;
+        if !matches!(unix_type, 0 | 0o100000) {
+            return Err(format!(
+                "llama.cpp archive entry {name:?} is a link or special file"
+            ));
+        }
+        declared_unpacked = declared_unpacked
+            .checked_add(entry.size())
+            .ok_or_else(|| "llama.cpp archive unpacked size overflowed".to_owned())?;
+        if declared_unpacked > artifact.unpacked_size_bytes {
+            return Err(format!(
+                "llama.cpp archive exceeds the allowed unpacked size of {} bytes",
+                artifact.unpacked_size_bytes
+            ));
+        }
+
+        let selected = folded == "llama-server.exe" || folded.ends_with(".dll");
+        if !selected {
+            continue;
+        }
+        found_server |= folded == "llama-server.exe";
+        dll_count += usize::from(folded.ends_with(".dll"));
+        let destination = bin_root.join(&name);
+        let declared_size = entry.size();
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|err| format!("could not create {}: {err}", destination.display()))?;
+        copy_archive_entry_bounded(
+            &mut entry,
+            &mut output,
+            &name,
+            declared_size,
+            &mut extracted_payload,
+            artifact.unpacked_size_bytes,
+        )?;
+        output
+            .sync_all()
+            .map_err(|err| format!("could not finish {}: {err}", destination.display()))?;
+        drop(output);
+        let mut image = File::open(&destination)
+            .map_err(|err| format!("could not inspect {}: {err}", destination.display()))?;
+        let mut signature = [0_u8; 2];
+        image
+            .read_exact(&mut signature)
+            .map_err(|_| format!("llama.cpp runtime payload is truncated: {name}"))?;
+        if signature != *b"MZ" {
+            return Err(format!(
+                "llama.cpp runtime payload is not a Windows PE image: {name}"
+            ));
+        }
+    }
+    if declared_unpacked != expected.unpacked_size
+        || declared_unpacked != artifact.unpacked_size_bytes
+    {
+        return Err(format!(
+            "llama.cpp archive unpacked size mismatch: expected {}, received {declared_unpacked}",
+            artifact.unpacked_size_bytes
+        ));
+    }
+    if !found_server
+        || dll_count != expected.dll_count
+        || extracted_payload != expected.payload_size
+    {
+        return Err("llama.cpp archive runtime payload inventory does not match b9637".to_owned());
+    }
+    write_pinned_llama_license(stage_root)?;
+    write_generated_runtime_manifest(artifact, stage_root)?;
+    validate_extracted_manifest(artifact, stage_root)?;
+    if !stage_root.join(&artifact.entrypoint).is_file() {
+        return Err(format!(
+            "llama.cpp runtime did not create {}",
+            artifact.entrypoint.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_pinned_llama_license(stage_root: &Path) -> Result<(), String> {
+    let digest = format!("{:x}", Sha256::digest(LLAMA_CPP_LICENSE));
+    if LLAMA_CPP_LICENSE.len() != 1_078
+        || digest != "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    {
+        return Err("embedded llama.cpp license does not match the approved bytes".to_owned());
+    }
+    let path = stage_root.join("LICENSE.llama.cpp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| format!("could not create {}: {err}", path.display()))?;
+    file.write_all(LLAMA_CPP_LICENSE)
+        .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("could not finish {}: {err}", path.display()))
+}
+
+fn write_generated_runtime_manifest(
+    artifact: &RuntimeArtifact,
+    stage_root: &Path,
+) -> Result<(), String> {
+    let manifest = RuntimeArtifactManifest {
+        manifest_version: 1,
+        runtime_id: artifact.runtime_id.clone(),
+        version: artifact.version.clone(),
+        platform: format!("{}-{}", artifact.os, artifact.arch),
+        device: artifact.device,
+        entrypoint: artifact.entrypoint.clone(),
+        portable: true,
+        upstream_repository: artifact.upstream_repository.clone(),
+        upstream_revision: artifact.upstream_revision.clone(),
+        upstream_asset: artifact.upstream_asset.clone(),
+        upstream_sha256: artifact.upstream_sha256.clone(),
+        upstream_size_bytes: artifact.upstream_size_bytes,
+        license: artifact.license.clone(),
+        license_sha256: artifact.license_sha256.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|err| format!("could not serialize runtime manifest: {err}"))?;
+    bytes.push(b'\n');
+    let path = stage_root.join("runtime-manifest.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| format!("could not create {}: {err}", path.display()))?;
+    file.write_all(&bytes)
+        .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("could not finish {}: {err}", path.display()))
 }
 
 fn copy_archive_entry_bounded(
@@ -2077,6 +2557,7 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
     use zip::write::SimpleFileOptions;
 
@@ -2110,14 +2591,33 @@ mod tests {
     }
 
     fn intent_model(tier: &str, model_id: &str, url: Option<&str>) -> String {
-        let url = url
-            .map(|url| format!(r#","url":"{url}""#))
-            .unwrap_or_default();
+        let (version, repository, revision, filename, approved_url, size, sha, managed_path) =
+            match tier {
+                "balanced" => (
+                    "Qwen3-1.7B",
+                    "Qwen/Qwen3-1.7B-GGUF",
+                    "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+                    "Qwen3-1.7B-Q8_0.gguf",
+                    "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
+                    1_834_426_016_u64,
+                    "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+                    "voice-intent/Qwen3-1.7B-Q8_0.gguf",
+                ),
+                _ => (
+                    "Qwen3-0.6B",
+                    "Qwen/Qwen3-0.6B-GGUF",
+                    "ef4088322893040952513f532f736ddeab518403",
+                    "Qwen3-0.6B-Q8_0.gguf",
+                    "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf",
+                    804_753_088_u64,
+                    "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
+                    "voice-intent/Qwen3-0.6B-Q8_0.gguf",
+                ),
+            };
+        let url = url.unwrap_or(approved_url);
         format!(
-            r#"{{"runtime_id":"voice_intent_llama_cpp","tier":"{tier}","model_id":"{model_id}","version":"Qwen3-0.6B","upstream_repository":"Qwen/Qwen3-0.6B-GGUF","upstream_revision":"{}","upstream_filename":"Qwen3-0.6B-Q8_0.gguf","license":"Apache-2.0","license_sha256":"{}"{url},"sha256":"{}","size_bytes":4,"managed_relative_path":"voice-intent/{model_id}.gguf"}}"#,
-            "a".repeat(40),
+            r#"{{"runtime_id":"voice_intent_llama_cpp","tier":"{tier}","model_id":"{model_id}","version":"{version}","upstream_repository":"{repository}","upstream_revision":"{revision}","upstream_filename":"{filename}","license":"Apache-2.0","license_sha256":"{}","url":"{url}","sha256":"{sha}","size_bytes":{size},"managed_relative_path":"{managed_path}"}}"#,
             "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
-            "a".repeat(64),
         )
     }
 
@@ -2130,6 +2630,136 @@ mod tests {
             writer.write_all(contents).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    fn http_response(
+        status: u16,
+        locations: &[&str],
+        content_length: Option<&str>,
+        body: &[u8],
+    ) -> ArtifactHttpResponse {
+        ArtifactHttpResponse {
+            status,
+            locations: locations.iter().map(|value| (*value).to_owned()).collect(),
+            content_encoding: None,
+            content_length: content_length.map(ToOwned::to_owned),
+            content_type: Some("application/octet-stream".to_owned()),
+            body: Box::new(Cursor::new(body.to_vec())),
+        }
+    }
+
+    #[test]
+    fn controlled_redirects_accept_only_expected_official_host_transitions() {
+        let mut github = VecDeque::from([
+            http_response(
+                302,
+                &[
+                    "https://release-assets.githubusercontent.com/github-production-release-asset/file.zip?sig=secret",
+                ],
+                Some("0"),
+                b"",
+            ),
+            http_response(200, &[], Some("4"), b"data"),
+        ]);
+        let response = follow_artifact_redirects_with(
+            LLAMA_CPP_OFFICIAL_URL,
+            OfficialDownloadPolicy::LlamaCppRuntime,
+            4,
+            "runtime artifact",
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(github.pop_front().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+
+        let compact = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf";
+        let mut hugging_face = VecDeque::from([
+            http_response(
+                302,
+                &["https://us-east-1.cdn.hf.co/model.gguf?X-Amz-Signature=secret"],
+                None,
+                b"",
+            ),
+            http_response(200, &[], None, b"data"),
+        ]);
+        assert!(
+            follow_artifact_redirects_with(
+                compact,
+                OfficialDownloadPolicy::HuggingFaceModel,
+                4,
+                "voice intent model",
+                Instant::now() + Duration::from_secs(1),
+                |_| Ok(hugging_face.pop_front().unwrap()),
+            )
+            .is_ok()
+        );
+
+        for target in [
+            "http://us-east-1.cdn.hf.co/model.gguf",
+            "https://cdn.hf.co.attacker.example/model.gguf",
+            "https://huggingface.co.evil.example/model.gguf",
+            "https://127.0.0.1/model.gguf",
+            "https://user@us-east-1.cdn.hf.co/model.gguf",
+            "https://us-east-1.cdn.hf.co:444/model.gguf",
+        ] {
+            let mut responses = VecDeque::from([http_response(302, &[target], None, b"")]);
+            let error = follow_artifact_redirects_with(
+                compact,
+                OfficialDownloadPolicy::HuggingFaceModel,
+                4,
+                "voice intent model",
+                Instant::now() + Duration::from_secs(1),
+                |_| Ok(responses.pop_front().unwrap()),
+            )
+            .err()
+            .unwrap();
+            assert!(!error.contains(target));
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn controlled_redirects_reject_loops_limits_and_invalid_responses() {
+        let compact = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf";
+        let mut loop_response = VecDeque::from([http_response(302, &[compact], None, b"")]);
+        assert!(
+            follow_artifact_redirects_with(
+                compact,
+                OfficialDownloadPolicy::HuggingFaceModel,
+                4,
+                "voice intent model",
+                Instant::now() + Duration::from_secs(1),
+                |_| Ok(loop_response.pop_front().unwrap()),
+            )
+            .err()
+            .unwrap()
+            .contains("not approved")
+        );
+
+        for response in [
+            ArtifactHttpResponse {
+                content_encoding: Some("gzip".to_owned()),
+                ..http_response(200, &[], Some("4"), b"data")
+            },
+            ArtifactHttpResponse {
+                content_type: Some("text/html".to_owned()),
+                ..http_response(200, &[], Some("4"), b"data")
+            },
+            http_response(200, &[], Some("5"), b"data"),
+        ] {
+            let mut responses = Some(response);
+            assert!(
+                follow_artifact_redirects_with(
+                    compact,
+                    OfficialDownloadPolicy::HuggingFaceModel,
+                    4,
+                    "voice intent model",
+                    Instant::now() + Duration::from_secs(1),
+                    |_| Ok(responses.take().unwrap()),
+                )
+                .is_err()
+            );
+        }
     }
 
     fn manifest() -> Vec<u8> {
@@ -2157,6 +2787,7 @@ mod tests {
             size_bytes: expected_size,
             unpacked_size_bytes: unpacked_size,
             entrypoint: PathBuf::from("bin/whisper-cli"),
+            archive_layout: ArchiveLayout::ScribePortableZipV1,
             upstream_repository: None,
             upstream_revision: None,
             upstream_asset: None,
@@ -2165,6 +2796,101 @@ mod tests {
             license: None,
             license_sha256: None,
         }
+    }
+
+    fn test_official_llama_artifact(unpacked_size: u64) -> RuntimeArtifact {
+        RuntimeArtifact {
+            runtime_id: VOICE_INTENT_LLAMA_CPP_RUNTIME_ID.to_owned(),
+            version: "b9637".to_owned(),
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            device: RuntimeDevicePack::Cpu,
+            url: LLAMA_CPP_OFFICIAL_URL.to_owned(),
+            sha256: "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e".to_owned(),
+            size_bytes: 16_906_751,
+            unpacked_size_bytes: unpacked_size,
+            entrypoint: PathBuf::from("bin/llama-server.exe"),
+            archive_layout: ArchiveLayout::UpstreamLlamaCppFlatZipV1,
+            upstream_repository: Some("ggml-org/llama.cpp".to_owned()),
+            upstream_revision: Some("aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3".to_owned()),
+            upstream_asset: Some("llama-b9637-bin-win-cpu-x64.zip".to_owned()),
+            upstream_sha256: Some(
+                "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e".to_owned(),
+            ),
+            upstream_size_bytes: Some(16_906_751),
+            license: Some("MIT".to_owned()),
+            license_sha256: Some(
+                "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d".to_owned(),
+            ),
+        }
+    }
+
+    #[test]
+    fn official_llama_flat_zip_is_normalized_with_pinned_license_and_manifest() {
+        let bytes = archive(&[
+            ("llama-server.exe", b"MZserver"),
+            ("ggml.dll", b"MZdll"),
+            ("README.md", b"info"),
+        ]);
+        let root = temp_target("llama-normalize");
+        let artifact = test_official_llama_artifact(17);
+        extract_upstream_llama_cpp_archive_with_expectations(
+            &artifact,
+            Cursor::new(bytes),
+            &root,
+            LlamaArchiveExpectations {
+                entry_count: 3,
+                unpacked_size: 17,
+                dll_count: 1,
+                payload_size: 13,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(root.join("bin/llama-server.exe")).unwrap(),
+            b"MZserver"
+        );
+        assert_eq!(fs::read(root.join("bin/ggml.dll")).unwrap(), b"MZdll");
+        assert!(!root.join("README.md").exists());
+        assert_eq!(
+            fs::read(root.join("LICENSE.llama.cpp")).unwrap(),
+            LLAMA_CPP_LICENSE
+        );
+        validate_extracted_manifest(&artifact, &root).unwrap();
+
+        let manifest_path = root.join("runtime-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["unexpected"] = serde_json::json!(true);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(validate_extracted_manifest(&artifact, &root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn official_llama_transform_rejects_unsafe_names_and_cleans_via_staging() {
+        let bytes = archive(&[
+            ("../llama-server.exe", b"MZserver"),
+            ("ggml.dll", b"MZdll"),
+            ("README.md", b"info"),
+        ]);
+        let root = temp_target("llama-unsafe");
+        let artifact = test_official_llama_artifact(17);
+        let error = extract_upstream_llama_cpp_archive_with_expectations(
+            &artifact,
+            Cursor::new(bytes),
+            &root,
+            LlamaArchiveExpectations {
+                entry_count: 3,
+                unpacked_size: 17,
+                dll_count: 1,
+                payload_size: 13,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("unsafe"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_intent_model(bytes: &[u8], expected_size: u64) -> IntentModelArtifact {
@@ -2330,7 +3056,31 @@ mod tests {
             "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
         );
         assert_eq!(balanced.license_sha256, compact.license_sha256);
-        assert!(compact.url.is_none() && balanced.url.is_none());
+        assert_eq!(
+            compact.url.as_deref(),
+            Some(
+                "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf"
+            )
+        );
+        assert_eq!(
+            balanced.url.as_deref(),
+            Some(
+                "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf"
+            )
+        );
+        let runtime = catalog
+            .select(
+                VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+                "windows",
+                "x86_64",
+                RuntimeDevicePack::Cpu,
+            )
+            .unwrap();
+        assert_eq!(runtime.url, LLAMA_CPP_OFFICIAL_URL);
+        assert_eq!(
+            runtime.archive_layout,
+            ArchiveLayout::UpstreamLlamaCppFlatZipV1
+        );
         assert!(
             runtime_catalog::backend_spec_for_runtime_id(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
                 .is_none()
@@ -2387,27 +3137,19 @@ mod tests {
 
     #[test]
     fn auxiliary_runtime_is_cpu_only_without_expanding_the_stt_catalog() {
-        let trusted = artifact(
-            VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
-            "windows",
-            "x86_64",
-            "cpu",
-        );
-        assert!(RuntimeArtifactCatalog::parse(&catalog_json(&trusted)).is_ok());
+        let trusted = include_str!("../runtime-artifacts.default.json");
+        assert!(RuntimeArtifactCatalog::parse(trusted).is_ok());
         assert!(
-            RuntimeArtifactCatalog::parse(&catalog_json(&trusted.replace(
+            RuntimeArtifactCatalog::parse(&trusted.replace(
                 "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
                 &"0".repeat(64),
-            )))
+            ))
             .is_err()
         );
         assert!(
-            RuntimeArtifactCatalog::parse(&catalog_json(&artifact(
-                VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
-                "windows",
-                "x86_64",
-                "gpu"
-            )))
+            RuntimeArtifactCatalog::parse(
+                &trusted.replace(r#""device": "cpu""#, r#""device": "gpu""#,)
+            )
             .is_err()
         );
         assert!(

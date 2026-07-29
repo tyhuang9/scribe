@@ -10405,24 +10405,31 @@ mod layout_tests {
     }
 
     #[test]
-    fn checked_in_catalog_keeps_voice_editor_downloads_unpublished() {
+    fn checked_in_catalog_publishes_exact_official_voice_editor_downloads() {
         let catalog = runtime_artifacts::RuntimeArtifactCatalog::parse(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/runtime-artifacts.default.json"
         )))
         .unwrap();
         for tier in [IntentModelTier::Compact, IntentModelTier::Balanced] {
-            assert!(catalog.intent_model(tier).unwrap().url.is_none());
+            assert!(
+                catalog
+                    .intent_model(tier)
+                    .unwrap()
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("https://huggingface.co/Qwen/"))
+            );
         }
         assert!(
             catalog
                 .select(
                     runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
+                    "windows",
+                    "x86_64",
                     RuntimeDevicePack::Cpu,
                 )
-                .is_none()
+                .is_some()
         );
     }
 

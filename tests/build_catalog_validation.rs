@@ -8,6 +8,29 @@ fn approved_voice_models_validate_without_the_release_presence_flag() {
 }
 
 #[test]
+fn approved_voice_runtime_and_official_urls_are_exact() {
+    let approved = include_str!("../runtime-artifacts.default.json");
+    for (original, replacement) in [
+        (
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip",
+            "https://release-assets.githubusercontent.com/untrusted.zip",
+        ),
+        ("upstream_llama_cpp_flat_zip_v1", "scribe_portable_zip_v1"),
+        ("43983896", "43983895"),
+        (
+            "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf",
+            "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+        ),
+    ] {
+        let mutated = approved.replacen(original, replacement, 1);
+        assert!(
+            catalog_build::validate_catalog(&mutated).is_err(),
+            "mutation must fail: {original}"
+        );
+    }
+}
+
+#[test]
 fn arbitrary_voice_model_identity_is_rejected_without_the_release_presence_flag() {
     let approved: serde_json::Value =
         serde_json::from_str(include_str!("../runtime-artifacts.default.json")).unwrap();

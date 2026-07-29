@@ -41,6 +41,8 @@ struct Artifact {
     unpacked_size_bytes: u64,
     entrypoint: String,
     #[serde(default)]
+    archive_layout: ArchiveLayout,
+    #[serde(default)]
     upstream_repository: Option<String>,
     #[serde(default)]
     upstream_revision: Option<String>,
@@ -54,6 +56,14 @@ struct Artifact {
     license: Option<String>,
     #[serde(default)]
     license_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ArchiveLayout {
+    #[default]
+    ScribePortableZipV1,
+    UpstreamLlamaCppFlatZipV1,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +297,7 @@ fn validate_approved_intent_model(model: &IntentModel) -> Result<(), String> {
             "Qwen/Qwen3-0.6B-GGUF",
             "ef4088322893040952513f532f736ddeab518403",
             "Qwen3-0.6B-Q8_0.gguf",
+            "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf",
             804_753_088_u64,
             "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
             "voice-intent/Qwen3-0.6B-Q8_0.gguf",
@@ -297,6 +308,7 @@ fn validate_approved_intent_model(model: &IntentModel) -> Result<(), String> {
             "Qwen/Qwen3-1.7B-GGUF",
             "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
             "Qwen3-1.7B-Q8_0.gguf",
+            "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
             1_834_426_016_u64,
             "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
             "voice-intent/Qwen3-1.7B-Q8_0.gguf",
@@ -309,9 +321,10 @@ fn validate_approved_intent_model(model: &IntentModel) -> Result<(), String> {
         || model.upstream_repository != expected.2
         || model.upstream_revision != expected.3
         || model.upstream_filename != expected.4
-        || model.size_bytes != expected.5
-        || model.sha256 != expected.6
-        || model.managed_relative_path != expected.7
+        || model.url.as_deref() != Some(expected.5)
+        || model.size_bytes != expected.6
+        || model.sha256 != expected.7
+        || model.managed_relative_path != expected.8
         || model.license != "Apache-2.0"
         || model.license_sha256
             != "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
@@ -335,7 +348,9 @@ fn validate_voice_runtime_provenance(artifact: &Artifact) -> Result<(), String> 
         artifact.license_sha256.as_deref(),
     );
     if artifact.runtime_id != "voice_intent_llama_cpp" {
-        if provenance == (None, None, None, None, None, None, None) {
+        if provenance == (None, None, None, None, None, None, None)
+            && artifact.archive_layout == ArchiveLayout::ScribePortableZipV1
+        {
             return Ok(());
         }
         return Err(
@@ -355,6 +370,13 @@ fn validate_voice_runtime_provenance(artifact: &Artifact) -> Result<(), String> 
         || artifact.os != "windows"
         || artifact.arch != "x86_64"
         || artifact.device != "cpu"
+        || artifact.url
+            != "https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip"
+        || artifact.sha256 != "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e"
+        || artifact.size_bytes != 16_906_751
+        || artifact.unpacked_size_bytes != 43_983_896
+        || artifact.entrypoint != "bin/llama-server.exe"
+        || artifact.archive_layout != ArchiveLayout::UpstreamLlamaCppFlatZipV1
         || provenance != expected
     {
         return Err(
