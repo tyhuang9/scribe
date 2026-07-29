@@ -3454,21 +3454,34 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Recording"));
+                let heading = ui.label(section_heading("Recording"));
+                ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Heading);
+                    builder.set_hierarchical_level(2);
+                });
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.hotkey_mode;
-                    ui.label("Hotkey behavior");
-                    ui.selectable_value(
+                    let label = ui.label("Hotkey behavior");
+                    let press_once = ui.radio_value(
                         &mut self.config.hotkey_mode,
                         HotkeyMode::Toggle,
                         "Press once",
                     );
-                    ui.selectable_value(
+                    let hold = ui.radio_value(
                         &mut self.config.hotkey_mode,
                         HotkeyMode::HoldToTalk,
                         "Hold",
                     );
+                    let group = [press_once.id, hold.id];
+                    set_radio_accessibility(
+                        ui,
+                        &press_once,
+                        label.id,
+                        "Hotkey behavior: Press once",
+                        &group,
+                    );
+                    set_radio_accessibility(ui, &hold, label.id, "Hotkey behavior: Hold", &group);
                     if before != self.config.hotkey_mode {
                         self.save_config();
                     }
@@ -3480,46 +3493,60 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
 
                 let before = self.config.max_recording_seconds;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Duration preset");
-                    let response = ComboBox::from_id_source("recording-duration-preset")
-                        .selected_text(format_recording_duration(self.config.max_recording_seconds))
-                        .width(140.0)
-                        .show_ui(ui, |ui| {
-                            for (seconds, text) in RECORDING_DURATION_PRESETS {
-                                ui.selectable_value(
-                                    &mut self.config.max_recording_seconds,
-                                    seconds,
-                                    text,
-                                );
-                            }
-                        })
-                        .response;
-                    set_control_accessibility(ui, &response, label.id, "Recording duration preset");
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let mut minutes = recording_duration_minutes(self.config.max_recording_seconds);
-                    let label = ui.label("Custom duration");
-                    let response = ui.add(
-                        egui::DragValue::new(&mut minutes)
-                            .clamp_range(0.5..=120.0)
-                            .speed(0.5)
-                            .max_decimals(2)
-                            .suffix(" minutes"),
-                    );
-                    set_control_accessibility(
-                        ui,
-                        &response,
-                        label.id,
-                        "Custom recording duration in minutes",
-                    );
-                    if response.changed() {
-                        self.config.max_recording_seconds = recording_duration_seconds(minutes);
-                    }
-                    if self.active_recording.is_some() {
-                        ui.label("Applies next time.");
-                    }
-                });
+                let preset_response = ui
+                    .horizontal_wrapped(|ui| {
+                        let label = ui.label("Duration preset");
+                        let response = ComboBox::from_id_source("recording-duration-preset")
+                            .selected_text(format_recording_duration(
+                                self.config.max_recording_seconds,
+                            ))
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                for (seconds, text) in RECORDING_DURATION_PRESETS {
+                                    ui.selectable_value(
+                                        &mut self.config.max_recording_seconds,
+                                        seconds,
+                                        text,
+                                    );
+                                }
+                            })
+                            .response;
+                        set_control_accessibility(
+                            ui,
+                            &response,
+                            label.id,
+                            "Recording duration preset",
+                        );
+                        response
+                    })
+                    .inner;
+                let custom_response = ui
+                    .horizontal_wrapped(|ui| {
+                        let mut minutes =
+                            recording_duration_minutes(self.config.max_recording_seconds);
+                        let label = ui.label("Custom duration");
+                        let response = ui.add(
+                            egui::DragValue::new(&mut minutes)
+                                .clamp_range(0.5..=120.0)
+                                .speed(0.5)
+                                .max_decimals(2)
+                                .suffix(" minutes"),
+                        );
+                        set_control_accessibility(
+                            ui,
+                            &response,
+                            label.id,
+                            "Custom recording duration in minutes",
+                        );
+                        if response.changed() {
+                            self.config.max_recording_seconds = recording_duration_seconds(minutes);
+                        }
+                        response
+                    })
+                    .inner;
+                if self.active_recording.is_some() {
+                    recording_duration_change_notice(ui, [&preset_response, &custom_response]);
+                }
                 if before != self.config.max_recording_seconds {
                     self.config.max_recording_seconds =
                         config::normalize_recording_duration(self.config.max_recording_seconds);
@@ -4054,6 +4081,41 @@ fn set_control_accessibility(ui: &Ui, response: &egui::Response, label_id: egui:
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_name(name);
     });
+}
+
+fn set_radio_accessibility(
+    ui: &Ui,
+    response: &egui::Response,
+    label_id: egui::Id,
+    name: &str,
+    group: &[egui::Id],
+) {
+    response.clone().labelled_by(label_id);
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::RadioButton);
+        builder.set_name(name);
+        builder.set_radio_group(group.iter().map(|id| id.value().into()).collect::<Vec<_>>());
+    });
+}
+
+fn recording_duration_change_notice(ui: &mut Ui, controls: [&egui::Response; 2]) {
+    let notice = ui.add(
+        egui::Label::new(mut_text(
+            "Duration changes apply to the next recording; the current recording is unchanged.",
+        ))
+        .wrap(true),
+    );
+    ui.ctx().accesskit_node_builder(notice.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Status);
+        builder.set_live(egui::accesskit::Live::Polite);
+    });
+
+    let notice_id = notice.id.value().into();
+    for control in controls {
+        ui.ctx().accesskit_node_builder(control.id, |builder| {
+            builder.push_described_by(notice_id);
+        });
+    }
 }
 
 fn model_backend_filter_control(
@@ -8176,6 +8238,91 @@ mod layout_tests {
             .map(|(_, node)| node)
             .unwrap();
         assert!(hotkey.value().is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn recording_settings_expose_a_heading_and_exclusive_hotkey_radios() {
+        let output = render_accessible_app_tab(Tab::Settings, 840.0);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+
+        let (_, heading) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Recording")
+            })
+            .expect("recording heading should be exposed");
+        assert_eq!(heading.hierarchical_level(), Some(2));
+
+        let (press_once_id, press_once) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::RadioButton
+                    && node.name() == Some("Hotkey behavior: Press once")
+            })
+            .expect("Press once should be an accessible radio button");
+        let (hold_id, hold) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::RadioButton
+                    && node.name() == Some("Hotkey behavior: Hold")
+            })
+            .expect("Hold should be an accessible radio button");
+
+        assert_eq!(press_once.checked(), Some(egui::accesskit::Checked::True));
+        assert_eq!(hold.checked(), Some(egui::accesskit::Checked::False));
+        assert_eq!(press_once.radio_group(), &[*press_once_id, *hold_id]);
+        assert_eq!(hold.radio_group(), &[*press_once_id, *hold_id]);
+    }
+
+    #[test]
+    fn recording_duration_notice_is_a_polite_status_and_describes_duration_controls() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut custom_duration = 1.0;
+        let mut duration_control_ids = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let preset = ui.button("Duration preset");
+                    let custom = ui.add(egui::DragValue::new(&mut custom_duration));
+                    recording_duration_change_notice(ui, [&preset, &custom]);
+                    duration_control_ids = Some([preset.id, custom.id]);
+                });
+            },
+        );
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        let (notice_id, notice) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Status
+                    && node.name()
+                        == Some(
+                            "Duration changes apply to the next recording; the current recording is unchanged.",
+                        )
+            })
+            .expect("duration change notice should be an accessible status");
+        assert_eq!(notice.live(), Some(egui::accesskit::Live::Polite));
+
+        for control_id in duration_control_ids.expect("duration control ids should be recorded") {
+            let control_id = control_id.value().into();
+            let (_, control) = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == control_id)
+                .unwrap_or_else(|| panic!("missing duration control {control_id:?}"));
+            assert!(control.described_by().contains(notice_id));
+        }
     }
 
     #[test]
