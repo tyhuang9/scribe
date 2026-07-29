@@ -10431,6 +10431,15 @@ mod layout_tests {
                 )
                 .is_some()
         );
+        let platform_supported = cfg!(all(target_os = "windows", target_arch = "x86_64"));
+        assert_eq!(
+            voice_editor_release_artifacts_available(VoiceEditingModelTier::Compact),
+            platform_supported
+        );
+        assert_eq!(
+            voice_editor_release_artifacts_available(VoiceEditingModelTier::Balanced),
+            platform_supported
+        );
     }
 
     #[test]

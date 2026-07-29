@@ -31,6 +31,70 @@ fn approved_voice_runtime_and_official_urls_are_exact() {
 }
 
 #[test]
+fn every_official_runtime_and_model_fingerprint_is_build_enforced() {
+    let approved: serde_json::Value =
+        serde_json::from_str(include_str!("../runtime-artifacts.default.json")).unwrap();
+    for (field, replacement) in [
+        ("version", serde_json::json!("b9638")),
+        ("os", serde_json::json!("linux")),
+        ("arch", serde_json::json!("aarch64")),
+        ("device", serde_json::json!("gpu")),
+        (
+            "url",
+            serde_json::json!("https://release-assets.githubusercontent.com/untrusted.zip"),
+        ),
+        ("sha256", serde_json::json!("0".repeat(64))),
+        ("size_bytes", serde_json::json!(16_906_750_u64)),
+        ("unpacked_size_bytes", serde_json::json!(43_983_895_u64)),
+        ("entrypoint", serde_json::json!("bin/llama-cli.exe")),
+        (
+            "archive_layout",
+            serde_json::json!("scribe_portable_zip_v1"),
+        ),
+        (
+            "upstream_repository",
+            serde_json::json!("attacker/llama.cpp"),
+        ),
+        ("upstream_revision", serde_json::json!("0".repeat(40))),
+        ("upstream_asset", serde_json::json!("renamed.zip")),
+        ("upstream_sha256", serde_json::json!("0".repeat(64))),
+        ("upstream_size_bytes", serde_json::json!(16_906_750_u64)),
+        ("license", serde_json::json!("Apache-2.0")),
+        ("license_sha256", serde_json::json!("0".repeat(64))),
+    ] {
+        let mut catalog = approved.clone();
+        catalog["artifacts"][0][field] = replacement;
+        assert!(
+            catalog_build::validate_catalog(&catalog.to_string()).is_err(),
+            "runtime mutation must fail: {field}"
+        );
+    }
+
+    for model_index in 0..2 {
+        for (field, replacement) in [
+            ("upstream_revision", serde_json::json!("0".repeat(40))),
+            (
+                "url",
+                serde_json::json!("https://huggingface.co/Qwen/changed/resolve/main/model.gguf"),
+            ),
+            ("sha256", serde_json::json!("0".repeat(64))),
+            ("size_bytes", serde_json::json!(1_u64)),
+            (
+                "managed_relative_path",
+                serde_json::json!("voice-intent/changed.gguf"),
+            ),
+        ] {
+            let mut catalog = approved.clone();
+            catalog["intent_models"][model_index][field] = replacement;
+            assert!(
+                catalog_build::validate_catalog(&catalog.to_string()).is_err(),
+                "model {model_index} mutation must fail: {field}"
+            );
+        }
+    }
+}
+
+#[test]
 fn arbitrary_voice_model_identity_is_rejected_without_the_release_presence_flag() {
     let approved: serde_json::Value =
         serde_json::from_str(include_str!("../runtime-artifacts.default.json")).unwrap();

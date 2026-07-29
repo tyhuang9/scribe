@@ -2721,20 +2721,70 @@ mod tests {
     #[test]
     fn controlled_redirects_reject_loops_limits_and_invalid_responses() {
         let compact = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/ef4088322893040952513f532f736ddeab518403/Qwen3-0.6B-Q8_0.gguf";
-        let mut loop_response = VecDeque::from([http_response(302, &[compact], None, b"")]);
-        assert!(
-            follow_artifact_redirects_with(
-                compact,
-                OfficialDownloadPolicy::HuggingFaceModel,
-                4,
-                "voice intent model",
-                Instant::now() + Duration::from_secs(1),
-                |_| Ok(loop_response.pop_front().unwrap()),
-            )
-            .err()
-            .unwrap()
-            .contains("not approved")
+        let mut loop_responses = VecDeque::from([
+            http_response(302, &["https://a.cdn.hf.co/model?token=1"], None, b""),
+            http_response(302, &["https://b.cdn.hf.co/model?token=2"], None, b""),
+            http_response(302, &["https://a.cdn.hf.co/model?token=1"], None, b""),
+        ]);
+        let error = follow_artifact_redirects_with(
+            compact,
+            OfficialDownloadPolicy::HuggingFaceModel,
+            4,
+            "voice intent model",
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(loop_responses.pop_front().unwrap()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("loop detected"));
+
+        let mut too_many = VecDeque::from([
+            http_response(302, &["https://a.cdn.hf.co/model?hop=1"], None, b""),
+            http_response(302, &["https://b.cdn.hf.co/model?hop=2"], None, b""),
+            http_response(302, &["https://c.cdn.hf.co/model?hop=3"], None, b""),
+            http_response(302, &["https://d.cdn.hf.co/model?hop=4"], None, b""),
+        ]);
+        let error = follow_artifact_redirects_with(
+            compact,
+            OfficialDownloadPolicy::HuggingFaceModel,
+            4,
+            "voice intent model",
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(too_many.pop_front().unwrap()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("redirect limit"));
+
+        let oversized_location = format!(
+            "https://a.cdn.hf.co/{}",
+            "a".repeat(MAX_REDIRECT_LOCATION_BYTES)
         );
+        for response in [
+            http_response(302, &[], None, b""),
+            http_response(
+                302,
+                &["https://a.cdn.hf.co/one", "https://b.cdn.hf.co/two"],
+                None,
+                b"",
+            ),
+            http_response(302, &[&oversized_location], None, b""),
+            http_response(302, &["https://a.cdn.hf.co/model.gguf#fragment"], None, b""),
+            http_response(302, &["https://a.cdn.hf.co:444/model.gguf"], None, b""),
+        ] {
+            let mut responses = Some(response);
+            assert!(
+                follow_artifact_redirects_with(
+                    compact,
+                    OfficialDownloadPolicy::HuggingFaceModel,
+                    4,
+                    "voice intent model",
+                    Instant::now() + Duration::from_secs(1),
+                    |_| Ok(responses.take().unwrap()),
+                )
+                .is_err()
+            );
+        }
 
         for response in [
             ArtifactHttpResponse {
@@ -2746,6 +2796,8 @@ mod tests {
                 ..http_response(200, &[], Some("4"), b"data")
             },
             http_response(200, &[], Some("5"), b"data"),
+            http_response(200, &[], Some("four"), b"data"),
+            http_response(503, &[], Some("4"), b"data"),
         ] {
             let mut responses = Some(response);
             assert!(
@@ -2891,6 +2943,240 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("unsafe"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_llama_transform_rejected(
+        name: &str,
+        bytes: Vec<u8>,
+        unpacked_size: u64,
+        expected: LlamaArchiveExpectations,
+    ) {
+        let root = temp_target(name);
+        let error = extract_upstream_llama_cpp_archive_with_expectations(
+            &test_official_llama_artifact(unpacked_size),
+            Cursor::new(bytes),
+            &root,
+            expected,
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn official_llama_transform_rejects_ambiguous_special_and_missing_payloads() {
+        for (name, bytes, unpacked_size, expected) in [
+            (
+                "llama-casefold-duplicate",
+                archive(&[
+                    ("llama-server.exe", b"MZserver"),
+                    ("GGML.dll", b"MZdll"),
+                    ("ggml.dll", b"MZdll"),
+                    ("README.md", b"info"),
+                ]),
+                22,
+                LlamaArchiveExpectations {
+                    entry_count: 4,
+                    unpacked_size: 22,
+                    dll_count: 2,
+                    payload_size: 18,
+                },
+            ),
+            (
+                "llama-reserved-name",
+                archive(&[
+                    ("llama-server.exe", b"MZserver"),
+                    ("CON.dll", b"MZdll"),
+                    ("README.md", b"info"),
+                ]),
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+            (
+                "llama-colon-name",
+                archive(&[
+                    ("llama-server.exe", b"MZserver"),
+                    ("bad:name.dll", b"MZdll"),
+                    ("README.md", b"info"),
+                ]),
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+            (
+                "llama-backslash-name",
+                archive(&[
+                    ("llama-server.exe", b"MZserver"),
+                    ("nested\\ggml.dll", b"MZdll"),
+                    ("README.md", b"info"),
+                ]),
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+            (
+                "llama-missing-server",
+                archive(&[("ggml.dll", b"MZdll"), ("README.md", b"info")]),
+                9,
+                LlamaArchiveExpectations {
+                    entry_count: 2,
+                    unpacked_size: 9,
+                    dll_count: 1,
+                    payload_size: 5,
+                },
+            ),
+            (
+                "llama-missing-dll",
+                archive(&[("llama-server.exe", b"MZserver"), ("README.md", b"info")]),
+                12,
+                LlamaArchiveExpectations {
+                    entry_count: 2,
+                    unpacked_size: 12,
+                    dll_count: 1,
+                    payload_size: 8,
+                },
+            ),
+            (
+                "llama-wrong-pe",
+                archive(&[
+                    ("llama-server.exe", b"NOserver"),
+                    ("ggml.dll", b"MZdll"),
+                    ("README.md", b"info"),
+                ]),
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+        ] {
+            assert_llama_transform_rejected(name, bytes, unpacked_size, expected);
+        }
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink(
+                "linked.dll",
+                "ggml.dll",
+                SimpleFileOptions::default().unix_permissions(0o777),
+            )
+            .unwrap();
+        let symlink = writer.finish().unwrap().into_inner();
+        assert_llama_transform_rejected(
+            "llama-symlink",
+            symlink,
+            8,
+            LlamaArchiveExpectations {
+                entry_count: 1,
+                unpacked_size: 8,
+                dll_count: 1,
+                payload_size: 8,
+            },
+        );
+    }
+
+    #[test]
+    fn official_llama_transform_rejects_entry_raw_and_payload_inventory_mismatches() {
+        let bytes = archive(&[
+            ("llama-server.exe", b"MZserver"),
+            ("ggml.dll", b"MZdll"),
+            ("README.md", b"info"),
+        ]);
+        for (name, artifact_size, expected) in [
+            (
+                "llama-entry-count",
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 4,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+            (
+                "llama-raw-inventory",
+                18,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 18,
+                    dll_count: 1,
+                    payload_size: 13,
+                },
+            ),
+            (
+                "llama-payload-size",
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 1,
+                    payload_size: 14,
+                },
+            ),
+            (
+                "llama-dll-inventory",
+                17,
+                LlamaArchiveExpectations {
+                    entry_count: 3,
+                    unpacked_size: 17,
+                    dll_count: 2,
+                    payload_size: 13,
+                },
+            ),
+        ] {
+            assert_llama_transform_rejected(name, bytes.clone(), artifact_size, expected);
+        }
+    }
+
+    #[test]
+    fn special_llama_transform_failure_cleans_outer_staging_transactions() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "../llama-server.exe",
+                SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        writer.write_all(b"MZserver").unwrap();
+        for index in 0..50 {
+            writer
+                .start_file(
+                    format!("ignored-{index}.txt"),
+                    SimpleFileOptions::default().unix_permissions(0o644),
+                )
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut artifact = test_official_llama_artifact(LLAMA_CPP_UPSTREAM_UNPACKED_SIZE);
+        artifact.size_bytes = bytes.len() as u64;
+        artifact.sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let target = temp_target("llama-outer-cleanup").join(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID);
+
+        let error = stage_from_reader(&artifact, &target, Cursor::new(bytes)).unwrap_err();
+
+        assert!(error.contains("unsafe"));
+        assert!(
+            transaction_files(target.parent().unwrap(), VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
+                .is_empty()
+        );
+        fs::remove_dir_all(target.parent().unwrap()).unwrap();
     }
 
     fn test_intent_model(bytes: &[u8], expected_size: u64) -> IntentModelArtifact {
@@ -3085,6 +3371,64 @@ mod tests {
             runtime_catalog::backend_spec_for_runtime_id(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "manual network smoke: downloads the exact official llama.cpp runtime and both Qwen models"]
+    fn official_voice_artifact_downloads_smoke() {
+        if std::env::var("SCRIBE_RUN_OFFICIAL_ARTIFACT_SMOKE").as_deref() != Ok("1") {
+            eprintln!("set SCRIBE_RUN_OFFICIAL_ARTIFACT_SMOKE=1 to download all three artifacts");
+            return;
+        }
+        let root = temp_target("official-download-smoke");
+        let result = (|| -> Result<(), String> {
+            let catalog =
+                RuntimeArtifactCatalog::parse(include_str!("../runtime-artifacts.default.json"))?;
+            let runtime = catalog
+                .select(
+                    VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+                    "windows",
+                    "x86_64",
+                    RuntimeDevicePack::Cpu,
+                )
+                .ok_or_else(|| "official Windows x64 llama.cpp runtime is missing".to_owned())?;
+            let runtime_target = root.join(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID);
+            let staged = download_and_stage(runtime, &runtime_target)?;
+            validate_extracted_manifest(runtime, &staged.root)?;
+            let server_fingerprint = intent_model_file_fingerprint(&staged.entrypoint)?;
+            if server_fingerprint
+                != (
+                    "06444801bb1dc38a848bb5a527728c4ea14ad2aa45ce7e81a29a5fb5d2560eaf".to_owned(),
+                    9_216,
+                )
+            {
+                return Err("normalized llama-server.exe fingerprint mismatch".to_owned());
+            }
+            remove_path_if_exists(&staged.root)?;
+
+            for tier in [IntentModelTier::Compact, IntentModelTier::Balanced] {
+                let model = catalog
+                    .intent_model(tier)
+                    .ok_or_else(|| format!("official {tier:?} model is missing"))?;
+                let replacement = download_and_stage_intent_model(model, &root)?;
+                let fingerprint = intent_model_file_fingerprint(&replacement.installed_path)?;
+                if fingerprint != (model.sha256.clone(), model.size_bytes) {
+                    return Err(format!("downloaded {tier:?} model fingerprint mismatch"));
+                }
+                replacement.rollback()?;
+            }
+            Ok(())
+        })();
+        let cleanup = if root.exists() {
+            fs::remove_dir_all(&root)
+                .map_err(|error| format!("could not clean smoke root {}: {error}", root.display()))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            panic!("official artifact smoke failed: {error}; cleanup: {cleanup:?}");
+        }
+        cleanup.unwrap();
     }
 
     #[test]
