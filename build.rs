@@ -139,22 +139,7 @@ fn validate_required_voice_intent_artifacts(
         ));
     }
 
-    for (tier, model_id, size_bytes, sha256, revision) in [
-        (
-            "compact",
-            "qwen3_0_6b_q8_0",
-            804_753_088_u64,
-            "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
-            "ef4088322893040952513f532f736ddeab518403",
-        ),
-        (
-            "balanced",
-            "qwen3_1_7b_q8_0",
-            1_834_426_016_u64,
-            "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
-            "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
-        ),
-    ] {
+    for tier in ["compact", "balanced"] {
         let Some(model) = catalog
             .intent_models
             .iter()
@@ -162,24 +147,16 @@ fn validate_required_voice_intent_artifacts(
         else {
             return Err(format!("missing {tier} voice intent model"));
         };
-        if model.model_id != model_id
-            || model.size_bytes != size_bytes
-            || model.sha256 != sha256
-            || model.upstream_revision != revision
-            || model.license != "Apache-2.0"
-            || model.license_sha256
-                != "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
-            || model.url.is_none()
-        {
+        if model.url.is_none() {
             return Err(format!(
-                "{tier} model must match the approved Qwen artifact and have a direct release URL"
+                "{tier} voice intent model lacks a direct release URL"
             ));
         }
     }
     Ok(())
 }
 
-fn validate_catalog(contents: &str) -> Result<(), String> {
+pub(crate) fn validate_catalog(contents: &str) -> Result<(), String> {
     let catalog: Catalog = serde_json::from_str(contents).map_err(|err| err.to_string())?;
     if !matches!(catalog.schema_version, 1 | 2) || catalog.catalog_version.trim().is_empty() {
         return Err("unsupported schema or empty catalog version".to_owned());
@@ -292,11 +269,57 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
         }
         validate_entrypoint(&model.managed_relative_path)?;
         validate_gguf_path(&model.managed_relative_path, "intent model managed path")?;
+        validate_approved_intent_model(&model)?;
         if !intent_model_ids.insert(model.model_id.clone())
             || !intent_model_tiers.insert((model.runtime_id, model.tier))
         {
             return Err("duplicate intent model id or runtime/tier tuple".to_owned());
         }
+    }
+    Ok(())
+}
+
+fn validate_approved_intent_model(model: &IntentModel) -> Result<(), String> {
+    let expected = match model.tier.as_str() {
+        "compact" => (
+            "qwen3_0_6b_q8_0",
+            "Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B-GGUF",
+            "ef4088322893040952513f532f736ddeab518403",
+            "Qwen3-0.6B-Q8_0.gguf",
+            804_753_088_u64,
+            "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
+            "voice-intent/Qwen3-0.6B-Q8_0.gguf",
+        ),
+        "balanced" => (
+            "qwen3_1_7b_q8_0",
+            "Qwen3-1.7B",
+            "Qwen/Qwen3-1.7B-GGUF",
+            "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+            "Qwen3-1.7B-Q8_0.gguf",
+            1_834_426_016_u64,
+            "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+            "voice-intent/Qwen3-1.7B-Q8_0.gguf",
+        ),
+        _ => return Err(format!("unsupported intent model tier {:?}", model.tier)),
+    };
+    if model.runtime_id != "voice_intent_llama_cpp"
+        || model.model_id != expected.0
+        || model.version != expected.1
+        || model.upstream_repository != expected.2
+        || model.upstream_revision != expected.3
+        || model.upstream_filename != expected.4
+        || model.size_bytes != expected.5
+        || model.sha256 != expected.6
+        || model.managed_relative_path != expected.7
+        || model.license != "Apache-2.0"
+        || model.license_sha256
+            != "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
+    {
+        return Err(format!(
+            "{} voice intent model must match the approved Qwen artifact",
+            model.tier
+        ));
     }
     Ok(())
 }

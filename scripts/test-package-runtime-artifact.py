@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -14,6 +15,10 @@ import zipfile
 
 
 SCRIPT = Path(__file__).with_name("package-runtime-artifact.py")
+SPEC = importlib.util.spec_from_file_location("package_runtime_artifact", SCRIPT)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(MODULE)
 NATIVE_OS = {"linux": "linux", "darwin": "macos", "win32": "windows"}[sys.platform]
 NATIVE_ARCH = {
     "x86_64": "x86_64",
@@ -75,6 +80,31 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
             path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             path.chmod(0o755)
 
+    def write_voice_attestation(self):
+        files = []
+        for path in sorted(candidate for candidate in self.runtime.rglob("*") if candidate.is_file()):
+            digest, size = MODULE.hash_and_size(path)
+            files.append(
+                {
+                    "path": path.relative_to(self.runtime).as_posix(),
+                    "size_bytes": size,
+                    "sha256": digest,
+                }
+            )
+        attestation = {
+            "attestation_version": 1,
+            "runtime_id": "voice_intent_llama_cpp",
+            "version": "b9637",
+            "platform": "windows-x86_64",
+            "device": "cpu",
+            "entrypoint": self.entrypoint_relative,
+            **MODULE.VOICE_RUNTIME_PROVENANCE,
+            "files": files,
+        }
+        (self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION).write_text(
+            json.dumps(attestation), encoding="utf-8"
+        )
+
     def command(self, base_url="https://downloads.acme.dev/releases/scribe/1.0.0"):
         return [
             sys.executable,
@@ -132,6 +162,7 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
 
     def test_packages_voice_intent_llama_as_a_cpu_only_auxiliary_runtime(self):
         self.write_manifest("voice_intent_llama_cpp", "b9637")
+        self.write_voice_attestation()
         command = self.command()
         command[command.index("--runtime-id") + 1] = "voice_intent_llama_cpp"
         command[command.index("--version") + 1] = "b9637"
@@ -165,6 +196,50 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         rejected = subprocess.run(gpu, capture_output=True, text=True, check=False)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("does not support GPU", rejected.stderr)
+
+    def test_voice_runtime_rejects_missing_or_mismatched_preparation_attestation(self):
+        self.write_manifest("voice_intent_llama_cpp", "b9637")
+        entrypoint = MODULE.normalized_entrypoint(self.entrypoint_relative)
+        files = MODULE.runtime_files(self.runtime)
+        with self.assertRaisesRegex(ValueError, "attestation is required"):
+            MODULE.verify_voice_runtime_attestation(self.runtime, files, entrypoint)
+
+        self.write_voice_attestation()
+        attestation_path = self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        attestation["upstream_revision"] = "a" * 40
+        attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unapproved identity"):
+            MODULE.verify_voice_runtime_attestation(
+                self.runtime, MODULE.runtime_files(self.runtime), entrypoint
+            )
+        attestation["upstream_revision"] = MODULE.VOICE_RUNTIME_PROVENANCE[
+            "upstream_revision"
+        ]
+        attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+        files = MODULE.runtime_files(self.runtime)
+        payload, attested_files = MODULE.verify_voice_runtime_attestation(
+            self.runtime, files, entrypoint
+        )
+        self.assertNotIn(self.runtime / MODULE.VOICE_RUNTIME_ATTESTATION, payload)
+        self.assertEqual(
+            set(attested_files),
+            {path.relative_to(self.runtime).as_posix() for path in payload},
+        )
+
+        with self.entrypoint.open("ab") as target:
+            target.write(b"tampered")
+        with self.assertRaisesRegex(ValueError, "changed during packaging"):
+            MODULE.write_archive(
+                self.runtime,
+                payload,
+                self.root / "tampered.zip",
+                attested_files,
+            )
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            MODULE.verify_voice_runtime_attestation(
+                self.runtime, MODULE.runtime_files(self.runtime), entrypoint
+            )
 
     def test_rejects_placeholder_host_and_manifest_mismatch(self):
         placeholder = subprocess.run(

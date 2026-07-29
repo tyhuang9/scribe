@@ -40,6 +40,7 @@ VOICE_RUNTIME_PROVENANCE = {
     "license": "MIT",
     "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
 }
+VOICE_RUNTIME_ATTESTATION = ".scribe-llama-runtime-attestation.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +160,65 @@ def validate_manifest(root: Path, args: argparse.Namespace, entrypoint: PurePosi
         raise ValueError(f"runtime manifest does not match requested artifact identity: {expected}")
 
 
+def verify_voice_runtime_attestation(
+    root: Path, files: list[Path], entrypoint: PurePosixPath
+) -> tuple[list[Path], dict[str, tuple[str, int]]]:
+    attestation_path = root / VOICE_RUNTIME_ATTESTATION
+    if attestation_path not in files:
+        raise ValueError("prepared llama runtime attestation is required")
+    try:
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"prepared llama runtime attestation is invalid: {error}") from error
+    expected_identity = {
+        "attestation_version": 1,
+        "runtime_id": "voice_intent_llama_cpp",
+        "version": "b9637",
+        "platform": "windows-x86_64",
+        "device": "cpu",
+        "entrypoint": entrypoint.as_posix(),
+        **VOICE_RUNTIME_PROVENANCE,
+    }
+    if set(attestation) != {*expected_identity, "files"} or any(
+        attestation.get(key) != value for key, value in expected_identity.items()
+    ):
+        raise ValueError("prepared llama runtime attestation has an unapproved identity")
+    records = attestation.get("files")
+    if not isinstance(records, list) or not records:
+        raise ValueError("prepared llama runtime attestation has no file digests")
+    expected_files = {}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "size_bytes", "sha256"}:
+            raise ValueError("prepared llama runtime attestation has an invalid file record")
+        try:
+            relative = normalized_entrypoint(record["path"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("prepared llama runtime attestation has an unsafe file path") from error
+        relative_name = relative.as_posix()
+        if relative_name == VOICE_RUNTIME_ATTESTATION or relative_name in expected_files:
+            raise ValueError("prepared llama runtime attestation has a duplicate file record")
+        size = record["size_bytes"]
+        digest = record["sha256"]
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError("prepared llama runtime attestation has an invalid file digest")
+        expected_files[relative_name] = (digest, size)
+    payload = [path for path in files if path != attestation_path]
+    actual_names = {path.relative_to(root).as_posix() for path in payload}
+    if actual_names != set(expected_files):
+        raise ValueError("prepared llama runtime files do not match the attestation")
+    for path in payload:
+        relative = path.relative_to(root).as_posix()
+        if hash_and_size(path) != expected_files[relative]:
+            raise ValueError(f"prepared llama runtime file digest mismatch: {relative}")
+    return payload, expected_files
+
+
 def smoke_validate(root: Path, entrypoint: PurePosixPath) -> None:
     executable = root / Path(*entrypoint.parts)
     try:
@@ -176,30 +236,48 @@ def smoke_validate(root: Path, entrypoint: PurePosixPath) -> None:
         raise ValueError(f"runtime entrypoint --help returned {result.returncode}")
 
 
-def write_archive(root: Path, files: list[Path], destination: Path) -> int:
-    unpacked = sum(path.stat().st_size for path in files)
-    if unpacked > MAX_UNPACKED_BYTES:
-        raise ValueError(f"runtime exceeds the {MAX_UNPACKED_BYTES} byte unpacked limit")
+def write_archive(
+    root: Path,
+    files: list[Path],
+    destination: Path,
+    attested_files: dict[str, tuple[str, int]] | None = None,
+) -> int:
+    unpacked = 0
     with zipfile.ZipFile(destination, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files:
             relative = path.relative_to(root).as_posix()
             info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = (stat.S_IMODE(path.stat().st_mode) | stat.S_IFREG) << 16
+            digest = hashlib.sha256()
+            size = 0
             with path.open("rb") as source, archive.open(info, "w") as target:
                 while chunk := source.read(1024 * 1024):
+                    size += len(chunk)
+                    digest.update(chunk)
                     target.write(chunk)
+            if attested_files is not None and (digest.hexdigest(), size) != attested_files[relative]:
+                raise ValueError(f"prepared llama runtime changed during packaging: {relative}")
+            unpacked += size
+            if unpacked > MAX_UNPACKED_BYTES:
+                raise ValueError(f"runtime exceeds the {MAX_UNPACKED_BYTES} byte unpacked limit")
     if destination.stat().st_size > MAX_ARCHIVE_BYTES:
         raise ValueError(f"archive exceeds the {MAX_ARCHIVE_BYTES} byte compressed limit")
     return unpacked
 
 
 def sha256(path: Path) -> str:
+    return hash_and_size(path)[0]
+
+
+def hash_and_size(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
+    size = 0
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
+            size += len(chunk)
             digest.update(chunk)
-    return digest.hexdigest()
+    return digest.hexdigest(), size
 
 
 def fragment_directory(catalog: Path) -> Path:
@@ -287,6 +365,11 @@ def main() -> int:
     if args.runtime_dir / Path(*entrypoint.parts) not in files:
         raise ValueError("entrypoint is not a regular file in the runtime directory")
     validate_manifest(args.runtime_dir, args, entrypoint)
+    attested_files = None
+    if args.runtime_id == "voice_intent_llama_cpp":
+        files, attested_files = verify_voice_runtime_attestation(
+            args.runtime_dir, files, entrypoint
+        )
     smoke_validate(args.runtime_dir, entrypoint)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -301,7 +384,7 @@ def main() -> int:
     temporary.unlink()
     archive_published = False
     try:
-        unpacked_size = write_archive(args.runtime_dir, files, temporary)
+        unpacked_size = write_archive(args.runtime_dir, files, temporary, attested_files)
         artifact = {
             "runtime_id": args.runtime_id,
             "version": args.version,

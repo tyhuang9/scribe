@@ -25,6 +25,7 @@ UPSTREAM_UNPACKED_SIZE = 43_983_896
 LICENSE_SIZE = 1_078
 LICENSE_SHA256 = "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
 ENTRYPOINT = "bin/llama-server.exe"
+ATTESTATION_FILENAME = ".scribe-llama-runtime-attestation.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,6 +147,45 @@ def write_manifest(output_dir: Path) -> None:
         os.fsync(target.fileno())
 
 
+def write_attestation(output_dir: Path) -> None:
+    files = []
+    for path in sorted(output_dir.rglob("*")):
+        if path.is_symlink() or (path.exists() and not path.is_file() and not path.is_dir()):
+            raise ValueError(f"prepared runtime contains a non-regular entry: {path}")
+        if not path.is_file():
+            continue
+        digest, size = hash_and_size(path)
+        files.append(
+            {
+                "path": path.relative_to(output_dir).as_posix(),
+                "size_bytes": size,
+                "sha256": digest,
+            }
+        )
+    attestation = {
+        "attestation_version": 1,
+        "runtime_id": "voice_intent_llama_cpp",
+        "version": VERSION,
+        "platform": "windows-x86_64",
+        "device": "cpu",
+        "entrypoint": ENTRYPOINT,
+        "upstream_repository": UPSTREAM_REPOSITORY,
+        "upstream_revision": UPSTREAM_REVISION,
+        "upstream_asset": UPSTREAM_ASSET,
+        "upstream_sha256": UPSTREAM_SHA256,
+        "upstream_size_bytes": UPSTREAM_SIZE,
+        "license": "MIT",
+        "license_sha256": LICENSE_SHA256,
+        "files": files,
+    }
+    path = output_dir / ATTESTATION_FILENAME
+    with path.open("x", encoding="utf-8", newline="\n") as target:
+        json.dump(attestation, target, indent=2)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+
+
 def main() -> int:
     args = parse_args()
     verify_file(args.archive, UPSTREAM_SIZE, UPSTREAM_SHA256, "llama.cpp archive")
@@ -159,6 +199,7 @@ def main() -> int:
                 write_member(archive, info, args.output_dir / "bin" / info.filename)
         copy_file_no_replace(args.license_file, args.output_dir / "LICENSE.llama.cpp")
         write_manifest(args.output_dir)
+        write_attestation(args.output_dir)
     except Exception:
         shutil.rmtree(args.output_dir)
         raise

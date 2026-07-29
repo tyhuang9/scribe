@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -70,6 +71,33 @@ class PrepareLlamaRuntimeTests(unittest.TestCase):
             MODULE.verify_file(path, 8, digest, "fixture")
             with self.assertRaisesRegex(ValueError, "pinned upstream bytes"):
                 MODULE.verify_file(path, 9, digest, "fixture")
+
+    def test_attestation_binds_every_prepared_file_to_approved_upstream_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = root / "bin" / "llama-server.exe"
+            server.parent.mkdir()
+            server.write_bytes(b"MZserver")
+            license_file = root / "LICENSE.llama.cpp"
+            license_file.write_bytes(b"license")
+            MODULE.write_manifest(root)
+
+            MODULE.write_attestation(root)
+
+            attestation = json.loads(
+                (root / MODULE.ATTESTATION_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(attestation["upstream_sha256"], MODULE.UPSTREAM_SHA256)
+            self.assertEqual(attestation["upstream_revision"], MODULE.UPSTREAM_REVISION)
+            records = {record["path"]: record for record in attestation["files"]}
+            self.assertEqual(
+                set(records),
+                {"LICENSE.llama.cpp", "bin/llama-server.exe", "runtime-manifest.json"},
+            )
+            for relative, record in records.items():
+                contents = (root / relative).read_bytes()
+                self.assertEqual(record["size_bytes"], len(contents))
+                self.assertEqual(record["sha256"], hashlib.sha256(contents).hexdigest())
 
 
 if __name__ == "__main__":
