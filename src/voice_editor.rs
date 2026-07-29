@@ -829,7 +829,7 @@ fn command_at(text: &str, index: usize) -> Option<TriggerMatch> {
         if let Some(end) = match_phrase(text, index, phrase) {
             return Some(TriggerMatch {
                 start: index,
-                end,
+                end: consume_fixed_command_punctuation(text, end),
                 kind,
             });
         }
@@ -874,6 +874,16 @@ fn command_at(text: &str, index: usize) -> Option<TriggerMatch> {
         }
     }
     None
+}
+
+fn consume_fixed_command_punctuation(text: &str, mut end: usize) -> usize {
+    while let Some(ch) = text[end..].chars().next() {
+        if !matches!(ch, ',' | '.' | '!' | '?' | ';' | ':') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
 }
 
 fn match_word(text: &str, index: usize, word: &str) -> Option<usize> {
@@ -1293,6 +1303,10 @@ mod tests {
         let outcome = edit("Remove this scratch that");
         assert_eq!(outcome.edited_text, "");
         assert!(!outcome.requires_review);
+
+        let punctuated = edit("Remove this. Scratch that.");
+        assert_eq!(punctuated.edited_text, "");
+        assert!(!punctuated.requires_review);
     }
 
     #[test]
