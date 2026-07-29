@@ -45,6 +45,7 @@ const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const FINALIZING_PREVIEW_MESSAGE: &str = "Finishing live preview; final transcription starts next.";
 const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
     (30, "0.5 minutes"),
     (60, "1 minute"),
@@ -1361,7 +1362,9 @@ impl LocalTranscriberApp {
             || self.playground_pending > 0
             || matches!(
                 self.status,
-                TranscriptionStatus::Listening | TranscriptionStatus::Transcribing
+                TranscriptionStatus::Listening
+                    | TranscriptionStatus::Finalizing
+                    | TranscriptionStatus::Transcribing
             )
             || self.model_downloads.values().any(|status| {
                 matches!(
@@ -1448,8 +1451,10 @@ impl LocalTranscriberApp {
         if self.active_recording.is_some() {
             return;
         }
-        if self.status == TranscriptionStatus::Transcribing
-            || self.pending_final_transcription.is_some()
+        if matches!(
+            self.status,
+            TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+        ) || self.pending_final_transcription.is_some()
             || self.live_preview.has_in_flight_job()
         {
             self.status_message = "Wait for the current transcription to finish.".to_owned();
@@ -1568,30 +1573,27 @@ impl LocalTranscriberApp {
             }
             active.latency.wav_finalized_at = Some(Instant::now());
             match result {
-                Ok(audio_path) => {
-                    self.status = TranscriptionStatus::Transcribing;
-                    self.status_message = format!("Transcribing {}", audio_path.display());
-                    match source {
-                        RecordingSource::Transcribe => {
-                            let model = active
-                                .model
-                                .take()
-                                .expect("Transcribe recording should retain its model");
-                            let controlled_whisper = active.preview_session_id.is_some()
-                                && model.backend == "whisper.cpp";
-                            self.pending_final_transcription =
-                                Some(PendingFinalTranscription::new(
-                                    audio_path,
-                                    model,
-                                    active.latency,
-                                    controlled_whisper,
-                                ));
-                        }
-                        RecordingSource::Playground => {
-                            self.dispatch_playground_transcriptions(audio_path)
-                        }
+                Ok(audio_path) => match source {
+                    RecordingSource::Transcribe => {
+                        let model = active
+                            .model
+                            .take()
+                            .expect("Transcribe recording should retain its model");
+                        let controlled_whisper =
+                            active.preview_session_id.is_some() && model.backend == "whisper.cpp";
+                        self.queue_final_transcription(PendingFinalTranscription::new(
+                            audio_path,
+                            model,
+                            active.latency,
+                            controlled_whisper,
+                        ));
                     }
-                }
+                    RecordingSource::Playground => {
+                        self.status = TranscriptionStatus::Transcribing;
+                        self.status_message = format!("Transcribing {}", audio_path.display());
+                        self.dispatch_playground_transcriptions(audio_path)
+                    }
+                },
                 Err(message) => {
                     self.live_preview.final_wins();
                     self.status = TranscriptionStatus::Error;
@@ -1749,11 +1751,24 @@ impl LocalTranscriberApp {
             return;
         };
         let (audio, model, latency, controlled_whisper) = pending.into_parts();
+        self.status = TranscriptionStatus::Transcribing;
+        self.status_message = format!("Transcribing {}", audio.path().display());
         if controlled_whisper {
             self.dispatch_controlled_final_transcription(audio, model, latency);
         } else {
             self.dispatch_default_transcription(audio, model, latency);
         }
+    }
+
+    fn queue_final_transcription(&mut self, pending: PendingFinalTranscription) {
+        let waiting_for_preview = self.live_preview.has_in_flight_job();
+        self.pending_final_transcription = Some(pending);
+        self.status = TranscriptionStatus::Finalizing;
+        self.status_message = if waiting_for_preview {
+            FINALIZING_PREVIEW_MESSAGE.to_owned()
+        } else {
+            "Final transcription starts next.".to_owned()
+        };
     }
 
     fn poll_hotkey(&mut self) {
@@ -2523,7 +2538,10 @@ impl LocalTranscriberApp {
     fn runtime_consumer_activity(&self, runtime_id: &str) -> RuntimeConsumerActivity {
         RuntimeConsumerActivity {
             recording: self.active_recording.is_some(),
-            transcribing: self.status == TranscriptionStatus::Transcribing,
+            transcribing: matches!(
+                self.status,
+                TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+            ),
             playground_jobs: self.playground_pending > 0,
             model_download: model_download_uses_runtime(
                 &self.config,
@@ -3038,11 +3056,13 @@ impl LocalTranscriberApp {
                             "Start Listening"
                         };
                         let finalizing = !listening
-                            && (self.status == TranscriptionStatus::Transcribing
-                                || self.pending_final_transcription.is_some()
+                            && (matches!(
+                                self.status,
+                                TranscriptionStatus::Finalizing | TranscriptionStatus::Transcribing
+                            ) || self.pending_final_transcription.is_some()
                                 || self.live_preview.has_in_flight_job());
                         let disabled_tooltip = if finalizing {
-                            Some("Wait for the current final transcription to finish.".to_owned())
+                            Some(record_button_busy_tooltip(self.status).to_owned())
                         } else if listening || ready {
                             None
                         } else {
@@ -3095,7 +3115,11 @@ impl LocalTranscriberApp {
             if !provisional_text.is_empty() {
                 info_panel(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(section_heading("Live preview"));
+                        let heading = ui.label(section_heading("Live preview"));
+                        ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Heading);
+                            builder.set_hierarchical_level(2);
+                        });
                         badge(ui, "Provisional - local only", ChipTone::Neutral);
                     });
                     ui.add_space(8.0);
@@ -5707,6 +5731,14 @@ fn add_enabled_button<'a>(
     }
 }
 
+fn record_button_busy_tooltip(status: TranscriptionStatus) -> &'static str {
+    if status == TranscriptionStatus::Finalizing {
+        FINALIZING_PREVIEW_MESSAGE
+    } else {
+        "Wait for the current final transcription to finish."
+    }
+}
+
 fn tag_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(7.0, 6.0);
@@ -5718,6 +5750,7 @@ fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
     let tone = match status {
         TranscriptionStatus::Idle => ChipTone::Success,
         TranscriptionStatus::Listening => ChipTone::Active,
+        TranscriptionStatus::Finalizing => ChipTone::Warning,
         TranscriptionStatus::Transcribing => ChipTone::Warning,
         TranscriptionStatus::Error => ChipTone::Error,
     };
@@ -8298,6 +8331,9 @@ mod layout_tests {
         let mut app = test_app();
         assert_eq!(app.next_repaint_delay(), IDLE_REPAINT_DELAY);
 
+        app.status = TranscriptionStatus::Finalizing;
+        assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
+
         app.status = TranscriptionStatus::Transcribing;
         assert_eq!(app.next_repaint_delay(), ACTIVE_REPAINT_DELAY);
 
@@ -8443,21 +8479,40 @@ mod layout_tests {
         app.live_preview.stop_session(session);
         let final_path = test_preview_path("pending-final");
         fs::write(&final_path, b"full wav").unwrap();
-        app.pending_final_transcription = Some(PendingFinalTranscription::new(
+        app.queue_final_transcription(PendingFinalTranscription::new(
             final_path.clone(),
             test_model(),
             LatencyTrace::started_now(),
             false,
         ));
 
+        assert_eq!(app.status, TranscriptionStatus::Finalizing);
+        assert_eq!(app.status.to_string(), "Finalizing");
+        assert_eq!(app.status_message, FINALIZING_PREVIEW_MESSAGE);
+        assert_eq!(
+            record_button_busy_tooltip(app.status),
+            FINALIZING_PREVIEW_MESSAGE
+        );
+
         app.maybe_dispatch_pending_final();
 
         assert!(app.pending_final_transcription.is_some());
+        assert_eq!(app.status, TranscriptionStatus::Finalizing);
         assert!(final_path.exists());
         assert!(job.cancellation().is_cancelled());
+        assert_eq!(
+            app.live_preview
+                .complete(job.key(), Err("cancelled preview retired".to_owned())),
+            PreviewCompletion::Stale
+        );
         drop(job);
-        drop(app);
-        assert!(!final_path.exists());
+        app.maybe_dispatch_pending_final();
+        assert!(app.pending_final_transcription.is_none());
+        assert_eq!(app.status, TranscriptionStatus::Transcribing);
+        assert_eq!(
+            record_button_busy_tooltip(app.status),
+            "Wait for the current final transcription to finish."
+        );
     }
 
     #[test]
@@ -8573,12 +8628,10 @@ mod layout_tests {
         );
 
         let output = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 760.0, Vec::new());
-        let node = output
-            .platform_output
-            .accesskit_update
-            .unwrap()
+        let update = output.platform_output.accesskit_update.unwrap();
+        let node = update
             .nodes
-            .into_iter()
+            .iter()
             .find(|(_, node)| {
                 node.name() == Some("Provisional live preview, read only: read only draft")
             })
@@ -8586,6 +8639,76 @@ mod layout_tests {
             .expect("named provisional preview node");
         assert_eq!(node.role(), egui::accesskit::Role::StaticText);
         assert!(!node.supports_action(egui::accesskit::Action::Focus));
+
+        let heading = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Live preview")
+            })
+            .map(|(_, node)| node)
+            .expect("Live preview heading");
+        assert_eq!(heading.hierarchical_level(), Some(2));
+    }
+
+    #[test]
+    fn long_live_preview_wraps_without_overflowing_critical_controls_at_minimum_size() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Transcribe;
+        app.status = TranscriptionStatus::Listening;
+        let sentinel = "SCRIBE-LIVE-PREVIEW-WRAPPING-SENTINEL";
+        let long_preview = format!("{sentinel} {}", "provisional words ".repeat(120));
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "long-layout"));
+        let job = app.live_preview.take_next_job().unwrap();
+        assert_eq!(
+            app.live_preview
+                .complete(job.key(), Ok(PreviewTranscript::untimed(&long_preview))),
+            PreviewCompletion::Applied
+        );
+        drop(job);
+
+        let output = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 600.0, Vec::new());
+        assert_no_visible_horizontal_overflow(&output, 840.0, Tab::Transcribe);
+        assert_focusable_bounds_within_viewport(&output, 840.0, Tab::Transcribe);
+        assert_accessible_text_contains(&output, sentinel);
+
+        let preview = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.name()
+                    .is_some_and(|name| name.starts_with("Provisional live preview, read only:"))
+            })
+            .and_then(|(_, node)| node.bounds())
+            .expect("long provisional preview bounds");
+        assert!(preview.x0 >= -1.0 && preview.x1 <= 841.0);
+        assert!(
+            preview.y1 - preview.y0 > 40.0,
+            "preview did not wrap: {preview:?}"
+        );
+
+        let record_button =
+            accessible_bounds(&output, egui::accesskit::Role::Button, "Start Listening");
+        assert_accesskit_rect_within_viewport(record_button, 840.0, 600.0, "record button");
+
+        let (scroll_id, _, _) = page_scroll_metrics(&ctx, "Transcribe");
+        let mut scroll_state = egui::scroll_area::State::load(&ctx, scroll_id).unwrap();
+        scroll_state.offset.y = (preview.y0 as f32 - 240.0).max(0.0);
+        scroll_state.store(&ctx, scroll_id);
+        let scrolled = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 600.0, Vec::new());
+        assert_no_visible_horizontal_overflow(&scrolled, 840.0, Tab::Transcribe);
+        assert_focusable_bounds_within_viewport(&scrolled, 840.0, Tab::Transcribe);
+        assert_target_text_is_not_horizontally_clipped(&scrolled, sentinel);
     }
 
     #[test]

@@ -118,6 +118,7 @@ pub struct TranscriptResult {
 pub enum TranscriptionStatus {
     Idle,
     Listening,
+    Finalizing,
     Transcribing,
     Error,
 }
@@ -127,6 +128,7 @@ impl fmt::Display for TranscriptionStatus {
         match self {
             Self::Idle => write!(f, "Idle"),
             Self::Listening => write!(f, "Listening"),
+            Self::Finalizing => write!(f, "Finalizing"),
             Self::Transcribing => write!(f, "Transcribing"),
             Self::Error => write!(f, "Error"),
         }

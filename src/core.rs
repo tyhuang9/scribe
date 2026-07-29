@@ -58,7 +58,7 @@ pub fn reduce(state: &mut CoreState, event: CoreEvent) {
         }
         CoreEvent::RecordingFinished => {
             state.recording_status = RecordingStatus::Finalizing;
-            state.transcription_status = TranscriptionStatus::Transcribing;
+            state.transcription_status = TranscriptionStatus::Finalizing;
         }
         CoreEvent::TranscriptionStarted => {
             state.recording_status = RecordingStatus::Idle;
@@ -106,10 +106,7 @@ mod tests {
 
         reduce(&mut state, CoreEvent::RecordingFinished);
         assert_eq!(state.recording_status, RecordingStatus::Finalizing);
-        assert_eq!(
-            state.transcription_status,
-            TranscriptionStatus::Transcribing
-        );
+        assert_eq!(state.transcription_status, TranscriptionStatus::Finalizing);
 
         reduce(
             &mut state,

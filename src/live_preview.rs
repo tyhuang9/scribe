@@ -238,7 +238,12 @@ impl LivePreviewState {
                 self.applied_sequence = Some(key.sequence);
                 PreviewCompletion::Applied
             }
-            Err(message) => PreviewCompletion::Failed(message),
+            Err(message) => {
+                self.timed_words.clear();
+                self.untimed_mode = false;
+                self.provisional_text.clear();
+                PreviewCompletion::Failed(message)
+            }
         }
     }
 
@@ -506,15 +511,68 @@ mod tests {
         let mut state = LivePreviewState::default();
         let session = state.begin_session();
         state.offer(artifact(session, 1));
-        let job = state.take_next_job().unwrap();
+        let first = state.take_next_job().unwrap();
+        assert_eq!(
+            state.complete(first.key(), Ok(untimed("stale cumulative words"))),
+            PreviewCompletion::Applied
+        );
         state.offer(artifact(session, 2));
+        let failed = state.take_next_job().unwrap();
+        state.offer(artifact(session, 3));
 
         assert_eq!(
-            state.complete(job.key(), Err("runner failed".to_owned())),
+            state.complete(failed.key(), Err("runner failed".to_owned())),
             PreviewCompletion::Failed("runner failed".to_owned())
         );
         assert!(state.provisional_text().is_empty());
-        assert_eq!(state.take_next_job().unwrap().key().sequence, 2);
+        let recovery = state.take_next_job().unwrap();
+        assert_eq!(recovery.key().sequence, 3);
+        assert_eq!(
+            state.complete(recovery.key(), Ok(untimed("fresh words"))),
+            PreviewCompletion::Applied
+        );
+        assert_eq!(state.provisional_text(), "fresh words");
+    }
+
+    #[test]
+    fn preview_failure_clears_timed_merge_state() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(
+            first.key(),
+            Ok(PreviewTranscript {
+                text: "stale timed words".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(1_000),
+                    text: "stale timed words".to_owned(),
+                }],
+            }),
+        );
+        state.offer(artifact(session, 1));
+        let failed = state.take_next_job().unwrap();
+        assert_eq!(
+            state.complete(failed.key(), Err("runner failed".to_owned())),
+            PreviewCompletion::Failed("runner failed".to_owned())
+        );
+
+        state.offer(artifact(session, 2));
+        let recovery = state.take_next_job().unwrap();
+        state.complete(
+            recovery.key(),
+            Ok(PreviewTranscript {
+                text: "fresh timed words".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(1_000),
+                    text: "fresh timed words".to_owned(),
+                }],
+            }),
+        );
+
+        assert_eq!(state.provisional_text(), "fresh timed words");
     }
 
     #[test]
