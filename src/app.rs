@@ -9785,10 +9785,12 @@ mod layout_tests {
     }
 
     #[test]
-    fn restoring_a_window_unminimizes_shows_and_focuses_in_order() {
+    fn tray_show_command_unminimizes_shows_repaints_and_focuses_in_order() {
         let ctx = egui::Context::default();
         let mut app = test_app();
-        let output = ctx.run(egui::RawInput::default(), |ctx| app.show_window(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.apply_tray_command(TrayCommand::Show, ctx)
+        });
         let root = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -9804,6 +9806,23 @@ mod layout_tests {
         );
         assert_eq!(root.repaint_delay, Duration::ZERO);
         assert_eq!(app.status_message, "Scribe window restored");
+    }
+
+    #[test]
+    fn tray_quit_command_requests_a_normal_close_that_bypasses_close_to_tray() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.apply_tray_command(TrayCommand::Quit, ctx)
+        });
+        let root = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output");
+
+        assert!(app.quit_requested);
+        assert_eq!(root.commands, vec![ViewportCommand::Close]);
+        assert!(!should_hide_on_close(true, true, true, app.quit_requested));
     }
 
     #[test]

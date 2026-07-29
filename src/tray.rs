@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use std::sync::{Arc, OnceLock, RwLock};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const MENU_SHOW: &str = "scribe-show";
@@ -106,6 +106,12 @@ impl EventBridge {
         let _ = self.sender.send(command);
         (self.wake)();
     }
+
+    fn send_menu_event(&self, id: &MenuId) {
+        if let Some(command) = command_from_menu_id(id) {
+            self.send(command);
+        }
+    }
 }
 
 fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayCommand> {
@@ -128,9 +134,7 @@ fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayCommand> {
 
         let menu_bridge = bridge.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let Some(command) = command_from_menu_id(event.id().as_ref()) {
-                menu_bridge.send(command);
-            }
+            menu_bridge.send_menu_event(event.id());
         }));
 
         TrayIconEvent::set_event_handler(Some(move |event| {
@@ -221,8 +225,8 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
-    match id {
+fn command_from_menu_id(id: &MenuId) -> Option<TrayCommand> {
+    match id.as_ref() {
         MENU_SHOW => Some(TrayCommand::Show),
         MENU_HIDE => Some(TrayCommand::Hide),
         MENU_COPY_LAST => Some(TrayCommand::CopyLastTranscript),
@@ -286,14 +290,23 @@ mod tests {
 
     #[test]
     fn tray_menu_ids_map_to_expected_commands() {
-        assert_eq!(command_from_menu_id(MENU_SHOW), Some(TrayCommand::Show));
-        assert_eq!(command_from_menu_id(MENU_HIDE), Some(TrayCommand::Hide));
         assert_eq!(
-            command_from_menu_id(MENU_COPY_LAST),
+            command_from_menu_id(&MenuId::new(MENU_SHOW)),
+            Some(TrayCommand::Show)
+        );
+        assert_eq!(
+            command_from_menu_id(&MenuId::new(MENU_HIDE)),
+            Some(TrayCommand::Hide)
+        );
+        assert_eq!(
+            command_from_menu_id(&MenuId::new(MENU_COPY_LAST)),
             Some(TrayCommand::CopyLastTranscript)
         );
-        assert_eq!(command_from_menu_id(MENU_QUIT), Some(TrayCommand::Quit));
-        assert_eq!(command_from_menu_id("unknown"), None);
+        assert_eq!(
+            command_from_menu_id(&MenuId::new(MENU_QUIT)),
+            Some(TrayCommand::Quit)
+        );
+        assert_eq!(command_from_menu_id(&MenuId::new("unknown")), None);
     }
 
     #[test]
@@ -313,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn event_bridge_delivers_commands_and_requests_a_wake() {
+    fn show_and_quit_menu_events_queue_commands_and_wake_the_app() {
         let (sender, receiver) = unbounded();
         let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let wake_counter = wake_count.clone();
@@ -324,8 +337,9 @@ mod tests {
             }),
         };
 
-        bridge.send(TrayCommand::Show);
-        bridge.send(TrayCommand::Quit);
+        bridge.send_menu_event(&MenuId::new(MENU_SHOW));
+        bridge.send_menu_event(&MenuId::new(MENU_QUIT));
+        bridge.send_menu_event(&MenuId::new("unknown"));
 
         assert_eq!(
             drain_commands(&receiver),
