@@ -10,6 +10,7 @@ mod config;
 mod core;
 mod durable_fs;
 mod hotkey;
+mod intent_server;
 mod live_preview;
 mod managed_downloads;
 mod models;

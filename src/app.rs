@@ -21,9 +21,14 @@ use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
-use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
+use crate::config::{
+    self, AppConfig, HotkeyMode, ThemeMode, VoiceEditingModelTier, WhisperComputeMode,
+};
 use crate::durable_fs;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::intent_server::{
+    self, IntentCancellation, IntentOutcome, IntentTier, IntentTransactionRequest,
+};
 use crate::live_preview::{
     self, LivePreviewState, PreviewCompletion, PreviewJobKey, PreviewSegment, PreviewSessionId,
     PreviewTranscript,
@@ -38,6 +43,9 @@ use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
 use crate::tray::{TrayCommand, TrayService};
+use crate::voice_editor::{
+    self, VoiceEditCandidate, VoiceEditDecision, VoiceEditOutcome, VoiceEditPlan,
+};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
@@ -98,7 +106,11 @@ enum RecordingSource {
     Playground,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RecordingSessionId(u64);
+
 struct ActiveRecording {
+    session_id: RecordingSessionId,
     session: RecordingSession,
     source: RecordingSource,
     model: Option<SttModelInfo>,
@@ -110,6 +122,7 @@ struct ActiveRecording {
 }
 
 struct PendingFinalTranscription {
+    session_id: RecordingSessionId,
     audio_path: Option<PathBuf>,
     model: Option<SttModelInfo>,
     latency: Option<LatencyTrace>,
@@ -118,12 +131,14 @@ struct PendingFinalTranscription {
 
 impl PendingFinalTranscription {
     fn new(
+        session_id: RecordingSessionId,
         audio_path: PathBuf,
         model: SttModelInfo,
         latency: LatencyTrace,
         controlled_whisper: bool,
     ) -> Self {
         Self {
+            session_id,
             audio_path: Some(audio_path),
             model: Some(model),
             latency: Some(latency),
@@ -131,8 +146,17 @@ impl PendingFinalTranscription {
         }
     }
 
-    fn into_parts(mut self) -> (OwnedAudioArtifact, SttModelInfo, LatencyTrace, bool) {
+    fn into_parts(
+        mut self,
+    ) -> (
+        RecordingSessionId,
+        OwnedAudioArtifact,
+        SttModelInfo,
+        LatencyTrace,
+        bool,
+    ) {
         (
+            self.session_id,
             OwnedAudioArtifact::new(self.audio_path.take().expect("pending final audio path")),
             self.model.take().expect("pending final model"),
             self.latency.take().expect("pending final latency"),
@@ -167,6 +191,42 @@ impl Drop for OwnedAudioArtifact {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingVoiceEdit {
+    session_id: RecordingSessionId,
+    plan: VoiceEditPlan,
+    completion_message: String,
+    latency: Option<LatencyTrace>,
+}
+
+#[derive(Clone, Debug)]
+struct VoiceEditReviewState {
+    session_id: RecordingSessionId,
+    plan: VoiceEditPlan,
+    original_text: String,
+    completion_message: String,
+    latency: Option<LatencyTrace>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct VoiceEditDisplayState {
+    original_text: String,
+    edited_text: String,
+    applied_edit_count: usize,
+    showing_original: bool,
+}
+
+impl VoiceEditDisplayState {
+    fn current_text(&self) -> &str {
+        if self.showing_original {
+            &self.original_text
+        } else {
+            &self.edited_text
         }
     }
 }
@@ -281,14 +341,20 @@ enum AppEvent {
     },
     TranscriptionDone {
         source: RecordingSource,
+        session_id: Option<RecordingSessionId>,
         result: TranscriptResult,
         latency: Option<LatencyTrace>,
     },
     TranscriptionFailed {
         source: RecordingSource,
+        session_id: Option<RecordingSessionId>,
         model_id: String,
         message: String,
         latency: Option<LatencyTrace>,
+    },
+    VoiceEditFinished {
+        session_id: RecordingSessionId,
+        outcome: VoiceEditOutcome,
     },
     ModelDownloadProgress {
         model_id: String,
@@ -1155,6 +1221,157 @@ fn reduced_motion_enabled_for(value: Option<&str>) -> bool {
     value.is_some_and(env_flag_value_enabled)
 }
 
+fn transcription_completion_message(result: &TranscriptResult) -> String {
+    let segment_count = result.segments.len();
+    let timed_segments = result
+        .segments
+        .iter()
+        .filter(|segment| segment.start_ms.is_some() || segment.end_ms.is_some())
+        .count();
+    let segment_text_bytes = result
+        .segments
+        .iter()
+        .map(|segment| segment.text.len())
+        .sum::<usize>();
+    format!(
+        "{} via {} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
+        result.model_name,
+        result.backend,
+        result.duration_ms.unwrap_or_default(),
+        segment_count,
+        timed_segments,
+        segment_text_bytes,
+        result.stdout.len(),
+        result.stderr.len()
+    )
+}
+
+fn resolve_voice_edit_plan_with(
+    plan: &VoiceEditPlan,
+    mut decide: impl FnMut(&VoiceEditCandidate) -> VoiceEditDecision,
+) -> VoiceEditOutcome {
+    if plan.requires_review() {
+        return voice_editor::finalize_voice_edits(plan, &[]);
+    }
+    let mut decisions = Vec::with_capacity(plan.candidates().len());
+    for candidate in plan.candidates() {
+        let contextual = match plan.candidate_with_context(candidate.id, &decisions) {
+            Ok(candidate) => candidate,
+            Err(reason) => {
+                decisions.push(VoiceEditDecision::RequireReview {
+                    candidate_id: candidate.id,
+                    reason,
+                });
+                break;
+            }
+        };
+        let decision = decide(&contextual);
+        let requires_review = matches!(decision, VoiceEditDecision::RequireReview { .. });
+        decisions.push(decision);
+        if requires_review {
+            break;
+        }
+    }
+    voice_editor::finalize_voice_edits(plan, &decisions)
+}
+
+fn intent_decision_from_result(
+    candidate_id: u32,
+    result: intent_server::IntentTransactionResult,
+) -> VoiceEditDecision {
+    match result {
+        Ok(IntentOutcome::ReplaceCurrentDraft {
+            candidate_id: returned_id,
+            edited_text,
+            ..
+        }) if returned_id == candidate_id => VoiceEditDecision::ApplyRewrite {
+            candidate_id,
+            replacement_text: edited_text,
+        },
+        Ok(IntentOutcome::NoChange {
+            candidate_id: returned_id,
+            ..
+        }) if returned_id == candidate_id => VoiceEditDecision::NoChange { candidate_id },
+        Ok(IntentOutcome::NeedsReview {
+            candidate_id: returned_id,
+            ..
+        }) if returned_id == candidate_id => VoiceEditDecision::RequireReview {
+            candidate_id,
+            reason: "The local model could not apply this rewrite unambiguously".to_owned(),
+        },
+        Ok(_) => VoiceEditDecision::RequireReview {
+            candidate_id,
+            reason: "The local model returned a mismatched rewrite candidate".to_owned(),
+        },
+        Err(error) => VoiceEditDecision::RequireReview {
+            candidate_id,
+            reason: error.message,
+        },
+    }
+}
+
+fn voice_edit_review_outcome(plan: &VoiceEditPlan, reason: String) -> VoiceEditOutcome {
+    let mut outcome = voice_editor::finalize_voice_edits(plan, &[]);
+    outcome.edited_text = outcome.original_text.clone();
+    outcome.operations.clear();
+    outcome.used_ai = false;
+    outcome.requires_review = true;
+    outcome.warnings.insert(0, reason);
+    outcome
+}
+
+fn resolve_voice_editing_artifacts(
+    config: &AppConfig,
+) -> Result<(PathBuf, PathBuf, IntentTier), String> {
+    if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        return Err("Local voice rewriting is currently supported only on Windows x64".to_owned());
+    }
+    let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
+    let runtime = config
+        .managed_runtimes
+        .get(runtime_id)
+        .map(|install| install.path.clone())
+        .ok_or_else(|| {
+            "Install the local voice editor runtime before using AI rewrites".to_owned()
+        })?;
+    let runtime_root = config::runtime_storage_dir().join(runtime_id);
+    if !managed_voice_artifact_is_safe(&runtime, &runtime_root) {
+        return Err("The installed local voice editor runtime is missing or invalid".to_owned());
+    }
+
+    let tier = config.voice_editing_model_tier;
+    let model = config
+        .managed_models
+        .get(tier.model_id())
+        .map(|install| install.path.clone())
+        .ok_or_else(|| format!("Install the {} voice editing model first", tier.label()))?;
+    let model_root = config::model_storage_dir(config);
+    if !managed_voice_artifact_is_safe(&model, &model_root) {
+        return Err(format!(
+            "The installed {} voice editing model is missing or invalid",
+            tier.label()
+        ));
+    }
+    let intent_tier = match tier {
+        VoiceEditingModelTier::Compact => IntentTier::Compact,
+        VoiceEditingModelTier::Balanced => IntentTier::Balanced,
+    };
+    Ok((runtime, model, intent_tier))
+}
+
+fn managed_voice_artifact_is_safe(path: &Path, root: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
 pub struct LocalTranscriberApp {
     config: AppConfig,
     config_path: Option<PathBuf>,
@@ -1169,12 +1386,22 @@ pub struct LocalTranscriberApp {
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
+    next_recording_session_id: u64,
+    current_recording_session_id: Option<RecordingSessionId>,
+    authoritative_result_session_id: Option<RecordingSessionId>,
+    output_completed_session_id: Option<RecordingSessionId>,
+    captured_output_target: Option<Result<text_output::CapturedOutputTarget, String>>,
     active_recording: Option<ActiveRecording>,
     live_preview: LivePreviewState,
     preview_worker: Option<thread::JoinHandle<()>>,
     final_worker: Option<thread::JoinHandle<()>>,
     final_cancellation: Option<live_preview::PreviewCancellation>,
     pending_final_transcription: Option<PendingFinalTranscription>,
+    voice_edit_worker: Option<thread::JoinHandle<()>>,
+    voice_edit_cancellation: Option<IntentCancellation>,
+    pending_voice_edit: Option<PendingVoiceEdit>,
+    voice_edit_review: Option<VoiceEditReviewState>,
+    voice_edit_display: Option<VoiceEditDisplayState>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
@@ -1233,6 +1460,11 @@ impl LocalTranscriberApp {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
+            next_recording_session_id: 1,
+            current_recording_session_id: None,
+            authoritative_result_session_id: None,
+            output_completed_session_id: None,
+            captured_output_target: None,
             playground_cards: cards_from_config(&config),
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -1254,6 +1486,11 @@ impl LocalTranscriberApp {
             final_worker: None,
             final_cancellation: None,
             pending_final_transcription: None,
+            voice_edit_worker: None,
+            voice_edit_cancellation: None,
+            pending_voice_edit: None,
+            voice_edit_review: None,
+            voice_edit_display: None,
             tx,
             rx,
             playground_pending: 0,
@@ -1516,6 +1753,10 @@ impl LocalTranscriberApp {
             )
         });
         let preview_session_id = preview_enabled.then(|| self.live_preview.begin_session());
+        let session_id = RecordingSessionId(self.next_recording_session_id);
+        let captured_output_target = (source == RecordingSource::Transcribe
+            && self.config.voice_editing_enabled)
+            .then(text_output::capture_output_target);
 
         match audio::start_recording(
             self.config.max_recording_seconds,
@@ -1523,9 +1764,22 @@ impl LocalTranscriberApp {
             preview_session_id,
         ) {
             Ok(session) => {
+                self.next_recording_session_id =
+                    self.next_recording_session_id.wrapping_add(1).max(1);
                 latency.recorder_started_at = Some(Instant::now());
                 let path = session.audio_path.display().to_string();
+                if source == RecordingSource::Transcribe {
+                    self.current_recording_session_id = Some(session_id);
+                    self.authoritative_result_session_id = None;
+                    self.output_completed_session_id = None;
+                    self.captured_output_target = captured_output_target;
+                    self.pending_voice_edit = None;
+                    self.voice_edit_review = None;
+                    self.voice_edit_display = None;
+                    self.transcript.clear();
+                }
                 self.active_recording = Some(ActiveRecording {
+                    session_id,
                     session,
                     source,
                     model: recording_model,
@@ -1598,6 +1852,7 @@ impl LocalTranscriberApp {
                         let controlled_whisper =
                             active.preview_session_id.is_some() && model.backend == "whisper.cpp";
                         self.queue_final_transcription(PendingFinalTranscription::new(
+                            active.session_id,
                             audio_path,
                             model,
                             active.latency,
@@ -1718,12 +1973,27 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn join_finished_voice_edit_worker(&mut self) {
+        if self
+            .voice_edit_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.voice_edit_worker.take()
+        {
+            let _ = worker.join();
+            self.voice_edit_cancellation = None;
+        }
+    }
+
     fn shutdown_background_work(&mut self) {
         if let Some(active) = self.active_recording.as_mut() {
             active.session.stop();
         }
         self.live_preview.final_wins();
         if let Some(cancellation) = self.final_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(cancellation) = self.voice_edit_cancellation.take() {
             cancellation.cancel();
         }
         let started = Instant::now();
@@ -1748,6 +2018,17 @@ impl LocalTranscriberApp {
                 eprintln!("final transcription worker did not retire before shutdown timeout");
             }
         }
+        let started = Instant::now();
+        if let Some(worker) = self.voice_edit_worker.take() {
+            while !worker.is_finished() && started.elapsed() < BACKGROUND_SHUTDOWN_TIMEOUT {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!("voice edit worker did not retire before shutdown timeout");
+            }
+        }
 
         if let Some(mut active) = self.active_recording.take() {
             let completed = active.session.shutdown(BACKGROUND_SHUTDOWN_TIMEOUT);
@@ -1757,6 +2038,7 @@ impl LocalTranscriberApp {
             let _ = fs::remove_file(&active.session.audio_path);
         }
         self.pending_final_transcription = None;
+        self.pending_voice_edit = None;
     }
 
     fn maybe_dispatch_pending_final(&mut self) {
@@ -1766,13 +2048,13 @@ impl LocalTranscriberApp {
         let Some(pending) = self.pending_final_transcription.take() else {
             return;
         };
-        let (audio, model, latency, controlled_whisper) = pending.into_parts();
+        let (session_id, audio, model, latency, controlled_whisper) = pending.into_parts();
         self.status = TranscriptionStatus::Transcribing;
         self.status_message = format!("Transcribing {}", audio.path().display());
         if controlled_whisper {
-            self.dispatch_controlled_final_transcription(audio, model, latency);
+            self.dispatch_controlled_final_transcription(session_id, audio, model, latency);
         } else {
-            self.dispatch_default_transcription(audio, model, latency);
+            self.dispatch_default_transcription(session_id, audio, model, latency);
         }
     }
 
@@ -1883,9 +2165,259 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn handle_authoritative_transcription(
+        &mut self,
+        session_id: RecordingSessionId,
+        result: TranscriptResult,
+        mut latency: Option<LatencyTrace>,
+    ) {
+        if self.current_recording_session_id != Some(session_id)
+            || self.authoritative_result_session_id.is_some()
+        {
+            return;
+        }
+        self.authoritative_result_session_id = Some(session_id);
+        self.live_preview.final_wins();
+        if let Some(latency) = latency.as_mut() {
+            latency.ui_result_at = Some(Instant::now());
+        }
+        let completion_message = transcription_completion_message(&result);
+
+        if !self.config.voice_editing_enabled {
+            self.transcript = result.text;
+            self.voice_edit_display = None;
+            self.status = TranscriptionStatus::Idle;
+            if self.config.auto_insert_transcript {
+                let output_result =
+                    text_output::write_to_focused_app(&self.transcript, &self.config);
+                if let Some(latency) = latency.as_mut() {
+                    latency.paste_completed_at = Some(Instant::now());
+                }
+                self.status_message =
+                    format!("{completion_message}. {}", output_result.status_message());
+            } else {
+                self.status_message = completion_message;
+            }
+            self.latest_latency = latency;
+            self.cleanup_after_job(RecordingSource::Transcribe);
+            return;
+        }
+
+        let plan = voice_editor::plan_voice_edits(&result);
+        self.pending_voice_edit = Some(PendingVoiceEdit {
+            session_id,
+            plan: plan.clone(),
+            completion_message,
+            latency,
+        });
+        if plan.requires_ai() && !plan.requires_review() {
+            self.dispatch_voice_edit(session_id, plan);
+        } else {
+            let outcome = voice_editor::finalize_voice_edits(&plan, &[]);
+            self.finish_voice_edit(session_id, outcome);
+        }
+    }
+
+    fn dispatch_voice_edit(&mut self, session_id: RecordingSessionId, plan: VoiceEditPlan) {
+        let (executable_path, model_path, tier) =
+            match resolve_voice_editing_artifacts(&self.config) {
+                Ok(paths) => paths,
+                Err(message) => {
+                    self.finish_voice_edit(session_id, voice_edit_review_outcome(&plan, message));
+                    return;
+                }
+            };
+
+        let cancellation = IntentCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let tx = self.tx.clone();
+        let worker_plan = plan.clone();
+        self.status = TranscriptionStatus::Editing;
+        self.status_message = "Applying explicit voice edits locally...".to_owned();
+        match thread::Builder::new()
+            .name("voice-edit-transaction".to_owned())
+            .spawn(move || {
+                let outcome = resolve_voice_edit_plan_with(&worker_plan, |candidate| {
+                    if worker_cancellation.is_cancelled() {
+                        return VoiceEditDecision::RequireReview {
+                            candidate_id: candidate.id,
+                            reason: "Voice edit was cancelled".to_owned(),
+                        };
+                    }
+                    let request = IntentTransactionRequest {
+                        executable_path: executable_path.clone(),
+                        model_path: model_path.clone(),
+                        tier,
+                        generation_id: session_id.0,
+                        candidate_id: candidate.id,
+                        target_text: candidate.target_text.clone(),
+                        instruction: candidate.instruction.clone(),
+                    };
+                    intent_decision_from_result(
+                        candidate.id,
+                        intent_server::run_intent_transaction(request, &worker_cancellation),
+                    )
+                });
+                let _ = tx.send(AppEvent::VoiceEditFinished {
+                    session_id,
+                    outcome,
+                });
+            }) {
+            Ok(worker) => {
+                self.voice_edit_worker = Some(worker);
+                self.voice_edit_cancellation = Some(cancellation);
+            }
+            Err(error) => self.finish_voice_edit(
+                session_id,
+                voice_edit_review_outcome(
+                    &plan,
+                    format!("Could not start the local voice editor: {error}"),
+                ),
+            ),
+        }
+    }
+
+    fn finish_voice_edit(&mut self, session_id: RecordingSessionId, outcome: VoiceEditOutcome) {
+        if self.current_recording_session_id != Some(session_id)
+            || self.output_completed_session_id == Some(session_id)
+        {
+            return;
+        }
+        let Some(pending) = self
+            .pending_voice_edit
+            .take()
+            .filter(|pending| pending.session_id == session_id)
+        else {
+            return;
+        };
+        self.voice_edit_cancellation = None;
+        let mut latency = pending.latency;
+
+        if outcome.requires_review {
+            self.transcript = outcome.original_text.clone();
+            self.voice_edit_display = None;
+            self.voice_edit_review = Some(VoiceEditReviewState {
+                session_id,
+                plan: pending.plan,
+                original_text: outcome.original_text,
+                completion_message: pending.completion_message,
+                latency,
+                warnings: outcome.warnings.clone(),
+            });
+            self.status = TranscriptionStatus::Error;
+            self.status_message = outcome
+                .warnings
+                .first()
+                .map(|warning| format!("Voice edit needs review: {warning}"))
+                .unwrap_or_else(|| "Voice edit needs review before output.".to_owned());
+            self.cleanup_after_job(RecordingSource::Transcribe);
+            return;
+        }
+
+        self.output_completed_session_id = Some(session_id);
+        self.voice_edit_review = None;
+        self.transcript = outcome.edited_text.clone();
+        self.voice_edit_display = Some(VoiceEditDisplayState {
+            original_text: outcome.original_text,
+            edited_text: outcome.edited_text,
+            applied_edit_count: outcome.operations.len(),
+            showing_original: false,
+        });
+        self.status = TranscriptionStatus::Idle;
+        let edit_summary = format!(
+            "{} {} applied",
+            outcome.operations.len(),
+            if outcome.operations.len() == 1 {
+                "voice edit"
+            } else {
+                "voice edits"
+            }
+        );
+        if self.transcript.trim().is_empty() {
+            self.status_message = format!(
+                "{}. {edit_summary}; the transcript is intentionally empty, so no output was sent.",
+                pending.completion_message
+            );
+        } else if self.config.auto_insert_transcript {
+            match self.captured_output_target.as_ref() {
+                Some(Ok(target)) => {
+                    let output_result = text_output::write_to_captured_target(
+                        &self.transcript,
+                        &self.config,
+                        target,
+                    );
+                    if let Some(latency) = latency.as_mut() {
+                        latency.paste_completed_at = Some(Instant::now());
+                    }
+                    self.status_message = format!(
+                        "{}. {edit_summary}. {}",
+                        pending.completion_message,
+                        output_result.status_message()
+                    );
+                }
+                Some(Err(message)) => {
+                    self.status_message = format!(
+                        "{}. {edit_summary}. Automatic output was suppressed because the original target could not be captured ({message}); use Copy.",
+                        pending.completion_message
+                    );
+                }
+                None => {
+                    self.status_message = format!(
+                        "{}. {edit_summary}. Automatic output was suppressed; use Copy.",
+                        pending.completion_message
+                    );
+                }
+            }
+        } else {
+            self.status_message = format!("{}. {edit_summary}.", pending.completion_message);
+        }
+        self.latest_latency = latency;
+        self.cleanup_after_job(RecordingSource::Transcribe);
+    }
+
+    fn retry_voice_edit(&mut self) {
+        let Some(review) = self.voice_edit_review.take() else {
+            return;
+        };
+        if self.current_recording_session_id != Some(review.session_id)
+            || self.output_completed_session_id == Some(review.session_id)
+        {
+            return;
+        }
+        let session_id = review.session_id;
+        let plan = review.plan.clone();
+        self.pending_voice_edit = Some(PendingVoiceEdit {
+            session_id,
+            plan: review.plan,
+            completion_message: review.completion_message,
+            latency: review.latency,
+        });
+        self.dispatch_voice_edit(session_id, plan);
+    }
+
+    fn use_original_voice_transcript(&mut self) {
+        let Some(review) = self.voice_edit_review.take() else {
+            return;
+        };
+        self.output_completed_session_id = Some(review.session_id);
+        self.transcript = review.original_text.clone();
+        self.voice_edit_display = Some(VoiceEditDisplayState {
+            original_text: review.original_text.clone(),
+            edited_text: review.original_text,
+            applied_edit_count: 0,
+            showing_original: true,
+        });
+        self.latest_latency = review.latency;
+        self.status = TranscriptionStatus::Idle;
+        self.status_message =
+            "Using the original transcript. Automatic output remains suppressed; use Copy when ready."
+                .to_owned();
+    }
+
     fn poll_events(&mut self) {
         self.join_finished_preview_worker();
         self.join_finished_final_worker();
+        self.join_finished_voice_edit_worker();
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::LivePreviewFinished { key, result } => {
@@ -1913,73 +2445,38 @@ impl LocalTranscriberApp {
                 }
                 AppEvent::TranscriptionDone {
                     source,
+                    session_id,
                     result,
                     latency,
-                } => {
-                    let mut latency = latency.map(|mut latency| {
-                        latency.ui_result_at = Some(Instant::now());
-                        latency
-                    });
-                    match source {
-                        RecordingSource::Transcribe => {
-                            self.live_preview.final_wins();
-                            let segment_count = result.segments.len();
-                            let timed_segments = result
-                                .segments
-                                .iter()
-                                .filter(|segment| {
-                                    segment.start_ms.is_some() || segment.end_ms.is_some()
-                                })
-                                .count();
-                            let segment_text_bytes = result
-                                .segments
-                                .iter()
-                                .map(|segment| segment.text.len())
-                                .sum::<usize>();
-                            let stdout_bytes = result.stdout.len();
-                            let stderr_bytes = result.stderr.len();
-                            self.transcript = result.text.clone();
-                            self.status = TranscriptionStatus::Idle;
-                            let completion_message = format!(
-                                "{} via {} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
-                                result.model_name,
-                                result.backend,
-                                result.duration_ms.unwrap_or_default(),
-                                segment_count,
-                                timed_segments,
-                                segment_text_bytes,
-                                stdout_bytes,
-                                stderr_bytes
-                            );
-                            if self.config.auto_insert_transcript {
-                                let output_result = text_output::write_to_focused_app(
-                                    &self.transcript,
-                                    &self.config,
-                                );
-                                if let Some(latency) = latency.as_mut() {
-                                    latency.paste_completed_at = Some(Instant::now());
-                                }
-                                self.status_message = format!(
-                                    "{completion_message}. {}",
-                                    output_result.status_message()
-                                );
-                            } else {
-                                self.status_message = completion_message;
-                            }
-                            self.latest_latency = latency;
-                        }
-                        RecordingSource::Playground => {
-                            self.apply_playground_result(result);
+                } => match source {
+                    RecordingSource::Transcribe => {
+                        if let Some(session_id) = session_id {
+                            self.handle_authoritative_transcription(session_id, result, latency);
                         }
                     }
-                    self.cleanup_after_job(source);
-                }
+                    RecordingSource::Playground => {
+                        self.apply_playground_result(result);
+                        self.cleanup_after_job(source);
+                    }
+                },
                 AppEvent::TranscriptionFailed {
                     source,
+                    session_id,
                     model_id,
                     message,
                     latency,
                 } => {
+                    if source == RecordingSource::Transcribe
+                        && session_id != self.current_recording_session_id
+                    {
+                        continue;
+                    }
+                    if source == RecordingSource::Transcribe {
+                        if self.authoritative_result_session_id.is_some() {
+                            continue;
+                        }
+                        self.authoritative_result_session_id = session_id;
+                    }
                     if let Some(mut latency) = latency {
                         latency.ui_result_at = Some(Instant::now());
                         self.latest_latency = Some(latency);
@@ -2005,6 +2502,10 @@ impl LocalTranscriberApp {
                     }
                     self.cleanup_after_job(source);
                 }
+                AppEvent::VoiceEditFinished {
+                    session_id,
+                    outcome,
+                } => self.finish_voice_edit(session_id, outcome),
                 AppEvent::ModelDownloadProgress {
                     model_id,
                     downloaded_bytes,
@@ -2210,6 +2711,7 @@ impl LocalTranscriberApp {
 
     fn dispatch_default_transcription(
         &mut self,
+        session_id: RecordingSessionId,
         audio: OwnedAudioArtifact,
         model: SttModelInfo,
         mut latency: LatencyTrace,
@@ -2228,6 +2730,7 @@ impl LocalTranscriberApp {
                 Ok(result) => {
                     let _ = tx.send(AppEvent::TranscriptionDone {
                         source: RecordingSource::Transcribe,
+                        session_id: Some(session_id),
                         result,
                         latency: Some(latency),
                     });
@@ -2235,6 +2738,7 @@ impl LocalTranscriberApp {
                 Err(err) => {
                     let _ = tx.send(AppEvent::TranscriptionFailed {
                         source: RecordingSource::Transcribe,
+                        session_id: Some(session_id),
                         model_id: model.id,
                         message: err.to_string(),
                         latency: Some(latency),
@@ -2246,6 +2750,7 @@ impl LocalTranscriberApp {
 
     fn dispatch_controlled_final_transcription(
         &mut self,
+        session_id: RecordingSessionId,
         audio: OwnedAudioArtifact,
         model: SttModelInfo,
         mut latency: LatencyTrace,
@@ -2270,6 +2775,7 @@ impl LocalTranscriberApp {
                     Ok(result) => {
                         let _ = tx.send(AppEvent::TranscriptionDone {
                             source: RecordingSource::Transcribe,
+                            session_id: Some(session_id),
                             result,
                             latency: Some(latency),
                         });
@@ -2277,6 +2783,7 @@ impl LocalTranscriberApp {
                     Err(error) => {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Transcribe,
+                            session_id: Some(session_id),
                             model_id: model.id,
                             message: error.to_string(),
                             latency: Some(latency),
@@ -2332,6 +2839,7 @@ impl LocalTranscriberApp {
                     Ok(result) => {
                         let _ = tx.send(AppEvent::TranscriptionDone {
                             source: RecordingSource::Playground,
+                            session_id: None,
                             result,
                             latency: None,
                         });
@@ -2339,6 +2847,7 @@ impl LocalTranscriberApp {
                     Err(err) => {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
+                            session_id: None,
                             model_id: model.id,
                             message: err.to_string(),
                             latency: None,
@@ -3173,12 +3682,57 @@ impl LocalTranscriberApp {
                 });
                 ui.add_space(12.0);
             }
+
+            let mut review_action = None;
+            if let Some(review) = self.voice_edit_review.as_ref() {
+                let warnings = review.warnings.clone();
+                info_panel(ui, |ui| {
+                    let heading = ui.label(section_heading("Voice edit review"));
+                    ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Heading);
+                        builder.set_hierarchical_level(2);
+                    });
+                    ui.add_space(6.0);
+                    for warning in warnings.iter().take(3) {
+                        wrapped_label(ui, mut_text(warning));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(small_button(ui, "Retry")).clicked() {
+                            review_action = Some("retry");
+                        }
+                        if ui.add(small_button(ui, "Use original")).clicked() {
+                            review_action = Some("original");
+                        }
+                        if ui.add(small_button(ui, "Copy")).clicked() {
+                            review_action = Some("copy");
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+            }
+            match review_action {
+                Some("retry") => self.retry_voice_edit(),
+                Some("original") => self.use_original_voice_transcript(),
+                Some("copy") => self.copy_transcript_to_clipboard(),
+                _ => {}
+            }
+
             transcript_panel(ui, |ui| {
                 let label_id = ui
                     .horizontal(|ui| {
                         let label = ui.label(section_heading("Transcript"));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ready_dot(ui, self.status);
+                            if let Some(display) = self.voice_edit_display.as_ref()
+                                && display.applied_edit_count > 0
+                            {
+                                badge(
+                                    ui,
+                                    &format!("{} edits", display.applied_edit_count),
+                                    ChipTone::Neutral,
+                                );
+                            }
                         });
                         label.id
                     })
@@ -3191,13 +3745,53 @@ impl LocalTranscriberApp {
                         .hint_text("Your transcription appears here..."),
                 );
                 set_control_accessibility(ui, &response, label_id, "Transcript");
+                if response.changed()
+                    && self
+                        .voice_edit_display
+                        .as_ref()
+                        .is_some_and(|display| display.current_text() != self.transcript)
+                {
+                    self.voice_edit_display = None;
+                }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(small_button(ui, "Clear")).clicked() {
                         self.transcript.clear();
+                        self.voice_edit_display = None;
                     }
                     if ui.add(small_button(ui, "Copy")).clicked() {
                         self.copy_transcript_to_clipboard();
+                    }
+                    if let Some(display) = self.voice_edit_display.as_mut() {
+                        let view_label = if display.showing_original {
+                            "View edited"
+                        } else {
+                            "View original"
+                        };
+                        if ui.add(small_button(ui, view_label)).clicked() {
+                            display.showing_original = !display.showing_original;
+                            self.transcript = display.current_text().to_owned();
+                        }
+                        let redo = add_enabled_button(
+                            ui,
+                            display.showing_original,
+                            small_button(ui, "Redo"),
+                            Some("The edited transcript is already displayed"),
+                        );
+                        if redo.clicked() {
+                            display.showing_original = false;
+                            self.transcript = display.edited_text.clone();
+                        }
+                        let undo = add_enabled_button(
+                            ui,
+                            !display.showing_original,
+                            small_button(ui, "Undo"),
+                            Some("The original transcript is already displayed"),
+                        );
+                        if undo.clicked() {
+                            display.showing_original = true;
+                            self.transcript = display.original_text.clone();
+                        }
                     }
                 });
             });
@@ -8496,6 +9090,7 @@ mod layout_tests {
     #[test]
     fn final_transcription_clears_and_replaces_the_provisional_preview() {
         let mut app = test_app();
+        app.current_recording_session_id = Some(RecordingSessionId(1));
         let session = app.live_preview.begin_session();
         app.live_preview
             .offer(test_preview_artifact(session, 1, "final-wins"));
@@ -8510,6 +9105,7 @@ mod layout_tests {
         app.tx
             .send(AppEvent::TranscriptionDone {
                 source: RecordingSource::Transcribe,
+                session_id: Some(RecordingSessionId(1)),
                 result: test_transcript_result("full file result"),
                 latency: None,
             })
@@ -8519,6 +9115,127 @@ mod layout_tests {
 
         assert_eq!(app.transcript, "full file result");
         assert!(app.live_preview.provisional_text().is_empty());
+    }
+
+    #[test]
+    fn ordinary_dictation_never_invokes_the_voice_ai_provider() {
+        let plan = voice_editor::plan_voice_edits(&test_transcript_result(
+            "This is ordinary dictation without an edit command.",
+        ));
+        let calls = std::cell::Cell::new(0);
+
+        let outcome = resolve_voice_edit_plan_with(&plan, |_| {
+            calls.set(calls.get() + 1);
+            unreachable!("ordinary dictation must not invoke the AI provider")
+        });
+
+        assert_eq!(calls.get(), 0);
+        assert!(!outcome.used_ai);
+        assert!(!outcome.requires_review);
+        assert_eq!(
+            outcome.edited_text,
+            "This is ordinary dictation without an edit command."
+        );
+    }
+
+    #[test]
+    fn sequential_rewrites_receive_the_prior_validated_result() {
+        let plan = voice_editor::plan_voice_edits(&test_transcript_result(
+            "Draft. Rewrite that shorter. Rewrite that more direct.",
+        ));
+        let mut targets = Vec::new();
+
+        let outcome = resolve_voice_edit_plan_with(&plan, |candidate| {
+            targets.push(candidate.target_text.clone());
+            VoiceEditDecision::ApplyRewrite {
+                candidate_id: candidate.id,
+                replacement_text: if candidate.id == 1 {
+                    "Brief.".to_owned()
+                } else {
+                    "Ship.".to_owned()
+                },
+            }
+        });
+
+        assert_eq!(targets, ["Draft.", "Brief."]);
+        assert_eq!(outcome.edited_text, "Ship.");
+        assert!(outcome.used_ai);
+        assert!(!outcome.requires_review);
+    }
+
+    #[test]
+    fn stale_authoritative_results_do_not_change_the_current_transcript() {
+        let mut app = test_app();
+        app.current_recording_session_id = Some(RecordingSessionId(2));
+        app.transcript = "current".to_owned();
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id: Some(RecordingSessionId(1)),
+                result: test_transcript_result("stale"),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "current");
+        assert!(app.authoritative_result_session_id.is_none());
+    }
+
+    #[test]
+    fn deterministic_edit_to_empty_suppresses_all_output() {
+        let mut app = test_app();
+        app.config.voice_editing_enabled = true;
+        app.config.auto_insert_transcript = true;
+        app.current_recording_session_id = Some(RecordingSessionId(7));
+
+        app.handle_authoritative_transcription(
+            RecordingSessionId(7),
+            test_transcript_result("Remove this scratch that"),
+            None,
+        );
+
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.output_completed_session_id, Some(RecordingSessionId(7)));
+        assert!(app.voice_edit_review.is_none());
+        assert!(app.status_message.contains("no output was sent"));
+    }
+
+    #[test]
+    fn missing_rewrite_runtime_preserves_original_for_explicit_review() {
+        let mut app = test_app();
+        app.config.voice_editing_enabled = true;
+        app.config.auto_insert_transcript = true;
+        app.current_recording_session_id = Some(RecordingSessionId(8));
+
+        app.handle_authoritative_transcription(
+            RecordingSessionId(8),
+            test_transcript_result("This is wordy. Rewrite that shorter."),
+            None,
+        );
+
+        assert_eq!(app.transcript, "This is wordy. Rewrite that shorter.");
+        assert!(app.voice_edit_review.is_some());
+        assert!(app.output_completed_session_id.is_none());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+    }
+
+    #[test]
+    fn invalid_deterministic_command_preserves_original_for_review() {
+        let mut app = test_app();
+        app.config.voice_editing_enabled = true;
+        app.current_recording_session_id = Some(RecordingSessionId(9));
+
+        app.handle_authoritative_transcription(
+            RecordingSessionId(9),
+            test_transcript_result("Scratch that."),
+            None,
+        );
+
+        assert_eq!(app.transcript, "Scratch that.");
+        assert!(app.voice_edit_review.is_some());
+        assert!(app.output_completed_session_id.is_none());
     }
 
     #[test]
@@ -8532,6 +9249,7 @@ mod layout_tests {
         let final_path = test_preview_path("pending-final");
         fs::write(&final_path, b"full wav").unwrap();
         app.queue_final_transcription(PendingFinalTranscription::new(
+            RecordingSessionId(1),
             final_path.clone(),
             test_model(),
             LatencyTrace::started_now(),
@@ -8585,6 +9303,7 @@ mod layout_tests {
         let final_path = test_preview_path("continues-after-preview");
         fs::write(&final_path, b"full wav").unwrap();
         app.pending_final_transcription = Some(PendingFinalTranscription::new(
+            RecordingSessionId(1),
             final_path,
             test_model(),
             LatencyTrace::started_now(),
@@ -8617,6 +9336,7 @@ mod layout_tests {
         let final_path = test_preview_path("shutdown-final");
         fs::write(&final_path, b"full wav").unwrap();
         app.pending_final_transcription = Some(PendingFinalTranscription::new(
+            RecordingSessionId(1),
             final_path.clone(),
             test_model(),
             LatencyTrace::started_now(),
@@ -9994,6 +10714,11 @@ mod layout_tests {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
+            next_recording_session_id: 1,
+            current_recording_session_id: None,
+            authoritative_result_session_id: None,
+            output_completed_session_id: None,
+            captured_output_target: None,
             playground_cards: cards_from_config(&config),
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -10015,6 +10740,11 @@ mod layout_tests {
             final_worker: None,
             final_cancellation: None,
             pending_final_transcription: None,
+            voice_edit_worker: None,
+            voice_edit_cancellation: None,
+            pending_voice_edit: None,
+            voice_edit_review: None,
+            voice_edit_display: None,
             tx,
             rx,
             playground_pending: 0,
