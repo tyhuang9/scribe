@@ -58,6 +58,7 @@ const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SEMANTIC_EDIT_CANDIDATES: usize = 4;
 const FINALIZING_PREVIEW_MESSAGE: &str = "Finishing live preview; final transcription starts next.";
 const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
     (30, "0.5 minutes"),
@@ -1373,6 +1374,18 @@ fn voice_edit_review_outcome(plan: &VoiceEditPlan, reason: String) -> VoiceEditO
     outcome
 }
 
+fn voice_transcript_editable(status: TranscriptionStatus, has_review: bool) -> bool {
+    status != TranscriptionStatus::Editing && !has_review
+}
+
+fn semantic_candidate_limit_warning(plan: &VoiceEditPlan) -> Option<String> {
+    (plan.candidates().len() > MAX_SEMANTIC_EDIT_CANDIDATES).then(|| {
+        format!(
+            "A recording can apply at most {MAX_SEMANTIC_EDIT_CANDIDATES} contextual rewrites automatically"
+        )
+    })
+}
+
 fn resolve_voice_editing_artifacts(
     config: &AppConfig,
 ) -> Result<(PathBuf, PathBuf, IntentTier), String> {
@@ -2358,6 +2371,10 @@ impl LocalTranscriberApp {
     }
 
     fn dispatch_voice_edit(&mut self, session_id: RecordingSessionId, plan: VoiceEditPlan) {
+        if let Some(message) = semantic_candidate_limit_warning(&plan) {
+            self.finish_voice_edit(session_id, voice_edit_review_outcome(&plan, message));
+            return;
+        }
         let selected_tier = self
             .current_voice_editing_model_tier
             .unwrap_or(self.config.voice_editing_model_tier);
@@ -2535,6 +2552,18 @@ impl LocalTranscriberApp {
             latency: review.latency,
         });
         self.dispatch_voice_edit(session_id, plan);
+    }
+
+    fn cancel_voice_edit(&mut self) {
+        let Some(cancellation) = self.voice_edit_cancellation.as_ref() else {
+            return;
+        };
+        if !cancellation.is_cancelled() {
+            cancellation.cancel();
+            self.status_message =
+                "Cancelling the local voice edit; the original will remain available for review."
+                    .to_owned();
+        }
     }
 
     fn use_original_voice_transcript(&mut self) {
@@ -4211,11 +4240,29 @@ impl LocalTranscriberApp {
                                     .text(recording_timer_text(active)),
                             );
                         } else if ready {
-                            ui.label(
-                                RichText::new("Ready to listen - system audio & microphone active")
+                            if self.status == TranscriptionStatus::Editing {
+                                let cancellation_pending = self
+                                    .voice_edit_cancellation
+                                    .as_ref()
+                                    .is_some_and(IntentCancellation::is_cancelled);
+                                let response = add_enabled_button(
+                                    ui,
+                                    !cancellation_pending,
+                                    small_button(ui, "Cancel voice edit"),
+                                    Some("The current voice edit is already being cancelled"),
+                                );
+                                if response.clicked() {
+                                    self.cancel_voice_edit();
+                                }
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "Ready to listen - system audio & microphone active",
+                                    )
                                     .small()
                                     .weak(),
-                            );
+                                );
+                            }
                         }
                     });
                 });
@@ -4310,7 +4357,10 @@ impl LocalTranscriberApp {
                     })
                     .inner;
                 ui.add_space(10.0);
-                let response = ui.add(
+                let transcript_editable =
+                    voice_transcript_editable(self.status, self.voice_edit_review.is_some());
+                let response = ui.add_enabled(
+                    transcript_editable,
                     TextEdit::multiline(&mut self.transcript)
                         .desired_rows(14)
                         .desired_width(usable_width(ui))
@@ -4326,7 +4376,14 @@ impl LocalTranscriberApp {
                 }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(small_button(ui, "Clear")).clicked() {
+                    if add_enabled_button(
+                        ui,
+                        transcript_editable,
+                        small_button(ui, "Clear"),
+                        Some("Resolve or cancel the current voice edit before changing the transcript"),
+                    )
+                    .clicked()
+                    {
                         self.transcript.clear();
                         if let Some(display) = self.voice_edit_display.as_mut() {
                             display.edited_text.clear();
@@ -9914,6 +9971,40 @@ mod layout_tests {
         assert_eq!(outcome.edited_text, "Ship.");
         assert!(outcome.used_ai);
         assert!(!outcome.requires_review);
+    }
+
+    #[test]
+    fn excessive_contextual_rewrites_require_review_before_runtime_start() {
+        let plan = voice_editor::plan_voice_edits(&test_transcript_result(
+            "One. Rewrite that shorter. Two. Rewrite that shorter. Three. Rewrite that shorter. Four. Rewrite that shorter. Five. Rewrite that shorter.",
+        ));
+
+        assert_eq!(plan.candidates().len(), 5);
+        assert!(semantic_candidate_limit_warning(&plan).is_some());
+    }
+
+    #[test]
+    fn transcript_is_read_only_during_editing_and_review() {
+        assert!(!voice_transcript_editable(
+            TranscriptionStatus::Editing,
+            false
+        ));
+        assert!(!voice_transcript_editable(TranscriptionStatus::Error, true));
+        assert!(voice_transcript_editable(TranscriptionStatus::Idle, false));
+    }
+
+    #[test]
+    fn cancelling_voice_edit_preserves_worker_ownership_until_completion() {
+        let mut app = test_app();
+        let cancellation = IntentCancellation::default();
+        app.status = TranscriptionStatus::Editing;
+        app.voice_edit_cancellation = Some(cancellation.clone());
+
+        app.cancel_voice_edit();
+
+        assert!(cancellation.is_cancelled());
+        assert!(app.voice_edit_cancellation.is_some());
+        assert!(app.status_message.contains("Cancelling"));
     }
 
     #[test]

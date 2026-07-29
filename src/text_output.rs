@@ -41,8 +41,18 @@ pub enum CapturedOutputTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsOutputTarget {
     hwnd: usize,
+    interaction: WindowsInteractionIdentity,
     process_id: u32,
     process_creation_time: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsInteractionIdentity {
+    focused_hwnd: usize,
+    caret_hwnd: usize,
+    caret_rect: [i32; 4],
+    window_title: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -376,10 +386,11 @@ mod windows_target {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindow,
     };
 
-    use super::WindowsOutputTarget;
+    use super::{WindowsInteractionIdentity, WindowsOutputTarget};
 
     pub(super) fn capture() -> Result<WindowsOutputTarget, String> {
         // SAFETY: Every Win32 handle is checked before use. The process handle
@@ -392,7 +403,8 @@ mod windows_target {
             }
 
             let mut process_id = 0_u32;
-            if GetWindowThreadProcessId(hwnd, &mut process_id) == 0 || process_id == 0 {
+            let thread_id = GetWindowThreadProcessId(hwnd, &mut process_id);
+            if thread_id == 0 || process_id == 0 {
                 return Err("the foreground window owner could not be verified".to_owned());
             }
             if process_id == GetCurrentProcessId() {
@@ -402,6 +414,7 @@ mod windows_target {
             let process_creation_time = process_creation_time(process_id)?;
             let target = WindowsOutputTarget {
                 hwnd: hwnd as usize,
+                interaction: interaction_identity(hwnd, thread_id)?,
                 process_id,
                 process_creation_time,
             };
@@ -421,14 +434,70 @@ mod windows_target {
                 return false;
             }
             let mut process_id = 0_u32;
-            if GetWindowThreadProcessId(hwnd, &mut process_id) == 0
-                || process_id != target.process_id
-            {
+            let thread_id = GetWindowThreadProcessId(hwnd, &mut process_id);
+            if thread_id == 0 || process_id != target.process_id {
                 return false;
             }
+            let Ok(interaction) = interaction_identity(hwnd, thread_id) else {
+                return false;
+            };
             process_creation_time(process_id)
                 .is_ok_and(|created| created == target.process_creation_time)
+                && interaction_matches(&target.interaction, &interaction)
         }
+    }
+
+    unsafe fn interaction_identity(
+        hwnd: HWND,
+        thread_id: u32,
+    ) -> Result<WindowsInteractionIdentity, String> {
+        // SAFETY: User32 initializes the caller-owned structure after cbSize is
+        // set. Returned HWND values remain opaque and are validated before use.
+        let mut info: GUITHREADINFO = unsafe { zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if unsafe { GetGUIThreadInfo(thread_id, &mut info) } == 0
+            || info.hwndFocus.is_null()
+            || unsafe { IsWindow(info.hwndFocus) } == 0
+        {
+            return Err("the focused control could not be verified".to_owned());
+        }
+        Ok(WindowsInteractionIdentity {
+            focused_hwnd: info.hwndFocus as usize,
+            caret_hwnd: info.hwndCaret as usize,
+            caret_rect: [
+                info.rcCaret.left,
+                info.rcCaret.top,
+                info.rcCaret.right,
+                info.rcCaret.bottom,
+            ],
+            window_title: unsafe { window_title(hwnd) }?,
+        })
+    }
+
+    fn interaction_matches(
+        captured: &WindowsInteractionIdentity,
+        current: &WindowsInteractionIdentity,
+    ) -> bool {
+        captured == current
+    }
+
+    unsafe fn window_title(hwnd: HWND) -> Result<String, String> {
+        // SAFETY: The UTF-16 buffer is sized for the reported title length and
+        // passed only for the duration of GetWindowTextW.
+        let length = unsafe { GetWindowTextLengthW(hwnd) };
+        if length <= 0 {
+            return Ok(String::new());
+        }
+        let capacity = usize::try_from(length)
+            .unwrap_or_default()
+            .min(1_024)
+            .saturating_add(1);
+        let mut buffer = vec![0_u16; capacity];
+        let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), capacity as i32) };
+        if copied <= 0 {
+            return Err("the target window title could not be read".to_owned());
+        }
+        Ok(String::from_utf16_lossy(&buffer[..copied as usize]))
     }
 
     unsafe fn process_creation_time(process_id: u32) -> Result<u64, String> {
@@ -474,6 +543,42 @@ mod windows_target {
             return Err("elevated applications are not eligible for delayed paste".to_owned());
         }
         Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn identity() -> WindowsInteractionIdentity {
+            WindowsInteractionIdentity {
+                focused_hwnd: 20,
+                caret_hwnd: 30,
+                caret_rect: [4, 8, 5, 24],
+                window_title: "Document A - Editor".to_owned(),
+            }
+        }
+
+        #[test]
+        fn same_top_level_window_with_changed_child_is_rejected() {
+            let captured = identity();
+            let mut current = captured.clone();
+            current.focused_hwnd = 21;
+
+            assert!(!interaction_matches(&captured, &current));
+        }
+
+        #[test]
+        fn same_control_with_changed_document_or_caret_is_rejected() {
+            let captured = identity();
+            let mut changed_document = captured.clone();
+            changed_document.window_title = "Document B - Editor".to_owned();
+            let mut changed_caret = captured.clone();
+            changed_caret.caret_rect[0] += 1;
+
+            assert!(!interaction_matches(&captured, &changed_document));
+            assert!(!interaction_matches(&captured, &changed_caret));
+            assert!(interaction_matches(&captured, &captured));
+        }
     }
 }
 
