@@ -28,8 +28,18 @@ RUNTIME_IDS = {
     "sherpa_onnx",
     "moonshine",
     "parakeet",
+    "voice_intent_llama_cpp",
 }
 GPU_RUNTIME_IDS = {"whisper_cpp", "faster_whisper"}
+VOICE_RUNTIME_PROVENANCE = {
+    "upstream_repository": "ggml-org/llama.cpp",
+    "upstream_revision": "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+    "upstream_asset": "llama-b9637-bin-win-cpu-x64.zip",
+    "upstream_sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+    "upstream_size_bytes": 16_906_751,
+    "license": "MIT",
+    "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +153,8 @@ def validate_manifest(root: Path, args: argparse.Namespace, entrypoint: PurePosi
         "entrypoint": entrypoint.as_posix(),
         "portable": True,
     }
+    if args.runtime_id == "voice_intent_llama_cpp":
+        expected.update(VOICE_RUNTIME_PROVENANCE)
     if any(manifest.get(key) != value for key, value in expected.items()):
         raise ValueError(f"runtime manifest does not match requested artifact identity: {expected}")
 
@@ -255,6 +267,14 @@ def main() -> int:
         raise ValueError("runtime version is invalid")
     if args.device == "gpu" and args.runtime_id not in GPU_RUNTIME_IDS:
         raise ValueError(f"{args.runtime_id} does not support GPU packs")
+    if args.runtime_id == "voice_intent_llama_cpp" and args.version != "b9637":
+        raise ValueError("voice_intent_llama_cpp must use the approved b9637 build")
+    if args.runtime_id == "voice_intent_llama_cpp" and (
+        args.os,
+        args.arch,
+        args.device,
+    ) != ("windows", "x86_64", "cpu"):
+        raise ValueError("the approved b9637 voice intent runtime is Windows x86_64 CPU-only")
     native_os = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(sys.platform)
     native_arch = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(platform.machine().lower())
     if (args.os, args.arch) != (native_os, native_arch):
@@ -294,6 +314,8 @@ def main() -> int:
             "unpacked_size_bytes": unpacked_size,
             "entrypoint": entrypoint.as_posix(),
         }
+        if args.runtime_id == "voice_intent_llama_cpp":
+            artifact.update(VOICE_RUNTIME_PROVENANCE)
         os.link(temporary, archive_path)
         archive_published = True
         fragment = fragment_directory(args.catalog) / f"{archive_name}.json"

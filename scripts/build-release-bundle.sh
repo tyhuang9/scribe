@@ -30,9 +30,19 @@ else
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 catalog = json.loads(path.read_text(encoding="utf-8"))
-if catalog.get("schema_version") != 1 or not catalog.get("catalog_version") or not catalog.get("artifacts"):
-    raise SystemExit("Release runtime catalog must use schema 1 and contain at least one real artifact")
+if catalog.get("schema_version") not in (1, 2) or not catalog.get("catalog_version") or not catalog.get("artifacts"):
+    raise SystemExit("Release runtime catalog must use schema 1 or 2 and contain at least one real artifact")
 PY
+fi
+
+if [[ "${SCRIBE_BUILD_VOICE_AI:-0}" == "1" ]]; then
+  if [[ -z "${SCRIBE_RUNTIME_ARTIFACT_CATALOG:-}" ]]; then
+    echo "Voice-AI releases require a schema-2 catalog with a pinned llama runtime and both mirrored Qwen tiers." >&2
+    exit 1
+  fi
+  export SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS=1
+else
+  unset SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS || true
 fi
 
 if [[ -z "${WHISPER_BUILD_DIR:-}" || -z "${WHISPER_SOURCE_VERSION:-}" || ! "${WHISPER_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40,64}$ ]]; then
@@ -165,4 +175,7 @@ elif [[ "$MODE" == "offline-cpu" ]]; then
   echo "  contents:            bundled all-CPU runtimes supplied by platform CI"
 else
   echo "  contents:            explicit GPU product; faster-whisper is included only when a portable CI input was supplied"
+fi
+if [[ "${SCRIBE_BUILD_VOICE_AI:-0}" == "1" ]]; then
+  echo "  voice AI:            pinned CPU llama runtime and both direct mirrored Qwen tiers"
 fi

@@ -1489,6 +1489,13 @@ mod tests {
             size_bytes: 1,
             unpacked_size_bytes: 1,
             entrypoint: PathBuf::from("bin/whisper-cli"),
+            upstream_repository: None,
+            upstream_revision: None,
+            upstream_asset: None,
+            upstream_sha256: None,
+            upstream_size_bytes: None,
+            license: None,
+            license_sha256: None,
         };
         let mut install = config::ManagedRuntimeInstall::new(PathBuf::from("whisper-cli"));
         install.source = Some(artifact.url.clone());

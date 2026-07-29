@@ -49,6 +49,20 @@ pub(crate) struct RuntimeArtifact {
     pub(crate) size_bytes: u64,
     pub(crate) unpacked_size_bytes: u64,
     pub(crate) entrypoint: PathBuf,
+    #[serde(default)]
+    pub(crate) upstream_repository: Option<String>,
+    #[serde(default)]
+    pub(crate) upstream_revision: Option<String>,
+    #[serde(default)]
+    pub(crate) upstream_asset: Option<String>,
+    #[serde(default)]
+    pub(crate) upstream_sha256: Option<String>,
+    #[serde(default)]
+    pub(crate) upstream_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) license: Option<String>,
+    #[serde(default)]
+    pub(crate) license_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +89,7 @@ pub(crate) struct IntentModelArtifact {
     pub(crate) upstream_revision: String,
     pub(crate) upstream_filename: String,
     pub(crate) license: String,
+    pub(crate) license_sha256: String,
     #[serde(default)]
     pub(crate) url: Option<String>,
     pub(crate) sha256: String,
@@ -91,6 +106,20 @@ struct RuntimeArtifactManifest {
     device: RuntimeDevicePack,
     entrypoint: PathBuf,
     portable: bool,
+    #[serde(default)]
+    upstream_repository: Option<String>,
+    #[serde(default)]
+    upstream_revision: Option<String>,
+    #[serde(default)]
+    upstream_asset: Option<String>,
+    #[serde(default)]
+    upstream_sha256: Option<String>,
+    #[serde(default)]
+    upstream_size_bytes: Option<u64>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    license_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -261,6 +290,48 @@ impl RuntimeArtifact {
         }
         validate_relative_entrypoint(&self.entrypoint)
             .map_err(|err| format!("{} artifact entrypoint {err}", self.runtime_id))?;
+        self.validate_voice_intent_provenance()?;
+        Ok(())
+    }
+
+    fn validate_voice_intent_provenance(&self) -> Result<(), String> {
+        let provenance = (
+            self.upstream_repository.as_deref(),
+            self.upstream_revision.as_deref(),
+            self.upstream_asset.as_deref(),
+            self.upstream_sha256.as_deref(),
+            self.upstream_size_bytes,
+            self.license.as_deref(),
+            self.license_sha256.as_deref(),
+        );
+        if self.runtime_id != VOICE_INTENT_LLAMA_CPP_RUNTIME_ID {
+            if provenance == (None, None, None, None, None, None, None) {
+                return Ok(());
+            }
+            return Err(
+                "upstream runtime provenance is reserved for voice_intent_llama_cpp".to_owned(),
+            );
+        }
+        let expected = (
+            Some("ggml-org/llama.cpp"),
+            Some("aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3"),
+            Some("llama-b9637-bin-win-cpu-x64.zip"),
+            Some("f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e"),
+            Some(16_906_751_u64),
+            Some("MIT"),
+            Some("94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"),
+        );
+        if self.version != "b9637"
+            || self.os != "windows"
+            || self.arch != "x86_64"
+            || self.device != RuntimeDevicePack::Cpu
+            || provenance != expected
+        {
+            return Err(
+                "voice_intent_llama_cpp must carry the approved b9637 upstream asset and MIT license provenance"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 }
@@ -294,6 +365,7 @@ impl IntentModelArtifact {
             "voice intent model upstream filename",
         )?;
         validate_immutable_identifier(&self.license, "voice intent model license")?;
+        validate_sha256(&self.license_sha256, "voice intent model license")?;
         if let Some(url) = &self.url {
             validate_https_url(url)?;
         }
@@ -997,6 +1069,13 @@ fn validate_extracted_manifest(
         || manifest.device != artifact.device
         || manifest.entrypoint != artifact.entrypoint
         || !manifest.portable
+        || manifest.upstream_repository != artifact.upstream_repository
+        || manifest.upstream_revision != artifact.upstream_revision
+        || manifest.upstream_asset != artifact.upstream_asset
+        || manifest.upstream_sha256 != artifact.upstream_sha256
+        || manifest.upstream_size_bytes != artifact.upstream_size_bytes
+        || manifest.license != artifact.license
+        || manifest.license_sha256 != artifact.license_sha256
     {
         return Err(format!(
             "runtime artifact manifest does not match trusted catalog identity for {} {} {} {}",
@@ -1085,8 +1164,18 @@ mod tests {
     }
 
     fn artifact(runtime_id: &str, os: &str, arch: &str, device: &str) -> String {
+        let provenance = if runtime_id == VOICE_INTENT_LLAMA_CPP_RUNTIME_ID {
+            r#","upstream_repository":"ggml-org/llama.cpp","upstream_revision":"aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3","upstream_asset":"llama-b9637-bin-win-cpu-x64.zip","upstream_sha256":"f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e","upstream_size_bytes":16906751,"license":"MIT","license_sha256":"94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d""#
+        } else {
+            ""
+        };
+        let version = if runtime_id == VOICE_INTENT_LLAMA_CPP_RUNTIME_ID {
+            "b9637"
+        } else {
+            "1.2.3"
+        };
         format!(
-            r#"{{"runtime_id":"{runtime_id}","version":"1.2.3","os":"{os}","arch":"{arch}","device":"{device}","url":"https://github.com/scribe-runtime-tests/releases/download/1.2.3/{runtime_id}.zip","sha256":"{}","size_bytes":123,"unpacked_size_bytes":456,"entrypoint":"bin/runtime"}}"#,
+            r#"{{"runtime_id":"{runtime_id}","version":"{version}","os":"{os}","arch":"{arch}","device":"{device}","url":"https://github.com/scribe-runtime-tests/releases/download/1.2.3/{runtime_id}.zip","sha256":"{}","size_bytes":123,"unpacked_size_bytes":456,"entrypoint":"bin/runtime"{provenance}}}"#,
             "a".repeat(64)
         )
     }
@@ -1102,8 +1191,9 @@ mod tests {
             .map(|url| format!(r#","url":"{url}""#))
             .unwrap_or_default();
         format!(
-            r#"{{"runtime_id":"voice_intent_llama_cpp","tier":"{tier}","model_id":"{model_id}","version":"Qwen3-0.6B","upstream_repository":"Qwen/Qwen3-0.6B-GGUF","upstream_revision":"{}","upstream_filename":"Qwen3-0.6B-Q8_0.gguf","license":"Apache-2.0"{url},"sha256":"{}","size_bytes":4,"managed_relative_path":"voice-intent/{model_id}.gguf"}}"#,
+            r#"{{"runtime_id":"voice_intent_llama_cpp","tier":"{tier}","model_id":"{model_id}","version":"Qwen3-0.6B","upstream_repository":"Qwen/Qwen3-0.6B-GGUF","upstream_revision":"{}","upstream_filename":"Qwen3-0.6B-Q8_0.gguf","license":"Apache-2.0","license_sha256":"{}"{url},"sha256":"{}","size_bytes":4,"managed_relative_path":"voice-intent/{model_id}.gguf"}}"#,
             "a".repeat(40),
+            "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
             "a".repeat(64),
         )
     }
@@ -1144,6 +1234,13 @@ mod tests {
             size_bytes: expected_size,
             unpacked_size_bytes: unpacked_size,
             entrypoint: PathBuf::from("bin/whisper-cli"),
+            upstream_repository: None,
+            upstream_revision: None,
+            upstream_asset: None,
+            upstream_sha256: None,
+            upstream_size_bytes: None,
+            license: None,
+            license_sha256: None,
         }
     }
 
@@ -1157,6 +1254,8 @@ mod tests {
             upstream_revision: "a".repeat(40),
             upstream_filename: "Qwen3-1.7B-Q8_0.gguf".to_owned(),
             license: "Apache-2.0".to_owned(),
+            license_sha256: "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
+                .to_owned(),
             url: Some("https://github.com/scribe-runtime-tests/Qwen3-1.7B-Q8_0.gguf".to_owned()),
             sha256: format!("{:x}", Sha256::digest(bytes)),
             size_bytes: expected_size,
@@ -1215,10 +1314,10 @@ mod tests {
 
         assert_eq!(compact.runtime_id, VOICE_INTENT_LLAMA_CPP_RUNTIME_ID);
         assert_eq!(compact.version, "Qwen3-0.6B");
-        assert_eq!(compact.size_bytes, 639_446_688);
+        assert_eq!(compact.size_bytes, 804_753_088);
         assert_eq!(
             compact.sha256,
-            "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+            "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735"
         );
         assert_eq!(
             compact.upstream_revision,
@@ -1236,6 +1335,11 @@ mod tests {
         );
         assert_eq!(compact.license, "Apache-2.0");
         assert_eq!(balanced.license, "Apache-2.0");
+        assert_eq!(
+            compact.license_sha256,
+            "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
+        );
+        assert_eq!(balanced.license_sha256, compact.license_sha256);
         assert!(compact.url.is_none() && balanced.url.is_none());
         assert!(
             runtime_catalog::backend_spec_for_runtime_id(VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
@@ -1272,6 +1376,10 @@ mod tests {
         for invalid in [
             compact.replace("voice_intent_llama_cpp", "unknown"),
             compact.replace("\"tier\":\"compact\"", "\"tier\":\"gpu\""),
+            compact.replace(
+                "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd",
+                &"A".repeat(64),
+            ),
             intent_model(
                 "compact",
                 "qwen3_0_6b_q8_0",
@@ -1289,14 +1397,19 @@ mod tests {
 
     #[test]
     fn auxiliary_runtime_is_cpu_only_without_expanding_the_stt_catalog() {
+        let trusted = artifact(
+            VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+            "windows",
+            "x86_64",
+            "cpu",
+        );
+        assert!(RuntimeArtifactCatalog::parse(&catalog_json(&trusted)).is_ok());
         assert!(
-            RuntimeArtifactCatalog::parse(&catalog_json(&artifact(
-                VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
-                "windows",
-                "x86_64",
-                "cpu"
+            RuntimeArtifactCatalog::parse(&catalog_json(&trusted.replace(
+                "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+                &"0".repeat(64),
             )))
-            .is_ok()
+            .is_err()
         );
         assert!(
             RuntimeArtifactCatalog::parse(&catalog_json(&artifact(

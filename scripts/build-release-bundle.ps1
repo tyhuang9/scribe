@@ -10,6 +10,7 @@ param(
     [string]$WhisperSourceCommit,
     [string]$CatalogPath,
     [switch]$AllowEmptyCatalog,
+    [switch]$VoiceAi,
     [hashtable]$PortableRuntimes = @{},
     [string]$WhisperGpuRuntimeDir
 )
@@ -36,8 +37,8 @@ if ($WhisperVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$') {
 if ($CatalogPath) {
     $resolvedCatalog = (Resolve-Path -LiteralPath $CatalogPath).Path
     $catalog = Get-Content -LiteralPath $resolvedCatalog -Raw | ConvertFrom-Json
-    if ($catalog.schema_version -ne 1 -or -not $catalog.catalog_version -or @($catalog.artifacts).Count -eq 0) {
-        throw 'Release runtime catalog must use schema 1 and contain at least one real artifact.'
+    if (@(1, 2) -notcontains $catalog.schema_version -or -not $catalog.catalog_version -or @($catalog.artifacts).Count -eq 0) {
+        throw 'Release runtime catalog must use schema 1 or 2 and contain at least one real artifact.'
     }
     $env:SCRIBE_RUNTIME_ARTIFACT_CATALOG = $resolvedCatalog
 }
@@ -46,6 +47,16 @@ elseif ($AllowEmptyCatalog) {
 }
 elseif (-not $AllowEmptyCatalog) {
     throw 'Provide -CatalogPath from package-runtime-artifact.py, or explicitly use -AllowEmptyCatalog for a CPU-only release.'
+}
+
+if ($VoiceAi) {
+    if (-not $CatalogPath) {
+        throw 'VoiceAi releases require a schema-2 catalog with a pinned llama runtime and both mirrored Qwen tiers.'
+    }
+    $env:SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS = '1'
+}
+else {
+    Remove-Item Env:SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS -ErrorAction SilentlyContinue
 }
 
 $whisperBin = Join-Path $WhisperBuildDir 'bin'
@@ -171,4 +182,7 @@ elseif ($Mode -eq 'Gpu' -and $PortableRuntimes.ContainsKey('faster_whisper')) {
 Write-Host "Release bundle ready ($Mode): $releaseDir"
 if ($Mode -eq 'Standard') {
     Write-Host 'Standard contains only bundled CPU whisper.cpp; optional runtimes need an embedded trusted catalog.'
+}
+if ($VoiceAi) {
+    Write-Host 'Voice AI catalog verified: pinned CPU llama runtime and both direct mirrored Qwen tiers are embedded.'
 }

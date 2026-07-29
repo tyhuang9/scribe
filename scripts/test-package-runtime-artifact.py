@@ -36,19 +36,30 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def write_manifest(self, runtime_id):
-        (self.runtime / "runtime-manifest.json").write_text(
-            json.dumps(
+    def write_manifest(self, runtime_id, version="0.3.45"):
+        manifest = {
+            "manifest_version": 1,
+            "runtime_id": runtime_id,
+            "version": version,
+            "platform": f"{NATIVE_OS}-{NATIVE_ARCH}",
+            "device": "cpu",
+            "entrypoint": self.entrypoint_relative,
+            "portable": True,
+        }
+        if runtime_id == "voice_intent_llama_cpp":
+            manifest.update(
                 {
-                    "manifest_version": 1,
-                    "runtime_id": runtime_id,
-                    "version": "0.3.45",
-                    "platform": f"{NATIVE_OS}-{NATIVE_ARCH}",
-                    "device": "cpu",
-                    "entrypoint": self.entrypoint_relative,
-                    "portable": True,
+                    "upstream_repository": "ggml-org/llama.cpp",
+                    "upstream_revision": "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+                    "upstream_asset": "llama-b9637-bin-win-cpu-x64.zip",
+                    "upstream_sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+                    "upstream_size_bytes": 16_906_751,
+                    "license": "MIT",
+                    "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
                 }
-            ),
+            )
+        (self.runtime / "runtime-manifest.json").write_text(
+            json.dumps(manifest),
             encoding="utf-8",
         )
 
@@ -118,6 +129,42 @@ class RuntimeArtifactPackagerTests(unittest.TestCase):
         self.assertEqual(artifact["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
         with zipfile.ZipFile(archive) as packaged:
             self.assertEqual(sorted(packaged.namelist()), [self.entrypoint_relative, "runtime-manifest.json"])
+
+    def test_packages_voice_intent_llama_as_a_cpu_only_auxiliary_runtime(self):
+        self.write_manifest("voice_intent_llama_cpp", "b9637")
+        command = self.command()
+        command[command.index("--runtime-id") + 1] = "voice_intent_llama_cpp"
+        command[command.index("--version") + 1] = "b9637"
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+        if (NATIVE_OS, NATIVE_ARCH) != ("windows", "x86_64"):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Windows x86_64 CPU-only", result.stderr)
+            return
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fragment = json.loads(Path(json.loads(result.stdout)["fragment"]).read_text(encoding="utf-8"))
+        self.assertEqual(fragment["runtime_id"], "voice_intent_llama_cpp")
+        self.assertEqual(fragment["device"], "cpu")
+        self.assertEqual(
+            fragment["upstream_revision"],
+            "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+        )
+        self.assertEqual(
+            fragment["upstream_sha256"],
+            "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+        )
+        self.assertEqual(
+            fragment["license_sha256"],
+            "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+        )
+
+        gpu = command.copy()
+        gpu[gpu.index("--device") + 1] = "gpu"
+        rejected = subprocess.run(gpu, capture_output=True, text=True, check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("does not support GPU", rejected.stderr)
 
     def test_rejects_placeholder_host_and_manifest_mismatch(self):
         placeholder = subprocess.run(

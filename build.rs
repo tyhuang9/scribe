@@ -40,6 +40,20 @@ struct Artifact {
     size_bytes: u64,
     unpacked_size_bytes: u64,
     entrypoint: String,
+    #[serde(default)]
+    upstream_repository: Option<String>,
+    #[serde(default)]
+    upstream_revision: Option<String>,
+    #[serde(default)]
+    upstream_asset: Option<String>,
+    #[serde(default)]
+    upstream_sha256: Option<String>,
+    #[serde(default)]
+    upstream_size_bytes: Option<u64>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    license_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +67,7 @@ struct IntentModel {
     upstream_revision: String,
     upstream_filename: String,
     license: String,
+    license_sha256: String,
     #[serde(default)]
     url: Option<String>,
     sha256: String,
@@ -62,6 +77,7 @@ struct IntentModel {
 
 fn main() {
     const CATALOG_ENV: &str = "SCRIBE_RUNTIME_ARTIFACT_CATALOG";
+    const REQUIRE_VOICE_AI_ENV: &str = "SCRIBE_REQUIRE_VOICE_INTENT_ARTIFACTS";
     let source = env::var_os(CATALOG_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("runtime-artifacts.default.json"));
@@ -69,6 +85,7 @@ fn main() {
         .join("runtime-artifacts.json");
 
     println!("cargo:rerun-if-env-changed={CATALOG_ENV}");
+    println!("cargo:rerun-if-env-changed={REQUIRE_VOICE_AI_ENV}");
     println!("cargo:rerun-if-changed={}", source.display());
     let contents = fs::read_to_string(&source).unwrap_or_else(|err| {
         panic!(
@@ -82,12 +99,84 @@ fn main() {
             source.display()
         )
     });
+    if env::var(REQUIRE_VOICE_AI_ENV).as_deref() == Ok("1") {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets target OS");
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo sets target arch");
+        validate_required_voice_intent_artifacts(&contents, &target_os, &target_arch)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "voice-AI release catalog {} is incomplete: {err}",
+                    source.display()
+                )
+            });
+    }
     fs::write(&destination, contents).unwrap_or_else(|err| {
         panic!(
             "failed to embed runtime artifact catalog {}: {err}",
             source.display()
         )
     });
+}
+
+fn validate_required_voice_intent_artifacts(
+    contents: &str,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<(), String> {
+    let catalog: Catalog = serde_json::from_str(contents).map_err(|err| err.to_string())?;
+    if catalog.schema_version != 2 {
+        return Err("schema version 2 is required".to_owned());
+    }
+    let runtime_ready = catalog.artifacts.iter().any(|artifact| {
+        artifact.runtime_id == "voice_intent_llama_cpp"
+            && artifact.os == target_os
+            && artifact.arch == target_arch
+            && artifact.device == "cpu"
+    });
+    if !runtime_ready {
+        return Err(format!(
+            "missing voice_intent_llama_cpp CPU runtime for {target_os}-{target_arch}"
+        ));
+    }
+
+    for (tier, model_id, size_bytes, sha256, revision) in [
+        (
+            "compact",
+            "qwen3_0_6b_q8_0",
+            804_753_088_u64,
+            "12fae8b8f78f0360b498d04c8db7d33aff29ab7d8080231f93a17c18119e6735",
+            "ef4088322893040952513f532f736ddeab518403",
+        ),
+        (
+            "balanced",
+            "qwen3_1_7b_q8_0",
+            1_834_426_016_u64,
+            "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+            "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+        ),
+    ] {
+        let Some(model) = catalog
+            .intent_models
+            .iter()
+            .find(|model| model.tier == tier)
+        else {
+            return Err(format!("missing {tier} voice intent model"));
+        };
+        if model.model_id != model_id
+            || model.size_bytes != size_bytes
+            || model.sha256 != sha256
+            || model.upstream_revision != revision
+            || model.license != "Apache-2.0"
+            || model.license_sha256
+                != "5de36594c10839788a8c589443a8ef9d8b8d17c65a1b5807206ae037fc36c6bd"
+            || model.url.is_none()
+        {
+            return Err(format!(
+                "{tier} model must match the approved Qwen artifact and have a direct release URL"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_catalog(contents: &str) -> Result<(), String> {
@@ -145,6 +234,7 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
             return Err(format!("invalid size limits for {}", artifact.runtime_id));
         }
         validate_entrypoint(&artifact.entrypoint)?;
+        validate_voice_runtime_provenance(&artifact)?;
         let key = (
             artifact.runtime_id.clone(),
             artifact.os.clone(),
@@ -189,6 +279,7 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
         validate_entrypoint(&model.upstream_filename)?;
         validate_gguf_path(&model.upstream_filename, "intent model upstream filename")?;
         validate_immutable_identifier(&model.license, "intent model license")?;
+        validate_sha256(&model.license_sha256, "intent model license")?;
         if let Some(url) = &model.url {
             validate_url(url)?;
         }
@@ -206,6 +297,47 @@ fn validate_catalog(contents: &str) -> Result<(), String> {
         {
             return Err("duplicate intent model id or runtime/tier tuple".to_owned());
         }
+    }
+    Ok(())
+}
+
+fn validate_voice_runtime_provenance(artifact: &Artifact) -> Result<(), String> {
+    let provenance = (
+        artifact.upstream_repository.as_deref(),
+        artifact.upstream_revision.as_deref(),
+        artifact.upstream_asset.as_deref(),
+        artifact.upstream_sha256.as_deref(),
+        artifact.upstream_size_bytes,
+        artifact.license.as_deref(),
+        artifact.license_sha256.as_deref(),
+    );
+    if artifact.runtime_id != "voice_intent_llama_cpp" {
+        if provenance == (None, None, None, None, None, None, None) {
+            return Ok(());
+        }
+        return Err(
+            "upstream runtime provenance is reserved for voice_intent_llama_cpp".to_owned(),
+        );
+    }
+    let expected = (
+        Some("ggml-org/llama.cpp"),
+        Some("aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3"),
+        Some("llama-b9637-bin-win-cpu-x64.zip"),
+        Some("f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e"),
+        Some(16_906_751_u64),
+        Some("MIT"),
+        Some("94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"),
+    );
+    if artifact.version != "b9637"
+        || artifact.os != "windows"
+        || artifact.arch != "x86_64"
+        || artifact.device != "cpu"
+        || provenance != expected
+    {
+        return Err(
+            "voice_intent_llama_cpp must carry the approved b9637 upstream asset and MIT license provenance"
+                .to_owned(),
+        );
     }
     Ok(())
 }
