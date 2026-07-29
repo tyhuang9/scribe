@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIBE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+RUNTIMES_DIR="$SCRIBE_DIR/target/release/runtimes"
 MODE="standard"
 
 if [[ "${1:-}" == "--mode" ]]; then
@@ -72,13 +73,35 @@ if [[ "$MODE" == "offline-cpu" ]]; then
   done
 fi
 
-cargo build --release --manifest-path "$SCRIBE_DIR/Cargo.toml"
+assert_exact_runtime_set() {
+  python3 - "$RUNTIMES_DIR" "$@" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+expected = set(sys.argv[2:])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"Release runtime directory is missing or unsafe: {root}")
+entries = list(root.iterdir())
+unexpected = sorted(
+    entry.name for entry in entries
+    if entry.name not in expected or not entry.is_dir() or entry.is_symlink()
+)
+missing = sorted(name for name in expected if not (root / name).is_dir() or (root / name).is_symlink())
+if unexpected or missing:
+    raise SystemExit(f"Release runtime set is not exact. Unexpected: {unexpected}. Missing: {missing}.")
+PY
+}
 
-if [[ "$MODE" != "offline-cpu" ]]; then
-  for runtime_id in faster_whisper vosk sherpa_onnx moonshine parakeet; do
-    rm -rf -- "$SCRIBE_DIR/target/release/runtimes/$runtime_id"
-  done
+if [[ "$RUNTIMES_DIR" != "$SCRIBE_DIR/target/release/runtimes" ]]; then
+  echo "Refusing to reset unexpected release runtime path: $RUNTIMES_DIR" >&2
+  exit 1
 fi
+if [[ -L "$SCRIBE_DIR/target" || -L "$SCRIBE_DIR/target/release" ]]; then
+  echo "Refusing to reset release runtimes through a symbolic-link ancestor." >&2
+  exit 1
+fi
+rm -rf -- "$RUNTIMES_DIR"
+mkdir -p "$RUNTIMES_DIR"
+cargo build --release --manifest-path "$SCRIBE_DIR/Cargo.toml"
 
 case "$MODE" in
   gpu) SCRIBE_PROFILE=release SCRIBE_BUNDLE_CUDA=1 "$SCRIPT_DIR/bundle-whisper-runtime.sh" ;;
@@ -161,6 +184,12 @@ fi
 if [[ "$MODE" == "gpu" && -n "${SCRIBE_PORTABLE_FASTER_WHISPER_GPU_RUNTIME:-}" ]]; then
   echo "A faster-whisper GPU runtime must be packaged as a separate verified artifact; it is not copied into the whisper GPU product." >&2
   exit 1
+fi
+
+if [[ "$MODE" == "offline-cpu" ]]; then
+  assert_exact_runtime_set whisper_cpp faster_whisper vosk sherpa_onnx moonshine parakeet
+else
+  assert_exact_runtime_set whisper_cpp
 fi
 
 cat <<EOF

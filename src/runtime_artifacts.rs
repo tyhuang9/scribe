@@ -422,6 +422,10 @@ impl RuntimeArtifact {
         }
         Ok(())
     }
+
+    pub(crate) fn is_exact_official_voice_intent_runtime(&self) -> bool {
+        self.runtime_id == VOICE_INTENT_LLAMA_CPP_RUNTIME_ID && self.validate().is_ok()
+    }
 }
 
 impl IntentModelArtifact {
@@ -3243,6 +3247,35 @@ mod tests {
         install.device = Some(artifact.device.as_str().to_owned());
         install.source = Some("https://example.com/stale-runtime.zip".to_owned());
         assert!(!managed_install_matches_artifact(&install, &artifact));
+    }
+
+    #[test]
+    fn exact_voice_runtime_artifact_qualifies_for_smoke_exemption() {
+        let artifact = test_official_llama_artifact(LLAMA_CPP_UPSTREAM_UNPACKED_SIZE);
+        assert!(artifact.is_exact_official_voice_intent_runtime());
+    }
+
+    #[test]
+    fn mutated_voice_runtime_artifact_does_not_qualify_for_smoke_exemption() {
+        let exact = test_official_llama_artifact(LLAMA_CPP_UPSTREAM_UNPACKED_SIZE);
+
+        let mut wrong_revision = exact.clone();
+        wrong_revision.upstream_revision = Some("0".repeat(40));
+        assert!(!wrong_revision.is_exact_official_voice_intent_runtime());
+
+        let mut wrong_layout = exact.clone();
+        wrong_layout.archive_layout = ArchiveLayout::ScribePortableZipV1;
+        assert!(!wrong_layout.is_exact_official_voice_intent_runtime());
+
+        let mut wrong_hash = exact;
+        wrong_hash.sha256 = "0".repeat(64);
+        assert!(!wrong_hash.is_exact_official_voice_intent_runtime());
+    }
+
+    #[test]
+    fn non_voice_runtime_artifact_does_not_qualify_for_smoke_exemption() {
+        let artifact = test_artifact(b"runtime", 7, 7);
+        assert!(!artifact.is_exact_official_voice_intent_runtime());
     }
 
     #[test]

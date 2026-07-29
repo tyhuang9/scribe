@@ -20,7 +20,8 @@ $PortableRuntimes = if ($null -eq $PortableRuntimes) { @{} } else { $PortableRun
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scribeDir = Split-Path -Parent $scriptDir
 $releaseDir = Join-Path $scribeDir 'target\release'
-$runtimeDir = Join-Path $releaseDir 'runtimes\whisper_cpp'
+$runtimesDir = Join-Path $releaseDir 'runtimes'
+$runtimeDir = Join-Path $runtimesDir 'whisper_cpp'
 $runtimeBin = Join-Path $runtimeDir 'bin'
 $platformArchitecture = switch ([string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     'X64' { 'x86_64' }
@@ -98,6 +99,28 @@ function Assert-PortableRuntime([string]$Path, [string]$RuntimeId, [string]$Devi
     }
 }
 
+function Assert-ExactRuntimeSet([string[]]$ExpectedRuntimeIds) {
+    if (-not (Test-Path -LiteralPath $runtimesDir -PathType Container)) {
+        throw "Release runtime directory is missing: $runtimesDir"
+    }
+    $entries = @(Get-ChildItem -LiteralPath $runtimesDir -Force)
+    $unexpected = @($entries | Where-Object {
+        -not $_.PSIsContainer -or
+        ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        $ExpectedRuntimeIds -cnotcontains $_.Name
+    })
+    $missing = @($ExpectedRuntimeIds | Where-Object {
+        $expectedPath = Join-Path $runtimesDir $_
+        -not (Test-Path -LiteralPath $expectedPath -PathType Container) -or
+        ((Get-Item -LiteralPath $expectedPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)
+    })
+    if ($unexpected.Count -gt 0 -or $missing.Count -gt 0) {
+        $unexpectedNames = ($unexpected | ForEach-Object Name) -join ', '
+        $missingNames = $missing -join ', '
+        throw "Release runtime set is not exact. Unexpected: [$unexpectedNames]. Missing: [$missingNames]."
+    }
+}
+
 function Copy-PortableRuntime([string]$RuntimeId, [string]$Source, [string]$Entrypoint) {
     Assert-PortableRuntime $Source $RuntimeId 'cpu' $Entrypoint
     $destination = Join-Path $releaseDir "runtimes\$RuntimeId"
@@ -108,20 +131,38 @@ function Copy-PortableRuntime([string]$RuntimeId, [string]$Source, [string]$Entr
     Get-ChildItem -LiteralPath $Source -Force | Copy-Item -Destination $destination -Recurse -Force
 }
 
-cargo build --release --manifest-path (Join-Path $scribeDir 'Cargo.toml')
-if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed' }
-if ($Mode -ne 'OfflineCpu') {
-    foreach ($runtimeId in @('faster_whisper', 'vosk', 'sherpa_onnx', 'moonshine', 'parakeet')) {
-        $oldRuntime = Join-Path $releaseDir "runtimes\$runtimeId"
-        if (Test-Path -LiteralPath $oldRuntime) {
-            Remove-Item -LiteralPath $oldRuntime -Recurse -Force
+$releaseDirFull = [IO.Path]::GetFullPath($releaseDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$runtimesDirFull = [IO.Path]::GetFullPath($runtimesDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
+if ([IO.Path]::GetDirectoryName($runtimesDirFull) -cne $releaseDirFull -or
+    [IO.Path]::GetFileName($runtimesDirFull) -cne 'runtimes') {
+    throw "Refusing to reset unexpected release runtime path: $runtimesDirFull"
+}
+foreach ($ancestor in @((Join-Path $scribeDir 'target'), $releaseDirFull)) {
+    if (Test-Path -LiteralPath $ancestor) {
+        $ancestorItem = Get-Item -LiteralPath $ancestor -Force
+        if (-not $ancestorItem.PSIsContainer -or
+            ($ancestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Refusing to reset release runtimes through unsafe ancestor: $ancestor"
         }
     }
 }
-
-if (Test-Path -LiteralPath $runtimeDir) {
-    Remove-Item -LiteralPath $runtimeDir -Recurse -Force
+if (Test-Path -LiteralPath $runtimesDirFull) {
+    $staleRuntimes = Get-Item -LiteralPath $runtimesDirFull -Force
+    if ($staleRuntimes.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Remove-Item -LiteralPath $runtimesDirFull -Force
+    }
+    elseif ($staleRuntimes.PSIsContainer) {
+        Remove-Item -LiteralPath $runtimesDirFull -Recurse -Force
+    }
+    else {
+        Remove-Item -LiteralPath $runtimesDirFull -Force
+    }
 }
+cargo build --release --manifest-path (Join-Path $scribeDir 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed' }
+New-Item -ItemType Directory -Path $runtimesDirFull | Out-Null
+
+New-Item -ItemType Directory -Path $runtimeDir | Out-Null
 New-Item -ItemType Directory -Path $runtimeBin | Out-Null
 Copy-Item -LiteralPath $whisperCli -Destination $runtimeBin
 Get-ChildItem -LiteralPath $whisperBin -File -Filter '*.dll' | Copy-Item -Destination $runtimeBin
@@ -178,6 +219,14 @@ if ($Mode -eq 'OfflineCpu') {
 elseif ($Mode -eq 'Gpu' -and $PortableRuntimes.ContainsKey('faster_whisper')) {
     throw 'Package faster-whisper GPU as a separate verified artifact; do not mix it into the whisper GPU product.'
 }
+
+$expectedRuntimeIds = if ($Mode -eq 'OfflineCpu') {
+    @('whisper_cpp', 'faster_whisper', 'vosk', 'sherpa_onnx', 'moonshine', 'parakeet')
+}
+else {
+    @('whisper_cpp')
+}
+Assert-ExactRuntimeSet $expectedRuntimeIds
 
 Write-Host "Release bundle ready ($Mode): $releaseDir"
 if ($Mode -eq 'Standard') {

@@ -7927,7 +7927,9 @@ fn install_remote_runtime_artifact_with_progress(
             staged.entrypoint.display()
         ));
     }
-    if let Err(message) = smoke_validate_runtime(&staged.entrypoint) {
+    if requires_pre_activation_help_smoke(runtime_id, artifact)
+        && let Err(message) = smoke_validate_runtime(&staged.entrypoint)
+    {
         let _ = remove_path_if_exists(&staged.root);
         return Err(message);
     }
@@ -7938,6 +7940,10 @@ fn install_remote_runtime_artifact_with_progress(
         &artifact.entrypoint,
         install_lock,
     )
+}
+
+fn requires_pre_activation_help_smoke(runtime_id: &str, artifact: &RuntimeArtifact) -> bool {
+    runtime_id != artifact.runtime_id || !artifact.is_exact_official_voice_intent_runtime()
 }
 
 fn smoke_validate_runtime(executable: &Path) -> Result<(), String> {
@@ -12740,7 +12746,24 @@ mod layout_tests {
     }
 
     #[test]
-    fn runtime_smoke_validation_executes_help_successfully() {
+    fn exact_voice_runtime_skips_generic_help_smoke() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../runtime-artifacts.default.json")).unwrap();
+        let artifact: RuntimeArtifact =
+            serde_json::from_value(catalog["artifacts"][0].clone()).unwrap();
+        assert!(!requires_pre_activation_help_smoke(
+            runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+            &artifact,
+        ));
+    }
+
+    #[test]
+    fn normal_runtime_still_executes_help_smoke() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../runtime-artifacts.default.json")).unwrap();
+        let artifact: RuntimeArtifact =
+            serde_json::from_value(catalog["artifacts"][0].clone()).unwrap();
+        assert!(requires_pre_activation_help_smoke("vosk", &artifact));
         smoke_validate_runtime(&std::env::current_exe().unwrap()).unwrap();
     }
 
