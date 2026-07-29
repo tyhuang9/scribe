@@ -822,14 +822,8 @@ fn parse_model_response(
         return Err("private edit response must contain exactly one choice".to_owned());
     }
     let content = envelope.choices.into_iter().next().unwrap().message.content;
-    let mut stream = serde_json::Deserializer::from_str(&content).into_iter::<ModelEditResponse>();
-    let edit = stream
-        .next()
-        .ok_or_else(|| "model returned no JSON document".to_owned())?
+    let edit = serde_json::from_str::<ModelEditResponse>(&content)
         .map_err(|_| "model returned an invalid JSON document".to_owned())?;
-    if stream.byte_offset() != content.len() || stream.next().is_some() {
-        return Err("model returned trailing bytes after its JSON document".to_owned());
-    }
     if edit.schema_version != 1 {
         return Err("model returned an unsupported schema version".to_owned());
     }
@@ -1681,7 +1675,21 @@ mod tests {
     }
 
     #[test]
-    fn response_rejects_unknown_duplicate_trailing_and_control_fields() {
+    fn response_accepts_json_trailing_whitespace() {
+        let valid = r#"{"schema_version":1,"operation":"no_change","edited_text":""}"#;
+        for whitespace in [" ", "\t", "\r\n", " \t\r\n"] {
+            assert!(
+                parse_model_response(
+                    &completion_envelope(&format!("{valid}{whitespace}")),
+                    (1, 2)
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn response_rejects_unknown_duplicate_extra_documents_and_control_fields() {
         for invalid in [
             r#"{"schema_version":1,"operation":"no_change","edited_text":"","extra":1}"#,
             r#"{"schema_version":1,"schema_version":1,"operation":"no_change","edited_text":""}"#,
@@ -1693,10 +1701,32 @@ mod tests {
             assert!(parse_model_response(&completion_envelope(invalid), (1, 2)).is_err());
         }
         let valid = r#"{"schema_version":1,"operation":"no_change","edited_text":""}"#;
-        let trailing = format!("{valid}\n");
-        assert!(parse_model_response(&completion_envelope(&trailing), (1, 2)).is_err());
-        let second = format!("{valid}{valid}");
-        assert!(parse_model_response(&completion_envelope(&second), (1, 2)).is_err());
+        for invalid in [
+            format!("{valid}{valid}"),
+            format!("```json\n{valid}\n```"),
+            format!("Here is the result: {valid}"),
+        ] {
+            assert!(parse_model_response(&completion_envelope(&invalid), (1, 2)).is_err());
+        }
+    }
+
+    #[test]
+    fn failure_messages_do_not_echo_private_input_or_model_output() {
+        let private_model_output = "private model output";
+        let invalid = format!("not JSON: {private_model_output}");
+        let message = parse_model_response(&completion_envelope(&invalid), (1, 2)).unwrap_err();
+        assert_eq!(message, "model returned an invalid JSON document");
+        assert!(!message.contains(private_model_output));
+
+        let private_transcript = "private transcript";
+        let mut request = executable_request(private_transcript, "private instruction");
+        request.target_text = format!("{private_transcript}{}", "x".repeat(MAX_DRAFT_BYTES));
+        let message = validate_request(&request).unwrap_err();
+        assert_eq!(
+            message,
+            format!("current draft exceeds the {MAX_DRAFT_BYTES}-byte limit")
+        );
+        assert!(!message.contains(private_transcript));
     }
 
     #[test]

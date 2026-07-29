@@ -231,7 +231,14 @@ fn run_corpus(tier: IntentTier, model_env: &str) {
             },
             &IntentCancellation::default(),
         )
-        .unwrap_or_else(|failure| panic!("case {} failed: {:?}", index + 1, failure.kind));
+        .unwrap_or_else(|failure| {
+            panic!(
+                "case {} failed: {:?}: {}",
+                index + 1,
+                failure.kind,
+                failure.message
+            )
+        });
         let latency = started.elapsed();
         assert!(
             latency <= MAX_CASE_LATENCY,
