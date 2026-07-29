@@ -69,6 +69,10 @@ still works. To opt into tray behavior under WSL:
 SCRIBE_ENABLE_TRAY=1 cargo run
 ```
 
+Wayland tray support and click behavior depend on the compositor's
+StatusNotifier/AppIndicator implementation. If tray initialization is
+unavailable, close-to-tray is disabled and a normal window close exits Scribe.
+
 On Linux, global hotkey registration is disabled by default because some
 desktop/X sessions terminate the app when global key hooks are initialized.
 Use the in-app Start/Stop button, or opt in explicitly:

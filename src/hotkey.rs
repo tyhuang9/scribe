@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, unbounded};
+use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use std::sync::{Arc, OnceLock, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotkeyEvent {
@@ -11,14 +14,21 @@ pub enum HotkeyEvent {
 pub struct HotkeyService {
     manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    event_rx: Receiver<GlobalHotKeyEvent>,
     pub last_error: Option<String>,
 }
 
+struct EventHandlerState {
+    receiver: Receiver<GlobalHotKeyEvent>,
+    wake_ctx: Arc<RwLock<egui::Context>>,
+}
+
 impl HotkeyService {
-    pub fn new(spec: &str) -> Self {
+    pub fn new(spec: &str, ctx: &egui::Context) -> Self {
         let mut service = Self {
             manager: None,
             hotkey: None,
+            event_rx: install_event_handler(ctx),
             last_error: None,
         };
         if let Err(err) = global_hotkey_startup_allowed() {
@@ -57,13 +67,40 @@ impl HotkeyService {
     pub fn poll_events(&self) -> Vec<HotkeyEvent> {
         let registered_id = self.hotkey.map(|hotkey| hotkey.id());
         let mut events = Vec::new();
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+        while let Ok(event) = self.event_rx.try_recv() {
             if let Some(event) = event_from_global(event, registered_id) {
                 events.push(event);
             }
         }
         events
     }
+}
+
+fn install_event_handler(ctx: &egui::Context) -> Receiver<GlobalHotKeyEvent> {
+    static STATE: OnceLock<EventHandlerState> = OnceLock::new();
+
+    let state = STATE.get_or_init(|| {
+        let (sender, receiver) = unbounded();
+        let wake_ctx = Arc::new(RwLock::new(ctx.clone()));
+        let wake_context = wake_ctx.clone();
+        GlobalHotKeyEvent::set_event_handler(Some(move |event| {
+            let _ = sender.send(event);
+            let ctx = wake_context
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            ctx.request_repaint();
+        }));
+        EventHandlerState { receiver, wake_ctx }
+    });
+
+    // global-hotkey handlers are process-wide and cannot be replaced. Refresh
+    // the egui context when an app instance is reconstructed in this process.
+    *state
+        .wake_ctx
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ctx.clone();
+    state.receiver.clone()
 }
 
 fn event_from_global(event: GlobalHotKeyEvent, registered_id: Option<u32>) -> Option<HotkeyEvent> {
@@ -171,6 +208,36 @@ mod tests {
     }
 
     #[test]
+    fn drains_every_queued_event_for_the_registered_hotkey() {
+        let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let (sender, receiver) = unbounded();
+        let service = HotkeyService {
+            manager: None,
+            hotkey: Some(hotkey),
+            event_rx: receiver,
+            last_error: None,
+        };
+
+        sender
+            .send(GlobalHotKeyEvent {
+                id: hotkey.id(),
+                state: HotKeyState::Pressed,
+            })
+            .unwrap();
+        sender
+            .send(GlobalHotKeyEvent {
+                id: hotkey.id(),
+                state: HotKeyState::Released,
+            })
+            .unwrap();
+
+        assert_eq!(
+            service.poll_events(),
+            vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
+        );
+    }
+
+    #[test]
     fn ignores_events_for_other_hotkeys() {
         let hotkey = parse_hotkey("Ctrl+Shift+Space").unwrap();
         let other = parse_hotkey("Ctrl+Alt+K").unwrap();
@@ -193,6 +260,7 @@ mod tests {
         let mut service = HotkeyService {
             manager: None,
             hotkey: Some(existing),
+            event_rx: unbounded().1,
             last_error: None,
         };
 

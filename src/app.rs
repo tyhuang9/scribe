@@ -1241,7 +1241,7 @@ impl LocalTranscriberApp {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.hotkey),
+            hotkey_service: HotkeyService::new(&config.hotkey, &cc.egui_ctx),
             config,
             config_path,
             current_tab: initial_tab(),
@@ -1270,6 +1270,7 @@ impl LocalTranscriberApp {
             has_transcript: false,
         };
         match TrayService::new(
+            &cc.egui_ctx,
             initial_tray_state.is_recording,
             initial_tray_state.has_transcript,
         ) {
@@ -1792,7 +1793,7 @@ impl LocalTranscriberApp {
         let Some(tray_service) = &self.tray_service else {
             return;
         };
-        if let Some(command) = tray_service.poll_command() {
+        for command in tray_service.drain_commands() {
             self.apply_tray_command(command, ctx);
         }
     }
@@ -1845,8 +1846,19 @@ impl LocalTranscriberApp {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        for command in window_restore_commands() {
+            match command {
+                WindowRestoreCommand::Unminimize => {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                }
+                WindowRestoreCommand::Show => {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                }
+                WindowRestoreCommand::Focus => {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+            }
+        }
         self.status_message = "Scribe window restored".to_owned();
     }
 
@@ -5930,6 +5942,21 @@ fn tray_state_needs_sync(previous: Option<TrayUiState>, current: TrayUiState) ->
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRestoreCommand {
+    Unminimize,
+    Show,
+    Focus,
+}
+
+fn window_restore_commands() -> [WindowRestoreCommand; 3] {
+    [
+        WindowRestoreCommand::Unminimize,
+        WindowRestoreCommand::Show,
+        WindowRestoreCommand::Focus,
+    ]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HotkeyRecordingAction {
     StartTranscribe,
     Stop,
@@ -8237,6 +8264,18 @@ mod layout_tests {
     }
 
     #[test]
+    fn restoring_a_window_unminimizes_shows_and_focuses_in_order() {
+        assert_eq!(
+            window_restore_commands(),
+            [
+                WindowRestoreCommand::Unminimize,
+                WindowRestoreCommand::Show,
+                WindowRestoreCommand::Focus,
+            ]
+        );
+    }
+
+    #[test]
     fn captured_hotkeys_cover_extended_standard_keys() {
         let modifiers = egui::Modifiers {
             ctrl: true,
@@ -9950,7 +9989,7 @@ mod layout_tests {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.hotkey),
+            hotkey_service: HotkeyService::new(&config.hotkey, &egui::Context::default()),
             config,
             config_path: None,
             current_tab: Tab::Models,

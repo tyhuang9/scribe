@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use eframe::egui;
+use std::sync::{Arc, OnceLock, RwLock};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -19,6 +22,7 @@ pub enum TrayCommand {
 
 pub struct TrayService {
     _tray_icon: TrayIcon,
+    command_rx: Receiver<TrayCommand>,
     toggle_recording_item: MenuItem,
     copy_last_item: MenuItem,
     _show_item: MenuItem,
@@ -28,7 +32,7 @@ pub struct TrayService {
 }
 
 impl TrayService {
-    pub fn new(is_recording: bool, has_transcript: bool) -> Result<Self> {
+    pub fn new(ctx: &egui::Context, is_recording: bool, has_transcript: bool) -> Result<Self> {
         if std::env::var_os("SCRIBE_DISABLE_TRAY").is_some() {
             return Err(anyhow!("system tray disabled by SCRIBE_DISABLE_TRAY"));
         }
@@ -38,10 +42,15 @@ impl TrayService {
             ));
         }
         ensure_tray_runtime_available()?;
-        catch_tray_init_panic(|| Self::build(is_recording, has_transcript))?
+        let command_rx = install_event_handlers(ctx);
+        catch_tray_init_panic(|| Self::build(command_rx, is_recording, has_transcript))?
     }
 
-    fn build(is_recording: bool, has_transcript: bool) -> Result<Self> {
+    fn build(
+        command_rx: Receiver<TrayCommand>,
+        is_recording: bool,
+        has_transcript: bool,
+    ) -> Result<Self> {
         let show_item = MenuItem::with_id(MENU_SHOW, "Show Scribe", true, None);
         let hide_item = MenuItem::with_id(MENU_HIDE, "Hide Window", true, None);
         let toggle_recording_item = MenuItem::with_id(
@@ -68,6 +77,8 @@ impl TrayService {
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_menu_on_right_click(true)
             .with_tooltip("Scribe")
             .with_icon(scribe_icon()?)
             .build()
@@ -75,6 +86,7 @@ impl TrayService {
 
         Ok(Self {
             _tray_icon: tray_icon,
+            command_rx,
             toggle_recording_item,
             copy_last_item,
             _show_item: show_item,
@@ -93,24 +105,74 @@ impl TrayService {
         self.copy_last_item.set_enabled(has_transcript);
     }
 
-    pub fn poll_command(&self) -> Option<TrayCommand> {
-        let mut command = None;
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(menu_command) = command_from_menu_id(event.id().as_ref()) {
-                command = Some(menu_command);
-            }
-        }
-        if command.is_some() {
-            while TrayIconEvent::receiver().try_recv().is_ok() {}
-            return command;
-        }
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if tray_event_should_show(&event) {
-                command = Some(TrayCommand::Show);
-            }
-        }
-        command
+    pub fn drain_commands(&self) -> Vec<TrayCommand> {
+        drain_commands(&self.command_rx)
     }
+}
+
+#[derive(Clone)]
+struct EventBridge {
+    sender: Sender<TrayCommand>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+struct EventHandlerState {
+    receiver: Receiver<TrayCommand>,
+    wake_ctx: Arc<RwLock<egui::Context>>,
+}
+
+impl EventBridge {
+    fn send(&self, command: TrayCommand) {
+        let _ = self.sender.send(command);
+        (self.wake)();
+    }
+}
+
+fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayCommand> {
+    static STATE: OnceLock<EventHandlerState> = OnceLock::new();
+
+    let state = STATE.get_or_init(|| {
+        let (sender, receiver) = unbounded();
+        let wake_ctx = Arc::new(RwLock::new(ctx.clone()));
+        let wake_context = wake_ctx.clone();
+        let bridge = EventBridge {
+            sender,
+            wake: Arc::new(move || {
+                let ctx = wake_context
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                ctx.request_repaint();
+            }),
+        };
+
+        let menu_bridge = bridge.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some(command) = command_from_menu_id(event.id().as_ref()) {
+                menu_bridge.send(command);
+            }
+        }));
+
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if tray_event_should_show(&event) {
+                bridge.send(TrayCommand::Show);
+            }
+        }));
+
+        EventHandlerState { receiver, wake_ctx }
+    });
+
+    // tray-icon handlers are process-wide and cannot be replaced. Refresh the
+    // egui context so a reconstructed app still receives their wake requests.
+    *state
+        .wake_ctx
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ctx.clone();
+    state.receiver.clone()
+}
+
+fn drain_commands(receiver: &Receiver<TrayCommand>) -> Vec<TrayCommand> {
+    receiver.try_iter().collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -281,6 +343,28 @@ mod tests {
             MouseButton::Right,
             MouseButtonState::Up
         )));
+    }
+
+    #[test]
+    fn event_bridge_delivers_commands_and_requests_a_wake() {
+        let (sender, receiver) = unbounded();
+        let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_counter = wake_count.clone();
+        let bridge = EventBridge {
+            sender,
+            wake: Arc::new(move || {
+                wake_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        };
+
+        bridge.send(TrayCommand::Show);
+        bridge.send(TrayCommand::ToggleRecording);
+
+        assert_eq!(
+            drain_commands(&receiver),
+            vec![TrayCommand::Show, TrayCommand::ToggleRecording]
+        );
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
