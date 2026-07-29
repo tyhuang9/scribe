@@ -1846,19 +1846,10 @@ impl LocalTranscriberApp {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
-        for command in window_restore_commands() {
-            match command {
-                WindowRestoreCommand::Unminimize => {
-                    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                }
-                WindowRestoreCommand::Show => {
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                }
-                WindowRestoreCommand::Focus => {
-                    ctx.send_viewport_cmd(ViewportCommand::Focus);
-                }
-            }
-        }
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.request_repaint();
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.status_message = "Scribe window restored".to_owned();
     }
 
@@ -5942,21 +5933,6 @@ fn tray_state_needs_sync(previous: Option<TrayUiState>, current: TrayUiState) ->
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowRestoreCommand {
-    Unminimize,
-    Show,
-    Focus,
-}
-
-fn window_restore_commands() -> [WindowRestoreCommand; 3] {
-    [
-        WindowRestoreCommand::Unminimize,
-        WindowRestoreCommand::Show,
-        WindowRestoreCommand::Focus,
-    ]
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HotkeyRecordingAction {
     StartTranscribe,
     Stop,
@@ -8265,14 +8241,24 @@ mod layout_tests {
 
     #[test]
     fn restoring_a_window_unminimizes_shows_and_focuses_in_order() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.show_window(ctx));
+        let root = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output");
+
         assert_eq!(
-            window_restore_commands(),
-            [
-                WindowRestoreCommand::Unminimize,
-                WindowRestoreCommand::Show,
-                WindowRestoreCommand::Focus,
+            root.commands,
+            vec![
+                ViewportCommand::Minimized(false),
+                ViewportCommand::Visible(true),
+                ViewportCommand::Focus,
             ]
         );
+        assert_eq!(root.repaint_delay, Duration::ZERO);
+        assert_eq!(app.status_message, "Scribe window restored");
     }
 
     #[test]
