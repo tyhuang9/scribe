@@ -156,6 +156,7 @@ pub struct LivePreviewState {
     latest_sequence: Option<u64>,
     applied_sequence: Option<u64>,
     timed_words: Vec<TimedWord>,
+    untimed_mode: bool,
     provisional_text: String,
 }
 
@@ -168,6 +169,7 @@ impl LivePreviewState {
         self.latest_sequence = None;
         self.applied_sequence = None;
         self.timed_words.clear();
+        self.untimed_mode = false;
         self.provisional_text.clear();
         session_id
     }
@@ -277,7 +279,7 @@ impl LivePreviewState {
             .iter()
             .flat_map(|segment| timed_segment_words(key.chunk_offset_ms(), segment))
             .collect::<Vec<_>>();
-        if !timed_words.is_empty() {
+        if !self.untimed_mode && !timed_words.is_empty() {
             self.timed_words
                 .retain(|existing| !timed_words.iter().any(|new| words_overlap(existing, new)));
             self.timed_words.extend(timed_words);
@@ -293,6 +295,7 @@ impl LivePreviewState {
         }
 
         self.timed_words.clear();
+        self.untimed_mode = true;
         merge_untimed_text(&mut self.provisional_text, &transcript.text);
     }
 }
@@ -600,6 +603,67 @@ mod tests {
             state.provisional_text(),
             "old beginning old new boundary continues onward"
         );
+    }
+
+    #[test]
+    fn mixed_timing_permanently_downgrades_without_erasing_cumulative_text() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(
+            first.key(),
+            Ok(PreviewTranscript {
+                text: "alpha boundary".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(5_000),
+                    text: "alpha boundary".to_owned(),
+                }],
+            }),
+        );
+        state.offer(artifact(session, 1));
+        let second = state.take_next_job().unwrap();
+        state.complete(second.key(), Ok(untimed("boundary middle")));
+        state.offer(artifact(session, 2));
+        let third = state.take_next_job().unwrap();
+        state.complete(
+            third.key(),
+            Ok(PreviewTranscript {
+                text: "middle final".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(5_000),
+                    text: "middle final".to_owned(),
+                }],
+            }),
+        );
+
+        assert_eq!(state.provisional_text(), "alpha boundary middle final");
+    }
+
+    #[test]
+    fn untimed_then_timed_uses_cumulative_word_overlap() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(first.key(), Ok(untimed("alpha boundary")));
+        state.offer(artifact(session, 1));
+        let second = state.take_next_job().unwrap();
+        state.complete(
+            second.key(),
+            Ok(PreviewTranscript {
+                text: "boundary final".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(5_000),
+                    text: "boundary final".to_owned(),
+                }],
+            }),
+        );
+
+        assert_eq!(state.provisional_text(), "alpha boundary final");
     }
 
     #[test]
