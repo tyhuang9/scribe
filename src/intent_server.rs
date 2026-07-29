@@ -60,7 +60,7 @@ pub struct IntentTransactionRequest {
     pub model_path: PathBuf,
     pub tier: IntentTier,
     pub generation_id: u64,
-    pub candidate_id: u64,
+    pub candidate_id: u32,
     pub target_text: String,
     pub instruction: String,
 }
@@ -84,16 +84,16 @@ impl fmt::Debug for IntentTransactionRequest {
 pub enum IntentOutcome {
     ReplaceCurrentDraft {
         generation_id: u64,
-        candidate_id: u64,
+        candidate_id: u32,
         edited_text: String,
     },
     NoChange {
         generation_id: u64,
-        candidate_id: u64,
+        candidate_id: u32,
     },
     NeedsReview {
         generation_id: u64,
-        candidate_id: u64,
+        candidate_id: u32,
     },
 }
 
@@ -144,7 +144,7 @@ pub enum IntentFailureKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntentFailure {
     pub generation_id: u64,
-    pub candidate_id: u64,
+    pub candidate_id: u32,
     pub kind: IntentFailureKind,
     pub message: String,
     pub child_output: Option<ChildOutputMetadata>,
@@ -452,7 +452,7 @@ fn wait_until_ready(
     port: u16,
     timeout: Duration,
     cancellation: &IntentCancellation,
-    ids: (u64, u64),
+    ids: (u64, u32),
 ) -> Result<(), IntentFailure> {
     let deadline = Instant::now() + timeout;
     let mut consecutive_ready = 0_u8;
@@ -648,7 +648,7 @@ enum ModelOperation {
 
 fn parse_model_response(
     response: &[u8],
-    (generation_id, candidate_id): (u64, u64),
+    (generation_id, candidate_id): (u64, u32),
 ) -> Result<IntentOutcome, String> {
     let envelope: CompletionEnvelope = serde_json::from_slice(response)
         .map_err(|_| "private edit response envelope was invalid JSON".to_owned())?;
@@ -702,7 +702,7 @@ fn contains_disallowed_control(value: &str, allow_newline_and_tab: bool) -> bool
 }
 
 fn failure(
-    (generation_id, candidate_id): (u64, u64),
+    (generation_id, candidate_id): (u64, u32),
     kind: IntentFailureKind,
     message: impl Into<String>,
 ) -> IntentFailure {
