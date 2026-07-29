@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,10 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
     format_bytes,
 };
-use crate::runtime_artifacts::{self, RuntimeArtifact, RuntimeDevicePack};
+use crate::runtime_artifacts::{
+    self, DownloadControl, DownloadProgress, IntentModelArtifact, IntentModelTier, RuntimeArtifact,
+    RuntimeDevicePack,
+};
 use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
@@ -221,6 +226,43 @@ struct VoiceEditDisplayState {
     showing_original: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceEditorInstallPhase {
+    Runtime,
+    Model,
+}
+
+impl VoiceEditorInstallPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Runtime => "Runtime",
+            Self::Model => "Model",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VoiceEditorInstallProgress {
+    phase: VoiceEditorInstallPhase,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+}
+
+#[derive(Clone, Default)]
+struct VoiceEditorInstallCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl VoiceEditorInstallCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 impl VoiceEditDisplayState {
     fn current_text(&self) -> &str {
         if self.showing_original {
@@ -355,6 +397,17 @@ enum AppEvent {
     VoiceEditFinished {
         session_id: RecordingSessionId,
         outcome: VoiceEditOutcome,
+    },
+    VoiceEditorInstallProgress(VoiceEditorInstallProgress),
+    VoiceEditorInstallDone {
+        replacement: Option<Box<RuntimeReplacement>>,
+        runtime_install: Option<config::ManagedRuntimeInstall>,
+        model: IntentModelArtifact,
+        model_path: PathBuf,
+        model_was_new: bool,
+    },
+    VoiceEditorInstallFailed {
+        message: String,
     },
     ModelDownloadProgress {
         model_id: String,
@@ -1359,6 +1412,28 @@ fn resolve_voice_editing_artifacts(
     Ok((runtime, model, intent_tier))
 }
 
+fn voice_editor_platform_supported() -> bool {
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
+}
+
+fn intent_model_tier(tier: VoiceEditingModelTier) -> IntentModelTier {
+    match tier {
+        VoiceEditingModelTier::Compact => IntentModelTier::Compact,
+        VoiceEditingModelTier::Balanced => IntentModelTier::Balanced,
+    }
+}
+
+fn voice_editor_release_artifacts_available(tier: VoiceEditingModelTier) -> bool {
+    voice_editor_platform_supported()
+        && runtime_artifacts::embedded_artifact(
+            runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+            RuntimeDevicePack::Cpu,
+        )
+        .is_ok_and(|artifact| artifact.is_some())
+        && runtime_artifacts::embedded_intent_model(intent_model_tier(tier))
+            .is_ok_and(|model| model.is_some_and(|model| model.url.is_some()))
+}
+
 fn managed_voice_artifact_is_safe(path: &Path, root: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
@@ -1402,6 +1477,10 @@ pub struct LocalTranscriberApp {
     pending_voice_edit: Option<PendingVoiceEdit>,
     voice_edit_review: Option<VoiceEditReviewState>,
     voice_edit_display: Option<VoiceEditDisplayState>,
+    voice_editor_install_worker: Option<thread::JoinHandle<()>>,
+    voice_editor_install_cancellation: Option<VoiceEditorInstallCancellation>,
+    voice_editor_install_progress: Option<VoiceEditorInstallProgress>,
+    voice_editor_install_error: Option<String>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
@@ -1491,6 +1570,10 @@ impl LocalTranscriberApp {
             pending_voice_edit: None,
             voice_edit_review: None,
             voice_edit_display: None,
+            voice_editor_install_worker: None,
+            voice_editor_install_cancellation: None,
+            voice_editor_install_progress: None,
+            voice_editor_install_error: None,
             tx,
             rx,
             playground_pending: 0,
@@ -1700,6 +1783,11 @@ impl LocalTranscriberApp {
 
     fn start_recording(&mut self, source: RecordingSource) {
         if self.active_recording.is_some() {
+            return;
+        }
+        if self.voice_editor_install_worker.is_some() {
+            self.status_message =
+                "Wait for the local voice editor installation to finish.".to_owned();
             return;
         }
         if matches!(
@@ -1985,6 +2073,17 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn join_finished_voice_editor_install_worker(&mut self) {
+        if self
+            .voice_editor_install_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.voice_editor_install_worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+
     fn shutdown_background_work(&mut self) {
         if let Some(active) = self.active_recording.as_mut() {
             active.session.stop();
@@ -1994,6 +2093,9 @@ impl LocalTranscriberApp {
             cancellation.cancel();
         }
         if let Some(cancellation) = self.voice_edit_cancellation.take() {
+            cancellation.cancel();
+        }
+        if let Some(cancellation) = self.voice_editor_install_cancellation.take() {
             cancellation.cancel();
         }
         let started = Instant::now();
@@ -2027,6 +2129,17 @@ impl LocalTranscriberApp {
                 let _ = worker.join();
             } else {
                 eprintln!("voice edit worker did not retire before shutdown timeout");
+            }
+        }
+        let started = Instant::now();
+        if let Some(worker) = self.voice_editor_install_worker.take() {
+            while !worker.is_finished() && started.elapsed() < BACKGROUND_SHUTDOWN_TIMEOUT {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!("voice editor install worker did not retire before shutdown timeout");
             }
         }
 
@@ -2414,10 +2527,405 @@ impl LocalTranscriberApp {
                 .to_owned();
     }
 
+    fn voice_editor_busy(&self) -> bool {
+        self.active_recording.is_some()
+            || self.pending_final_transcription.is_some()
+            || self.final_worker.is_some()
+            || self.voice_edit_worker.is_some()
+            || self.pending_voice_edit.is_some()
+            || self.voice_editor_install_worker.is_some()
+            || matches!(
+                self.status,
+                TranscriptionStatus::Finalizing
+                    | TranscriptionStatus::Transcribing
+                    | TranscriptionStatus::Editing
+            )
+    }
+
+    fn start_voice_editor_install(&mut self) {
+        if !voice_editor_platform_supported() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                "Local voice editing installation is supported only on Windows x64.".to_owned();
+            return;
+        }
+        if self.voice_editor_busy() {
+            self.status_message =
+                "Wait for recording, transcription, editing, or installation to finish.".to_owned();
+            return;
+        }
+
+        let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
+        let runtime_artifact =
+            match runtime_artifacts::embedded_artifact(runtime_id, RuntimeDevicePack::Cpu) {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "This build does not publish a verified Windows x64 voice editor runtime."
+                            .to_owned();
+                    return;
+                }
+                Err(message) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Voice editor catalog is invalid: {message}");
+                    return;
+                }
+            };
+        let model_tier = intent_model_tier(self.config.voice_editing_model_tier);
+        let model_artifact = match runtime_artifacts::embedded_intent_model(model_tier) {
+            Ok(Some(model)) if model.url.is_some() => model,
+            Ok(Some(_)) | Ok(None) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "This build records the {} model provenance but does not publish an immutable Scribe download URL.",
+                    self.config.voice_editing_model_tier.label()
+                );
+                return;
+            }
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Voice editor model catalog is invalid: {message}");
+                return;
+            }
+        };
+
+        let runtime_root = config::runtime_storage_dir().join(runtime_id);
+        let runtime_ready = self
+            .config
+            .managed_runtimes
+            .get(runtime_id)
+            .is_some_and(|install| {
+                install.version.as_deref() == Some(runtime_artifact.version.as_str())
+                    && install.sha256.as_deref() == Some(runtime_artifact.sha256.as_str())
+                    && managed_voice_artifact_is_safe(&install.path, &runtime_root)
+            });
+        let model_root = config::model_storage_dir(&self.config);
+        let installed_model_path = self
+            .config
+            .managed_models
+            .get(&model_artifact.model_id)
+            .filter(|install| {
+                install.sha256.as_deref() == Some(model_artifact.sha256.as_str())
+                    && managed_voice_artifact_is_safe(&install.path, &model_root)
+            })
+            .map(|install| install.path.clone());
+        let model_ready = installed_model_path.is_some();
+        if runtime_ready && model_ready {
+            self.status = TranscriptionStatus::Idle;
+            self.status_message = format!(
+                "The {} local voice editor is already installed.",
+                self.config.voice_editing_model_tier.label()
+            );
+            return;
+        }
+
+        let cancellation = VoiceEditorInstallCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let tx = self.tx.clone();
+        self.voice_editor_install_cancellation = Some(cancellation);
+        self.voice_editor_install_error = None;
+        self.voice_editor_install_progress = Some(VoiceEditorInstallProgress {
+            phase: if runtime_ready {
+                VoiceEditorInstallPhase::Model
+            } else {
+                VoiceEditorInstallPhase::Runtime
+            },
+            downloaded_bytes: 0,
+            total_bytes: if runtime_ready {
+                model_artifact.size_bytes
+            } else {
+                runtime_artifact.size_bytes
+            },
+        });
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = "Downloading verified local voice editor files...".to_owned();
+
+        let worker = thread::Builder::new()
+            .name("voice-editor-install".to_owned())
+            .spawn(move || {
+                let replacement = if runtime_ready {
+                    None
+                } else {
+                    let mut last_report = Instant::now() - Duration::from_secs(1);
+                    match install_remote_runtime_artifact_with_progress(
+                        runtime_id,
+                        &runtime_artifact,
+                        |progress| {
+                            if worker_cancellation.is_cancelled() {
+                                return DownloadControl::Cancel;
+                            }
+                            let now = Instant::now();
+                            if progress.downloaded_bytes == progress.total_bytes
+                                || now.duration_since(last_report) >= Duration::from_millis(100)
+                            {
+                                last_report = now;
+                                let _ = tx.send(AppEvent::VoiceEditorInstallProgress(
+                                    VoiceEditorInstallProgress {
+                                        phase: VoiceEditorInstallPhase::Runtime,
+                                        downloaded_bytes: progress.downloaded_bytes,
+                                        total_bytes: progress.total_bytes,
+                                    },
+                                ));
+                            }
+                            DownloadControl::Continue
+                        },
+                    ) {
+                        Ok(replacement) => Some(replacement),
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::VoiceEditorInstallFailed { message });
+                            return;
+                        }
+                    }
+                };
+
+                let runtime_install = replacement.as_ref().map(|replacement| {
+                    managed_runtime_install_record(
+                        replacement.installed_path.clone(),
+                        "trusted-release-artifact",
+                        Some(&runtime_artifact),
+                    )
+                });
+                let model_path = if model_ready {
+                    installed_model_path.expect("verified installed voice model path")
+                } else {
+                    let mut last_report = Instant::now() - Duration::from_secs(1);
+                    match runtime_artifacts::download_and_stage_intent_model_with_progress(
+                        &model_artifact,
+                        &model_root,
+                        |progress| {
+                            if worker_cancellation.is_cancelled() {
+                                return DownloadControl::Cancel;
+                            }
+                            let now = Instant::now();
+                            if progress.downloaded_bytes == progress.total_bytes
+                                || now.duration_since(last_report) >= Duration::from_millis(100)
+                            {
+                                last_report = now;
+                                let _ = tx.send(AppEvent::VoiceEditorInstallProgress(
+                                    VoiceEditorInstallProgress {
+                                        phase: VoiceEditorInstallPhase::Model,
+                                        downloaded_bytes: progress.downloaded_bytes,
+                                        total_bytes: progress.total_bytes,
+                                    },
+                                ));
+                            }
+                            DownloadControl::Continue
+                        },
+                    ) {
+                        Ok(path) => path,
+                        Err(message) => {
+                            let rollback = replacement
+                                .and_then(|replacement| replacement.rollback().err())
+                                .map(|rollback| format!(" Rollback warning: {rollback}"))
+                                .unwrap_or_default();
+                            let _ = tx.send(AppEvent::VoiceEditorInstallFailed {
+                                message: format!("{message}.{rollback}"),
+                            });
+                            return;
+                        }
+                    }
+                };
+                let _ = tx.send(AppEvent::VoiceEditorInstallDone {
+                    replacement: replacement.map(Box::new),
+                    runtime_install,
+                    model: model_artifact,
+                    model_path,
+                    model_was_new: !model_ready,
+                });
+            });
+        match worker {
+            Ok(worker) => self.voice_editor_install_worker = Some(worker),
+            Err(error) => {
+                self.voice_editor_install_cancellation = None;
+                self.voice_editor_install_progress = None;
+                self.voice_editor_install_error = Some(error.to_string());
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not start voice editor installation: {error}");
+            }
+        }
+    }
+
+    fn remove_voice_editor(&mut self) {
+        if self.voice_editor_busy() {
+            self.status_message =
+                "Wait for recording, transcription, editing, or installation to finish before removing the voice editor."
+                    .to_owned();
+            return;
+        }
+        let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
+        let model_ids = VoiceEditingModelTier::ALL.map(VoiceEditingModelTier::model_id);
+        let model_paths = model_ids
+            .iter()
+            .filter_map(|model_id| {
+                self.config
+                    .managed_models
+                    .get(*model_id)
+                    .map(|install| install.path.clone())
+            })
+            .collect::<Vec<_>>();
+        let target_root = config::runtime_storage_dir().join(runtime_id);
+        let result = uninstall_runtime_transaction_at(
+            &mut self.config,
+            runtime_id,
+            &target_root,
+            |candidate| {
+                let mut candidate = candidate.clone();
+                for model_id in model_ids {
+                    candidate.managed_models.remove(model_id);
+                }
+                config::save_config_with_runtime_update(&candidate, Some((runtime_id, None)))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        match result {
+            Ok(outcome) => {
+                let mut warnings = Vec::new();
+                if let Some(warning) = outcome.durability_warning {
+                    warnings.push(warning);
+                }
+                for path in model_paths {
+                    let model_root = config::model_storage_dir(&self.config);
+                    if managed_voice_artifact_is_safe(&path, &model_root)
+                        && let Err(error) = durable_fs::remove(&path)
+                    {
+                        warnings.push(format!("Could not remove {}: {error}", path.display()));
+                    }
+                }
+                self.voice_editor_install_error = None;
+                self.status = if warnings.is_empty() {
+                    TranscriptionStatus::Idle
+                } else {
+                    TranscriptionStatus::Error
+                };
+                self.status_message = if warnings.is_empty() {
+                    "Removed the local voice editor runtime and models.".to_owned()
+                } else {
+                    format!("Voice editor removal warning: {}", warnings.join("; "))
+                };
+            }
+            Err(message) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not remove the local voice editor: {message}");
+            }
+        }
+    }
+
+    fn finish_voice_editor_install(
+        &mut self,
+        mut replacement: Option<Box<RuntimeReplacement>>,
+        runtime_install: Option<config::ManagedRuntimeInstall>,
+        model: IntentModelArtifact,
+        model_path: PathBuf,
+        model_was_new: bool,
+    ) {
+        self.voice_editor_install_cancellation = None;
+        self.voice_editor_install_progress = None;
+        let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
+        let mut model_install = config::ManagedModelInstall::app_managed(
+            model_path.clone(),
+            "trusted-release-artifact",
+        );
+        model_install.source = model.url.clone();
+        model_install.version = Some(model.version.clone());
+        model_install.sha256 = Some(model.sha256.clone());
+        model_install.platform = Some(config::current_platform_key());
+
+        let mut candidate = self.config.clone();
+        candidate
+            .managed_models
+            .insert(model.model_id.clone(), model_install);
+        if let Some(runtime_install) = runtime_install.as_ref() {
+            candidate
+                .managed_runtimes
+                .insert(runtime_id.to_owned(), runtime_install.clone());
+        }
+        let prepare_error = replacement.as_mut().and_then(|replacement| {
+            replacement
+                .prepare_persistence(runtime_install.as_ref())
+                .err()
+        });
+        if let Some(message) = prepare_error {
+            let rollback = replacement
+                .take()
+                .and_then(|replacement| replacement.rollback().err())
+                .map(|warning| format!(" Rollback warning: {warning}"))
+                .unwrap_or_default();
+            if model_was_new {
+                let _ = durable_fs::remove(&model_path);
+            }
+            self.fail_voice_editor_install(format!("{message}.{rollback}"));
+            return;
+        }
+
+        let persisted = if let Some(runtime_install) = runtime_install.clone() {
+            config::save_config_with_runtime_update(
+                &candidate,
+                Some((runtime_id, Some(runtime_install))),
+            )
+        } else {
+            config::save_config_merging_managed_runtimes(&candidate)
+        };
+        let committed = match persisted {
+            Ok(committed) => committed,
+            Err(error) => {
+                let rollback = replacement
+                    .take()
+                    .and_then(|replacement| replacement.rollback().err())
+                    .map(|warning| format!(" Rollback warning: {warning}"))
+                    .unwrap_or_default();
+                if model_was_new {
+                    let _ = durable_fs::remove(&model_path);
+                }
+                self.fail_voice_editor_install(format!(
+                    "Could not save the verified voice editor installation: {error}.{rollback}"
+                ));
+                return;
+            }
+        };
+        self.config = committed.config;
+        let durability_warning = if let Some(replacement) = replacement {
+            finalize_runtime_transaction(*replacement, committed.durability_warning)
+        } else {
+            committed.durability_warning
+        };
+        if self.config_path.is_none() {
+            self.config_path = config::config_file_path().ok();
+        }
+        self.voice_editor_install_error = None;
+        self.status = if durability_warning.is_some() {
+            TranscriptionStatus::Error
+        } else {
+            TranscriptionStatus::Idle
+        };
+        self.status_message = durability_warning.map_or_else(
+            || {
+                format!(
+                    "The {} local voice editor is installed and ready.",
+                    self.config.voice_editing_model_tier.label()
+                )
+            },
+            |warning| {
+                format!(
+                    "Voice editor installed, but durability is unconfirmed; startup recovery will verify it: {warning}"
+                )
+            },
+        );
+    }
+
+    fn fail_voice_editor_install(&mut self, message: String) {
+        self.voice_editor_install_cancellation = None;
+        self.voice_editor_install_progress = None;
+        self.voice_editor_install_error = Some(message.clone());
+        self.status = TranscriptionStatus::Error;
+        self.status_message = format!("Voice editor installation failed: {message}");
+    }
+
     fn poll_events(&mut self) {
         self.join_finished_preview_worker();
         self.join_finished_final_worker();
         self.join_finished_voice_edit_worker();
+        self.join_finished_voice_editor_install_worker();
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::LivePreviewFinished { key, result } => {
@@ -2506,6 +3014,31 @@ impl LocalTranscriberApp {
                     session_id,
                     outcome,
                 } => self.finish_voice_edit(session_id, outcome),
+                AppEvent::VoiceEditorInstallProgress(progress) => {
+                    self.voice_editor_install_progress = Some(progress);
+                    self.status_message = format!(
+                        "Downloading voice editor {}: {} of {}",
+                        progress.phase.label().to_ascii_lowercase(),
+                        format_bytes(progress.downloaded_bytes),
+                        format_bytes(progress.total_bytes)
+                    );
+                }
+                AppEvent::VoiceEditorInstallDone {
+                    replacement,
+                    runtime_install,
+                    model,
+                    model_path,
+                    model_was_new,
+                } => self.finish_voice_editor_install(
+                    replacement,
+                    runtime_install,
+                    model,
+                    model_path,
+                    model_was_new,
+                ),
+                AppEvent::VoiceEditorInstallFailed { message } => {
+                    self.fail_voice_editor_install(message)
+                }
                 AppEvent::ModelDownloadProgress {
                     model_id,
                     downloaded_bytes,
@@ -3746,18 +4279,20 @@ impl LocalTranscriberApp {
                 );
                 set_control_accessibility(ui, &response, label_id, "Transcript");
                 if response.changed()
-                    && self
-                        .voice_edit_display
-                        .as_ref()
-                        .is_some_and(|display| display.current_text() != self.transcript)
+                    && let Some(display) = self.voice_edit_display.as_mut()
+                    && display.current_text() != self.transcript
                 {
-                    self.voice_edit_display = None;
+                    display.edited_text = self.transcript.clone();
+                    display.showing_original = false;
                 }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(small_button(ui, "Clear")).clicked() {
                         self.transcript.clear();
-                        self.voice_edit_display = None;
+                        if let Some(display) = self.voice_edit_display.as_mut() {
+                            display.edited_text.clear();
+                            display.showing_original = false;
+                        }
                     }
                     if ui.add(small_button(ui, "Copy")).clicked() {
                         self.copy_transcript_to_clipboard();
@@ -4510,6 +5045,7 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
+            let mut voice_editor_action = None;
             card(ui, |ui| {
                 let heading = ui.label(section_heading("Recording"));
                 ui.ctx().accesskit_node_builder(heading.id, |builder| {
@@ -4628,7 +5164,159 @@ impl LocalTranscriberApp {
                         "Off by default. Transcribe runs a local 5-second whisper.cpp job at a time, which may repeatedly load the model and use extra CPU or GPU. Other backends and Model Playground remain batch-only.",
                     ),
                 );
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
+                let voice_heading = ui.label(body_strong("Voice editing"));
+                ui.ctx()
+                    .accesskit_node_builder(voice_heading.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Heading);
+                        builder.set_hierarchical_level(3);
+                    });
+                ui.add_space(6.0);
+                let mut voice_editing_enabled = self.config.voice_editing_enabled;
+                if ui
+                    .checkbox(
+                        &mut voice_editing_enabled,
+                        "Enable commands for the current recording",
+                    )
+                    .changed()
+                {
+                    self.config.voice_editing_enabled = voice_editing_enabled;
+                    self.save_config();
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Local model");
+                    let before = self.config.voice_editing_model_tier;
+                    let compact = ui.radio_value(
+                        &mut self.config.voice_editing_model_tier,
+                        VoiceEditingModelTier::Compact,
+                        "Compact",
+                    );
+                    let balanced = ui.radio_value(
+                        &mut self.config.voice_editing_model_tier,
+                        VoiceEditingModelTier::Balanced,
+                        "Balanced",
+                    );
+                    let group = [compact.id, balanced.id];
+                    set_radio_accessibility(
+                        ui,
+                        &compact,
+                        label.id,
+                        "Local voice editing model: Compact",
+                        &group,
+                    );
+                    set_radio_accessibility(
+                        ui,
+                        &balanced,
+                        label.id,
+                        "Local voice editing model: Balanced",
+                        &group,
+                    );
+                    if before != self.config.voice_editing_model_tier {
+                        self.save_config();
+                    }
+                });
+
+                let ready = resolve_voice_editing_artifacts(&self.config).is_ok();
+                let has_install = self
+                    .config
+                    .managed_runtimes
+                    .contains_key(runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID)
+                    || VoiceEditingModelTier::ALL
+                        .iter()
+                        .any(|tier| self.config.managed_models.contains_key(tier.model_id()));
+                let published =
+                    voice_editor_release_artifacts_available(self.config.voice_editing_model_tier);
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    badge(
+                        ui,
+                        if self.voice_editor_install_worker.is_some() {
+                            "Installing"
+                        } else if ready {
+                            "Ready"
+                        } else if has_install {
+                            "Incomplete"
+                        } else {
+                            "Not installed"
+                        },
+                        if ready {
+                            ChipTone::Success
+                        } else if self.voice_editor_install_error.is_some() {
+                            ChipTone::Error
+                        } else {
+                            ChipTone::Warning
+                        },
+                    );
+                    ui.label(mut_text(match self.config.voice_editing_model_tier {
+                        VoiceEditingModelTier::Compact => "Qwen3 0.6B Q8 - 768 MB",
+                        VoiceEditingModelTier::Balanced => "Qwen3 1.7B Q8 - 1.71 GB",
+                    }));
+                });
+                if let Some(progress) = self.voice_editor_install_progress {
+                    let fraction = if progress.total_bytes == 0 {
+                        0.0
+                    } else {
+                        progress.downloaded_bytes as f32 / progress.total_bytes as f32
+                    };
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                            .desired_width(usable_width(ui))
+                            .text(format!(
+                                "{}: {} / {}",
+                                progress.phase.label(),
+                                format_bytes(progress.downloaded_bytes),
+                                format_bytes(progress.total_bytes)
+                            )),
+                    );
+                }
+                if let Some(error) = self.voice_editor_install_error.as_deref() {
+                    ui.add_space(6.0);
+                    wrapped_label(ui, mut_text(error));
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let install_enabled = !ready
+                        && published
+                        && !self.voice_editor_busy()
+                        && self.voice_editor_install_worker.is_none();
+                    let install = add_enabled_button(
+                        ui,
+                        install_enabled,
+                        small_button(ui, "Install"),
+                        Some(if !voice_editor_platform_supported() {
+                            "Available only on Windows x64"
+                        } else if !published {
+                            "This build has no immutable voice editor release artifacts"
+                        } else if ready {
+                            "The selected model and runtime are already installed"
+                        } else {
+                            "Wait for the current operation to finish"
+                        }),
+                    );
+                    if install.clicked() {
+                        voice_editor_action = Some("install");
+                    }
+                    let remove = add_enabled_button(
+                        ui,
+                        has_install && !self.voice_editor_busy(),
+                        small_button(ui, "Remove"),
+                        Some("Wait for the current operation to finish"),
+                    );
+                    if remove.clicked() {
+                        voice_editor_action = Some("remove");
+                    }
+                });
             });
+            match voice_editor_action {
+                Some("install") => self.start_voice_editor_install(),
+                Some("remove") => self.remove_voice_editor(),
+                _ => {}
+            }
 
             ui.add_space(12.0);
             card(ui, |ui| {
@@ -6999,9 +7687,20 @@ fn install_remote_runtime_artifact(
     runtime_id: &str,
     artifact: &RuntimeArtifact,
 ) -> Result<RuntimeReplacement, String> {
+    install_remote_runtime_artifact_with_progress(runtime_id, artifact, |_| {
+        DownloadControl::Continue
+    })
+}
+
+fn install_remote_runtime_artifact_with_progress(
+    runtime_id: &str,
+    artifact: &RuntimeArtifact,
+    on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
+) -> Result<RuntimeReplacement, String> {
     let target_root = config::runtime_storage_dir().join(runtime_id);
     let install_lock = acquire_runtime_install_lock(runtime_id, &target_root)?;
-    let staged = runtime_artifacts::download_and_stage(artifact, &target_root)?;
+    let staged =
+        runtime_artifacts::download_and_stage_with_progress(artifact, &target_root, on_progress)?;
     if !installed_runtime_executable_usable(runtime_id, &staged.entrypoint) {
         let _ = remove_path_if_exists(&staged.root);
         return Err(format!(
@@ -7356,13 +8055,19 @@ fn lock_runtime_install(
 fn recover_managed_runtime_transactions(config: &mut AppConfig) -> Result<(), String> {
     let storage = config::runtime_storage_dir();
     let mut errors = Vec::new();
-    for spec in runtime_catalog::backend_specs() {
-        let target = storage.join(spec.runtime_id);
+    let runtime_ids = runtime_catalog::backend_specs()
+        .iter()
+        .map(|spec| spec.runtime_id)
+        .chain(std::iter::once(
+            runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+        ));
+    for runtime_id in runtime_ids {
+        let target = storage.join(runtime_id);
         if !runtime_recovery_needed(&target) {
             continue;
         }
-        if let Err(message) = acquire_runtime_install_lock(spec.runtime_id, &target) {
-            errors.push(format!("{}: {message}", spec.runtime_id));
+        if let Err(message) = acquire_runtime_install_lock(runtime_id, &target) {
+            errors.push(format!("{runtime_id}: {message}"));
         }
     }
     if errors.is_empty() {
@@ -9380,6 +10085,66 @@ mod layout_tests {
     }
 
     #[test]
+    fn shutdown_cancels_and_joins_voice_editor_install_worker() {
+        let mut app = test_app();
+        let cancellation = VoiceEditorInstallCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let retired = Arc::new(AtomicBool::new(false));
+        let retired_signal = retired.clone();
+        app.voice_editor_install_cancellation = Some(cancellation);
+        app.voice_editor_install_worker = Some(thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            retired_signal.store(true, Ordering::Release);
+        }));
+
+        app.shutdown_background_work();
+
+        assert!(retired.load(Ordering::Acquire));
+        assert!(app.voice_editor_install_worker.is_none());
+        assert!(app.voice_editor_install_cancellation.is_none());
+    }
+
+    #[test]
+    fn voice_editor_removal_is_blocked_while_an_edit_is_active() {
+        let mut app = test_app();
+        let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
+        app.config.managed_runtimes.insert(
+            runtime_id.to_owned(),
+            config::ManagedRuntimeInstall::new(PathBuf::from("voice-editor-runtime")),
+        );
+        app.status = TranscriptionStatus::Editing;
+
+        app.remove_voice_editor();
+
+        assert!(app.config.managed_runtimes.contains_key(runtime_id));
+        assert!(app.status_message.contains("finish before removing"));
+    }
+
+    #[test]
+    fn checked_in_catalog_keeps_voice_editor_downloads_unpublished() {
+        let catalog = runtime_artifacts::RuntimeArtifactCatalog::parse(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/runtime-artifacts.default.json"
+        )))
+        .unwrap();
+        for tier in [IntentModelTier::Compact, IntentModelTier::Balanced] {
+            assert!(catalog.intent_model(tier).unwrap().url.is_none());
+        }
+        assert!(
+            catalog
+                .select(
+                    runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    RuntimeDevicePack::Cpu,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn provisional_preview_is_exposed_as_read_only_static_text() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -9651,6 +10416,42 @@ mod layout_tests {
     }
 
     #[test]
+    fn voice_edit_actions_remain_accessible_at_minimum_viewport() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Transcribe;
+        app.transcript = "Edited transcript".to_owned();
+        app.voice_edit_display = Some(VoiceEditDisplayState {
+            original_text: "Original transcript".to_owned(),
+            edited_text: "Edited transcript".to_owned(),
+            applied_edit_count: 2,
+            showing_original: false,
+        });
+
+        let output = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 600.0, Vec::new());
+        for name in ["Undo", "Redo", "View original", "Copy"] {
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
+                    }),
+                "missing voice edit action {name}"
+            );
+        }
+        assert_no_visible_horizontal_overflow(&output, 840.0, Tab::Transcribe);
+        assert_focusable_bounds_within_viewport(&output, 840.0, Tab::Transcribe);
+    }
+
+    #[test]
     fn custom_control_targets_use_stable_heights() {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
@@ -9820,6 +10621,47 @@ mod layout_tests {
         assert_eq!(hold.checked(), Some(egui::accesskit::Checked::False));
         assert_eq!(press_once.radio_group(), &[*press_once_id, *hold_id]);
         assert_eq!(hold.radio_group(), &[*press_once_id, *hold_id]);
+    }
+
+    #[test]
+    fn voice_editor_settings_are_accessible_and_model_tiers_are_exclusive() {
+        let output = render_accessible_app_tab(Tab::Settings, 840.0);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+
+        let (_, heading) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading
+                    && node.name() == Some("Voice editing")
+            })
+            .expect("voice editing heading should be exposed");
+        assert_eq!(heading.hierarchical_level(), Some(3));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node.name() == Some("Enable commands for the current recording")
+        }));
+
+        let (compact_id, compact) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::RadioButton
+                    && node.name() == Some("Local voice editing model: Compact")
+            })
+            .expect("Compact should be an accessible radio button");
+        let (balanced_id, balanced) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::RadioButton
+                    && node.name() == Some("Local voice editing model: Balanced")
+            })
+            .expect("Balanced should be an accessible radio button");
+        assert_eq!(compact.checked(), Some(egui::accesskit::Checked::False));
+        assert_eq!(balanced.checked(), Some(egui::accesskit::Checked::True));
+        assert_eq!(compact.radio_group(), &[*compact_id, *balanced_id]);
+        assert_eq!(balanced.radio_group(), &[*compact_id, *balanced_id]);
     }
 
     #[test]
@@ -10745,6 +11587,10 @@ mod layout_tests {
             pending_voice_edit: None,
             voice_edit_review: None,
             voice_edit_display: None,
+            voice_editor_install_worker: None,
+            voice_editor_install_cancellation: None,
+            voice_editor_install_progress: None,
+            voice_editor_install_error: None,
             tx,
             rx,
             playground_pending: 0,
