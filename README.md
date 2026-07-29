@@ -234,7 +234,7 @@ Scribe disables environment proxy discovery and automatic redirects for these do
 
 `-VoiceAi` and `SCRIBE_BUILD_VOICE_AI=1` validate that the embedded catalog contains the exact pinned runtime and both exact model sources. They do not copy voice-AI artifacts into the product. The standard release bundle physically contains only `runtimes/whisper_cpp`; the llama.cpp runtime and selected Qwen model remain explicit, post-install downloads.
 
-The fixed real-model corpus is an ignored, manual benchmark. It verifies the exact source archive, installed runtime manifest, license, `llama-server.exe`, model bytes, per-case three-minute limit, prompt-leak protection, and review handling for unsafe instructions. The previously observed useful semantic rewrite rates (Compact 55%, Balanced 60%) are informational; deterministic command recognition is tested separately.
+The fixed real-model corpus is an ignored, manual benchmark. It verifies the exact source archive, installed runtime manifest, license, `llama-server.exe`, model bytes, per-case three-minute limit, prompt-leak protection, and review handling for unsafe instructions. Exact post-parser runs produced 7/20 useful rewrites for Compact (35%, 2,362 ms p95) and 10/20 for Balanced (50%, 4,119 ms p95); both passed 2/2 unsafe cases with zero destructive false positives. These rewrite rates and latencies are informational quality limitations, not command-recognition scores. Safety and response validity, plus separately tested deterministic command recognition, remain release gates.
 
 ```powershell
 $env:SCRIBE_INTENT_LLAMA_SERVER = 'C:\verified\voice-intent-llama\bin\llama-server.exe'

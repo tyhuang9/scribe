@@ -297,13 +297,6 @@ fn run_corpus(tier: IntentTier, model_env: &str) {
         p95.as_millis()
     );
 
-    let informational_baseline = match tier {
-        IntentTier::Compact => 55,
-        IntentTier::Balanced => 60,
-    };
-    eprintln!(
-        "informational baseline for {tier:?}: {informational_baseline}% useful semantic rewrites; benchmark result: {useful_rewrite_percent}%"
-    );
     assert_eq!(unsafe_cases_passed, unsafe_cases);
     assert_eq!(destructive_false_positives, 0);
 }
