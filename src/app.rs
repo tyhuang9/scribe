@@ -25,7 +25,8 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::durable_fs;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::live_preview::{
-    self, LivePreviewState, PreviewCompletion, PreviewJobKey, PreviewSessionId,
+    self, LivePreviewState, PreviewCompletion, PreviewJobKey, PreviewSegment, PreviewSessionId,
+    PreviewTranscript,
 };
 use crate::managed_downloads;
 use crate::models::{
@@ -244,7 +245,7 @@ enum PlaygroundAction {
 enum AppEvent {
     LivePreviewFinished {
         key: PreviewJobKey,
-        result: Result<String, String>,
+        result: Result<PreviewTranscript, String>,
     },
     TranscriptionDone {
         source: RecordingSource,
@@ -1588,9 +1589,25 @@ impl LocalTranscriberApp {
                 if cancellation.is_cancelled() {
                     return Err("live preview was cancelled".to_owned());
                 }
-                stt::transcribe_with_config(&config, job.path().to_path_buf(), model)
-                    .map(|result| result.text)
-                    .map_err(|error| error.to_string())
+                stt::transcribe_preview_with_config(
+                    &config,
+                    job.path().to_path_buf(),
+                    model,
+                    &cancellation,
+                )
+                .map(|result| PreviewTranscript {
+                    text: result.text,
+                    segments: result
+                        .segments
+                        .into_iter()
+                        .map(|segment| PreviewSegment {
+                            start_ms: segment.start_ms,
+                            end_ms: segment.end_ms,
+                            text: segment.text,
+                        })
+                        .collect(),
+                })
+                .map_err(|error| error.to_string())
             }))
             .unwrap_or_else(|_| Err("live preview worker stopped unexpectedly".to_owned()));
             drop(job);
@@ -8189,7 +8206,7 @@ mod layout_tests {
         app.tx
             .send(AppEvent::LivePreviewFinished {
                 key,
-                result: Ok("provisional words".to_owned()),
+                result: Ok(PreviewTranscript::untimed("provisional words")),
             })
             .unwrap();
 
@@ -8209,7 +8226,8 @@ mod layout_tests {
         let key = job.key();
         drop(job);
         assert_eq!(
-            app.live_preview.complete(key, Ok("provisional".to_owned())),
+            app.live_preview
+                .complete(key, Ok(PreviewTranscript::untimed("provisional"))),
             PreviewCompletion::Applied
         );
         app.tx
@@ -8253,6 +8271,34 @@ mod layout_tests {
     }
 
     #[test]
+    fn preview_failure_retires_the_job_and_allows_final_transcription_to_continue() {
+        let mut app = test_app();
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "failed-before-final"));
+        let job = app.live_preview.take_next_job().unwrap();
+        let key = job.key();
+        drop(job);
+        assert_eq!(
+            app.live_preview
+                .complete(key, Err("live preview exceeded its timeout".to_owned())),
+            PreviewCompletion::Failed("live preview exceeded its timeout".to_owned())
+        );
+
+        let final_path = test_preview_path("continues-after-preview");
+        fs::write(&final_path, b"full wav").unwrap();
+        app.pending_final_transcription = Some(PendingFinalTranscription::new(
+            final_path,
+            test_model(),
+            LatencyTrace::started_now(),
+        ));
+        app.maybe_dispatch_pending_final();
+
+        assert!(app.pending_final_transcription.is_none());
+        assert!(!app.live_preview.has_in_flight_job());
+    }
+
+    #[test]
     fn provisional_preview_is_exposed_as_read_only_static_text() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -8268,7 +8314,7 @@ mod layout_tests {
         drop(job);
         assert_eq!(
             app.live_preview
-                .complete(key, Ok("read only draft".to_owned())),
+                .complete(key, Ok(PreviewTranscript::untimed("read only draft"))),
             PreviewCompletion::Applied
         );
 

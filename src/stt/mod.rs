@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use anyhow::{Result, anyhow};
 
 use crate::config::AppConfig;
+use crate::live_preview::PreviewCancellation;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, backend_capabilities,
 };
@@ -233,6 +234,42 @@ pub fn transcribe_with_config(
         }
         backend => Err(anyhow!("unsupported STT backend: {backend}")),
     }
+}
+
+pub fn transcribe_preview_with_config(
+    config: &AppConfig,
+    audio_path: PathBuf,
+    model: SttModelInfo,
+    cancellation: &PreviewCancellation,
+) -> Result<TranscriptResult> {
+    if model.backend != "whisper.cpp" {
+        return Err(anyhow!("live preview supports only whisper.cpp"));
+    }
+    let provider = provider_for_backend("whisper.cpp")
+        .ok_or_else(|| anyhow!("missing whisper.cpp provider adapter"))?;
+    if !backend_capabilities(provider.backend).runnable {
+        return Err(anyhow!("whisper.cpp managed runtime is not bundled yet"));
+    }
+    let backend = whisper_cpp::WhisperCppBackend::new(
+        whisper_cpp::resolve_whisper_cpp_executable(config),
+        whisper_cpp::WhisperCppOptions {
+            compute_mode: config.whisper_compute_mode,
+            gpu_device: config.whisper_gpu_device,
+            cuda_backend_path: config.whisper_cuda_backend_path.clone(),
+            cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+        },
+    );
+    if !backend
+        .list_models()
+        .iter()
+        .any(|available_model| available_model.id == model.id)
+    {
+        return Err(anyhow!(
+            "whisper.cpp does not advertise support for {}",
+            model.name
+        ));
+    }
+    backend.transcribe_preview(audio_path, model, cancellation)
 }
 
 #[cfg(test)]

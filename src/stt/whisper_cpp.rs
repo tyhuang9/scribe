@@ -1,18 +1,24 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::config::{self, AppConfig, WhisperComputeMode};
+use crate::live_preview::PreviewCancellation;
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
 use crate::runtime_artifacts::{self, RuntimeDevicePack};
 
 use super::SttBackend;
+
+pub const PREVIEW_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
+const PREVIEW_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct WhisperCppBackend {
     executable_path: Option<PathBuf>,
@@ -45,29 +51,31 @@ impl WhisperCppBackend {
             options,
         }
     }
-}
 
-impl SttBackend for WhisperCppBackend {
-    fn id(&self) -> &str {
-        "whisper.cpp"
+    pub fn transcribe_preview(
+        &self,
+        audio_path: PathBuf,
+        model: SttModelInfo,
+        cancellation: &PreviewCancellation,
+    ) -> Result<TranscriptResult> {
+        let (executable, model_path) = self.validate_inputs(&audio_path, &model)?;
+        let started = Instant::now();
+        let mut command = self.command(&executable, &model_path, &audio_path)?;
+        let output =
+            run_preview_command(&mut command, cancellation, PREVIEW_TRANSCRIPTION_TIMEOUT)?;
+        self.result_from_output(model, output, started)
     }
 
-    fn list_models(&self) -> Vec<SttModelInfo> {
-        default_model_catalog()
-            .into_iter()
-            .filter(|model| model.backend == "whisper.cpp")
-            .collect()
-    }
-
-    fn transcribe(&self, audio_path: PathBuf, model: SttModelInfo) -> Result<TranscriptResult> {
-        let executable = self
-            .executable_path
-            .clone()
-            .ok_or_else(|| {
-                anyhow!(
-                    "whisper.cpp runtime is not installed. Install a whisper.cpp model/runtime from Models, or set SCRIBE_WHISPER_CPP_CLI for development."
-                )
-            })?;
+    fn validate_inputs(
+        &self,
+        audio_path: &Path,
+        model: &SttModelInfo,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let executable = self.executable_path.clone().ok_or_else(|| {
+            anyhow!(
+                "whisper.cpp runtime is not installed. Install a whisper.cpp model/runtime from Models, or set SCRIBE_WHISPER_CPP_CLI for development."
+            )
+        })?;
         let model_path = model
             .local_path
             .clone()
@@ -92,15 +100,22 @@ impl SttBackend for WhisperCppBackend {
                 audio_path.display()
             ));
         }
+        Ok((executable, model_path))
+    }
 
-        let started = Instant::now();
-        let mut command = Command::new(&executable);
-        command.args(whisper_cli_args(&model_path, &audio_path, &self.options));
-        apply_whisper_environment(&mut command, &executable, &self.options)?;
-        let output = command
-            .output()
-            .with_context(|| format!("failed to run {}", executable.display()))?;
+    fn command(&self, executable: &Path, model_path: &Path, audio_path: &Path) -> Result<Command> {
+        let mut command = Command::new(executable);
+        command.args(whisper_cli_args(model_path, audio_path, &self.options));
+        apply_whisper_environment(&mut command, executable, &self.options)?;
+        Ok(command)
+    }
 
+    fn result_from_output(
+        &self,
+        model: SttModelInfo,
+        output: Output,
+        started: Instant,
+    ) -> Result<TranscriptResult> {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -141,6 +156,116 @@ impl SttBackend for WhisperCppBackend {
             stderr,
         })
     }
+}
+
+impl SttBackend for WhisperCppBackend {
+    fn id(&self) -> &str {
+        "whisper.cpp"
+    }
+
+    fn list_models(&self) -> Vec<SttModelInfo> {
+        default_model_catalog()
+            .into_iter()
+            .filter(|model| model.backend == "whisper.cpp")
+            .collect()
+    }
+
+    fn transcribe(&self, audio_path: PathBuf, model: SttModelInfo) -> Result<TranscriptResult> {
+        let (executable, model_path) = self.validate_inputs(&audio_path, &model)?;
+        let started = Instant::now();
+        let mut command = self.command(&executable, &model_path, &audio_path)?;
+        let output = command
+            .output()
+            .with_context(|| format!("failed to run {}", executable.display()))?;
+        self.result_from_output(model, output, started)
+    }
+}
+
+fn run_preview_command(
+    command: &mut Command,
+    cancellation: &PreviewCancellation,
+    timeout: Duration,
+) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("failed to start whisper.cpp preview")?;
+    let stdout = child.stdout.take().expect("preview stdout should be piped");
+    let stderr = child.stderr.take().expect("preview stderr should be piped");
+    let stdout_reader = match thread::Builder::new()
+        .name("whisper-preview-stdout".to_owned())
+        .spawn(move || read_pipe(stdout))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_and_reap(&mut child);
+            return Err(error).context("failed to start whisper.cpp preview stdout reader");
+        }
+    };
+    let stderr_reader = match thread::Builder::new()
+        .name("whisper-preview-stderr".to_owned())
+        .spawn(move || read_pipe(stderr))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_and_reap(&mut child);
+            let _ = stdout_reader.join();
+            return Err(error).context("failed to start whisper.cpp preview stderr reader");
+        }
+    };
+    let started = Instant::now();
+
+    let status = loop {
+        if cancellation.is_cancelled() {
+            terminate_and_reap(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!("live preview was cancelled"));
+        }
+        if started.elapsed() >= timeout {
+            terminate_and_reap(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!(
+                "live preview exceeded its {} second timeout",
+                timeout.as_secs_f32()
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_and_reap(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error).context("failed to poll whisper.cpp preview");
+            }
+        }
+        thread::sleep(PREVIEW_PROCESS_POLL_INTERVAL.min(timeout));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("whisper.cpp preview stdout reader stopped unexpectedly"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("whisper.cpp preview stderr reader stopped unexpectedly"))?;
+    Ok(Output {
+        status,
+        stdout: stdout.context("failed to read whisper.cpp preview stdout")?,
+        stderr: stderr.context("failed to read whisper.cpp preview stderr")?,
+    })
+}
+
+fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn terminate_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
@@ -461,11 +586,88 @@ fn strip_timestamp_prefix(line: &str) -> String {
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
+    use std::time::Duration;
 
     use crate::models::default_model_catalog;
     use crate::stt::SttBackend;
 
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn preview_process_helper() {
+        match env::var("SCRIBE_PREVIEW_TEST_CHILD").as_deref() {
+            Ok("success") => {
+                println!("preview-success");
+                eprintln!("preview-stderr");
+            }
+            Ok("sleep") => thread::sleep(Duration::from_secs(5)),
+            _ => {}
+        }
+    }
+
+    fn preview_test_command(mode: &str) -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "stt::whisper_cpp::tests::preview_process_helper",
+                "--nocapture",
+            ])
+            .env("SCRIBE_PREVIEW_TEST_CHILD", mode);
+        command
+    }
+
+    #[test]
+    fn preview_process_completes_and_captures_both_pipes() {
+        let cancellation = PreviewCancellation::new();
+        let output = run_preview_command(
+            &mut preview_test_command("success"),
+            &cancellation,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("preview-success"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("preview-stderr"));
+    }
+
+    #[test]
+    fn preview_process_cancellation_kills_and_reaps_the_child() {
+        let cancellation = PreviewCancellation::new();
+        let cancellation_signal = cancellation.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            cancellation_signal.cancel();
+        });
+        let started = Instant::now();
+        let error = run_preview_command(
+            &mut preview_test_command("sleep"),
+            &cancellation,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn preview_process_timeout_kills_and_reaps_the_child() {
+        let cancellation = PreviewCancellation::new();
+        let started = Instant::now();
+        let error = run_preview_command(
+            &mut preview_test_command("sleep"),
+            &cancellation,
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn parse_final_text_removes_timestamps_and_diagnostics() {

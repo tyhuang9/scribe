@@ -24,6 +24,36 @@ pub struct PreviewJobKey {
     pub sequence: u64,
 }
 
+impl PreviewJobKey {
+    pub fn chunk_offset_ms(self) -> u64 {
+        self.sequence
+            .saturating_mul(PREVIEW_CHUNK_DURATION_MS - PREVIEW_CHUNK_OVERLAP_MS)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewSegment {
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewTranscript {
+    pub text: String,
+    pub segments: Vec<PreviewSegment>,
+}
+
+impl PreviewTranscript {
+    #[cfg(test)]
+    pub fn untimed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            segments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreviewArtifact {
     key: PreviewJobKey,
@@ -67,7 +97,7 @@ impl Drop for PreviewArtifact {
 pub struct PreviewCancellation(Arc<AtomicBool>);
 
 impl PreviewCancellation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
@@ -111,12 +141,21 @@ struct InFlightPreview {
     cancellation: PreviewCancellation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TimedWord {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
 #[derive(Default)]
 pub struct LivePreviewState {
     active_session: Option<PreviewSessionId>,
     in_flight: Option<InFlightPreview>,
     pending: Option<PreviewArtifact>,
     latest_sequence: Option<u64>,
+    applied_sequence: Option<u64>,
+    timed_words: Vec<TimedWord>,
     provisional_text: String,
 }
 
@@ -127,6 +166,8 @@ impl LivePreviewState {
         self.pending = None;
         self.active_session = Some(session_id);
         self.latest_sequence = None;
+        self.applied_sequence = None;
+        self.timed_words.clear();
         self.provisional_text.clear();
         session_id
     }
@@ -170,7 +211,7 @@ impl LivePreviewState {
     pub fn complete(
         &mut self,
         key: PreviewJobKey,
-        result: Result<String, String>,
+        result: Result<PreviewTranscript, String>,
     ) -> PreviewCompletion {
         let Some(in_flight) = self.in_flight.take() else {
             return PreviewCompletion::Stale;
@@ -182,10 +223,17 @@ impl LivePreviewState {
         if self.active_session != Some(key.session_id) {
             return PreviewCompletion::Stale;
         }
+        if self
+            .applied_sequence
+            .is_some_and(|sequence| key.sequence <= sequence)
+        {
+            return PreviewCompletion::Stale;
+        }
 
         match result {
-            Ok(text) => {
-                self.provisional_text = text.trim().to_owned();
+            Ok(transcript) => {
+                self.merge_transcript(key, transcript);
+                self.applied_sequence = Some(key.sequence);
                 PreviewCompletion::Applied
             }
             Err(message) => PreviewCompletion::Failed(message),
@@ -205,6 +253,7 @@ impl LivePreviewState {
         self.active_session = None;
         self.pending = None;
         self.cancel_in_flight();
+        self.timed_words.clear();
         self.provisional_text.clear();
     }
 
@@ -221,6 +270,31 @@ impl LivePreviewState {
             in_flight.cancellation.cancel();
         }
     }
+
+    fn merge_transcript(&mut self, key: PreviewJobKey, transcript: PreviewTranscript) {
+        let timed_words = transcript
+            .segments
+            .iter()
+            .flat_map(|segment| timed_segment_words(key.chunk_offset_ms(), segment))
+            .collect::<Vec<_>>();
+        if !timed_words.is_empty() {
+            self.timed_words
+                .retain(|existing| !timed_words.iter().any(|new| words_overlap(existing, new)));
+            self.timed_words.extend(timed_words);
+            self.timed_words
+                .sort_by_key(|word| (word.start_ms, word.end_ms));
+            self.provisional_text = self
+                .timed_words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return;
+        }
+
+        self.timed_words.clear();
+        merge_untimed_text(&mut self.provisional_text, &transcript.text);
+    }
 }
 
 impl Drop for LivePreviewState {
@@ -236,6 +310,84 @@ pub fn is_live_preview_eligible(
     model_ready: bool,
 ) -> bool {
     enabled && is_transcribe_recording && backend == "whisper.cpp" && model_ready
+}
+
+fn timed_segment_words(chunk_offset_ms: u64, segment: &PreviewSegment) -> Vec<TimedWord> {
+    let (Some(start_ms), Some(end_ms)) = (segment.start_ms, segment.end_ms) else {
+        return Vec::new();
+    };
+    if end_ms <= start_ms {
+        return Vec::new();
+    }
+    let words = segment.text.split_whitespace().collect::<Vec<_>>();
+    let Ok(word_count) = u64::try_from(words.len()) else {
+        return Vec::new();
+    };
+    if word_count == 0 {
+        return Vec::new();
+    }
+    let duration = end_ms - start_ms;
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let index = index as u64;
+            let word_start = duration.saturating_mul(index) / word_count;
+            let word_end = duration.saturating_mul(index + 1) / word_count;
+            TimedWord {
+                start_ms: chunk_offset_ms
+                    .saturating_add(start_ms)
+                    .saturating_add(word_start),
+                end_ms: chunk_offset_ms
+                    .saturating_add(start_ms)
+                    .saturating_add(word_end),
+                text: text.to_owned(),
+            }
+        })
+        .collect()
+}
+
+fn words_overlap(left: &TimedWord, right: &TimedWord) -> bool {
+    left.start_ms < right.end_ms && right.start_ms < left.end_ms
+}
+
+fn merge_untimed_text(cumulative: &mut String, chunk: &str) {
+    let chunk_words = chunk.split_whitespace().collect::<Vec<_>>();
+    if chunk_words.is_empty() {
+        return;
+    }
+    let cumulative_words = cumulative.split_whitespace().collect::<Vec<_>>();
+    let max_overlap = cumulative_words.len().min(chunk_words.len());
+    let overlap = (1..=max_overlap)
+        .rev()
+        .find(|&count| {
+            cumulative_words[cumulative_words.len() - count..]
+                .iter()
+                .zip(&chunk_words[..count])
+                .all(|(left, right)| normalize_word(left) == normalize_word(right))
+        })
+        .unwrap_or(0);
+    let addition = chunk_words[overlap..].join(" ");
+    if addition.is_empty() {
+        return;
+    }
+    if !cumulative.is_empty() {
+        cumulative.push(' ');
+    }
+    cumulative.push_str(&addition);
+}
+
+fn normalize_word(word: &str) -> String {
+    let normalized = word
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized.is_empty() {
+        word.to_lowercase()
+    } else {
+        normalized
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +423,10 @@ mod tests {
         PreviewArtifact::new(session_id, sequence, path)
     }
 
+    fn untimed(text: &str) -> PreviewTranscript {
+        PreviewTranscript::untimed(text)
+    }
+
     #[test]
     fn fake_runner_enforces_one_job_and_coalesces_to_latest_chunk() {
         let mut state = LivePreviewState::default();
@@ -290,7 +446,7 @@ mod tests {
         assert!(!superseded_path.exists());
         let first_key = runner.jobs.remove(0).key();
         assert_eq!(
-            state.complete(first_key, Ok("first".to_owned())),
+            state.complete(first_key, Ok(untimed("first"))),
             PreviewCompletion::Applied
         );
         runner.dispatch(&mut state);
@@ -309,7 +465,7 @@ mod tests {
         assert!(old_job.cancellation().is_cancelled());
         state.offer(artifact(second, 1));
         assert_eq!(
-            state.complete(old_key, Ok("obsolete".to_owned())),
+            state.complete(old_key, Ok(untimed("obsolete"))),
             PreviewCompletion::Stale
         );
         assert!(state.provisional_text().is_empty());
@@ -317,7 +473,7 @@ mod tests {
         let job = state.take_next_job().unwrap();
         let key = job.key();
         assert_eq!(
-            state.complete(key, Ok("current".to_owned())),
+            state.complete(key, Ok(untimed("current"))),
             PreviewCompletion::Applied
         );
         assert_eq!(state.provisional_text(), "current");
@@ -335,7 +491,7 @@ mod tests {
 
         assert!(job.cancellation().is_cancelled());
         assert_eq!(
-            state.complete(key, Ok("too late".to_owned())),
+            state.complete(key, Ok(untimed("too late"))),
             PreviewCompletion::Stale
         );
         state.final_wins();
@@ -359,23 +515,114 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_partial_results_replace_instead_of_repeating_words() {
+    fn repeated_boundary_uses_the_longest_overlap_deterministically() {
         let mut state = LivePreviewState::default();
         let session = state.begin_session();
         state.offer(artifact(session, 1));
         let first = state.take_next_job().unwrap();
         assert_eq!(
-            state.complete(first.key(), Ok("hello from the overlap".to_owned())),
+            state.complete(first.key(), Ok(untimed("go now go now"))),
             PreviewCompletion::Applied
         );
         state.offer(artifact(session, 2));
         let second = state.take_next_job().unwrap();
         assert_eq!(
-            state.complete(second.key(), Ok("from the overlap onward".to_owned())),
+            state.complete(second.key(), Ok(untimed("go now again"))),
             PreviewCompletion::Applied
         );
 
-        assert_eq!(state.provisional_text(), "from the overlap onward");
+        assert_eq!(state.provisional_text(), "go now go now again");
+    }
+
+    #[test]
+    fn untimed_chunks_append_when_there_is_no_overlap() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(first.key(), Ok(untimed("first thought")));
+        state.offer(artifact(session, 1));
+        let second = state.take_next_job().unwrap();
+        state.complete(second.key(), Ok(untimed("new words")));
+
+        assert_eq!(state.provisional_text(), "first thought new words");
+    }
+
+    #[test]
+    fn untimed_overlap_normalizes_case_and_punctuation_but_preserves_original_words() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(first.key(), Ok(untimed("Keep This, Boundary!")));
+        state.offer(artifact(session, 1));
+        let second = state.take_next_job().unwrap();
+        state.complete(second.key(), Ok(untimed("this boundary continues Here.")));
+
+        assert_eq!(
+            state.provisional_text(),
+            "Keep This, Boundary! continues Here."
+        );
+    }
+
+    #[test]
+    fn timed_segments_replace_only_the_overlapping_absolute_timeline() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 0));
+        let first = state.take_next_job().unwrap();
+        state.complete(
+            first.key(),
+            Ok(PreviewTranscript {
+                text: "old beginning old boundary".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(5_000),
+                    text: "old beginning old boundary".to_owned(),
+                }],
+            }),
+        );
+        state.offer(artifact(session, 1));
+        let second = state.take_next_job().unwrap();
+        state.complete(
+            second.key(),
+            Ok(PreviewTranscript {
+                text: "new boundary continues onward".to_owned(),
+                segments: vec![PreviewSegment {
+                    start_ms: Some(0),
+                    end_ms: Some(4_000),
+                    text: "new boundary continues onward".to_owned(),
+                }],
+            }),
+        );
+
+        assert_eq!(
+            state.provisional_text(),
+            "old beginning old new boundary continues onward"
+        );
+    }
+
+    #[test]
+    fn out_of_order_sequence_cannot_mutate_cumulative_text() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 2));
+        let current = state.take_next_job().unwrap();
+        let stale_key = PreviewJobKey {
+            session_id: session,
+            sequence: 1,
+        };
+
+        assert_eq!(
+            state.complete(stale_key, Ok(untimed("stale"))),
+            PreviewCompletion::Stale
+        );
+        assert!(state.provisional_text().is_empty());
+        assert_eq!(
+            state.complete(current.key(), Ok(untimed("current"))),
+            PreviewCompletion::Applied
+        );
+        assert_eq!(state.provisional_text(), "current");
     }
 
     #[test]
