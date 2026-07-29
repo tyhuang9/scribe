@@ -112,22 +112,30 @@ struct PendingFinalTranscription {
     audio_path: Option<PathBuf>,
     model: Option<SttModelInfo>,
     latency: Option<LatencyTrace>,
+    controlled_whisper: bool,
 }
 
 impl PendingFinalTranscription {
-    fn new(audio_path: PathBuf, model: SttModelInfo, latency: LatencyTrace) -> Self {
+    fn new(
+        audio_path: PathBuf,
+        model: SttModelInfo,
+        latency: LatencyTrace,
+        controlled_whisper: bool,
+    ) -> Self {
         Self {
             audio_path: Some(audio_path),
             model: Some(model),
             latency: Some(latency),
+            controlled_whisper,
         }
     }
 
-    fn into_parts(mut self) -> (PathBuf, SttModelInfo, LatencyTrace) {
+    fn into_parts(mut self) -> (OwnedAudioArtifact, SttModelInfo, LatencyTrace, bool) {
         (
-            self.audio_path.take().expect("pending final audio path"),
+            OwnedAudioArtifact::new(self.audio_path.take().expect("pending final audio path")),
             self.model.take().expect("pending final model"),
             self.latency.take().expect("pending final latency"),
+            self.controlled_whisper,
         )
     }
 }
@@ -135,6 +143,28 @@ impl PendingFinalTranscription {
 impl Drop for PendingFinalTranscription {
     fn drop(&mut self) {
         if let Some(path) = self.audio_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct OwnedAudioArtifact {
+    path: Option<PathBuf>,
+}
+
+impl OwnedAudioArtifact {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("owned audio path")
+    }
+}
+
+impl Drop for OwnedAudioArtifact {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
         }
     }
@@ -1141,6 +1171,8 @@ pub struct LocalTranscriberApp {
     active_recording: Option<ActiveRecording>,
     live_preview: LivePreviewState,
     preview_worker: Option<thread::JoinHandle<()>>,
+    final_worker: Option<thread::JoinHandle<()>>,
+    final_cancellation: Option<live_preview::PreviewCancellation>,
     pending_final_transcription: Option<PendingFinalTranscription>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1179,6 +1211,10 @@ impl LocalTranscriberApp {
             eprintln!("could not clean stale Scribe recording artifacts: {error}");
             status_message = format!("{status_message} Recording cleanup warning: {error}");
         }
+        if let Err(error) = stt::whisper_cpp::cleanup_stale_preview_outputs() {
+            eprintln!("could not clean stale whisper.cpp preview output: {error}");
+            status_message = format!("{status_message} Preview cleanup warning: {error}");
+        }
         if let Err(message) = recover_managed_runtime_transactions(&mut config) {
             status_message = format!("{status_message} Runtime recovery warning: {message}");
         }
@@ -1214,6 +1250,8 @@ impl LocalTranscriberApp {
             active_recording: None,
             live_preview: LivePreviewState::default(),
             preview_worker: None,
+            final_worker: None,
+            final_cancellation: None,
             pending_final_transcription: None,
             tx,
             rx,
@@ -1539,9 +1577,15 @@ impl LocalTranscriberApp {
                                 .model
                                 .take()
                                 .expect("Transcribe recording should retain its model");
-                            self.pending_final_transcription = Some(
-                                PendingFinalTranscription::new(audio_path, model, active.latency),
-                            );
+                            let controlled_whisper = active.preview_session_id.is_some()
+                                && model.backend == "whisper.cpp";
+                            self.pending_final_transcription =
+                                Some(PendingFinalTranscription::new(
+                                    audio_path,
+                                    model,
+                                    active.latency,
+                                    controlled_whisper,
+                                ));
                         }
                         RecordingSource::Playground => {
                             self.dispatch_playground_transcriptions(audio_path)
@@ -1644,11 +1688,26 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn join_finished_final_worker(&mut self) {
+        if self
+            .final_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.final_worker.take()
+        {
+            let _ = worker.join();
+            self.final_cancellation = None;
+        }
+    }
+
     fn shutdown_background_work(&mut self) {
         if let Some(active) = self.active_recording.as_mut() {
             active.session.stop();
         }
         self.live_preview.final_wins();
+        if let Some(cancellation) = self.final_cancellation.take() {
+            cancellation.cancel();
+        }
         let started = Instant::now();
         if let Some(worker) = self.preview_worker.take() {
             while !worker.is_finished() && started.elapsed() < BACKGROUND_SHUTDOWN_TIMEOUT {
@@ -1658,6 +1717,17 @@ impl LocalTranscriberApp {
                 let _ = worker.join();
             } else {
                 eprintln!("live preview worker did not retire before shutdown timeout");
+            }
+        }
+        let started = Instant::now();
+        if let Some(worker) = self.final_worker.take() {
+            while !worker.is_finished() && started.elapsed() < BACKGROUND_SHUTDOWN_TIMEOUT {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!("final transcription worker did not retire before shutdown timeout");
             }
         }
 
@@ -1678,8 +1748,12 @@ impl LocalTranscriberApp {
         let Some(pending) = self.pending_final_transcription.take() else {
             return;
         };
-        let (audio_path, model, latency) = pending.into_parts();
-        self.dispatch_default_transcription(audio_path, model, latency);
+        let (audio, model, latency, controlled_whisper) = pending.into_parts();
+        if controlled_whisper {
+            self.dispatch_controlled_final_transcription(audio, model, latency);
+        } else {
+            self.dispatch_default_transcription(audio, model, latency);
+        }
     }
 
     fn poll_hotkey(&mut self) {
@@ -1777,6 +1851,8 @@ impl LocalTranscriberApp {
     }
 
     fn poll_events(&mut self) {
+        self.join_finished_preview_worker();
+        self.join_finished_final_worker();
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::LivePreviewFinished { key, result } => {
@@ -2094,7 +2170,7 @@ impl LocalTranscriberApp {
 
     fn dispatch_default_transcription(
         &mut self,
-        audio_path: PathBuf,
+        audio: OwnedAudioArtifact,
         model: SttModelInfo,
         mut latency: LatencyTrace,
     ) {
@@ -2103,9 +2179,10 @@ impl LocalTranscriberApp {
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            let result = stt::transcribe_with_config(&config, audio_path.clone(), model.clone());
+            let result =
+                stt::transcribe_with_config(&config, audio.path().to_path_buf(), model.clone());
             latency.transcription_completed_at = Some(Instant::now());
-            let _ = fs::remove_file(&audio_path);
+            drop(audio);
 
             match result {
                 Ok(result) => {
@@ -2125,6 +2202,58 @@ impl LocalTranscriberApp {
                 }
             }
         });
+    }
+
+    fn dispatch_controlled_final_transcription(
+        &mut self,
+        audio: OwnedAudioArtifact,
+        model: SttModelInfo,
+        mut latency: LatencyTrace,
+    ) {
+        latency.transcription_dispatched_at = Some(Instant::now());
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        let cancellation = live_preview::PreviewCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::Builder::new()
+            .name("final-whisper-transcription".to_owned())
+            .spawn(move || {
+                let result = stt::transcribe_final_with_config_cancellable(
+                    &config,
+                    audio.path().to_path_buf(),
+                    model.clone(),
+                    &worker_cancellation,
+                );
+                latency.transcription_completed_at = Some(Instant::now());
+                drop(audio);
+                match result {
+                    Ok(result) => {
+                        let _ = tx.send(AppEvent::TranscriptionDone {
+                            source: RecordingSource::Transcribe,
+                            result,
+                            latency: Some(latency),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::TranscriptionFailed {
+                            source: RecordingSource::Transcribe,
+                            model_id: model.id,
+                            message: error.to_string(),
+                            latency: Some(latency),
+                        });
+                    }
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.final_worker = Some(worker);
+                self.final_cancellation = Some(cancellation);
+            }
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Failed to start final transcription: {error}");
+            }
+        }
     }
 
     fn dispatch_playground_transcriptions(&mut self, audio_path: PathBuf) {
@@ -8318,6 +8447,7 @@ mod layout_tests {
             final_path.clone(),
             test_model(),
             LatencyTrace::started_now(),
+            false,
         ));
 
         app.maybe_dispatch_pending_final();
@@ -8351,6 +8481,7 @@ mod layout_tests {
             final_path,
             test_model(),
             LatencyTrace::started_now(),
+            false,
         ));
         app.maybe_dispatch_pending_final();
 
@@ -8382,6 +8513,7 @@ mod layout_tests {
             final_path.clone(),
             test_model(),
             LatencyTrace::started_now(),
+            false,
         ));
 
         app.shutdown_background_work();
@@ -8391,6 +8523,33 @@ mod layout_tests {
         assert!(!preview_path.exists());
         assert!(!final_path.exists());
         assert!(app.pending_final_transcription.is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_and_joins_controlled_final_and_cleans_full_audio() {
+        let mut app = test_app();
+        let final_path = test_preview_path("dispatched-final-shutdown");
+        fs::write(&final_path, b"full wav").unwrap();
+        let audio = OwnedAudioArtifact::new(final_path.clone());
+        let cancellation = live_preview::PreviewCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retired_signal = retired.clone();
+        app.final_cancellation = Some(cancellation);
+        app.final_worker = Some(thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(audio);
+            retired_signal.store(true, std::sync::atomic::Ordering::Release);
+        }));
+
+        app.shutdown_background_work();
+
+        assert!(retired.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.final_worker.is_none());
+        assert!(app.final_cancellation.is_none());
+        assert!(!final_path.exists());
     }
 
     #[test]
@@ -9678,6 +9837,8 @@ mod layout_tests {
             active_recording: None,
             live_preview: LivePreviewState::default(),
             preview_worker: None,
+            final_worker: None,
+            final_cancellation: None,
             pending_final_transcription: None,
             tx,
             rx,
