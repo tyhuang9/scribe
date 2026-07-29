@@ -771,7 +771,10 @@ fn stage_intent_model_from_reader_until_with_progress(
             ));
         }
         drop(file);
-        crate::durable_fs::rename(&partial, &target, false).map_err(|err| {
+        // The final path may contain a verified model whose config publication
+        // was interrupted by process exit. Replacing only after the new bytes
+        // pass exact size and hash checks makes the next install self-healing.
+        crate::durable_fs::rename(&partial, &target, true).map_err(|err| {
             format!(
                 "could not atomically activate voice intent model {}: {err}",
                 target.display()
@@ -1669,6 +1672,27 @@ mod tests {
                 .exists()
         );
         fs::remove_dir_all(cancel_root).unwrap();
+    }
+
+    #[test]
+    fn raw_gguf_staging_replaces_an_unpublished_completed_model() {
+        let bytes = b"verified gguf bytes";
+        let model = test_intent_model(bytes, bytes.len() as u64);
+        let root = temp_target("model-interrupted-publication");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"orphaned prior bytes").unwrap();
+
+        let staged = stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).unwrap();
+
+        assert_eq!(staged, target);
+        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        assert!(
+            !target
+                .with_file_name(".Qwen3-1.7B-Q8_0.gguf.partial")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
