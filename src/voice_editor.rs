@@ -60,6 +60,9 @@ pub(crate) enum VoiceEditDecision {
         candidate_id: u32,
         replacement_text: String,
     },
+    NoChange {
+        candidate_id: u32,
+    },
     RequireReview {
         candidate_id: u32,
         reason: String,
@@ -119,6 +122,59 @@ impl VoiceEditPlan {
                 .iter()
                 .any(|step| matches!(step, ProgramStep::Review(_)))
     }
+
+    pub fn candidate_with_context(
+        &self,
+        candidate_id: u32,
+        decisions: &[VoiceEditDecision],
+    ) -> Result<VoiceEditCandidate, String> {
+        if self.requires_review() {
+            return Err("Voice edit plan already requires review".to_owned());
+        }
+        let decision_map = decision_map(decisions)?;
+        let mut evaluation = Evaluation::default();
+        for step in &self.steps {
+            if let ProgramStep::Rewrite(candidate) = step {
+                if candidate.id == candidate_id {
+                    let target = self
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.id == candidate_id)
+                        .ok_or_else(|| format!("Unknown voice edit candidate {candidate_id}"))?;
+                    let current_target = evaluation
+                        .atoms
+                        .iter()
+                        .find_map(|atom| match atom {
+                            BufferAtom::Text(unit) if unit.id == target.target_unit_id => {
+                                Some(unit.text.clone())
+                            }
+                            BufferAtom::Text(_) | BufferAtom::Break(_) => None,
+                        })
+                        .ok_or_else(|| {
+                            format!("Voice edit candidate {candidate_id} no longer has a target")
+                        })?;
+                    let mut contextual = target.clone();
+                    contextual.target_text = current_target;
+                    return Ok(contextual);
+                }
+                if !decision_map.contains_key(&candidate.id) {
+                    return Err(format!(
+                        "Voice edit candidate {} must be decided before candidate {candidate_id}",
+                        candidate.id
+                    ));
+                }
+            }
+            evaluation.apply_step(step, &decision_map);
+            if evaluation.requires_review {
+                return Err(evaluation
+                    .warnings
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "Earlier voice edit requires review".to_owned()));
+            }
+        }
+        Err(format!("Unknown voice edit candidate {candidate_id}"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,19 +222,14 @@ pub(crate) fn finalize_voice_edits(
         warnings: plan.parser_warnings.clone(),
         ..Evaluation::default()
     };
-    let mut decision_map = HashMap::new();
-    for decision in decisions {
-        let candidate_id = match decision {
-            VoiceEditDecision::ApplyRewrite { candidate_id, .. }
-            | VoiceEditDecision::RequireReview { candidate_id, .. } => *candidate_id,
-        };
-        if decision_map.insert(candidate_id, decision).is_some() {
+    let decision_map = match decision_map(decisions) {
+        Ok(decision_map) => decision_map,
+        Err(message) => {
             evaluation.requires_review = true;
-            evaluation.warnings.push(format!(
-                "Voice edit candidate {candidate_id} received more than one decision"
-            ));
+            evaluation.warnings.push(message);
+            HashMap::new()
         }
-    }
+    };
 
     let known_candidates = plan
         .candidates
@@ -225,6 +276,25 @@ pub(crate) fn finalize_voice_edits(
         warnings: evaluation.warnings,
         requires_review: evaluation.requires_review,
     }
+}
+
+fn decision_map(
+    decisions: &[VoiceEditDecision],
+) -> Result<HashMap<u32, &VoiceEditDecision>, String> {
+    let mut decision_map = HashMap::new();
+    for decision in decisions {
+        let candidate_id = match decision {
+            VoiceEditDecision::ApplyRewrite { candidate_id, .. }
+            | VoiceEditDecision::NoChange { candidate_id }
+            | VoiceEditDecision::RequireReview { candidate_id, .. } => *candidate_id,
+        };
+        if decision_map.insert(candidate_id, decision).is_some() {
+            return Err(format!(
+                "Voice edit candidate {candidate_id} received more than one decision"
+            ));
+        }
+    }
+    Ok(decision_map)
 }
 
 fn plan_voice_edits_from_parts(text: &str, segments: &[TranscriptSegment]) -> VoiceEditPlan {
@@ -504,6 +574,9 @@ impl Evaluation {
                         after: replacement_text.trim().to_owned(),
                         instruction: candidate.instruction.clone(),
                     });
+                }
+                Some(VoiceEditDecision::NoChange { .. }) => {
+                    self.used_ai = true;
                 }
                 Some(VoiceEditDecision::RequireReview { reason, .. }) => {
                     self.used_ai = true;
@@ -1100,6 +1173,68 @@ mod tests {
         assert_eq!(outcome.edited_text, "Ship soon. Keep this.");
         assert!(outcome.used_ai);
         assert!(!outcome.requires_review);
+    }
+
+    #[test]
+    fn no_change_decision_records_ai_use_without_an_applied_operation() {
+        let transcript = "Keep this. Rewrite that keep the wording if it is already clear.";
+        let plan = plan_voice_edits(&result(transcript));
+        let outcome =
+            finalize_voice_edits(&plan, &[VoiceEditDecision::NoChange { candidate_id: 1 }]);
+
+        assert_eq!(outcome.edited_text, "Keep this.");
+        assert!(outcome.used_ai);
+        assert!(outcome.operations.is_empty());
+        assert!(!outcome.requires_review);
+    }
+
+    #[test]
+    fn later_rewrite_candidate_uses_prior_validated_rewrite_text() {
+        let plan = plan_voice_edits(&result(
+            "This is wordy. Rewrite that make it concise. Rewrite that make it enthusiastic.",
+        ));
+        assert_eq!(plan.candidates().len(), 2);
+
+        let first = VoiceEditDecision::ApplyRewrite {
+            candidate_id: 1,
+            replacement_text: "Brief.".to_owned(),
+        };
+        let second = plan
+            .candidate_with_context(2, std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(second.target_text, "Brief.");
+
+        let outcome = finalize_voice_edits(
+            &plan,
+            &[
+                first,
+                VoiceEditDecision::ApplyRewrite {
+                    candidate_id: 2,
+                    replacement_text: "Brief and bold!".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(outcome.edited_text, "Brief and bold!");
+        assert_eq!(outcome.operations.len(), 2);
+        assert!(!outcome.requires_review);
+    }
+
+    #[test]
+    fn later_rewrite_candidate_rejects_missing_or_reviewed_prior_decision() {
+        let plan = plan_voice_edits(&result(
+            "This is wordy. Rewrite that make it concise. Rewrite that make it enthusiastic.",
+        ));
+        assert!(plan.candidate_with_context(2, &[]).is_err());
+        assert!(
+            plan.candidate_with_context(
+                2,
+                &[VoiceEditDecision::RequireReview {
+                    candidate_id: 1,
+                    reason: "ambiguous".to_owned(),
+                }]
+            )
+            .is_err()
+        );
     }
 
     #[test]
