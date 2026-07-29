@@ -1510,11 +1510,12 @@ impl LocalTranscriberApp {
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
-        if close_requested
-            && self.config.close_to_tray
-            && self.tray_service.is_some()
-            && !self.quit_requested
-        {
+        if should_hide_on_close(
+            close_requested,
+            self.config.close_to_tray,
+            self.tray_service.is_some(),
+            self.quit_requested,
+        ) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.hide_window(ctx);
         }
@@ -6796,6 +6797,15 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
     }
 }
 
+fn should_hide_on_close(
+    close_requested: bool,
+    close_to_tray: bool,
+    tray_available: bool,
+    quit_requested: bool,
+) -> bool {
+    close_requested && close_to_tray && tray_available && !quit_requested
+}
+
 fn captured_hotkey_spec(input: &egui::InputState) -> Option<String> {
     input.events.iter().find_map(|event| {
         if let egui::Event::Key {
@@ -6839,11 +6849,26 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
         egui::Key::Tab => "Tab",
         egui::Key::Escape => "Esc",
         egui::Key::Backspace => "Backspace",
+        egui::Key::Insert => "Insert",
         egui::Key::Delete => "Delete",
+        egui::Key::Home => "Home",
+        egui::Key::End => "End",
+        egui::Key::PageUp => "PageUp",
+        egui::Key::PageDown => "PageDown",
         egui::Key::ArrowUp => "Up",
         egui::Key::ArrowDown => "Down",
         egui::Key::ArrowLeft => "Left",
         egui::Key::ArrowRight => "Right",
+        egui::Key::Colon | egui::Key::Semicolon => "Semicolon",
+        egui::Key::Comma => "Comma",
+        egui::Key::Backslash | egui::Key::Pipe => "Backslash",
+        egui::Key::Slash | egui::Key::Questionmark => "Slash",
+        egui::Key::OpenBracket => "BracketLeft",
+        egui::Key::CloseBracket => "BracketRight",
+        egui::Key::Backtick => "Backquote",
+        egui::Key::Minus => "Minus",
+        egui::Key::Period => "Period",
+        egui::Key::Plus | egui::Key::Equals => "Equal",
         egui::Key::F1 => "F1",
         egui::Key::F2 => "F2",
         egui::Key::F3 => "F3",
@@ -6856,6 +6881,18 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
         egui::Key::F10 => "F10",
         egui::Key::F11 => "F11",
         egui::Key::F12 => "F12",
+        egui::Key::F13 => "F13",
+        egui::Key::F14 => "F14",
+        egui::Key::F15 => "F15",
+        egui::Key::F16 => "F16",
+        egui::Key::F17 => "F17",
+        egui::Key::F18 => "F18",
+        egui::Key::F19 => "F19",
+        egui::Key::F20 => "F20",
+        egui::Key::F21 => "F21",
+        egui::Key::F22 => "F22",
+        egui::Key::F23 => "F23",
+        egui::Key::F24 => "F24",
         egui::Key::A => "A",
         egui::Key::B => "B",
         egui::Key::C => "C",
@@ -7566,6 +7603,38 @@ mod layout_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn close_to_tray_intercepts_only_a_normal_window_close() {
+        assert!(should_hide_on_close(true, true, true, false));
+        assert!(!should_hide_on_close(false, true, true, false));
+        assert!(!should_hide_on_close(true, false, true, false));
+        assert!(!should_hide_on_close(true, true, false, false));
+        assert!(!should_hide_on_close(true, true, true, true));
+    }
+
+    #[test]
+    fn captured_hotkeys_cover_extended_standard_keys() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            hotkey_spec_from_key(egui::Key::F24, modifiers),
+            Some("Ctrl+Alt+F24".to_owned())
+        );
+        assert_eq!(
+            hotkey_spec_from_key(egui::Key::Home, modifiers),
+            Some("Ctrl+Alt+Home".to_owned())
+        );
+        assert_eq!(
+            hotkey_spec_from_key(egui::Key::Backtick, modifiers),
+            Some("Ctrl+Alt+Backquote".to_owned())
+        );
+        assert_eq!(hotkey_spec_from_key(egui::Key::Copy, modifiers), None);
     }
 
     #[test]

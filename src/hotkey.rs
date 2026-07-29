@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,18 +32,26 @@ impl HotkeyService {
     }
 
     pub fn register(&mut self, spec: &str) -> Result<()> {
-        self.hotkey = None;
-        self.manager = None;
-        global_hotkey_startup_allowed()?;
+        let result: Result<()> = (|| {
+            global_hotkey_startup_allowed()?;
+            let hotkey = parse_hotkey(spec)?;
 
-        let manager = GlobalHotKeyManager::new()?;
-        let hotkey = parse_hotkey(spec)?;
-        manager.register(hotkey)?;
+            // Keep the existing registration until the replacement is known to work.
+            // A rejected system shortcut must not leave the user without recording control.
+            if self.manager.is_some() && self.hotkey == Some(hotkey) {
+                return Ok(());
+            }
 
-        self.manager = Some(manager);
-        self.hotkey = Some(hotkey);
-        self.last_error = None;
-        Ok(())
+            let manager = GlobalHotKeyManager::new()?;
+            manager.register(hotkey)?;
+
+            self.manager = Some(manager);
+            self.hotkey = Some(hotkey);
+            Ok(())
+        })();
+
+        self.last_error = result.as_ref().err().map(|error| error.to_string());
+        result
     }
 
     pub fn poll_events(&self) -> Vec<HotkeyEvent> {
@@ -87,101 +95,24 @@ fn global_hotkey_startup_allowed() -> Result<()> {
 }
 
 pub fn parse_hotkey(spec: &str) -> Result<HotKey> {
-    let mut modifiers = Modifiers::empty();
-    let mut key = None;
-
-    for part in spec.split('+') {
-        let token = part.trim().to_ascii_lowercase();
-        match token.as_str() {
-            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
-            "shift" => modifiers |= Modifiers::SHIFT,
-            "alt" | "option" => modifiers |= Modifiers::ALT,
-            "super" | "meta" | "cmd" | "command" | "win" => modifiers |= Modifiers::SUPER,
-            "" => {}
-            _ => key = Some(parse_key(&token)?),
-        }
-    }
-
-    let key =
-        key.ok_or_else(|| anyhow!("hotkey must include a key, for example Ctrl+Shift+Space"))?;
-    Ok(HotKey::new(Some(modifiers), key))
+    let canonical = canonical_hotkey_spec(spec);
+    canonical
+        .parse::<HotKey>()
+        .map_err(|error| anyhow!("invalid hotkey {spec:?}: {error}"))
 }
 
-fn parse_key(token: &str) -> Result<Code> {
-    match token {
-        "space" => Ok(Code::Space),
-        "enter" | "return" => Ok(Code::Enter),
-        "tab" => Ok(Code::Tab),
-        "escape" | "esc" => Ok(Code::Escape),
-        "backspace" => Ok(Code::Backspace),
-        "delete" => Ok(Code::Delete),
-        "up" | "arrowup" => Ok(Code::ArrowUp),
-        "down" | "arrowdown" => Ok(Code::ArrowDown),
-        "left" | "arrowleft" => Ok(Code::ArrowLeft),
-        "right" | "arrowright" => Ok(Code::ArrowRight),
-        "f1" => Ok(Code::F1),
-        "f2" => Ok(Code::F2),
-        "f3" => Ok(Code::F3),
-        "f4" => Ok(Code::F4),
-        "f5" => Ok(Code::F5),
-        "f6" => Ok(Code::F6),
-        "f7" => Ok(Code::F7),
-        "f8" => Ok(Code::F8),
-        "f9" => Ok(Code::F9),
-        "f10" => Ok(Code::F10),
-        "f11" => Ok(Code::F11),
-        "f12" => Ok(Code::F12),
-        _ if token.len() == 1 => {
-            let ch = token.chars().next().unwrap();
-            match ch {
-                'a'..='z' => Ok(letter_code(ch)),
-                '0' => Ok(Code::Digit0),
-                '1' => Ok(Code::Digit1),
-                '2' => Ok(Code::Digit2),
-                '3' => Ok(Code::Digit3),
-                '4' => Ok(Code::Digit4),
-                '5' => Ok(Code::Digit5),
-                '6' => Ok(Code::Digit6),
-                '7' => Ok(Code::Digit7),
-                '8' => Ok(Code::Digit8),
-                '9' => Ok(Code::Digit9),
-                _ => Err(anyhow!("unsupported hotkey key: {token}")),
-            }
-        }
-        _ => Err(anyhow!("unsupported hotkey key: {token}")),
-    }
-}
-
-fn letter_code(ch: char) -> Code {
-    match ch {
-        'a' => Code::KeyA,
-        'b' => Code::KeyB,
-        'c' => Code::KeyC,
-        'd' => Code::KeyD,
-        'e' => Code::KeyE,
-        'f' => Code::KeyF,
-        'g' => Code::KeyG,
-        'h' => Code::KeyH,
-        'i' => Code::KeyI,
-        'j' => Code::KeyJ,
-        'k' => Code::KeyK,
-        'l' => Code::KeyL,
-        'm' => Code::KeyM,
-        'n' => Code::KeyN,
-        'o' => Code::KeyO,
-        'p' => Code::KeyP,
-        'q' => Code::KeyQ,
-        'r' => Code::KeyR,
-        's' => Code::KeyS,
-        't' => Code::KeyT,
-        'u' => Code::KeyU,
-        'v' => Code::KeyV,
-        'w' => Code::KeyW,
-        'x' => Code::KeyX,
-        'y' => Code::KeyY,
-        'z' => Code::KeyZ,
-        _ => Code::Space,
-    }
+fn canonical_hotkey_spec(spec: &str) -> String {
+    spec.split('+')
+        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "Control",
+            "alt" | "option" => "Alt",
+            "super" | "meta" | "cmd" | "command" | "win" => "Super",
+            "esc" | "escape" => "Escape",
+            "return" | "enter" => "Enter",
+            _ => part.trim(),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 #[cfg(test)]
@@ -192,6 +123,19 @@ mod tests {
     fn parses_common_modifier_combo() {
         assert!(parse_hotkey("Ctrl+Shift+Space").is_ok());
         assert!(parse_hotkey("command+alt+k").is_ok());
+    }
+
+    #[test]
+    fn parses_extended_standard_keys_and_legacy_aliases() {
+        for spec in [
+            "Win+Alt+F24",
+            "Ctrl+Shift+Home",
+            "Ctrl+Alt+Backquote",
+            "Ctrl+Alt+Comma",
+            "Ctrl+Alt+Numpad1",
+        ] {
+            assert!(parse_hotkey(spec).is_ok(), "{spec}");
+        }
     }
 
     #[test]
@@ -241,5 +185,20 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn rejected_replacement_preserves_existing_hotkey() {
+        let existing = parse_hotkey("Ctrl+Shift+Space").unwrap();
+        let mut service = HotkeyService {
+            manager: None,
+            hotkey: Some(existing),
+            last_error: None,
+        };
+
+        assert!(service.register("Ctrl+Mouse1").is_err());
+        assert_eq!(service.hotkey, Some(existing));
+        assert!(service.manager.is_none());
+        assert!(service.last_error.is_some());
     }
 }

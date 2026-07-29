@@ -9,7 +9,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
 - Local JSON config for hotkey, active model, Playground ordering, managed model/runtime metadata, performance mode, theme mode, audio input device, and max recording duration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
-- Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
+- Global hotkey support with `Ctrl+Shift+Space` as the default; users can type or capture a supported standard key combination and choose toggle or hold-to-talk behavior.
 - Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
 - Six runnable local STT backends: `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet. They use bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
 - Experimental sherpa-onnx-family support (sherpa-onnx, Moonshine, and Parakeet) runs through managed, short-lived Python sidecars and currently provides batch transcription only; streaming needs a future backend API.

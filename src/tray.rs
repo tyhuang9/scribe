@@ -234,3 +234,58 @@ fn scribe_icon() -> Result<Icon> {
 
     Icon::from_rgba(rgba, SIZE, SIZE).context("failed to create tray icon bitmap")
 }
+
+#[cfg(test)]
+mod tests {
+    use tray_icon::{Rect, TrayIconId, dpi::PhysicalPosition};
+
+    use super::*;
+
+    fn click_event(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: TrayIconId::new("scribe-test"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button,
+            button_state,
+        }
+    }
+
+    #[test]
+    fn tray_menu_ids_map_to_expected_commands() {
+        assert_eq!(command_from_menu_id(MENU_SHOW), Some(TrayCommand::Show));
+        assert_eq!(command_from_menu_id(MENU_HIDE), Some(TrayCommand::Hide));
+        assert_eq!(
+            command_from_menu_id(MENU_TOGGLE_RECORDING),
+            Some(TrayCommand::ToggleRecording)
+        );
+        assert_eq!(
+            command_from_menu_id(MENU_COPY_LAST),
+            Some(TrayCommand::CopyLastTranscript)
+        );
+        assert_eq!(command_from_menu_id(MENU_QUIT), Some(TrayCommand::Quit));
+        assert_eq!(command_from_menu_id("unknown"), None);
+    }
+
+    #[test]
+    fn only_a_completed_left_click_restores_the_window() {
+        assert!(tray_event_should_show(&click_event(
+            MouseButton::Left,
+            MouseButtonState::Up
+        )));
+        assert!(!tray_event_should_show(&click_event(
+            MouseButton::Left,
+            MouseButtonState::Down
+        )));
+        assert!(!tray_event_should_show(&click_event(
+            MouseButton::Right,
+            MouseButtonState::Up
+        )));
+    }
+
+    #[test]
+    fn recording_menu_label_tracks_recording_state() {
+        assert_eq!(recording_label(false), "Start Recording");
+        assert_eq!(recording_label(true), "Stop Recording");
+    }
+}
