@@ -217,6 +217,13 @@ pub fn run_intent_transaction(
             format!("could not generate the per-request credential: {err}"),
         )
     })?;
+    let wrong_bearer = generate_bearer().map_err(|err| {
+        failure(
+            ids,
+            IntentFailureKind::Startup,
+            format!("could not generate the readiness challenge: {err}"),
+        )
+    })?;
     let arguments = llama_arguments(&request.model_path, port);
 
     // Keep the OS-selected port reserved until the last possible moment. The
@@ -237,6 +244,8 @@ pub fn run_intent_transaction(
         wait_until_ready(
             &mut child,
             port,
+            &bearer,
+            &wrong_bearer,
             request.tier.startup_timeout(),
             cancellation,
             ids,
@@ -364,7 +373,6 @@ fn generate_bearer() -> io::Result<String> {
 }
 
 fn llama_arguments(model_path: &Path, port: u16) -> Vec<std::ffi::OsString> {
-    let cors_origin = format!("http://{LOOPBACK}:{port}");
     [
         std::ffi::OsString::from("-m"),
         model_path.as_os_str().to_owned(),
@@ -382,9 +390,6 @@ fn llama_arguments(model_path: &Path, port: u16) -> Vec<std::ffi::OsString> {
         std::ffi::OsString::from("--no-ui"),
         std::ffi::OsString::from("--no-ui-mcp-proxy"),
         std::ffi::OsString::from("--no-mmproj"),
-        std::ffi::OsString::from("--cors-origins"),
-        std::ffi::OsString::from(cors_origin),
-        std::ffi::OsString::from("--no-cors-credentials"),
         std::ffi::OsString::from("--no-slots"),
         std::ffi::OsString::from("--no-cache-prompt"),
         std::ffi::OsString::from("--no-cache-idle-slots"),
@@ -450,6 +455,8 @@ fn build_request_body(request: &IntentTransactionRequest) -> Result<Vec<u8>, Str
 fn wait_until_ready(
     child: &mut ManagedChild,
     port: u16,
+    bearer: &str,
+    wrong_bearer: &str,
     timeout: Duration,
     cancellation: &IntentCancellation,
     ids: (u64, u32),
@@ -501,6 +508,21 @@ fn wait_until_ready(
                         "the private edit server exited during readiness verification",
                     ));
                 }
+                verify_authenticated_readiness(port, bearer, wrong_bearer)
+                    .map_err(|message| failure(ids, IntentFailureKind::Startup, message))?;
+                if child.has_exited().map_err(|err| {
+                    failure(
+                        ids,
+                        IntentFailureKind::Startup,
+                        format!("could not inspect the private edit server: {err}"),
+                    )
+                })? {
+                    return Err(failure(
+                        ids,
+                        IntentFailureKind::Startup,
+                        "the private edit server exited during authenticated readiness verification",
+                    ));
+                }
                 return Ok(());
             }
         } else {
@@ -527,6 +549,82 @@ fn health_ready(port: u16) -> bool {
         .get(&url)
         .call()
         .is_ok_and(|response| response.status() == 200)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtectedProbe {
+    Unauthorized,
+    Authorized,
+}
+
+fn verify_authenticated_readiness(
+    port: u16,
+    bearer: &str,
+    wrong_bearer: &str,
+) -> Result<(), String> {
+    if bearer == wrong_bearer {
+        return Err("readiness challenge unexpectedly matched the server credential".to_owned());
+    }
+    if props_probe(port, None)? != ProtectedProbe::Unauthorized {
+        return Err("private edit server accepted an unauthenticated readiness probe".to_owned());
+    }
+    if props_probe(port, Some(wrong_bearer))? != ProtectedProbe::Unauthorized {
+        return Err("private edit server accepted an invalid readiness credential".to_owned());
+    }
+    if props_probe(port, Some(bearer))? != ProtectedProbe::Authorized {
+        return Err("private edit server rejected its readiness credential".to_owned());
+    }
+    Ok(())
+}
+
+fn props_probe(port: u16, bearer: Option<&str>) -> Result<ProtectedProbe, String> {
+    let url = format!("http://{LOOPBACK}:{port}/props");
+    let agent = http_agent(HEALTH_TIMEOUT);
+    let mut request = agent.get(&url).set("Accept", "application/json");
+    let authorization;
+    if let Some(bearer) = bearer {
+        authorization = format!("Bearer {bearer}");
+        request = request.set("Authorization", &authorization);
+    }
+    match request.call() {
+        Ok(response) if response.status() == 200 => {
+            validate_probe_json(response)?;
+            Ok(ProtectedProbe::Authorized)
+        }
+        Ok(_) => Err("private edit readiness returned an unexpected success status".to_owned()),
+        Err(ureq::Error::Status(401 | 403, _)) => Ok(ProtectedProbe::Unauthorized),
+        Err(ureq::Error::Status(status, _)) => Err(format!(
+            "private edit readiness returned unexpected HTTP status {status}"
+        )),
+        Err(ureq::Error::Transport(error)) => {
+            Err(format!("private edit readiness request failed: {error}"))
+        }
+    }
+}
+
+fn validate_probe_json(response: ureq::Response) -> Result<(), String> {
+    if !is_json_content_type(response.header("Content-Type")) {
+        return Err("private edit readiness did not have JSON content type".to_owned());
+    }
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+    {
+        return Err("private edit readiness exceeded the byte limit".to_owned());
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("could not read private edit readiness: {err}"))?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("private edit readiness exceeded the byte limit".to_owned());
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|_| "private edit readiness was not valid JSON".to_owned())?;
+    Ok(())
 }
 
 fn send_completion(
@@ -984,6 +1082,7 @@ mod tests {
     use super::*;
 
     struct CapturedRequest {
+        request_line: String,
         headers: HashMap<String, String>,
         body: Vec<u8>,
     }
@@ -999,14 +1098,20 @@ mod tests {
     }
 
     fn spawn_server(response: Vec<u8>) -> (u16, mpsc::Receiver<CapturedRequest>) {
+        spawn_server_sequence(vec![response])
+    }
+
+    fn spawn_server_sequence(responses: Vec<Vec<u8>>) -> (u16, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(responses.len());
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
-            let _ = sender.send(request);
-            let _ = stream.write_all(&response);
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let _ = sender.send(request);
+                let _ = stream.write_all(&response);
+            }
         });
         (port, receiver)
     }
@@ -1032,6 +1137,7 @@ mod tests {
             .filter_map(|line| line.split_once(':'))
             .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
             .collect();
+        let request_line = header_text.lines().next().unwrap().to_owned();
         let content_length = headers
             .get("content-length")
             .and_then(|value| value.parse::<usize>().ok())
@@ -1042,9 +1148,14 @@ mod tests {
             bytes.extend_from_slice(&buffer[..read]);
         }
         CapturedRequest {
+            request_line,
             headers,
             body: bytes[header_end..header_end + content_length].to_vec(),
         }
+    }
+
+    fn unauthorized_response() -> Vec<u8> {
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     }
 
     fn completion_envelope(content: &str) -> Vec<u8> {
@@ -1088,9 +1199,6 @@ mod tests {
             "--no-ui",
             "--no-ui-mcp-proxy",
             "--no-mmproj",
-            "--cors-origins",
-            "http://127.0.0.1:43123",
-            "--no-cors-credentials",
             "--no-slots",
             "--no-cache-prompt",
             "--no-cache-idle-slots",
@@ -1105,6 +1213,12 @@ mod tests {
         assert!(!strings.iter().any(|argument| argument == "--tools"));
         assert!(!strings.iter().any(|argument| argument == "--agent"));
         assert!(!strings.iter().any(|argument| argument == "--no-agent"));
+        assert!(!strings.iter().any(|argument| argument == "--cors-origins"));
+        assert!(
+            !strings
+                .iter()
+                .any(|argument| argument == "--no-cors-credentials")
+        );
     }
 
     #[test]
@@ -1227,6 +1341,56 @@ mod tests {
         let request = captured.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!request.headers.contains_key("authorization"));
         assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn authenticated_readiness_rejects_missing_and_wrong_keys_before_accepting_bearer() {
+        let (port, captured) = spawn_server_sequence(vec![
+            unauthorized_response(),
+            unauthorized_response(),
+            response("application/json", br#"{"model_path":"metadata only"}"#),
+        ]);
+
+        verify_authenticated_readiness(port, "correct-token", "wrong-token").unwrap();
+
+        let requests: Vec<CapturedRequest> = (0..3)
+            .map(|_| captured.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.request_line == "GET /props HTTP/1.1")
+        );
+        assert!(!requests[0].headers.contains_key("authorization"));
+        assert_eq!(
+            requests[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer wrong-token")
+        );
+        assert_eq!(
+            requests[2].headers.get("authorization").map(String::as_str),
+            Some("Bearer correct-token")
+        );
+        assert!(requests.iter().all(|request| request.body.is_empty()));
+    }
+
+    #[test]
+    fn authenticated_readiness_fails_closed_when_missing_or_wrong_key_is_accepted() {
+        let (missing_port, _) = spawn_server(response("application/json", b"{}"));
+        assert!(
+            verify_authenticated_readiness(missing_port, "correct", "wrong")
+                .unwrap_err()
+                .contains("unauthenticated")
+        );
+
+        let (wrong_port, _) = spawn_server_sequence(vec![
+            unauthorized_response(),
+            response("application/json", b"{}"),
+        ]);
+        assert!(
+            verify_authenticated_readiness(wrong_port, "correct", "wrong")
+                .unwrap_err()
+                .contains("invalid readiness credential")
+        );
     }
 
     #[test]
