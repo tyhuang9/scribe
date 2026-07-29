@@ -254,7 +254,9 @@ impl PreviewChunkWriter {
             self.ensure_current_chunk()?;
             let current = self.current.as_mut().expect("preview chunk should be open");
             let remaining = self.chunk_samples - current.samples_written;
-            let take = samples.len().min(remaining as usize);
+            let take = samples
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
             let (chunk, rest) = samples.split_at(take);
             write_samples(&mut current.writer, chunk.iter().copied())
                 .context("failed to write live preview chunk")?;
@@ -281,8 +283,15 @@ impl PreviewChunkWriter {
         let path = preview_chunk_path(&self.recording_path, self.next_sequence)?;
         let file = create_recording_file(&path)
             .with_context(|| format!("failed to reserve live preview chunk {}", path.display()))?;
-        let mut writer = hound::WavWriter::new(BufWriter::new(file), self.spec)
-            .with_context(|| format!("failed to create live preview chunk {}", path.display()))?;
+        let mut writer = match hound::WavWriter::new(BufWriter::new(file), self.spec) {
+            Ok(writer) => writer,
+            Err(error) => {
+                remove_file_best_effort(&path, "incomplete live preview chunk");
+                return Err(error).with_context(|| {
+                    format!("failed to create live preview chunk {}", path.display())
+                });
+            }
+        };
         if let Err(error) = write_samples(&mut writer, self.overlap.iter().copied()) {
             drop(writer);
             remove_file_best_effort(&path, "incomplete live preview chunk");
@@ -1211,7 +1220,7 @@ mod tests {
         )
         .unwrap();
 
-        chunks.write_samples(&vec![1; 49]).unwrap();
+        chunks.write_samples(&[1; 49]).unwrap();
         assert!(preview_rx.try_recv().is_err());
         assert!(partial_path.exists());
         drop(chunks);
@@ -1238,7 +1247,7 @@ mod tests {
         )
         .unwrap();
 
-        chunks.write_samples(&vec![1; 140]).unwrap();
+        chunks.write_samples(&[1; 140]).unwrap();
 
         assert_eq!(preview_rx.len(), MAX_PENDING_PREVIEW_CHUNKS);
         assert!(!dir.join("recording-1-2-3-chunk-2.wav").exists());

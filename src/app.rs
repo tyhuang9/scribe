@@ -24,6 +24,9 @@ use crate::benchmark::{
 use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::durable_fs;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::live_preview::{
+    self, LivePreviewState, PreviewCompletion, PreviewJobKey, PreviewSessionId,
+};
 use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
@@ -95,10 +98,44 @@ enum RecordingSource {
 struct ActiveRecording {
     session: RecordingSession,
     source: RecordingSource,
+    model: Option<SttModelInfo>,
+    preview_session_id: Option<PreviewSessionId>,
     stop_requested: bool,
     started_at: Instant,
     max_duration_seconds: u32,
     latency: LatencyTrace,
+}
+
+struct PendingFinalTranscription {
+    audio_path: Option<PathBuf>,
+    model: Option<SttModelInfo>,
+    latency: Option<LatencyTrace>,
+}
+
+impl PendingFinalTranscription {
+    fn new(audio_path: PathBuf, model: SttModelInfo, latency: LatencyTrace) -> Self {
+        Self {
+            audio_path: Some(audio_path),
+            model: Some(model),
+            latency: Some(latency),
+        }
+    }
+
+    fn into_parts(mut self) -> (PathBuf, SttModelInfo, LatencyTrace) {
+        (
+            self.audio_path.take().expect("pending final audio path"),
+            self.model.take().expect("pending final model"),
+            self.latency.take().expect("pending final latency"),
+        )
+    }
+}
+
+impl Drop for PendingFinalTranscription {
+    fn drop(&mut self) {
+        if let Some(path) = self.audio_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +242,10 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    LivePreviewFinished {
+        key: PreviewJobKey,
+        result: Result<String, String>,
+    },
     TranscriptionDone {
         source: RecordingSource,
         result: TranscriptResult,
@@ -1096,6 +1137,8 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
+    live_preview: LivePreviewState,
+    pending_final_transcription: Option<PendingFinalTranscription>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
@@ -1166,6 +1209,8 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             status_message,
             active_recording: None,
+            live_preview: LivePreviewState::default(),
+            pending_final_transcription: None,
             tx,
             rx,
             playground_pending: 0,
@@ -1269,6 +1314,8 @@ impl LocalTranscriberApp {
 
     fn has_active_work(&self) -> bool {
         self.active_recording.is_some()
+            || self.live_preview.has_in_flight_job()
+            || self.pending_final_transcription.is_some()
             || self.playground_pending > 0
             || matches!(
                 self.status,
@@ -1359,6 +1406,13 @@ impl LocalTranscriberApp {
         if self.active_recording.is_some() {
             return;
         }
+        if self.status == TranscriptionStatus::Transcribing
+            || self.pending_final_transcription.is_some()
+            || self.live_preview.has_in_flight_job()
+        {
+            self.status_message = "Wait for the current transcription to finish.".to_owned();
+            return;
+        }
         if source == RecordingSource::Playground
             && let Some(message) = self.playground_run_block_reason()
         {
@@ -1367,6 +1421,7 @@ impl LocalTranscriberApp {
             return;
         }
         let mut latency = LatencyTrace::started_now();
+        let mut recording_model = None;
 
         if source == RecordingSource::Transcribe {
             let Some(model) = self.selected_model() else {
@@ -1381,16 +1436,28 @@ impl LocalTranscriberApp {
                 self.status_message = setup_message_for_status(&runtime_status);
                 return;
             }
+            recording_model = Some(model);
         }
 
         if source == RecordingSource::Playground {
             self.reset_playground_for_run();
         }
 
+        self.live_preview.final_wins();
+        let preview_enabled = recording_model.as_ref().is_some_and(|model| {
+            live_preview::is_live_preview_eligible(
+                self.config.live_whisper_preview,
+                source == RecordingSource::Transcribe,
+                &model.backend,
+                true,
+            )
+        });
+        let preview_session_id = preview_enabled.then(|| self.live_preview.begin_session());
+
         match audio::start_recording(
             self.config.max_recording_seconds,
             self.config.audio_input_device_name.clone(),
-            None,
+            preview_session_id,
         ) {
             Ok(session) => {
                 latency.recorder_started_at = Some(Instant::now());
@@ -1398,6 +1465,8 @@ impl LocalTranscriberApp {
                 self.active_recording = Some(ActiveRecording {
                     session,
                     source,
+                    model: recording_model,
+                    preview_session_id,
                     stop_requested: false,
                     started_at: Instant::now(),
                     max_duration_seconds: self.config.max_recording_seconds,
@@ -1407,6 +1476,10 @@ impl LocalTranscriberApp {
                 self.status_message = format!("Listening. Temporary WAV: {path}");
             }
             Err(err) => {
+                if let Some(session_id) = preview_session_id {
+                    self.live_preview.stop_session(session_id);
+                    self.live_preview.final_wins();
+                }
                 self.status = TranscriptionStatus::Error;
                 self.status_message = format!("Microphone failed: {err}");
             }
@@ -1417,6 +1490,9 @@ impl LocalTranscriberApp {
         if let Some(active) = self.active_recording.as_mut()
             && !active.stop_requested
         {
+            if let Some(session_id) = active.preview_session_id {
+                self.live_preview.stop_session(session_id);
+            }
             active.session.stop();
             active.stop_requested = true;
             active.latency.stop_requested_at = Some(Instant::now());
@@ -1445,6 +1521,9 @@ impl LocalTranscriberApp {
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
+            if let Some(session_id) = active.preview_session_id {
+                self.live_preview.stop_session(session_id);
+            }
             active.latency.wav_finalized_at = Some(Instant::now());
             match result {
                 Ok(audio_path) => {
@@ -1452,7 +1531,13 @@ impl LocalTranscriberApp {
                     self.status_message = format!("Transcribing {}", audio_path.display());
                     match source {
                         RecordingSource::Transcribe => {
-                            self.dispatch_default_transcription(audio_path, active.latency)
+                            let model = active
+                                .model
+                                .take()
+                                .expect("Transcribe recording should retain its model");
+                            self.pending_final_transcription = Some(
+                                PendingFinalTranscription::new(audio_path, model, active.latency),
+                            );
                         }
                         RecordingSource::Playground => {
                             self.dispatch_playground_transcriptions(audio_path)
@@ -1460,11 +1545,68 @@ impl LocalTranscriberApp {
                     }
                 }
                 Err(message) => {
+                    self.live_preview.final_wins();
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Recording failed: {message}");
                 }
             }
         }
+    }
+
+    fn poll_live_preview_chunks(&mut self) {
+        let mut chunks = Vec::new();
+        if let Some(active) = self.active_recording.as_ref()
+            && active.preview_session_id.is_some()
+        {
+            while let Some(chunk) = active.session.try_preview_chunk() {
+                chunks.push(chunk);
+            }
+        }
+        for chunk in chunks {
+            self.live_preview.offer(chunk);
+        }
+    }
+
+    fn dispatch_live_preview(&mut self) {
+        let Some(model) = self.active_recording.as_ref().and_then(|active| {
+            active
+                .preview_session_id
+                .and(active.model.as_ref().cloned())
+        }) else {
+            return;
+        };
+        let Some(job) = self.live_preview.take_next_job() else {
+            return;
+        };
+
+        let key = job.key();
+        let cancellation = job.cancellation();
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if cancellation.is_cancelled() {
+                    return Err("live preview was cancelled".to_owned());
+                }
+                stt::transcribe_with_config(&config, job.path().to_path_buf(), model)
+                    .map(|result| result.text)
+                    .map_err(|error| error.to_string())
+            }))
+            .unwrap_or_else(|_| Err("live preview worker stopped unexpectedly".to_owned()));
+            drop(job);
+            let _ = tx.send(AppEvent::LivePreviewFinished { key, result });
+        });
+    }
+
+    fn maybe_dispatch_pending_final(&mut self) {
+        if self.live_preview.has_in_flight_job() {
+            return;
+        }
+        let Some(pending) = self.pending_final_transcription.take() else {
+            return;
+        };
+        let (audio_path, model, latency) = pending.into_parts();
+        self.dispatch_default_transcription(audio_path, model, latency);
     }
 
     fn poll_hotkey(&mut self) {
@@ -1564,6 +1706,29 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                AppEvent::LivePreviewFinished { key, result } => {
+                    let current_recording = self
+                        .active_recording
+                        .as_ref()
+                        .is_some_and(|active| active.preview_session_id == Some(key.session_id));
+                    match self.live_preview.complete(key, result) {
+                        PreviewCompletion::Applied if current_recording => {
+                            self.status_message =
+                                "Listening. Live preview updated locally; final transcription follows after stop."
+                                    .to_owned();
+                        }
+                        PreviewCompletion::Failed(message) if current_recording => {
+                            eprintln!("live preview failed; recording continues: {message}");
+                            self.status_message = format!(
+                                "Listening. Live preview unavailable ({message}); recording and final transcription continue."
+                            );
+                        }
+                        PreviewCompletion::Failed(message) => {
+                            eprintln!("live preview failed after stop: {message}");
+                        }
+                        PreviewCompletion::Applied | PreviewCompletion::Stale => {}
+                    }
+                }
                 AppEvent::TranscriptionDone {
                     source,
                     result,
@@ -1575,6 +1740,7 @@ impl LocalTranscriberApp {
                     });
                     match source {
                         RecordingSource::Transcribe => {
+                            self.live_preview.final_wins();
                             let segment_count = result.segments.len();
                             let timed_segments = result
                                 .segments
@@ -1638,6 +1804,7 @@ impl LocalTranscriberApp {
                     }
                     match source {
                         RecordingSource::Transcribe => {
+                            self.live_preview.final_wins();
                             self.status = TranscriptionStatus::Error;
                             self.status_message = message;
                         }
@@ -1852,14 +2019,12 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn dispatch_default_transcription(&mut self, audio_path: PathBuf, mut latency: LatencyTrace) {
-        let Some(model) = self.selected_model() else {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "No default model selected".to_owned();
-            let _ = fs::remove_file(audio_path);
-            return;
-        };
-
+    fn dispatch_default_transcription(
+        &mut self,
+        audio_path: PathBuf,
+        model: SttModelInfo,
+        mut latency: LatencyTrace,
+    ) {
         latency.transcription_dispatched_at = Some(Instant::now());
         let config = self.config.clone();
         let tx = self.tx.clone();
@@ -2543,7 +2708,10 @@ impl eframe::App for LocalTranscriberApp {
             self.poll_hotkey();
         }
         self.poll_recording();
+        self.poll_live_preview_chunks();
         self.poll_events();
+        self.maybe_dispatch_pending_final();
+        self.dispatch_live_preview();
         self.sync_tray_state();
 
         navigation_rail(ctx, &mut self.current_tab);
@@ -2663,7 +2831,13 @@ impl LocalTranscriberApp {
                         } else {
                             "Start Listening"
                         };
-                        let disabled_tooltip = if listening || ready {
+                        let finalizing = !listening
+                            && (self.status == TranscriptionStatus::Transcribing
+                                || self.pending_final_transcription.is_some()
+                                || self.live_preview.has_in_flight_job());
+                        let disabled_tooltip = if finalizing {
+                            Some("Wait for the current final transcription to finish.".to_owned())
+                        } else if listening || ready {
                             None
                         } else {
                             Some(
@@ -2678,7 +2852,7 @@ impl LocalTranscriberApp {
                         };
                         let response = add_enabled_button(
                             ui,
-                            listening || ready,
+                            listening || ready && !finalizing,
                             record_button(ui, listening),
                             disabled_tooltip.as_deref(),
                         );
@@ -2711,6 +2885,35 @@ impl LocalTranscriberApp {
             });
 
             ui.add_space(12.0);
+            let provisional_text = self.live_preview.provisional_text().trim();
+            if !provisional_text.is_empty() {
+                info_panel(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(section_heading("Live preview"));
+                        badge(ui, "Provisional · local only", ChipTone::Neutral);
+                    });
+                    ui.add_space(8.0);
+                    let response = ui.add(
+                        egui::Label::new(
+                            RichText::new(provisional_text).color(ui_palette(ui).primary),
+                        )
+                        .wrap(true),
+                    );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_name(format!(
+                            "Provisional live preview, read only: {provisional_text}"
+                        ));
+                    });
+                    ui.add_space(6.0);
+                    wrapped_label(
+                        ui,
+                        mut_text(
+                            "This text stays inside Scribe and is replaced by the full transcription after you stop.",
+                        ),
+                    );
+                });
+                ui.add_space(12.0);
+            }
             transcript_panel(ui, |ui| {
                 let label_id = ui
                     .horizontal(|ui| {
@@ -7973,6 +8176,119 @@ mod layout_tests {
     }
 
     #[test]
+    fn provisional_event_never_mutates_the_canonical_or_output_transcript() {
+        let mut app = test_app();
+        app.config.auto_insert_transcript = true;
+        app.transcript = "authoritative before".to_owned();
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "display-only"));
+        let job = app.live_preview.take_next_job().unwrap();
+        let key = job.key();
+        drop(job);
+        app.tx
+            .send(AppEvent::LivePreviewFinished {
+                key,
+                result: Ok("provisional words".to_owned()),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.live_preview.provisional_text(), "provisional words");
+        assert_eq!(app.transcript, "authoritative before");
+    }
+
+    #[test]
+    fn final_transcription_clears_and_replaces_the_provisional_preview() {
+        let mut app = test_app();
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "final-wins"));
+        let job = app.live_preview.take_next_job().unwrap();
+        let key = job.key();
+        drop(job);
+        assert_eq!(
+            app.live_preview.complete(key, Ok("provisional".to_owned())),
+            PreviewCompletion::Applied
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                result: test_transcript_result("full file result"),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "full file result");
+        assert!(app.live_preview.provisional_text().is_empty());
+    }
+
+    #[test]
+    fn final_transcription_waits_for_an_obsolete_preview_job_to_retire() {
+        let mut app = test_app();
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "retiring"));
+        let job = app.live_preview.take_next_job().unwrap();
+        app.live_preview.stop_session(session);
+        let final_path = test_preview_path("pending-final");
+        fs::write(&final_path, b"full wav").unwrap();
+        app.pending_final_transcription = Some(PendingFinalTranscription::new(
+            final_path.clone(),
+            test_model(),
+            LatencyTrace::started_now(),
+        ));
+
+        app.maybe_dispatch_pending_final();
+
+        assert!(app.pending_final_transcription.is_some());
+        assert!(final_path.exists());
+        assert!(job.cancellation().is_cancelled());
+        drop(job);
+        drop(app);
+        assert!(!final_path.exists());
+    }
+
+    #[test]
+    fn provisional_preview_is_exposed_as_read_only_static_text() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Transcribe;
+        let session = app.live_preview.begin_session();
+        app.live_preview
+            .offer(test_preview_artifact(session, 1, "accessible"));
+        let job = app.live_preview.take_next_job().unwrap();
+        let key = job.key();
+        drop(job);
+        assert_eq!(
+            app.live_preview
+                .complete(key, Ok("read only draft".to_owned())),
+            PreviewCompletion::Applied
+        );
+
+        let output = render_accessible_app_tab_frame(&ctx, &mut app, 840.0, 760.0, Vec::new());
+        let node = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| {
+                node.name() == Some("Provisional live preview, read only: read only draft")
+            })
+            .map(|(_, node)| node)
+            .expect("named provisional preview node");
+        assert_eq!(node.role(), egui::accesskit::Role::StaticText);
+        assert!(!node.supports_action(egui::accesskit::Action::Focus));
+    }
+
+    #[test]
     fn tray_state_tracks_visible_recording_and_transcript_changes() {
         let idle = tray_ui_state(false, "  \n ");
         assert_eq!(
@@ -8258,6 +8574,20 @@ mod layout_tests {
             .map(|(_, node)| node)
             .unwrap();
         assert!(hotkey.value().is_some_and(|value| !value.is_empty()));
+        assert!(
+            settings
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::CheckBox
+                        && node.name()
+                            == Some("Show provisional whisper.cpp preview while recording")
+                })
+        );
     }
 
     #[test]
@@ -9205,6 +9535,8 @@ mod layout_tests {
             transcript: String::new(),
             status_message: "Ready".to_owned(),
             active_recording: None,
+            live_preview: LivePreviewState::default(),
+            pending_final_transcription: None,
             tx,
             rx,
             playground_pending: 0,
@@ -9233,6 +9565,40 @@ mod layout_tests {
             )),
             install_status: ModelInstallStatus::Installed,
             download_model: Some("base.en".to_owned()),
+        }
+    }
+
+    fn test_preview_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "scribe-app-preview-{label}-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn test_preview_artifact(
+        session_id: PreviewSessionId,
+        sequence: u64,
+        label: &str,
+    ) -> crate::live_preview::PreviewArtifact {
+        let path = test_preview_path(label);
+        fs::write(&path, b"preview wav").unwrap();
+        crate::live_preview::PreviewArtifact::new(session_id, sequence, path)
+    }
+
+    fn test_transcript_result(text: &str) -> TranscriptResult {
+        TranscriptResult {
+            model_id: "whisper_cpp_base_en".to_owned(),
+            model_name: "whisper.cpp base.en".to_owned(),
+            backend: "whisper.cpp".to_owned(),
+            text: text.to_owned(),
+            segments: Vec::new(),
+            duration_ms: Some(10),
+            stdout: text.to_owned(),
+            stderr: String::new(),
         }
     }
 

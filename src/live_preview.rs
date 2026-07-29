@@ -359,6 +359,26 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_partial_results_replace_instead_of_repeating_words() {
+        let mut state = LivePreviewState::default();
+        let session = state.begin_session();
+        state.offer(artifact(session, 1));
+        let first = state.take_next_job().unwrap();
+        assert_eq!(
+            state.complete(first.key(), Ok("hello from the overlap".to_owned())),
+            PreviewCompletion::Applied
+        );
+        state.offer(artifact(session, 2));
+        let second = state.take_next_job().unwrap();
+        assert_eq!(
+            state.complete(second.key(), Ok("from the overlap onward".to_owned())),
+            PreviewCompletion::Applied
+        );
+
+        assert_eq!(state.provisional_text(), "from the overlap onward");
+    }
+
+    #[test]
     fn eligibility_excludes_playground_non_whisper_and_unready_models() {
         assert!(is_live_preview_eligible(true, true, "whisper.cpp", true));
         assert!(!is_live_preview_eligible(true, false, "whisper.cpp", true));

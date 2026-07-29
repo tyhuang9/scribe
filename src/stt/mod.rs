@@ -255,6 +255,28 @@ mod tests {
     }
 
     #[test]
+    fn whisper_cpp_has_one_canonical_runtime_provider() {
+        assert_eq!(
+            provider_adapters()
+                .iter()
+                .filter(|provider| provider.runtime_id == "whisper_cpp")
+                .count(),
+            1
+        );
+        assert_eq!(
+            runtime_catalog::backend_specs()
+                .iter()
+                .filter(|spec| spec.runtime_id == "whisper_cpp")
+                .count(),
+            1
+        );
+        assert_eq!(
+            provider_for_backend("whisper.cpp").unwrap().runtime_id,
+            "whisper_cpp"
+        );
+    }
+
+    #[test]
     fn provider_model_hooks_match_current_runtime_phase() {
         let whisper = provider_for_backend("whisper.cpp").unwrap();
         let faster_whisper = provider_for_backend("faster-whisper").unwrap();
