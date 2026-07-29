@@ -40,6 +40,14 @@ const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
+const RECORDING_DURATION_PRESETS: [(u32, &str); 6] = [
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (5 * 60, "5 minutes"),
+    (15 * 60, "15 minutes"),
+    (30 * 60, "30 minutes"),
+    (60 * 60, "60 minutes"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -3612,17 +3620,51 @@ impl LocalTranscriberApp {
                         self.refresh_audio_devices();
                     }
                 });
-                let mut max_duration = self.config.max_recording_seconds as i32;
+                let before = self.config.max_recording_seconds;
                 ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Max recording seconds");
-                    let response =
-                        ui.add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600));
-                    set_control_accessibility(ui, &response, label.id, "Max recording seconds");
-                    if response.changed() {
-                        self.config.max_recording_seconds = max_duration.max(1) as u32;
-                        self.save_config();
+                    let label = ui.label("Maximum recording duration");
+                    let response = ComboBox::from_id_source("recording-duration-preset")
+                        .selected_text(format_recording_duration(self.config.max_recording_seconds))
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for (seconds, text) in RECORDING_DURATION_PRESETS {
+                                ui.selectable_value(
+                                    &mut self.config.max_recording_seconds,
+                                    seconds,
+                                    text,
+                                );
+                            }
+                        })
+                        .response;
+                    set_control_accessibility(
+                        ui,
+                        &response,
+                        label.id,
+                        "Maximum recording duration preset",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Custom duration");
+                    let response = ui.add(
+                        egui::DragValue::new(&mut self.config.max_recording_seconds)
+                            .clamp_range(1..=config::MAX_RECORDING_SECONDS)
+                            .suffix(" seconds"),
+                    );
+                    set_control_accessibility(
+                        ui,
+                        &response,
+                        label.id,
+                        "Custom recording duration in seconds",
+                    );
+                    if self.active_recording.is_some() {
+                        ui.label("Applies to the next recording.");
                     }
                 });
+                if before != self.config.max_recording_seconds {
+                    self.config.max_recording_seconds =
+                        config::normalize_recording_duration(self.config.max_recording_seconds);
+                    self.save_config();
+                }
             });
 
             ui.add_space(12.0);
@@ -5318,6 +5360,16 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
     format!("{elapsed}s elapsed - {remaining}s left")
 }
 
+fn format_recording_duration(seconds: u32) -> String {
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    match (minutes, remainder) {
+        (0, seconds) => format!("{seconds} second{}", if seconds == 1 { "" } else { "s" }),
+        (minutes, 0) => format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" }),
+        (minutes, seconds) => format!("{minutes}m {seconds}s"),
+    }
+}
+
 fn tray_ui_state(is_recording: bool, transcript: &str) -> TrayUiState {
     TrayUiState {
         is_recording,
@@ -6938,6 +6990,15 @@ mod layout_tests {
     use super::*;
 
     #[test]
+    fn recording_duration_labels_are_human_readable() {
+        assert_eq!(format_recording_duration(1), "1 second");
+        assert_eq!(format_recording_duration(30), "30 seconds");
+        assert_eq!(format_recording_duration(60), "1 minute");
+        assert_eq!(format_recording_duration(125), "2m 5s");
+        assert_eq!(format_recording_duration(3_600), "60 minutes");
+    }
+
+    #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
         assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
         assert_eq!(
@@ -8057,7 +8118,10 @@ mod layout_tests {
             (egui::accesskit::Role::ComboBox, "Hotkey mode"),
             (egui::accesskit::Role::ComboBox, "Transcription device"),
             (egui::accesskit::Role::ComboBox, "Microphone"),
-            (egui::accesskit::Role::SpinButton, "Max recording seconds"),
+            (
+                egui::accesskit::Role::SpinButton,
+                "Custom recording duration in seconds",
+            ),
             (egui::accesskit::Role::ComboBox, "Theme"),
         ] {
             assert_named_control(&settings, role, name);

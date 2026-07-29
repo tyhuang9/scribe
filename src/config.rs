@@ -47,6 +47,7 @@ pub struct AppConfig {
     pub model_paths: HashMap<String, PathBuf>,
     pub last_used_backend: String,
     pub debug_mode: bool,
+    #[serde(default = "default_max_recording_seconds")]
     pub max_recording_seconds: u32,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
@@ -227,7 +228,7 @@ impl Default for AppConfig {
             model_paths: HashMap::new(),
             last_used_backend: "whisper.cpp".to_owned(),
             debug_mode: false,
-            max_recording_seconds: 30,
+            max_recording_seconds: default_max_recording_seconds(),
             close_to_tray: true,
             auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
@@ -888,9 +889,7 @@ pub fn normalize_config(config: &mut AppConfig) {
 
     normalize_playground_order(config, &catalog_ids);
 
-    if config.max_recording_seconds == 0 {
-        config.max_recording_seconds = 30;
-    }
+    config.max_recording_seconds = normalize_recording_duration(config.max_recording_seconds);
     if config.paste_delay_ms == 0 {
         config.paste_delay_ms = default_paste_delay_ms();
     }
@@ -898,6 +897,20 @@ pub fn normalize_config(config: &mut AppConfig) {
 
 fn default_true() -> bool {
     true
+}
+
+pub const MAX_RECORDING_SECONDS: u32 = 60 * 60;
+
+pub fn normalize_recording_duration(seconds: u32) -> u32 {
+    if seconds == 0 {
+        default_max_recording_seconds()
+    } else {
+        seconds.min(MAX_RECORDING_SECONDS)
+    }
+}
+
+fn default_max_recording_seconds() -> u32 {
+    30
 }
 
 fn default_legacy_whisper_compute_mode() -> WhisperComputeMode {
@@ -1367,6 +1380,25 @@ mod tests {
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(!config.auto_insert_transcript);
+    }
+
+    #[test]
+    fn recording_duration_defaults_and_normalizes_legacy_values() {
+        let mut serialized = serde_json::to_value(AppConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_recording_seconds");
+        let missing: AppConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(missing.max_recording_seconds, 30);
+
+        assert_eq!(normalize_recording_duration(0), 30);
+        assert_eq!(normalize_recording_duration(1), 1);
+        assert_eq!(normalize_recording_duration(600), 600);
+        assert_eq!(
+            normalize_recording_duration(u32::MAX),
+            MAX_RECORDING_SECONDS
+        );
     }
 
     #[test]
