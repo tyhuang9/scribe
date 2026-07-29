@@ -2907,7 +2907,7 @@ impl LocalTranscriberApp {
                 info_panel(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(section_heading("Live preview"));
-                        badge(ui, "Provisional · local only", ChipTone::Neutral);
+                        badge(ui, "Provisional - local only", ChipTone::Neutral);
                     });
                     ui.add_space(8.0);
                     let response = ui.add(
