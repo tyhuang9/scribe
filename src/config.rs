@@ -327,26 +327,65 @@ pub(crate) struct ConfigSaveOutcome {
 pub(crate) fn save_config_merging_managed_runtimes(
     config: &AppConfig,
 ) -> Result<ConfigSaveOutcome> {
-    save_config_with_runtime_update(config, None)
+    let path = config_file_path()?;
+    save_config_merging_managed_runtimes_at(&path, config)
 }
 
 pub(crate) fn save_config_with_runtime_update(
     config: &AppConfig,
     runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
 ) -> Result<ConfigSaveOutcome> {
-    let path = config_file_path()?;
-    save_config_with_runtime_update_at(&path, config, runtime_update)
+    save_config_with_managed_updates(config, &[], runtime_update)
 }
 
-fn save_config_with_runtime_update_at(
+pub(crate) fn save_config_with_managed_updates(
+    config: &AppConfig,
+    model_updates: &[(&str, Option<ManagedModelInstall>)],
+    runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
+) -> Result<ConfigSaveOutcome> {
+    let path = config_file_path()?;
+    save_config_with_managed_updates_at(&path, config, model_updates, runtime_update)
+}
+
+fn save_config_merging_managed_runtimes_at(
     path: &Path,
     config: &AppConfig,
-    runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
 ) -> Result<ConfigSaveOutcome> {
     let lock = lock_config_path(path, Duration::from_secs(10))?;
     let persisted = recover_config_file(path)?.unwrap_or_default();
     let mut merged = config.clone();
     merged.managed_runtimes = persisted.managed_runtimes;
+    normalize_config(&mut merged);
+    let durability_warning = save_config_file_locked(path, &merged, &lock)?;
+    Ok(ConfigSaveOutcome {
+        config: merged,
+        durability_warning,
+    })
+}
+
+fn save_config_with_managed_updates_at(
+    path: &Path,
+    config: &AppConfig,
+    model_updates: &[(&str, Option<ManagedModelInstall>)],
+    runtime_update: Option<(&str, Option<ManagedRuntimeInstall>)>,
+) -> Result<ConfigSaveOutcome> {
+    let lock = lock_config_path(path, Duration::from_secs(10))?;
+    let persisted = recover_config_file(path)?.unwrap_or_default();
+    let mut merged = config.clone();
+    merged.managed_models = persisted.managed_models;
+    merged.managed_runtimes = persisted.managed_runtimes;
+    for (model_id, install) in model_updates {
+        match install {
+            Some(install) => {
+                merged
+                    .managed_models
+                    .insert((*model_id).to_owned(), install.clone());
+            }
+            None => {
+                merged.managed_models.remove(*model_id);
+            }
+        }
+    }
     if let Some((runtime_id, install)) = runtime_update {
         match install {
             Some(install) => {
@@ -1301,9 +1340,10 @@ mod tests {
 
         let stale_second = AppConfig::default();
         let sherpa = ManagedRuntimeInstall::new(PathBuf::from("sherpa/bin/runtime"));
-        let merged = save_config_with_runtime_update_at(
+        let merged = save_config_with_managed_updates_at(
             &path,
             &stale_second,
+            &[],
             Some(("sherpa_onnx", Some(sherpa.clone()))),
         )
         .unwrap();
@@ -1315,6 +1355,103 @@ mod tests {
         );
         let persisted = read_config_file(&path).unwrap();
         assert_eq!(persisted.managed_runtimes, merged.config.managed_runtimes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn per_model_updates_preserve_unrelated_records_from_other_processes() {
+        let path = config_test_path("merge-models");
+        let root = path.parent().unwrap();
+        let model_root = root.join("models");
+        let first_install = ManagedModelInstall::new(model_root.join("first.gguf"));
+        let mut first = AppConfig {
+            model_storage_dir: model_root.clone(),
+            ..AppConfig::default()
+        };
+        first
+            .managed_models
+            .insert("first".to_owned(), first_install.clone());
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        save_config_file_locked(&path, &first, &lock).unwrap();
+        drop(lock);
+
+        let stale = AppConfig {
+            model_storage_dir: model_root.clone(),
+            ..AppConfig::default()
+        };
+        let second_install = ManagedModelInstall::new(model_root.join("second.gguf"));
+        let merged = save_config_with_managed_updates_at(
+            &path,
+            &stale,
+            &[("second", Some(second_install.clone()))],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged.config.managed_models.get("first"),
+            Some(&first_install)
+        );
+        assert_eq!(
+            merged.config.managed_models.get("second"),
+            Some(&second_install)
+        );
+
+        let removed =
+            save_config_with_managed_updates_at(&path, &stale, &[("first", None)], None).unwrap();
+        assert!(!removed.config.managed_models.contains_key("first"));
+        assert_eq!(
+            removed.config.managed_models.get("second"),
+            Some(&second_install)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_model_update_does_not_resurrect_old_root_metadata() {
+        let path = config_test_path("changed-model-root");
+        let root = path.parent().unwrap();
+        let old_root = root.join("old-models");
+        let new_root = root.join("new-models");
+        let mut persisted = AppConfig {
+            model_storage_dir: old_root.clone(),
+            ..AppConfig::default()
+        };
+        persisted.managed_models.insert(
+            "voice".to_owned(),
+            ManagedModelInstall::new(old_root.join("voice.gguf")),
+        );
+        let lock = lock_config_path(&path, Duration::from_secs(1)).unwrap();
+        save_config_file_locked(&path, &persisted, &lock).unwrap();
+        drop(lock);
+
+        let changed_root = AppConfig {
+            model_storage_dir: new_root.clone(),
+            ..AppConfig::default()
+        };
+        let replacement = ManagedModelInstall::new(new_root.join("voice.gguf"));
+        let updated = save_config_with_managed_updates_at(
+            &path,
+            &changed_root,
+            &[("voice", Some(replacement.clone()))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            updated.config.managed_models.get("voice"),
+            Some(&replacement)
+        );
+
+        let removed =
+            save_config_with_managed_updates_at(&path, &changed_root, &[("voice", None)], None)
+                .unwrap();
+        assert!(!removed.config.managed_models.contains_key("voice"));
+        assert!(
+            !read_config_file(&path)
+                .unwrap()
+                .managed_models
+                .contains_key("voice")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

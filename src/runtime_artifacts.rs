@@ -1,8 +1,10 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -19,6 +21,8 @@ const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 pub(crate) const VOICE_INTENT_LLAMA_CPP_RUNTIME_ID: &str = "voice_intent_llama_cpp";
+const INTENT_MODEL_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+static INTENT_MODEL_PARTIAL_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DownloadProgress {
@@ -107,6 +111,45 @@ pub(crate) struct IntentModelArtifact {
     pub(crate) sha256: String,
     pub(crate) size_bytes: u64,
     pub(crate) managed_relative_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IntentModelTransactionPhase {
+    Prepared,
+    BackedUp,
+    Activated,
+    AwaitingPersistence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntentModelTransactionJournal {
+    version: u32,
+    model_id: String,
+    phase: IntentModelTransactionPhase,
+    had_previous_model: bool,
+    previous_install: Option<config::ManagedModelInstall>,
+    new_install: Option<config::ManagedModelInstall>,
+    expected_sha256: Option<String>,
+    expected_size_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+struct IntentModelInstallLock {
+    _file: File,
+    previous_install: Option<config::ManagedModelInstall>,
+}
+
+#[derive(Debug)]
+pub(crate) struct IntentModelReplacement {
+    pub(crate) installed_path: PathBuf,
+    model_id: String,
+    backup_path: Option<PathBuf>,
+    expected_sha256: Option<String>,
+    expected_size_bytes: Option<u64>,
+    persistence_install: Option<Option<config::ManagedModelInstall>>,
+    _lock: IntentModelInstallLock,
 }
 
 #[derive(Deserialize)]
@@ -593,7 +636,7 @@ pub(crate) fn embedded_intent_model(
 pub(crate) fn download_and_stage_intent_model(
     model: &IntentModelArtifact,
     managed_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<IntentModelReplacement, String> {
     download_and_stage_intent_model_with_progress(model, managed_root, |_| {
         DownloadControl::Continue
     })
@@ -603,7 +646,7 @@ pub(crate) fn download_and_stage_intent_model_with_progress(
     model: &IntentModelArtifact,
     managed_root: &Path,
     on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
-) -> Result<PathBuf, String> {
+) -> Result<IntentModelReplacement, String> {
     model.validate()?;
     let url = model.url.as_deref().ok_or_else(|| {
         format!(
@@ -662,7 +705,7 @@ fn stage_intent_model_from_reader(
     model: &IntentModelArtifact,
     managed_root: &Path,
     reader: impl Read,
-) -> Result<PathBuf, String> {
+) -> Result<IntentModelReplacement, String> {
     stage_intent_model_from_reader_until(model, managed_root, reader, None)
 }
 
@@ -672,7 +715,7 @@ fn stage_intent_model_from_reader_until(
     managed_root: &Path,
     reader: impl Read,
     deadline: Option<Instant>,
-) -> Result<PathBuf, String> {
+) -> Result<IntentModelReplacement, String> {
     stage_intent_model_from_reader_until_with_progress(
         model,
         managed_root,
@@ -688,7 +731,7 @@ fn stage_intent_model_from_reader_until_with_progress(
     mut reader: impl Read,
     deadline: Option<Instant>,
     mut on_progress: impl FnMut(DownloadProgress) -> DownloadControl,
-) -> Result<PathBuf, String> {
+) -> Result<IntentModelReplacement, String> {
     model.validate()?;
     let target = managed_root.join(&model.managed_relative_path);
     let parent = target.parent().ok_or_else(|| {
@@ -699,17 +742,12 @@ fn stage_intent_model_from_reader_until_with_progress(
     })?;
     crate::durable_fs::create_dir_all(parent)
         .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
-    let partial = target.with_file_name(format!(
-        ".{}.partial",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("model")
-    ));
+    let install_lock = acquire_intent_model_install_lock(model, managed_root)?;
+    let partial = unique_intent_model_partial_path(&target);
 
     let mut owns_partial = false;
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&partial)
@@ -773,22 +811,713 @@ fn stage_intent_model_from_reader_until_with_progress(
             ));
         }
         drop(file);
-        // The final path may contain a verified model whose config publication
-        // was interrupted by process exit. Replacing only after the new bytes
-        // pass exact size and hash checks makes the next install self-healing.
-        crate::durable_fs::rename(&partial, &target, true).map_err(|err| {
-            format!(
-                "could not atomically activate voice intent model {}: {err}",
-                target.display()
-            )
-        })?;
-        Ok(target.clone())
+        publish_verified_intent_model(model, target, partial.clone(), install_lock, |_| Ok(()))
     })();
 
     if result.is_err() && owns_partial && partial.exists() {
-        let _ = crate::durable_fs::remove(&partial);
+        if let Err(cleanup) = crate::durable_fs::remove(&partial) {
+            return Err(format!(
+                "{}. Could not clean owned partial {}: {cleanup}",
+                result.unwrap_err(),
+                partial.display()
+            ));
+        }
     }
     result
+}
+
+impl IntentModelReplacement {
+    pub(crate) fn prepare_persistence(
+        &mut self,
+        new_install: Option<&config::ManagedModelInstall>,
+    ) -> Result<(), String> {
+        match new_install {
+            Some(install)
+                if install.path == self.installed_path
+                    && install.sha256 == self.expected_sha256
+                    && intent_model_file_matches(
+                        &self.installed_path,
+                        self.expected_size_bytes,
+                        self.expected_sha256.as_deref(),
+                    ) => {}
+            Some(_) => {
+                return Err(format!(
+                    "Refusing to persist invalid voice intent model metadata for {}.",
+                    self.model_id
+                ));
+            }
+            None if self.expected_sha256.is_none() && !self.installed_path.exists() => {}
+            None => {
+                return Err(format!(
+                    "Refusing to persist removal while voice intent model {} still exists.",
+                    self.installed_path.display()
+                ));
+            }
+        }
+        write_intent_model_journal(
+            &self.installed_path,
+            &IntentModelTransactionJournal {
+                version: 1,
+                model_id: self.model_id.clone(),
+                phase: IntentModelTransactionPhase::AwaitingPersistence,
+                had_previous_model: self.backup_path.is_some(),
+                previous_install: self._lock.previous_install.clone(),
+                new_install: new_install.cloned(),
+                expected_sha256: self.expected_sha256.clone(),
+                expected_size_bytes: self.expected_size_bytes,
+            },
+        )?;
+        self.persistence_install = Some(new_install.cloned());
+        Ok(())
+    }
+
+    pub(crate) fn commit(self) -> Result<(), String> {
+        let Some(new_install) = self.persistence_install.as_ref() else {
+            return Err(format!(
+                "Refusing to finalize voice intent model {} before configuration persistence.",
+                self.model_id
+            ));
+        };
+        if !intent_model_committed_state_is_valid(
+            &self.installed_path,
+            new_install.as_ref(),
+            self.expected_size_bytes,
+            self.expected_sha256.as_deref(),
+        ) {
+            return Err(format!(
+                "Refusing to finalize invalid voice intent model state for {}.",
+                self.model_id
+            ));
+        }
+        if let Some(backup) = self.backup_path.as_deref() {
+            remove_intent_model_path(backup)?;
+        }
+        remove_intent_model_journal(&self.installed_path)
+    }
+
+    pub(crate) fn rollback(self) -> Result<(), String> {
+        rollback_intent_model_files(
+            &self.installed_path,
+            self.backup_path.as_deref(),
+            self.backup_path.is_some(),
+        )?;
+        remove_intent_model_journal(&self.installed_path)
+    }
+}
+
+pub(crate) fn stage_intent_model_removal(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+) -> Result<IntentModelReplacement, String> {
+    model.validate()?;
+    let target = managed_root.join(&model.managed_relative_path);
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "voice intent model target {} has no parent",
+            target.display()
+        )
+    })?;
+    crate::durable_fs::create_dir_all(parent)
+        .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    let install_lock = acquire_intent_model_install_lock(model, managed_root)?;
+    publish_intent_model_removal(model, target, install_lock, |_| Ok(()))
+}
+
+fn acquire_intent_model_install_lock(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+) -> Result<IntentModelInstallLock, String> {
+    #[cfg(test)]
+    {
+        return acquire_intent_model_install_lock_with_timeout(
+            model,
+            managed_root,
+            None,
+            INTENT_MODEL_LOCK_TIMEOUT,
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let file = lock_intent_model_install(
+            &managed_root.join(&model.managed_relative_path),
+            INTENT_MODEL_LOCK_TIMEOUT,
+            &model.model_id,
+        )?;
+        let (mut persisted, _) = config::load_config().map_err(|err| {
+            format!("Could not load configuration for voice model recovery: {err}")
+        })?;
+        config::normalize_config(&mut persisted);
+        let target = managed_root.join(&model.managed_relative_path);
+        let previous_install = persisted
+            .managed_models
+            .get(&model.model_id)
+            .filter(|install| install.path == target)
+            .cloned();
+        recover_intent_model_transaction(model, &target, previous_install.as_ref())?;
+        Ok(IntentModelInstallLock {
+            _file: file,
+            previous_install,
+        })
+    }
+}
+
+fn acquire_intent_model_install_lock_with_timeout(
+    model: &IntentModelArtifact,
+    managed_root: &Path,
+    current_install: Option<&config::ManagedModelInstall>,
+    timeout: Duration,
+) -> Result<IntentModelInstallLock, String> {
+    let target = managed_root.join(&model.managed_relative_path);
+    let file = lock_intent_model_install(&target, timeout, &model.model_id)?;
+    recover_intent_model_transaction(model, &target, current_install)?;
+    Ok(IntentModelInstallLock {
+        _file: file,
+        previous_install: current_install.cloned(),
+    })
+}
+
+fn lock_intent_model_install(
+    target: &Path,
+    timeout: Duration,
+    model_id: &str,
+) -> Result<File, String> {
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "voice intent model target {} has no parent",
+            target.display()
+        )
+    })?;
+    crate::durable_fs::create_dir_all(parent)
+        .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    let lock_path = intent_model_transaction_path(target, "lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            format!(
+                "could not open voice intent model lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "Another Scribe process is installing or removing voice intent model {model_id}."
+                ));
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(format!(
+                    "could not lock voice intent model transaction {}: {err}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn publish_verified_intent_model(
+    model: &IntentModelArtifact,
+    target: PathBuf,
+    partial: PathBuf,
+    install_lock: IntentModelInstallLock,
+    on_phase: impl FnMut(IntentModelTransactionPhase) -> Result<(), String>,
+) -> Result<IntentModelReplacement, String> {
+    publish_intent_model_transaction(
+        model,
+        target,
+        Some(partial),
+        Some((model.sha256.clone(), model.size_bytes)),
+        install_lock,
+        on_phase,
+    )
+}
+
+fn publish_intent_model_removal(
+    model: &IntentModelArtifact,
+    target: PathBuf,
+    install_lock: IntentModelInstallLock,
+    on_phase: impl FnMut(IntentModelTransactionPhase) -> Result<(), String>,
+) -> Result<IntentModelReplacement, String> {
+    publish_intent_model_transaction(model, target, None, None, install_lock, on_phase)
+}
+
+fn publish_intent_model_transaction(
+    model: &IntentModelArtifact,
+    target: PathBuf,
+    partial: Option<PathBuf>,
+    expected: Option<(String, u64)>,
+    install_lock: IntentModelInstallLock,
+    mut on_phase: impl FnMut(IntentModelTransactionPhase) -> Result<(), String>,
+) -> Result<IntentModelReplacement, String> {
+    let backup = intent_model_transaction_path(&target, "backup");
+    if backup.exists() {
+        return Err(format!(
+            "Found an unrecovered voice intent model backup at {}; preserving it for recovery.",
+            backup.display()
+        ));
+    }
+    let had_previous_model = target.exists();
+    let mut journal = IntentModelTransactionJournal {
+        version: 1,
+        model_id: model.model_id.clone(),
+        phase: IntentModelTransactionPhase::Prepared,
+        had_previous_model,
+        previous_install: install_lock.previous_install.clone(),
+        new_install: None,
+        expected_sha256: expected.as_ref().map(|(sha256, _)| sha256.clone()),
+        expected_size_bytes: expected.as_ref().map(|(_, size)| *size),
+    };
+    write_intent_model_journal(&target, &journal)?;
+    let mut backup_moved = false;
+    let mut new_activated = false;
+    let publication = (|| {
+        on_phase(IntentModelTransactionPhase::Prepared)?;
+        if had_previous_model {
+            crate::durable_fs::rename(&target, &backup, false).map_err(|err| {
+                format!(
+                    "could not preserve existing voice intent model {}: {err}",
+                    target.display()
+                )
+            })?;
+            backup_moved = true;
+        }
+        journal.phase = IntentModelTransactionPhase::BackedUp;
+        write_intent_model_journal(&target, &journal)?;
+        on_phase(IntentModelTransactionPhase::BackedUp)?;
+        if let Some(partial) = partial.as_deref() {
+            crate::durable_fs::rename(partial, &target, false).map_err(|err| {
+                format!(
+                    "could not atomically activate voice intent model {}: {err}",
+                    target.display()
+                )
+            })?;
+            new_activated = true;
+        }
+        journal.phase = IntentModelTransactionPhase::Activated;
+        write_intent_model_journal(&target, &journal)?;
+        on_phase(IntentModelTransactionPhase::Activated)
+    })();
+    if let Err(message) = publication {
+        let mut failures = Vec::new();
+        if let Err(rollback) = rollback_failed_intent_model_publication(
+            &target,
+            &backup,
+            had_previous_model,
+            backup_moved,
+            new_activated,
+        ) {
+            failures.push(format!("rollback failed: {rollback}"));
+        } else if let Err(cleanup) = remove_intent_model_journal(&target) {
+            failures.push(format!("journal cleanup failed: {cleanup}"));
+        }
+        if let Some(partial) = partial.as_deref()
+            && partial.exists()
+            && let Err(cleanup) = remove_intent_model_path(partial)
+        {
+            failures.push(format!("partial cleanup failed: {cleanup}"));
+        }
+        return Err(if failures.is_empty() {
+            message
+        } else {
+            format!("{message}. {}", failures.join("; "))
+        });
+    }
+
+    Ok(IntentModelReplacement {
+        installed_path: target,
+        model_id: model.model_id.clone(),
+        backup_path: had_previous_model.then_some(backup),
+        expected_sha256: expected.as_ref().map(|(sha256, _)| sha256.clone()),
+        expected_size_bytes: expected.map(|(_, size)| size),
+        persistence_install: None,
+        _lock: install_lock,
+    })
+}
+
+fn rollback_failed_intent_model_publication(
+    target: &Path,
+    backup: &Path,
+    had_previous_model: bool,
+    backup_moved: bool,
+    new_activated: bool,
+) -> Result<(), String> {
+    if had_previous_model && backup_moved {
+        if !backup.exists() {
+            return Err(format!(
+                "the previous model backup {} is missing",
+                backup.display()
+            ));
+        }
+        if new_activated {
+            remove_intent_model_path(target)?;
+        }
+        crate::durable_fs::rename(backup, target, false).map_err(|err| {
+            format!(
+                "could not restore previous voice intent model {}: {err}",
+                target.display()
+            )
+        })?;
+    } else if !had_previous_model && new_activated {
+        remove_intent_model_path(target)?;
+    }
+    Ok(())
+}
+
+fn rollback_intent_model_files(
+    target: &Path,
+    backup: Option<&Path>,
+    had_previous_model: bool,
+) -> Result<(), String> {
+    match backup {
+        Some(backup) if backup.exists() => {
+            remove_intent_model_path(target)?;
+            crate::durable_fs::rename(backup, target, false).map_err(|err| {
+                format!(
+                    "could not restore previous voice intent model {}: {err}",
+                    target.display()
+                )
+            })
+        }
+        Some(backup) => Err(format!(
+            "the previous voice intent model backup {} is missing",
+            backup.display()
+        )),
+        None if had_previous_model => Err(format!(
+            "the previous voice intent model backup for {} is missing",
+            target.display()
+        )),
+        None => remove_intent_model_path(target),
+    }
+}
+
+pub(crate) fn recover_intent_model_transactions(config: &config::AppConfig) -> Result<(), String> {
+    let managed_root = config::model_storage_dir(config);
+    let mut errors = Vec::new();
+    for tier in [IntentModelTier::Compact, IntentModelTier::Balanced] {
+        let model = match embedded_intent_model(tier) {
+            Ok(Some(model)) => model,
+            Ok(None) => continue,
+            Err(message) => return Err(message),
+        };
+        let target = managed_root.join(&model.managed_relative_path);
+        if !intent_model_recovery_needed(&target) {
+            continue;
+        }
+        let current_install = config.managed_models.get(&model.model_id);
+        if let Err(message) = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &managed_root,
+            current_install,
+            INTENT_MODEL_LOCK_TIMEOUT,
+        ) {
+            errors.push(format!("{}: {message}", model.model_id));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn recover_intent_model_transaction(
+    model: &IntentModelArtifact,
+    target: &Path,
+    current_install: Option<&config::ManagedModelInstall>,
+) -> Result<(), String> {
+    let backup = intent_model_transaction_path(target, "backup");
+    if let Some(journal) = read_intent_model_journal(&model.model_id, target)? {
+        match journal.phase {
+            IntentModelTransactionPhase::AwaitingPersistence => {
+                if current_install == journal.new_install.as_ref() {
+                    if !intent_model_committed_state_is_valid(
+                        target,
+                        journal.new_install.as_ref(),
+                        journal.expected_size_bytes,
+                        journal.expected_sha256.as_deref(),
+                    ) {
+                        return Err(format!(
+                            "Committed voice intent model files for {} do not match the transaction journal.",
+                            model.model_id
+                        ));
+                    }
+                    remove_intent_model_path(&backup)?;
+                    remove_intent_model_journal(target)?;
+                } else if current_install == journal.previous_install.as_ref() {
+                    recover_intent_model_rollback(target, &backup, &journal)?;
+                    remove_intent_model_journal(target)?;
+                } else {
+                    return Err(format!(
+                        "Voice intent model transaction metadata for {} does not match the persisted configuration.",
+                        model.model_id
+                    ));
+                }
+            }
+            IntentModelTransactionPhase::Prepared => {
+                if backup.exists() {
+                    rollback_intent_model_files(target, Some(&backup), true)?;
+                } else if journal.had_previous_model && !target.exists() {
+                    return Err(format!(
+                        "The previous voice intent model {} is missing during recovery.",
+                        model.model_id
+                    ));
+                }
+                remove_intent_model_journal(target)?;
+            }
+            IntentModelTransactionPhase::BackedUp | IntentModelTransactionPhase::Activated => {
+                recover_intent_model_rollback(target, &backup, &journal)?;
+                remove_intent_model_journal(target)?;
+            }
+        }
+    } else if backup.exists() {
+        return Err(format!(
+            "Found an unjournaled voice intent model backup at {}; preserving it for manual recovery.",
+            backup.display()
+        ));
+    }
+    cleanup_stale_intent_model_partials(target)
+}
+
+fn recover_intent_model_rollback(
+    target: &Path,
+    backup: &Path,
+    journal: &IntentModelTransactionJournal,
+) -> Result<(), String> {
+    if journal.had_previous_model {
+        rollback_intent_model_files(target, Some(backup), true)
+    } else {
+        rollback_intent_model_files(target, None, false)
+    }
+}
+
+fn intent_model_committed_state_is_valid(
+    target: &Path,
+    install: Option<&config::ManagedModelInstall>,
+    expected_size_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> bool {
+    match install {
+        Some(install) => {
+            install.path == target
+                && install.sha256.as_deref() == expected_sha256
+                && intent_model_file_matches(target, expected_size_bytes, expected_sha256)
+        }
+        None => expected_sha256.is_none() && !target.exists(),
+    }
+}
+
+fn intent_model_file_matches(
+    path: &Path,
+    expected_size_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let (Some(expected_size_bytes), Some(expected_sha256)) = (expected_size_bytes, expected_sha256)
+    else {
+        return false;
+    };
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() == expected_size_bytes)
+    {
+        return false;
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hasher.finalize()) == expected_sha256
+}
+
+fn read_intent_model_journal(
+    model_id: &str,
+    target: &Path,
+) -> Result<Option<IntentModelTransactionJournal>, String> {
+    let next = intent_model_transaction_path(target, "transaction.next");
+    let current = intent_model_transaction_path(target, "transaction");
+    if next.exists() {
+        match parse_intent_model_journal(&next) {
+            Ok(journal) => {
+                validate_intent_model_journal(model_id, &next, &journal)?;
+                return Ok(Some(journal));
+            }
+            Err(next_error) if current.exists() => {
+                return parse_intent_model_journal(&current)
+                    .and_then(|journal| {
+                        validate_intent_model_journal(model_id, &current, &journal)?;
+                        Ok(journal)
+                    })
+                    .map(Some)
+                    .map_err(|current_error| format!("{next_error} {current_error}"));
+            }
+            Err(next_error) => return Err(next_error),
+        }
+    }
+    if !current.exists() {
+        return Ok(None);
+    }
+    let journal = parse_intent_model_journal(&current)?;
+    validate_intent_model_journal(model_id, &current, &journal)?;
+    Ok(Some(journal))
+}
+
+fn parse_intent_model_journal(path: &Path) -> Result<IntentModelTransactionJournal, String> {
+    let contents = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "could not read voice intent model transaction {}: {err}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&contents).map_err(|err| {
+        format!(
+            "voice intent model transaction {} is invalid: {err}",
+            path.display()
+        )
+    })
+}
+
+fn validate_intent_model_journal(
+    model_id: &str,
+    path: &Path,
+    journal: &IntentModelTransactionJournal,
+) -> Result<(), String> {
+    if journal.version != 1 || journal.model_id != model_id {
+        return Err(format!(
+            "voice intent model transaction {} has an unexpected identity",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_intent_model_journal(
+    target: &Path,
+    journal: &IntentModelTransactionJournal,
+) -> Result<(), String> {
+    let path = intent_model_transaction_path(target, "transaction");
+    let next = intent_model_transaction_path(target, "transaction.next");
+    remove_intent_model_path(&next)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&next)
+        .map_err(|err| {
+            format!(
+                "could not create voice intent model transaction {}: {err}",
+                next.display()
+            )
+        })?;
+    serde_json::to_writer(&mut file, journal)
+        .map_err(|err| format!("could not serialize voice intent model transaction: {err}"))?;
+    file.write_all(b"\n")
+        .map_err(|err| format!("could not write voice intent model transaction: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("could not sync voice intent model transaction: {err}"))?;
+    drop(file);
+    crate::durable_fs::rename(&next, &path, true).map_err(|err| {
+        format!(
+            "could not publish voice intent model transaction {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn remove_intent_model_journal(target: &Path) -> Result<(), String> {
+    remove_intent_model_path(&intent_model_transaction_path(target, "transaction.next"))?;
+    remove_intent_model_path(&intent_model_transaction_path(target, "transaction"))
+}
+
+fn remove_intent_model_path(path: &Path) -> Result<(), String> {
+    crate::durable_fs::remove(path)
+        .map_err(|err| format!("could not remove {}: {err}", path.display()))
+}
+
+fn intent_model_transaction_path(target: &Path, suffix: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    target.with_file_name(format!(".{name}.{suffix}"))
+}
+
+fn unique_intent_model_partial_path(target: &Path) -> PathBuf {
+    let sequence = INTENT_MODEL_PARTIAL_NONCE.fetch_add(1, Ordering::Relaxed);
+    intent_model_transaction_path(
+        target,
+        &format!("partial-{}-{sequence:016x}", std::process::id()),
+    )
+}
+
+fn cleanup_stale_intent_model_partials(target: &Path) -> Result<(), String> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    let legacy = format!(".{name}.partial");
+    let prefix = format!(".{name}.partial-");
+    for entry in fs::read_dir(parent).map_err(|err| {
+        format!(
+            "could not scan {} for stale partials: {err}",
+            parent.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            format!(
+                "could not inspect a stale model partial in {}: {err}",
+                parent.display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name == legacy || file_name.starts_with(&prefix) {
+            remove_intent_model_path(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn intent_model_recovery_needed(target: &Path) -> bool {
+    intent_model_transaction_path(target, "transaction").exists()
+        || intent_model_transaction_path(target, "transaction.next").exists()
+        || intent_model_transaction_path(target, "backup").exists()
+        || target.parent().is_some_and(|parent| {
+            let name = target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("model");
+            fs::read_dir(parent).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry.file_name().to_str().is_some_and(|candidate| {
+                        candidate == format!(".{name}.partial")
+                            || candidate.starts_with(&format!(".{name}.partial-"))
+                    })
+                })
+            })
+        })
 }
 
 fn report_download_progress(
@@ -1369,6 +2098,27 @@ mod tests {
         }
     }
 
+    fn test_model_install(
+        model: &IntentModelArtifact,
+        path: PathBuf,
+    ) -> config::ManagedModelInstall {
+        let mut install = config::ManagedModelInstall::app_managed(path, "test-release");
+        install.version = Some(model.version.clone());
+        install.sha256 = Some(model.sha256.clone());
+        install
+    }
+
+    fn commit_test_model(
+        model: &IntentModelArtifact,
+        mut replacement: IntentModelReplacement,
+    ) -> PathBuf {
+        let path = replacement.installed_path.clone();
+        let install = test_model_install(model, path.clone());
+        replacement.prepare_persistence(Some(&install)).unwrap();
+        replacement.commit().unwrap();
+        path
+    }
+
     fn temp_target(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "scribe-runtime-artifact-{name}-{}-{}",
@@ -1537,12 +2287,11 @@ mod tests {
     fn raw_gguf_staging_verifies_size_hash_exclusivity_and_cleanup() {
         let bytes = b"verified gguf bytes";
         let root = temp_target("model-success");
-        let staged = stage_intent_model_from_reader(
-            &test_intent_model(bytes, bytes.len() as u64),
-            &root,
-            Cursor::new(bytes),
-        )
-        .unwrap();
+        let model = test_intent_model(bytes, bytes.len() as u64);
+        let staged = commit_test_model(
+            &model,
+            stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).unwrap(),
+        );
         assert_eq!(fs::read(&staged).unwrap(), bytes);
         assert!(
             !root
@@ -1576,18 +2325,17 @@ mod tests {
             fs::remove_dir_all(root).unwrap();
         }
 
-        let root = temp_target("exclusive-partial");
+        let root = temp_target("stale-partial");
         let partial = root.join("voice-intent/.Qwen3-1.7B-Q8_0.gguf.partial");
         fs::create_dir_all(partial.parent().unwrap()).unwrap();
-        fs::write(&partial, b"owned by another download").unwrap();
-        let error = stage_intent_model_from_reader(
-            &test_intent_model(bytes, bytes.len() as u64),
-            &root,
-            Cursor::new(bytes),
-        )
-        .unwrap_err();
-        assert!(error.contains("exclusively create"));
-        assert_eq!(fs::read(&partial).unwrap(), b"owned by another download");
+        fs::write(&partial, b"crashed download").unwrap();
+        let model = test_intent_model(bytes, bytes.len() as u64);
+        let staged = commit_test_model(
+            &model,
+            stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).unwrap(),
+        );
+        assert_eq!(fs::read(staged).unwrap(), bytes);
+        assert!(!partial.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1649,6 +2397,7 @@ mod tests {
                 },
             ]
         );
+        let staged = commit_test_model(&model, staged);
         assert_eq!(fs::read(staged).unwrap(), bytes);
         fs::remove_dir_all(progress_root).unwrap();
 
@@ -1687,7 +2436,10 @@ mod tests {
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"orphaned prior bytes").unwrap();
 
-        let staged = stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).unwrap();
+        let staged = commit_test_model(
+            &model,
+            stage_intent_model_from_reader(&model, &root, Cursor::new(bytes)).unwrap(),
+        );
 
         assert_eq!(staged, target);
         assert_eq!(fs::read(&staged).unwrap(), bytes);
@@ -1696,6 +2448,210 @@ mod tests {
                 .with_file_name(".Qwen3-1.7B-Q8_0.gguf.partial")
                 .exists()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_publication_rolls_back_verified_previous_bytes_on_config_failure() {
+        let old = b"previous verified gguf";
+        let new = b"replacement verified gguf";
+        let model = test_intent_model(new, new.len() as u64);
+        let root = temp_target("model-config-rollback");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+
+        let mut replacement =
+            stage_intent_model_from_reader(&model, &root, Cursor::new(new)).unwrap();
+        let install = test_model_install(&model, target.clone());
+        replacement.prepare_persistence(Some(&install)).unwrap();
+        replacement.rollback().unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert!(!intent_model_transaction_path(&target, "backup").exists());
+        assert!(!intent_model_transaction_path(&target, "transaction").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_failure_injection_restores_previous_model_and_surfaces_rollback_failure() {
+        let old = b"previous verified gguf";
+        let new = b"replacement verified gguf";
+        let model = test_intent_model(new, new.len() as u64);
+
+        let root = temp_target("model-publish-failure");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+        let lock = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let partial = unique_intent_model_partial_path(&target);
+        fs::write(&partial, new).unwrap();
+        let error = publish_verified_intent_model(&model, target.clone(), partial, lock, |phase| {
+            if phase == IntentModelTransactionPhase::Activated {
+                Err("injected post-activation failure".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("injected post-activation failure"));
+        assert_eq!(fs::read(&target).unwrap(), old);
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = temp_target("model-rollback-failure");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+        let lock = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            None,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let partial = unique_intent_model_partial_path(&target);
+        fs::write(&partial, new).unwrap();
+        let backup = intent_model_transaction_path(&target, "backup");
+        let error = publish_verified_intent_model(&model, target.clone(), partial, lock, |phase| {
+            if phase == IntentModelTransactionPhase::Activated {
+                fs::remove_file(&backup).unwrap();
+                Err("injected failure after losing backup".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("previous model backup"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_install_lock_is_exclusive_and_crash_recovery_uses_persisted_record() {
+        let old = b"previous verified gguf";
+        let new = b"replacement verified gguf";
+        let model = test_intent_model(new, new.len() as u64);
+        let root = temp_target("model-lock-and-recovery");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+        let previous = config::ManagedModelInstall::new(target.clone());
+
+        let first = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let error = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(error.contains("Another Scribe process"));
+        drop(first);
+
+        let lock = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let partial = unique_intent_model_partial_path(&target);
+        fs::write(&partial, new).unwrap();
+        let mut replacement =
+            publish_verified_intent_model(&model, target.clone(), partial, lock, |_| Ok(()))
+                .unwrap();
+        let install = test_model_install(&model, target.clone());
+        replacement.prepare_persistence(Some(&install)).unwrap();
+        drop(replacement); // Simulate process exit after publication, before transaction cleanup.
+
+        let recovered = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert!(!intent_model_transaction_path(&target, "backup").exists());
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_model_record_completes_recovery_and_stale_unique_partial_is_removed() {
+        let old = b"previous verified gguf";
+        let new = b"replacement verified gguf";
+        let model = test_intent_model(new, new.len() as u64);
+        let root = temp_target("model-recovery-commit");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, old).unwrap();
+        let previous = config::ManagedModelInstall::new(target.clone());
+        let lock = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&previous),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let partial = unique_intent_model_partial_path(&target);
+        fs::write(&partial, new).unwrap();
+        let mut replacement =
+            publish_verified_intent_model(&model, target.clone(), partial, lock, |_| Ok(()))
+                .unwrap();
+        let install = test_model_install(&model, target.clone());
+        replacement.prepare_persistence(Some(&install)).unwrap();
+        drop(replacement);
+
+        let stale_partial = unique_intent_model_partial_path(&target);
+        fs::write(&stale_partial, b"crashed partial").unwrap();
+        let recovered = acquire_intent_model_install_lock_with_timeout(
+            &model,
+            &root,
+            Some(&install),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), new);
+        assert!(!intent_model_transaction_path(&target, "backup").exists());
+        assert!(!stale_partial.exists());
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_removal_stages_files_until_config_commit_and_can_restore_them() {
+        let bytes = b"verified gguf bytes";
+        let model = test_intent_model(bytes, bytes.len() as u64);
+        let root = temp_target("model-removal");
+        let target = root.join(&model.managed_relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, bytes).unwrap();
+
+        let mut removal = stage_intent_model_removal(&model, &root).unwrap();
+        assert!(!target.exists());
+        assert!(intent_model_transaction_path(&target, "backup").exists());
+        removal.prepare_persistence(None).unwrap();
+        removal.rollback().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+
+        let mut removal = stage_intent_model_removal(&model, &root).unwrap();
+        removal.prepare_persistence(None).unwrap();
+        removal.commit().unwrap();
+        assert!(!target.exists());
+        assert!(!intent_model_transaction_path(&target, "backup").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
