@@ -589,7 +589,7 @@ enum RuntimeVersionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeInstallSource {
     Packaged(PathBuf),
-    Remote(RuntimeArtifact),
+    Remote(Box<RuntimeArtifact>),
     DevelopmentScript(DevelopmentRuntimePackage),
 }
 
@@ -1009,7 +1009,7 @@ fn runtime_install_source_from_candidates(
     packaged
         .filter(|path| runtime_source_is_staged(config, model, path))
         .map(RuntimeInstallSource::Packaged)
-        .or_else(|| remote.map(RuntimeInstallSource::Remote))
+        .or_else(|| remote.map(|artifact| RuntimeInstallSource::Remote(Box::new(artifact))))
         .or_else(|| development.map(RuntimeInstallSource::DevelopmentScript))
 }
 
@@ -2822,9 +2822,9 @@ impl LocalTranscriberApp {
                     None,
                 ),
                 RuntimeInstallSource::Remote(artifact) => (
-                    install_remote_runtime_artifact(&runtime_id, &artifact),
+                    install_remote_runtime_artifact(&runtime_id, artifact.as_ref()),
                     "trusted-release-artifact",
-                    Some(artifact),
+                    Some(*artifact),
                 ),
                 RuntimeInstallSource::DevelopmentScript(package) => (
                     build_development_runtime_package(&runtime_id, &backend, package),
