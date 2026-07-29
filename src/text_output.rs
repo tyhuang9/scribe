@@ -213,6 +213,12 @@ where
     // A delayed target mismatch is an aborted output operation, so retain the
     // prior value independently of the normal post-insert restore preference.
     let previous_clipboard = clipboard.get_text().ok();
+    // Clipboard reads may block behind another process. Revalidate again at
+    // the actual mutation boundary so a focus change during that read cannot
+    // redirect a delayed result.
+    if !guard.matches_captured_target() {
+        return TextOutputResult::TargetChanged;
+    }
     if let Err(err) = clipboard.set_text(text.to_owned()) {
         return TextOutputResult::Failed(err.to_string());
     }
@@ -649,13 +655,36 @@ mod tests {
     }
 
     #[test]
-    fn delayed_output_target_change_before_paste_restores_untouched_clipboard() {
+    fn delayed_output_rechecks_focus_after_read_and_before_clipboard_write() {
         let mut clipboard = FakeClipboard {
             text: Some("before".to_owned()),
             ..FakeClipboard::default()
         };
         let mut paste = FakePaste::default();
         let mut guard = FakeTargetGuard::new([true, false], true);
+
+        let result = write_text_with_target_guard(
+            &mut clipboard,
+            &mut paste,
+            &mut guard,
+            "hello",
+            fast_options(),
+        );
+
+        assert_eq!(result, TextOutputResult::TargetChanged);
+        assert_eq!(clipboard.text.as_deref(), Some("before"));
+        assert!(clipboard.set_history.is_empty());
+        assert_eq!(paste.calls, 0);
+    }
+
+    #[test]
+    fn delayed_output_target_change_before_paste_restores_untouched_clipboard() {
+        let mut clipboard = FakeClipboard {
+            text: Some("before".to_owned()),
+            ..FakeClipboard::default()
+        };
+        let mut paste = FakePaste::default();
+        let mut guard = FakeTargetGuard::new([true, true, false], true);
 
         let result = write_text_with_target_guard(
             &mut clipboard,
@@ -681,7 +710,7 @@ mod tests {
             ..FakeClipboard::default()
         };
         let mut paste = FakePaste::default();
-        let mut guard = FakeTargetGuard::new([true, false], true);
+        let mut guard = FakeTargetGuard::new([true, true, false], true);
 
         let result = write_text_with_target_guard(
             &mut clipboard,
@@ -703,7 +732,7 @@ mod tests {
             ..FakeClipboard::default()
         };
         let mut paste = FakePaste::default();
-        let mut guard = FakeTargetGuard::new([true], false);
+        let mut guard = FakeTargetGuard::new([true, true], false);
 
         let result = write_text_with_target_guard(
             &mut clipboard,
@@ -728,7 +757,7 @@ mod tests {
             ..FakeClipboard::default()
         };
         let mut paste = FakePaste::default();
-        let mut guard = FakeTargetGuard::new([true, true], true);
+        let mut guard = FakeTargetGuard::new([true, true, true], true);
 
         let result = write_text_with_target_guard(
             &mut clipboard,
