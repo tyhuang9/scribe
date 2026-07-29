@@ -15,7 +15,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Experimental sherpa-onnx-family support (sherpa-onnx, Moonshine, and Parakeet) runs through managed, short-lived Python sidecars and currently provides batch transcription only; streaming needs a future backend API.
 - Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper, Vosk, sherpa-onnx, Moonshine, and Parakeet model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
-- Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
+- Tray/menu integration with close-to-tray behavior and Show, Hide, Copy Last Transcript, and Quit actions.
 - Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
 - Optional current-recording voice commands with deterministic destructive edits and on-demand local Qwen rewriting. Ordinary dictation never starts the editor model.
 - Raw, read-only whisper.cpp live preview while recording; commands are evaluated only after authoritative final transcription.

@@ -7,7 +7,6 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 
 const MENU_SHOW: &str = "scribe-show";
 const MENU_HIDE: &str = "scribe-hide";
-const MENU_TOGGLE_RECORDING: &str = "scribe-toggle-recording";
 const MENU_COPY_LAST: &str = "scribe-copy-last";
 const MENU_QUIT: &str = "scribe-quit";
 
@@ -15,7 +14,6 @@ const MENU_QUIT: &str = "scribe-quit";
 pub enum TrayCommand {
     Show,
     Hide,
-    ToggleRecording,
     CopyLastTranscript,
     Quit,
 }
@@ -23,7 +21,6 @@ pub enum TrayCommand {
 pub struct TrayService {
     _tray_icon: TrayIcon,
     command_rx: Receiver<TrayCommand>,
-    toggle_recording_item: MenuItem,
     copy_last_item: MenuItem,
     _show_item: MenuItem,
     _hide_item: MenuItem,
@@ -32,7 +29,7 @@ pub struct TrayService {
 }
 
 impl TrayService {
-    pub fn new(ctx: &egui::Context, is_recording: bool, has_transcript: bool) -> Result<Self> {
+    pub fn new(ctx: &egui::Context, has_transcript: bool) -> Result<Self> {
         if std::env::var_os("SCRIBE_DISABLE_TRAY").is_some() {
             return Err(anyhow!("system tray disabled by SCRIBE_DISABLE_TRAY"));
         }
@@ -43,22 +40,12 @@ impl TrayService {
         }
         ensure_tray_runtime_available()?;
         let command_rx = install_event_handlers(ctx);
-        catch_tray_init_panic(|| Self::build(command_rx, is_recording, has_transcript))?
+        catch_tray_init_panic(|| Self::build(command_rx, has_transcript))?
     }
 
-    fn build(
-        command_rx: Receiver<TrayCommand>,
-        is_recording: bool,
-        has_transcript: bool,
-    ) -> Result<Self> {
+    fn build(command_rx: Receiver<TrayCommand>, has_transcript: bool) -> Result<Self> {
         let show_item = MenuItem::with_id(MENU_SHOW, "Show Scribe", true, None);
         let hide_item = MenuItem::with_id(MENU_HIDE, "Hide Window", true, None);
-        let toggle_recording_item = MenuItem::with_id(
-            MENU_TOGGLE_RECORDING,
-            recording_label(is_recording),
-            true,
-            None,
-        );
         let copy_last_item =
             MenuItem::with_id(MENU_COPY_LAST, "Copy Last Transcript", has_transcript, None);
         let separator = PredefinedMenuItem::separator();
@@ -68,7 +55,6 @@ impl TrayService {
         menu.append_items(&[
             &show_item,
             &hide_item,
-            &toggle_recording_item,
             &copy_last_item,
             &separator,
             &quit_item,
@@ -87,18 +73,12 @@ impl TrayService {
         Ok(Self {
             _tray_icon: tray_icon,
             command_rx,
-            toggle_recording_item,
             copy_last_item,
             _show_item: show_item,
             _hide_item: hide_item,
             _quit_item: quit_item,
             _separator: separator,
         })
-    }
-
-    pub fn set_recording(&self, is_recording: bool) {
-        self.toggle_recording_item
-            .set_text(recording_label(is_recording));
     }
 
     pub fn set_has_transcript(&self, has_transcript: bool) {
@@ -245,7 +225,6 @@ fn command_from_menu_id(id: &str) -> Option<TrayCommand> {
     match id {
         MENU_SHOW => Some(TrayCommand::Show),
         MENU_HIDE => Some(TrayCommand::Hide),
-        MENU_TOGGLE_RECORDING => Some(TrayCommand::ToggleRecording),
         MENU_COPY_LAST => Some(TrayCommand::CopyLastTranscript),
         MENU_QUIT => Some(TrayCommand::Quit),
         _ => None,
@@ -264,14 +243,6 @@ fn tray_event_should_show(event: &TrayIconEvent) -> bool {
             ..
         }
     )
-}
-
-fn recording_label(is_recording: bool) -> &'static str {
-    if is_recording {
-        "Stop Recording"
-    } else {
-        "Start Recording"
-    }
 }
 
 fn scribe_icon() -> Result<Icon> {
@@ -318,10 +289,6 @@ mod tests {
         assert_eq!(command_from_menu_id(MENU_SHOW), Some(TrayCommand::Show));
         assert_eq!(command_from_menu_id(MENU_HIDE), Some(TrayCommand::Hide));
         assert_eq!(
-            command_from_menu_id(MENU_TOGGLE_RECORDING),
-            Some(TrayCommand::ToggleRecording)
-        );
-        assert_eq!(
             command_from_menu_id(MENU_COPY_LAST),
             Some(TrayCommand::CopyLastTranscript)
         );
@@ -358,18 +325,12 @@ mod tests {
         };
 
         bridge.send(TrayCommand::Show);
-        bridge.send(TrayCommand::ToggleRecording);
+        bridge.send(TrayCommand::Quit);
 
         assert_eq!(
             drain_commands(&receiver),
-            vec![TrayCommand::Show, TrayCommand::ToggleRecording]
+            vec![TrayCommand::Show, TrayCommand::Quit]
         );
         assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn recording_menu_label_tracks_recording_state() {
-        assert_eq!(recording_label(false), "Start Recording");
-        assert_eq!(recording_label(true), "Stop Recording");
     }
 }
