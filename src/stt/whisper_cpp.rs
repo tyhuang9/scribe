@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -19,6 +20,8 @@ use super::SttBackend;
 
 pub const PREVIEW_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PREVIEW_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_PREVIEW_OUTPUT_BYTES: u64 = 1024 * 1024;
+static NEXT_PREVIEW_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct WhisperCppBackend {
     executable_path: Option<PathBuf>,
@@ -60,10 +63,10 @@ impl WhisperCppBackend {
     ) -> Result<TranscriptResult> {
         let (executable, model_path) = self.validate_inputs(&audio_path, &model)?;
         let started = Instant::now();
-        let mut command = self.command(&executable, &model_path, &audio_path)?;
+        let mut command = self.preview_command(&executable, &model_path, &audio_path)?;
         let output =
             run_preview_command(&mut command, cancellation, PREVIEW_TRANSCRIPTION_TIMEOUT)?;
-        self.result_from_output(model, output, started)
+        self.result_from_output(model, output, started, true)
     }
 
     fn validate_inputs(
@@ -110,11 +113,28 @@ impl WhisperCppBackend {
         Ok(command)
     }
 
+    fn preview_command(
+        &self,
+        executable: &Path,
+        model_path: &Path,
+        audio_path: &Path,
+    ) -> Result<Command> {
+        let mut command = Command::new(executable);
+        command.args(whisper_preview_cli_args(
+            model_path,
+            audio_path,
+            &self.options,
+        ));
+        apply_whisper_environment(&mut command, executable, &self.options)?;
+        Ok(command)
+    }
+
     fn result_from_output(
         &self,
         model: SttModelInfo,
         output: Output,
         started: Instant,
+        preview: bool,
     ) -> Result<TranscriptResult> {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -141,15 +161,21 @@ impl WhisperCppBackend {
             text
         };
 
+        let segments = if preview {
+            preview_segments(&stdout, &text)
+        } else {
+            vec![TranscriptSegment {
+                start_ms: None,
+                end_ms: None,
+                text: text.clone(),
+            }]
+        };
+
         Ok(TranscriptResult {
             model_id: model.id,
             model_name: model.name,
             backend: "whisper.cpp".to_owned(),
-            segments: vec![TranscriptSegment {
-                start_ms: None,
-                end_ms: None,
-                text: text.clone(),
-            }],
+            segments,
             text,
             duration_ms: Some(started.elapsed().as_millis()),
             stdout,
@@ -177,7 +203,7 @@ impl SttBackend for WhisperCppBackend {
         let output = command
             .output()
             .with_context(|| format!("failed to run {}", executable.display()))?;
-        self.result_from_output(model, output, started)
+        self.result_from_output(model, output, started, false)
     }
 }
 
@@ -186,46 +212,39 @@ fn run_preview_command(
     cancellation: &PreviewCancellation,
     timeout: Duration,
 ) -> Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("failed to start whisper.cpp preview")?;
-    let stdout = child.stdout.take().expect("preview stdout should be piped");
-    let stderr = child.stderr.take().expect("preview stderr should be piped");
-    let stdout_reader = match thread::Builder::new()
-        .name("whisper-preview-stdout".to_owned())
-        .spawn(move || read_pipe(stdout))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_and_reap(&mut child);
-            return Err(error).context("failed to start whisper.cpp preview stdout reader");
-        }
-    };
-    let stderr_reader = match thread::Builder::new()
-        .name("whisper-preview-stderr".to_owned())
-        .spawn(move || read_pipe(stderr))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            terminate_and_reap(&mut child);
-            let _ = stdout_reader.join();
-            return Err(error).context("failed to start whisper.cpp preview stderr reader");
-        }
-    };
+    run_preview_command_in(command, cancellation, timeout, &env::temp_dir())
+}
+
+fn run_preview_command_in(
+    command: &mut Command,
+    cancellation: &PreviewCancellation,
+    timeout: Duration,
+    output_dir: &Path,
+) -> Result<Output> {
+    let mut stdout = PreviewOutputFile::new(output_dir, "stdout")?;
+    let mut stderr = PreviewOutputFile::new(output_dir, "stderr")?;
+    command
+        .stdout(stdout.child_stdio()?)
+        .stderr(stderr.child_stdio()?);
+    let child = command.spawn();
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = child.context("failed to start whisper.cpp preview")?;
     let started = Instant::now();
 
     let status = loop {
         if cancellation.is_cancelled() {
             terminate_and_reap(&mut child);
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
             return Err(anyhow!("live preview was cancelled"));
+        }
+        if stdout.exceeds_limit()? || stderr.exceeds_limit()? {
+            terminate_and_reap(&mut child);
+            return Err(anyhow!(
+                "whisper.cpp preview output exceeded {} bytes",
+                MAX_PREVIEW_OUTPUT_BYTES
+            ));
         }
         if started.elapsed() >= timeout {
             terminate_and_reap(&mut child);
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
             return Err(anyhow!(
                 "live preview exceeded its {} second timeout",
                 timeout.as_secs_f32()
@@ -236,31 +255,105 @@ fn run_preview_command(
             Ok(None) => {}
             Err(error) => {
                 terminate_and_reap(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
                 return Err(error).context("failed to poll whisper.cpp preview");
             }
         }
         thread::sleep(PREVIEW_PROCESS_POLL_INTERVAL.min(timeout));
     };
 
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| anyhow!("whisper.cpp preview stdout reader stopped unexpectedly"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow!("whisper.cpp preview stderr reader stopped unexpectedly"))?;
     Ok(Output {
         status,
-        stdout: stdout.context("failed to read whisper.cpp preview stdout")?,
-        stderr: stderr.context("failed to read whisper.cpp preview stderr")?,
+        stdout: stdout.read_bounded()?,
+        stderr: stderr.read_bounded()?,
     })
 }
 
-fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    pipe.read_to_end(&mut output)?;
-    Ok(output)
+struct PreviewOutputFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl PreviewOutputFile {
+    fn new(output_dir: &Path, stream: &str) -> Result<Self> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..100 {
+            let id = NEXT_PREVIEW_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = output_dir.join(format!(
+                "scribe-whisper-preview-{}-{timestamp}-{id}-{stream}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create preview output file in {}",
+                            output_dir.display()
+                        )
+                    });
+                }
+            }
+        }
+        Err(anyhow!(
+            "failed to reserve a unique preview output file in {}",
+            output_dir.display()
+        ))
+    }
+
+    fn child_stdio(&self) -> Result<Stdio> {
+        self.file
+            .try_clone()
+            .map(Stdio::from)
+            .context("failed to clone preview output file")
+    }
+
+    fn exceeds_limit(&self) -> Result<bool> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len() > MAX_PREVIEW_OUTPUT_BYTES)
+            .context("failed to inspect preview output file")
+    }
+
+    fn read_bounded(&mut self) -> Result<Vec<u8>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("failed to rewind preview output file")?;
+        let mut output = Vec::new();
+        self.file
+            .by_ref()
+            .take(MAX_PREVIEW_OUTPUT_BYTES + 1)
+            .read_to_end(&mut output)
+            .context("failed to read preview output file")?;
+        if output.len() as u64 > MAX_PREVIEW_OUTPUT_BYTES {
+            return Err(anyhow!(
+                "whisper.cpp preview output exceeded {} bytes",
+                MAX_PREVIEW_OUTPUT_BYTES
+            ));
+        }
+        Ok(output)
+    }
+}
+
+impl Drop for PreviewOutputFile {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to remove whisper.cpp preview output {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 fn terminate_and_reap(child: &mut std::process::Child) {
@@ -452,13 +545,32 @@ fn whisper_cli_args(
     audio_path: &Path,
     options: &WhisperCppOptions,
 ) -> Vec<OsString> {
+    whisper_args(model_path, audio_path, options, false)
+}
+
+fn whisper_preview_cli_args(
+    model_path: &Path,
+    audio_path: &Path,
+    options: &WhisperCppOptions,
+) -> Vec<OsString> {
+    whisper_args(model_path, audio_path, options, true)
+}
+
+fn whisper_args(
+    model_path: &Path,
+    audio_path: &Path,
+    options: &WhisperCppOptions,
+    timestamps: bool,
+) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("-m"),
         model_path.as_os_str().to_owned(),
         OsString::from("-f"),
         audio_path.as_os_str().to_owned(),
-        OsString::from("-nt"),
     ];
+    if !timestamps {
+        args.push(OsString::from("-nt"));
+    }
 
     match options.compute_mode {
         WhisperComputeMode::Auto => {}
@@ -572,6 +684,59 @@ pub(crate) fn parse_final_text(stdout: &str) -> String {
         .join("\n")
 }
 
+fn preview_segments(stdout: &str, fallback_text: &str) -> Vec<TranscriptSegment> {
+    let segments = stdout
+        .lines()
+        .filter_map(parse_timestamped_segment)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        vec![TranscriptSegment {
+            start_ms: None,
+            end_ms: None,
+            text: fallback_text.to_owned(),
+        }]
+    } else {
+        segments
+    }
+}
+
+fn parse_timestamped_segment(line: &str) -> Option<TranscriptSegment> {
+    let line = line.trim();
+    let end = line.find(']')?;
+    if !line.starts_with('[') {
+        return None;
+    }
+    let (start, finish) = line[1..end].split_once("-->")?;
+    let text = line[end + 1..].trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(TranscriptSegment {
+        start_ms: Some(parse_timestamp_ms(start.trim())?),
+        end_ms: Some(parse_timestamp_ms(finish.trim())?),
+        text: text.to_owned(),
+    })
+}
+
+fn parse_timestamp_ms(timestamp: &str) -> Option<u64> {
+    let (clock, millis) = timestamp.split_once('.')?;
+    let mut clock = clock.split(':');
+    let hours = clock.next()?.parse::<u64>().ok()?;
+    let minutes = clock.next()?.parse::<u64>().ok()?;
+    let seconds = clock.next()?.parse::<u64>().ok()?;
+    if clock.next().is_some() || minutes >= 60 || seconds >= 60 || millis.len() != 3 {
+        return None;
+    }
+    let millis = millis.parse::<u64>().ok()?;
+    hours
+        .checked_mul(60)?
+        .checked_add(minutes)?
+        .checked_mul(60)?
+        .checked_add(seconds)?
+        .checked_mul(1_000)?
+        .checked_add(millis)
+}
+
 fn strip_timestamp_prefix(line: &str) -> String {
     if let Some(end) = line.find(']')
         && line.starts_with('[')
@@ -601,6 +766,10 @@ mod tests {
                 println!("preview-success");
                 eprintln!("preview-stderr");
             }
+            Ok("large") => {
+                let output = vec![b'x'; MAX_PREVIEW_OUTPUT_BYTES as usize + 1];
+                std::io::Write::write_all(&mut std::io::stdout(), &output).unwrap();
+            }
             Ok("sleep") => thread::sleep(Duration::from_secs(5)),
             _ => {}
         }
@@ -619,54 +788,95 @@ mod tests {
         command
     }
 
+    fn preview_output_dir(label: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "scribe-preview-output-test-{label}-{}-{}",
+            std::process::id(),
+            NEXT_PREVIEW_OUTPUT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn assert_output_files_cleaned(path: &Path) {
+        assert!(fs::read_dir(path).unwrap().next().is_none());
+        fs::remove_dir(path).unwrap();
+    }
+
     #[test]
     fn preview_process_completes_and_captures_both_pipes() {
         let cancellation = PreviewCancellation::new();
-        let output = run_preview_command(
+        let output_dir = preview_output_dir("success");
+        let output = run_preview_command_in(
             &mut preview_test_command("success"),
             &cancellation,
             Duration::from_secs(2),
+            &output_dir,
         )
         .unwrap();
 
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("preview-success"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("preview-stderr"));
+        assert_output_files_cleaned(&output_dir);
     }
 
     #[test]
     fn preview_process_cancellation_kills_and_reaps_the_child() {
         let cancellation = PreviewCancellation::new();
         let cancellation_signal = cancellation.clone();
-        thread::spawn(move || {
+        let cancellation_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(40));
             cancellation_signal.cancel();
         });
         let started = Instant::now();
-        let error = run_preview_command(
+        let output_dir = preview_output_dir("cancel");
+        let error = run_preview_command_in(
             &mut preview_test_command("sleep"),
             &cancellation,
             Duration::from_secs(2),
+            &output_dir,
         )
         .unwrap_err();
+        cancellation_thread.join().unwrap();
 
         assert!(error.to_string().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_output_files_cleaned(&output_dir);
     }
 
     #[test]
     fn preview_process_timeout_kills_and_reaps_the_child() {
         let cancellation = PreviewCancellation::new();
         let started = Instant::now();
-        let error = run_preview_command(
+        let output_dir = preview_output_dir("timeout");
+        let error = run_preview_command_in(
             &mut preview_test_command("sleep"),
             &cancellation,
             Duration::from_millis(60),
+            &output_dir,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("timeout"));
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_output_files_cleaned(&output_dir);
+    }
+
+    #[test]
+    fn preview_process_enforces_output_limit_and_cleans_files() {
+        let cancellation = PreviewCancellation::new();
+        let output_dir = preview_output_dir("large");
+        let error = run_preview_command_in(
+            &mut preview_test_command("large"),
+            &cancellation,
+            Duration::from_secs(2),
+            &output_dir,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("output exceeded"));
+        assert_output_files_cleaned(&output_dir);
     }
 
     #[test]
@@ -686,6 +896,49 @@ mod tests {
     #[test]
     fn parse_final_text_keeps_plain_lines() {
         assert_eq!(parse_final_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn preview_timestamp_parser_returns_real_segment_offsets() {
+        let segments = preview_segments(
+            "[00:00:01.250 --> 00:00:03.750]  Timed preview words.",
+            "Timed preview words.",
+        );
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_ms, Some(1_250));
+        assert_eq!(segments[0].end_ms, Some(3_750));
+        assert_eq!(segments[0].text, "Timed preview words.");
+    }
+
+    #[test]
+    fn preview_segments_fall_back_to_untimed_output() {
+        let segments = preview_segments("plain output", "plain output");
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_ms, None);
+        assert_eq!(segments[0].end_ms, None);
+        assert_eq!(segments[0].text, "plain output");
+    }
+
+    #[test]
+    fn preview_args_keep_timestamps_enabled() {
+        let args = whisper_preview_cli_args(
+            Path::new("/models/ggml-base.en.bin"),
+            Path::new("/tmp/audio.wav"),
+            &WhisperCppOptions::default(),
+        );
+
+        assert!(!args.contains(&OsString::from("-nt")));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("/models/ggml-base.en.bin"),
+                OsString::from("-f"),
+                OsString::from("/tmp/audio.wav"),
+            ]
+        );
     }
 
     #[test]
