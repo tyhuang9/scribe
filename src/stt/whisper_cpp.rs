@@ -3,13 +3,16 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::config::{self, AppConfig, WhisperComputeMode};
 use crate::live_preview::PreviewCancellation;
@@ -21,6 +24,10 @@ use super::SttBackend;
 pub const PREVIEW_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PREVIEW_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_PREVIEW_OUTPUT_BYTES: u64 = 1024 * 1024;
+const PREVIEW_OUTPUT_DIR_NAME: &str = "whisper-preview-output";
+const PREVIEW_OUTPUT_PREFIX: &str = "scribe-whisper-preview-";
+const PREVIEW_OUTPUT_SUFFIX: &str = ".tmp";
+const STALE_PREVIEW_OUTPUT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_PREVIEW_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct WhisperCppBackend {
@@ -67,6 +74,19 @@ impl WhisperCppBackend {
         let output =
             run_preview_command(&mut command, cancellation, PREVIEW_TRANSCRIPTION_TIMEOUT)?;
         self.result_from_output(model, output, started, true)
+    }
+
+    pub fn transcribe_final_cancellable(
+        &self,
+        audio_path: PathBuf,
+        model: SttModelInfo,
+        cancellation: &PreviewCancellation,
+    ) -> Result<TranscriptResult> {
+        let (executable, model_path) = self.validate_inputs(&audio_path, &model)?;
+        let started = Instant::now();
+        let mut command = self.command(&executable, &model_path, &audio_path)?;
+        let output = run_controlled_command(&mut command, cancellation, Duration::MAX)?;
+        self.result_from_output(model, output, started, false)
     }
 
     fn validate_inputs(
@@ -212,7 +232,105 @@ fn run_preview_command(
     cancellation: &PreviewCancellation,
     timeout: Duration,
 ) -> Result<Output> {
-    run_preview_command_in(command, cancellation, timeout, &env::temp_dir())
+    run_controlled_command(command, cancellation, timeout)
+}
+
+fn run_controlled_command(
+    command: &mut Command,
+    cancellation: &PreviewCancellation,
+    timeout: Duration,
+) -> Result<Output> {
+    run_preview_command_in(command, cancellation, timeout, &preview_output_dir()?)
+}
+
+fn preview_output_dir() -> Result<PathBuf> {
+    let path = config::cache_dir()?.join(PREVIEW_OUTPUT_DIR_NAME);
+    fs::create_dir_all(&path).with_context(|| {
+        format!(
+            "failed to create whisper.cpp preview output directory {}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "failed to secure whisper.cpp preview output directory {}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+pub fn cleanup_stale_preview_outputs() -> Result<usize> {
+    let output_dir = preview_output_dir()?;
+    cleanup_stale_preview_outputs_in(&output_dir, SystemTime::now())
+}
+
+fn cleanup_stale_preview_outputs_in(output_dir: &Path, now: SystemTime) -> Result<usize> {
+    let mut removed = 0;
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to inspect {}", output_dir.display()))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("failed to inspect stale whisper.cpp preview output: {error}");
+                continue;
+            }
+        };
+        let is_file = match entry.file_type() {
+            Ok(file_type) => file_type.is_file(),
+            Err(error) => {
+                eprintln!(
+                    "failed to inspect stale whisper.cpp preview output {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if !is_file || !is_owned_preview_output_name(&entry.file_name()) {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(error) => {
+                eprintln!(
+                    "failed to read stale whisper.cpp preview output age {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if now.duration_since(modified).unwrap_or_default() < STALE_PREVIEW_OUTPUT_AGE {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => eprintln!(
+                "failed to remove stale whisper.cpp preview output {}: {error}",
+                entry.path().display()
+            ),
+        }
+    }
+    Ok(removed)
+}
+
+fn is_owned_preview_output_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(body) = name
+        .strip_prefix(PREVIEW_OUTPUT_PREFIX)
+        .and_then(|name| name.strip_suffix(PREVIEW_OUTPUT_SUFFIX))
+    else {
+        return false;
+    };
+    let parts = body.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[..3]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && matches!(parts[3], "stdout" | "stderr")
 }
 
 fn run_preview_command_in(
@@ -220,6 +338,30 @@ fn run_preview_command_in(
     cancellation: &PreviewCancellation,
     timeout: Duration,
     output_dir: &Path,
+) -> Result<Output> {
+    run_preview_command_in_with_check(
+        command,
+        cancellation,
+        timeout,
+        output_dir,
+        |stdout, stderr| {
+            if stdout.exceeds_limit()? || stderr.exceeds_limit()? {
+                return Err(anyhow!(
+                    "whisper.cpp preview output exceeded {} bytes",
+                    MAX_PREVIEW_OUTPUT_BYTES
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+fn run_preview_command_in_with_check(
+    command: &mut Command,
+    cancellation: &PreviewCancellation,
+    timeout: Duration,
+    output_dir: &Path,
+    mut check_output: impl FnMut(&PreviewOutputFile, &PreviewOutputFile) -> Result<()>,
 ) -> Result<Output> {
     let mut stdout = PreviewOutputFile::new(output_dir, "stdout")?;
     let mut stderr = PreviewOutputFile::new(output_dir, "stderr")?;
@@ -231,23 +373,17 @@ fn run_preview_command_in(
     // this path must add platform process-group/job containment before adoption.
     let child = command.spawn();
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = child.context("failed to start whisper.cpp preview")?;
+    let mut child = PreviewChild::new(child.context("failed to start whisper.cpp preview")?);
     let started = Instant::now();
 
     let status = loop {
         if cancellation.is_cancelled() {
-            terminate_and_reap(&mut child);
+            child.terminate_and_reap();
             return Err(anyhow!("live preview was cancelled"));
         }
-        if stdout.exceeds_limit()? || stderr.exceeds_limit()? {
-            terminate_and_reap(&mut child);
-            return Err(anyhow!(
-                "whisper.cpp preview output exceeded {} bytes",
-                MAX_PREVIEW_OUTPUT_BYTES
-            ));
-        }
+        check_output(&stdout, &stderr)?;
         if started.elapsed() >= timeout {
-            terminate_and_reap(&mut child);
+            child.terminate_and_reap();
             return Err(anyhow!(
                 "live preview exceeded its {} second timeout",
                 timeout.as_secs_f32()
@@ -257,7 +393,7 @@ fn run_preview_command_in(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                terminate_and_reap(&mut child);
+                child.terminate_and_reap();
                 return Err(error).context("failed to poll whisper.cpp preview");
             }
         }
@@ -269,6 +405,43 @@ fn run_preview_command_in(
         stdout: stdout.read_bounded()?,
         stderr: stderr.read_bounded()?,
     })
+}
+
+struct PreviewChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl PreviewChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    fn terminate_and_reap(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+}
+
+impl Drop for PreviewChild {
+    fn drop(&mut self) {
+        self.terminate_and_reap();
+    }
 }
 
 struct PreviewOutputFile {
@@ -285,15 +458,14 @@ impl PreviewOutputFile {
         for _ in 0..100 {
             let id = NEXT_PREVIEW_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
             let path = output_dir.join(format!(
-                "scribe-whisper-preview-{}-{timestamp}-{id}-{stream}.tmp",
+                "{PREVIEW_OUTPUT_PREFIX}{}-{timestamp}-{id}-{stream}{PREVIEW_OUTPUT_SUFFIX}",
                 std::process::id()
             ));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path) {
                 Ok(file) => return Ok(Self { path, file }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -357,11 +529,6 @@ impl Drop for PreviewOutputFile {
             );
         }
     }
-}
-
-fn terminate_and_reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
@@ -756,6 +923,9 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::models::default_model_catalog;
     use crate::stt::SttBackend;
 
@@ -791,7 +961,7 @@ mod tests {
         command
     }
 
-    fn preview_output_dir(label: &str) -> PathBuf {
+    fn test_preview_output_dir(label: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
             "scribe-preview-output-test-{label}-{}-{}",
             std::process::id(),
@@ -807,9 +977,49 @@ mod tests {
     }
 
     #[test]
+    fn stale_preview_output_cleanup_is_age_gated_and_name_scoped() {
+        let output_dir = test_preview_output_dir("stale-cleanup");
+        let owned = output_dir.join("scribe-whisper-preview-1-2-3-stdout.tmp");
+        let unrelated = output_dir.join("unrelated.tmp");
+        fs::write(&owned, b"old preview").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        let modified = fs::metadata(&owned).unwrap().modified().unwrap();
+
+        assert_eq!(
+            cleanup_stale_preview_outputs_in(&output_dir, modified).unwrap(),
+            0
+        );
+        assert!(owned.exists());
+        assert_eq!(
+            cleanup_stale_preview_outputs_in(
+                &output_dir,
+                modified + STALE_PREVIEW_OUTPUT_AGE + Duration::from_secs(1),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
+        fs::remove_file(unrelated).unwrap();
+        fs::remove_dir(output_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_output_files_are_created_owner_only() {
+        let output_dir = test_preview_output_dir("permissions");
+        let output = PreviewOutputFile::new(&output_dir, "stdout").unwrap();
+        let mode = output.file.metadata().unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode, 0o600);
+        drop(output);
+        assert_output_files_cleaned(&output_dir);
+    }
+
+    #[test]
     fn preview_process_completes_and_captures_both_pipes() {
         let cancellation = PreviewCancellation::new();
-        let output_dir = preview_output_dir("success");
+        let output_dir = test_preview_output_dir("success");
         let output = run_preview_command_in(
             &mut preview_test_command("success"),
             &cancellation,
@@ -833,11 +1043,11 @@ mod tests {
             cancellation_signal.cancel();
         });
         let started = Instant::now();
-        let output_dir = preview_output_dir("cancel");
+        let output_dir = test_preview_output_dir("cancel");
         let error = run_preview_command_in(
             &mut preview_test_command("sleep"),
             &cancellation,
-            Duration::from_secs(2),
+            Duration::MAX,
             &output_dir,
         )
         .unwrap_err();
@@ -852,7 +1062,7 @@ mod tests {
     fn preview_process_timeout_kills_and_reaps_the_child() {
         let cancellation = PreviewCancellation::new();
         let started = Instant::now();
-        let output_dir = preview_output_dir("timeout");
+        let output_dir = test_preview_output_dir("timeout");
         let error = run_preview_command_in(
             &mut preview_test_command("sleep"),
             &cancellation,
@@ -869,7 +1079,7 @@ mod tests {
     #[test]
     fn preview_process_enforces_output_limit_and_cleans_files() {
         let cancellation = PreviewCancellation::new();
-        let output_dir = preview_output_dir("large");
+        let output_dir = test_preview_output_dir("large");
         let error = run_preview_command_in(
             &mut preview_test_command("large"),
             &cancellation,
@@ -879,6 +1089,29 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("output exceeded"));
+        assert_output_files_cleaned(&output_dir);
+    }
+
+    #[test]
+    fn preview_post_spawn_error_reaps_child_and_cleans_files() {
+        let cancellation = PreviewCancellation::new();
+        let output_dir = test_preview_output_dir("post-spawn-error");
+        let started = Instant::now();
+        let error = run_preview_command_in_with_check(
+            &mut preview_test_command("sleep"),
+            &cancellation,
+            Duration::from_secs(2),
+            &output_dir,
+            |_, _| Err(anyhow!("injected output metadata failure")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected output metadata failure")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_output_files_cleaned(&output_dir);
     }
 

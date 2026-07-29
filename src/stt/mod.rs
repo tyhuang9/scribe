@@ -121,15 +121,7 @@ pub fn transcribe_with_config(
         "whisper.cpp" => {
             let provider = provider_for_backend("whisper.cpp")
                 .ok_or_else(|| anyhow!("missing whisper.cpp provider adapter"))?;
-            let backend = whisper_cpp::WhisperCppBackend::new(
-                whisper_cpp::resolve_whisper_cpp_executable(config),
-                whisper_cpp::WhisperCppOptions {
-                    compute_mode: config.whisper_compute_mode,
-                    gpu_device: config.whisper_gpu_device,
-                    cuda_backend_path: config.whisper_cuda_backend_path.clone(),
-                    cuda_library_paths: config.whisper_cuda_library_paths.clone(),
-                },
-            );
+            let backend = configured_whisper_cpp_backend(config);
             let capabilities = backend_capabilities(provider.backend);
             if !capabilities.runnable {
                 return Err(anyhow!(
@@ -250,15 +242,7 @@ pub fn transcribe_preview_with_config(
     if !backend_capabilities(provider.backend).runnable {
         return Err(anyhow!("whisper.cpp managed runtime is not bundled yet"));
     }
-    let backend = whisper_cpp::WhisperCppBackend::new(
-        whisper_cpp::resolve_whisper_cpp_executable(config),
-        whisper_cpp::WhisperCppOptions {
-            compute_mode: config.whisper_compute_mode,
-            gpu_device: config.whisper_gpu_device,
-            cuda_backend_path: config.whisper_cuda_backend_path.clone(),
-            cuda_library_paths: config.whisper_cuda_library_paths.clone(),
-        },
-    );
+    let backend = configured_whisper_cpp_backend(config);
     if !backend
         .list_models()
         .iter()
@@ -270,6 +254,48 @@ pub fn transcribe_preview_with_config(
         ));
     }
     backend.transcribe_preview(audio_path, model, cancellation)
+}
+
+pub fn transcribe_final_with_config_cancellable(
+    config: &AppConfig,
+    audio_path: PathBuf,
+    model: SttModelInfo,
+    cancellation: &PreviewCancellation,
+) -> Result<TranscriptResult> {
+    if model.backend != "whisper.cpp" {
+        return Err(anyhow!(
+            "controlled final transcription supports only whisper.cpp"
+        ));
+    }
+    let provider = provider_for_backend("whisper.cpp")
+        .ok_or_else(|| anyhow!("missing whisper.cpp provider adapter"))?;
+    if !backend_capabilities(provider.backend).runnable {
+        return Err(anyhow!("whisper.cpp managed runtime is not bundled yet"));
+    }
+    let backend = configured_whisper_cpp_backend(config);
+    if !backend
+        .list_models()
+        .iter()
+        .any(|available_model| available_model.id == model.id)
+    {
+        return Err(anyhow!(
+            "whisper.cpp does not advertise support for {}",
+            model.name
+        ));
+    }
+    backend.transcribe_final_cancellable(audio_path, model, cancellation)
+}
+
+fn configured_whisper_cpp_backend(config: &AppConfig) -> whisper_cpp::WhisperCppBackend {
+    whisper_cpp::WhisperCppBackend::new(
+        whisper_cpp::resolve_whisper_cpp_executable(config),
+        whisper_cpp::WhisperCppOptions {
+            compute_mode: config.whisper_compute_mode,
+            gpu_device: config.whisper_gpu_device,
+            cuda_backend_path: config.whisper_cuda_backend_path.clone(),
+            cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+        },
+    )
 }
 
 #[cfg(test)]
