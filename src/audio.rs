@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,14 +15,22 @@ use crate::config;
 const WAV_HEADER_BYTES: u64 = 44;
 const WAV_BYTES_PER_SAMPLE: u64 = 2;
 const RECORDING_STORAGE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RIFF_WAV_BYTES: u64 = u32::MAX as u64;
 const STALE_RECORDING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const RECORDING_PATH_ATTEMPTS: usize = 32;
 static RECORDING_NONCE: AtomicU64 = AtomicU64::new(0);
-const AUDIO_QUEUE_CAPACITY: usize = 8;
+// Allow 250 ms of conservative 5 ms callback batches: enough for scheduler jitter,
+// but bounded so a stalled writer fails promptly instead of growing memory indefinitely.
+const AUDIO_QUEUE_LATENCY_BUDGET_MS: usize = 250;
+const CONSERVATIVE_CALLBACK_INTERVAL_MS: usize = 5;
+const AUDIO_QUEUE_CAPACITY: usize =
+    AUDIO_QUEUE_LATENCY_BUDGET_MS / CONSERVATIVE_CALLBACK_INTERVAL_MS;
 
 pub struct RecordingSession {
     pub audio_path: PathBuf,
     stop_tx: Sender<()>,
     finished_rx: Receiver<Result<PathBuf, String>>,
+    completion_reported: AtomicBool,
 }
 
 impl RecordingSession {
@@ -31,7 +39,20 @@ impl RecordingSession {
     }
 
     pub fn try_finish(&self) -> Option<Result<PathBuf, String>> {
-        self.finished_rx.try_recv().ok()
+        if self.completion_reported.load(Ordering::Acquire) {
+            return None;
+        }
+        let completion = match self.finished_rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(
+                "audio recorder stopped unexpectedly before reporting completion".to_owned(),
+            )),
+        };
+        if completion.is_some() {
+            self.completion_reported.store(true, Ordering::Release);
+        }
+        completion
     }
 }
 
@@ -64,7 +85,7 @@ pub fn start_recording(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
 ) -> Result<RecordingSession> {
-    let audio_path = temp_wav_path()?;
+    let (audio_path, audio_file) = temp_wav_file()?;
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
     let (started_tx, started_rx) = bounded::<Result<(), String>>(1);
@@ -74,6 +95,7 @@ pub fn start_recording(
         let startup_error_tx = started_tx.clone();
         let result = record_to_wav(
             worker_path.clone(),
+            audio_file,
             stop_rx,
             max_duration_seconds,
             input_device_name,
@@ -82,9 +104,9 @@ pub fn start_recording(
         if let Err(err) = &result {
             let _ = startup_error_tx.try_send(Err(err.to_string()));
         }
-        let _ = fs::remove_file(recording_lock_path(&worker_path));
+        remove_file_best_effort(&recording_lock_path(&worker_path), "recording lock");
         if result.is_err() {
-            let _ = fs::remove_file(&worker_path);
+            remove_file_best_effort(&worker_path, "incomplete recording");
         }
         let _ = finished_tx.send(result.map(|_| worker_path).map_err(|err| err.to_string()));
     });
@@ -97,31 +119,69 @@ pub fn start_recording(
             audio_path,
             stop_tx,
             finished_rx,
+            completion_reported: AtomicBool::new(false),
         }),
         Err(message) => Err(anyhow!(message)),
     }
 }
 
-fn temp_wav_path() -> Result<PathBuf> {
+pub fn cleanup_stale_recording_artifacts() -> Result<usize> {
+    let dir = config::cache_dir()?.join("recordings");
+    match cleanup_stale_recordings(&dir, SystemTime::now(), STALE_RECORDING_AGE) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(0)
+        }
+        result => result,
+    }
+}
+
+fn temp_wav_file() -> Result<(PathBuf, File)> {
     let dir = config::cache_dir()?.join("recordings");
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create recording directory {}", dir.display()))?;
-    if let Err(err) = cleanup_stale_recordings(&dir, SystemTime::now(), STALE_RECORDING_AGE) {
+    if let Err(err) = cleanup_stale_recording_artifacts() {
         eprintln!("could not clean stale Scribe recordings: {err}");
     }
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let nonce = RECORDING_NONCE.fetch_add(1, Ordering::Relaxed);
-    Ok(dir.join(format!(
-        "recording-{millis}-{}-{nonce}.wav",
-        std::process::id()
-    )))
+    for _ in 0..RECORDING_PATH_ATTEMPTS {
+        let nonce = RECORDING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "recording-{millis}-{}-{nonce}.wav",
+            std::process::id()
+        ));
+        match create_recording_file(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to reserve recording file {}", path.display())
+                });
+            }
+        }
+    }
+    Err(anyhow!(
+        "failed to reserve a unique recording file after {RECORDING_PATH_ATTEMPTS} attempts"
+    ))
+}
+
+fn create_recording_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 fn record_to_wav(
     path: PathBuf,
+    audio_file: File,
     stop_rx: Receiver<()>,
     max_duration_seconds: u32,
     input_device_name: Option<String>,
@@ -149,7 +209,7 @@ fn record_to_wav(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&path, wav_spec)
+    let mut writer = hound::WavWriter::new(BufWriter::new(audio_file), wav_spec)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let (sample_tx, sample_rx) = bounded::<Vec<i16>>(AUDIO_QUEUE_CAPACITY);
     let (callback_error_tx, callback_error_rx) = bounded::<String>(1);
@@ -198,7 +258,7 @@ fn record_to_wav(
         let _ = started_tx.send(Err(message.clone()));
         return Err(anyhow!(message));
     }
-    let _ = started_tx.send(Ok(()));
+    confirm_recording_started(&started_tx)?;
 
     let max_duration = Duration::from_secs(max_duration_seconds.max(1) as u64);
     let started_at = std::time::Instant::now();
@@ -208,8 +268,13 @@ fn record_to_wav(
             callback_error = Some(message);
             break;
         }
-        if stop_rx.try_recv().is_ok() {
-            break;
+        match recording_stop_signal(&stop_rx) {
+            RecordingStopSignal::Continue => {}
+            RecordingStopSignal::Requested => break,
+            RecordingStopSignal::OwnerDropped => {
+                callback_error = Some("recording session was cancelled".to_owned());
+                break;
+            }
         }
         match sample_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(samples) => {
@@ -230,15 +295,10 @@ fn record_to_wav(
     if callback_error.is_none() {
         callback_error = callback_error_rx.try_recv().ok();
     }
-    while callback_error.is_none() {
-        match sample_rx.try_recv() {
-            Ok(samples) => {
-                if let Err(err) = write_samples(&mut writer, samples) {
-                    callback_error = Some(format!("failed to write recording audio: {err}"));
-                }
-            }
-            Err(_) => break,
-        }
+    if callback_error.is_none()
+        && let Err(err) = drain_queued_samples(&sample_rx, &mut writer)
+    {
+        callback_error = Some(format!("failed to write recording audio: {err}"));
     }
     let finalize_error = writer.finalize().err();
     if let Some(message) = callback_error {
@@ -253,6 +313,35 @@ fn record_to_wav(
 
 fn recording_limit_reached(elapsed: Duration, maximum: Duration) -> bool {
     elapsed >= maximum
+}
+
+fn confirm_recording_started(started_tx: &Sender<Result<(), String>>) -> Result<()> {
+    started_tx
+        .send(Ok(()))
+        .map_err(|_| anyhow!("recording startup was cancelled"))
+}
+
+fn remove_file_best_effort(path: &Path, description: &str) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("failed to remove {description} {}: {error}", path.display());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordingStopSignal {
+    Continue,
+    Requested,
+    OwnerDropped,
+}
+
+fn recording_stop_signal(stop_rx: &Receiver<()>) -> RecordingStopSignal {
+    match stop_rx.try_recv() {
+        Ok(()) => RecordingStopSignal::Requested,
+        Err(crossbeam_channel::TryRecvError::Empty) => RecordingStopSignal::Continue,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => RecordingStopSignal::OwnerDropped,
+    }
 }
 
 fn estimated_wav_bytes(sample_rate: u32, channels: u16, duration_seconds: u32) -> Option<u64> {
@@ -270,6 +359,10 @@ fn has_recording_space(available_bytes: u64, estimated_bytes: u64, reserve_bytes
         .is_some_and(|required| available_bytes >= required)
 }
 
+fn fits_supported_riff_wav(estimated_bytes: u64) -> bool {
+    estimated_bytes <= MAX_RIFF_WAV_BYTES
+}
+
 fn ensure_recording_space(
     recording_dir: &Path,
     sample_rate: u32,
@@ -278,6 +371,11 @@ fn ensure_recording_space(
 ) -> Result<()> {
     let estimated = estimated_wav_bytes(sample_rate, channels, duration_seconds)
         .ok_or_else(|| anyhow!("recording storage estimate overflowed"))?;
+    if !fits_supported_riff_wav(estimated) {
+        return Err(anyhow!(
+            "this microphone format and duration would exceed the 4 GiB WAV limit; choose a shorter recording duration"
+        ));
+    }
     let available = fs2::available_space(recording_dir)
         .with_context(|| format!("failed to check free space for {}", recording_dir.display()))?;
     if !has_recording_space(available, estimated, RECORDING_STORAGE_RESERVE_BYTES) {
@@ -292,9 +390,18 @@ fn ensure_recording_space(
 }
 
 fn recording_lock_path(recording_path: &Path) -> PathBuf {
-    let mut name = recording_path.as_os_str().to_os_string();
-    name.push(".lock");
-    PathBuf::from(name)
+    let owner_name = recording_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(recording_owner_name);
+    if let Some(mut owner_name) = owner_name {
+        owner_name.push_str(".lock");
+        return recording_path.with_file_name(owner_name);
+    }
+
+    let mut path = recording_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 fn lock_recording_path(recording_path: &Path) -> Result<File> {
@@ -319,16 +426,29 @@ fn recording_lock_is_contended(error: &anyhow::Error) -> bool {
 }
 
 fn is_owned_recording_name(name: &str) -> bool {
-    let Some(id) = name
+    recording_owner_name(name).is_some()
+}
+
+fn recording_owner_name(name: &str) -> Option<String> {
+    let id = name
         .strip_prefix("recording-")
-        .and_then(|name| name.strip_suffix(".wav"))
-    else {
-        return false;
-    };
-    !id.is_empty()
-        && id
-            .split('-')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|name| name.strip_suffix(".wav"))?;
+    let parts = id.split('-').collect::<Vec<_>>();
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    match parts.as_slice() {
+        [millis] if numeric(millis) => Some(name.to_owned()),
+        [millis, pid, nonce] if [millis, pid, nonce].into_iter().all(|part| numeric(part)) => {
+            Some(name.to_owned())
+        }
+        [millis, pid, nonce, "chunk", sequence]
+            if [millis, pid, nonce, sequence]
+                .into_iter()
+                .all(|part| numeric(part)) =>
+        {
+            Some(format!("recording-{millis}-{pid}-{nonce}.wav"))
+        }
+        _ => None,
+    }
 }
 
 fn is_stale_recording(
@@ -387,7 +507,7 @@ fn cleanup_stale_recordings(
         fs::remove_file(&path)
             .with_context(|| format!("failed to remove stale recording {}", path.display()))?;
         drop(lock);
-        let _ = fs::remove_file(recording_lock_path(&path));
+        remove_file_best_effort(&recording_lock_path(&path), "stale recording lock");
         removed += 1;
     }
     Ok(removed)
@@ -432,6 +552,19 @@ where
 {
     for sample in samples {
         writer.write_sample(sample)?;
+    }
+    Ok(())
+}
+
+fn drain_queued_samples<W>(
+    sample_rx: &Receiver<Vec<i16>>,
+    writer: &mut hound::WavWriter<W>,
+) -> hound::Result<()>
+where
+    W: Write + Seek,
+{
+    while let Ok(samples) = sample_rx.try_recv() {
+        write_samples(writer, samples)?;
     }
     Ok(())
 }
@@ -526,6 +659,17 @@ mod tests {
         assert_eq!(estimated_wav_bytes(48_000, 2, 60), Some(11_712_044));
         assert_eq!(estimated_wav_bytes(48_000, 2, 3_600), Some(691_392_044));
         assert_eq!(estimated_wav_bytes(u32::MAX, u16::MAX, u32::MAX), None);
+        let oversized = estimated_wav_bytes(384_000, 32, 7_200).unwrap();
+        assert!(!fits_supported_riff_wav(oversized));
+        assert!(
+            ensure_recording_space(Path::new("unused-for-oversized-wav"), 384_000, 32, 7_200)
+                .unwrap_err()
+                .to_string()
+                .contains("4 GiB WAV limit")
+        );
+        assert!(fits_supported_riff_wav(
+            estimated_wav_bytes(48_000, 2, 7_200).unwrap()
+        ));
     }
 
     #[test]
@@ -540,18 +684,27 @@ mod tests {
         let dir = test_dir("cleanup");
         fs::create_dir_all(dir.join("recording-333.wav")).unwrap();
         let stale = dir.join("recording-111.wav");
-        let active = dir.join("recording-222.wav");
+        let active = dir.join("recording-222-3-4.wav");
+        let active_chunk = dir.join("recording-222-3-4-chunk-5.wav");
+        let stale_chunk = dir.join("recording-555-6-7-chunk-8.wav");
+        let malformed = dir.join("recording-1-2.wav");
         let unrelated = dir.join("notes.wav");
         fs::write(&stale, b"stale").unwrap();
         fs::write(&active, b"active").unwrap();
+        fs::write(&active_chunk, b"active chunk").unwrap();
+        fs::write(&stale_chunk, b"stale chunk").unwrap();
+        fs::write(&malformed, b"not owned").unwrap();
         fs::write(&unrelated, b"unrelated").unwrap();
         let active_lock = lock_recording_path(&active).unwrap();
 
         let removed = cleanup_stale_recordings(&dir, SystemTime::now(), Duration::ZERO).unwrap();
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert!(!stale.exists());
+        assert!(!stale_chunk.exists());
         assert!(active.exists());
+        assert!(active_chunk.exists());
+        assert!(malformed.exists());
         assert!(unrelated.exists());
         assert!(dir.join("recording-333.wav").is_dir());
         drop(active_lock);
@@ -588,6 +741,34 @@ mod tests {
     }
 
     #[test]
+    fn owned_recording_parser_accepts_only_reserved_shapes() {
+        assert_eq!(
+            recording_owner_name("recording-1.wav").as_deref(),
+            Some("recording-1.wav")
+        );
+        assert_eq!(
+            recording_owner_name("recording-1-2-3.wav").as_deref(),
+            Some("recording-1-2-3.wav")
+        );
+        assert_eq!(
+            recording_owner_name("recording-1-2-3-chunk-4.wav").as_deref(),
+            Some("recording-1-2-3.wav")
+        );
+        for malformed in [
+            "recording-.wav",
+            "recording-1-2.wav",
+            "recording-1-2-3-4.wav",
+            "recording-1-2-3-chunk.wav",
+            "recording-1-2-3-chunk-x.wav",
+            "recording-1-2-3-chunk-4-5.wav",
+            "recording-x-2-3.wav",
+            "other-1-2-3.wav",
+        ] {
+            assert_eq!(recording_owner_name(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
     fn wav_write_errors_are_returned_to_the_recorder() {
         let spec = hound::WavSpec {
             channels: 1,
@@ -614,14 +795,110 @@ mod tests {
     }
 
     #[test]
-    fn full_sample_queue_is_reported_instead_of_dropping_audio_silently() {
-        let (sample_tx, _sample_rx) = bounded(1);
+    fn latency_bounded_sample_queue_reports_overflow_instead_of_dropping_audio() {
+        assert_eq!(AUDIO_QUEUE_CAPACITY, 50);
+        let (sample_tx, _sample_rx) = bounded(AUDIO_QUEUE_CAPACITY);
         let (error_tx, error_rx) = bounded(1);
-        sample_tx.try_send(vec![1_i16]).unwrap();
+        for _ in 0..AUDIO_QUEUE_CAPACITY {
+            sample_tx.try_send(vec![1_i16]).unwrap();
+        }
 
         queue_samples(vec![2_i16], &sample_tx, &error_tx);
 
         assert!(error_rx.try_recv().unwrap().contains("could not keep up"));
+    }
+
+    #[test]
+    fn queued_sample_batches_drain_in_capture_order() {
+        let dir = test_dir("queue-order");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ordered.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let (sample_tx, sample_rx) = bounded(2);
+        sample_tx.send(vec![1_i16, 2_i16]).unwrap();
+        sample_tx.send(vec![3_i16, 4_i16]).unwrap();
+
+        drain_queued_samples(&sample_rx, &mut writer).unwrap();
+        writer.finalize().unwrap();
+
+        let samples = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples, [1, 2, 3, 4]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recording_file_reservation_never_clobbers_an_existing_path() {
+        let dir = test_dir("create-new");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recording-1-2-3.wav");
+        fs::write(&path, b"keep me").unwrap();
+
+        let error = create_recording_file(&path).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"keep me");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropped_startup_receiver_rejects_the_handshake() {
+        let (started_tx, started_rx) = bounded(1);
+        drop(started_rx);
+
+        assert!(confirm_recording_started(&started_tx).is_err());
+    }
+
+    #[test]
+    fn disconnected_worker_is_reported_once_as_recording_completion() {
+        let (stop_tx, _stop_rx) = bounded(1);
+        let (finished_tx, finished_rx) = bounded(1);
+        drop(finished_tx);
+        let session = RecordingSession {
+            audio_path: PathBuf::from("recording-1.wav"),
+            stop_tx,
+            finished_rx,
+            completion_reported: AtomicBool::new(false),
+        };
+
+        assert!(session.try_finish().unwrap().is_err());
+        assert!(session.try_finish().is_none());
+    }
+
+    #[test]
+    fn dropped_startup_session_owner_cancels_the_recorder() {
+        let (stop_tx, stop_rx) = bounded(1);
+        assert_eq!(
+            recording_stop_signal(&stop_rx),
+            RecordingStopSignal::Continue
+        );
+
+        drop(stop_tx);
+
+        assert_eq!(
+            recording_stop_signal(&stop_rx),
+            RecordingStopSignal::OwnerDropped
+        );
+    }
+
+    #[test]
+    fn explicit_stop_request_remains_a_successful_recording_stop() {
+        let (stop_tx, stop_rx) = bounded(1);
+        stop_tx.send(()).unwrap();
+
+        assert_eq!(
+            recording_stop_signal(&stop_rx),
+            RecordingStopSignal::Requested
+        );
     }
 
     #[test]

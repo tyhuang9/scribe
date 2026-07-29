@@ -41,7 +41,7 @@ const RECORD_STATE_MOTION_SECONDS: f32 = 0.18;
 const RECORD_HOVER_MOTION_SECONDS: f32 = 0.12;
 const RECORD_PRESS_MOTION_SECONDS: f32 = 0.08;
 const RECORDING_DURATION_PRESETS: [(u32, &str); 7] = [
-    (30, "30 seconds"),
+    (30, "0.5 minutes"),
     (60, "1 minute"),
     (5 * 60, "5 minutes"),
     (10 * 60, "10 minutes"),
@@ -1129,6 +1129,10 @@ impl LocalTranscriberApp {
             ),
         };
         config::normalize_config(&mut config);
+        if let Err(error) = audio::cleanup_stale_recording_artifacts() {
+            eprintln!("could not clean stale Scribe recording artifacts: {error}");
+            status_message = format!("{status_message} Recording cleanup warning: {error}");
+        }
         if let Err(message) = recover_managed_runtime_transactions(&mut config) {
             status_message = format!("{status_message} Runtime recovery warning: {message}");
         }
@@ -5371,13 +5375,15 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
 }
 
 fn format_recording_duration(seconds: u32) -> String {
-    let minutes = seconds / 60;
-    let remainder = seconds % 60;
-    match (minutes, remainder) {
-        (0, seconds) => format!("{seconds} second{}", if seconds == 1 { "" } else { "s" }),
-        (minutes, 0) => format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" }),
-        (minutes, seconds) => format!("{minutes}m {seconds}s"),
+    let minutes = recording_duration_minutes(seconds);
+    let mut value = format!("{minutes:.2}");
+    while value.ends_with('0') {
+        value.pop();
     }
+    if value.ends_with('.') {
+        value.pop();
+    }
+    format!("{value} minute{}", if seconds == 60 { "" } else { "s" })
 }
 
 fn recording_duration_minutes(seconds: u32) -> f64 {
@@ -7009,10 +7015,10 @@ mod layout_tests {
 
     #[test]
     fn recording_duration_labels_are_human_readable() {
-        assert_eq!(format_recording_duration(1), "1 second");
-        assert_eq!(format_recording_duration(30), "30 seconds");
+        assert_eq!(format_recording_duration(1), "0.02 minutes");
+        assert_eq!(format_recording_duration(30), "0.5 minutes");
         assert_eq!(format_recording_duration(60), "1 minute");
-        assert_eq!(format_recording_duration(125), "2m 5s");
+        assert_eq!(format_recording_duration(125), "2.08 minutes");
         assert_eq!(format_recording_duration(3_600), "60 minutes");
         assert_eq!(format_recording_duration(7_200), "120 minutes");
     }
