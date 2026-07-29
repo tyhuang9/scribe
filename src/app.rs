@@ -41,8 +41,8 @@ use crate::models::{
     format_bytes,
 };
 use crate::runtime_artifacts::{
-    self, DownloadControl, DownloadProgress, IntentModelArtifact, IntentModelTier, RuntimeArtifact,
-    RuntimeDevicePack,
+    self, DownloadControl, DownloadProgress, IntentModelArtifact, IntentModelReplacement,
+    IntentModelTier, RuntimeArtifact, RuntimeDevicePack,
 };
 use crate::runtime_catalog;
 use crate::stt;
@@ -402,11 +402,11 @@ enum AppEvent {
     },
     VoiceEditorInstallProgress(VoiceEditorInstallProgress),
     VoiceEditorInstallDone {
-        replacement: Option<Box<RuntimeReplacement>>,
+        runtime_replacement: Option<Box<RuntimeReplacement>>,
         runtime_install: Option<config::ManagedRuntimeInstall>,
         model: IntentModelArtifact,
-        model_path: PathBuf,
-        model_was_new: bool,
+        model_replacement: Option<Box<IntentModelReplacement>>,
+        model_install: Option<config::ManagedModelInstall>,
     },
     VoiceEditorInstallFailed {
         message: String,
@@ -1387,6 +1387,43 @@ fn semantic_candidate_limit_warning(plan: &VoiceEditPlan) -> Option<String> {
     })
 }
 
+fn rollback_voice_editor_install_transactions(
+    runtime: Option<Box<RuntimeReplacement>>,
+    model: Option<Box<IntentModelReplacement>>,
+) -> String {
+    let mut warnings = Vec::new();
+    if let Some(model) = model
+        && let Err(message) = model.rollback()
+    {
+        warnings.push(message);
+    }
+    if let Some(runtime) = runtime
+        && let Err(message) = runtime.rollback()
+    {
+        warnings.push(message);
+    }
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(" Rollback warning: {}", warnings.join("; "))
+    }
+}
+
+fn rollback_intent_model_transactions(
+    transactions: &mut Vec<(String, IntentModelReplacement)>,
+) -> Vec<String> {
+    transactions
+        .drain(..)
+        .rev()
+        .filter_map(|(model_id, replacement)| {
+            replacement
+                .rollback()
+                .err()
+                .map(|message| format!("{model_id}: {message}"))
+        })
+        .collect()
+}
+
 fn resolve_voice_editing_artifacts(
     config: &AppConfig,
 ) -> Result<(PathBuf, PathBuf, IntentTier), String> {
@@ -1559,6 +1596,11 @@ impl LocalTranscriberApp {
         }
         if let Err(message) = recover_managed_runtime_transactions(&mut config) {
             status_message = format!("{status_message} Runtime recovery warning: {message}");
+        }
+        if voice_editor_platform_supported()
+            && let Err(message) = runtime_artifacts::recover_intent_model_transactions(&config)
+        {
+            status_message = format!("{status_message} Voice model recovery warning: {message}");
         }
         cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
             config.theme_mode,
@@ -2713,7 +2755,7 @@ impl LocalTranscriberApp {
         let worker = thread::Builder::new()
             .name("voice-editor-install".to_owned())
             .spawn(move || {
-                let replacement = if runtime_ready {
+                let runtime_replacement = if runtime_ready {
                     None
                 } else {
                     let mut last_report = Instant::now() - Duration::from_secs(1);
@@ -2748,15 +2790,15 @@ impl LocalTranscriberApp {
                     }
                 };
 
-                let runtime_install = replacement.as_ref().map(|replacement| {
+                let runtime_install = runtime_replacement.as_ref().map(|replacement| {
                     managed_runtime_install_record(
                         replacement.installed_path.clone(),
                         "trusted-release-artifact",
                         Some(&runtime_artifact),
                     )
                 });
-                let model_path = if model_ready {
-                    installed_model_path.expect("verified installed voice model path")
+                let (model_replacement, model_install) = if model_ready {
+                    (None, None)
                 } else {
                     let mut last_report = Instant::now() - Duration::from_secs(1);
                     match runtime_artifacts::download_and_stage_intent_model_with_progress(
@@ -2782,9 +2824,19 @@ impl LocalTranscriberApp {
                             DownloadControl::Continue
                         },
                     ) {
-                        Ok(path) => path,
+                        Ok(replacement) => {
+                            let mut install = config::ManagedModelInstall::app_managed(
+                                replacement.installed_path.clone(),
+                                "trusted-release-artifact",
+                            );
+                            install.source = model_artifact.url.clone();
+                            install.version = Some(model_artifact.version.clone());
+                            install.sha256 = Some(model_artifact.sha256.clone());
+                            install.platform = Some(config::current_platform_key());
+                            (Some(Box::new(replacement)), Some(install))
+                        }
                         Err(message) => {
-                            let rollback = replacement
+                            let rollback = runtime_replacement
                                 .and_then(|replacement| replacement.rollback().err())
                                 .map(|rollback| format!(" Rollback warning: {rollback}"))
                                 .unwrap_or_default();
@@ -2796,11 +2848,11 @@ impl LocalTranscriberApp {
                     }
                 };
                 let _ = tx.send(AppEvent::VoiceEditorInstallDone {
-                    replacement: replacement.map(Box::new),
+                    runtime_replacement: runtime_replacement.map(Box::new),
                     runtime_install,
                     model: model_artifact,
-                    model_path,
-                    model_was_new: !model_ready,
+                    model_replacement,
+                    model_install,
                 });
             });
         match worker {
@@ -2823,53 +2875,96 @@ impl LocalTranscriberApp {
             return;
         }
         let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
-        let model_ids = VoiceEditingModelTier::ALL.map(VoiceEditingModelTier::model_id);
-        let mut model_paths = model_ids
-            .iter()
-            .filter_map(|model_id| {
-                self.config
-                    .managed_models
-                    .get(*model_id)
-                    .map(|install| install.path.clone())
-            })
-            .collect::<Vec<_>>();
-        for path in known_voice_editor_model_paths(&self.config) {
-            if !model_paths.contains(&path) {
-                model_paths.push(path);
-            }
-        }
+        let model_root = config::model_storage_dir(&self.config);
         let target_root = config::runtime_storage_dir().join(runtime_id);
+        let mut staged_models: Vec<(String, IntentModelReplacement)> = Vec::new();
+        let mut retained_warnings = Vec::new();
         let result = uninstall_runtime_transaction_at(
             &mut self.config,
             runtime_id,
             &target_root,
             |candidate| {
-                let mut candidate = candidate.clone();
-                for model_id in model_ids {
-                    candidate.managed_models.remove(model_id);
+                for tier in [IntentModelTier::Compact, IntentModelTier::Balanced] {
+                    let model = runtime_artifacts::embedded_intent_model(tier)
+                        .map_err(|message| format!("Voice editor catalog is invalid: {message}"))?
+                        .ok_or_else(|| format!("Voice editor catalog is missing {tier:?}"))?;
+                    let expected_path = model_root.join(&model.managed_relative_path);
+                    if let Some(install) = candidate.managed_models.get(&model.model_id)
+                        && install.path != expected_path
+                    {
+                        retained_warnings.push(format!(
+                            "Retained {} metadata because {} is outside the current managed model directory",
+                            model.model_id,
+                            install.path.display()
+                        ));
+                        continue;
+                    }
+                    if !expected_path.exists()
+                        && !candidate.managed_models.contains_key(&model.model_id)
+                    {
+                        continue;
+                    }
+                    let mut removal =
+                        match runtime_artifacts::stage_intent_model_removal(&model, &model_root) {
+                            Ok(removal) => removal,
+                            Err(message) => {
+                                let rollback =
+                                    rollback_intent_model_transactions(&mut staged_models);
+                                return Err(format!(
+                                    "Could not stage {} removal: {message}. {}",
+                                    model.model_id,
+                                    rollback.join("; ")
+                                ));
+                            }
+                        };
+                    if let Err(message) = removal.prepare_persistence(None) {
+                        let mut rollback = rollback_intent_model_transactions(&mut staged_models);
+                        if let Err(rollback_message) = removal.rollback() {
+                            rollback.push(format!("{}: {rollback_message}", model.model_id));
+                        }
+                        return Err(format!(
+                            "Could not prepare {} removal: {message}. {}",
+                            model.model_id,
+                            rollback.join("; ")
+                        ));
+                    }
+                    staged_models.push((model.model_id, removal));
                 }
-                config::save_config_with_runtime_update(&candidate, Some((runtime_id, None)))
-                    .map_err(|error| error.to_string())
+
+                let model_updates = staged_models
+                    .iter()
+                    .map(|(model_id, _)| (model_id.as_str(), None))
+                    .collect::<Vec<_>>();
+                match config::save_config_with_managed_updates(
+                    candidate,
+                    &model_updates,
+                    Some((runtime_id, None)),
+                ) {
+                    Ok(committed) => Ok(committed),
+                    Err(error) => {
+                        let rollback = rollback_intent_model_transactions(&mut staged_models);
+                        Err(format!(
+                            "Could not persist model removal: {error}. {}",
+                            rollback.join("; ")
+                        ))
+                    }
+                }
             },
         );
         match result {
             Ok(outcome) => {
-                let mut warnings = Vec::new();
-                let removal_is_durable = outcome.durability_warning.is_none();
+                let mut warnings = retained_warnings;
                 if let Some(warning) = outcome.durability_warning {
                     warnings.push(warning);
                     warnings.push(
-                        "Model files were retained until removal can be confirmed after restart"
+                        "Model removal journals were retained until startup can confirm the persisted configuration"
                             .to_owned(),
                     );
-                }
-                if removal_is_durable {
-                    for path in model_paths {
-                        let model_root = config::model_storage_dir(&self.config);
-                        if managed_voice_artifact_is_safe(&path, &model_root)
-                            && let Err(error) = durable_fs::remove(&path)
-                        {
-                            warnings.push(format!("Could not remove {}: {error}", path.display()));
+                    drop(staged_models);
+                } else {
+                    for (model_id, removal) in staged_models {
+                        if let Err(message) = removal.commit() {
+                            warnings.push(format!("{model_id}: {message}"));
                         }
                     }
                 }
@@ -2894,70 +2989,80 @@ impl LocalTranscriberApp {
 
     fn finish_voice_editor_install(
         &mut self,
-        mut replacement: Option<Box<RuntimeReplacement>>,
+        mut runtime_replacement: Option<Box<RuntimeReplacement>>,
         runtime_install: Option<config::ManagedRuntimeInstall>,
         model: IntentModelArtifact,
-        model_path: PathBuf,
-        model_was_new: bool,
+        mut model_replacement: Option<Box<IntentModelReplacement>>,
+        model_install: Option<config::ManagedModelInstall>,
     ) {
         self.voice_editor_install_cancellation = None;
         self.voice_editor_install_progress = None;
         let runtime_id = runtime_artifacts::VOICE_INTENT_LLAMA_CPP_RUNTIME_ID;
-        let mut model_install = config::ManagedModelInstall::app_managed(
-            model_path.clone(),
-            "trusted-release-artifact",
-        );
-        model_install.source = model.url.clone();
-        model_install.version = Some(model.version.clone());
-        model_install.sha256 = Some(model.sha256.clone());
-        model_install.platform = Some(config::current_platform_key());
-
         let mut candidate = self.config.clone();
-        candidate
-            .managed_models
-            .insert(model.model_id.clone(), model_install);
+        if let Some(model_install) = model_install.as_ref() {
+            candidate
+                .managed_models
+                .insert(model.model_id.clone(), model_install.clone());
+        }
         if let Some(runtime_install) = runtime_install.as_ref() {
             candidate
                 .managed_runtimes
                 .insert(runtime_id.to_owned(), runtime_install.clone());
         }
-        let prepare_error = replacement.as_mut().and_then(|replacement| {
+
+        if runtime_replacement.is_some() != runtime_install.is_some()
+            || model_replacement.is_some() != model_install.is_some()
+        {
+            let rollback = rollback_voice_editor_install_transactions(
+                runtime_replacement.take(),
+                model_replacement.take(),
+            );
+            self.fail_voice_editor_install(format!(
+                "The staged voice editor files and their metadata did not match.{rollback}"
+            ));
+            return;
+        }
+        if let Some(message) = runtime_replacement.as_mut().and_then(|replacement| {
             replacement
                 .prepare_persistence(runtime_install.as_ref())
                 .err()
-        });
-        if let Some(message) = prepare_error {
-            let rollback = replacement
-                .take()
-                .and_then(|replacement| replacement.rollback().err())
-                .map(|warning| format!(" Rollback warning: {warning}"))
-                .unwrap_or_default();
-            if model_was_new {
-                let _ = durable_fs::remove(&model_path);
-            }
+        }) {
+            let rollback = rollback_voice_editor_install_transactions(
+                runtime_replacement.take(),
+                model_replacement.take(),
+            );
+            self.fail_voice_editor_install(format!("{message}.{rollback}"));
+            return;
+        }
+        if let Some(message) = model_replacement.as_mut().and_then(|replacement| {
+            replacement
+                .prepare_persistence(model_install.as_ref())
+                .err()
+        }) {
+            let rollback = rollback_voice_editor_install_transactions(
+                runtime_replacement.take(),
+                model_replacement.take(),
+            );
             self.fail_voice_editor_install(format!("{message}.{rollback}"));
             return;
         }
 
-        let persisted = if let Some(runtime_install) = runtime_install.clone() {
-            config::save_config_with_runtime_update(
-                &candidate,
-                Some((runtime_id, Some(runtime_install))),
-            )
-        } else {
-            config::save_config_merging_managed_runtimes(&candidate)
-        };
+        let model_updates = model_install
+            .clone()
+            .map(|install| vec![(model.model_id.as_str(), Some(install))])
+            .unwrap_or_default();
+        let runtime_update = runtime_install
+            .clone()
+            .map(|install| (runtime_id, Some(install)));
+        let persisted =
+            config::save_config_with_managed_updates(&candidate, &model_updates, runtime_update);
         let committed = match persisted {
             Ok(committed) => committed,
             Err(error) => {
-                let rollback = replacement
-                    .take()
-                    .and_then(|replacement| replacement.rollback().err())
-                    .map(|warning| format!(" Rollback warning: {warning}"))
-                    .unwrap_or_default();
-                if model_was_new {
-                    let _ = durable_fs::remove(&model_path);
-                }
+                let rollback = rollback_voice_editor_install_transactions(
+                    runtime_replacement.take(),
+                    model_replacement.take(),
+                );
                 self.fail_voice_editor_install(format!(
                     "Could not save the verified voice editor installation: {error}.{rollback}"
                 ));
@@ -2965,32 +3070,44 @@ impl LocalTranscriberApp {
             }
         };
         self.config = committed.config;
-        let durability_warning = if let Some(replacement) = replacement {
-            finalize_runtime_transaction(*replacement, committed.durability_warning)
+        let mut transaction_warnings = Vec::new();
+        if let Some(warning) = committed.durability_warning {
+            transaction_warnings.push(warning);
+            drop(model_replacement);
+            drop(runtime_replacement);
         } else {
-            committed.durability_warning
-        };
+            if let Some(replacement) = model_replacement
+                && let Err(message) = replacement.commit()
+            {
+                transaction_warnings.push(message);
+            }
+            if let Some(replacement) = runtime_replacement
+                && let Some(message) = finalize_runtime_transaction(*replacement, None)
+            {
+                transaction_warnings.push(message);
+            }
+        }
         if self.config_path.is_none() {
             self.config_path = config::config_file_path().ok();
         }
         self.voice_editor_install_error = None;
-        self.status = if durability_warning.is_some() {
-            TranscriptionStatus::Error
-        } else {
+        self.status = if transaction_warnings.is_empty() {
             TranscriptionStatus::Idle
+        } else {
+            TranscriptionStatus::Error
         };
         let installed_tier = match model.tier {
             IntentModelTier::Compact => "Compact",
             IntentModelTier::Balanced => "Balanced",
         };
-        self.status_message = durability_warning.map_or_else(
-            || format!("The {installed_tier} local voice editor is installed and ready."),
-            |warning| {
-                format!(
-                    "Voice editor installed, but durability is unconfirmed; startup recovery will verify it: {warning}"
-                )
-            },
-        );
+        self.status_message = if transaction_warnings.is_empty() {
+            format!("The {installed_tier} local voice editor is installed and ready.")
+        } else {
+            format!(
+                "Voice editor installed, but durability is unconfirmed; startup recovery will verify it: {}",
+                transaction_warnings.join("; ")
+            )
+        };
     }
 
     fn fail_voice_editor_install(&mut self, message: String) {
@@ -3104,17 +3221,17 @@ impl LocalTranscriberApp {
                     );
                 }
                 AppEvent::VoiceEditorInstallDone {
-                    replacement,
+                    runtime_replacement,
                     runtime_install,
                     model,
-                    model_path,
-                    model_was_new,
+                    model_replacement,
+                    model_install,
                 } => self.finish_voice_editor_install(
-                    replacement,
+                    runtime_replacement,
                     runtime_install,
                     model,
-                    model_path,
-                    model_was_new,
+                    model_replacement,
+                    model_install,
                 ),
                 AppEvent::VoiceEditorInstallFailed { message } => {
                     self.fail_voice_editor_install(message)
