@@ -18,6 +18,7 @@ mod runtime_catalog;
 mod stt;
 mod text_output;
 mod tray;
+mod voice_editor;
 
 use eframe::egui;
 
