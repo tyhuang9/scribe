@@ -30,6 +30,9 @@ const PREVIEW_OUTPUT_SUFFIX: &str = ".tmp";
 const STALE_PREVIEW_OUTPUT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_PREVIEW_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(target_os = "windows")]
+const WHISPER_CHILD_CREATION_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
 pub struct WhisperCppBackend {
     executable_path: Option<PathBuf>,
     options: WhisperCppOptions,
@@ -127,7 +130,7 @@ impl WhisperCppBackend {
     }
 
     fn command(&self, executable: &Path, model_path: &Path, audio_path: &Path) -> Result<Command> {
-        let mut command = Command::new(executable);
+        let mut command = new_whisper_command(executable);
         command.args(whisper_cli_args(model_path, audio_path, &self.options));
         apply_whisper_environment(&mut command, executable, &self.options)?;
         Ok(command)
@@ -139,7 +142,7 @@ impl WhisperCppBackend {
         model_path: &Path,
         audio_path: &Path,
     ) -> Result<Command> {
-        let mut command = Command::new(executable);
+        let mut command = new_whisper_command(executable);
         command.args(whisper_preview_cli_args(
             model_path,
             audio_path,
@@ -202,6 +205,24 @@ impl WhisperCppBackend {
             stderr,
         })
     }
+}
+
+fn new_whisper_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    configure_whisper_child_process(&mut command);
+    command
+}
+
+fn configure_whisper_child_process(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.creation_flags(WHISPER_CHILD_CREATION_FLAGS);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
 }
 
 impl SttBackend for WhisperCppBackend {
@@ -959,6 +980,47 @@ mod tests {
             ])
             .env("SCRIBE_PREVIEW_TEST_CHILD", mode);
         command
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore]
+    fn whisper_console_window_helper() {
+        if env::var_os("SCRIBE_WHISPER_CONSOLE_TEST_CHILD").is_none() {
+            return;
+        }
+
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+
+        let has_console_window = unsafe { !GetConsoleWindow().is_null() };
+        println!(
+            "whisper-console-window={}",
+            if has_console_window {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn configured_whisper_child_does_not_create_a_console_window() {
+        let executable = env::current_exe().unwrap();
+        let mut command = new_whisper_command(&executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "stt::whisper_cpp::tests::whisper_console_window_helper",
+                "--nocapture",
+            ])
+            .env("SCRIBE_WHISPER_CONSOLE_TEST_CHILD", "1");
+
+        let output = command.output().unwrap();
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("whisper-console-window=absent"));
     }
 
     fn test_preview_output_dir(label: &str) -> PathBuf {

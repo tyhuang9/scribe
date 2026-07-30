@@ -258,6 +258,10 @@ fn native_wake_for_command(command: TrayCommand) -> NativeWake {
     }
 }
 
+pub(crate) fn wake_scribe_app_from_background_event() {
+    post_native_wake(NativeWake::Message);
+}
+
 #[cfg(target_os = "windows")]
 fn post_native_wake(wake: NativeWake) {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
@@ -373,9 +377,38 @@ fn scribe_icon() -> Result<Icon> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "windows")]
+    use std::time::{Duration, Instant};
+
     use tray_icon::{Rect, TrayIconId, dpi::PhysicalPosition};
 
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    static NATIVE_WAKE_TEST_MESSAGES: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(target_os = "windows")]
+    unsafe extern "system" fn native_wake_test_window_proc(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        message: u32,
+        wparam: windows_sys::Win32::Foundation::WPARAM,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_NULL};
+
+        if message == WM_NULL {
+            NATIVE_WAKE_TEST_MESSAGES.fetch_add(1, Ordering::SeqCst);
+            return 0;
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn wide_null_terminated(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(Some(0)).collect()
+    }
 
     fn click_event(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
         TrayIconEvent::Click {
@@ -496,5 +529,69 @@ mod tests {
             *order.lock().expect("final order lock"),
             vec!["native", "repaint"]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "native Windows message-loop integration check"]
+    fn background_wake_posts_to_a_hidden_scribe_window() {
+        use std::mem::zeroed;
+        use std::ptr::{null, null_mut};
+        use std::thread;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+            RegisterClassW, UnregisterClassW, WNDCLASSW,
+        };
+
+        NATIVE_WAKE_TEST_MESSAGES.store(0, Ordering::SeqCst);
+        let class_name = wide_null_terminated("ScribeNativeWakeIntegrationTest");
+        let window_title = wide_null_terminated("Scribe");
+        let instance = unsafe { GetModuleHandleW(null()) };
+        assert!(!instance.is_null());
+
+        let mut window_class: WNDCLASSW = unsafe { zeroed() };
+        window_class.hInstance = instance;
+        window_class.lpszClassName = class_name.as_ptr();
+        window_class.lpfnWndProc = Some(native_wake_test_window_proc);
+        let class_atom = unsafe { RegisterClassW(&window_class) };
+        assert_ne!(class_atom, 0);
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                window_title.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+
+        wake_scribe_app_from_background_event();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while NATIVE_WAKE_TEST_MESSAGES.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            let mut message: MSG = unsafe { zeroed() };
+            while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
+                unsafe {
+                    DispatchMessageW(&message);
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let delivered = NATIVE_WAKE_TEST_MESSAGES.load(Ordering::SeqCst);
+        unsafe {
+            DestroyWindow(hwnd);
+            UnregisterClassW(class_name.as_ptr(), instance);
+        }
+        assert_eq!(delivered, 1);
     }
 }
