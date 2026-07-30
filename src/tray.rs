@@ -23,7 +23,6 @@ enum NativeWake {
     None,
     Restore,
     Message,
-    Close,
 }
 
 pub struct TrayService {
@@ -253,7 +252,9 @@ fn native_wake_for_command(command: TrayCommand) -> NativeWake {
         TrayCommand::Show => NativeWake::Restore,
         TrayCommand::Hide => NativeWake::None,
         TrayCommand::CopyLastTranscript => NativeWake::Message,
-        TrayCommand::Quit => NativeWake::Close,
+        // A close message alone does not schedule an egui frame for a hidden
+        // winit window. Restoring it lets the queued Quit command close cleanly.
+        TrayCommand::Quit => NativeWake::Restore,
     }
 }
 
@@ -263,8 +264,7 @@ fn post_native_wake(wake: NativeWake) {
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindow, PostMessageW, SC_RESTORE, WM_CLOSE, WM_NULL,
-        WM_SYSCOMMAND,
+        GetWindowThreadProcessId, IsWindow, PostMessageW, SC_RESTORE, WM_NULL, WM_SYSCOMMAND,
     };
 
     if wake == NativeWake::None {
@@ -324,7 +324,6 @@ fn post_native_wake(wake: NativeWake) {
     let (message, wparam) = match wake {
         NativeWake::Restore => (WM_SYSCOMMAND, SC_RESTORE as usize),
         NativeWake::Message => (WM_NULL, 0),
-        NativeWake::Close => (WM_CLOSE, 0),
         NativeWake::None => return,
     };
     unsafe {
@@ -422,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             native_wake_for_command(TrayCommand::Quit),
-            NativeWake::Close
+            NativeWake::Restore
         );
     }
 
