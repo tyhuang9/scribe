@@ -4184,8 +4184,8 @@ impl eframe::App for LocalTranscriberApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx, frame);
         paint_viewport_background(ctx);
-        self.handle_close_request(ctx);
         self.poll_tray(ctx);
+        self.handle_close_request(ctx);
         self.poll_hotkey_capture(ctx);
         if !self.capturing_hotkey {
             self.poll_hotkey();
