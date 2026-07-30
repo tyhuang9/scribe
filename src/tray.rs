@@ -18,6 +18,14 @@ pub enum TrayCommand {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWake {
+    None,
+    Restore,
+    Message,
+    Close,
+}
+
 pub struct TrayService {
     _tray_icon: TrayIcon,
     command_rx: Receiver<TrayCommand>,
@@ -93,6 +101,7 @@ impl TrayService {
 #[derive(Clone)]
 struct EventBridge {
     sender: Sender<TrayCommand>,
+    native_wake: Arc<dyn Fn(NativeWake) + Send + Sync>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -103,7 +112,10 @@ struct EventHandlerState {
 
 impl EventBridge {
     fn send(&self, command: TrayCommand) {
-        let _ = self.sender.send(command);
+        if self.sender.send(command).is_err() {
+            return;
+        }
+        (self.native_wake)(native_wake_for_command(command));
         (self.wake)();
     }
 
@@ -123,6 +135,7 @@ fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayCommand> {
         let wake_context = wake_ctx.clone();
         let bridge = EventBridge {
             sender,
+            native_wake: Arc::new(post_native_wake),
             wake: Arc::new(move || {
                 let ctx = wake_context
                     .read()
@@ -235,6 +248,93 @@ fn command_from_menu_id(id: &MenuId) -> Option<TrayCommand> {
     }
 }
 
+fn native_wake_for_command(command: TrayCommand) -> NativeWake {
+    match command {
+        TrayCommand::Show => NativeWake::Restore,
+        TrayCommand::Hide => NativeWake::None,
+        TrayCommand::CopyLastTranscript => NativeWake::Message,
+        TrayCommand::Quit => NativeWake::Close,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn post_native_wake(wake: NativeWake) {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindow, PostMessageW, SC_RESTORE, WM_CLOSE, WM_NULL,
+        WM_SYSCOMMAND,
+    };
+
+    if wake == NativeWake::None {
+        return;
+    }
+
+    struct WindowSearch {
+        process_id: u32,
+        hwnd: HWND,
+    }
+
+    unsafe extern "system" fn find_scribe_window(hwnd: HWND, state: LPARAM) -> BOOL {
+        let state = unsafe { &mut *(state as *mut WindowSearch) };
+        let mut process_id = 0;
+        if unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) } == 0
+            || process_id != state.process_id
+            || !unsafe { GetWindow(hwnd, GW_OWNER) }.is_null()
+        {
+            return 1;
+        }
+
+        let title_length = unsafe { GetWindowTextLengthW(hwnd) };
+        if title_length <= 0 {
+            return 1;
+        }
+        let mut title = vec![0_u16; title_length as usize + 1];
+        let copied = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        if copied > 0 && String::from_utf16_lossy(&title[..copied as usize]) == "Scribe" {
+            state.hwnd = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    let process_id = unsafe { GetCurrentProcessId() };
+    let mut search = WindowSearch {
+        process_id,
+        hwnd: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_scribe_window),
+            &mut search as *mut WindowSearch as LPARAM,
+        );
+    }
+    if search.hwnd.is_null() || unsafe { IsWindow(search.hwnd) } == 0 {
+        return;
+    }
+
+    let mut owner_process_id = 0;
+    if unsafe { GetWindowThreadProcessId(search.hwnd, &mut owner_process_id) } == 0
+        || owner_process_id != process_id
+    {
+        return;
+    }
+
+    let (message, wparam) = match wake {
+        NativeWake::Restore => (WM_SYSCOMMAND, SC_RESTORE as usize),
+        NativeWake::Message => (WM_NULL, 0),
+        NativeWake::Close => (WM_CLOSE, 0),
+        NativeWake::None => return,
+    };
+    unsafe {
+        PostMessageW(search.hwnd, message, wparam, 0);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn post_native_wake(_wake: NativeWake) {}
+
 fn tray_event_should_show(event: &TrayIconEvent) -> bool {
     matches!(
         event,
@@ -310,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn tray_commands_select_the_expected_native_wake() {
+        assert_eq!(
+            native_wake_for_command(TrayCommand::Show),
+            NativeWake::Restore
+        );
+        assert_eq!(native_wake_for_command(TrayCommand::Hide), NativeWake::None);
+        assert_eq!(
+            native_wake_for_command(TrayCommand::CopyLastTranscript),
+            NativeWake::Message
+        );
+        assert_eq!(
+            native_wake_for_command(TrayCommand::Quit),
+            NativeWake::Close
+        );
+    }
+
+    #[test]
     fn only_a_completed_left_click_restores_the_window() {
         assert!(tray_event_should_show(&click_event(
             MouseButton::Left,
@@ -332,6 +449,7 @@ mod tests {
         let wake_counter = wake_count.clone();
         let bridge = EventBridge {
             sender,
+            native_wake: Arc::new(|_| {}),
             wake: Arc::new(move || {
                 wake_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }),
@@ -346,5 +464,38 @@ mod tests {
             vec![TrayCommand::Show, TrayCommand::Quit]
         );
         assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bridge_enqueues_before_native_wake_and_repaints_last() {
+        let (sender, receiver) = unbounded();
+        let native_receiver = receiver.clone();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let native_order = order.clone();
+        let repaint_order = order.clone();
+        let bridge = EventBridge {
+            sender,
+            native_wake: Arc::new(move |wake| {
+                assert_eq!(native_receiver.try_recv(), Ok(TrayCommand::Show));
+                assert_eq!(wake, NativeWake::Restore);
+                native_order
+                    .lock()
+                    .expect("native order lock")
+                    .push("native");
+            }),
+            wake: Arc::new(move || {
+                repaint_order
+                    .lock()
+                    .expect("repaint order lock")
+                    .push("repaint");
+            }),
+        };
+
+        bridge.send(TrayCommand::Show);
+
+        assert_eq!(
+            *order.lock().expect("final order lock"),
+            vec!["native", "repaint"]
+        );
     }
 }
