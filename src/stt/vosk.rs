@@ -96,9 +96,9 @@ impl SttBackend for VoskBackend {
         }
 
         let started = Instant::now();
-        let output = Command::new(&executable)
-            .args(vosk_args(&model_path, &audio_path))
-            .output()
+        let mut command = Command::new(&executable);
+        command.args(vosk_args(&model_path, &audio_path));
+        let output = crate::stt::run_cancellable_command(&mut command)
             .with_context(|| format!("failed to run {}", executable.display()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

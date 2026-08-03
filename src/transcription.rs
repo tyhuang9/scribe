@@ -590,6 +590,7 @@ impl TranscriptionService {
     /// call. Later requests capture the new generation and are unaffected.
     pub fn cancel_active(&self) {
         self.router.cancel_active();
+        crate::stt::cancel_active_processes();
     }
 
     /// Drops all retained native model state on the dedicated worker.
@@ -840,9 +841,8 @@ impl SpeechEngine for LegacyBatchAdapter {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(anyhow!(
-            "cancellation is not supported by the Phase 1 legacy transcription path"
-        ))
+        crate::stt::cancel_active_processes();
+        Ok(())
     }
 
     fn unload(&mut self) -> Result<()> {
@@ -1071,6 +1071,7 @@ fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
         // timestamp values. whisper.cpp strips its text timing and the sherpa
         // family currently reports null segment bounds.
         timestamps: matches!(model.backend.as_str(), "faster-whisper" | "Vosk"),
+        cancellation: true,
         ..RuntimeCapabilities::default()
     }
 }
@@ -1227,6 +1228,7 @@ mod tests {
                 "{} timestamp capability",
                 model.backend
             );
+            assert!(capabilities.cancellation, "{} cancellation", model.backend);
             assert!(!capabilities.streaming, "{} streaming", model.backend);
             assert!(!capabilities.translation, "{} translation", model.backend);
             assert!(
@@ -1360,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_adapter_has_explicit_stateless_load_and_unsupported_cancel_semantics() {
+    fn legacy_adapter_has_explicit_stateless_load_and_process_cancel_semantics() {
         let model = config::configured_models(&AppConfig::default())
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
@@ -1370,12 +1372,12 @@ mod tests {
         adapter
             .load()
             .expect("legacy adapter has no persistent load");
-        let error = adapter.cancel().unwrap_err();
+        adapter
+            .cancel()
+            .expect("legacy child cancellation is available");
         adapter
             .unload()
             .expect("legacy adapter has no persistent unload");
-
-        assert!(error.to_string().contains("cancellation is not supported"));
     }
 
     #[test]

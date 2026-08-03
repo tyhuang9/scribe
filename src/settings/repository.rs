@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use super::super::normalize_config;
-use super::{AppConfig, parse_settings_value};
+use super::{AppConfig, parse_settings_value_with_diagnostics};
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -80,9 +80,15 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
     };
 
     let original = value.clone();
-    let mut config = parse_settings_value(value);
+    let (mut config, diagnostics) = parse_settings_value_with_diagnostics(value);
     normalize_config(&mut config);
-    if serde_json::to_value(&config)? != original {
+    let rewritten = serde_json::to_value(&config)? != original;
+    if rewritten {
+        if diagnostics.invalid_values_salvaged {
+            backup_corrupt(path)?;
+        } else {
+            backup_before_migration(path)?;
+        }
         save_to_path(path, &config)?;
     }
     Ok(config)
@@ -99,6 +105,14 @@ pub(crate) fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
 }
 
 fn backup_corrupt(path: &Path) -> Result<PathBuf> {
+    backup_original(path, "corrupt")
+}
+
+fn backup_before_migration(path: &Path) -> Result<PathBuf> {
+    backup_original(path, "pre-v1-migration")
+}
+
+fn backup_original(path: &Path, reason: &str) -> Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
@@ -110,7 +124,7 @@ fn backup_corrupt(path: &Path) -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let backup = parent.join(format!("{file_name}.corrupt-{stamp}.bak"));
+    let backup = parent.join(format!("{file_name}.{reason}-{stamp}.bak"));
     fs::copy(path, &backup).with_context(|| {
         format!(
             "failed to back up corrupt config {} to {}",
@@ -118,6 +132,7 @@ fn backup_corrupt(path: &Path) -> Result<PathBuf> {
             backup.display()
         )
     })?;
+    secure_file_permissions(&backup)?;
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -139,6 +154,7 @@ where
         .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    secure_directory_permissions(parent)?;
     let (temp_path, mut temp) = create_temp_file(path)?;
     let result = (|| -> Result<()> {
         temp.write_all(content)?;
@@ -169,17 +185,44 @@ fn create_temp_file(path: &Path) -> Result<(PathBuf, File)> {
             std::process::id(),
             attempt
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
             Ok(file) => return Ok((temp_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
     }
     Err(anyhow!("could not create a unique config temporary file"))
+}
+
+#[cfg(unix)]
+fn secure_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure settings directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure settings file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -286,6 +329,66 @@ mod tests {
             super::super::CURRENT_SCHEMA_VERSION
         );
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_known_field_is_backed_up_before_field_level_salvage() {
+        let dir = test_dir("invalid-field");
+        let path = dir.join("config.json");
+        let original = br#"{
+            "schema_version": 1,
+            "general": {"selected_default_model": "whisper_cpp_base_en"},
+            "recording": {"hotkey": "Ctrl+Alt+R", "max_recording_seconds": "invalid"}
+        }"#;
+        fs::write(&path, original).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+        assert_eq!(config.recording.hotkey, "Ctrl+Alt+R");
+        assert_eq!(config.recording.max_recording_seconds, 30);
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("config.json.corrupt-") && name.ends_with(".bak")
+                    })
+            })
+            .expect("invalid source document backup");
+        assert_eq!(fs::read(backup).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn valid_legacy_config_is_backed_up_before_sectioned_migration() {
+        let dir = test_dir("legacy-backup");
+        let path = dir.join("config.json");
+        let original = br#"{"hotkey":"Alt+Space","selected_default_model":"whisper_cpp_base_en"}"#;
+        fs::write(&path, original).unwrap();
+
+        let config = load_from_path(&path).unwrap();
+
+        assert_eq!(config.recording.hotkey, "Alt+Space");
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("config.json.pre-v1-migration-") && name.ends_with(".bak")
+                    })
+            })
+            .expect("pre-migration backup");
+        assert_eq!(fs::read(backup).unwrap(), original);
         fs::remove_dir_all(dir).unwrap();
     }
 

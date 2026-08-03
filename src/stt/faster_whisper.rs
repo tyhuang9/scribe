@@ -113,8 +113,7 @@ impl SttBackend for FasterWhisperBackend {
         let mut command = Command::new(&executable);
         command.args(faster_whisper_args(&model_path, &audio_path, &self.options));
         apply_faster_whisper_environment(&mut command, &executable, &self.options)?;
-        let output = command
-            .output()
+        let output = crate::stt::run_cancellable_command(&mut command)
             .with_context(|| format!("failed to run {}", executable.display()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

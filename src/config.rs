@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
@@ -22,7 +24,7 @@ pub use settings::{
     StreamingSettings,
 };
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedModelInstall {
     pub path: PathBuf,
     #[serde(default)]
@@ -35,9 +37,11 @@ pub struct ManagedModelInstall {
     pub platform: Option<String>,
     #[serde(default)]
     pub installed_at_unix_seconds: Option<u64>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedRuntimeInstall {
     pub path: PathBuf,
     #[serde(default)]
@@ -50,6 +54,90 @@ pub struct ManagedRuntimeInstall {
     pub platform: Option<String>,
     #[serde(default)]
     pub installed_at_unix_seconds: Option<u64>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
+}
+
+#[derive(Default)]
+struct ManagedInstallFields {
+    path: PathBuf,
+    source: Option<String>,
+    version: Option<String>,
+    sha256: Option<String>,
+    platform: Option<String>,
+    installed_at_unix_seconds: Option<u64>,
+    unknown: BTreeMap<String, Value>,
+}
+
+fn deserialize_managed_install<'de, D>(deserializer: D) -> Result<ManagedInstallFields, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut values = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    let path = values
+        .remove("path")
+        .ok_or_else(|| D::Error::missing_field("path"))
+        .and_then(|value| serde_json::from_value(value).map_err(D::Error::custom))?;
+    let source = values
+        .remove("source")
+        .and_then(|value| serde_json::from_value(value).ok());
+    let version = values
+        .remove("version")
+        .and_then(|value| serde_json::from_value(value).ok());
+    let sha256 = values
+        .remove("sha256")
+        .and_then(|value| serde_json::from_value(value).ok());
+    let platform = values
+        .remove("platform")
+        .and_then(|value| serde_json::from_value(value).ok());
+    let installed_at_unix_seconds = values
+        .remove("installed_at_unix_seconds")
+        .and_then(|value| serde_json::from_value(value).ok());
+    Ok(ManagedInstallFields {
+        path,
+        source,
+        version,
+        sha256,
+        platform,
+        installed_at_unix_seconds,
+        unknown: values,
+    })
+}
+
+impl<'de> Deserialize<'de> for ManagedModelInstall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = deserialize_managed_install(deserializer)?;
+        Ok(Self {
+            path: fields.path,
+            source: fields.source,
+            version: fields.version,
+            sha256: fields.sha256,
+            platform: fields.platform,
+            installed_at_unix_seconds: fields.installed_at_unix_seconds,
+            unknown: fields.unknown,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedRuntimeInstall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = deserialize_managed_install(deserializer)?;
+        Ok(Self {
+            path: fields.path,
+            source: fields.source,
+            version: fields.version,
+            sha256: fields.sha256,
+            platform: fields.platform,
+            installed_at_unix_seconds: fields.installed_at_unix_seconds,
+            unknown: fields.unknown,
+        })
+    }
 }
 
 impl ManagedModelInstall {

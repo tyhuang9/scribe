@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 
@@ -13,6 +16,80 @@ pub mod faster_whisper;
 pub mod sherpa_onnx;
 pub mod vosk;
 pub mod whisper_cpp;
+
+struct RegisteredProcess {
+    pid: u32,
+}
+
+impl Drop for RegisteredProcess {
+    fn drop(&mut self) {
+        if let Ok(mut processes) = active_legacy_processes().lock() {
+            processes.remove(&self.pid);
+        }
+    }
+}
+
+fn active_legacy_processes() -> &'static Mutex<HashMap<u32, usize>> {
+    static PROCESSES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+    PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_legacy_process(child: &Child) -> RegisteredProcess {
+    let pid = child.id();
+    #[cfg(windows)]
+    let native_handle = {
+        use std::os::windows::io::AsRawHandle;
+        child.as_raw_handle() as usize
+    };
+    #[cfg(unix)]
+    let native_handle = pid as usize;
+    if let Ok(mut processes) = active_legacy_processes().lock() {
+        processes.insert(pid, native_handle);
+    }
+    RegisteredProcess { pid }
+}
+
+pub(crate) fn run_cancellable_command(command: &mut Command) -> io::Result<Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let registration = register_legacy_process(&child);
+    let output = child.wait_with_output();
+    drop(registration);
+    output
+}
+
+pub(crate) fn cancel_active_processes() {
+    let processes = active_legacy_processes()
+        .lock()
+        .map(|processes| processes.values().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for process in processes {
+        terminate_process(process);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process(native_handle: usize) {
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    unsafe {
+        TerminateProcess(native_handle as *mut std::ffi::c_void, 1);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: usize) {
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
 
 pub trait SttBackend: Send + Sync {
     fn id(&self) -> &str;
@@ -245,6 +322,56 @@ mod tests {
     use crate::models::default_model_catalog;
 
     use super::*;
+
+    #[test]
+    fn cancellation_terminates_a_registered_legacy_process() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = Command::new("powershell.exe");
+                command.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 30",
+                ]);
+                command
+            };
+            #[cfg(unix)]
+            let mut command = {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                command
+            };
+            let _ = tx.send(run_cancellable_command(&mut command));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while active_legacy_processes()
+            .lock()
+            .map(|processes| processes.is_empty())
+            .unwrap_or(true)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            active_legacy_processes()
+                .lock()
+                .is_ok_and(|processes| !processes.is_empty()),
+            "legacy process was not registered"
+        );
+
+        cancel_active_processes();
+
+        let output = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("cancelled process acknowledged termination")
+            .expect("legacy process launched");
+        assert!(!output.status.success());
+    }
 
     #[test]
     fn provider_adapters_cover_catalog_backends() {

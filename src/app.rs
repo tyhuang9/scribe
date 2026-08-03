@@ -1085,6 +1085,10 @@ impl LocalTranscriberApp {
             quit_requested: false,
         };
 
+        if let Err(err) = audio::cleanup_abandoned_recordings() {
+            app.status_message = format!("Recording cleanup warning: {err}");
+        }
+
         let initial_tray_state = TrayUiState {
             is_recording: false,
             has_transcript: false,
@@ -1161,6 +1165,15 @@ impl LocalTranscriberApp {
         if let Err(err) = store.flush() {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!("Failed to save settings: {err}");
+        }
+    }
+
+    fn stop_and_discard_active_recording(&mut self) {
+        let Some(active) = self.active_recording.take() else {
+            return;
+        };
+        if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
+            eprintln!("failed to stop and discard active recording: {err:#}");
         }
     }
 
@@ -1342,15 +1355,7 @@ impl LocalTranscriberApp {
             self.reset_playground_for_run();
         }
 
-        if let Some(previous_session) = self.session_coordinator.active_session_id() {
-            self.transcription_service.cancel_active();
-            let _ = self.session_coordinator.cancel_active();
-            if let Some(run) = self.playground_runs.remove(&previous_session) {
-                let _ = fs::remove_file(run.audio_path);
-            }
-            self.playground_pending = 0;
-            self.playground_audio_path = None;
-        }
+        self.supersede_active_session();
 
         let session_id = match self.session_coordinator.begin(source.purpose()) {
             Ok(session_id) => session_id,
@@ -1437,6 +1442,20 @@ impl LocalTranscriberApp {
                 }
             },
         );
+    }
+
+    fn supersede_active_session(&mut self) {
+        let Some(previous_session) = self.session_coordinator.active_session_id() else {
+            return;
+        };
+        self.transcription_service.cancel_active();
+        let _ = self.session_coordinator.cancel_active();
+        if let Some(run) = self.playground_runs.remove(&previous_session) {
+            let _ = fs::remove_file(run.audio_path);
+        }
+        self.playground_pending = 0;
+        self.playground_audio_path = None;
+        self.refresh_playground_runtime_statuses();
     }
 
     fn stop_recording(&mut self) {
@@ -1576,9 +1595,7 @@ impl LocalTranscriberApp {
             TrayCommand::ToggleRecording => self.toggle_recording(),
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
-                if let Some(active) = self.active_recording.as_mut() {
-                    active.session.stop();
-                }
+                self.stop_and_discard_active_recording();
                 self.transcription_service.cancel_active();
                 let _ = self.session_coordinator.cancel_active();
                 self.flush_settings();
@@ -2887,9 +2904,7 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(active) = self.active_recording.as_mut() {
-            active.session.stop();
-        }
+        self.stop_and_discard_active_recording();
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
         self.flush_settings();
@@ -7273,6 +7288,44 @@ mod layout_tests {
         assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
 
         fs::remove_file(current_audio).unwrap();
+    }
+
+    #[test]
+    fn superseding_playground_resets_cards_before_new_capture_can_fail() {
+        let audio = std::env::temp_dir().join(format!(
+            "scribe-playground-superseded-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&audio, b"superseded wav").unwrap();
+        let mut app = test_app();
+        app.playground_cards[0].status = ModelRuntimeStatus::Running;
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            SessionId(7),
+            RequestId(70),
+            "whisper_cpp_base_en",
+        );
+        app.playground_runs.insert(
+            SessionId(7),
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(
+                    RequestId(70),
+                    "whisper_cpp_base_en".to_owned(),
+                )]),
+                audio_path: audio.clone(),
+            },
+        );
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(audio.clone());
+
+        app.supersede_active_session();
+
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.playground_audio_path, None);
+        assert!(!audio.exists());
+        assert_ne!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
     }
 
     #[test]
