@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::model_catalog::{RuntimeRequirement, runtime_model_manifest};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
@@ -183,9 +184,13 @@ enum RuntimeKind {
 }
 
 fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
-    (cfg!(all(target_os = "windows", target_arch = "x86_64"))
-        && model_id.as_str().starts_with("whisper_cpp_"))
-    .then_some(RuntimeKind::TranscribeCpp)
+    if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        return None;
+    }
+    let requirement = runtime_model_manifest(model_id)?.runtime;
+    match requirement {
+        RuntimeRequirement::PrimaryNative => Some(RuntimeKind::TranscribeCpp),
+    }
 }
 
 /// The sole application-level runtime router. Clones share one serialized
@@ -1033,6 +1038,17 @@ mod tests {
     fn native_handler_implements_the_common_speech_engine_contract() {
         fn assert_engine<T: SpeechEngine>() {}
         assert_engine::<TranscribeCppRuntime>();
+    }
+
+    #[test]
+    fn runtime_selection_requires_a_catalog_manifest_not_an_id_prefix() {
+        assert!(runtime_kind_for_model(&ModelId::new("whisper_cpp_unknown")).is_none());
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert!(matches!(
+                runtime_kind_for_model(&ModelId::new("whisper_cpp_base_en")),
+                Some(RuntimeKind::TranscribeCpp)
+            ));
+        }
     }
 
     #[test]

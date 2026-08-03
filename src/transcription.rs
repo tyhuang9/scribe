@@ -25,6 +25,11 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, AppConfig};
+#[allow(unused_imports)]
+pub use crate::model_catalog::{
+    CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
+};
+use crate::model_catalog::{model_descriptor, model_descriptors, runtime_model_manifest};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_router::{
@@ -499,15 +504,30 @@ impl TranscriptionService {
         }
     }
 
+    /// Returns the normalized, runtime-neutral model catalog. Concrete
+    /// runtime requirements and artifact routing remain private below this
+    /// service boundary.
+    pub fn model_descriptors(&self) -> Vec<ModelDescriptor> {
+        model_descriptors()
+    }
+
+    /// Resolves one runtime-neutral catalog descriptor.
+    pub fn model_descriptor(&self, model_id: &ModelId) -> Result<ModelDescriptor> {
+        model_descriptor(model_id)
+            .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))
+    }
+
     /// Returns the conservative feature set for a configured model.
     pub fn capabilities_for(&self, model_id: &ModelId) -> Result<RuntimeCapabilities> {
         let model = self.resolve_model(model_id, None)?;
         if self.router.handles_model(model_id) {
             let runtime_model = self.resolve_runtime_model(model)?;
-            return self
+            let runtime_capabilities = self
                 .router
                 .capabilities(&runtime_model)
-                .ok_or_else(|| anyhow!("runtime router rejected its own selected model"));
+                .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
+            let descriptor = self.model_descriptor(model_id)?;
+            return Ok(intersect_capabilities(&runtime_capabilities, &descriptor));
         }
         Ok(capabilities_for_legacy_model(&model))
     }
@@ -664,8 +684,7 @@ impl TranscriptionService {
                 "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
             )
         })?;
-        let artifact = crate::runtime_catalog::model_artifact_spec(&model.id)
-            .filter(|artifact| artifact.download_bytes.is_some() && artifact.sha256.is_some())
+        let manifest = runtime_model_manifest(&ModelId::new(model.id.clone()))
             .ok_or_else(|| {
                 anyhow!(
                     "model {} has no pinned size and SHA-256 evidence for in-process native loading",
@@ -676,8 +695,8 @@ impl TranscriptionService {
             id: model.id.into(),
             path,
             package_root,
-            expected_size_bytes: artifact.download_bytes.expect("checked above"),
-            expected_sha256: artifact.sha256.expect("checked above"),
+            expected_size_bytes: manifest.artifact_size_bytes,
+            expected_sha256: manifest.artifact_sha256,
         })
     }
 
@@ -1033,6 +1052,33 @@ fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
     }
 }
 
+fn intersect_capabilities(
+    runtime: &RuntimeCapabilities,
+    descriptor: &ModelDescriptor,
+) -> RuntimeCapabilities {
+    let manifest = descriptor.capabilities;
+    RuntimeCapabilities {
+        streaming: runtime.streaming && manifest.native_streaming,
+        cancellation: runtime.cancellation && manifest.cancellation,
+        translation: runtime.translation && manifest.translation,
+        timestamps: runtime.timestamps && manifest.timestamps,
+        language_detection: runtime.language_detection && manifest.language_detection,
+        confidence_scores: runtime.confidence_scores,
+        custom_vocabulary: runtime.custom_vocabulary,
+        supported_languages: runtime
+            .supported_languages
+            .iter()
+            .filter(|language| {
+                descriptor
+                    .languages
+                    .iter()
+                    .any(|allowed| allowed == &language.as_str())
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1223,52 @@ mod tests {
             );
             assert!(capabilities.supported_languages.is_empty());
         }
+    }
+
+    #[test]
+    fn normalized_catalog_exposes_only_neutral_experimental_descriptors() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let descriptors = service.model_descriptors();
+
+        assert_eq!(descriptors.len(), 4);
+        for descriptor in descriptors {
+            assert!(matches!(
+                descriptor.compatibility,
+                CompatibilityStatus::Experimental { .. }
+            ));
+            assert!(descriptor.roles.is_empty());
+            assert!(!descriptor.capabilities.native_streaming);
+            assert!(
+                descriptor
+                    .languages
+                    .iter()
+                    .all(|language| *language == "en")
+            );
+        }
+    }
+
+    #[test]
+    fn effective_capabilities_are_a_fail_closed_intersection() {
+        let descriptor = model_descriptor(&ModelId::new("whisper_cpp_base_en")).unwrap();
+        let runtime = RuntimeCapabilities {
+            streaming: true,
+            cancellation: true,
+            translation: true,
+            timestamps: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            supported_languages: vec!["en".to_owned(), "fr".to_owned()],
+        };
+
+        let effective = intersect_capabilities(&runtime, &descriptor);
+
+        assert!(!effective.streaming);
+        assert!(effective.cancellation);
+        assert!(!effective.translation);
+        assert!(effective.timestamps);
+        assert!(!effective.language_detection);
+        assert_eq!(effective.supported_languages, ["en"]);
     }
 
     #[test]
