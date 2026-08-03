@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod benchmark;
+mod compatibility_bridge;
 mod config;
 mod core;
 mod hotkey;

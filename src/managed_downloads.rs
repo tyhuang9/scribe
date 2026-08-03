@@ -10,84 +10,34 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::config::AppConfig;
-use crate::models::{
-    SttModelInfo, sherpa_model_download_url, vosk_model_download_url, whisper_cpp_download_url,
-};
+use crate::models::{SttModelInfo, sherpa_model_download_url, vosk_model_download_url};
+use crate::transcription::ModelId;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(crate) fn download_configured_model(
+pub(crate) fn download_model(
     config: &AppConfig,
-    model: &SttModelInfo,
-    destination: &Path,
-    expected_total_bytes: Option<u64>,
-    expected_sha256: Option<&str>,
+    model_id: &ModelId,
     progress: &dyn Fn(ModelDownloadProgress),
 ) -> Result<PathBuf, String> {
-    let download_model = model
-        .download_model
-        .as_deref()
-        .ok_or_else(|| format!("{} does not have a supported download", model.name))?;
-    match model.backend.as_str() {
-        "whisper.cpp" => download_whisper_cpp_model(
-            download_model,
-            destination,
-            &model.id,
-            expected_total_bytes,
-            expected_sha256,
-            progress,
-        ),
-        "faster-whisper" => {
-            let runtime = crate::stt::faster_whisper::resolve_faster_whisper_executable(config)
-                .ok_or_else(|| {
-                    "Install the faster-whisper compatibility runtime before downloading this model."
-                        .to_owned()
-                })?;
-            download_faster_whisper_model(
-                &runtime,
-                download_model,
-                destination,
-                &model.id,
-                expected_total_bytes,
-                progress,
-            )
-        }
-        "Vosk" => {
-            let runtime = crate::stt::vosk::resolve_vosk_executable(config).ok_or_else(|| {
-                "Install the Vosk compatibility runtime before downloading this model.".to_owned()
-            })?;
-            download_vosk_model(
-                &runtime,
-                download_model,
-                destination,
-                &model.id,
-                expected_total_bytes,
-                progress,
-            )
-        }
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-            let runtime =
-                crate::stt::sherpa_onnx::resolve_executable_for_backend(config, &model.backend)
-                    .ok_or_else(|| {
-                        format!(
-                            "Install the {} compatibility runtime before downloading this model.",
-                            model.backend
-                        )
-                    })?;
-            download_sherpa_model(
-                &runtime,
-                model,
-                download_model,
-                destination,
-                &model.id,
-                expected_total_bytes,
-                progress,
-            )
-        }
-        backend => Err(format!(
-            "Managed downloader for compatibility provider {backend} is not available."
-        )),
-    }
+    let model = config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == model_id.as_str())
+        .ok_or_else(|| format!("Unknown configured model: {model_id}"))?;
+    let destination = config::downloaded_model_path(config, &model)
+        .ok_or_else(|| "No model storage directory is configured.".to_owned())?;
+    let artifact = crate::model_catalog::runtime_model_manifest(model_id)
+        .ok_or_else(|| "The model has no normalized pinned artifact manifest.".to_owned())?;
+    let url = crate::model_catalog::runtime_model_download_url(model_id)
+        .ok_or_else(|| "The model has no pinned download URL.".to_owned())?;
+    download_whisper_cpp_model(
+        &url,
+        &destination,
+        model_id.as_str(),
+        artifact.artifact_size_bytes,
+        artifact.artifact_sha256,
+        progress,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,26 +48,26 @@ pub(crate) struct ModelDownloadProgress {
     pub(crate) bytes_per_second: Option<u64>,
 }
 
-pub(crate) fn download_whisper_cpp_model(
-    model_name: &str,
+fn download_whisper_cpp_model(
+    url: &str,
     destination: &Path,
     model_id: &str,
-    expected_total_bytes: Option<u64>,
-    expected_sha256: Option<&str>,
+    expected_total_bytes: u64,
+    expected_sha256: &str,
     progress: &dyn Fn(ModelDownloadProgress),
 ) -> Result<PathBuf, String> {
-    let url = whisper_cpp_download_url(model_name);
     download_model_file(
-        &url,
+        url,
         destination,
         model_id,
-        expected_total_bytes,
-        expected_sha256,
+        Some(expected_total_bytes),
+        Some(expected_sha256),
         progress,
     )
 }
 
-pub(crate) fn download_faster_whisper_model(
+#[allow(dead_code)]
+fn download_faster_whisper_model(
     runner: &Path,
     model_name: &str,
     destination: &Path,
@@ -139,7 +89,8 @@ pub(crate) fn download_faster_whisper_model(
     })
 }
 
-pub(crate) fn download_vosk_model(
+#[allow(dead_code)]
+fn download_vosk_model(
     runner: &Path,
     model_name: &str,
     destination: &Path,
@@ -165,7 +116,8 @@ pub(crate) fn download_vosk_model(
     })
 }
 
-pub(crate) fn download_sherpa_model(
+#[allow(dead_code)]
+fn download_sherpa_model(
     runner: &Path,
     model: &SttModelInfo,
     model_name: &str,

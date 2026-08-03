@@ -20,6 +20,7 @@ use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
+use crate::compatibility_bridge::{self, ProviderHandle};
 use crate::config::{self, AppConfig, HotkeyMode, ThemeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
@@ -27,8 +28,6 @@ use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
 };
 use crate::prepared_audio::PreparedAudio;
-use crate::runtime_catalog;
-use crate::stt;
 use crate::text_output;
 use crate::transcription::{
     AccelerationPreference, CompatibilityStatus, ModelDescriptor, RequestId, SessionId,
@@ -232,7 +231,8 @@ fn format_duration_ms(duration: Duration) -> String {
 
 #[derive(Clone, Debug)]
 struct PlaygroundCardState {
-    model: SttModelInfo,
+    descriptor: ModelDescriptor,
+    install_status: ModelInstallStatus,
     status: ModelRuntimeStatus,
     transcript: String,
     latency_ms: Option<u128>,
@@ -285,7 +285,7 @@ enum AppEvent {
     },
     RuntimeInstallDone {
         runtime_id: String,
-        backend: String,
+        runtime_label: String,
         replacement: RuntimeReplacement,
         source_label: &'static str,
     },
@@ -352,29 +352,29 @@ enum RuntimeActionKind {
     Uninstall,
 }
 
-fn runtime_action_label(kind: RuntimeActionKind, backend: &str, busy: bool) -> String {
+fn runtime_action_label(kind: RuntimeActionKind, runtime_label: &str, busy: bool) -> String {
     if busy {
-        return format!("Preparing {backend} runtime");
+        return format!("Preparing {runtime_label} runtime");
     }
     let action = match kind {
         RuntimeActionKind::Install => "Install",
         RuntimeActionKind::Update => "Update",
         RuntimeActionKind::Uninstall => "Remove",
     };
-    format!("{action} {backend} runtime")
+    format!("{action} {runtime_label} runtime")
 }
 
 fn model_primary_action_label(
     action: ModelPrimaryAction,
-    model: &SttModelInfo,
+    _model: &SttModelInfo,
     install_status: &ModelInstallStatus,
 ) -> String {
     match action {
-        ModelPrimaryAction::Repair => format!("Repair {} runtime", model.backend),
+        ModelPrimaryAction::Repair => "Repair runtime".to_owned(),
         ModelPrimaryAction::Installing
             if matches!(install_status, ModelInstallStatus::InstallingRuntime) =>
         {
-            format!("Preparing {} runtime", model.backend)
+            "Preparing runtime".to_owned()
         }
         _ => action.label().to_owned(),
     }
@@ -496,10 +496,9 @@ fn runtime_metadata_matches(
     config.managed_runtimes.get(runtime_id) == Some(install)
 }
 
-fn missing_runtime_source_message(backend: &str) -> String {
-    format!(
-        "This build does not include the {backend} backend runtime. Install a packaged or staged build that includes it."
-    )
+fn missing_runtime_source_message() -> String {
+    "This build does not include the required local speech runtime. Install a packaged or staged build that includes it."
+        .to_owned()
 }
 
 fn should_activate_installed_model(active_model_is_runnable: bool) -> bool {
@@ -611,10 +610,7 @@ fn model_primary_disabled_tooltip(
         ModelPrimaryAction::Install | ModelPrimaryAction::Retry
             if !supports_managed_install(model) =>
         {
-            Some(format!(
-                "Managed downloads are not available for {} models in this build.",
-                model.backend
-            ))
+            Some("Managed downloads are not available for this model in this build.".to_owned())
         }
         ModelPrimaryAction::Retry => match install_status {
             ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
@@ -625,7 +621,7 @@ fn model_primary_disabled_tooltip(
             ModelInstallStatus::RuntimeError(message) => {
                 Some(format!("Runtime repair failed: {message}"))
             }
-            _ => Some("The backend runtime is not ready for this installed model.".to_owned()),
+            _ => Some("The local runtime is not ready for this installed model.".to_owned()),
         },
         ModelPrimaryAction::Install => {
             Some("This model does not have a managed installer.".to_owned())
@@ -655,25 +651,22 @@ fn runtime_action_state_with_activity(
     activity: RuntimeConsumerActivity,
 ) -> RuntimeActionState {
     let state = runtime_action_state_inner(config, model);
-    restrict_runtime_action(state, &model.backend, busy, activity)
+    restrict_runtime_action(state, busy, activity)
 }
 
 fn restrict_runtime_action(
     mut state: RuntimeActionState,
-    backend: &str,
     busy: bool,
     activity: RuntimeConsumerActivity,
 ) -> RuntimeActionState {
     if busy {
         state.enabled = false;
-        state.disabled_tooltip = Some(format!(
-            "The shared {} runtime is already being prepared.",
-            backend
-        ));
+        state.disabled_tooltip =
+            Some("The shared local runtime is already being prepared.".to_owned());
     } else if matches!(
         state.kind,
         RuntimeActionKind::Update | RuntimeActionKind::Uninstall
-    ) && let Some(reason) = runtime_consumer_block_reason(backend, activity)
+    ) && let Some(reason) = runtime_consumer_block_reason(activity)
     {
         state.enabled = false;
         state.disabled_tooltip = Some(reason);
@@ -681,26 +674,20 @@ fn restrict_runtime_action(
     state
 }
 
-fn runtime_consumer_block_reason(
-    backend: &str,
-    activity: RuntimeConsumerActivity,
-) -> Option<String> {
+fn runtime_consumer_block_reason(activity: RuntimeConsumerActivity) -> Option<String> {
     if activity.recording {
-        Some(format!(
-            "Stop the active recording before changing the shared {backend} runtime."
-        ))
+        Some("Stop the active recording before changing the shared local runtime.".to_owned())
     } else if activity.transcribing {
-        Some(format!(
-            "Wait for transcription to finish before changing the shared {backend} runtime."
-        ))
+        Some(
+            "Wait for transcription to finish before changing the shared local runtime.".to_owned(),
+        )
     } else if activity.playground_jobs {
-        Some(format!(
-            "Wait for Playground jobs to finish before changing the shared {backend} runtime."
-        ))
+        Some(
+            "Wait for Playground jobs to finish before changing the shared local runtime."
+                .to_owned(),
+        )
     } else if activity.model_download {
-        Some(format!(
-            "Wait for the {backend} model download to finish before changing its runtime."
-        ))
+        Some("Wait for the model download to finish before changing its runtime.".to_owned())
     } else {
         None
     }
@@ -715,8 +702,8 @@ fn model_download_uses_runtime(
         matches!(
             model_downloads.get(&model.id),
             Some(ModelInstallStatus::Downloading { .. })
-        ) && stt::provider_for_backend(&model.backend)
-            .is_some_and(|provider| provider.runtime_id == runtime_id)
+        ) && compatibility_bridge::provider_for_model(&model)
+            .is_some_and(|provider| provider.id() == runtime_id)
     })
 }
 
@@ -731,22 +718,21 @@ fn apply_runtime_uninstall_result(
 }
 
 fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> RuntimeActionState {
-    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
         return RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
-            disabled_tooltip: Some(format!("{} is not a supported STT backend.", model.backend)),
+            disabled_tooltip: Some("This model has no compatible local provider.".to_owned()),
         };
     };
 
-    if !provider.runtime_install_supported {
+    if !provider.runtime_install_supported() {
         return RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
-            disabled_tooltip: Some(format!(
-                "The managed {} runtime installer is not bundled in this build.",
-                model.backend
-            )),
+            disabled_tooltip: Some(
+                "The managed local runtime installer is not bundled in this build.".to_owned(),
+            ),
         };
     }
 
@@ -760,8 +746,8 @@ fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> Runti
 
 fn runtime_action_state_for_source(
     config: &AppConfig,
-    model: &SttModelInfo,
-    provider: &stt::SttProviderAdapter,
+    _model: &SttModelInfo,
+    provider: ProviderHandle,
     source_available: bool,
 ) -> RuntimeActionState {
     if has_managed_runtime_install(config, provider) {
@@ -790,44 +776,40 @@ fn runtime_action_state_for_source(
         RuntimeActionState {
             kind: RuntimeActionKind::Install,
             enabled: false,
-            disabled_tooltip: Some(missing_runtime_source_message(&model.backend)),
+            disabled_tooltip: Some(missing_runtime_source_message()),
         }
     }
 }
 
 fn supports_managed_install(model: &SttModelInfo) -> bool {
-    stt::provider_for_backend(&model.backend)
+    compatibility_bridge::provider_for_model(model)
         .is_some_and(|provider| provider.can_install_model(model))
 }
 
 fn supports_managed_uninstall(model: &SttModelInfo, install_status: &ModelInstallStatus) -> bool {
-    stt::provider_for_backend(&model.backend).is_some_and(|provider| {
+    compatibility_bridge::provider_for_model(model).is_some_and(|provider| {
         let mut model = model.clone();
         model.install_status = install_status.clone();
         provider.can_uninstall_model(&model)
     })
 }
 
-fn has_managed_runtime_install(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
+fn has_managed_runtime_install(config: &AppConfig, provider: ProviderHandle) -> bool {
     resolve_managed_runtime_executable(config, provider).is_some()
 }
 
-fn runtime_needs_update(config: &AppConfig, provider: &stt::SttProviderAdapter) -> bool {
+fn runtime_needs_update(config: &AppConfig, provider: ProviderHandle) -> bool {
     matches!(
         runtime_version_state(config, provider),
         RuntimeVersionState::UpdateAvailable { .. }
     )
 }
 
-fn runtime_version_state(
-    config: &AppConfig,
-    provider: &stt::SttProviderAdapter,
-) -> RuntimeVersionState {
-    let Some(available) = runtime_catalog::runtime_version_for_runtime_id(provider.runtime_id)
-    else {
+fn runtime_version_state(config: &AppConfig, provider: ProviderHandle) -> RuntimeVersionState {
+    let Some(available) = provider.available_version() else {
         return RuntimeVersionState::NotTracked;
     };
-    let Some(install) = config.managed_runtimes.get(provider.runtime_id) else {
+    let Some(install) = config.managed_runtimes.get(provider.id()) else {
         return RuntimeVersionState::NotTracked;
     };
     let installed = install
@@ -851,22 +833,19 @@ fn runtime_version_state(
 
 fn resolve_managed_runtime_executable(
     config: &AppConfig,
-    provider: &stt::SttProviderAdapter,
+    provider: ProviderHandle,
 ) -> Option<PathBuf> {
-    let root = config::managed_runtime_path(config, provider.backend)?;
-    runtime_catalog::resolve_runtime_entrypoint(provider.runtime_id, [root])
+    let root = provider.managed_root(config)?;
+    provider.resolve_entrypoint([root])
 }
 
 fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
-    let provider = stt::provider_for_backend(&model.backend)?;
+    let provider = compatibility_bridge::provider_for_model(model)?;
     let bundled_root = env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
-    let managed_root = config::managed_runtime_path(config, &model.backend);
-    runtime_catalog::resolve_runtime_entrypoint(
-        provider.runtime_id,
-        bundled_root.into_iter().chain(managed_root),
-    )
+    let managed_root = provider.managed_root(config);
+    provider.resolve_entrypoint(bundled_root.into_iter().chain(managed_root))
 }
 
 fn runtime_install_source(
@@ -901,10 +880,10 @@ fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Pat
         return false;
     };
 
-    let Some(provider) = stt::provider_for_backend(&model.backend) else {
+    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
         return false;
     };
-    let Some(current) = config.managed_runtimes.get(provider.runtime_id) else {
+    let Some(current) = config.managed_runtimes.get(provider.id()) else {
         return true;
     };
 
@@ -922,10 +901,10 @@ fn development_runtime_package(
     _config: &AppConfig,
     model: &SttModelInfo,
 ) -> Option<DevelopmentRuntimePackage> {
-    let provider = stt::provider_for_backend(&model.backend)?;
-    let spec = runtime_catalog::development_runtime_spec(provider.runtime_id)?;
+    let provider = compatibility_bridge::provider_for_model(model)?;
+    let spec = provider.development_package()?;
     let script = find_development_bundle_script(spec.script_name)?;
-    let destination_root = config::runtime_storage_dir().join(provider.runtime_id);
+    let destination_root = config::runtime_storage_dir().join(provider.id());
     Some(DevelopmentRuntimePackage {
         script,
         destination_env: spec.destination_env,
@@ -1045,6 +1024,7 @@ impl LocalTranscriberApp {
 
         let (tx, rx) = unbounded();
         let transcription_service = TranscriptionService::new(config.clone());
+        let playground_cards = cards_from_config(&config, &transcription_service);
         let mut app = Self {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
@@ -1052,7 +1032,7 @@ impl LocalTranscriberApp {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
-            playground_cards: cards_from_config(&config),
+            playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
             playground_selector_header_focus: None,
@@ -1144,18 +1124,20 @@ impl LocalTranscriberApp {
         let existing_cards = std::mem::take(&mut self.playground_cards);
         let mut existing_by_id = existing_cards
             .into_iter()
-            .map(|card| (card.model.id.clone(), card))
+            .map(|card| (card.descriptor.id.as_str().to_owned(), card))
             .collect::<HashMap<_, _>>();
 
-        self.playground_cards = cards_from_config(&self.config)
+        self.playground_cards = cards_from_config(&self.config, &self.transcription_service)
             .into_iter()
             .map(|mut card| {
-                if let Some(mut existing) = existing_by_id.remove(&card.model.id) {
-                    existing.model = card.model;
-                    existing.status = runtime_status_for_model(&self.config, &existing.model);
+                if let Some(mut existing) = existing_by_id.remove(card.descriptor.id.as_str()) {
+                    existing.descriptor = card.descriptor;
+                    existing.install_status = card.install_status;
+                    existing.status =
+                        runtime_status_for_id(&self.config, existing.descriptor.id.as_str());
                     existing
                 } else {
-                    card.status = runtime_status_for_model(&self.config, &card.model);
+                    card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
                     card
                 }
             })
@@ -1194,7 +1176,7 @@ impl LocalTranscriberApp {
                 if let Some(card) = self
                     .playground_cards
                     .iter_mut()
-                    .find(|card| card.model.id == model_id)
+                    .find(|card| card.descriptor.id.as_str() == model_id)
                 {
                     card.transcript.clear();
                     card.latency_ms = None;
@@ -1210,7 +1192,7 @@ impl LocalTranscriberApp {
                 let selected_ids = self
                     .playground_cards
                     .iter()
-                    .map(|card| card.model.id.clone())
+                    .map(|card| card.descriptor.id.as_str().to_owned())
                     .collect::<Vec<_>>();
                 if let Some(position) = move_selected_model_by(
                     &mut self.config.playground_model_order,
@@ -1221,8 +1203,8 @@ impl LocalTranscriberApp {
                     let model_name = self
                         .playground_cards
                         .iter()
-                        .find(|card| card.model.id == model_id)
-                        .map(|card| card.model.name.clone())
+                        .find(|card| card.descriptor.id.as_str() == model_id)
+                        .map(|card| card.descriptor.display_name.to_owned())
                         .unwrap_or(model_id);
                     self.save_config();
                     self.status_message = format!(
@@ -1246,7 +1228,7 @@ impl LocalTranscriberApp {
                     if let Some(position) = self
                         .playground_cards
                         .iter()
-                        .position(|card| card.model.id == dragged_id)
+                        .position(|card| card.descriptor.id.as_str() == dragged_id)
                     {
                         self.status_message = format!(
                             "Moved model to position {} of {}.",
@@ -1591,7 +1573,7 @@ impl LocalTranscriberApp {
                 && let Some(card) = self
                     .playground_cards
                     .iter_mut()
-                    .find(|card| card.model.id == expected_model_id)
+                    .find(|card| card.descriptor.id.as_str() == expected_model_id)
             {
                 card.status = ModelRuntimeStatus::Error(message.to_owned());
                 card.transcript.clear();
@@ -1668,9 +1650,8 @@ impl LocalTranscriberApp {
                             self.transcript = result.transcript.text.clone();
                             self.status = TranscriptionStatus::Idle;
                             let completion_message = format!(
-                                "{} via {} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
+                                "{} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
                                 result.model_name,
-                                result.backend_label,
                                 result.processing_duration_ms.unwrap_or_default(),
                                 segment_count,
                                 timed_segments,
@@ -1747,7 +1728,7 @@ impl LocalTranscriberApp {
                             if let Some(card) = self
                                 .playground_cards
                                 .iter_mut()
-                                .find(|card| card.model.id == model_id)
+                                .find(|card| card.descriptor.id.as_str() == model_id)
                             {
                                 card.status = ModelRuntimeStatus::Error(message.clone());
                                 card.transcript.clear();
@@ -1792,7 +1773,10 @@ impl LocalTranscriberApp {
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.selected_default_model = model_id.clone();
-                            self.config.last_used_backend = model.backend;
+                            compatibility_bridge::record_selected_provider(
+                                &mut self.config,
+                                &model,
+                            );
                         }
                     }
                     self.save_config();
@@ -1817,7 +1801,7 @@ impl LocalTranscriberApp {
                 }
                 AppEvent::RuntimeInstallDone {
                     runtime_id,
-                    backend,
+                    runtime_label,
                     replacement,
                     source_label,
                 } => {
@@ -1877,10 +1861,10 @@ impl LocalTranscriberApp {
                     }
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = cleanup_warning.map_or_else(
-                        || format!("{backend} runtime is ready."),
+                        || format!("{runtime_label} runtime is ready."),
                         |warning| {
                             format!(
-                                "{backend} runtime is ready. Old runtime backup cleanup warning: {warning}"
+                                "{runtime_label} runtime is ready. Old runtime backup cleanup warning: {warning}"
                             )
                         },
                     );
@@ -2077,7 +2061,7 @@ impl LocalTranscriberApp {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
-                .find(|card| card.model.id == model.id)
+                .find(|card| card.descriptor.id.as_str() == model.id)
             {
                 card.status = ModelRuntimeStatus::Running;
                 card.transcript.clear();
@@ -2149,9 +2133,11 @@ impl LocalTranscriberApp {
     }
 
     fn reset_playground_for_run(&mut self) {
-        self.playground_cards = cards_from_config(&self.config).into_iter().collect();
+        self.playground_cards = cards_from_config(&self.config, &self.transcription_service)
+            .into_iter()
+            .collect();
         for card in &mut self.playground_cards {
-            card.status = runtime_status_for_model(&self.config, &card.model);
+            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
             card.transcript.clear();
             card.latency_ms = None;
             card.audio_duration_ms = None;
@@ -2172,7 +2158,7 @@ impl LocalTranscriberApp {
         if let Some(card) = self
             .playground_cards
             .iter_mut()
-            .find(|card| card.model.id == result.model_id.as_str())
+            .find(|card| card.descriptor.id == result.model_id)
         {
             card.status = ModelRuntimeStatus::Ready;
             card.transcript = transcript.clone();
@@ -2190,7 +2176,7 @@ impl LocalTranscriberApp {
             card.audio_duration_ms = None;
             card.peak_ram_mb = None;
             card.peak_vram_mb = None;
-            card.status = runtime_status_for_model(&self.config, &card.model);
+            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
         }
         if clear_reference {
             self.playground_reference_transcript.clear();
@@ -2252,7 +2238,7 @@ impl LocalTranscriberApp {
             .map(|card| {
                 format!(
                     "{} is not ready. Repair or install its runtime from Models before running the Playground.",
-                    card.model.name
+                    card.descriptor.display_name
                 )
             })
     }
@@ -2261,10 +2247,15 @@ impl LocalTranscriberApp {
         self.playground_cards
             .iter()
             .find(|card| {
-                card.model.id == self.config.selected_default_model
+                card.descriptor.id.as_str() == self.config.selected_default_model
                     && !card.transcript.trim().is_empty()
             })
-            .map(|card| (card.model.name.clone(), card.transcript.clone()))
+            .map(|card| {
+                (
+                    card.descriptor.display_name.to_owned(),
+                    card.transcript.clone(),
+                )
+            })
     }
 
     fn apply_active_playground_output_as_reference(&mut self) -> bool {
@@ -2287,8 +2278,8 @@ impl LocalTranscriberApp {
             .iter()
             .filter(|card| !card.transcript.trim().is_empty())
             .map(|card| BenchmarkModelInput {
-                model_id: card.model.id.clone(),
-                model_name: card.model.name.clone(),
+                model_id: card.descriptor.id.as_str().to_owned(),
+                model_name: card.descriptor.display_name.to_owned(),
                 predicted_transcript: card.transcript.clone(),
                 reference_transcript: reference.to_owned(),
                 elapsed_ms: card.latency_ms,
@@ -2349,7 +2340,7 @@ impl LocalTranscriberApp {
 
     fn select_model_as_default(&mut self, model: &SttModelInfo) {
         self.config.selected_default_model = model.id.clone();
-        self.config.last_used_backend = model.backend.clone();
+        compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
     }
 
@@ -2374,11 +2365,8 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download(&mut self, model: &SttModelInfo) {
-        let Some(provider) = stt::provider_for_backend(&model.backend) else {
-            self.fail_model_install(
-                &model.id,
-                format!("{} is not a supported STT backend.", model.backend),
-            );
+        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+            self.fail_model_install(&model.id, "Model provider is not available.".to_owned());
             return;
         };
 
@@ -2406,15 +2394,13 @@ impl LocalTranscriberApp {
             return;
         }
 
-        let Some(destination) = config::downloaded_model_path(&self.config, model) else {
+        if config::downloaded_model_path(&self.config, model).is_none() {
             self.status = TranscriptionStatus::Error;
             self.status_message = "No model storage directory is configured.".to_owned();
             return;
-        };
+        }
 
         let expected_total_bytes = model_download_total_bytes(model);
-        let expected_sha256 =
-            runtime_catalog::model_artifact_spec(&model.id).and_then(|artifact| artifact.sha256);
         self.model_downloads.insert(
             model.id.clone(),
             ModelInstallStatus::Downloading {
@@ -2428,18 +2414,11 @@ impl LocalTranscriberApp {
 
         let tx = self.tx.clone();
         let model_id = model.id.clone();
+        let download_id = crate::transcription::ModelId::new(&model_id);
         let config = self.config.clone();
-        let model = model.clone();
         thread::spawn(move || {
             let progress = |progress| send_model_download_progress(&tx, progress);
-            let result = managed_downloads::download_configured_model(
-                &config,
-                &model,
-                &destination,
-                expected_total_bytes,
-                expected_sha256,
-                &progress,
-            );
+            let result = managed_downloads::download_model(&config, &download_id, &progress);
             send_model_download_result(&tx, model_id, result);
         });
     }
@@ -2465,23 +2444,21 @@ impl LocalTranscriberApp {
     }
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
-        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!("{} is not a supported STT backend.", model.backend);
+            self.status_message = "Model provider is not available.".to_owned();
             return;
         };
 
-        if !provider.runtime_install_supported {
+        if !provider.runtime_install_supported() {
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!(
-                "Managed runtime installer for {} is not available in this build.",
-                model.backend
-            );
+            self.status_message =
+                "Managed local runtime installation is not available in this build.".to_owned();
             return;
         }
 
         let Some(source) = runtime_install_source(&self.config, model) else {
-            let message = missing_runtime_source_message(&model.backend);
+            let message = missing_runtime_source_message();
             match intent {
                 RuntimeJobIntent::DownloadModel(model_id) => {
                     self.model_downloads
@@ -2498,7 +2475,7 @@ impl LocalTranscriberApp {
             return;
         };
 
-        if let Some(job) = self.runtime_jobs.get_mut(provider.runtime_id) {
+        if let Some(job) = self.runtime_jobs.get_mut(provider.id()) {
             let queued_model_id = match intent {
                 RuntimeJobIntent::DownloadModel(model_id) => {
                     queue_runtime_model(&mut job.download_model_ids, model_id.clone())
@@ -2533,14 +2510,13 @@ impl LocalTranscriberApp {
             self.model_downloads
                 .insert(model_id.clone(), ModelInstallStatus::InstallingRuntime);
         }
-        self.runtime_jobs
-            .insert(provider.runtime_id.to_owned(), job);
+        self.runtime_jobs.insert(provider.id().to_owned(), job);
         self.status = TranscriptionStatus::Idle;
-        self.status_message = format!("Preparing {} runtime...", model.backend);
+        self.status_message = "Preparing local speech runtime...".to_owned();
 
         let tx = self.tx.clone();
-        let runtime_id = provider.runtime_id.to_owned();
-        let backend = model.backend.clone();
+        let runtime_id = provider.id().to_owned();
+        let runtime_label = "Local speech".to_owned();
         thread::spawn(move || {
             let (result, source_label) = match source {
                 RuntimeInstallSource::Packaged(packaged_path) => (
@@ -2548,7 +2524,7 @@ impl LocalTranscriberApp {
                     "packaged-runtime",
                 ),
                 RuntimeInstallSource::DevelopmentScript(package) => (
-                    build_development_runtime_package(&runtime_id, &backend, package),
+                    build_development_runtime_package(&runtime_id, &runtime_label, package),
                     "development-script",
                 ),
             };
@@ -2556,7 +2532,7 @@ impl LocalTranscriberApp {
                 Ok(replacement) => {
                     let _ = tx.send(AppEvent::RuntimeInstallDone {
                         runtime_id,
-                        backend,
+                        runtime_label,
                         replacement,
                         source_label,
                     });
@@ -2596,20 +2572,19 @@ impl LocalTranscriberApp {
     }
 
     fn uninstall_runtime(&mut self, model: &SttModelInfo) {
-        let Some(provider) = stt::provider_for_backend(&model.backend) else {
+        let Some(provider) = compatibility_bridge::provider_for_model(model) else {
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!("{} is not a supported STT backend.", model.backend);
+            self.status_message = "Model provider is not available.".to_owned();
             return;
         };
 
-        let removal = uninstall_runtime_files(&self.config, provider.runtime_id);
+        let removal = uninstall_runtime_files(&self.config, provider.id());
         let removed_files =
-            match apply_runtime_uninstall_result(&mut self.config, provider.runtime_id, removal) {
+            match apply_runtime_uninstall_result(&mut self.config, provider.id(), removal) {
                 Ok(removed_files) => removed_files,
                 Err(message) => {
                     self.status = TranscriptionStatus::Error;
-                    self.status_message =
-                        format!("Could not uninstall {} runtime. {message}", model.backend);
+                    self.status_message = format!("Could not uninstall runtime. {message}");
                     return;
                 }
             };
@@ -2617,14 +2592,14 @@ impl LocalTranscriberApp {
         self.refresh_playground_runtime_statuses();
         self.status = TranscriptionStatus::Idle;
         self.status_message = match removed_files {
-            true => format!("Uninstalled {} runtime.", model.backend),
-            false => format!("Removed {} runtime from Scribe.", model.backend),
+            true => "Uninstalled local speech runtime.".to_owned(),
+            false => "Removed local speech runtime from Scribe.".to_owned(),
         };
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
         for card in &mut self.playground_cards {
-            card.status = runtime_status_for_model(&self.config, &card.model);
+            card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
         }
     }
 }
@@ -2701,12 +2676,17 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map(|model| runtime_status_for_model(&self.config, model));
             let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
-            let selected_model_summary = selected_model.as_ref().map(|model| {
-                (
-                    model.name.clone(),
-                    model.backend.clone(),
-                    self.effective_install_status(model),
-                )
+            let selected_model_summary = selected_model.as_ref().and_then(|model| {
+                self.transcription_service
+                    .model_descriptor(&crate::transcription::ModelId::new(&model.id))
+                    .ok()
+                    .map(|descriptor| {
+                        (
+                            descriptor.display_name,
+                            descriptor.compatibility.label(),
+                            self.effective_install_status(model),
+                        )
+                    })
             });
             let hotkey = self.config.hotkey.clone();
             let mut requested_tab = None;
@@ -2716,10 +2696,11 @@ impl LocalTranscriberApp {
                     &mut columns[0],
                     "Current Model",
                     |ui| {
-                        if let Some((name, backend, install_status)) = &selected_model_summary {
+                        if let Some((name, compatibility, install_status)) = &selected_model_summary
+                        {
                             ui.label(body_strong(name));
                             ui.horizontal_wrapped(|ui| {
-                                badge(ui, backend, ChipTone::Neutral);
+                                badge(ui, compatibility, ChipTone::Warning);
                                 badge(
                                     ui,
                                     &install_status.label(),
@@ -2767,22 +2748,6 @@ impl LocalTranscriberApp {
                     ui.label(mut_text(setup_message));
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
-                        for model_id in ["whisper_cpp_base_en", "whisper_cpp_tiny_en"] {
-                            if let Some(model) = config::configured_models(&self.config)
-                                .into_iter()
-                                .find(|model| model.id == model_id)
-                            {
-                                let label = if model_id == "whisper_cpp_base_en" {
-                                    "Download base.en"
-                                } else {
-                                    "Download tiny.en"
-                                };
-                                if ui.add(small_button(ui, label)).clicked() {
-                                    self.select_model_as_default(&model);
-                                    self.start_model_download(&model);
-                                }
-                            }
-                        }
                         if ui.add(small_button(ui, "Manage models")).clicked() {
                             self.current_tab = Tab::Models;
                         }
@@ -2896,8 +2861,11 @@ impl LocalTranscriberApp {
                     ui.label(section_heading("Downloads"));
                     ui.add_space(8.0);
                     for (index, (model, install_status)) in download_rows.iter().enumerate() {
-                        let descriptor = descriptors_by_id.get(model.id.as_str()).copied();
-                        download_summary_row(ui, model, descriptor, install_status);
+                        let descriptor = descriptors_by_id
+                            .get(model.id.as_str())
+                            .copied()
+                            .expect("filtered download row must have a neutral descriptor");
+                        download_summary_row(ui, descriptor, install_status);
                         if index + 1 < download_rows.len() {
                             ui.add_space(8.0);
                         }
@@ -2911,7 +2879,7 @@ impl LocalTranscriberApp {
                 .default_open(false)
                 .show(ui, |ui| panel(ui, |ui| {
                 ui.label(mut_text(
-                    "Install, update, or remove backend runtimes. Models prepare a missing runtime automatically.",
+                    "Install, update, or remove the local speech runtime. Models prepare a missing runtime automatically.",
                 ));
                 wrapped_label(
                     ui,
@@ -2926,20 +2894,19 @@ impl LocalTranscriberApp {
                     .into_iter()
                     .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
                 {
-                    let provider = stt::provider_for_backend(&model.backend);
+                    let provider = compatibility_bridge::provider_for_model(&model);
                     let runtime_busy = provider.is_some_and(|provider| {
-                        self.runtime_jobs.contains_key(provider.runtime_id)
+                        self.runtime_jobs.contains_key(provider.id())
                     });
                     let consumer_activity = provider
-                        .map(|provider| self.runtime_consumer_activity(provider.runtime_id))
+                        .map(|provider| self.runtime_consumer_activity(provider.id()))
                         .unwrap_or_default();
                     let runtime_status = provider
                         .map(|provider| provider.runtime_status(&self.config))
                         .unwrap_or_else(|| {
-                            ModelRuntimeStatus::Error(format!(
-                                "unsupported STT backend: {}",
-                                model.backend
-                            ))
+                            ModelRuntimeStatus::Error(
+                                "The model provider is not available.".to_owned(),
+                            )
                         });
                     let action_state = runtime_action_state_with_activity(
                         &self.config,
@@ -2987,7 +2954,10 @@ impl LocalTranscriberApp {
                             }
                             badge(
                                 ui,
-                                &format!("Runtime {}", runtime_storage_estimate(&model.backend)),
+                                &format!(
+                                    "Runtime {}",
+                                    compatibility_bridge::runtime_storage_estimate(&model)
+                                ),
                                 ChipTone::Neutral,
                             );
                         });
@@ -3038,7 +3008,7 @@ impl LocalTranscriberApp {
                 let selected = self.config.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
                 let runtime_ready =
-                    stt::provider_for_backend(&model.backend).is_some_and(|provider| {
+                    compatibility_bridge::provider_for_model(&model).is_some_and(|provider| {
                         provider.runtime_status(&self.config) == ModelRuntimeStatus::Ready
                     });
                 let action_state = model_action_state_with_runtime(
@@ -3057,7 +3027,7 @@ impl LocalTranscriberApp {
                 let mut start_install = false;
                 let mut uninstall = false;
 
-                model_catalog_row(ui, descriptor, &model, &install_status, selected, |ui| {
+                model_catalog_row(ui, descriptor, &install_status, selected, |ui| {
                     let primary_label =
                         model_primary_action_label(action_state.primary, &model, &install_status);
                     let primary_button = match action_state.primary {
@@ -3074,10 +3044,10 @@ impl LocalTranscriberApp {
                     )
                     .on_hover_text(match action_state.primary {
                         ModelPrimaryAction::Repair => format!(
-                            "Prepare the shared {} runtime for {} without downloading the model again.",
-                            model.backend, model.name
+                            "Prepare the shared local runtime for {} without downloading the model again.",
+                            descriptor.display_name
                         ),
-                        _ => format!("{} for {}.", primary_label, model.name),
+                        _ => format!("{} for {}.", primary_label, descriptor.display_name),
                     });
                     if primary_response.clicked() {
                         match action_state.primary {
@@ -3303,7 +3273,7 @@ impl LocalTranscriberApp {
             }
             let card_count = self.playground_cards.len();
             for (card_index, card_state) in self.playground_cards.iter_mut().enumerate() {
-                let model_id = card_state.model.id.clone();
+                let model_id = card_state.descriptor.id.as_str().to_owned();
                 let is_active_model = model_id == self.config.selected_default_model;
                 let drag_id = ui.id().with(("playground-card", &model_id));
                 let outer_width = usable_width(ui);
@@ -3372,9 +3342,19 @@ impl LocalTranscriberApp {
             return;
         };
         let busy = self.playground_selector_busy();
+        let descriptors = self
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
+            .collect::<HashMap<_, _>>();
         let installed_models = config::configured_models(&self.config)
             .into_iter()
             .filter(|model| model.install_status.is_runnable())
+            .filter_map(|model| {
+                let descriptor = descriptors.get(&model.id)?.clone();
+                Some((model, descriptor))
+            })
             .collect::<Vec<_>>();
         let request_initial_focus =
             std::mem::take(&mut self.playground_selector_needs_initial_focus);
@@ -3419,7 +3399,7 @@ impl LocalTranscriberApp {
                     if select_all.clicked() {
                         draft = installed_models
                             .iter()
-                            .map(|model| model.id.clone())
+                            .map(|(model, _)| model.id.clone())
                             .collect();
                     }
                     if ui
@@ -3438,21 +3418,26 @@ impl LocalTranscriberApp {
                     egui::ScrollArea::vertical()
                         .max_height(320.0)
                         .show(ui, |ui| {
-                            for model in &installed_models {
+                            for (model, descriptor) in &installed_models {
                                 ui.horizontal_wrapped(|ui| {
                                     let mut selected = draft.iter().any(|id| id == &model.id);
                                     let readiness = runtime_status_for_model(&self.config, model);
                                     let checkbox = ui.add_enabled(
                                         !busy,
-                                        egui::Checkbox::new(&mut selected, &model.name),
+                                        egui::Checkbox::new(
+                                            &mut selected,
+                                            descriptor.display_name,
+                                        ),
                                     );
                                     checkbox.widget_info(|| {
                                         let mut info = egui::WidgetInfo::selected(
                                             egui::WidgetType::Checkbox,
                                             selected,
                                             format!(
-                                                "{}; backend {}; readiness {}",
-                                                model.name, model.backend, readiness
+                                                "{}; compatibility {}; readiness {}",
+                                                descriptor.display_name,
+                                                descriptor.compatibility.label(),
+                                                readiness
                                             ),
                                         );
                                         info.enabled = !busy;
@@ -3468,7 +3453,11 @@ impl LocalTranscriberApp {
                                     } else {
                                         draft.retain(|id| id != &model.id);
                                     }
-                                    badge(ui, &model.backend, ChipTone::Neutral);
+                                    badge(
+                                        ui,
+                                        descriptor.compatibility.label(),
+                                        ChipTone::Warning,
+                                    );
                                     badge(
                                         ui,
                                         &readiness.to_string(),
@@ -4034,7 +4023,6 @@ fn summary_card(
 fn model_catalog_row(
     ui: &mut Ui,
     descriptor: &ModelDescriptor,
-    model: &SttModelInfo,
     install_status: &ModelInstallStatus,
     selected: bool,
     actions: impl FnOnce(&mut Ui),
@@ -4066,7 +4054,7 @@ fn model_catalog_row(
                             }
                             CompatibilityStatus::Supported { .. } => {}
                         }
-                        if let Some(detail) = model_install_detail(model, install_status) {
+                        if let Some(detail) = model_install_detail(descriptor, install_status) {
                             ui.add_space(4.0);
                             wrapped_label(ui, mut_text(&detail));
                         }
@@ -4164,8 +4152,7 @@ fn current_download_rows(
 
 fn download_summary_row(
     ui: &mut Ui,
-    model: &SttModelInfo,
-    descriptor: Option<&ModelDescriptor>,
+    descriptor: &ModelDescriptor,
     install_status: &ModelInstallStatus,
 ) {
     full_width_frame(
@@ -4174,26 +4161,17 @@ fn download_summary_row(
         |ui| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    wrapped_label(
-                        ui,
-                        body_strong(
-                            descriptor
-                                .map(|descriptor| descriptor.display_name)
-                                .unwrap_or(&model.name),
-                        ),
-                    );
+                    wrapped_label(ui, body_strong(descriptor.display_name));
                     tag_row(ui, |ui| {
-                        if let Some(descriptor) = descriptor {
-                            badge(
-                                ui,
-                                descriptor.compatibility.label(),
-                                match descriptor.compatibility {
-                                    CompatibilityStatus::Supported { .. } => ChipTone::Success,
-                                    CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
-                                    CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
-                                },
-                            );
-                        }
+                        badge(
+                            ui,
+                            descriptor.compatibility.label(),
+                            match descriptor.compatibility {
+                                CompatibilityStatus::Supported { .. } => ChipTone::Success,
+                                CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
+                                CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
+                            },
+                        );
                         badge(
                             ui,
                             &install_status.label(),
@@ -4305,7 +4283,7 @@ fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<Strin
         }
         ModelInstallStatus::Installed => Some("Installed".to_owned()),
         ModelInstallStatus::InstallingRuntime => {
-            Some("Preparing the shared backend runtime before downloading this model.".to_owned())
+            Some("Preparing the shared local runtime before downloading this model.".to_owned())
         }
         ModelInstallStatus::Error(message) => Some(message.clone()),
         ModelInstallStatus::RuntimeError(message) => Some(message.clone()),
@@ -4417,8 +4395,8 @@ fn playground_card_ui(
                     playground_drag_handle(
                         ui,
                         drag_id,
-                        card_state.model.id.clone(),
-                        &card_state.model.name,
+                        card_state.descriptor.id.as_str().to_owned(),
+                        card_state.descriptor.display_name,
                         is_active_model,
                     );
                 },
@@ -4429,25 +4407,36 @@ fn playground_card_ui(
                 Layout::top_down(Align::LEFT),
                 |ui| {
                     set_exact_width(ui, detail_width);
-                    wrapped_label(ui, card_title(ui, &card_state.model.name, is_active_model));
-                    wrapped_label(ui, mut_text(&card_state.model.description));
+                    wrapped_label(
+                        ui,
+                        card_title(ui, card_state.descriptor.display_name, is_active_model),
+                    );
+                    wrapped_label(ui, mut_text(card_state.descriptor.description));
                     ui.add_space(8.0);
                     tag_row(ui, |ui| {
-                        badge(ui, &card_state.model.backend, ChipTone::Neutral);
                         badge(
                             ui,
-                            &format!("Device {}", model_device_label(&card_state.model)),
+                            if card_state.descriptor.capabilities.gpu {
+                                "CPU / GPU eligible"
+                            } else {
+                                "CPU verified path"
+                            },
                             ChipTone::Neutral,
                         );
                         badge(
                             ui,
-                            &card_state.model.install_status.label(),
-                            install_chip_tone(&card_state.model.install_status),
+                            &card_state.install_status.label(),
+                            install_chip_tone(&card_state.install_status),
                         );
                         badge(
                             ui,
-                            &format!("{} speed", card_state.model.speed_tier),
+                            &format!("{} speed", card_state.descriptor.speed_guidance),
                             ChipTone::Neutral,
+                        );
+                        badge(
+                            ui,
+                            card_state.descriptor.compatibility.label(),
+                            ChipTone::Warning,
                         );
                     });
                 },
@@ -4462,14 +4451,14 @@ fn playground_card_ui(
                     move_up.widget_info(|| {
                         let mut info = egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
-                            format!("Move {} up", card_state.model.name),
+                            format!("Move {} up", card_state.descriptor.display_name),
                         );
                         info.enabled = can_move_up;
                         info
                     });
                     if move_up.clicked() {
                         actions.push(PlaygroundAction::MoveBy {
-                            model_id: card_state.model.id.clone(),
+                            model_id: card_state.descriptor.id.as_str().to_owned(),
                             offset: -1,
                         });
                     }
@@ -4477,19 +4466,21 @@ fn playground_card_ui(
                     move_down.widget_info(|| {
                         let mut info = egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
-                            format!("Move {} down", card_state.model.name),
+                            format!("Move {} down", card_state.descriptor.display_name),
                         );
                         info.enabled = can_move_down;
                         info
                     });
                     if move_down.clicked() {
                         actions.push(PlaygroundAction::MoveBy {
-                            model_id: card_state.model.id.clone(),
+                            model_id: card_state.descriptor.id.as_str().to_owned(),
                             offset: 1,
                         });
                     }
                     if ui.add(small_button(ui, "Clear")).clicked() {
-                        actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
+                        actions.push(PlaygroundAction::Clear(
+                            card_state.descriptor.id.as_str().to_owned(),
+                        ));
                     }
                     badge(
                         ui,
@@ -4506,7 +4497,11 @@ fn playground_card_ui(
     }
 
     ui.add_space(6.0);
-    playground_result_editor(ui, &card_state.model.id, &card_state.transcript);
+    playground_result_editor(
+        ui,
+        card_state.descriptor.id.as_str(),
+        &card_state.transcript,
+    );
 
     actions
 }
@@ -5158,14 +5153,14 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
 }
 
 fn model_install_detail(
-    model: &SttModelInfo,
+    descriptor: &ModelDescriptor,
     install_status: &ModelInstallStatus,
 ) -> Option<String> {
-    let base = format!("Model storage: {}", model_storage_estimate(model));
+    let base = format!(
+        "Model storage: {}",
+        format_bytes(descriptor.artifact_size_bytes)
+    );
     match install_status {
-        ModelInstallStatus::NotInstalled if !supports_managed_install(model) => {
-            Some(format!("{base} · Installer unavailable in this build."))
-        }
         ModelInstallStatus::Downloading { .. } => {
             Some(format!("{base} · {}", install_status.label()))
         }
@@ -5184,17 +5179,17 @@ fn model_install_detail(
 }
 
 fn runtime_representative_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    let mut seen_backends = Vec::new();
+    let mut seen_providers = Vec::new();
     config::configured_models(config)
         .into_iter()
         .filter(|model| {
-            if seen_backends
-                .iter()
-                .any(|backend: &String| backend == &model.backend)
-            {
+            let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+                return false;
+            };
+            if seen_providers.contains(&provider.id()) {
                 false
             } else {
-                seen_backends.push(model.backend.clone());
+                seen_providers.push(provider.id());
                 true
             }
         })
@@ -5206,8 +5201,8 @@ fn runtime_detail_text(
     model: &SttModelInfo,
     status: &ModelRuntimeStatus,
 ) -> String {
-    let used_by = runtime_model_summary(config, &model.backend);
-    let storage = runtime_storage_detail(&model.backend);
+    let used_by = runtime_model_summary(config, model);
+    let storage = compatibility_bridge::runtime_storage_detail(model);
     let status_detail = match status {
         ModelRuntimeStatus::Ready => "The local runtime is ready.".to_owned(),
         ModelRuntimeStatus::MissingConfiguration => {
@@ -5225,10 +5220,11 @@ fn runtime_detail_text(
     format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}{version}")
 }
 
-fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
+fn runtime_model_summary(config: &AppConfig, representative: &SttModelInfo) -> String {
+    let provider = compatibility_bridge::provider_for_model(representative);
     let models = config::configured_models(config)
         .into_iter()
-        .filter(|model| model.backend == backend)
+        .filter(|model| provider.is_some_and(|provider| provider.same_provider(model)))
         .map(|model| model.name)
         .collect::<Vec<_>>();
     let count = models.len();
@@ -5242,34 +5238,17 @@ fn runtime_model_summary(config: &AppConfig, backend: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
-    runtime_catalog::model_storage_estimate(&model.id)
-}
-
-fn model_device_label(model: &SttModelInfo) -> &'static str {
-    runtime_catalog::backend_spec(&model.backend)
-        .map(|spec| spec.device_support.label())
-        .unwrap_or("Unknown")
+    compatibility_bridge::model_storage_estimate(model)
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
-    runtime_catalog::model_download_total_bytes(&model.id)
-}
-
-fn runtime_storage_estimate(backend: &str) -> &'static str {
-    runtime_catalog::backend_spec(backend)
-        .map(|spec| spec.runtime_storage_estimate)
-        .unwrap_or("varies")
-}
-
-fn runtime_storage_detail(backend: &str) -> &'static str {
-    runtime_catalog::backend_spec(backend)
-        .map(|spec| spec.runtime_storage_detail)
-        .unwrap_or("varies")
+    compatibility_bridge::model_download_total_bytes(model)
 }
 
 fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(String, ChipTone)> {
-    let provider = stt::provider_for_backend(&model.backend)?;
+    let provider = compatibility_bridge::provider_for_model(model)?;
     match runtime_version_state(config, provider) {
         RuntimeVersionState::NotTracked => None,
         RuntimeVersionState::Current(version) => {
@@ -5291,7 +5270,7 @@ fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(St
 }
 
 fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<String> {
-    let provider = stt::provider_for_backend(&model.backend)?;
+    let provider = compatibility_bridge::provider_for_model(model)?;
     match runtime_version_state(config, provider) {
         RuntimeVersionState::NotTracked => None,
         RuntimeVersionState::Current(version) => Some(format!("Runtime version: {version}.")),
@@ -5359,7 +5338,7 @@ fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool,
 
 fn build_development_runtime_package(
     runtime_id: &str,
-    backend: &str,
+    runtime_label: &str,
     package: DevelopmentRuntimePackage,
 ) -> Result<RuntimeReplacement, String> {
     let relative_executable = package
@@ -5381,7 +5360,8 @@ fn build_development_runtime_package(
         destination_root: stage_root.clone(),
     };
     remove_path_if_exists(&stage_root)?;
-    if let Err(message) = build_development_runtime_into(runtime_id, backend, &staged_package) {
+    if let Err(message) = build_development_runtime_into(runtime_id, runtime_label, &staged_package)
+    {
         let _ = remove_path_if_exists(&stage_root);
         return Err(message);
     }
@@ -5390,7 +5370,7 @@ fn build_development_runtime_package(
 
 fn build_development_runtime_into(
     runtime_id: &str,
-    backend: &str,
+    runtime_label: &str,
     package: &DevelopmentRuntimePackage,
 ) -> Result<(), String> {
     if let Some(parent) = package.destination_root.parent() {
@@ -5406,16 +5386,16 @@ fn build_development_runtime_into(
     if !output.status.success() {
         return Err(format!(
             "Could not build {} runtime with {}: {}",
-            backend,
+            runtime_label,
             package.script.display(),
             command_output_message(&output.stdout, &output.stderr)
         ));
     }
 
-    if !installed_runtime_executable_usable(runtime_id, &package.executable_path) {
+    if !compatibility_bridge::entrypoint_is_usable(runtime_id, &package.executable_path) {
         return Err(format!(
             "{} runtime build finished but did not create a usable runtime at {}.",
-            backend,
+            runtime_label,
             package.executable_path.display()
         ));
     }
@@ -5467,7 +5447,7 @@ fn install_runtime_files_to(
         return Err(message);
     }
     let staged_executable = stage_root.join(&relative_executable);
-    if !installed_runtime_executable_usable(runtime_id, &staged_executable) {
+    if !compatibility_bridge::entrypoint_is_usable(runtime_id, &staged_executable) {
         let _ = remove_path_if_exists(&stage_root);
         return Err(format!(
             "Runtime install did not create a usable runtime at {}.",
@@ -5588,17 +5568,6 @@ fn runtime_manifest_metadata(executable: &Path) -> Option<RuntimeManifestMetadat
     let manifest = runtime_package_root(executable)?.join("runtime-manifest.json");
     let contents = fs::read_to_string(manifest).ok()?;
     serde_json::from_str(&contents).ok()
-}
-
-fn installed_runtime_executable_usable(runtime_id: &str, executable: &Path) -> bool {
-    match runtime_id {
-        "faster_whisper" => stt::faster_whisper::is_faster_whisper_runtime_usable(executable),
-        "vosk" => stt::vosk::is_vosk_runtime_usable(executable),
-        "sherpa_onnx" | "moonshine" | "parakeet" => {
-            stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, executable)
-        }
-        _ => executable.exists(),
-    }
 }
 
 fn command_output_message(stdout: &[u8], stderr: &[u8]) -> String {
@@ -5859,27 +5828,37 @@ fn move_selected_model_by(
     Some(to_selected)
 }
 
-fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
+fn cards_from_config(
+    config: &AppConfig,
+    service: &TranscriptionService,
+) -> Vec<PlaygroundCardState> {
+    let descriptors = service
+        .model_descriptors()
+        .into_iter()
+        .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
+        .collect::<HashMap<_, _>>();
     config::playground_selected_installed_models(config)
         .into_iter()
-        .map(|model| {
+        .filter_map(|model| {
+            let descriptor = descriptors.get(&model.id)?.clone();
             let status = runtime_status_for_model(config, &model);
-            PlaygroundCardState {
-                model,
+            Some(PlaygroundCardState {
+                install_status: model.install_status,
+                descriptor,
                 status,
                 transcript: String::new(),
                 latency_ms: None,
                 audio_duration_ms: None,
                 peak_ram_mb: None,
                 peak_vram_mb: None,
-            }
+            })
         })
         .collect()
 }
 
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
-    let Some(provider) = stt::provider_for_backend(&model.backend) else {
-        return ModelRuntimeStatus::Error(format!("unsupported STT backend: {}", model.backend));
+    let Some(provider) = compatibility_bridge::provider_for_model(model) else {
+        return ModelRuntimeStatus::Error("Model provider is not available.".to_owned());
     };
 
     match provider.model_install_status(model) {
@@ -5891,6 +5870,16 @@ fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRu
         ModelInstallStatus::Error(message) => ModelRuntimeStatus::Error(message),
         ModelInstallStatus::RuntimeError(message) => ModelRuntimeStatus::Error(message),
     }
+}
+
+fn runtime_status_for_id(config: &AppConfig, model_id: &str) -> ModelRuntimeStatus {
+    config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .map_or_else(
+            || ModelRuntimeStatus::Error("Model is no longer configured.".to_owned()),
+            |model| runtime_status_for_model(config, &model),
+        )
 }
 
 fn captured_hotkey_spec(input: &egui::InputState) -> Option<String> {
@@ -6460,7 +6449,7 @@ mod layout_tests {
         fs::write(&temp_path, b"wav").unwrap();
 
         let mut app = test_app();
-        let model_id = app.playground_cards[0].model.id.clone();
+        let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(3);
         let request_id = RequestId(30);
         app.status = TranscriptionStatus::Transcribing;
@@ -6500,7 +6489,7 @@ mod layout_tests {
         let card = app
             .playground_cards
             .iter()
-            .find(|card| card.model.id == model_id)
+            .find(|card| card.descriptor.id.as_str() == model_id)
             .unwrap();
         assert_eq!(card.transcript, "accepted playground result");
     }
@@ -6514,7 +6503,7 @@ mod layout_tests {
         fs::write(&temp_path, b"wav").unwrap();
 
         let mut app = test_app();
-        let model_id = app.playground_cards[0].model.id.clone();
+        let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(4);
         let request_id = RequestId(40);
         app.status = TranscriptionStatus::Transcribing;
@@ -6550,7 +6539,7 @@ mod layout_tests {
         let card = app
             .playground_cards
             .iter()
-            .find(|card| card.model.id == model_id)
+            .find(|card| card.descriptor.id.as_str() == model_id)
             .unwrap();
         assert_eq!(
             card.status,
@@ -6597,7 +6586,7 @@ mod layout_tests {
         ));
         fs::write(&temp_path, b"wav").unwrap();
         let mut app = test_app();
-        let model_id = app.playground_cards[0].model.id.clone();
+        let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(5);
         let request_id = RequestId(50);
         app.status = TranscriptionStatus::Transcribing;
@@ -6636,7 +6625,7 @@ mod layout_tests {
         let card = app
             .playground_cards
             .iter()
-            .find(|card| card.model.id == model_id)
+            .find(|card| card.descriptor.id.as_str() == model_id)
             .unwrap();
         assert!(matches!(card.status, ModelRuntimeStatus::Error(_)));
     }
@@ -6649,7 +6638,7 @@ mod layout_tests {
         ));
         fs::write(&temp_path, b"wav").unwrap();
         let mut app = test_app();
-        let expected_model_id = app.playground_cards[0].model.id.clone();
+        let expected_model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(6);
         let request_id = RequestId(60);
         app.status = TranscriptionStatus::Transcribing;
@@ -6686,7 +6675,7 @@ mod layout_tests {
         let card = app
             .playground_cards
             .iter()
-            .find(|card| card.model.id == expected_model_id)
+            .find(|card| card.descriptor.id.as_str() == expected_model_id)
             .unwrap();
         assert!(matches!(card.status, ModelRuntimeStatus::Error(_)));
         assert!(card.transcript.is_empty());
@@ -7027,18 +7016,10 @@ mod layout_tests {
                             .unwrap();
                             let install_status = ModelInstallStatus::Installed;
 
-                            model_catalog_row(
-                                ui,
-                                &descriptor,
-                                &model,
-                                &install_status,
-                                true,
-                                |ui| {
-                                    let _ =
-                                        ui.add_enabled(false, primary_small_button(ui, "Active"));
-                                    let _ = ui.add(small_button(ui, "Uninstall"));
-                                },
-                            );
+                            model_catalog_row(ui, &descriptor, &install_status, true, |ui| {
+                                let _ = ui.add_enabled(false, primary_small_button(ui, "Active"));
+                                let _ = ui.add(small_button(ui, "Uninstall"));
+                            });
                         },
                     );
                 });
@@ -7320,6 +7301,7 @@ mod layout_tests {
         let (tx, rx) = unbounded();
 
         let transcription_service = TranscriptionService::new(config.clone());
+        let playground_cards = cards_from_config(&config, &transcription_service);
         LocalTranscriberApp {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
@@ -7327,7 +7309,7 @@ mod layout_tests {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
-            playground_cards: cards_from_config(&config),
+            playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
             playground_selector_header_focus: None,
@@ -7473,7 +7455,7 @@ mod layout_tests {
         }
     }
 
-    fn expected_runtime_install_action(backend: &str) -> RuntimeActionState {
+    fn expected_runtime_install_action(_backend: &str) -> RuntimeActionState {
         if cfg!(unix) {
             RuntimeActionState {
                 kind: RuntimeActionKind::Install,
@@ -7484,7 +7466,7 @@ mod layout_tests {
             RuntimeActionState {
                 kind: RuntimeActionKind::Install,
                 enabled: false,
-                disabled_tooltip: Some(missing_runtime_source_message(backend)),
+                disabled_tooltip: Some(missing_runtime_source_message()),
             }
         }
     }
@@ -7587,7 +7569,7 @@ mod layout_tests {
             "installed-model".to_owned()
         ));
         assert_eq!(job.repair_model_ids, ["installed-model"]);
-        assert!(missing_runtime_source_message("Vosk").contains("packaged or staged build"));
+        assert!(missing_runtime_source_message().contains("packaged or staged build"));
     }
 
     #[test]
@@ -7856,7 +7838,7 @@ mod layout_tests {
         );
         let mut model = test_model();
         model.backend = "Vosk".to_owned();
-        let provider = stt::provider_for_backend("Vosk").unwrap();
+        let provider = compatibility_bridge::provider_for_model(&model).unwrap();
 
         let action = runtime_action_state_for_source(&config, &model, provider, false);
 
@@ -7886,7 +7868,9 @@ mod layout_tests {
 
         assert!(result.is_err());
         assert!(target_root.join("previous.marker").is_file());
-        assert!(stt::vosk::is_vosk_runtime_usable(&previous_executable));
+        assert!(crate::stt::vosk::is_vosk_runtime_usable(
+            &previous_executable
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8308,7 +8292,11 @@ mod layout_tests {
         );
 
         app.playground_cards.push(PlaygroundCardState {
-            model: test_model(),
+            install_status: ModelInstallStatus::Installed,
+            descriptor: app
+                .transcription_service
+                .model_descriptor(&crate::transcription::ModelId::new("whisper_cpp_base_en"))
+                .unwrap(),
             status: ModelRuntimeStatus::MissingConfiguration,
             transcript: String::new(),
             latency_ms: None,
@@ -8384,7 +8372,7 @@ mod layout_tests {
                 &model,
                 &ModelInstallStatus::RuntimeError("failed".to_owned()),
             ),
-            "Repair whisper.cpp runtime"
+            "Repair runtime"
         );
     }
 
@@ -8425,7 +8413,7 @@ mod layout_tests {
                 "model download",
             ),
         ] {
-            let blocked = restrict_runtime_action(update.clone(), "Vosk", false, activity);
+            let blocked = restrict_runtime_action(update.clone(), false, activity);
             assert!(!blocked.enabled);
             assert!(
                 blocked
@@ -8442,7 +8430,6 @@ mod layout_tests {
         assert!(
             !restrict_runtime_action(
                 remove,
-                "Vosk",
                 false,
                 RuntimeConsumerActivity {
                     recording: true,
@@ -8458,7 +8445,6 @@ mod layout_tests {
         assert!(
             restrict_runtime_action(
                 install,
-                "Vosk",
                 false,
                 RuntimeConsumerActivity {
                     recording: true,
@@ -8474,9 +8460,9 @@ mod layout_tests {
         let config = AppConfig::default();
         let model = config::configured_models(&config)
             .into_iter()
-            .find(|model| stt::provider_for_backend(&model.backend).is_some())
+            .find(|model| crate::stt::provider_for_backend(&model.backend).is_some())
             .unwrap();
-        let runtime_id = stt::provider_for_backend(&model.backend)
+        let runtime_id = crate::stt::provider_for_backend(&model.backend)
             .unwrap()
             .runtime_id;
         let mut downloads = HashMap::new();
@@ -8525,7 +8511,6 @@ mod layout_tests {
         .unwrap();
 
         assert!(tooltip.contains("not available"));
-        assert!(tooltip.contains("sherpa-onnx"));
     }
 
     #[test]
@@ -8698,6 +8683,40 @@ mod layout_tests {
                 .iter()
                 .all(|descriptor| !descriptor.capabilities.gpu)
         );
+    }
+
+    #[test]
+    fn playground_cards_are_sourced_only_from_service_descriptors() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-neutral-playground-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let primary = root.join("primary.bin");
+        let legacy = root.join("legacy");
+        fs::create_dir_all(legacy.join("am")).unwrap();
+        fs::create_dir_all(legacy.join("conf")).unwrap();
+        fs::create_dir_all(legacy.join("graph")).unwrap();
+        fs::write(&primary, b"model").unwrap();
+        fs::write(legacy.join("am/final.mdl"), b"model").unwrap();
+        fs::write(legacy.join("conf/model.conf"), b"config").unwrap();
+        fs::write(legacy.join("graph/HCLG.fst"), b"graph").unwrap();
+
+        let mut config = AppConfig::default();
+        config
+            .model_paths
+            .insert("whisper_cpp_base_en".to_owned(), primary);
+        config
+            .model_paths
+            .insert("vosk_small_en".to_owned(), legacy);
+        config.playground_selected_models =
+            vec!["whisper_cpp_base_en".to_owned(), "vosk_small_en".to_owned()];
+        let service = TranscriptionService::new(config.clone());
+
+        let cards = cards_from_config(&config, &service);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].descriptor.id.as_str(), "whisper_cpp_base_en");
+        assert_eq!(cards[0].descriptor.display_name, "English Base");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8884,7 +8903,7 @@ mod layout_tests {
             unsupported_action
                 .disabled_tooltip
                 .as_deref()
-                .is_some_and(|tooltip| tooltip.contains("not a supported STT backend"))
+                .is_some_and(|tooltip| tooltip.contains("no compatible local provider"))
         );
 
         let _ = fs::remove_dir_all(runtime_root);
@@ -8932,7 +8951,9 @@ mod layout_tests {
 
     #[test]
     fn runtime_version_state_detects_current_stale_and_unknown_installs() {
-        let provider = stt::provider_for_backend("Vosk").unwrap();
+        let mut model = test_model();
+        model.backend = "Vosk".to_owned();
+        let provider = compatibility_bridge::provider_for_model(&model).unwrap();
         let mut config = AppConfig::default();
 
         config.managed_runtimes.insert(

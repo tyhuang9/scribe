@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::model_catalog::{RuntimeRequirement, runtime_model_manifest};
+use crate::model_catalog::{RuntimeRequirement, RuntimeVersion, runtime_model_manifest};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
@@ -183,13 +183,24 @@ enum RuntimeKind {
     TranscribeCpp,
 }
 
+const TRANSCRIBE_CPP_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
+    major: 1,
+    minor: 9,
+    patch: 1,
+};
+
 fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
     if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         return None;
     }
-    let requirement = runtime_model_manifest(model_id)?.runtime;
-    match requirement {
-        RuntimeRequirement::PrimaryNative => Some(RuntimeKind::TranscribeCpp),
+    let manifest = runtime_model_manifest(model_id)?;
+    match manifest.runtime {
+        RuntimeRequirement::PrimaryNative
+            if TRANSCRIBE_CPP_RUNTIME_VERSION >= manifest.minimum_runtime_version =>
+        {
+            Some(RuntimeKind::TranscribeCpp)
+        }
+        RuntimeRequirement::PrimaryNative => None,
     }
 }
 
@@ -214,8 +225,8 @@ impl RuntimeRouter {
         runtime_kind_for_model(model_id).is_some()
     }
 
-    pub(crate) fn capabilities(&self, model: &RuntimeModel) -> Option<RuntimeCapabilities> {
-        runtime_kind_for_model(&model.id).map(|kind| match kind {
+    pub(crate) fn capabilities(&self, model_id: &ModelId) -> Option<RuntimeCapabilities> {
+        runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
         })
     }
@@ -1052,6 +1063,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_version_must_meet_the_model_minimum() {
+        assert!(
+            TRANSCRIBE_CPP_RUNTIME_VERSION
+                >= RuntimeVersion {
+                    major: 1,
+                    minor: 9,
+                    patch: 1,
+                }
+        );
+        assert!(
+            TRANSCRIBE_CPP_RUNTIME_VERSION
+                < RuntimeVersion {
+                    major: 1,
+                    minor: 10,
+                    patch: 0,
+                }
+        );
+
+        let package_manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json"
+        ))
+        .unwrap();
+        assert_eq!(package_manifest["upstream"]["tag"], "v1.9.1");
+    }
+
+    #[test]
     fn manifest_symbols_exactly_match_the_native_shim_contract() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json"
@@ -1216,8 +1253,75 @@ mod tests {
             .find(|(path, _)| path.file_name().is_some_and(|name| name == "app.rs"))
             .map(|(_, source)| source)
             .unwrap();
-        assert!(!app.contains("stt::whisper_cpp"));
-        assert!(!app.contains("RuntimeRouter"));
-        assert!(!app.contains("transcribe_with_config"));
+        let app = app
+            .split("\n#[cfg(test)]\nmod layout_tests")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "use crate::stt",
+            "runtime_catalog::",
+            "provider_for_backend",
+            ".backend",
+            "backend_label",
+            "RuntimeRouter",
+            "transcribe_with_config",
+            "whisper_cpp_",
+        ] {
+            assert!(
+                !app.contains(forbidden),
+                "production app escaped the neutral service boundary through {forbidden}"
+            );
+        }
+
+        for (path, source) in &sources {
+            let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
+                source
+                    .split("\n#[cfg(test)]\nmod layout_tests")
+                    .next()
+                    .unwrap()
+            } else {
+                source
+            };
+            if production_source.contains("provider_for_backend") {
+                let allowed = path.ends_with("stt/mod.rs")
+                    || path.file_name().is_some_and(|name| {
+                        name == "compatibility_bridge.rs" || name == "runtime_router.rs"
+                    });
+                assert!(
+                    allowed,
+                    "legacy provider selection escaped its private bridge into {}",
+                    path.display()
+                );
+            }
+        }
+
+        for (path, source) in &sources {
+            let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
+                source
+                    .split("\n#[cfg(test)]\nmod layout_tests")
+                    .next()
+                    .unwrap()
+            } else {
+                source
+            };
+            for concrete_adapter in [
+                "stt::whisper_cpp",
+                "stt::faster_whisper",
+                "stt::vosk",
+                "stt::sherpa_onnx",
+            ] {
+                let allowed = path
+                    .components()
+                    .any(|component| component.as_os_str() == "stt")
+                    || path.file_name().is_some_and(|name| {
+                        name == "runtime_router.rs" || name == "compatibility_bridge.rs"
+                    });
+                assert!(
+                    allowed || !production_source.contains(concrete_adapter),
+                    "concrete compatibility adapter escaped its private bridge into {}",
+                    path.display()
+                );
+            }
+        }
     }
 }

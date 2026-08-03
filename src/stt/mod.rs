@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
@@ -51,6 +51,20 @@ pub fn provider_for_backend(backend: &str) -> Option<&'static SttProviderAdapter
     provider_adapters()
         .iter()
         .find(|provider| provider.backend == backend)
+}
+
+/// Transitional runtime-package validation kept inside the private legacy
+/// bridge. New inference selection belongs exclusively to `RuntimeRouter`.
+pub(crate) fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
+    match runtime_id {
+        "whisper_cpp" => path.is_file(),
+        "faster_whisper" => faster_whisper::is_faster_whisper_runtime_usable(path),
+        "vosk" => vosk::is_vosk_runtime_usable(path),
+        "sherpa_onnx" | "moonshine" | "parakeet" => {
+            sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, path)
+        }
+        _ => false,
+    }
 }
 
 impl SttProviderAdapter {

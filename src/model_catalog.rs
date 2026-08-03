@@ -2,6 +2,9 @@
 
 use std::collections::HashSet;
 
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
 use crate::transcription::ModelId;
 
 const WHISPER_CPP_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
@@ -22,7 +25,7 @@ enum ModelFormat {
     Ggml,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeVersion {
     pub(crate) major: u16,
     pub(crate) minor: u16,
@@ -48,6 +51,7 @@ struct CompatibilityEvidence {
     unload_reload: bool,
     acceleration: bool,
     platform: bool,
+    receipt: Option<CompatibilityReceipt>,
 }
 
 impl CompatibilityEvidence {
@@ -58,6 +62,7 @@ impl CompatibilityEvidence {
             && self.unload_reload
             && self.acceleration
             && self.platform
+            && self.receipt.is_some()
     }
 
     const fn link(self) -> EvidenceLink {
@@ -66,6 +71,34 @@ impl CompatibilityEvidence {
             source: self.source,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompatibilityReceipt {
+    json: &'static str,
+    sha256: &'static str,
+    runtime_package_manifest: &'static [u8],
+    fixture_corpus_manifest: &'static [u8],
+    results_manifest: &'static [u8],
+}
+
+#[derive(Debug, Deserialize)]
+struct CompatibilityReceiptDocument {
+    schema_version: u16,
+    model_id: String,
+    evidence_id: String,
+    runtime_version: String,
+    model_artifact_sha256: String,
+    runtime_package_sha256: String,
+    fixture_corpus_sha256: String,
+    results_sha256: String,
+    platform: String,
+    load: bool,
+    known_fixture: bool,
+    cancellation: bool,
+    unload_reload: bool,
+    acceleration: bool,
+    platform_tests: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +182,8 @@ pub struct ModelCapabilities {
     pub timestamps: bool,
     pub translation: bool,
     pub language_detection: bool,
+    pub confidence_scores: bool,
+    pub custom_vocabulary: bool,
     pub cpu: bool,
     pub gpu: bool,
 }
@@ -196,6 +231,8 @@ const BATCH_ENGLISH_CAPABILITIES: ModelCapabilities = ModelCapabilities {
     timestamps: true,
     translation: false,
     language_detection: false,
+    confidence_scores: false,
+    custom_vocabulary: false,
     cpu: true,
     gpu: false,
 };
@@ -211,6 +248,7 @@ const PHASE_ZERO_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
     unload_reload: false,
     acceleration: false,
     platform: false,
+    receipt: None,
 };
 
 const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
@@ -222,6 +260,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
     unload_reload: true,
     acceleration: true,
     platform: false,
+    receipt: None,
 };
 
 const MODELS: &[ModelManifest] = &[
@@ -327,10 +366,12 @@ const fn whisper_manifest(
 }
 
 pub fn model_descriptors() -> Vec<ModelDescriptor> {
+    assert_catalog_valid();
     MODELS.iter().map(ModelManifest::descriptor).collect()
 }
 
 pub fn model_descriptor(id: &ModelId) -> Option<ModelDescriptor> {
+    assert_catalog_valid();
     MODELS
         .iter()
         .find(|manifest| manifest.id == id.as_str())
@@ -338,6 +379,7 @@ pub fn model_descriptor(id: &ModelId) -> Option<ModelDescriptor> {
 }
 
 pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifest> {
+    assert_catalog_valid();
     MODELS
         .iter()
         .find(|manifest| manifest.id == id.as_str())
@@ -354,8 +396,20 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
         })
 }
 
+pub(crate) fn runtime_model_download_url(id: &ModelId) -> Option<String> {
+    let manifest = runtime_model_manifest(id)?;
+    Some(format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        manifest.artifact_repository, manifest.artifact_revision, manifest.artifact_filename
+    ))
+}
+
 pub(crate) fn validate_catalog() -> Result<(), String> {
     validate_manifests(MODELS)
+}
+
+fn assert_catalog_valid() {
+    validate_catalog().expect("normalized model catalog must satisfy evidence and integrity rules");
 }
 
 impl ModelManifest {
@@ -478,6 +532,24 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
         if manifest.id.is_empty() || !ids.insert(manifest.id) {
             return Err(format!("duplicate or empty model id: {}", manifest.id));
         }
+        if manifest.display_name.is_empty()
+            || manifest.description.is_empty()
+            || manifest.storage_guidance.is_empty()
+            || manifest.expected_ram.is_empty()
+            || manifest.speed_guidance.is_empty()
+            || manifest.accuracy_guidance.is_empty()
+        {
+            return Err(format!("{} has incomplete user guidance", manifest.id));
+        }
+        if manifest.minimum_runtime_version
+            == (RuntimeVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            })
+        {
+            return Err(format!("{} has no minimum runtime version", manifest.id));
+        }
         validate_artifact(manifest.artifact)?;
         if manifest.languages.is_empty()
             || manifest
@@ -493,15 +565,34 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
                 manifest.id
             ));
         }
+        let (status_evidence, reason) = match manifest.compatibility {
+            CompatibilityStatus::Supported { evidence } => (evidence, None),
+            CompatibilityStatus::Experimental { evidence, reason }
+            | CompatibilityStatus::Incompatible { evidence, reason } => (evidence, Some(reason)),
+        };
+        if status_evidence != manifest.evidence.link() {
+            return Err(format!(
+                "{} compatibility status cites different evidence",
+                manifest.id
+            ));
+        }
+        if reason.is_some_and(str::is_empty) {
+            return Err(format!(
+                "{} compatibility status has no explanatory reason",
+                manifest.id
+            ));
+        }
         if matches!(
             manifest.compatibility,
             CompatibilityStatus::Supported { .. }
-        ) && !manifest.evidence.complete()
-        {
-            return Err(format!(
-                "{} cannot be Supported without complete evidence",
-                manifest.id
-            ));
+        ) {
+            if !manifest.evidence.complete() {
+                return Err(format!(
+                    "{} cannot be Supported without complete evidence and a receipt",
+                    manifest.id
+                ));
+            }
+            validate_compatibility_receipt(manifest)?;
         }
         if !manifest.roles.is_empty()
             && !matches!(
@@ -518,6 +609,68 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
         if manifest.roles.iter().any(|role| !roles.insert(*role)) {
             return Err(format!("{} has duplicate roles", manifest.id));
         }
+    }
+    Ok(())
+}
+
+fn validate_compatibility_receipt(manifest: &ModelManifest) -> Result<(), String> {
+    let receipt = manifest
+        .evidence
+        .receipt
+        .ok_or_else(|| format!("{} has no compatibility receipt", manifest.id))?;
+    if receipt.sha256.len() != 64 || !receipt.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{} has a malformed receipt hash", manifest.id));
+    }
+    let actual_hash = format!("{:x}", Sha256::digest(receipt.json.as_bytes()));
+    if !actual_hash.eq_ignore_ascii_case(receipt.sha256) {
+        return Err(format!(
+            "{} compatibility receipt hash mismatch",
+            manifest.id
+        ));
+    }
+    let document: CompatibilityReceiptDocument =
+        serde_json::from_str(receipt.json).map_err(|error| {
+            format!(
+                "{} has an invalid compatibility receipt: {error}",
+                manifest.id
+            )
+        })?;
+    let runtime_version = format!(
+        "{}.{}.{}",
+        manifest.minimum_runtime_version.major,
+        manifest.minimum_runtime_version.minor,
+        manifest.minimum_runtime_version.patch
+    );
+    let valid_hash =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let embedded_hash = |contents: &[u8]| format!("{:x}", Sha256::digest(contents));
+    if document.schema_version != 1
+        || document.model_id != manifest.id
+        || document.evidence_id != manifest.evidence.id
+        || document.runtime_version != runtime_version
+        || !document
+            .model_artifact_sha256
+            .eq_ignore_ascii_case(manifest.artifact.sha256)
+        || !valid_hash(&document.runtime_package_sha256)
+        || !embedded_hash(receipt.runtime_package_manifest)
+            .eq_ignore_ascii_case(&document.runtime_package_sha256)
+        || !valid_hash(&document.fixture_corpus_sha256)
+        || !embedded_hash(receipt.fixture_corpus_manifest)
+            .eq_ignore_ascii_case(&document.fixture_corpus_sha256)
+        || !valid_hash(&document.results_sha256)
+        || !embedded_hash(receipt.results_manifest).eq_ignore_ascii_case(&document.results_sha256)
+        || document.platform != "windows-x86_64"
+        || !document.load
+        || !document.known_fixture
+        || !document.cancellation
+        || !document.unload_reload
+        || !document.acceleration
+        || !document.platform_tests
+    {
+        return Err(format!(
+            "{} compatibility receipt does not match the manifest or complete gate",
+            manifest.id
+        ));
     }
     Ok(())
 }
@@ -591,6 +744,113 @@ mod tests {
     }
 
     #[test]
+    fn complete_booleans_cannot_promote_without_a_hashed_receipt() {
+        let mut manifest = MODELS[0];
+        manifest.evidence = CompatibilityEvidence {
+            load: true,
+            known_fixture: true,
+            cancellation: true,
+            unload_reload: true,
+            acceleration: true,
+            platform: true,
+            receipt: None,
+            ..manifest.evidence
+        };
+        manifest.compatibility = CompatibilityStatus::Supported {
+            evidence: manifest.evidence.link(),
+        };
+
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("receipt")
+        );
+    }
+
+    #[test]
+    fn supported_status_requires_a_matching_machine_readable_receipt() {
+        const RECEIPT: &str = r#"{"schema_version":1,"model_id":"whisper_cpp_tiny_en","evidence_id":"phase-0-whisper-jfk-process-smoke","runtime_version":"1.9.1","model_artifact_sha256":"921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f","runtime_package_sha256":"6510693d373c9ed4adbb708015135ea9ec885c8e4312d543ca7d1c2f3dbbd7dc","fixture_corpus_sha256":"9799f3da4289f4db1586d89570026fc0d2ba4f5cec8c64daaebedf8e0643cccf","results_sha256":"a341e990e02ed8589238eb1e8c152a855ec2fbbcd2519d069f5378c098bb28fa","platform":"windows-x86_64","load":true,"known_fixture":true,"cancellation":true,"unload_reload":true,"acceleration":true,"platform_tests":true}"#;
+        let mut manifest = MODELS[0];
+        manifest.evidence = CompatibilityEvidence {
+            load: true,
+            known_fixture: true,
+            cancellation: true,
+            unload_reload: true,
+            acceleration: true,
+            platform: true,
+            receipt: Some(CompatibilityReceipt {
+                json: RECEIPT,
+                sha256: "602aa9895b6b3eea75c93eebddfc828c34a8a19c105c5e47034aa9c06556b39f",
+                runtime_package_manifest: br#"{"package":"fixture"}"#,
+                fixture_corpus_manifest: br#"{"corpus":"fixture"}"#,
+                results_manifest: br#"{"results":"pass"}"#,
+            }),
+            ..manifest.evidence
+        };
+        manifest.compatibility = CompatibilityStatus::Supported {
+            evidence: manifest.evidence.link(),
+        };
+
+        assert_eq!(validate_manifests(&[manifest]), Ok(()));
+
+        manifest.evidence.receipt = Some(CompatibilityReceipt {
+            json: RECEIPT,
+            sha256: "602aa9895b6b3eea75c93eebddfc828c34a8a19c105c5e47034aa9c06556b39f",
+            runtime_package_manifest: br#"{"package":"fixture"}"#,
+            fixture_corpus_manifest: br#"{"corpus":"fixture"}"#,
+            results_manifest: b"tampered",
+        });
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("does not match")
+        );
+
+        manifest.evidence.receipt = Some(CompatibilityReceipt {
+            json: RECEIPT,
+            sha256: "702aa9895b6b3eea75c93eebddfc828c34a8a19c105c5e47034aa9c06556b39f",
+            runtime_package_manifest: br#"{"package":"fixture"}"#,
+            fixture_corpus_manifest: br#"{"corpus":"fixture"}"#,
+            results_manifest: br#"{"results":"pass"}"#,
+        });
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("hash mismatch")
+        );
+    }
+
+    #[test]
+    fn compatibility_status_must_cite_its_manifest_evidence() {
+        let mut manifest = MODELS[0];
+        manifest.compatibility = CompatibilityStatus::Experimental {
+            evidence: PHASE_TWO_BASE_SMOKE.link(),
+            reason: "still incomplete",
+        };
+
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("cites different evidence")
+        );
+    }
+
+    #[test]
+    fn tentative_status_requires_an_explanatory_reason() {
+        let mut manifest = MODELS[0];
+        manifest.compatibility = CompatibilityStatus::Experimental {
+            evidence: manifest.evidence.link(),
+            reason: "",
+        };
+
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("no explanatory reason")
+        );
+    }
+
+    #[test]
     fn curated_roles_require_supported_status() {
         let mut manifest = MODELS[0];
         manifest.roles = &[ModelRole::FastEnglish];
@@ -634,6 +894,16 @@ mod tests {
         assert_eq!(
             manifest.artifact_sha256,
             "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+        );
+    }
+
+    #[test]
+    fn primary_download_url_is_derived_from_the_authoritative_manifest() {
+        assert_eq!(
+            runtime_model_download_url(&ModelId::new("whisper_cpp_base_en")).as_deref(),
+            Some(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin"
+            )
         );
     }
 

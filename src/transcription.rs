@@ -509,11 +509,15 @@ impl TranscriptionService {
     /// service boundary.
     pub fn model_descriptors(&self) -> Vec<ModelDescriptor> {
         model_descriptors()
+            .into_iter()
+            .map(|descriptor| self.effective_descriptor(descriptor))
+            .collect()
     }
 
     /// Resolves one runtime-neutral catalog descriptor.
     pub fn model_descriptor(&self, model_id: &ModelId) -> Result<ModelDescriptor> {
         model_descriptor(model_id)
+            .map(|descriptor| self.effective_descriptor(descriptor))
             .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))
     }
 
@@ -521,15 +525,28 @@ impl TranscriptionService {
     pub fn capabilities_for(&self, model_id: &ModelId) -> Result<RuntimeCapabilities> {
         let model = self.resolve_model(model_id, None)?;
         if self.router.handles_model(model_id) {
-            let runtime_model = self.resolve_runtime_model(model)?;
             let runtime_capabilities = self
                 .router
-                .capabilities(&runtime_model)
+                .capabilities(model_id)
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
-            let descriptor = self.model_descriptor(model_id)?;
+            let descriptor = model_descriptor(model_id)
+                .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
             return Ok(intersect_capabilities(&runtime_capabilities, &descriptor));
         }
         Ok(capabilities_for_legacy_model(&model))
+    }
+
+    fn effective_descriptor(&self, mut descriptor: ModelDescriptor) -> ModelDescriptor {
+        if let Ok(effective) = self.capabilities_for(&descriptor.id) {
+            descriptor.capabilities.native_streaming = effective.streaming;
+            descriptor.capabilities.cancellation = effective.cancellation;
+            descriptor.capabilities.translation = effective.translation;
+            descriptor.capabilities.timestamps = effective.timestamps;
+            descriptor.capabilities.language_detection = effective.language_detection;
+            descriptor.capabilities.confidence_scores = effective.confidence_scores;
+            descriptor.capabilities.custom_vocabulary = effective.custom_vocabulary;
+        }
+        descriptor
     }
 
     /// Loads a primary-runtime model on the dedicated worker. Phase 4 uses
@@ -634,7 +651,7 @@ impl TranscriptionService {
         fallback_reason: Option<String>,
     ) -> Result<TranscriptionOutcome> {
         if fallback_reason.is_some() {
-            let cli = crate::stt::whisper_cpp::resolve_whisper_cpp_executable(&self.config)
+            let cli = crate::compatibility_bridge::primary_runtime_entrypoint(&self.config)
                 .ok_or_else(|| anyhow!("the verified compatibility CLI is unavailable"))?;
             verify_compatibility_cli(&cli).map_err(|error| anyhow!(error))?;
         }
@@ -719,7 +736,7 @@ impl TranscriptionService {
 }
 
 fn primary_runtime_package_root(config: &AppConfig) -> Option<PathBuf> {
-    let entrypoint = crate::stt::whisper_cpp::resolve_whisper_cpp_executable(config)?;
+    let entrypoint = crate::compatibility_bridge::primary_runtime_entrypoint(config)?;
     let bin_dir = entrypoint.parent()?;
     if bin_dir
         .file_name()
@@ -1063,8 +1080,8 @@ fn intersect_capabilities(
         translation: runtime.translation && manifest.translation,
         timestamps: runtime.timestamps && manifest.timestamps,
         language_detection: runtime.language_detection && manifest.language_detection,
-        confidence_scores: runtime.confidence_scores,
-        custom_vocabulary: runtime.custom_vocabulary,
+        confidence_scores: runtime.confidence_scores && manifest.confidence_scores,
+        custom_vocabulary: runtime.custom_vocabulary && manifest.custom_vocabulary,
         supported_languages: runtime
             .supported_languages
             .iter()
@@ -1268,7 +1285,24 @@ mod tests {
         assert!(!effective.translation);
         assert!(effective.timestamps);
         assert!(!effective.language_detection);
+        assert!(!effective.confidence_scores);
+        assert!(!effective.custom_vocabulary);
         assert_eq!(effective.supported_languages, ["en"]);
+    }
+
+    #[test]
+    fn singular_and_list_descriptor_capabilities_are_identical() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let from_list = service
+            .model_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == ModelId::new("whisper_cpp_base_en"))
+            .unwrap();
+        let singular = service
+            .model_descriptor(&ModelId::new("whisper_cpp_base_en"))
+            .unwrap();
+
+        assert_eq!(singular, from_list);
     }
 
     #[test]
@@ -1463,7 +1497,7 @@ mod tests {
         assert_eq!(outcome.session_id, session_id);
         assert_eq!(outcome.request_id, request_id);
         assert_eq!(outcome.model_id, ModelId::new("whisper_cpp_base_en"));
-        assert_eq!(outcome.model_name, "whisper.cpp base.en");
+        assert_eq!(outcome.model_name, "English Base");
         assert_eq!(outcome.backend_label, "transcribe-cpp");
         assert!(!outcome.warm_model_reused);
         assert!(

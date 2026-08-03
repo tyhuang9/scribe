@@ -6,15 +6,6 @@ pub enum DeviceSupport {
     CpuAndGpu,
 }
 
-impl DeviceSupport {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CpuOnly => "CPU",
-            Self::CpuAndGpu => "CPU/GPU",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevelopmentRuntimeSpec {
     pub script_name: &'static str,
@@ -249,16 +240,8 @@ pub fn resolve_runtime_entrypoint(
     None
 }
 
-fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
-    match runtime_id {
-        "whisper_cpp" => path.is_file(),
-        "faster_whisper" => crate::stt::faster_whisper::is_faster_whisper_runtime_usable(path),
-        "vosk" => crate::stt::vosk::is_vosk_runtime_usable(path),
-        "sherpa_onnx" | "moonshine" | "parakeet" => {
-            crate::stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, path)
-        }
-        _ => false,
-    }
+pub(crate) fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
+    crate::stt::runtime_entrypoint_is_usable(runtime_id, path)
 }
 
 fn platform_executable_path(relative: &str) -> PathBuf {
@@ -286,6 +269,7 @@ pub fn model_artifact_spec(model_id: &str) -> Option<ModelArtifactSpec> {
         .copied()
 }
 
+#[cfg(test)]
 pub fn model_storage_estimate(model_id: &str) -> &'static str {
     model_artifact_spec(model_id)
         .map(|artifact| artifact.storage_estimate)
