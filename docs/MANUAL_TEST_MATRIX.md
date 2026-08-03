@@ -1,7 +1,7 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 2 matrix (2026-08-03). No manual desktop, microphone,
-model-runtime, tray, hotkey, or paste test was executed during the Phase 0/1
+**Status:** living Phase 3 matrix (2026-08-03). No manual desktop, microphone,
+model-runtime, tray, hotkey, or paste test was executed during the Phase 0-3
 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
@@ -86,6 +86,22 @@ not verify a live desktop, microphone, hotkey, overlay, target window, paste,
 memory/idle CPU, non-ASCII Unicode model path, live-session cancellation, or any other model. All
 manual rows remain NOT VERIFIED.
 
+## Automated Phase 3 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 252 discovered, 247 passed, 0 failed, 5 ignored environment-required tests |
+| Normalized catalog | Catalog validation, evidence-link/hashed-receipt binding, role-gating, malformed-artifact, duplicate-ID, capability-intersection, minimum-runtime enforcement, and ID-prefix independence tests | PASS - four primary descriptors, all Experimental, zero curated roles |
+| Architecture boundary | Rust source-boundary test plus `wsl.exe python3 scripts/check-catalog-boundaries.py` | PASS - one logical handler; neutral production UI including Playground; family-coded quick actions/IDs rejected; legacy provider and concrete adapter selection confined to its private bridge |
+| Release build/package | `cargo build --release --all-features`; verified PowerShell package script | PASS |
+| Release primary fixture | ignored exact service JFK smoke with pinned v1.9.1/base.en/JFK paths | PASS - cold load 290 ms, first decode 791 ms, retained decode 780 ms; explicit unload/reload passed |
+| Exact Zipformer candidate | Fail-closed machine-readable evidence gate | **NO-GO** - no v1.13.4 native package/model pins, first-partial/comparator, corpus WER, <=250 ms cancel, lifecycle/crash/memory, or platform evidence; no second handler shipped |
+
+These automated results verify catalog truthfulness and retain the Phase 2
+primary vertical runtime slice. They do not promote a model, prove live desktop
+behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -108,6 +124,7 @@ manual rows remain NOT VERIFIED.
 | UI-04 | Win/Linux/macOS | P1 | If tray is supported, hide window, open tray menu, Show, Hide, Start/Stop Recording, Copy Last Transcript, Quit. | Tray commands affect the app exactly once; Quit exits; no duplicate recording. Capture tray menu and status. | **NOT VERIFIED** |
 | UI-05 | Linux (X11/Wayland) | P1, P6 | Run once with tray/hotkey defaults and once with explicit `SCRIBE_ENABLE_GLOBAL_HOTKEY=1`; try `SCRIBE_DISABLE_TRAY=1`. | Unsupported session paths fail visibly and main window remains usable; no silent process exit. | **NOT VERIFIED** |
 | UI-06 | Win/Linux/macOS | P1, P5 | Start dictation with the target on each monitor and with mixed display scaling. | Current overlay/window (if enabled) appears on the intended monitor without stealing target focus. **Pre-created overlay is a future target.** | **NOT VERIFIED** |
+| UI-07 | Win/Linux/macOS | P1, P3 | Open Models and inspect every visible card, search, device choice, and runtime-maintenance row. | Exactly the four normalized primary entries are visible; each has an Experimental text cue/reason, CPU-only capability, no backend/family filter or badge, and no curated role. Existing legacy paths/files remain untouched. | **NOT VERIFIED** |
 
 ## Hotkeys and recording lifecycle
 
@@ -136,6 +153,7 @@ manual rows remain NOT VERIFIED.
 | STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | If a model advertises streaming, observe transcript while speaking; otherwise record that only final batch text appears. | Current baseline is expected to be final-only; do not claim first-partial/streaming support without evidence. | **NOT VERIFIED** |
 | STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
+| STT-09 | Windows | P1, P3 | Record the exact sherpa-onnx v1.13.4 and streaming Zipformer prerequisites; attempt the evidence harness only after a native package, pinned model, shared corpus, and Phase 7 comparator exist. | Any missing measurement remains NO-GO. A second logical handler appears only if every first-partial, 30% improvement, RTF, cancellation, WER, lifecycle, crash, memory, and platform threshold passes. | **NOT VERIFIED / CURRENT NO-GO** |
 
 ## Output, clipboard, and target safety
 
