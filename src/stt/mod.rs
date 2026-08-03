@@ -168,14 +168,10 @@ pub(crate) fn run_cancellable_command(
 pub(crate) fn cancel_active_processes() {
     CANCELLATION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let (state, _) = active_legacy_state();
-    let processes = state
+    let state = state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .processes
-        .values()
-        .copied()
-        .collect::<Vec<_>>();
-    for process in processes {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for process in state.processes.values().copied() {
         terminate_process_container(process);
     }
 }
