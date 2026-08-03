@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -253,6 +253,14 @@ pub struct TranscriptionRequest {
     /// Optional per-request override for a configured model location.
     pub model_path: Option<PathBuf>,
     pub options: TranscriptionOptions,
+}
+
+/// Opaque, runtime-neutral cancellation state captured before dispatching a
+/// transcription task to a worker thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptionTicket {
+    native_generation: u64,
+    process_generation: crate::stt::CancellationSnapshot,
 }
 
 impl TranscriptionRequest {
@@ -593,6 +601,22 @@ impl TranscriptionService {
         crate::stt::cancel_active_processes();
     }
 
+    /// Cancels active work and waits for service requests and compatibility
+    /// processes to release their transient audio resources.
+    pub fn cancel_active_and_wait(&self, timeout: Duration) -> bool {
+        self.router.cancel_active();
+        crate::stt::cancel_active_processes_and_wait(timeout)
+    }
+
+    /// Captures cancellation state synchronously before a caller dispatches
+    /// audio preparation or transcription to another thread.
+    pub fn transcription_ticket(&self) -> TranscriptionTicket {
+        TranscriptionTicket {
+            native_generation: self.router.cancellation_snapshot(),
+            process_generation: crate::stt::cancellation_snapshot(),
+        }
+    }
+
     /// Drops all retained native model state on the dedicated worker.
     pub fn unload_runtime(&self) -> Result<()> {
         self.worker.unload().map_err(|error| anyhow!(error))
@@ -602,18 +626,35 @@ impl TranscriptionService {
     /// opportunity to handle every model; unretired providers remain behind a
     /// private compatibility bridge until Phase 11 retirement evidence exists.
     pub fn transcribe(&self, request: TranscriptionRequest) -> Result<TranscriptionOutcome> {
+        let ticket = self.transcription_ticket();
+        self.transcribe_with_ticket(request, ticket)
+    }
+
+    pub fn transcribe_with_ticket(
+        &self,
+        request: TranscriptionRequest,
+        ticket: TranscriptionTicket,
+    ) -> Result<TranscriptionOutcome> {
+        let _request = crate::stt::register_cancellable_request(ticket.process_generation)
+            .map_err(|error| anyhow!(error))?;
+        if self.router.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(
+                "transcription request was cancelled before dispatch"
+            ));
+        }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
         if self.router.handles_model(&request.model_id) {
-            return self.transcribe_primary(request, model);
+            return self.transcribe_primary(request, model, ticket);
         }
 
-        self.transcribe_legacy(request, model)
+        self.transcribe_legacy(request, model, ticket)
     }
 
     fn transcribe_primary(
         &self,
         request: TranscriptionRequest,
         model: SttModelInfo,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
         validate_default_options(&request.options)?;
         let runtime_model = self.resolve_runtime_model(model.clone())?;
@@ -622,13 +663,13 @@ impl TranscriptionService {
             self.config.performance.acceleration_preference,
             Arc::clone(&request.audio),
             request.options.clone(),
-            self.router.cancellation_snapshot(),
+            ticket.native_generation,
         ) {
             Ok(execution) => Ok(map_native_execution(request, model, execution)),
             Err(crate::runtime_router::RuntimeError::Bootstrap(failure))
                 if failure.cli_fallback_eligible() =>
             {
-                self.transcribe_legacy_with_fallback_reason(request, model, failure)
+                self.transcribe_legacy_with_fallback_reason(request, model, failure, ticket)
             }
             Err(error) => Err(anyhow!(error)),
         }
@@ -638,8 +679,9 @@ impl TranscriptionService {
         &self,
         request: TranscriptionRequest,
         model: SttModelInfo,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, None)
+        self.transcribe_legacy_inner(request, model, None, ticket)
     }
 
     fn transcribe_legacy_with_fallback_reason(
@@ -647,8 +689,9 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         model: SttModelInfo,
         failure: NativeBootstrapFailure,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, Some(failure.to_string()))
+        self.transcribe_legacy_inner(request, model, Some(failure.to_string()), ticket)
     }
 
     fn transcribe_legacy_inner(
@@ -656,13 +699,15 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         model: SttModelInfo,
         fallback_reason: Option<String>,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
         if fallback_reason.is_some() {
             let cli = crate::compatibility_bridge::primary_runtime_entrypoint(&self.config)
                 .ok_or_else(|| anyhow!("the verified compatibility CLI is unavailable"))?;
             verify_compatibility_cli(&cli).map_err(|error| anyhow!(error))?;
         }
-        let mut engine = LegacyBatchAdapter::new(self.config.clone(), model);
+        let mut engine =
+            LegacyBatchAdapter::new(self.config.clone(), model, ticket.process_generation);
         engine.load()?;
         let transcription = engine.transcribe(&request.audio, &request.options);
         let unload_result = engine.unload();
@@ -788,14 +833,20 @@ fn map_native_execution(
 struct LegacyBatchAdapter {
     config: AppConfig,
     model: SttModelInfo,
+    cancellation_snapshot: crate::stt::CancellationSnapshot,
     diagnostics: Option<LegacyDiagnostics>,
 }
 
 impl LegacyBatchAdapter {
-    fn new(config: AppConfig, model: SttModelInfo) -> Self {
+    fn new(
+        config: AppConfig,
+        model: SttModelInfo,
+        cancellation_snapshot: crate::stt::CancellationSnapshot,
+    ) -> Self {
         Self {
             config,
             model,
+            cancellation_snapshot,
             diagnostics: None,
         }
     }
@@ -824,6 +875,7 @@ impl SpeechEngine for LegacyBatchAdapter {
             &self.config,
             prepared_wav.path().to_path_buf(),
             self.model.clone(),
+            self.cancellation_snapshot,
         )?;
         let (transcript, diagnostics) = map_legacy_result(result);
         self.diagnostics = Some(diagnostics);
@@ -1333,6 +1385,23 @@ mod tests {
     }
 
     #[test]
+    fn ticket_captured_before_cancellation_cannot_dispatch_later() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let ticket = service.transcription_ticket();
+        service.cancel_active();
+        let request = TranscriptionRequest::new(
+            SessionId(91),
+            RequestId(92),
+            prepared_audio(),
+            "whisper_cpp_tiny_en",
+        );
+
+        let error = service.transcribe_with_ticket(request, ticket).unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
     fn service_returns_legacy_adapter_option_errors_without_needing_a_runtime() {
         let service = TranscriptionService::new(AppConfig::default());
         let mut request = TranscriptionRequest::new(
@@ -1354,7 +1423,11 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
             .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(AppConfig::default(), model);
+        let mut adapter = LegacyBatchAdapter::new(
+            AppConfig::default(),
+            model,
+            crate::stt::cancellation_snapshot(),
+        );
 
         let error = adapter.health_check().unwrap_err();
 
@@ -1367,7 +1440,11 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
             .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(AppConfig::default(), model);
+        let mut adapter = LegacyBatchAdapter::new(
+            AppConfig::default(),
+            model,
+            crate::stt::cancellation_snapshot(),
+        );
 
         adapter
             .load()

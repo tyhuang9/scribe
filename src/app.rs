@@ -1596,7 +1596,12 @@ impl LocalTranscriberApp {
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
                 self.stop_and_discard_active_recording();
-                self.transcription_service.cancel_active();
+                if !self
+                    .transcription_service
+                    .cancel_active_and_wait(Duration::from_secs(2))
+                {
+                    eprintln!("transcription workers did not stop before the quit timeout");
+                }
                 let _ = self.session_coordinator.cancel_active();
                 self.flush_settings();
                 self.quit_requested = true;
@@ -2184,6 +2189,7 @@ impl LocalTranscriberApp {
         };
         latency.transcription_dispatched_at = Some(Instant::now());
         let service = self.transcription_service.with_config(self.config.clone());
+        let ticket = service.transcription_ticket();
         let tx = self.tx.clone();
 
         thread::spawn(move || {
@@ -2207,7 +2213,7 @@ impl LocalTranscriberApp {
                 TranscriptionRequest::new(session_id, request_id, prepared, model.id.clone());
             request.model_path = model.local_path.clone();
             request.options = TranscriptionOptions::default();
-            let result = service.transcribe(request);
+            let result = service.transcribe_with_ticket(request, ticket);
             let completed_at = Instant::now();
             latency.transcription_job_completed_at = Some(completed_at);
 
@@ -2259,6 +2265,7 @@ impl LocalTranscriberApp {
         self.playground_pending = models.len();
         let audio_duration_ms = audio::wav_duration_ms(&audio_path);
         let service = self.transcription_service.with_config(self.config.clone());
+        let ticket = service.transcription_ticket();
 
         let mut requests = Vec::with_capacity(models.len());
         for model in models {
@@ -2339,7 +2346,7 @@ impl LocalTranscriberApp {
                     );
                     request.model_path = model.local_path.clone();
                     request.options = TranscriptionOptions::default();
-                    match service.transcribe(request) {
+                    match service.transcribe_with_ticket(request, ticket) {
                         Ok(result) => {
                             let _ = tx.send(AppEvent::TranscriptionDone {
                                 source: RecordingSource::Playground,
@@ -2905,7 +2912,12 @@ impl eframe::App for LocalTranscriberApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_and_discard_active_recording();
-        self.transcription_service.cancel_active();
+        if !self
+            .transcription_service
+            .cancel_active_and_wait(Duration::from_secs(2))
+        {
+            eprintln!("transcription workers did not stop before the exit timeout");
+        }
         let _ = self.session_coordinator.cancel_active();
         self.flush_settings();
     }
