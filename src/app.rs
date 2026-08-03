@@ -2189,7 +2189,16 @@ impl LocalTranscriberApp {
         };
         latency.transcription_dispatched_at = Some(Instant::now());
         let service = self.transcription_service.with_config(self.config.clone());
-        let ticket = service.transcription_ticket();
+        let task = match service.begin_transcription_task() {
+            Ok(task) => task,
+            Err(err) => {
+                let _ = self.session_coordinator.fail(session_id);
+                let _ = fs::remove_file(audio_path);
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not dispatch transcription: {err}");
+                return;
+            }
+        };
         let tx = self.tx.clone();
 
         thread::spawn(move || {
@@ -2213,7 +2222,7 @@ impl LocalTranscriberApp {
                 TranscriptionRequest::new(session_id, request_id, prepared, model.id.clone());
             request.model_path = model.local_path.clone();
             request.options = TranscriptionOptions::default();
-            let result = service.transcribe_with_ticket(request, ticket);
+            let result = service.transcribe_task(request, task);
             let completed_at = Instant::now();
             latency.transcription_job_completed_at = Some(completed_at);
 
@@ -2265,7 +2274,6 @@ impl LocalTranscriberApp {
         self.playground_pending = models.len();
         let audio_duration_ms = audio::wav_duration_ms(&audio_path);
         let service = self.transcription_service.with_config(self.config.clone());
-        let ticket = service.transcription_ticket();
 
         let mut requests = Vec::with_capacity(models.len());
         for model in models {
@@ -2284,20 +2292,32 @@ impl LocalTranscriberApp {
                     return;
                 }
             };
-            requests.push((request_id, model));
+            let task = match service.begin_transcription_task() {
+                Ok(task) => task,
+                Err(err) => {
+                    let _ = self.session_coordinator.fail(session_id);
+                    self.playground_pending = 0;
+                    self.playground_audio_path = None;
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not dispatch model comparison: {err}");
+                    let _ = fs::remove_file(audio_path);
+                    return;
+                }
+            };
+            requests.push((request_id, model, task));
         }
         self.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: requests
                     .iter()
-                    .map(|(request_id, model)| (*request_id, model.id.clone()))
+                    .map(|(request_id, model, _)| (*request_id, model.id.clone()))
                     .collect(),
                 audio_path: audio_path.clone(),
             },
         );
 
-        for (_, model) in &requests {
+        for (_, model, _) in &requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
@@ -2319,7 +2339,7 @@ impl LocalTranscriberApp {
             let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    for (request_id, model) in requests {
+                    for (request_id, model, _) in requests {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
@@ -2333,7 +2353,7 @@ impl LocalTranscriberApp {
                 }
             };
 
-            for (request_id, model) in requests {
+            for (request_id, model, task) in requests {
                 let tx = tx.clone();
                 let service = service.clone();
                 let prepared = prepared.clone();
@@ -2346,7 +2366,7 @@ impl LocalTranscriberApp {
                     );
                     request.model_path = model.local_path.clone();
                     request.options = TranscriptionOptions::default();
-                    match service.transcribe_with_ticket(request, ticket) {
+                    match service.transcribe_task(request, task) {
                         Ok(result) => {
                             let _ = tx.send(AppEvent::TranscriptionDone {
                                 source: RecordingSource::Playground,

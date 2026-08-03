@@ -53,7 +53,7 @@ struct ActiveProcessState {
     processes: HashMap<u32, usize>,
 }
 
-struct RegisteredRequest;
+pub(crate) struct RegisteredRequest;
 
 impl Drop for RegisteredRequest {
     fn drop(&mut self) {
@@ -88,6 +88,14 @@ fn active_legacy_state() -> &'static (Mutex<ActiveProcessState>, Condvar) {
     STATE.get_or_init(|| (Mutex::new(ActiveProcessState::default()), Condvar::new()))
 }
 
+#[cfg(test)]
+pub(crate) fn cancellation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn cancellation_snapshot() -> CancellationSnapshot {
     CancellationSnapshot(CANCELLATION_GENERATION.load(Ordering::Acquire))
 }
@@ -105,7 +113,7 @@ fn is_cancelled(snapshot: CancellationSnapshot) -> bool {
 
 pub(crate) fn register_cancellable_request(
     snapshot: CancellationSnapshot,
-) -> io::Result<impl Drop> {
+) -> io::Result<RegisteredRequest> {
     let (state, _) = active_legacy_state();
     let mut state = state
         .lock()
@@ -497,6 +505,7 @@ mod tests {
 
     #[test]
     fn cancellation_terminates_a_registered_process_tree() {
+        let _test_lock = cancellation_test_lock();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let snapshot = cancellation_snapshot();
         std::thread::spawn(move || {
@@ -551,6 +560,7 @@ mod tests {
 
     #[test]
     fn cancellation_before_registration_rejects_the_stale_request() {
+        let _test_lock = cancellation_test_lock();
         let snapshot = cancellation_snapshot();
         cancel_active_processes();
 

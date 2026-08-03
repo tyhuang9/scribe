@@ -263,6 +263,13 @@ pub struct TranscriptionTicket {
     process_generation: crate::stt::CancellationSnapshot,
 }
 
+/// Owned registration that spans native audio preparation and the complete
+/// transcription request on a worker thread.
+pub struct TranscriptionTask {
+    ticket: TranscriptionTicket,
+    _registration: crate::stt::RegisteredRequest,
+}
+
 impl TranscriptionRequest {
     pub fn new(
         session_id: SessionId,
@@ -617,6 +624,22 @@ impl TranscriptionService {
         }
     }
 
+    /// Registers work synchronously before the caller starts an audio worker.
+    pub fn begin_transcription_task(&self) -> Result<TranscriptionTask> {
+        let ticket = self.transcription_ticket();
+        let registration = crate::stt::register_cancellable_request(ticket.process_generation)
+            .map_err(|error| anyhow!(error))?;
+        if self.router.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(
+                "transcription request was cancelled before dispatch"
+            ));
+        }
+        Ok(TranscriptionTask {
+            ticket,
+            _registration: registration,
+        })
+    }
+
     /// Drops all retained native model state on the dedicated worker.
     pub fn unload_runtime(&self) -> Result<()> {
         self.worker.unload().map_err(|error| anyhow!(error))
@@ -626,8 +649,8 @@ impl TranscriptionService {
     /// opportunity to handle every model; unretired providers remain behind a
     /// private compatibility bridge until Phase 11 retirement evidence exists.
     pub fn transcribe(&self, request: TranscriptionRequest) -> Result<TranscriptionOutcome> {
-        let ticket = self.transcription_ticket();
-        self.transcribe_with_ticket(request, ticket)
+        let task = self.begin_transcription_task()?;
+        self.transcribe_task(request, task)
     }
 
     pub fn transcribe_with_ticket(
@@ -635,8 +658,23 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
-        let _request = crate::stt::register_cancellable_request(ticket.process_generation)
+        let registration = crate::stt::register_cancellable_request(ticket.process_generation)
             .map_err(|error| anyhow!(error))?;
+        self.transcribe_task(
+            request,
+            TranscriptionTask {
+                ticket,
+                _registration: registration,
+            },
+        )
+    }
+
+    pub fn transcribe_task(
+        &self,
+        request: TranscriptionRequest,
+        task: TranscriptionTask,
+    ) -> Result<TranscriptionOutcome> {
+        let ticket = task.ticket;
         if self.router.cancellation_snapshot() != ticket.native_generation {
             return Err(anyhow!(
                 "transcription request was cancelled before dispatch"
@@ -1386,6 +1424,7 @@ mod tests {
 
     #[test]
     fn ticket_captured_before_cancellation_cannot_dispatch_later() {
+        let _test_lock = crate::stt::cancellation_test_lock();
         let service = TranscriptionService::new(AppConfig::default());
         let ticket = service.transcription_ticket();
         service.cancel_active();
@@ -1399,6 +1438,33 @@ mod tests {
         let error = service.transcribe_with_ticket(request, ticket).unwrap_err();
 
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn registered_task_keeps_shutdown_waiting_through_audio_cleanup() {
+        let _test_lock = crate::stt::cancellation_test_lock();
+        let service = TranscriptionService::new(AppConfig::default());
+        let task = service.begin_transcription_task().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "scribe-dispatch-cleanup-{}-{}.wav",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&path, b"pcm").unwrap();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            fs::remove_file(&worker_path).unwrap();
+            drop(task);
+        });
+
+        assert!(service.cancel_active_and_wait(Duration::from_secs(2)));
+
+        worker.join().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
