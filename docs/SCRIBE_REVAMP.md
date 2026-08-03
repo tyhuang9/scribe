@@ -878,9 +878,10 @@ same validated runtime path. This overlaps model loading with capture without
 adding an async runtime or exposing a concrete runtime above the service.
 
 Superseding a run cancels native work and registered transitional process
-trees before retiring the coordinator. An opaque service ticket captures both
-native and compatibility cancellation generations before audio preparation is
-dispatched; a request cancelled before process registration cannot start later.
+trees before retiring the coordinator. An opaque service task captures both
+native and compatibility cancellation generations and registers synchronously
+before audio preparation is dispatched; it remains owned through WAV deletion
+and transcription. A request cancelled before process registration cannot start later.
 Transitional Unix children use a dedicated process group, while Windows wraps
 each child and its descendants in a kill-on-close Job Object. Quit waits a
 bounded interval for request/process registry drain and transient-audio cleanup.
@@ -940,7 +941,7 @@ Final Phase 4 verification on 2026-08-03:
 | Format | `cargo fmt --all -- --check` | PASS |
 | Compile | `cargo check --all-targets --all-features` | PASS |
 | Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
-| Tests | `cargo test --all-targets --all-features` | PASS: 281 discovered, 276 passed, 0 failed, 5 environment-required ignored |
+| Tests | `cargo test --all-targets --all-features` | PASS: 282 discovered, 277 passed, 0 failed, 5 environment-required ignored |
 | Debug build | `cargo build --all-features` | PASS |
 | Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary test | PASS: one logical handler; normalized service/router boundary retained |
 

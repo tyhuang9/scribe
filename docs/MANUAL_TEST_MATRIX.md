@@ -107,7 +107,7 @@ behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
-| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 281 discovered, 276 passed, 0 failed, 5 ignored environment-required tests |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 282 discovered, 277 passed, 0 failed, 5 ignored environment-required tests |
 | Session authority | Coordinator transition, stop-priority, cancellation, correlation, stale/duplicate/out-of-order, preload, comparison, and exactly-once output gates | PASS |
 | Settings durability | Legacy/missing/invalid/truncated/future inputs; field salvage; unknown-field round trip; corrupt and rollback backup; debounce; injected atomic failure; transactional save ordering | PASS |
 | Cancellation/privacy | Pre-dispatch cancellation ticket; stale-registration rejection; Windows Job Object/Unix process-group tree termination; bounded registry drain; recorder shutdown and PCM deletion; failed-start cleanup; Unix private-file setup | PASS automated paths; live microphone/process-exit behavior remains NOT VERIFIED |
