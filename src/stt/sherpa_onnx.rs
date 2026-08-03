@@ -202,19 +202,6 @@ pub fn resolve_executable_for_backend(config: &AppConfig, backend: &str) -> Opti
     )
 }
 
-pub fn resolve_packaged_executable_for_backend(
-    config: &AppConfig,
-    backend: &str,
-) -> Option<PathBuf> {
-    let spec = runtime_spec_for_backend(backend)?;
-    resolve_executable_from_candidates(
-        spec.runtime_id,
-        bundled_runtime_root(),
-        managed_runtime_roots(config, backend),
-        [],
-    )
-}
-
 fn bundled_runtime_root() -> Option<PathBuf> {
     env::current_exe()
         .ok()

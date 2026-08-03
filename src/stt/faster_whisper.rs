@@ -7,8 +7,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::config::{self, AppConfig, WhisperComputeMode};
+use crate::config::{self, AppConfig};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
+use crate::transcription::AccelerationPreference;
 
 use super::SttBackend;
 
@@ -19,7 +20,7 @@ pub struct FasterWhisperBackend {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FasterWhisperOptions {
-    pub compute_mode: WhisperComputeMode,
+    pub compute_mode: AccelerationPreference,
     pub gpu_device: u32,
     pub cuda_library_paths: Vec<PathBuf>,
 }
@@ -27,7 +28,7 @@ pub struct FasterWhisperOptions {
 impl Default for FasterWhisperOptions {
     fn default() -> Self {
         Self {
-            compute_mode: WhisperComputeMode::Auto,
+            compute_mode: AccelerationPreference::Auto,
             gpu_device: 0,
             cuda_library_paths: Vec::new(),
         }
@@ -172,14 +173,6 @@ pub fn resolve_faster_whisper_executable(config: &AppConfig) -> Option<PathBuf> 
         bundled_runtime_root(),
         managed_runtime_roots(config),
         dev_runtime_paths(),
-    )
-}
-
-pub fn resolve_faster_whisper_packaged_executable(config: &AppConfig) -> Option<PathBuf> {
-    resolve_faster_whisper_executable_from_candidates(
-        bundled_runtime_root(),
-        managed_runtime_roots(config),
-        [],
     )
 }
 
@@ -332,7 +325,7 @@ fn apply_faster_whisper_environment(
     executable_path: &Path,
     options: &FasterWhisperOptions,
 ) -> Result<()> {
-    if options.compute_mode == WhisperComputeMode::Cpu {
+    if options.compute_mode == AccelerationPreference::Cpu {
         return Ok(());
     }
 
@@ -382,11 +375,11 @@ fn joined_library_path(paths: &[PathBuf]) -> Result<Option<OsString>> {
         .with_context(|| "failed to build LD_LIBRARY_PATH for faster-whisper")
 }
 
-fn device_mode_arg(mode: WhisperComputeMode) -> &'static str {
+fn device_mode_arg(mode: AccelerationPreference) -> &'static str {
     match mode {
-        WhisperComputeMode::Auto => "auto",
-        WhisperComputeMode::PreferGpu => "gpu",
-        WhisperComputeMode::Cpu => "cpu",
+        AccelerationPreference::Auto => "auto",
+        AccelerationPreference::Gpu => "gpu",
+        AccelerationPreference::Cpu => "cpu",
     }
 }
 
@@ -421,7 +414,7 @@ mod tests {
             Path::new("/models/tiny"),
             Path::new("/tmp/audio.wav"),
             &FasterWhisperOptions {
-                compute_mode: WhisperComputeMode::PreferGpu,
+                compute_mode: AccelerationPreference::Gpu,
                 gpu_device: 2,
                 ..FasterWhisperOptions::default()
             },
@@ -543,7 +536,7 @@ mod tests {
             &mut command,
             &executable,
             &FasterWhisperOptions {
-                compute_mode: WhisperComputeMode::PreferGpu,
+                compute_mode: AccelerationPreference::Gpu,
                 gpu_device: 0,
                 cuda_library_paths: vec![configured_path.clone()],
             },
@@ -571,7 +564,7 @@ mod tests {
             &mut command,
             &executable,
             &FasterWhisperOptions {
-                compute_mode: WhisperComputeMode::Cpu,
+                compute_mode: AccelerationPreference::Cpu,
                 gpu_device: 0,
                 cuda_library_paths: vec![PathBuf::from("/opt/scribe-cuda")],
             },
@@ -604,7 +597,7 @@ mod tests {
         let backend = FasterWhisperBackend::new(
             Some(runner),
             FasterWhisperOptions {
-                compute_mode: WhisperComputeMode::Cpu,
+                compute_mode: AccelerationPreference::Cpu,
                 gpu_device: 0,
                 ..FasterWhisperOptions::default()
             },

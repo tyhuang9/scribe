@@ -8,6 +8,7 @@ mod managed_downloads;
 mod models;
 mod prepared_audio;
 mod runtime_catalog;
+mod runtime_router;
 mod stt;
 mod text_output;
 mod transcription;

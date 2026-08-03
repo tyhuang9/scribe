@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceSupport {
     CpuOnly,
@@ -218,6 +220,63 @@ pub fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSp
     backend_spec_for_runtime_id(runtime_id).and_then(|spec| spec.development_runtime)
 }
 
+/// Resolves a packaged runtime entrypoint using catalog data only. This keeps
+/// UI/install code independent of concrete runtime modules; inference runtime
+/// selection remains exclusively inside `RuntimeRouter`.
+pub fn resolve_runtime_entrypoint(
+    runtime_id: &str,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    let spec = development_runtime_spec(runtime_id)?;
+    let relative = platform_executable_path(spec.executable_relative_path);
+    let file_name = relative.file_name()?.to_owned();
+    let mut seen = Vec::new();
+
+    for root in roots {
+        let candidates = if root.is_file() {
+            vec![root]
+        } else {
+            vec![
+                root.join("runtimes").join(runtime_id).join(&relative),
+                root.join(&relative),
+                root.join("bin").join(&file_name),
+                root.join(&file_name),
+            ]
+        };
+        for candidate in candidates {
+            if !candidate.as_os_str().is_empty()
+                && !seen.iter().any(|existing| existing == &candidate)
+            {
+                seen.push(candidate.clone());
+                if runtime_entrypoint_is_usable(runtime_id, &candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
+    match runtime_id {
+        "whisper_cpp" => path.is_file(),
+        "faster_whisper" => crate::stt::faster_whisper::is_faster_whisper_runtime_usable(path),
+        "vosk" => crate::stt::vosk::is_vosk_runtime_usable(path),
+        "sherpa_onnx" | "moonshine" | "parakeet" => {
+            crate::stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, path)
+        }
+        _ => false,
+    }
+}
+
+fn platform_executable_path(relative: &str) -> PathBuf {
+    let mut path = Path::new(relative).to_path_buf();
+    if cfg!(windows) && path.extension().is_none() {
+        path.set_extension("exe");
+    }
+    path
+}
+
 pub fn model_artifact_spec(model_id: &str) -> Option<&'static ModelArtifactSpec> {
     MODEL_ARTIFACTS
         .iter()
@@ -327,5 +386,28 @@ mod tests {
                 model.id
             );
         }
+    }
+
+    #[test]
+    fn generic_runtime_entrypoint_resolution_uses_catalog_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let entrypoint = root
+            .join("runtimes")
+            .join("whisper_cpp")
+            .join(platform_executable_path("bin/whisper-cli"));
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, b"runtime").unwrap();
+
+        let resolved = resolve_runtime_entrypoint("whisper_cpp", [root.clone()]);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(resolved, Some(entrypoint));
     }
 }
