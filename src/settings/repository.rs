@@ -52,6 +52,12 @@ impl SettingsStore {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+
+    /// Discards a scheduled snapshot after another transactional path has
+    /// persisted the current configuration successfully.
+    pub fn mark_current_persisted(&mut self) {
+        self.pending = None;
+    }
 }
 
 pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
@@ -351,6 +357,27 @@ mod tests {
         let persisted: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.recording.hotkey, "Latest");
         assert!(!store.flush().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transactional_save_discards_an_older_scheduled_snapshot() {
+        let dir = test_dir("transactional-save");
+        let path = dir.join("config.json");
+        let mut store = SettingsStore::new(path.clone(), Duration::from_secs(60));
+        let mut stale = AppConfig::default();
+        stale.recording.hotkey = "Stale".to_owned();
+        let mut current = stale.clone();
+        current.recording.hotkey = "Persisted transaction".to_owned();
+
+        store.schedule(&stale);
+        save_to_path(&path, &current).unwrap();
+        store.mark_current_persisted();
+
+        assert!(!store.has_pending());
+        assert!(!store.flush().unwrap());
+        let persisted: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.recording.hotkey, "Persisted transaction");
         fs::remove_dir_all(dir).unwrap();
     }
 }

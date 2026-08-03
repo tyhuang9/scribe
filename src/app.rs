@@ -2035,6 +2035,9 @@ impl LocalTranscriberApp {
                             continue;
                         }
                     };
+                    if let Some(store) = self.settings_store.as_mut() {
+                        store.mark_current_persisted();
+                    }
                     let cleanup_warning = replacement.commit().err();
                     if self.config_path.is_none() {
                         self.config_path = config::config_file_path().ok();
