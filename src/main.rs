@@ -5,6 +5,7 @@ mod config;
 mod core;
 mod hotkey;
 mod managed_downloads;
+mod model_catalog;
 mod models;
 mod prepared_audio;
 mod runtime_catalog;
