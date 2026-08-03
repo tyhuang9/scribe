@@ -80,7 +80,7 @@ impl ProviderHandle {
 }
 
 pub(crate) fn record_selected_provider(config: &mut AppConfig, model: &SttModelInfo) {
-    config.last_used_backend.clone_from(&model.backend);
+    config.general.last_used_backend.clone_from(&model.backend);
 }
 
 pub(crate) fn primary_runtime_entrypoint(config: &AppConfig) -> Option<PathBuf> {

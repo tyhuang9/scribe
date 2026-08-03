@@ -560,7 +560,10 @@ impl TranscriptionService {
         let runtime_model = self.resolve_runtime_model(model)?;
         let execution = self
             .worker
-            .load(runtime_model, self.config.acceleration_preference)
+            .load(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+            )
             .map_err(|error| anyhow!(error))?;
         Ok(ModelLoadOutcome {
             model_id: model_id.clone(),
@@ -576,7 +579,10 @@ impl TranscriptionService {
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         self.worker
-            .health_check(runtime_model, self.config.acceleration_preference)
+            .health_check(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+            )
             .map_err(|error| anyhow!(error))
     }
 
@@ -612,7 +618,7 @@ impl TranscriptionService {
         let runtime_model = self.resolve_runtime_model(model.clone())?;
         match self.worker.transcribe(
             runtime_model,
-            self.config.acceleration_preference,
+            self.config.performance.acceleration_preference,
             Arc::clone(&request.audio),
             request.options.clone(),
             self.router.cancellation_snapshot(),
@@ -1467,10 +1473,8 @@ mod tests {
                 .expect("set SCRIBE_WHISPER_CPP_AUDIO to the JFK WAV fixture"),
         );
 
-        let config = AppConfig {
-            whisper_executable_path: Some(whisper_cli),
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(whisper_cli);
         let service = TranscriptionService::new(config);
         let session_id = SessionId(701);
         let request_id = RequestId(1701);
@@ -1558,11 +1562,9 @@ mod tests {
         let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
         let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
         let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
-        let config = AppConfig {
-            whisper_executable_path: Some(cli),
-            acceleration_preference: AccelerationPreference::Cpu,
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(cli);
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
         let make_request = |request_id: u64| {
             let mut request = TranscriptionRequest::new(
                 SessionId(8_000 + request_id),
@@ -1628,11 +1630,10 @@ mod tests {
             source_sample_rate: fixture.sample_rate,
             source_channels: 1,
         });
-        let service = TranscriptionService::new(AppConfig {
-            whisper_executable_path: Some(cli),
-            acceleration_preference: AccelerationPreference::Cpu,
-            ..AppConfig::default()
-        });
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(cli);
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        let service = TranscriptionService::new(config);
         service
             .preload_model(
                 &ModelId::new("whisper_cpp_base_en"),

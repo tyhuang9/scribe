@@ -19,8 +19,8 @@ pub struct TextOutputOptions {
 impl TextOutputOptions {
     pub fn from_config(config: &AppConfig) -> Self {
         Self {
-            restore_clipboard_after_insert: config.restore_clipboard_after_insert,
-            paste_delay_ms: config.paste_delay_ms,
+            restore_clipboard_after_insert: config.output.restore_clipboard_after_insert,
+            paste_delay_ms: config.output.paste_delay_ms,
         }
     }
 }

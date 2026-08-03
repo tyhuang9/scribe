@@ -166,7 +166,7 @@ fn dev_runtime_paths(config: &AppConfig) -> Vec<PathBuf> {
     [
         env::var_os("SCRIBE_WHISPER_CPP_CLI").map(PathBuf::from),
         env::var_os("SCRIBE_WHISPER_CUDA_CLI").map(PathBuf::from),
-        config.whisper_executable_path.clone(),
+        config.developer.whisper_executable_path.clone(),
     ]
     .into_iter()
     .flatten()

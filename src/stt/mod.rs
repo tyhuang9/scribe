@@ -127,10 +127,10 @@ pub fn transcribe_with_config(
             let backend = whisper_cpp::WhisperCppBackend::new(
                 whisper_cpp::resolve_whisper_cpp_executable(config),
                 whisper_cpp::WhisperCppOptions {
-                    compute_mode: config.acceleration_preference,
-                    gpu_device: config.whisper_gpu_device,
-                    cuda_backend_path: config.whisper_cuda_backend_path.clone(),
-                    cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+                    compute_mode: config.performance.acceleration_preference,
+                    gpu_device: config.performance.whisper_gpu_device,
+                    cuda_backend_path: config.performance.whisper_cuda_backend_path.clone(),
+                    cuda_library_paths: config.performance.whisper_cuda_library_paths.clone(),
                 },
             );
             let capabilities = backend_capabilities(provider.backend);
@@ -159,9 +159,9 @@ pub fn transcribe_with_config(
             let backend = faster_whisper::FasterWhisperBackend::new(
                 faster_whisper::resolve_faster_whisper_executable(config),
                 faster_whisper::FasterWhisperOptions {
-                    compute_mode: config.acceleration_preference,
-                    gpu_device: config.whisper_gpu_device,
-                    cuda_library_paths: config.whisper_cuda_library_paths.clone(),
+                    compute_mode: config.performance.acceleration_preference,
+                    gpu_device: config.performance.whisper_gpu_device,
+                    cuda_library_paths: config.performance.whisper_cuda_library_paths.clone(),
                 },
             );
             let capabilities = backend_capabilities(provider.backend);
