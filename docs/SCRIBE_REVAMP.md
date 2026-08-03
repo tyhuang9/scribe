@@ -1,8 +1,9 @@
-# Scribe revamp: Phase 0 baseline and architecture record
+# Scribe revamp implementation record
 
-**Status:** Phase 0 documentation baseline (2026-08-03). This document records the
-checked-out repository and the target architecture from the consolidated revamp
-plan. It does not claim that later phases are implemented.
+**Status:** Phase 1 implemented on its stacked branch (2026-08-03). This document
+preserves the Phase 0 audit and records each implemented phase against the
+consolidated revamp plan. It does not claim that uncompleted later phases are
+implemented.
 
 ## How to read this document
 
@@ -19,12 +20,12 @@ this audit, the manual test scaffold in
 in `src/app.rs` and `src/hotkey.rs`, and non-Linux warning gating in
 `src/main.rs`.
 
-## Verified current-state summary
+## Verified Phase 0 current-state summary (historical)
 
-Scribe is a Rust 2024 native desktop application using `eframe`/egui. The
-application is organized as a monolithic `src/app.rs` UI/coordinator with small
+At the Phase 0 base, Scribe was a Rust 2024 native desktop application using
+`eframe`/egui. The application was organized as a monolithic `src/app.rs` UI/coordinator with small
 modules for audio, settings/configuration, downloads, model metadata, output,
-tray, hotkeys, and STT adapters. The current end-to-end path is:
+tray, hotkeys, and STT adapters. The Phase 0 end-to-end path was:
 
 ```text
 egui app / hotkey or Start button
@@ -50,15 +51,16 @@ TranscriptResult -> UI transcript -> optional clipboard + paste automation
 The six user-visible backend labels are `whisper.cpp`, `faster-whisper`,
 `Vosk`, `sherpa-onnx`, `Moonshine`, and `Parakeet`. They are implemented by four
 Rust adapters: the three dedicated adapters plus one sherpa-family adapter.
-Every current transcription call is batch-oriented: the app records to a WAV,
-then starts a short-lived child process. There is no shared
+Every Phase 0 transcription call was batch-oriented: the app recorded to a WAV,
+then started a short-lived child process. At that point there was no shared
 `TranscriptionService`, `RuntimeRouter`, native Rust transcriber, ORT binding,
 overlay target capture, session ID, VAD, or committed/tentative streaming path
-in this baseline.
+in that baseline. The Phase 1 section below records the service and correlation
+boundary now layered over this legacy execution path.
 
-### Current call-site audit
+### Phase 0 call-site audit
 
-| Concern | Verified location(s) | Current behavior | Target boundary |
+| Concern | Verified location(s) | Phase 0 behavior | Target boundary |
 | --- | --- | --- | --- |
 | Application dispatch | `src/app.rs:1702-1785` | Default and Playground jobs call `stt::transcribe_with_config` on worker threads after WAV finalization. | `TranscriptionService` only; no concrete backend imports above it. |
 | Runtime selection | `src/stt/mod.rs:64-232` | `runtime_status` and `transcribe_with_config` match backend strings. | One `RuntimeRouter` match on `RuntimeKind`. |
@@ -248,17 +250,19 @@ cold/warm state:
 | `total_end_to_end_ms` | hotkey observation to output completion | `summary_lines` reports total observed; it excludes unobserved physical event/overlay/VAD work. |
 | `realtime_factor` | transcription compute time / audio duration | Playground benchmark has an RTF helper; dictation latency does not persist this metric. |
 
-Current instrumentation added on this branch is intentionally diagnostic only:
+Phase 0 instrumentation added on that branch was intentionally diagnostic only:
 it records timestamps in `LatencyTrace` and displays a latest summary. The
 trigger timestamp is `TriggerObservation::HotkeyPoll` when a registered
 `GlobalHotKeyEvent` is drained by UI polling (or `AppAction` for an in-app
-button), not the physical key-generation time. It does not create a session ID,
-reject stale events, correlate concurrent sessions, or measure true first
-partials. `transcription_job_completed_at` is worker completion;
+button), not the physical key-generation time. At that checkpoint it did not
+create a session ID, reject stale events, correlate concurrent sessions, or
+measure true first partials. Phase 1 has since added the session/request checks;
+true first-partial measurement remains unimplemented.
+`transcription_job_completed_at` is worker completion;
 `final_text_ready_at` is set only on the successful final-text path. Failures
 must not produce a final-text/paste latency claim. Measurements are reliable
 only for non-overlapping sequential sessions and should not be compared as
-cold/warm or cross-model benchmarks until the service/session work is
+cold/warm or cross-model benchmarks until the retained runtime work is
 implemented.
 
 ### Baseline command evidence
@@ -315,7 +319,7 @@ streaming mode, cold/warm state, and fixture checksum alongside each sample.
 | --- | --- | --- | --- |
 | Runtime/model compatibility is aspirational | **High** | No transcribe-cpp/ORT dependency or curated load/transcribe smoke evidence exists; current model labels are not proof of support. | Pin runtime/artifact revisions; run contract and platform matrix; leave entries Experimental/Incompatible until evidence passes. |
 | Audio callback can block on a mutexed WAV writer | **High** | `src/audio.rs` writes through `Arc<Mutex<Option<WavWriter>>>` in the cpal callback. | Move capture to a bounded native queue/ring buffer and keep filesystem/model work off the callback. |
-| Sessions are not correlated | **Medium** | `AppEvent` and current traces have no session ID or stale-event rejection; metrics are valid only for sequential non-overlapping sessions. | Add session IDs and coordinator-owned state transitions before concurrency/streaming work. |
+| Phase 0 sessions were not correlated; facade-level issue resolved in Phase 1 | **Low** remaining | Phase 1 adds session/request IDs, cross-source supersession, model correlation, and stale-event rejection before output. The authoritative coordinator/cancellation state machine is still pending. | Preserve these guards and consolidate them into the Phase 4 coordinator before streaming work. |
 | Output/permissions differ by desktop and target integrity | **Medium** | Enigo/clipboard behavior, Wayland restrictions, macOS Accessibility, and elevated Windows targets were not manually run. | Execute the platform matrix; capture target identity and fall back to clipboard without guessing. |
 | Download integrity and rollback are incomplete | **Medium** | Model metadata has estimated sizes but no hash/revision; current installer paths are backend-specific. | Add partial/resume, exact size/hash, staged smoke test, atomic activation, and previous-known-good rollback. |
 | Privacy/history behavior is not durable yet | **Low** | Current temporary WAV is removed after jobs and latest transcript is in memory; there is no history retention subsystem. | Default to transcript-only history, audio off, explicit retention, and startup reconciliation when history lands. |
@@ -403,9 +407,140 @@ docs—but any PR/integration must target or wait for that stacked base. Targeti
   Parakeet model meets the measured-benefit gate for the optional ONNX handler.
 - Add pinned artifact repository revisions, exact sizes, SHA-256 values, and a
   signed catalog/update policy.
-- Add session IDs, stale-event rejection, model load/first-partial timestamps,
-  and cold/warm benchmark records.
+- Extend the implemented session/request correlation into the authoritative
+  Phase 4 coordinator, and add model-load/first-partial timestamps plus
+  retained-engine cold/warm benchmark records.
 - Replace callback mutex WAV writes with bounded native capture and one shared
   audio preparation path; add VAD/endpointing and target-window capture.
 - Execute the manual matrix on the supported Windows environment and at least
   one Linux/macOS desktop session before marking platform support.
+
+## Phase 1: common contract and current-model wrapper
+
+**Implementation status:** complete on `revamp/phase-1-transcription-service`,
+stacked on the Phase 0 branch. No merge is authorized or performed.
+
+### Implemented vertical boundary
+
+Normal dictation and Playground/model comparison now enter one application
+facade:
+
+```text
+egui coordinator / normal dictation / Playground
+                       |
+                       v
+             TranscriptionService
+                       |
+                       v
+        private LegacyBatchAdapter : SpeechEngine
+                       |
+                       v
+       existing stt::transcribe_with_config bridge
+```
+
+`src/app.rs` no longer calls `stt::transcribe_with_config`. The only call above
+the old `src/stt/` adapters is inside private `src/transcription.rs`. The bridge
+deliberately retains the existing backend implementations so the working
+behavior is wrapped before it is replaced. Runtime installation/status UI still
+uses legacy provider helpers; moving those branches behind `RuntimeRouter` and
+neutral manifests is Phase 2/3 debt, not hidden completion.
+
+The common contract introduces `ModelId`, `SessionId`, `RequestId`, normalized
+transcript/segment/options/outcome types, conservative capabilities,
+`SpeechEngine`, and the optional `SpeechStream` extension. Engine lifecycle
+operations include health, load, unload, cancellation, and final
+transcription. The legacy bridge is stateless: load/unload are explicit no-ops,
+health is unimplemented, and cancellation returns an explicit unsupported error
+instead of pretending to cancel a child process. Unsupported request options
+are rejected rather than ignored.
+
+Legacy adapter `duration_ms` values measure processing wall-clock time, not
+utterance duration. Phase 1 therefore exposes them as
+`TranscriptionOutcome.processing_duration_ms`; `Transcript.duration_ms` remains
+unset until the native preparation path can provide true audio duration.
+Timestamp capability is claimed only for the current faster-whisper and Vosk
+adapters whose parsed results actually retain segment timing. Whisper.cpp and
+the sherpa/Moonshine/Parakeet bridge remain conservative.
+
+### Correlation and stale-result safety
+
+- A monotonic session ID is allocated before native capture is started. Request
+  IDs are allocated after WAV finalization and immediately before service
+  dispatch; both IDs are carried unchanged through the service outcome.
+- A newly accepted normal or Playground recording supersedes the other active
+  source. An obsolete completion is rejected before transcript, latency,
+  status, clipboard, or paste mutation.
+- Playground requests are tracked per run as request-to-model mappings. A
+  response with mismatched IDs or the wrong model is rejected, the expected
+  card receives an actionable error, and no transcript is applied.
+- Superseded Playground runs retain only bookkeeping needed to remove their own
+  temporary WAV after every outstanding request completes. They cannot
+  decrement a newer run, delete a newer recording, or overwrite newer UI state.
+- The service independently verifies that legacy diagnostics returned the
+  requested model ID, protecting normal dictation as well as Playground.
+
+### Decisions and compatibility evidence
+
+- **No `RuntimeRouter` yet.** Phase 1 is an extraction boundary. Introducing a
+  router or another runtime before the working path was wrapped would violate
+  the ordered plan.
+- **No second logical runtime.** `OnnxSpeechRuntime` was not added and no ONNX
+  benefit claim was made.
+- **No model was promoted.** All Phase 0 compatibility statuses remain
+  Experimental or Incompatible/NOT VERIFIED. Passing facade/unit tests does not
+  prove model compatibility.
+- `PreparedAudio` and acceleration resolution are deferred to Phase 2, where
+  path-based inference is removed. Dictation phase/transcript-state types move
+  with the authoritative coordinator and incremental transcript work. The
+  structured cross-stage error taxonomy remains open; Phase 1 preserves current
+  errors and adds explicit option/lifecycle/correlation failures.
+
+### Automated verification
+
+Final Phase 1 gates on 2026-08-03:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | **PASS**. |
+| `cargo check --all-targets --all-features` | **PASS**. |
+| `cargo test --all-targets --all-features` | **PASS**: 200 discovered; 197 passed, 0 failed, 3 ignored environment-required smoke tests. |
+| `cargo test transcription::tests::transcription_service_jfk_smoke_uses_the_whisper_cpp_facade --all-features -- --ignored --exact` | **PASS**: 1 passed using the Phase 0 Windows whisper.cpp 1.9.1 CLI, local `base.en` artifact, and JFK WAV fixture. |
+| `cargo clippy --all-targets --all-features -- -D warnings` | **PASS**. |
+| `cargo build --all-features` | **PASS**. |
+| `git diff --check` | **PASS**. |
+| Boundary scan for `transcribe_with_config` outside `src/stt/**` | **PASS**: only the documented private call in `src/transcription.rs`; no application dispatch call remains. |
+
+Added deterministic coverage verifies neutral result mapping, processing-time
+semantics, conservative capabilities for every legacy backend, explicit
+lifecycle behavior, unsupported options, unknown models, model-ID validation,
+monotonic IDs, current normal success/failure, current Playground
+success/failure and exactly-once cleanup, stale same-source and cross-source
+success/failure rejection, multi-request stale cleanup, mismatched service IDs,
+and wrong-model Playground responses.
+
+### Manual verification and measured results
+
+The JFK fixture completed through `TranscriptionService` and the private
+whisper.cpp bridge with non-empty text and matching correlation/model metadata.
+Application-integrated microphone, GUI, hotkey, Playground, target-window, and
+paste tests were **NOT VERIFIED** in this phase. Other ignored runtime tests
+remain environment-gated. The targeted smoke was functional evidence, not a
+controlled latency sample, so the Phase 0 CLI-only figures remain the only
+performance baseline and no latency improvement is claimed. The manual matrix
+records the precise remaining checks.
+
+### Risks and next phase
+
+| Risk | Level | Mitigation |
+| --- | --- | --- |
+| The facade still reaches four legacy process adapters through one private transitional bridge. | **Medium** | Phase 2 introduces the private router and primary runtime, keeps the bridge only as bounded rollback, and adds the boundary guard. |
+| Current child processes cannot acknowledge cancellation through the common contract. | **Medium** | Dedicated runtime workers and cancel commands land with the primary runtime; unsupported is explicit meanwhile. |
+| Audio remains a temporary WAV path across the service boundary. | **Medium** | Phase 2 adds canonical in-memory `PreparedAudio`; Phase 6 replaces callback WAV writes. |
+| Runtime/UI provider branches remain in `app.rs`. | **Medium** | Move selection behind `RuntimeRouter` and model/runtime metadata behind neutral descriptors before retiring legacy branches. |
+| Real runtime and desktop vertical slices were not manually exercised. | **High** for release confidence | Run the Windows fixture and manual matrix with exact runtime/model artifacts before any Supported status or release claim. |
+
+Phase 2 must now introduce private `RuntimeKind`, the sole `RuntimeRouter`, and
+the primary `TranscribeCppRuntime`; verify the pinned package and native API;
+add canonical mono 16 kHz `f32` preparation and acceleration resolution; retain
+the current CLI bridge until equivalent load/transcribe evidence passes; and
+save new cold/warm latency evidence without changing any model to Supported.
