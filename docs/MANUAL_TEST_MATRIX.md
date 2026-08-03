@@ -1,0 +1,148 @@
+# Scribe manual test matrix
+
+**Status:** living Phase 0 scaffold (2026-08-03). No manual desktop, microphone,
+model-runtime, tray, hotkey, or paste test was executed during the automated
+Phase 0 work. Every row below is therefore marked **NOT VERIFIED** until an
+operator records evidence. Automated Rust checks are listed separately and are
+not a substitute for the platform rows.
+
+## Test conditions and evidence rules
+
+Run the matrix against a packaged/debug build that includes the intended runtime
+and at least one installed model. Use a fresh temporary app-data directory for
+destructive install/uninstall tests; do not use a user's production history.
+Capture for each run:
+
+- Test ID, date, OS/version, desktop/session (X11/Wayland, Win32, macOS), Scribe
+  build/commit, runtime executable/version, model ID/version, and CPU/GPU mode.
+- A short screen recording or screenshot for UI/overlay/tray rows.
+- Scribe status text/logs and the latency summary for recording/transcription
+  rows (do not attach private transcripts or audio unless explicitly approved).
+- For failures, the exact user-facing message, stage, and whether retry/rollback
+  restored Idle state.
+
+Use a neutral fixture phrase such as **“Schedule a meeting with Alex tomorrow.”**
+For no-speech tests, use a silent WAV or remain silent for the configured
+endpoint. For model/download tests, use the catalog's smallest recommended model
+and a deliberately truncated/corrupt copy in the temporary data directory.
+
+Status values:
+
+- **PASS** — expected result observed and evidence attached to the test record.
+- **FAIL** — behavior differs; file a defect with the captured evidence.
+- **BLOCKED** — prerequisite unavailable; record why.
+- **NOT VERIFIED** — not yet run (the Phase 0 status for all manual rows).
+
+## Automated baseline (verified in Phase 0)
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format gate | `cargo fmt --all -- --check` | PASS |
+| Compile/check | `cargo check --all-targets --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS — 174 discovered, 172 passed, 0 failed, 2 ignored environment-required runtime/GPU smoke tests. |
+| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Build | `cargo build --all-features` | PASS |
+
+The final source gate was run at HEAD `536a85f813943dbc8beaa684fc5901ff281f6577`
+(source diff hash `6c39139e80fac94c8ce735e7962ed3a4ac75e0a7`,
+2026-08-03 14:20:24.998–14:20:30.146 `-05:00`). All commands emitted the same
+non-fatal warning: `could not canonicalize path C:\Users\huang`.
+
+## Prerequisites and test data
+
+| Code | Prerequisite |
+| --- | --- |
+| P1 | Scribe debug/release build launches in a real desktop session with the app data directory isolated. |
+| P2 | A microphone is connected and selectable; test one USB and one Bluetooth device when available. |
+| P3 | A known-good installed model/runtime pair. Record exact IDs and versions; compatibility is not implied by a catalog label. |
+| P4 | A text target for paste: browser text input, VS Code/editor, terminal, and a native desktop field where available. |
+| P5 | Optional second monitor or mixed-DPI scaling for overlay placement. |
+| P6 | Permission access as applicable: Windows microphone/input automation, macOS Microphone + Accessibility/Input Monitoring, Linux audio/clipboard and optional global-hotkey permission. |
+| P7 | Test account/data is disposable; backup clipboard content and do not use sensitive text. |
+
+## Core UI, startup, and tray
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| UI-01 | Win/Linux/macOS | P1 | Launch Scribe; visit each current page (Transcribe, Models, Playground, Settings); close and relaunch. | Window opens without panic; page navigation and close/reopen behavior are stable. Capture startup log/screenshot. | **NOT VERIFIED** |
+| UI-02 | Win/Linux/macOS | P1, P7 | Change a setting, restart, and inspect the value. Then load a config with one unknown/invalid field in the isolated data dir. | Valid settings persist; invalid data does not erase all valid settings; user receives actionable recovery. **Target behavior is not implemented yet.** | **NOT VERIFIED** |
+| UI-03 | Win/Linux/macOS | P1 | Toggle theme/performance/audio/input settings available in the current build; verify labels and disabled states. | Controls are keyboard reachable, labels are understandable, and unavailable runtime actions explain why. | **NOT VERIFIED** |
+| UI-04 | Win/Linux/macOS | P1 | If tray is supported, hide window, open tray menu, Show, Hide, Start/Stop Recording, Copy Last Transcript, Quit. | Tray commands affect the app exactly once; Quit exits; no duplicate recording. Capture tray menu and status. | **NOT VERIFIED** |
+| UI-05 | Linux (X11/Wayland) | P1, P6 | Run once with tray/hotkey defaults and once with explicit `SCRIBE_ENABLE_GLOBAL_HOTKEY=1`; try `SCRIBE_DISABLE_TRAY=1`. | Unsupported session paths fail visibly and main window remains usable; no silent process exit. | **NOT VERIFIED** |
+| UI-06 | Win/Linux/macOS | P1, P5 | Start dictation with the target on each monitor and with mixed display scaling. | Current overlay/window (if enabled) appears on the intended monitor without stealing target focus. **Pre-created overlay is a future target.** | **NOT VERIFIED** |
+
+## Hotkeys and recording lifecycle
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| HK-01 | Windows | P1, P2, P4, P6 | Focus a text field; press and hold configured `Ctrl+Shift+Space`; speak fixture; release. | One recording starts on press, stops on release, and returns to Idle after finalization. Record latency summary and screen evidence. | **NOT VERIFIED** |
+| HK-02 | Linux | P1, P2, P4, P6 | Repeat HK-01 with global hotkey opt-in and with the Start/Stop button when global hotkey is disabled. | Opt-in hotkey works where supported; button path remains available when hotkeys are disabled. | **NOT VERIFIED** |
+| HK-03 | macOS | P1, P2, P4, P6 | Grant required permissions, then repeat HK-01. Revoke Accessibility/Input Monitoring and repeat. | Granted path records; denied path gives actionable permission guidance and does not paste unpredictably. | **NOT VERIFIED** |
+| HK-04 | Win/Linux/macOS | P1, P2 | Configure Toggle mode; press once, speak, press again. | First press starts and second press finalizes exactly one session. | **NOT VERIFIED** |
+| HK-05 | Win/Linux/macOS | P1, P2 | Configure Hold mode; press/release without speech; then press/release twice rapidly. | No-speech path does not paste empty/partial text; rapid events do not create overlapping sessions. | **NOT VERIFIED** |
+| HK-06 | Win/Linux/macOS | P1 | Register a shortcut known to be used by another app; restart/reconfigure. | Conflict is reported; app remains usable through visible Start/Stop control. | **NOT VERIFIED** |
+| REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and temporary recording directory. | Capture begins after stream start, WAV finalizes, transcription starts, and temporary file cleanup follows current policy. Capture exact latency phases. | **NOT VERIFIED** |
+| REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture. | Microphone failure is visible, no hang occurs, and app returns to a valid Idle/Error state without paste. | **NOT VERIFIED** |
+| REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
+| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists). | Cancel never pastes; pending work is cleaned up; stale completion cannot overwrite the next session. Session IDs are a future requirement. | **NOT VERIFIED** |
+
+## Runtime, model, and transcription flows
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
+| STT-02 | Win/Linux/macOS | P1, P2, P3 | Run the same WAV in Playground for every installed/ready model. | Each selected ready model completes independently; missing runtime/model blocks only that card with repair guidance. | **NOT VERIFIED** |
+| STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle. | Current batch runtime behavior is stable; record cold/warm state and process startup time. Model warm retention is a future feature. | **NOT VERIFIED** |
+| STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | No child process is started; actionable status identifies what to install/repair; no paste occurs. | **NOT VERIFIED** |
+| STT-05 | Win/Linux/macOS | P1, P2, P3 | Kill the short-lived runtime process or force a non-zero exit during transcription. | Failure is surfaced, app returns to Idle/Error, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
+| STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
+| STT-07 | Win/Linux/macOS | P1, P2, P3 | If a model advertises streaming, observe transcript while speaking; otherwise record that only final batch text appears. | Current baseline is expected to be final-only; do not claim first-partial/streaming support without evidence. | **NOT VERIFIED** |
+| STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/Prefer GPU/CPU-only performance mode where supported; run fixture on each available mode. | Requested mode is honored or rejected with a clear message; record resolved backend/device and errors. | **NOT VERIFIED** |
+
+## Output, clipboard, and target safety
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| OUT-01 | Windows | P1, P2, P3, P4, P7 | Put sentinel text on clipboard; focus browser/editor; run HK-01 with auto-insert enabled. | Final text is pasted once into the original field and clipboard is restored when configured. Verify target text and clipboard sentinel manually. | **NOT VERIFIED** |
+| OUT-02 | Linux X11 | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on X11. | Clipboard + paste automation works where Enigo permits; capture output status and clipboard before/after. | **NOT VERIFIED** |
+| OUT-03 | Linux Wayland | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on Wayland. | If synthetic paste is blocked, final text is copied only with an explicit notice; no paste into an unrelated field. | **NOT VERIFIED** |
+| OUT-04 | macOS | P1, P2, P3, P4, P6, P7 | Grant Accessibility, repeat OUT-01; revoke permission and repeat. | Granted path inserts once; denied path falls back to clipboard/actionable error without focus theft. | **NOT VERIFIED** |
+| OUT-05 | Win/Linux/macOS | P1, P2, P3, P4 | Begin dictation in target A, switch focus to unrelated target B before completion. | Current baseline behavior must be recorded; target-window capture is a future requirement. Never accept a result pasted into an unrelated app as PASS. | **NOT VERIFIED** |
+| OUT-06 | Win/Linux/macOS | P1, P2, P3, P4 | Close target app during finalization; then change clipboard from another app before restoration delay expires. | No unrelated paste; final text is recoverable from clipboard/status; restoration does not overwrite an independently changed clipboard. | **NOT VERIFIED** |
+| OUT-07 | Win/Linux/macOS | P1, P2, P3 | Disable auto-insert; transcribe fixture and use Copy Transcript. | No synthetic key input occurs; explicit copy places the final transcript on clipboard. | **NOT VERIFIED** |
+
+## Downloads, install, settings, privacy, and recovery
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| DL-01 | Win/Linux/macOS | P1, disposable data dir, network | Start a recommended model download; cancel halfway; resume. | Progress is truthful; partial artifact is retained/resumable or the UI explains why resume is unavailable. **Verified hash/size/atomic activation are future requirements.** | **NOT VERIFIED** |
+| DL-02 | Win/Linux/macOS | P1, disposable data dir, network | Replace a downloaded artifact with a truncated file; attempt activation. | Corrupt/incomplete model is rejected and never shown as runnable. | **NOT VERIFIED** |
+| DL-03 | Win/Linux/macOS | P1, disposable data dir, network | Interrupt extraction/installation; restart app. | Staging is cleaned or safely quarantined; previous known-good install remains usable. | **NOT VERIFIED** |
+| DL-04 | Win/Linux/macOS | P1, disposable data dir | Install runtime, remove it while no transcription is running, then try a model. | Runtime status transitions are visible; removal does not delete unrelated models; repair action is offered. | **NOT VERIFIED** |
+| SET-01 | Win/Linux/macOS | P1, P7 | Edit hotkey, recording mode, active model, microphone, performance mode, theme, and auto-insert; restart. | Values persist with no silent reset; invalid values are rejected or salvaged. | **NOT VERIFIED** |
+| SET-02 | Win/Linux/macOS | P1, P7 | Copy the config aside, corrupt one field/file, launch, then inspect backup/recovery. | Valid fields survive; corrupt file is backed up before defaults are regenerated. **Target migration behavior is not implemented yet.** | **NOT VERIFIED** |
+| PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect current data directory after successful and failed transcription. | Current baseline removes temporary WAV after jobs and stores latest transcript in memory; durable history/audio retention is a future feature. Record actual files without exposing transcript content. | **NOT VERIFIED** |
+| PRIV-02 | Win/Linux/macOS | P1, P7 | If a later build exposes history modes, exercise Off, Transcript only, and Transcript + audio; pin one entry and clear unpinned. | Audio is off by default, pinned entries survive cleanup, and delete-audio does not delete transcript metadata. | **NOT VERIFIED** |
+| RECOV-01 | Win/Linux/macOS | P1, P2, P3 | Force microphone, runtime, output, and config failures one at a time; start a fresh dictation after each. | Each failure has a user-facing stage/message, no stale result leaks into the next run, and Idle is recoverable. | **NOT VERIFIED** |
+| RECOV-02 | Win/Linux/macOS | P1, P3 | If retry/history exists, fail a transcription with retained audio then retry. | Retry uses the retained recording and does not create duplicate output/history entries. | **NOT VERIFIED** |
+
+## Platform coverage and sign-off
+
+| Platform/session | Required rows | Operator/evidence | Status |
+| --- | --- | --- | --- |
+| Windows 11 desktop, standard-integrity target | UI, HK, REC, STT, OUT, DL, SET, RECOV | **NOT VERIFIED** — no Windows GUI/microphone/runtime run in Phase 0. | **NOT VERIFIED** |
+| Windows elevated target (if supported) | OUT-01, OUT-05, OUT-06 | **NOT VERIFIED** — SendInput integrity boundary not exercised. | **NOT VERIFIED** |
+| Ubuntu/Debian X11 | UI, HK-02, REC, STT, OUT-02, DL, SET | **NOT VERIFIED** — no Linux desktop/audio run in Phase 0. | **NOT VERIFIED** |
+| Linux Wayland | UI, HK-02, REC, STT, OUT-03, RECOV | **NOT VERIFIED** — clipboard/paste and global-hotkey portal behavior not exercised. | **NOT VERIFIED** |
+| macOS desktop | UI, HK-03, REC, STT, OUT-04, SET, RECOV | **NOT VERIFIED** — permissions and accessibility behavior not exercised. | **NOT VERIFIED** |
+| Multi-monitor/mixed-DPI | UI-06, OUT-05 | **NOT VERIFIED** — no multi-monitor run. | **NOT VERIFIED** |
+| USB + Bluetooth microphones | REC-01, REC-02 | **NOT VERIFIED** — no physical devices available to this documentation run. | **NOT VERIFIED** |
+
+### Completion rule
+
+The Phase 0 matrix deliverable is complete when this scaffold is executable and
+its unrun rows are truthfully marked **NOT VERIFIED**. Platform/release sign-off
+requires a later dated PASS/FAIL/BLOCKED result with evidence in the owning test
+report. Do not change a row to PASS based solely on compilation or a unit test.
+Rows that cannot be run on a platform remain **NOT VERIFIED** and are listed as
+release risks until an explicit support decision is made.
