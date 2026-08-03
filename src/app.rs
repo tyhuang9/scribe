@@ -2415,6 +2415,8 @@ impl LocalTranscriberApp {
         };
 
         let expected_total_bytes = model_download_total_bytes(model);
+        let expected_sha256 =
+            runtime_catalog::model_artifact_spec(&model.id).and_then(|artifact| artifact.sha256);
         self.model_downloads.insert(
             model.id.clone(),
             ModelInstallStatus::Downloading {
@@ -2509,6 +2511,7 @@ impl LocalTranscriberApp {
                         &destination,
                         &model_id,
                         expected_total_bytes,
+                        expected_sha256,
                         &progress,
                     );
                     send_model_download_result(&tx, model_id, result);
@@ -3689,7 +3692,7 @@ impl LocalTranscriberApp {
                     wrapped_label(
                         ui,
                         mut_text(
-                            "The active model backend is CPU-only. GPU mode is available for whisper.cpp and faster-whisper models.",
+                            "The active model backend is CPU-only. GPU mode remains available only for verified compatibility backends that advertise it.",
                         ),
                     );
                 }
@@ -8789,6 +8792,14 @@ mod layout_tests {
             .unwrap();
 
         assert_eq!(model_device_label(&vosk), "CPU");
+        assert!(!selected_model_device_support(&config).supports_gpu());
+
+        config.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let whisper = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+        assert_eq!(model_device_label(&whisper), "CPU");
         assert!(!selected_model_device_support(&config).supports_gpu());
     }
 

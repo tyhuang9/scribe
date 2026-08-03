@@ -9,17 +9,20 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
+    SpeechEngine, Transcript, TranscriptSegment, TranscriptionOptions,
 };
 
-const WARM_MODEL_TTL: Duration = Duration::from_secs(5 * 60);
+pub(crate) const WARM_MODEL_TTL: Duration = Duration::from_secs(5 * 60);
 const WHISPER_DLL_SHA256: &str = "b31690c12461517fe9774e61318ab63a69972b948151feed98b913be35f708b6";
 const WHISPER_CLI_SHA256: &str = "58245314fb73b30fbd0cf0542c5c172e23f02b6eb7cad7b51e792439cf5e1755";
 #[cfg(test)]
@@ -27,47 +30,47 @@ const WHISPER_ARCHIVE_SHA256: &str =
     "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539";
 const COMMON_GGML_DEPENDENCIES: [(&str, &str); 11] = [
     (
-        "bin/ggml.dll",
+        "ggml.dll",
         "db753141098018ab482796052a61e727ee0106cbc280f28397f6a111b5e667d7",
     ),
     (
-        "bin/ggml-base.dll",
+        "ggml-base.dll",
         "8be6f3e06388b3a9aac75d29bec86363e2e2f5b0cee86ce6438866bcac0bcf86",
     ),
     (
-        "bin/ggml-cpu-alderlake.dll",
+        "ggml-cpu-alderlake.dll",
         "323408503da53ccc67248b26d711f16d73d2d6239f7703a00a6a18b60ed5b8b8",
     ),
     (
-        "bin/ggml-cpu-cannonlake.dll",
+        "ggml-cpu-cannonlake.dll",
         "0f659d98b823bb871c7845787bba7485facd220099cf58aa773652b9b842ab2e",
     ),
     (
-        "bin/ggml-cpu-cascadelake.dll",
+        "ggml-cpu-cascadelake.dll",
         "8116b0e516134139de29400c536ecf06fe708ce1a078a96d30b562b30d524fbe",
     ),
     (
-        "bin/ggml-cpu-haswell.dll",
+        "ggml-cpu-haswell.dll",
         "e5925923a47672392f9e9c8c92e4b9b65ea473948bf4f568a0300a3a42485135",
     ),
     (
-        "bin/ggml-cpu-icelake.dll",
+        "ggml-cpu-icelake.dll",
         "b726d528bee0c811c6b2ad8775357379d651cabb487bbf800331697fe73da187",
     ),
     (
-        "bin/ggml-cpu-sandybridge.dll",
+        "ggml-cpu-sandybridge.dll",
         "1c49c64817233b2447ca305b41c66afa4bed31b058bc190a98af2a30cc703542",
     ),
     (
-        "bin/ggml-cpu-skylakex.dll",
+        "ggml-cpu-skylakex.dll",
         "06082dc62a09a82fbba4aab49b2c049b96db84c5fc561a446a8ddbfb9b20bf86",
     ),
     (
-        "bin/ggml-cpu-sse42.dll",
+        "ggml-cpu-sse42.dll",
         "9a8f55ff1dfad231aa6250ac52c330c5bfa5c4c37691c8b591a68b52090ce40c",
     ),
     (
-        "bin/ggml-cpu-x64.dll",
+        "ggml-cpu-x64.dll",
         "45ff644d301b8a1fffc7c5e3864205047360eb197814c7311f366d106bb5b19f",
     ),
 ];
@@ -78,29 +81,8 @@ pub(crate) struct RuntimeModel {
     pub id: ModelId,
     pub path: PathBuf,
     pub package_root: PathBuf,
-}
-
-/// Borrowed, already-prepared mono 16 kHz PCM data.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RuntimeAudio<'a> {
-    pub samples: &'a [f32],
-    pub sample_rate_hz: u32,
-    pub channels: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeSegment {
-    pub text: String,
-    pub start_ms: u64,
-    pub end_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeTranscript {
-    pub text: String,
-    pub segments: Vec<RuntimeSegment>,
-    pub detected_language: Option<String>,
-    pub duration_ms: Option<u128>,
+    pub expected_size_bytes: u64,
+    pub expected_sha256: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,11 +93,16 @@ pub(crate) struct NativeRuntimeDiagnostics {
     pub model_load_duration_ms: u128,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RuntimeExecution {
-    pub transcript: RuntimeTranscript,
+    pub transcript: Transcript,
     pub diagnostics: NativeRuntimeDiagnostics,
     pub processing_duration_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeLoadExecution {
+    pub diagnostics: NativeRuntimeDiagnostics,
 }
 
 #[derive(Debug, Error)]
@@ -143,6 +130,8 @@ pub(crate) enum NativeBootstrapFailure {
     },
     #[error("native whisper.cpp could not load model {path}: {message}")]
     ModelLoad { path: PathBuf, message: String },
+    #[error("verified model integrity check failed for {path}: {message}")]
+    ModelIntegrity { path: PathBuf, message: String },
     #[error("failed to hash native package file {path}: {source}")]
     PackageIo { path: PathBuf, source: io::Error },
 }
@@ -177,10 +166,14 @@ pub(crate) enum RuntimeError {
     Inference(String),
     #[error("native whisper.cpp callback failed: {0}")]
     Callback(String),
+    #[error("native speech engine failed: {0}")]
+    Engine(String),
     #[error("native whisper.cpp runtime lock was poisoned")]
     Poisoned,
     #[error("the model is not handled by the consolidated primary runtime: {0}")]
     UnsupportedModel(ModelId),
+    #[error("dedicated native runtime worker is unavailable: {0}")]
+    WorkerUnavailable(String),
 }
 
 /// Deliberately private: the only Phase 2 selection has one variant.
@@ -201,12 +194,14 @@ fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
 #[derive(Clone)]
 pub(crate) struct RuntimeRouter {
     inner: Arc<Mutex<RouterState>>,
+    cancel_generation: Arc<AtomicU64>,
 }
 
 impl RuntimeRouter {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RouterState::default())),
+            cancel_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -216,11 +211,7 @@ impl RuntimeRouter {
 
     pub(crate) fn capabilities(&self, model: &RuntimeModel) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(&model.id).map(|kind| match kind {
-            RuntimeKind::TranscribeCpp => RuntimeCapabilities {
-                timestamps: true,
-                supported_languages: vec!["en".to_owned()],
-                ..RuntimeCapabilities::default()
-            },
+            RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
         })
     }
 
@@ -228,10 +219,11 @@ impl RuntimeRouter {
         &self,
         model: RuntimeModel,
         preference: AccelerationPreference,
-        audio: RuntimeAudio<'_>,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation_snapshot: u64,
     ) -> Result<RuntimeExecution, RuntimeError> {
-        if audio.sample_rate_hz != 16_000
-            || audio.channels != 1
+        if audio.sample_rate != PREPARED_SAMPLE_RATE
             || audio.samples.is_empty()
             || audio
                 .samples
@@ -239,8 +231,8 @@ impl RuntimeRouter {
                 .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
         {
             return Err(RuntimeError::InvalidAudio {
-                sample_rate_hz: audio.sample_rate_hz,
-                channels: audio.channels,
+                sample_rate_hz: audio.sample_rate,
+                channels: 1,
             });
         }
 
@@ -248,8 +240,71 @@ impl RuntimeRouter {
             .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         match kind {
-            RuntimeKind::TranscribeCpp => state.transcribe_cpp(model, preference, audio.samples),
+            RuntimeKind::TranscribeCpp => state.transcribe_cpp(
+                model,
+                preference,
+                audio,
+                options,
+                Arc::clone(&self.cancel_generation),
+                cancellation_snapshot,
+            ),
         }
+    }
+
+    pub(crate) fn load(
+        &self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let kind = runtime_kind_for_model(&model.id)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        match kind {
+            RuntimeKind::TranscribeCpp => {
+                state.load_transcribe_cpp(model, preference, Arc::clone(&self.cancel_generation))
+            }
+        }
+    }
+
+    pub(crate) fn health_check(
+        &self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+    ) -> Result<(), RuntimeError> {
+        let kind = runtime_kind_for_model(&model.id)
+            .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        match kind {
+            RuntimeKind::TranscribeCpp => {
+                let runtime = state.transcribe_cpp_runtime(
+                    model,
+                    preference,
+                    Arc::clone(&self.cancel_generation),
+                )?;
+                SpeechEngine::health_check(runtime)
+                    .map_err(|error| RuntimeError::Engine(format!("{error:#}")))
+            }
+        }
+    }
+
+    /// Cancellation is lock-free so it can interrupt inference while the
+    /// dedicated native worker owns the serialized engine lock.
+    pub(crate) fn cancel_active(&self) {
+        self.cancel_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn cancellation_snapshot(&self) -> u64 {
+        self.cancel_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn unload_all(&self) -> Result<(), RuntimeError> {
+        let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
+        if let Some(runtime) = state.transcribe_cpp.as_mut() {
+            SpeechEngine::unload(runtime)
+                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        }
+        state.transcribe_cpp = None;
+        Ok(())
     }
 }
 
@@ -267,12 +322,12 @@ struct RouterState {
 }
 
 impl RouterState {
-    fn transcribe_cpp(
+    fn transcribe_cpp_runtime(
         &mut self,
         model: RuntimeModel,
         preference: AccelerationPreference,
-        samples: &[f32],
-    ) -> Result<RuntimeExecution, RuntimeError> {
+        cancel_generation: Arc<AtomicU64>,
+    ) -> Result<&mut TranscribeCppRuntime, RuntimeError> {
         if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
             return Err(NativeBootstrapFailure::UnsupportedPlatform.into());
         }
@@ -282,14 +337,53 @@ impl RouterState {
             .as_ref()
             .is_some_and(|runtime| runtime.model == model && runtime.acceleration == acceleration);
         if !reusable {
-            NativePackage::from_root(model.package_root.clone()).verify_native()?;
-            self.transcribe_cpp = Some(TranscribeCppRuntime::new(model, acceleration));
+            self.transcribe_cpp = Some(TranscribeCppRuntime::new(
+                model,
+                acceleration,
+                cancel_generation,
+            ));
         }
-
-        let runtime = self
+        Ok(self
             .transcribe_cpp
             .as_mut()
-            .expect("the selected runtime was initialized");
+            .expect("the selected runtime was initialized"))
+    }
+
+    fn load_transcribe_cpp(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        cancel_generation: Arc<AtomicU64>,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
+        let load_started = Instant::now();
+        let warm_reused = runtime.ensure_loaded()?;
+        let model_load_duration_ms = if warm_reused {
+            0
+        } else {
+            load_started.elapsed().as_millis()
+        };
+        runtime.last_used_at = Some(Instant::now());
+        Ok(RuntimeLoadExecution {
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration: runtime.acceleration.clone(),
+                native_library_path: runtime.package.native_library_path(),
+                warm_reused,
+                model_load_duration_ms,
+            },
+        })
+    }
+
+    fn transcribe_cpp(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancel_generation: Arc<AtomicU64>,
+        cancellation_snapshot: u64,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        let runtime = self.transcribe_cpp_runtime(model, preference, cancel_generation)?;
         let load_started = Instant::now();
         let warm_reused = runtime.ensure_loaded()?;
         let model_load_duration_ms = if warm_reused {
@@ -298,7 +392,19 @@ impl RouterState {
             load_started.elapsed().as_millis()
         };
         let processing_started = Instant::now();
-        let transcript = runtime.transcribe(samples)?;
+        // Invoke the selected concrete handler through the common engine
+        // contract. RuntimeRouter remains the only code that selects it.
+        runtime.request_cancel_snapshot = Some(cancellation_snapshot);
+        let transcript = match SpeechEngine::transcribe(runtime, audio, options) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                // A failed native decode may leave upstream context state
+                // ambiguous. Discard it so the next request performs a clean
+                // load and cannot be misreported as a warm reuse.
+                let _ = SpeechEngine::unload(runtime);
+                return Err(RuntimeError::Engine(format!("{error:#}")));
+            }
+        };
         let processing_duration_ms = processing_started.elapsed().as_millis();
         runtime.last_used_at = Some(Instant::now());
 
@@ -321,10 +427,16 @@ struct TranscribeCppRuntime {
     acceleration: ResolvedAcceleration,
     loaded: Option<NativeWhisperHandle>,
     last_used_at: Option<Instant>,
+    cancel_generation: Arc<AtomicU64>,
+    request_cancel_snapshot: Option<u64>,
 }
 
 impl TranscribeCppRuntime {
-    fn new(model: RuntimeModel, acceleration: ResolvedAcceleration) -> Self {
+    fn new(
+        model: RuntimeModel,
+        acceleration: ResolvedAcceleration,
+        cancel_generation: Arc<AtomicU64>,
+    ) -> Self {
         let package = NativePackage::from_root(model.package_root.clone());
         Self {
             model,
@@ -332,6 +444,8 @@ impl TranscribeCppRuntime {
             acceleration,
             loaded: None,
             last_used_at: None,
+            cancel_generation,
+            request_cancel_snapshot: None,
         }
     }
 
@@ -349,6 +463,10 @@ impl TranscribeCppRuntime {
             return Ok(self.last_used_at.is_some());
         }
 
+        // Verify immediately before every open, including retries and TTL
+        // reloads. Verification is not cached across a dropped handle.
+        self.package.verify_native()?;
+        verify_runtime_model(&self.model)?;
         let mut handle = NativeWhisperHandle::open(&self.package)?;
         let use_gpu = matches!(self.acceleration.resolved, ComputeDevice::Gpu { .. });
         // Auto resolves to CPU for this verified CPU-only package, so native
@@ -359,12 +477,80 @@ impl TranscribeCppRuntime {
         Ok(false)
     }
 
-    fn transcribe(&mut self, samples: &[f32]) -> Result<RuntimeTranscript, RuntimeError> {
+    fn runtime_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            cancellation: true,
+            timestamps: true,
+            supported_languages: vec!["en".to_owned()],
+            ..RuntimeCapabilities::default()
+        }
+    }
+
+    fn decode_samples(&mut self, samples: &[f32]) -> Result<Transcript, RuntimeError> {
         let handle = self
             .loaded
             .as_mut()
             .expect("ensure_loaded must retain a native context");
-        handle.transcribe(samples)
+        let cancellation_snapshot = self
+            .request_cancel_snapshot
+            .take()
+            .unwrap_or_else(|| self.cancel_generation.load(Ordering::Acquire));
+        handle.transcribe(samples, &self.cancel_generation, cancellation_snapshot)
+    }
+}
+
+impl SpeechEngine for TranscribeCppRuntime {
+    fn load(&mut self) -> anyhow::Result<()> {
+        self.ensure_loaded()?;
+        Ok(())
+    }
+
+    fn transcribe(
+        &mut self,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+    ) -> anyhow::Result<Transcript> {
+        if *options != TranscriptionOptions::default() {
+            return Err(anyhow::anyhow!(
+                "the verified native whisper.cpp adapter currently accepts only default transcription options"
+            ));
+        }
+        if audio.sample_rate != PREPARED_SAMPLE_RATE
+            || audio.samples.is_empty()
+            || audio
+                .samples
+                .iter()
+                .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+        {
+            return Err(anyhow::anyhow!(
+                "native whisper.cpp requires non-empty canonical mono 16 kHz finite f32 audio"
+            ));
+        }
+        if self.loaded.is_none() {
+            self.load()?;
+        }
+        self.decode_samples(&audio.samples).map_err(Into::into)
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        Self::runtime_capabilities()
+    }
+
+    fn health_check(&mut self) -> anyhow::Result<()> {
+        self.package.verify_native()?;
+        verify_runtime_model(&self.model)?;
+        Ok(())
+    }
+
+    fn cancel(&mut self) -> anyhow::Result<()> {
+        self.cancel_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn unload(&mut self) -> anyhow::Result<()> {
+        self.loaded.take();
+        self.last_used_at = None;
+        Ok(())
     }
 }
 
@@ -378,8 +564,17 @@ impl NativePackage {
         Self { root }
     }
 
+    fn bin_dir(&self) -> PathBuf {
+        let nested = self.root.join("bin");
+        if nested.is_dir() {
+            nested
+        } else {
+            self.root.clone()
+        }
+    }
+
     fn native_library_path(&self) -> PathBuf {
-        self.root.join("bin").join(if cfg!(windows) {
+        self.bin_dir().join(if cfg!(windows) {
             "whisper.dll"
         } else {
             "libwhisper.so"
@@ -391,7 +586,12 @@ impl NativePackage {
     }
 
     fn compatibility_cli_path_for_root(root: &Path) -> PathBuf {
-        root.join("bin").join(if cfg!(windows) {
+        let bin_dir = if root.join("bin").is_dir() {
+            root.join("bin")
+        } else {
+            root.to_path_buf()
+        };
+        bin_dir.join(if cfg!(windows) {
             "whisper-cli.exe"
         } else {
             "whisper-cli"
@@ -405,8 +605,8 @@ impl NativePackage {
             });
         }
         verify_sha256(&self.native_library_path(), WHISPER_DLL_SHA256)?;
-        for (relative_path, hash) in COMMON_GGML_DEPENDENCIES {
-            let path = self.root.join(relative_path);
+        for (file_name, hash) in COMMON_GGML_DEPENDENCIES {
+            let path = self.bin_dir().join(file_name);
             verify_sha256(&path, hash)?;
         }
         Ok(())
@@ -424,14 +624,23 @@ pub(crate) fn verify_compatibility_cli(path: &Path) -> Result<(), NativeBootstra
                 path.display()
             ),
         })?;
-    for (relative_path, hash) in COMMON_GGML_DEPENDENCIES {
-        verify_sha256(&package_root.join(relative_path), hash)?;
+    let package = NativePackage::from_root(package_root);
+    for (file_name, hash) in COMMON_GGML_DEPENDENCIES {
+        verify_sha256(&package.bin_dir().join(file_name), hash)?;
     }
     Ok(())
 }
 
 fn native_package_root(path: &Path) -> Option<PathBuf> {
-    path.parent()?.parent().map(Path::to_path_buf)
+    let parent = path.parent()?;
+    if parent
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+    {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
 }
 
 fn resolve_acceleration(
@@ -475,6 +684,36 @@ fn verify_sha256(path: &Path, expected: &'static str) -> Result<(), NativeBootst
     Ok(())
 }
 
+fn verify_runtime_model(model: &RuntimeModel) -> Result<(), NativeBootstrapFailure> {
+    let metadata =
+        std::fs::metadata(&model.path).map_err(|error| NativeBootstrapFailure::ModelIntegrity {
+            path: model.path.clone(),
+            message: error.to_string(),
+        })?;
+    if metadata.len() != model.expected_size_bytes {
+        return Err(NativeBootstrapFailure::ModelIntegrity {
+            path: model.path.clone(),
+            message: format!(
+                "expected {} bytes, got {}",
+                model.expected_size_bytes,
+                metadata.len()
+            ),
+        });
+    }
+    let actual =
+        sha256_file(&model.path).map_err(|error| NativeBootstrapFailure::ModelIntegrity {
+            path: model.path.clone(),
+            message: error.to_string(),
+        })?;
+    if !actual.eq_ignore_ascii_case(model.expected_sha256) {
+        return Err(NativeBootstrapFailure::ModelIntegrity {
+            path: model.path.clone(),
+            message: format!("expected SHA-256 {}, got {actual}", model.expected_sha256),
+        });
+    }
+    Ok(())
+}
+
 fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -495,6 +734,7 @@ struct NativeRuntimeOpaque {
 }
 
 type SegmentCallback = unsafe extern "C" fn(*mut c_void, *const c_char, i64, i64);
+type AbortCallback = unsafe extern "C" fn(*mut c_void) -> i32;
 
 unsafe extern "C" {
     fn scribe_whisper_runtime_open(
@@ -514,7 +754,8 @@ unsafe extern "C" {
         sample_count: usize,
         callback: Option<SegmentCallback>,
         user_data: *mut c_void,
-        out_language: *mut *mut c_char,
+        abort_callback: Option<AbortCallback>,
+        abort_user_data: *mut c_void,
         out_error: *mut *mut c_char,
     ) -> i32;
     fn scribe_whisper_runtime_destroy(runtime: *mut NativeRuntimeOpaque);
@@ -582,9 +823,17 @@ impl NativeWhisperHandle {
         }
     }
 
-    fn transcribe(&mut self, samples: &[f32]) -> Result<RuntimeTranscript, RuntimeError> {
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        cancel_generation: &AtomicU64,
+        cancellation_snapshot: u64,
+    ) -> Result<Transcript, RuntimeError> {
         let mut callback_state = CallbackState::default();
-        let mut language = std::ptr::null_mut();
+        let mut abort_state = AbortState {
+            generation: cancel_generation,
+            started_at: cancellation_snapshot,
+        };
         let mut error = std::ptr::null_mut();
         let result = unsafe {
             scribe_whisper_runtime_transcribe(
@@ -593,11 +842,11 @@ impl NativeWhisperHandle {
                 samples.len(),
                 Some(collect_segment),
                 (&mut callback_state as *mut CallbackState).cast(),
-                &mut language,
+                Some(check_cancelled),
+                (&mut abort_state as *mut AbortState<'_>).cast(),
                 &mut error,
             )
         };
-        let detected_language = take_native_string(language);
         if result != 0 {
             return Err(RuntimeError::Inference(
                 take_native_string(error)
@@ -607,15 +856,11 @@ impl NativeWhisperHandle {
         if let Some(error) = callback_state.error {
             return Err(RuntimeError::Callback(error));
         }
-        let text = callback_state
-            .segments
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect::<String>();
-        Ok(RuntimeTranscript {
+        let text = assemble_segment_text(&callback_state.segments);
+        Ok(Transcript {
             text,
             segments: callback_state.segments,
-            detected_language,
+            detected_language: None,
             duration_ms: Some((samples.len() as u128 * 1000) / 16_000),
         })
     }
@@ -627,9 +872,31 @@ impl Drop for NativeWhisperHandle {
     }
 }
 
+fn assemble_segment_text(segments: &[TranscriptSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+struct AbortState<'a> {
+    generation: &'a AtomicU64,
+    started_at: u64,
+}
+
+unsafe extern "C" fn check_cancelled(user_data: *mut c_void) -> i32 {
+    if user_data.is_null() {
+        return 1;
+    }
+    let state = unsafe { &*user_data.cast::<AbortState<'_>>() };
+    i32::from(state.generation.load(Ordering::Acquire) != state.started_at)
+}
+
 #[derive(Default)]
 struct CallbackState {
-    segments: Vec<RuntimeSegment>,
+    segments: Vec<TranscriptSegment>,
     error: Option<String>,
 }
 
@@ -656,10 +923,11 @@ unsafe extern "C" fn collect_segment(
         };
         let start_ms = ticks_to_ms(start_ticks)?;
         let end_ms = ticks_to_ms(end_ticks)?;
-        Ok(RuntimeSegment {
+        Ok(TranscriptSegment {
             text,
-            start_ms,
-            end_ms,
+            start_ms: Some(start_ms),
+            end_ms: Some(end_ms),
+            confidence: None,
         })
     }));
     match outcome {
@@ -679,7 +947,10 @@ fn ticks_to_ms(ticks: i64) -> Result<u64, String> {
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
     // Whisper v1.9.1 exposes only narrow `char *` model paths. Windows Unicode
     // path fidelity is therefore not proven for this upstream ABI.
-    CString::new(path.to_string_lossy().as_bytes())
+    let path = path
+        .to_str()
+        .ok_or_else(|| "native Whisper path is not valid Unicode".to_owned())?;
+    CString::new(path.as_bytes())
         .map_err(|_| "native Whisper path contains an interior NUL byte".to_owned())
 }
 
@@ -756,6 +1027,120 @@ mod tests {
         assert!(manifest.contains(WHISPER_CLI_SHA256));
         assert!(manifest.contains(WHISPER_ARCHIVE_SHA256));
         assert!(manifest.contains("f049fff95a089aa9969deb009cdd4892b3e74916"));
+    }
+
+    #[test]
+    fn native_handler_implements_the_common_speech_engine_contract() {
+        fn assert_engine<T: SpeechEngine>() {}
+        assert_engine::<TranscribeCppRuntime>();
+    }
+
+    #[test]
+    fn manifest_symbols_exactly_match_the_native_shim_contract() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json"
+        ))
+        .unwrap();
+        let symbols = manifest["entrypoints"]["required_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = [
+            "whisper_context_default_params_by_ref",
+            "whisper_full_default_params_by_ref",
+            "whisper_free_context_params",
+            "whisper_free_params",
+            "whisper_init_from_file_with_params",
+            "whisper_full",
+            "whisper_full_n_segments",
+            "whisper_full_get_segment_text",
+            "whisper_full_get_segment_t0",
+            "whisper_full_get_segment_t1",
+            "whisper_free",
+        ];
+        assert_eq!(symbols, expected);
+        assert_eq!(
+            manifest["entrypoints"]["backend_required_symbols"],
+            serde_json::json!(["ggml_backend_load"])
+        );
+        assert_eq!(
+            manifest["entrypoints"]["cpu_backend_required_symbols"],
+            serde_json::json!(["ggml_backend_score", "ggml_backend_init"])
+        );
+
+        let shim = include_str!("../native/whisper_shim.c");
+        for symbol in expected {
+            assert!(shim.contains(&format!("\"{symbol}\"")));
+        }
+        assert!(shim.contains("\"ggml_backend_load\""));
+        assert!(shim.contains("\"ggml_backend_score\""));
+        assert!(!shim.contains("ggml_backend_load_all"));
+    }
+
+    #[test]
+    fn cancellation_generation_is_observed_without_the_router_lock() {
+        let generation = AtomicU64::new(9);
+        let mut state = AbortState {
+            generation: &generation,
+            started_at: 9,
+        };
+        let state_ptr = (&mut state as *mut AbortState<'_>).cast();
+
+        assert_eq!(unsafe { check_cancelled(state_ptr) }, 0);
+        generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(unsafe { check_cancelled(state_ptr) }, 1);
+        assert_eq!(unsafe { check_cancelled(std::ptr::null_mut()) }, 1);
+    }
+
+    #[test]
+    fn segment_assembly_removes_only_outer_whitespace() {
+        let segments = vec![
+            TranscriptSegment {
+                text: "  Hello".to_owned(),
+                start_ms: Some(0),
+                end_ms: Some(100),
+                confidence: None,
+            },
+            TranscriptSegment {
+                text: " world.  ".to_owned(),
+                start_ms: Some(100),
+                end_ms: Some(200),
+                confidence: None,
+            },
+        ];
+
+        assert_eq!(assemble_segment_text(&segments), "Hello world.");
+    }
+
+    #[test]
+    fn native_package_supports_nested_and_flat_upstream_layouts() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-native-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let nested = NativePackage::from_root(root.clone());
+        assert_eq!(nested.native_library_path(), root.join("bin/whisper.dll"));
+        std::fs::remove_dir_all(root.join("bin")).unwrap();
+        let flat = NativePackage::from_root(root.clone());
+        assert_eq!(flat.native_library_path(), root.join("whisper.dll"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_windows_paths_are_rejected_without_lossy_substitution() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_wide(&[0xD800]));
+        assert!(path_to_cstring(&path).is_err());
     }
 
     #[test]

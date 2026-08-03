@@ -24,6 +24,18 @@ typedef void (*scribe_whisper_segment_callback)(
     int64_t start_ticks,
     int64_t end_ticks);
 
+typedef int (*scribe_whisper_abort_callback)(void * user_data);
+
+struct scribe_abort_context {
+    scribe_whisper_abort_callback callback;
+    void * user_data;
+};
+
+static bool scribe_should_abort(void * data) {
+    struct scribe_abort_context * context = (struct scribe_abort_context *) data;
+    return context != NULL && context->callback != NULL && context->callback(context->user_data) != 0;
+}
+
 struct scribe_whisper_runtime {
 #ifdef _WIN32
     HMODULE module;
@@ -48,10 +60,8 @@ struct scribe_whisper_runtime {
     const char * (*full_get_segment_text)(struct whisper_context * context, int i_segment);
     int64_t (*full_get_segment_t0)(struct whisper_context * context, int i_segment);
     int64_t (*full_get_segment_t1)(struct whisper_context * context, int i_segment);
-    int (*full_lang_id)(struct whisper_context * context);
-    const char * (*lang_str)(int id);
     void (*free_context)(struct whisper_context * context);
-    void (*backend_load_all_from_path)(const char * dir_path);
+    void * (*backend_load)(const char * path);
 };
 
 static char * scribe_strdup(const char * source) {
@@ -147,7 +157,7 @@ static void * scribe_find_backend_loader(void) {
     if (ggml_module == NULL) {
         return NULL;
     }
-    return (void *) GetProcAddress(ggml_module, "ggml_backend_load_all_from_path");
+    return (void *) GetProcAddress(ggml_module, "ggml_backend_load");
 }
 #else
 static void * scribe_open_library(const char * path, char ** out_error) {
@@ -169,7 +179,7 @@ static void scribe_close_library(void * module) {
 }
 
 static void * scribe_find_backend_loader(void) {
-    return dlsym(RTLD_DEFAULT, "ggml_backend_load_all_from_path");
+    return dlsym(RTLD_DEFAULT, "ggml_backend_load");
 }
 #endif
 
@@ -194,6 +204,76 @@ static char * scribe_parent_directory(const char * path) {
     return parent;
 }
 
+static char * scribe_join_path(const char * directory, const char * file_name) {
+    size_t directory_length = strlen(directory);
+    size_t file_name_length = strlen(file_name);
+    bool needs_separator = directory_length > 0 &&
+        directory[directory_length - 1] != '/' && directory[directory_length - 1] != '\\';
+    char * joined = (char *) malloc(directory_length + (needs_separator ? 1 : 0) + file_name_length + 1);
+    if (joined == NULL) {
+        return NULL;
+    }
+    memcpy(joined, directory, directory_length);
+    if (needs_separator) {
+#ifdef _WIN32
+        joined[directory_length++] = '\\';
+#else
+        joined[directory_length++] = '/';
+#endif
+    }
+    memcpy(joined + directory_length, file_name, file_name_length + 1);
+    return joined;
+}
+
+static char * scribe_select_cpu_backend(const char * directory) {
+    static const char * candidates[] = {
+#ifdef _WIN32
+        "ggml-cpu-alderlake.dll",
+        "ggml-cpu-cannonlake.dll",
+        "ggml-cpu-cascadelake.dll",
+        "ggml-cpu-haswell.dll",
+        "ggml-cpu-icelake.dll",
+        "ggml-cpu-sandybridge.dll",
+        "ggml-cpu-skylakex.dll",
+        "ggml-cpu-sse42.dll",
+        "ggml-cpu-x64.dll"
+#else
+        "libggml-cpu-x64.so"
+#endif
+    };
+    char * best_path = NULL;
+    int best_score = 0;
+    size_t index;
+
+    for (index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
+        char * candidate_path = scribe_join_path(directory, candidates[index]);
+        int score = 0;
+        if (candidate_path == NULL) {
+            continue;
+        }
+#ifdef _WIN32
+        HMODULE candidate = scribe_open_library(candidate_path, NULL);
+#else
+        void * candidate = scribe_open_library(candidate_path, NULL);
+#endif
+        if (candidate != NULL) {
+            int (*score_fn)(void) = (int (*)(void)) scribe_find_symbol(candidate, "ggml_backend_score");
+            if (score_fn != NULL) {
+                score = score_fn();
+            }
+            scribe_close_library(candidate);
+        }
+        if (score > best_score) {
+            free(best_path);
+            best_path = candidate_path;
+            best_score = score;
+        } else {
+            free(candidate_path);
+        }
+    }
+    return best_path;
+}
+
 #define SCRIBE_LOAD_SYMBOL(runtime, field, symbol_name, out_error) \
     do { \
         (runtime)->field = (void *) scribe_find_symbol((runtime)->module, (symbol_name)); \
@@ -208,6 +288,7 @@ struct scribe_whisper_runtime * scribe_whisper_runtime_open(
     char ** out_error) {
     struct scribe_whisper_runtime * runtime;
     char * backend_directory;
+    char * cpu_backend_path;
 
     if (out_error != NULL) {
         *out_error = NULL;
@@ -237,12 +318,10 @@ struct scribe_whisper_runtime * scribe_whisper_runtime_open(
     SCRIBE_LOAD_SYMBOL(runtime, full_get_segment_text, "whisper_full_get_segment_text", out_error);
     SCRIBE_LOAD_SYMBOL(runtime, full_get_segment_t0, "whisper_full_get_segment_t0", out_error);
     SCRIBE_LOAD_SYMBOL(runtime, full_get_segment_t1, "whisper_full_get_segment_t1", out_error);
-    SCRIBE_LOAD_SYMBOL(runtime, full_lang_id, "whisper_full_lang_id", out_error);
-    SCRIBE_LOAD_SYMBOL(runtime, lang_str, "whisper_lang_str", out_error);
     SCRIBE_LOAD_SYMBOL(runtime, free_context, "whisper_free", out_error);
-    runtime->backend_load_all_from_path = (void (*)(const char *)) scribe_find_backend_loader();
-    if (runtime->backend_load_all_from_path == NULL) {
-        scribe_set_error(out_error, "native Whisper package is missing ggml_backend_load_all_from_path");
+    runtime->backend_load = (void * (*)(const char *)) scribe_find_backend_loader();
+    if (runtime->backend_load == NULL) {
+        scribe_set_error(out_error, "native Whisper package is missing ggml_backend_load");
         goto failed;
     }
     backend_directory = scribe_parent_directory(library_path);
@@ -250,8 +329,18 @@ struct scribe_whisper_runtime * scribe_whisper_runtime_open(
         scribe_set_error(out_error, "native Whisper shim could not resolve its backend directory");
         goto failed;
     }
-    runtime->backend_load_all_from_path(backend_directory);
+    cpu_backend_path = scribe_select_cpu_backend(backend_directory);
     free(backend_directory);
+    if (cpu_backend_path == NULL) {
+        scribe_set_error(out_error, "native Whisper shim could not allocate its CPU backend path");
+        goto failed;
+    }
+    if (runtime->backend_load(cpu_backend_path) == NULL) {
+        scribe_set_error(out_error, "native Whisper could not load the verified CPU backend: %s", cpu_backend_path);
+        free(cpu_backend_path);
+        goto failed;
+    }
+    free(cpu_backend_path);
 
     return runtime;
 
@@ -308,20 +397,18 @@ int scribe_whisper_runtime_transcribe(
     size_t sample_count,
     scribe_whisper_segment_callback callback,
     void * user_data,
-    char ** out_language,
+    scribe_whisper_abort_callback abort_callback,
+    void * abort_user_data,
     char ** out_error) {
     struct whisper_full_params * defaults;
     struct whisper_full_params full_params;
     int result;
     int segment_count;
-    int language_id;
     int segment_index;
+    struct scribe_abort_context abort_context;
 
     if (out_error != NULL) {
         *out_error = NULL;
-    }
-    if (out_language != NULL) {
-        *out_language = NULL;
     }
     if (runtime == NULL || runtime->context == NULL) {
         scribe_set_error(out_error, "native Whisper runtime is not loaded");
@@ -346,18 +433,15 @@ int scribe_whisper_runtime_transcribe(
     full_params.no_timestamps = false;
     full_params.language = "en";
     full_params.detect_language = false;
+    abort_context.callback = abort_callback;
+    abort_context.user_data = abort_user_data;
+    full_params.abort_callback = scribe_should_abort;
+    full_params.abort_callback_user_data = &abort_context;
 
     result = runtime->full(runtime->context, full_params, samples, (int) sample_count);
     if (result != 0) {
         scribe_set_error(out_error, "native Whisper inference failed with code %d", result);
         return result;
-    }
-
-    if (out_language != NULL) {
-        language_id = runtime->full_lang_id(runtime->context);
-        if (language_id >= 0) {
-            *out_language = scribe_strdup(runtime->lang_str(language_id));
-        }
     }
 
     segment_count = runtime->full_n_segments(runtime->context);

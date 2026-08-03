@@ -208,7 +208,8 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
 }
 
 pub fn whisper_cpp_download_url(model_name: &str) -> String {
-    format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin")
+    const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+    format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/{REVISION}/ggml-{model_name}.bin")
 }
 
 pub fn vosk_model_download_url(model_name: &str) -> Option<&'static str> {
@@ -433,10 +434,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whisper_download_url_uses_official_whisper_cpp_pattern() {
+    fn whisper_download_url_uses_pinned_official_revision() {
         assert_eq!(
             whisper_cpp_download_url("base.en"),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin"
         );
     }
 

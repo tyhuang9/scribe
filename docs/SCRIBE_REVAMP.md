@@ -555,10 +555,10 @@ Phase 2 replaces the path-based service contract with a native-audio boundary:
 egui/coordinator/Playground
         |
         v
-TranscriptionService (long-lived, config snapshots share one router)
+TranscriptionService (long-lived, bounded command/reply channels)
         |
         v
-RuntimeRouter (private RuntimeKind; sole concrete-runtime match)
+dedicated native worker -> RuntimeRouter (sole concrete-runtime match)
         |
         v
 TranscribeCppRuntime -> thin C ABI shim -> pinned whisper.cpp DLL
@@ -573,16 +573,23 @@ TranscribeCppRuntime -> thin C ABI shim -> pinned whisper.cpp DLL
   deletes the capture WAV after preparation, and shares the buffer with every
   selected Playground request. PCM does not cross React, JavaScript, webview
   events, or general UI IPC.
-- `TranscriptionService` owns a cloneable shared `RuntimeRouter`. Router access
-  is serialized so upstream's same-context non-concurrency rule is enforced.
-  A loaded model is retained for five minutes and lazily unloaded/reloaded.
+- `TranscriptionService` owns a single named native worker with a capacity-one
+  command queue and capacity-one replies. Router/engine lifecycle and inference
+  execute only there; upstream's same-context non-concurrency rule is enforced.
+  The worker unloads the retained model after five idle minutes, and explicit
+  preload/health/unload operations use the same neutral service boundary.
+- `TranscribeCppRuntime` implements `SpeechEngine`. Cancellation increments a
+  lock-free request generation observed through whisper.cpp's native abort
+  callback, so it can interrupt inference while the worker owns the engine.
+  Failed/cancelled inference discards the context before accepting a retry.
 - `RuntimeKind` and `TranscribeCppRuntime` are private to
   `src/runtime_router.rs`. An automated source-boundary test rejects those
   names outside that module and rejects concrete runtime imports in `app.rs`.
 - Non-primary providers remain reachable only through the private transitional
-  process bridge. That bridge creates a private canonical PCM16 WAV from
-  `PreparedAudio`, removes it with RAII, and is retained solely until Phase 11
-  replacement/retirement evidence exists.
+  process bridge. That bridge creates a mode-`0600` canonical PCM16 WAV in an
+  app-private directory, removes it with RAII, scavenges crash leftovers older
+  than 24 hours, and is retained solely until Phase 11 replacement/retirement
+  evidence exists.
 - Application configuration now exposes neutral
   `AccelerationPreference::{Auto,Cpu,Gpu}`. The legacy
   `whisper_compute_mode` key and `cuda`/`prefer_gpu` values deserialize through
@@ -616,10 +623,16 @@ The Windows x64 package is the official `whisper.cpp` v1.9.1 release at commit
   null text and invalid timestamps, and the shim uses a restricted Windows DLL
   search path.
 - The first native JFK run exposed that the release package's CPU backend is a
-  dynamically loaded GGML plugin. Without the CLI's
-  `ggml_backend_load_all_from_path` step, model initialization asserted with
-  zero devices. The shim now loads the exact hash-validated backend directory
-  before model creation; the subsequent debug and release fixture tests pass.
+  dynamically loaded GGML plugin. The shim scores only the fixed set of nine
+  hash-verified CPU variants, then loads the best one by absolute path via
+  `ggml_backend_load`. It does not scan the directory or honor ambient
+  `GGML_BACKEND_PATH`; the measured host selected the verified Cascadelake
+  variant. Debug and release fixture tests pass.
+
+All four checked local Whisper artifacts are pinned to Hugging Face repository
+revision `5359861c739e955e79d9a303bcbc70fb988958b1` with exact byte sizes and
+SHA-256 values. Direct downloads validate both before activation, and the
+native handler revalidates them before every fresh in-process model load.
 
 CLI fallback is allowed only for a native library/bootstrap availability
 failure and only after the CLI plus common GGML dependencies independently
@@ -652,14 +665,16 @@ requests after one retained-model warmup:
 
 | Metric | Median | p95 |
 | --- | ---: | ---: |
-| Native cold total | 1,172 ms | 1,188 ms |
-| Native model load component | 150 ms | 155 ms |
-| Native warm total | 785 ms | 798 ms |
+| Native cold total | 1,084 ms | 1,105 ms |
+| Native model verification + load component | 286 ms | 296 ms |
+| Native warm total | 782 ms | 796 ms |
 | Native warm decode component | 781 ms | 795 ms |
 
 Compared with the Phase 0 repeated-process baseline, native cold total improved
-about 8.4% at median and 18.2% at p95; retained-model warm total improved about
-38.6% at median and 45.1% at p95. These are fixture/runtime measurements, not
+about 15.3% at median and 23.9% at p95; retained-model warm total improved about
+38.9% at median and 45.2% at p95. Release cancellation interrupted a synthetic
+220-second active decode and returned after context cleanup in 781 ms; this is
+not the optional streaming candidate's 250 ms evidence gate. These are fixture/runtime measurements, not
 hotkey-to-paste or first-partial measurements. Memory, idle CPU, GPU, microphone,
 overlay, target activation, clipboard, and full end-to-end latency remain
 unverified.
@@ -672,11 +687,12 @@ Final Phase 2 gates on 2026-08-03:
 | --- | --- | --- |
 | Format | `cargo fmt --all -- --check` | PASS |
 | Compile | `cargo check --all-targets --all-features` | PASS |
-| Tests | `cargo test --all-targets --all-features` | PASS: 222 discovered, 218 passed, 0 failed, 4 ignored |
+| Tests | `cargo test --all-targets --all-features` | PASS: 231 discovered, 226 passed, 0 failed, 5 ignored |
 | Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | Debug build | `cargo build --all-features` | PASS |
 | Debug native fixture | `cargo test transcription_service_jfk_smoke_uses_the_whisper_cpp_facade --all-features -- --ignored` with local paths | PASS; first load and retained warm request returned non-empty text |
-| Benchmark | `cargo test native_runtime_jfk_cold_and_warm_benchmark --all-features -- --ignored --nocapture` | PASS; 5 cold + 20 warm results above |
+| Benchmark | `cargo test --release native_runtime_jfk_cold_and_warm_benchmark --all-features -- --ignored --nocapture` | PASS; 5 cold + 20 warm results above |
+| Native cancellation | release ignored `native_runtime_cancellation_interrupts_active_decode` | PASS; lock-free abort stopped a synthetic 220-second decode and completed cleanup in 781 ms |
 | Release build | `cargo build --release --all-features` | PASS |
 | Runtime package | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\bundle-whisper-runtime.ps1 -Profile release` | PASS; every file size/hash validated before staged copy |
 | Release native fixture | `cargo test --release transcription_service_jfk_smoke_uses_the_whisper_cpp_facade --all-features -- --ignored` | PASS against the release runtime layout |
@@ -690,10 +706,11 @@ All Cargo invocations continued to emit the pre-existing non-fatal
 | Item | Risk | Mitigation / next evidence |
 | --- | --- | --- |
 | The linear resampler has no anti-alias filter and no loudness normalization. | **Medium** audio-quality risk | Replace with the Phase 6 shared worker DSP and deterministic quality fixtures. |
-| Native model paths use upstream's narrow `char *` API; non-ASCII Windows model paths were not exercised. | **Medium** compatibility risk | Add Unicode-path fixture or a verified wide-path adapter before Supported status. |
+| Native model paths use upstream's UTF-8 narrow `char *` API; non-Unicode paths are rejected and non-ASCII Windows paths were not exercised. | **Medium** compatibility risk | Add a non-ASCII Unicode-path fixture or a verified wide-path adapter before Supported status. |
 | Upstream can assert/terminate on some invalid native inputs; crash isolation is incomplete. | **High** recovery risk | Add failure injection and crash recovery before Supported status; never treat model-load failure as CLI fallback. |
-| One router mutex serializes model comparison and inference. | **Medium** Playground/performance limitation | Measure in Phase 3; keep serialization unless a safe worker/context pool is justified. |
-| Cancellation is still explicitly unsupported by the transitional bridge and not yet wired through the native abort callback. | **Medium** session-safety gap | Phase 4 worker commands/cancellation and contract tests are required before promotion. |
+| The capacity-one dedicated worker intentionally serializes model comparison and inference. | **Medium** Playground/performance limitation | Phase 7 keeps one active decode and one newest pending snapshot; do not add an unsafe context pool. |
+| Primary-runtime cancellation completes context cleanup in 781 ms on the release fixture; transitional process adapters remain non-cancellable. | **Medium** session-safety gap | Phase 4 must couple cancel to authoritative session sequencing; the optional streaming handler still must meet its separate 250 ms gate. |
+| Runtime/model verification hashes a path immediately before reopening it, but Windows path-based verification cannot completely eliminate a same-user TOCTOU swap. | **Low** local hardening risk | Phase 9 activates immutable private staged artifacts and records file identity; never load an unverified external artifact. |
 | Only base.en/JFK on Windows CPU has native behavior evidence. | **High** compatibility limitation | Phase 3 starts every model Experimental and runs the complete compatibility gate per artifact/platform. |
 | No desktop microphone, hotkey, overlay, target focus, or paste row was executed. | **High** release-readiness gap | Execute the Windows manual matrix in later vertical-slice phases; current automation is not a desktop sign-off. |
 

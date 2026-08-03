@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::models::{
@@ -27,10 +28,18 @@ pub(crate) fn download_whisper_cpp_model(
     destination: &Path,
     model_id: &str,
     expected_total_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
     progress: &dyn Fn(ModelDownloadProgress),
 ) -> Result<PathBuf, String> {
     let url = whisper_cpp_download_url(model_name);
-    download_model_file(&url, destination, model_id, expected_total_bytes, progress)
+    download_model_file(
+        &url,
+        destination,
+        model_id,
+        expected_total_bytes,
+        expected_sha256,
+        progress,
+    )
 }
 
 pub(crate) fn download_faster_whisper_model(
@@ -117,9 +126,11 @@ fn download_model_file(
     destination: &Path,
     model_id: &str,
     expected_total_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
     progress: &dyn Fn(ModelDownloadProgress),
 ) -> Result<PathBuf, String> {
     if destination.exists() {
+        verify_downloaded_file(destination, expected_total_bytes, expected_sha256)?;
         return Ok(destination.to_path_buf());
     }
 
@@ -180,6 +191,8 @@ fn download_model_file(
         );
         file.sync_all()
             .map_err(|err| format!("failed to finish {}: {err}", partial_path.display()))?;
+        drop(file);
+        verify_downloaded_file(&partial_path, expected_total_bytes, expected_sha256)?;
         fs::rename(&partial_path, destination).map_err(|err| {
             format!(
                 "failed to move {} to {}: {err}",
@@ -195,6 +208,58 @@ fn download_model_file(
     }
 
     result
+}
+
+fn verify_downloaded_file(
+    path: &Path,
+    expected_size: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect downloaded model {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Some(expected_size) = expected_size
+        && metadata.len() != expected_size
+    {
+        return Err(format!(
+            "downloaded model size mismatch for {}: expected {expected_size} bytes, got {}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    if let Some(expected_sha256) = expected_sha256 {
+        let mut file = fs::File::open(path).map_err(|error| {
+            format!(
+                "failed to open downloaded model {} for verification: {error}",
+                path.display()
+            )
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| {
+                format!(
+                    "failed to verify downloaded model {}: {error}",
+                    path.display()
+                )
+            })?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
+            return Err(format!(
+                "downloaded model checksum mismatch for {}: expected {expected_sha256}, got {actual}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct RunnerModelDownload<'a> {
@@ -517,5 +582,30 @@ mod tests {
         assert!(!destination.exists());
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn downloaded_model_requires_exact_size_and_sha256() {
+        let path = unique_temp_path("integrity");
+        let bytes = b"pinned model bytes";
+        fs::write(&path, bytes).unwrap();
+        let expected = format!("{:x}", Sha256::digest(bytes));
+
+        assert_eq!(
+            verify_downloaded_file(&path, Some(bytes.len() as u64), Some(&expected)),
+            Ok(())
+        );
+        assert!(
+            verify_downloaded_file(&path, Some(bytes.len() as u64 + 1), Some(&expected))
+                .unwrap_err()
+                .contains("size mismatch")
+        );
+        assert!(
+            verify_downloaded_file(&path, Some(bytes.len() as u64), Some(&"0".repeat(64)))
+                .unwrap_err()
+                .contains("checksum mismatch")
+        );
+
+        fs::remove_file(path).unwrap();
     }
 }

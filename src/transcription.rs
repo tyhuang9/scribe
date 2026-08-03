@@ -15,7 +15,11 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -24,8 +28,8 @@ use crate::config::{self, AppConfig};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::PreparedAudio;
 use crate::runtime_router::{
-    NativeBootstrapFailure, RuntimeAudio, RuntimeExecution, RuntimeModel, RuntimeRouter,
-    verify_compatibility_cli,
+    NativeBootstrapFailure, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeModel,
+    RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 
 /// Identifies one user dictation session.
@@ -182,6 +186,7 @@ pub struct TranscriptionOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeCapabilities {
     pub streaming: bool,
+    pub cancellation: bool,
     pub translation: bool,
     pub timestamps: bool,
     pub language_detection: bool,
@@ -288,18 +293,199 @@ pub struct TranscriptionOutcome {
     pub stderr: String,
 }
 
+/// Runtime-neutral diagnostics from an explicit model preload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelLoadOutcome {
+    pub model_id: ModelId,
+    pub resolved_acceleration: ResolvedAcceleration,
+    pub model_load_duration_ms: u128,
+    pub warm_model_reused: bool,
+}
+
+enum RuntimeCommand {
+    Transcribe {
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+        cancellation_snapshot: u64,
+        reply: SyncSender<Result<RuntimeExecution, RuntimeError>>,
+    },
+    Load {
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        reply: SyncSender<Result<RuntimeLoadExecution, RuntimeError>>,
+    },
+    Health {
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        reply: SyncSender<Result<(), RuntimeError>>,
+    },
+    Unload {
+        reply: SyncSender<Result<(), RuntimeError>>,
+    },
+}
+
+/// A bounded, dedicated native worker. Application-created task threads may
+/// wait on this facade, but all concrete engine lifecycle and inference work
+/// is serialized on the one named native worker.
+#[derive(Clone)]
+struct RuntimeWorker {
+    commands: SyncSender<RuntimeCommand>,
+}
+
+impl RuntimeWorker {
+    fn new(router: RuntimeRouter) -> Self {
+        cleanup_stale_temporary_audio();
+        let (commands, receiver) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("scribe-native-runtime".to_owned())
+            .spawn(move || runtime_worker_loop(router, receiver))
+            .expect("Scribe could not create its native runtime worker");
+        Self { commands }
+    }
+
+    fn transcribe(
+        &self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+        cancellation_snapshot: u64,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.commands
+            .send(RuntimeCommand::Transcribe {
+                model,
+                preference,
+                audio,
+                options,
+                cancellation_snapshot,
+                reply,
+            })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
+    fn load(
+        &self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.commands
+            .send(RuntimeCommand::Load {
+                model,
+                preference,
+                reply,
+            })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
+    fn health_check(
+        &self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+    ) -> Result<(), RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.commands
+            .send(RuntimeCommand::Health {
+                model,
+                preference,
+                reply,
+            })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+
+    fn unload(&self) -> Result<(), RuntimeError> {
+        let (reply, response) = sync_channel(1);
+        self.commands
+            .send(RuntimeCommand::Unload { reply })
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
+        response
+            .recv()
+            .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+}
+
+impl fmt::Debug for RuntimeWorker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeWorker")
+            .finish_non_exhaustive()
+    }
+}
+
+fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>) {
+    loop {
+        match commands.recv_timeout(WARM_MODEL_TTL) {
+            Ok(RuntimeCommand::Transcribe {
+                model,
+                preference,
+                audio,
+                options,
+                cancellation_snapshot,
+                reply,
+            }) => {
+                let _ = reply.send(router.transcribe(
+                    model,
+                    preference,
+                    &audio,
+                    &options,
+                    cancellation_snapshot,
+                ));
+            }
+            Ok(RuntimeCommand::Load {
+                model,
+                preference,
+                reply,
+            }) => {
+                let _ = reply.send(router.load(model, preference));
+            }
+            Ok(RuntimeCommand::Health {
+                model,
+                preference,
+                reply,
+            }) => {
+                let _ = reply.send(router.health_check(model, preference));
+            }
+            Ok(RuntimeCommand::Unload { reply }) => {
+                let _ = reply.send(router.unload_all());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = router.unload_all();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = router.unload_all();
+                break;
+            }
+        }
+    }
+}
+
 /// Application-facing boundary for all transcription work.
 #[derive(Clone, Debug)]
 pub struct TranscriptionService {
     config: AppConfig,
     router: RuntimeRouter,
+    worker: RuntimeWorker,
 }
 
 impl TranscriptionService {
     pub fn new(config: AppConfig) -> Self {
+        let router = RuntimeRouter::new();
         Self {
             config,
-            router: RuntimeRouter::new(),
+            worker: RuntimeWorker::new(router.clone()),
+            router,
         }
     }
 
@@ -309,6 +495,7 @@ impl TranscriptionService {
         Self {
             config,
             router: self.router.clone(),
+            worker: self.worker.clone(),
         }
     }
 
@@ -323,6 +510,48 @@ impl TranscriptionService {
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"));
         }
         Ok(capabilities_for_legacy_model(&model))
+    }
+
+    /// Loads a primary-runtime model on the dedicated worker. Phase 4 uses
+    /// this to overlap model startup with native capture.
+    pub fn preload_model(
+        &self,
+        model_id: &ModelId,
+        model_path: Option<PathBuf>,
+    ) -> Result<ModelLoadOutcome> {
+        let model = self.resolve_model(model_id, model_path)?;
+        let runtime_model = self.resolve_runtime_model(model)?;
+        let execution = self
+            .worker
+            .load(runtime_model, self.config.acceleration_preference)
+            .map_err(|error| anyhow!(error))?;
+        Ok(ModelLoadOutcome {
+            model_id: model_id.clone(),
+            resolved_acceleration: execution.diagnostics.resolved_acceleration,
+            model_load_duration_ms: execution.diagnostics.model_load_duration_ms,
+            warm_model_reused: execution.diagnostics.warm_reused,
+        })
+    }
+
+    /// Checks the selected primary runtime package and model without allowing
+    /// UI or coordinator code to name the concrete handler.
+    pub fn health_check(&self, model_id: &ModelId, model_path: Option<PathBuf>) -> Result<()> {
+        let model = self.resolve_model(model_id, model_path)?;
+        let runtime_model = self.resolve_runtime_model(model)?;
+        self.worker
+            .health_check(runtime_model, self.config.acceleration_preference)
+            .map_err(|error| anyhow!(error))
+    }
+
+    /// Requests lock-free cancellation of native work submitted before this
+    /// call. Later requests capture the new generation and are unaffected.
+    pub fn cancel_active(&self) {
+        self.router.cancel_active();
+    }
+
+    /// Drops all retained native model state on the dedicated worker.
+    pub fn unload_runtime(&self) -> Result<()> {
+        self.worker.unload().map_err(|error| anyhow!(error))
     }
 
     /// Transcribes canonical prepared audio. The router receives the first
@@ -342,18 +571,14 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         model: SttModelInfo,
     ) -> Result<TranscriptionOutcome> {
-        validate_legacy_options(&request.options)?;
+        validate_default_options(&request.options)?;
         let runtime_model = self.resolve_runtime_model(model.clone())?;
-        let runtime_audio = RuntimeAudio {
-            samples: &request.audio.samples,
-            sample_rate_hz: request.audio.sample_rate,
-            channels: 1,
-        };
-
-        match self.router.transcribe(
+        match self.worker.transcribe(
             runtime_model,
             self.config.acceleration_preference,
-            runtime_audio,
+            Arc::clone(&request.audio),
+            request.options.clone(),
+            self.router.cancellation_snapshot(),
         ) {
             Ok(execution) => Ok(map_native_execution(request, model, execution)),
             Err(crate::runtime_router::RuntimeError::Bootstrap(failure))
@@ -439,10 +664,20 @@ impl TranscriptionService {
                 "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
             )
         })?;
+        let artifact = crate::runtime_catalog::model_artifact_spec(&model.id)
+            .filter(|artifact| artifact.download_bytes.is_some() && artifact.sha256.is_some())
+            .ok_or_else(|| {
+                anyhow!(
+                    "model {} has no pinned size and SHA-256 evidence for in-process native loading",
+                    model.name
+                )
+            })?;
         Ok(RuntimeModel {
             id: model.id.into(),
             path,
             package_root,
+            expected_size_bytes: artifact.download_bytes.expect("checked above"),
+            expected_sha256: artifact.sha256.expect("checked above"),
         })
     }
 
@@ -488,22 +723,7 @@ fn map_native_execution(
         model_id: request.model_id,
         model_name: model.name,
         backend_label: "transcribe-cpp".to_owned(),
-        transcript: Transcript {
-            text: execution.transcript.text,
-            segments: execution
-                .transcript
-                .segments
-                .into_iter()
-                .map(|segment| TranscriptSegment {
-                    text: segment.text,
-                    start_ms: Some(segment.start_ms),
-                    end_ms: Some(segment.end_ms),
-                    confidence: None,
-                })
-                .collect(),
-            detected_language: execution.transcript.detected_language,
-            duration_ms: execution.transcript.duration_ms,
-        },
+        transcript: execution.transcript,
         processing_duration_ms: Some(execution.processing_duration_ms),
         resolved_acceleration: Some(execution.diagnostics.resolved_acceleration),
         model_load_duration_ms: Some(execution.diagnostics.model_load_duration_ms),
@@ -554,7 +774,7 @@ impl SpeechEngine for LegacyBatchAdapter {
         audio: &PreparedAudio,
         options: &TranscriptionOptions,
     ) -> Result<Transcript> {
-        validate_legacy_options(options)?;
+        validate_default_options(options)?;
         let prepared_wav = TemporaryPreparedWav::create(audio)?;
 
         let result = crate::stt::transcribe_with_config(
@@ -618,13 +838,16 @@ impl TemporaryPreparedWav {
             .unwrap_or_default()
             .as_nanos();
         let sequence = TEMP_AUDIO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let directory = private_temporary_audio_dir()?;
+        let path = directory.join(format!(
             "scribe-prepared-{}-{nonce}-{sequence}.wav",
             std::process::id()
         ));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
             .open(&path)
             .map_err(|err| anyhow!("failed to create private prepared-audio WAV: {err}"))?;
         let temporary = Self { path };
@@ -651,6 +874,68 @@ impl TemporaryPreparedWav {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+fn private_temporary_audio_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    let root = std::env::temp_dir().join("scribe-test-private-data");
+    #[cfg(not(test))]
+    let runtime_dir = config::runtime_storage_dir();
+    #[cfg(not(test))]
+    let root = runtime_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = root.join("transient-audio");
+    if !directory.is_dir() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&directory).map_err(|error| {
+            anyhow!(
+                "failed to create private prepared-audio directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        anyhow!(
+            "failed to secure prepared-audio directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
+}
+
+fn cleanup_stale_temporary_audio() {
+    let Ok(directory) = private_temporary_audio_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("scribe-prepared-") && name.ends_with(".wav"))
+        {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
+        if is_stale {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -713,25 +998,25 @@ fn validate_response_model_id(
     Ok(())
 }
 
-fn validate_legacy_options(options: &TranscriptionOptions) -> Result<()> {
+fn validate_default_options(options: &TranscriptionOptions) -> Result<()> {
     if options.language.is_some() {
         return Err(anyhow!(
-            "language selection is not supported by the Phase 1 legacy transcription path"
+            "language selection is not supported by the selected transcription capability"
         ));
     }
     if options.translate_to_english {
         return Err(anyhow!(
-            "translation is not supported by the Phase 1 legacy transcription path"
+            "translation is not supported by the selected transcription capability"
         ));
     }
     if options.enable_timestamps {
         return Err(anyhow!(
-            "requesting timestamps is not supported by the Phase 1 legacy transcription path"
+            "requesting timestamps is not supported as a decoding option by the selected transcription capability"
         ));
     }
     if options.initial_prompt.is_some() {
         return Err(anyhow!(
-            "initial prompts are not supported by the Phase 1 legacy transcription path"
+            "initial prompts are not supported by the selected transcription capability"
         ));
     }
 
@@ -833,7 +1118,7 @@ mod tests {
                 initial_prompt: None,
             }
         );
-        assert!(validate_legacy_options(&TranscriptionOptions::default()).is_ok());
+        assert!(validate_default_options(&TranscriptionOptions::default()).is_ok());
     }
 
     #[test]
@@ -858,7 +1143,7 @@ mod tests {
         ];
 
         for options in unsupported_options {
-            assert!(validate_legacy_options(&options).is_err());
+            assert!(validate_default_options(&options).is_err());
         }
     }
 
@@ -1069,7 +1354,14 @@ mod tests {
         );
         let mut request =
             TranscriptionRequest::new(session_id, request_id, audio.clone(), "whisper_cpp_base_en");
-        request.model_path = Some(model_path);
+        request.model_path = Some(model_path.clone());
+
+        service
+            .health_check(
+                &ModelId::new("whisper_cpp_base_en"),
+                request.model_path.clone(),
+            )
+            .expect("pinned runtime package and model pass health validation");
 
         let outcome = service
             .transcribe(request)
@@ -1098,17 +1390,30 @@ mod tests {
         let mut warm_request = TranscriptionRequest::new(
             session_id,
             RequestId(request_id.0 + 1),
-            audio,
+            Arc::clone(&audio),
             "whisper_cpp_base_en",
         );
-        warm_request.model_path = Some(PathBuf::from(
-            std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap(),
-        ));
+        warm_request.model_path = Some(model_path.clone());
         let warm = service
             .transcribe(warm_request)
             .expect("retained native model transcribes a second request");
         assert!(warm.warm_model_reused);
         assert_eq!(warm.model_load_duration_ms, Some(0));
+
+        service
+            .unload_runtime()
+            .expect("explicit native unload succeeds");
+        let mut reload_request = TranscriptionRequest::new(
+            session_id,
+            RequestId(request_id.0 + 2),
+            audio,
+            "whisper_cpp_base_en",
+        );
+        reload_request.model_path = Some(model_path);
+        let reloaded = service
+            .transcribe(reload_request)
+            .expect("native model reload succeeds after explicit unload");
+        assert!(!reloaded.warm_model_reused);
         eprintln!(
             "native_jfk first_load_ms={} first_decode_ms={} warm_load_ms={} warm_decode_ms={}",
             outcome.model_load_duration_ms.unwrap_or_default(),
@@ -1177,6 +1482,58 @@ mod tests {
             percentile(&warm_decode, 50),
             percentile(&warm_decode, 95),
         );
+    }
+
+    #[test]
+    #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
+    fn native_runtime_cancellation_interrupts_active_decode() {
+        let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
+        let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
+        let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
+        let fixture = PreparedAudio::from_wav_path(audio_path).unwrap();
+        let mut samples = Vec::with_capacity(fixture.samples.len() * 20);
+        for _ in 0..20 {
+            samples.extend_from_slice(&fixture.samples);
+        }
+        let audio = Arc::new(PreparedAudio {
+            source_frames: samples.len(),
+            samples,
+            sample_rate: fixture.sample_rate,
+            source_sample_rate: fixture.sample_rate,
+            source_channels: 1,
+        });
+        let service = TranscriptionService::new(AppConfig {
+            whisper_executable_path: Some(cli),
+            acceleration_preference: AccelerationPreference::Cpu,
+            ..AppConfig::default()
+        });
+        service
+            .preload_model(
+                &ModelId::new("whisper_cpp_base_en"),
+                Some(model_path.clone()),
+            )
+            .unwrap();
+
+        let worker_service = service.clone();
+        let worker = std::thread::spawn(move || {
+            let mut request = TranscriptionRequest::new(
+                SessionId(9_001),
+                RequestId(9_001),
+                audio,
+                "whisper_cpp_base_en",
+            );
+            request.model_path = Some(model_path);
+            worker_service.transcribe(request)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let cancel_started = std::time::Instant::now();
+        service.cancel_active();
+        let error = worker.join().unwrap().unwrap_err();
+        let cancellation_latency = cancel_started.elapsed();
+        eprintln!("native_cancel_ack_ms={}", cancellation_latency.as_millis());
+
+        assert!(cancellation_latency <= std::time::Duration::from_secs(2));
+        assert!(error.to_string().contains("inference failed"));
     }
 
     fn percentile(values: &[u128], percentile: usize) -> u128 {

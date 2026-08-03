@@ -73,16 +73,17 @@ on Windows before treating the wrapped path as release-verified.
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
-| Unit/integration tests | `cargo test --all-targets --all-features` | PASS — 222 discovered, 218 passed, 0 failed, 4 ignored environment-required tests |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS — 231 discovered, 226 passed, 0 failed, 5 ignored environment-required tests |
 | Debug native fixture | ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` with pinned v1.9.1 package, base.en, and JFK WAV | PASS — non-empty final text, CPU resolution, cold model load, then retained warm reuse |
-| Native latency benchmark | ignored `native_runtime_jfk_cold_and_warm_benchmark` | PASS — five cold and 20 warm runs; cold total median/p95 1,172/1,188 ms; warm 785/798 ms |
+| Native latency benchmark | release ignored `native_runtime_jfk_cold_and_warm_benchmark` | PASS — five cold and 20 warm runs; cold total median/p95 1,084/1,105 ms; warm 782/796 ms |
+| Native cancellation | release ignored `native_runtime_cancellation_interrupts_active_decode` | PASS — native abort stopped a synthetic 220-second active decode; error/context cleanup returned in 781 ms |
 | Release build/package | `cargo build --release --all-features`; verified PowerShell bundle script | PASS — release package staged only after exact size/SHA-256 validation |
 | Release native fixture | release ignored service smoke against `target/release/runtimes/whisper_cpp` | PASS |
 | Runtime boundary/integrity | boundary scan, tampered-file rejection, manifest/hash tests, GPU resolution tests | PASS |
 
 These results verify one Windows CPU runtime/model fixture in-process. They do
 not verify a live desktop, microphone, hotkey, overlay, target window, paste,
-memory/idle CPU, Unicode model path, cancellation, or any other model. All
+memory/idle CPU, non-ASCII Unicode model path, live-session cancellation, or any other model. All
 manual rows remain NOT VERIFIED.
 
 ## Prerequisites and test data
@@ -121,7 +122,7 @@ manual rows remain NOT VERIFIED.
 | REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and temporary recording directory. | Capture begins after stream start, WAV finalizes, transcription starts, and temporary file cleanup follows current policy. Capture exact latency phases. | **NOT VERIFIED** |
 | REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture. | Microphone failure is visible, no hang occurs, and app returns to a valid Idle/Error state without paste. | **NOT VERIFIED** |
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
-| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists); immediately start another normal or Playground session. | Cancel never pastes; pending work is cleaned up; the implemented session/request checks reject stale completion without overwriting the next session. Native worker cancellation is not implemented yet. | **NOT VERIFIED** |
+| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists); immediately start another normal or Playground session. | Cancel never pastes; pending work is cleaned up; the implemented session/request checks reject stale completion without overwriting the next session. Native abort is automated, but the live coordinator path still requires this manual check. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 
@@ -129,7 +130,7 @@ manual rows remain NOT VERIFIED.
 | --- | --- | --- | --- | --- | --- |
 | STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
 | STT-02 | Win/Linux/macOS | P1, P2, P3 | Run the same WAV in Playground for every installed/ready model. | Each selected ready model completes independently; missing runtime/model blocks only that card with repair guidance. | **NOT VERIFIED** |
-| STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | Windows primary runtime reports immediate warm reuse, then lazily unloads/reloads after the five-minute TTL; other platforms preserve the compatibility path. Record load/decode metrics. | **NOT VERIFIED** |
+| STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | Windows primary runtime reports immediate warm reuse; the dedicated worker unloads after the five-minute idle timeout and the next request reloads. Other platforms preserve the compatibility path. Record load/decode metrics. | **NOT VERIFIED** |
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | No child process is started; actionable status identifies what to install/repair; no paste occurs. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Kill the short-lived runtime process or force a non-zero exit during transcription. | Failure is surfaced, app returns to Idle/Error, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
@@ -152,7 +153,7 @@ manual rows remain NOT VERIFIED.
 
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| DL-01 | Win/Linux/macOS | P1, disposable data dir, network | Start a recommended model download; cancel halfway; resume. | Progress is truthful; partial artifact is retained/resumable or the UI explains why resume is unavailable. **Verified hash/size/atomic activation are future requirements.** | **NOT VERIFIED** |
+| DL-01 | Win/Linux/macOS | P1, disposable data dir, network | Start a recommended model download; cancel halfway; resume. | Progress is truthful; partial artifact is retained/resumable or the UI explains why resume is unavailable. Whisper files already require exact size/SHA-256; resumable/atomic activation remains Phase 9 work. | **NOT VERIFIED** |
 | DL-02 | Win/Linux/macOS | P1, disposable data dir, network | Replace a downloaded artifact with a truncated file; attempt activation. | Corrupt/incomplete model is rejected and never shown as runnable. | **NOT VERIFIED** |
 | DL-03 | Win/Linux/macOS | P1, disposable data dir, network | Interrupt extraction/installation; restart app. | Staging is cleaned or safely quarantined; previous known-good install remains usable. | **NOT VERIFIED** |
 | DL-04 | Win/Linux/macOS | P1, disposable data dir | Install runtime, remove it while no transcription is running, then try a model. | Runtime status transitions are visible; removal does not delete unrelated models; repair action is offered. | **NOT VERIFIED** |

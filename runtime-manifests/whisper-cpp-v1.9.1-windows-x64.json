@@ -29,9 +29,18 @@
       {
         "id": "cpu",
         "health_validated": true,
+        "selection": "highest ggml_backend_score from this fixed hash-verified allowlist",
         "libraries": [
           "bin/ggml.dll",
           "bin/ggml-base.dll",
+          "bin/ggml-cpu-alderlake.dll",
+          "bin/ggml-cpu-cannonlake.dll",
+          "bin/ggml-cpu-cascadelake.dll",
+          "bin/ggml-cpu-haswell.dll",
+          "bin/ggml-cpu-icelake.dll",
+          "bin/ggml-cpu-sandybridge.dll",
+          "bin/ggml-cpu-skylakex.dll",
+          "bin/ggml-cpu-sse42.dll",
           "bin/ggml-cpu-x64.dll"
         ]
       }
@@ -42,9 +51,10 @@
     "native_library": "bin/whisper.dll",
     "compatibility_cli": "bin/whisper-cli.exe",
     "required_symbols": [
-      "whisper_version",
       "whisper_context_default_params_by_ref",
       "whisper_full_default_params_by_ref",
+      "whisper_free_context_params",
+      "whisper_free_params",
       "whisper_init_from_file_with_params",
       "whisper_full",
       "whisper_full_n_segments",
@@ -52,6 +62,13 @@
       "whisper_full_get_segment_t0",
       "whisper_full_get_segment_t1",
       "whisper_free"
+    ],
+    "backend_required_symbols": [
+      "ggml_backend_load"
+    ],
+    "cpu_backend_required_symbols": [
+      "ggml_backend_score",
+      "ggml_backend_init"
     ]
   },
   "files": [
