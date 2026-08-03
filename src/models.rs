@@ -237,162 +237,151 @@ pub fn sherpa_model_download_url(model_name: &str) -> Option<&'static str> {
 }
 
 pub fn default_model_catalog() -> Vec<SttModelInfo> {
-    vec![
-        model(
-            "whisper_cpp_tiny_en",
-            "whisper.cpp tiny.en",
-            "whisper.cpp",
-            "Smallest local English model for quick testing and low-resource machines.",
-            "1 GB",
-            "Basic",
-            "Fastest",
-            Some("tiny.en"),
-        ),
-        model(
-            "whisper_cpp_base_en",
-            "whisper.cpp base.en",
-            "whisper.cpp",
-            "Recommended first-run local English model with a better speed/quality balance.",
-            "1 GB",
-            "Good",
-            "Fast",
-            Some("base.en"),
-        ),
-        model(
-            "whisper_cpp_small_en",
-            "whisper.cpp small.en",
-            "whisper.cpp",
-            "More accurate local English model for longer dictation and cleaner audio.",
-            "2 GB",
-            "Better",
-            "Medium",
-            Some("small.en"),
-        ),
-        model(
-            "whisper_cpp_medium_en",
-            "whisper.cpp medium.en",
-            "whisper.cpp",
-            "Higher-accuracy local English model for machines with more memory.",
-            "5 GB",
-            "High",
-            "Slower",
-            Some("medium.en"),
-        ),
-        model(
+    let mut models = crate::model_catalog::model_descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            let runtime = crate::model_catalog::runtime_model_manifest(&descriptor.id)
+                .expect("every normalized descriptor must have a runtime manifest");
+            let download_model = runtime
+                .artifact_filename
+                .strip_prefix("ggml-")
+                .and_then(|name| name.strip_suffix(".bin"))
+                .map(str::to_owned);
+            SttModelInfo {
+                id: descriptor.id.into_inner(),
+                name: descriptor.display_name.to_owned(),
+                backend: "whisper.cpp".to_owned(),
+                description: descriptor.description.to_owned(),
+                expected_ram: descriptor.expected_ram.to_owned(),
+                accuracy_tier: descriptor.accuracy_guidance.to_owned(),
+                speed_tier: descriptor.speed_guidance.to_owned(),
+                local_path: None,
+                install_status: ModelInstallStatus::NotInstalled,
+                download_model,
+            }
+        })
+        .collect::<Vec<_>>();
+    // These entries remain solely for the private Phase 1 compatibility
+    // bridge and existing configuration migration. They are intentionally
+    // absent from the normalized UI/service catalog and provide no evidence
+    // for a shipped runtime handler.
+    models.extend([
+        legacy_model(
             "vosk_small_en",
             "Vosk small English",
             "Vosk",
-            "Offline Apache 2.0 English model for low-resource CPU transcription with the managed Vosk runtime.",
+            "Offline Apache 2.0 English compatibility model.",
             "1 GB",
             "Basic",
             "Fast",
-            Some("vosk-model-small-en-us-0.15"),
+            "vosk-model-small-en-us-0.15",
         ),
-        model(
+        legacy_model(
             "faster_whisper_tiny_en",
             "faster-whisper tiny.en",
             "faster-whisper",
-            "Tiny English model for quick faster-whisper CPU or GPU smoke tests.",
+            "Legacy compatibility model retained for migration.",
             "1 GB",
             "Basic",
             "Fastest",
-            Some("tiny.en"),
+            "tiny.en",
         ),
-        model(
+        legacy_model(
             "faster_whisper_base_en",
             "faster-whisper base.en",
             "faster-whisper",
-            "Base English model with a balanced faster-whisper CPU or GPU footprint.",
+            "Legacy compatibility model retained for migration.",
             "1 GB",
             "Good",
             "Fast",
-            Some("base.en"),
+            "base.en",
         ),
-        model(
+        legacy_model(
             "faster_whisper_small_en_gpu",
             "faster-whisper small.en",
             "faster-whisper",
-            "Small English model for better faster-whisper CPU or GPU accuracy.",
+            "Legacy compatibility model retained for migration.",
             "1-2 GB",
             "Good",
             "Fast",
-            Some("small.en"),
+            "small.en",
         ),
-        model(
+        legacy_model(
             "faster_whisper_medium_en_gpu",
             "faster-whisper medium.en",
             "faster-whisper",
-            "Medium English model for high-accuracy faster-whisper CPU or GPU transcription.",
+            "Legacy compatibility model retained for migration.",
             "3-6 GB",
             "High",
             "Medium",
-            Some("medium.en"),
+            "medium.en",
         ),
-        model(
+        legacy_model(
             "faster_whisper_large_v3",
             "faster-whisper large-v3",
             "faster-whisper",
-            "High-accuracy faster-whisper model for CPU or GPU transcription.",
+            "Legacy compatibility model retained for migration.",
             "5-10 GB",
             "Highest",
             "Slow",
-            Some("large-v3"),
+            "large-v3",
         ),
-        model(
+        legacy_model(
             "faster_whisper_turbo",
             "faster-whisper turbo",
             "faster-whisper",
-            "Fast faster-whisper model for CPU or GPU transcription.",
+            "Legacy compatibility model retained for migration.",
             "4-8 GB",
             "High",
             "Fast",
-            Some("turbo"),
+            "turbo",
         ),
-        model(
+        legacy_model(
             "faster_whisper_distil_large_v3",
             "faster-whisper distil-large-v3",
             "faster-whisper",
-            "Distilled high-accuracy faster-whisper model for CPU or GPU transcription.",
+            "Legacy compatibility model retained for migration.",
             "3-6 GB",
             "High",
             "Fast",
-            Some("distil-large-v3"),
+            "distil-large-v3",
         ),
-        model(
+        legacy_model(
             "sherpa_onnx_zipformer_small",
             "sherpa-onnx Zipformer Small",
             "sherpa-onnx",
-            "Offline English Zipformer transducer model through the managed sherpa-onnx runtime.",
+            "Legacy offline compatibility model; not the streaming candidate.",
             "1-2 GB",
             "Good",
             "Fast",
-            Some("sherpa-onnx-zipformer-small-en-2023-06-26"),
+            "sherpa-onnx-zipformer-small-en-2023-06-26",
         ),
-        model(
+        legacy_model(
             "moonshine",
             "Moonshine tiny English",
             "Moonshine",
-            "Low-latency English Moonshine ONNX model through the managed sherpa-onnx-based Moonshine runtime.",
+            "Legacy compatibility model retained for migration.",
             "1-2 GB",
             "Good",
             "Fast",
-            Some("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"),
+            "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
         ),
-        model(
+        legacy_model(
             "parakeet_0_6b",
             "Parakeet Unified 0.6B int8",
             "Parakeet",
-            "Experimental high-accuracy NVIDIA Parakeet unified 0.6B int8 ONNX model through the managed sherpa-onnx-based Parakeet runtime.",
+            "Legacy compatibility model retained for migration.",
             "2-4 GB",
             "High",
             "Medium",
-            Some("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"),
+            "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
         ),
-    ]
+    ]);
+    models
 }
 
 #[allow(clippy::too_many_arguments)]
-fn model(
+fn legacy_model(
     id: &str,
     name: &str,
     backend: &str,
@@ -400,7 +389,7 @@ fn model(
     expected_ram: &str,
     accuracy_tier: &str,
     speed_tier: &str,
-    download_model: Option<&str>,
+    download_model: &str,
 ) -> SttModelInfo {
     SttModelInfo {
         id: id.to_owned(),
@@ -412,7 +401,7 @@ fn model(
         speed_tier: speed_tier.to_owned(),
         local_path: None,
         install_status: ModelInstallStatus::NotInstalled,
-        download_model: download_model.map(str::to_owned),
+        download_model: Some(download_model.to_owned()),
     }
 }
 

@@ -31,8 +31,8 @@ use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
 use crate::transcription::{
-    AccelerationPreference, RequestId, SessionId, TranscriptionOptions, TranscriptionOutcome,
-    TranscriptionRequest, TranscriptionService,
+    AccelerationPreference, CompatibilityStatus, ModelDescriptor, RequestId, SessionId,
+    TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
 };
 use crate::tray::{TrayCommand, TrayService};
 
@@ -994,7 +994,6 @@ pub struct LocalTranscriberApp {
     status_message: String,
     hotkey_input: String,
     model_search: String,
-    model_backend_filter: String,
     audio_devices: Vec<String>,
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
@@ -1049,7 +1048,6 @@ impl LocalTranscriberApp {
         let mut app = Self {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
-            model_backend_filter: "All".to_owned(),
             audio_devices: Vec::new(),
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
@@ -2393,11 +2391,11 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download_only(&mut self, model: &SttModelInfo) {
-        let Some(download_model) = model.download_model.clone() else {
+        if model.download_model.is_none() {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!("{} does not have a supported download.", model.name);
             return;
-        };
+        }
 
         if !supports_managed_install(model) {
             self.status = TranscriptionStatus::Error;
@@ -2430,99 +2428,20 @@ impl LocalTranscriberApp {
 
         let tx = self.tx.clone();
         let model_id = model.id.clone();
-        match model.backend.as_str() {
-            "faster-whisper" => {
-                let Some(runtime) =
-                    stt::faster_whisper::resolve_faster_whisper_executable(&self.config)
-                else {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message =
-                        "Install the faster-whisper runtime before downloading this model."
-                            .to_owned();
-                    self.model_downloads.remove(&model.id);
-                    return;
-                };
-                thread::spawn(move || {
-                    let progress = |progress| send_model_download_progress(&tx, progress);
-                    let result = managed_downloads::download_faster_whisper_model(
-                        &runtime,
-                        &download_model,
-                        &destination,
-                        &model_id,
-                        expected_total_bytes,
-                        &progress,
-                    );
-                    send_model_download_result(&tx, model_id, result);
-                });
-            }
-            "Vosk" => {
-                let Some(runtime) = stt::vosk::resolve_vosk_executable(&self.config) else {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message =
-                        "Install the Vosk runtime before downloading this model.".to_owned();
-                    self.model_downloads.remove(&model.id);
-                    return;
-                };
-                thread::spawn(move || {
-                    let progress = |progress| send_model_download_progress(&tx, progress);
-                    let result = managed_downloads::download_vosk_model(
-                        &runtime,
-                        &download_model,
-                        &destination,
-                        &model_id,
-                        expected_total_bytes,
-                        &progress,
-                    );
-                    send_model_download_result(&tx, model_id, result);
-                });
-            }
-            "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-                let Some(runtime) =
-                    stt::sherpa_onnx::resolve_executable_for_backend(&self.config, &model.backend)
-                else {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!(
-                        "Install the {} runtime before downloading this model.",
-                        model.backend
-                    );
-                    self.model_downloads.remove(&model.id);
-                    return;
-                };
-                let model_for_download = model.clone();
-                thread::spawn(move || {
-                    let progress = |progress| send_model_download_progress(&tx, progress);
-                    let result = managed_downloads::download_sherpa_model(
-                        &runtime,
-                        &model_for_download,
-                        &download_model,
-                        &destination,
-                        &model_id,
-                        expected_total_bytes,
-                        &progress,
-                    );
-                    send_model_download_result(&tx, model_id, result);
-                });
-            }
-            "whisper.cpp" => {
-                thread::spawn(move || {
-                    let progress = |progress| send_model_download_progress(&tx, progress);
-                    let result = managed_downloads::download_whisper_cpp_model(
-                        &download_model,
-                        &destination,
-                        &model_id,
-                        expected_total_bytes,
-                        expected_sha256,
-                        &progress,
-                    );
-                    send_model_download_result(&tx, model_id, result);
-                });
-            }
-            backend => {
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Managed downloader for {backend} is not available.");
-                self.model_downloads.remove(&model.id);
-            }
-        }
+        let config = self.config.clone();
+        let model = model.clone();
+        thread::spawn(move || {
+            let progress = |progress| send_model_download_progress(&tx, progress);
+            let result = managed_downloads::download_configured_model(
+                &config,
+                &model,
+                &destination,
+                expected_total_bytes,
+                expected_sha256,
+                &progress,
+            );
+            send_model_download_result(&tx, model_id, result);
+        });
     }
 
     fn uninstall_model(&mut self, model: &SttModelInfo) {
@@ -2842,7 +2761,7 @@ impl LocalTranscriberApp {
                         .as_ref()
                         .map(setup_message_for_status)
                         .unwrap_or_else(|| {
-                            "Choose a local whisper.cpp model to start transcribing.".to_owned()
+                            "Choose an installed local model to start transcribing.".to_owned()
                         });
                     ui.label(section_heading("Setup required"));
                     ui.label(mut_text(setup_message));
@@ -2952,10 +2871,11 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        let backends = stt::provider_adapters()
+        let descriptors = self.transcription_service.model_descriptors();
+        let descriptors_by_id = descriptors
             .iter()
-            .map(|provider| provider.backend.to_owned())
-            .collect::<Vec<_>>();
+            .map(|descriptor| (descriptor.id.as_str(), descriptor))
+            .collect::<HashMap<_, _>>();
 
         let status = self.status;
         let status_message = self.status_message.clone();
@@ -2963,24 +2883,21 @@ impl LocalTranscriberApp {
             panel(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     model_search_filter_control(ui, &mut self.model_search);
-                    ui.add_space(10.0);
-                    model_backend_filter_control(
-                        ui,
-                        "model-backend-filter",
-                        &mut self.model_backend_filter,
-                        &backends,
-                    );
                 });
             });
 
             ui.add_space(12.0);
-            let download_rows = current_download_rows(&self.config, &self.model_downloads);
+            let download_rows = current_download_rows(&self.config, &self.model_downloads)
+                .into_iter()
+                .filter(|(model, _)| descriptors_by_id.contains_key(model.id.as_str()))
+                .collect::<Vec<_>>();
             if !download_rows.is_empty() {
                 panel(ui, |ui| {
                     ui.label(section_heading("Downloads"));
                     ui.add_space(8.0);
                     for (index, (model, install_status)) in download_rows.iter().enumerate() {
-                        download_summary_row(ui, model, install_status);
+                        let descriptor = descriptors_by_id.get(model.id.as_str()).copied();
+                        download_summary_row(ui, model, descriptor, install_status);
                         if index + 1 < download_rows.len() {
                             ui.add_space(8.0);
                         }
@@ -3005,7 +2922,10 @@ impl LocalTranscriberApp {
                     )),
                 );
                 ui.add_space(8.0);
-                for model in runtime_representative_models(&self.config) {
+                for model in runtime_representative_models(&self.config)
+                    .into_iter()
+                    .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
+                {
                     let provider = stt::provider_for_backend(&model.backend);
                     let runtime_busy = provider.is_some_and(|provider| {
                         self.runtime_jobs.contains_key(provider.runtime_id)
@@ -3029,7 +2949,7 @@ impl LocalTranscriberApp {
                     );
                     ui.horizontal_wrapped(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(body_strong(&format!("{} runtime", model.backend)));
+                            ui.label(body_strong("Local speech runtime"));
                             wrapped_label(
                                 ui,
                                 mut_text(runtime_detail_text(
@@ -3042,7 +2962,7 @@ impl LocalTranscriberApp {
                         ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                             let label = runtime_action_label(
                                 action_state.kind,
-                                &model.backend,
+                                "speech",
                                 runtime_busy,
                             );
                             let runtime_button = small_button(ui, &label);
@@ -3052,10 +2972,7 @@ impl LocalTranscriberApp {
                                 runtime_button,
                                 action_state.disabled_tooltip.as_deref(),
                             )
-                            .on_hover_text(format!(
-                                "Manage the shared {} backend runtime used by {} models.",
-                                model.backend, model.backend
-                            ));
+                            .on_hover_text("Manage the shared native runtime used by this model.");
                             if response.clicked() {
                                 runtime_action = Some((model.clone(), action_state.kind));
                             }
@@ -3094,15 +3011,30 @@ impl LocalTranscriberApp {
             let models = config::configured_models(&self.config)
                 .into_iter()
                 .filter(|model| {
-                    (self.model_backend_filter == "All"
-                        || self.model_backend_filter == model.backend)
-                        && (search.is_empty()
-                            || model.name.to_ascii_lowercase().contains(&search)
-                            || model.backend.to_ascii_lowercase().contains(&search))
+                    descriptors_by_id
+                        .get(model.id.as_str())
+                        .is_some_and(|descriptor| {
+                            search.is_empty()
+                                || descriptor
+                                    .display_name
+                                    .to_ascii_lowercase()
+                                    .contains(&search)
+                                || descriptor
+                                    .description
+                                    .to_ascii_lowercase()
+                                    .contains(&search)
+                                || descriptor
+                                    .languages
+                                    .iter()
+                                    .any(|language| language.to_ascii_lowercase().contains(&search))
+                        })
                 })
                 .collect::<Vec<_>>();
 
             for model in models {
+                let descriptor = descriptors_by_id
+                    .get(model.id.as_str())
+                    .expect("filtered normalized model must have a descriptor");
                 let selected = self.config.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
                 let runtime_ready =
@@ -3125,7 +3057,7 @@ impl LocalTranscriberApp {
                 let mut start_install = false;
                 let mut uninstall = false;
 
-                model_catalog_row(ui, &model, &install_status, selected, |ui| {
+                model_catalog_row(ui, descriptor, &model, &install_status, selected, |ui| {
                     let primary_label =
                         model_primary_action_label(action_state.primary, &model, &install_status);
                     let primary_button = match action_state.primary {
@@ -3667,8 +3599,12 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Performance"));
                 ui.add_space(8.0);
-                let active_device_support = selected_model_device_support(&self.config);
-                let gpu_available = active_device_support.supports_gpu();
+                let gpu_available = self
+                    .transcription_service
+                    .model_descriptor(&crate::transcription::ModelId::new(
+                        &self.config.selected_default_model,
+                    ))
+                    .is_ok_and(|descriptor| descriptor.capabilities.gpu);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Transcription device");
                     let mut preference = self.config.acceleration_preference;
@@ -3692,43 +3628,9 @@ impl LocalTranscriberApp {
                     wrapped_label(
                         ui,
                         mut_text(
-                            "The active model backend is CPU-only. GPU mode remains available only for verified compatibility backends that advertise it.",
+                            "The active model is verified for CPU use only. GPU mode is enabled only for a model whose compatibility evidence advertises it.",
                         ),
                     );
-                }
-                if let Some(provider) = stt::provider_for_backend("whisper.cpp")
-                    && provider.device_detection_supported
-                {
-                    let devices = provider.detect_devices(&self.config);
-                    if devices.len() > 1 {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("GPU device");
-                            let mut selected_device = self.config.whisper_gpu_device.to_string();
-                            ComboBox::from_id_source("transcription-device-picker")
-                                .selected_text(
-                                    devices
-                                        .iter()
-                                        .find(|device| device.id == selected_device)
-                                        .map(|device| device.name.as_str())
-                                        .unwrap_or("Auto"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for device in &devices {
-                                        ui.selectable_value(
-                                            &mut selected_device,
-                                            device.id.clone(),
-                                            &device.name,
-                                        );
-                                    }
-                                });
-                            if let Ok(device_index) = selected_device.parse::<u32>()
-                                && device_index != self.config.whisper_gpu_device
-                            {
-                                self.config.whisper_gpu_device = device_index;
-                                self.save_config();
-                            }
-                        });
-                    }
                 }
             });
 
@@ -4091,30 +3993,6 @@ fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
     });
 }
 
-fn model_backend_filter_control(
-    ui: &mut Ui,
-    id_source: &'static str,
-    selected_backend: &mut String,
-    backends: &[String],
-) {
-    ui.vertical(|ui| {
-        ui.label(label_caps("Filter Backend"));
-        ComboBox::from_id_source(id_source)
-            .selected_text(if selected_backend == "All" {
-                "All Backends"
-            } else {
-                selected_backend.as_str()
-            })
-            .width(150.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(selected_backend, "All".to_owned(), "All backends");
-                for backend in backends {
-                    ui.selectable_value(selected_backend, backend.clone(), backend);
-                }
-            });
-    });
-}
-
 fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
     let colors = ui_palette(ui);
     full_width_frame(
@@ -4155,6 +4033,7 @@ fn summary_card(
 
 fn model_catalog_row(
     ui: &mut Ui,
+    descriptor: &ModelDescriptor,
     model: &SttModelInfo,
     install_status: &ModelInstallStatus,
     selected: bool,
@@ -4171,8 +4050,22 @@ fn model_catalog_row(
                     Layout::top_down(Align::LEFT),
                     |ui| {
                         set_exact_width(ui, detail_width);
-                        wrapped_label(ui, card_title(ui, &model.name, selected));
-                        wrapped_label(ui, mut_text(&model.description));
+                        wrapped_label(ui, card_title(ui, descriptor.display_name, selected));
+                        wrapped_label(ui, mut_text(descriptor.description));
+                        match descriptor.compatibility {
+                            CompatibilityStatus::Experimental { reason, .. }
+                            | CompatibilityStatus::Incompatible { reason, .. } => {
+                                ui.add_space(4.0);
+                                wrapped_label(
+                                    ui,
+                                    mut_text(format!(
+                                        "{}: {reason}",
+                                        descriptor.compatibility.label()
+                                    )),
+                                );
+                            }
+                            CompatibilityStatus::Supported { .. } => {}
+                        }
                         if let Some(detail) = model_install_detail(model, install_status) {
                             ui.add_space(4.0);
                             wrapped_label(ui, mut_text(&detail));
@@ -4187,30 +4080,42 @@ fn model_catalog_row(
                         }
                         ui.add_space(8.0);
                         tag_row(ui, |ui| {
-                            badge(ui, &model.backend, ChipTone::Neutral);
                             badge(
                                 ui,
-                                &format!("Device {}", model_device_label(model)),
+                                descriptor.compatibility.label(),
+                                match descriptor.compatibility {
+                                    CompatibilityStatus::Supported { .. } => ChipTone::Success,
+                                    CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
+                                    CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
+                                },
+                            );
+                            badge(
+                                ui,
+                                if descriptor.capabilities.gpu {
+                                    "Device CPU/GPU"
+                                } else {
+                                    "Device CPU"
+                                },
                                 ChipTone::Neutral,
                             );
                             badge(
                                 ui,
-                                &format!("Model {}", model_storage_estimate(model)),
+                                &format!("Model {}", format_bytes(descriptor.artifact_size_bytes)),
                                 ChipTone::Neutral,
                             );
                             badge(
                                 ui,
-                                &format!("RAM {}", model.expected_ram),
+                                &format!("RAM {}", descriptor.expected_ram),
                                 ChipTone::Neutral,
                             );
                             badge(
                                 ui,
-                                &format!("{} speed", model.speed_tier),
+                                &format!("{} speed", descriptor.speed_guidance),
                                 ChipTone::Neutral,
                             );
                             badge(
                                 ui,
-                                &format!("{} accuracy", model.accuracy_tier),
+                                &format!("{} accuracy", descriptor.accuracy_guidance),
                                 ChipTone::Neutral,
                             );
                         });
@@ -4257,21 +4162,38 @@ fn current_download_rows(
     rows
 }
 
-fn download_summary_row(ui: &mut Ui, model: &SttModelInfo, install_status: &ModelInstallStatus) {
+fn download_summary_row(
+    ui: &mut Ui,
+    model: &SttModelInfo,
+    descriptor: Option<&ModelDescriptor>,
+    install_status: &ModelInstallStatus,
+) {
     full_width_frame(
         ui,
         Frame::none().inner_margin(Margin::symmetric(0.0, 4.0)),
         |ui| {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    wrapped_label(ui, body_strong(&model.name));
+                    wrapped_label(
+                        ui,
+                        body_strong(
+                            descriptor
+                                .map(|descriptor| descriptor.display_name)
+                                .unwrap_or(&model.name),
+                        ),
+                    );
                     tag_row(ui, |ui| {
-                        badge(ui, &model.backend, ChipTone::Neutral);
-                        badge(
-                            ui,
-                            &format!("Device {}", model_device_label(model)),
-                            ChipTone::Neutral,
-                        );
+                        if let Some(descriptor) = descriptor {
+                            badge(
+                                ui,
+                                descriptor.compatibility.label(),
+                                match descriptor.compatibility {
+                                    CompatibilityStatus::Supported { .. } => ChipTone::Success,
+                                    CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
+                                    CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
+                                },
+                            );
+                        }
                         badge(
                             ui,
                             &install_status.label(),
@@ -5193,12 +5115,12 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
                 .to_owned()
         }
         ModelRuntimeStatus::NotInstalled => {
-            "Download a local whisper.cpp model before transcribing.".to_owned()
+            "Download an evidence-listed local model before transcribing.".to_owned()
         }
         ModelRuntimeStatus::Downloading => "The selected model is still downloading.".to_owned(),
         ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
         ModelRuntimeStatus::NotImplemented => {
-            "This backend runtime is not bundled yet; choose a whisper.cpp model.".to_owned()
+            "No verified local runtime is bundled for this model.".to_owned()
         }
         ModelRuntimeStatus::Error(message) => message.clone(),
     }
@@ -5287,17 +5209,13 @@ fn runtime_detail_text(
     let used_by = runtime_model_summary(config, &model.backend);
     let storage = runtime_storage_detail(&model.backend);
     let status_detail = match status {
-        ModelRuntimeStatus::Ready => {
-            format!("{} models can use this local runtime.", model.backend)
+        ModelRuntimeStatus::Ready => "The local runtime is ready.".to_owned(),
+        ModelRuntimeStatus::MissingConfiguration => {
+            "The model is installed, but its local runtime is not configured.".to_owned()
         }
-        ModelRuntimeStatus::MissingConfiguration => format!(
-            "{} models are installed separately, but this runtime is not configured.",
-            model.backend
-        ),
-        ModelRuntimeStatus::NotImplemented => format!(
-            "{} models are listed for comparison, but their managed runtime is not bundled yet.",
-            model.backend
-        ),
+        ModelRuntimeStatus::NotImplemented => {
+            "No verified local runtime is available for this model.".to_owned()
+        }
         ModelRuntimeStatus::Error(message) => message.clone(),
         _ => setup_message_for_status(status),
     };
@@ -5332,15 +5250,6 @@ fn model_device_label(model: &SttModelInfo) -> &'static str {
     runtime_catalog::backend_spec(&model.backend)
         .map(|spec| spec.device_support.label())
         .unwrap_or("Unknown")
-}
-
-fn selected_model_device_support(config: &AppConfig) -> runtime_catalog::DeviceSupport {
-    config::configured_models(config)
-        .into_iter()
-        .find(|model| model.id == config.selected_default_model)
-        .and_then(|model| runtime_catalog::backend_spec(&model.backend))
-        .map(|spec| spec.device_support)
-        .unwrap_or(runtime_catalog::DeviceSupport::CpuOnly)
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
@@ -7107,26 +7016,29 @@ mod layout_tests {
                                 ui.horizontal_wrapped(|ui| {
                                     let mut search = "whisper".to_owned();
                                     model_search_filter_control(ui, &mut search);
-                                    ui.add_space(10.0);
-                                    let mut backend = "All".to_owned();
-                                    let backends = vec!["whisper.cpp".to_owned()];
-                                    model_backend_filter_control(
-                                        ui,
-                                        "test-model-backend-filter",
-                                        &mut backend,
-                                        &backends,
-                                    );
                                 });
                             });
 
                             ui.add_space(12.0);
                             let model = test_model();
+                            let descriptor = crate::model_catalog::model_descriptor(
+                                &crate::transcription::ModelId::new(&model.id),
+                            )
+                            .unwrap();
                             let install_status = ModelInstallStatus::Installed;
 
-                            model_catalog_row(ui, &model, &install_status, true, |ui| {
-                                let _ = ui.add_enabled(false, primary_small_button(ui, "Active"));
-                                let _ = ui.add(small_button(ui, "Uninstall"));
-                            });
+                            model_catalog_row(
+                                ui,
+                                &descriptor,
+                                &model,
+                                &install_status,
+                                true,
+                                |ui| {
+                                    let _ =
+                                        ui.add_enabled(false, primary_small_button(ui, "Active"));
+                                    let _ = ui.add(small_button(ui, "Uninstall"));
+                                },
+                            );
                         },
                     );
                 });
@@ -7411,7 +7323,6 @@ mod layout_tests {
         LocalTranscriberApp {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
-            model_backend_filter: "All".to_owned(),
             audio_devices: Vec::new(),
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
@@ -8295,7 +8206,7 @@ mod layout_tests {
                 },
             )],
         );
-        let checkbox = accesskit_control_id_with_prefix(&output, "whisper.cpp tiny.en;");
+        let checkbox = accesskit_control_id_with_prefix(&output, "English Tiny;");
         let apply = accesskit_control_id(&output, "Apply model selection");
         render_playground(
             &ctx,
@@ -8772,35 +8683,21 @@ mod layout_tests {
     }
 
     #[test]
-    fn device_labels_follow_backend_capabilities() {
-        let mut config = AppConfig {
-            selected_default_model: "faster_whisper_tiny_en".to_owned(),
-            ..AppConfig::default()
-        };
-        let faster_whisper = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "faster_whisper_tiny_en")
-            .unwrap();
+    fn normalized_descriptors_expose_only_evidence_backed_device_capabilities() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let descriptors = service.model_descriptors();
 
-        assert_eq!(model_device_label(&faster_whisper), "CPU/GPU");
-        assert!(selected_model_device_support(&config).supports_gpu());
-
-        config.selected_default_model = "vosk_small_en".to_owned();
-        let vosk = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "vosk_small_en")
-            .unwrap();
-
-        assert_eq!(model_device_label(&vosk), "CPU");
-        assert!(!selected_model_device_support(&config).supports_gpu());
-
-        config.selected_default_model = "whisper_cpp_base_en".to_owned();
-        let whisper = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .unwrap();
-        assert_eq!(model_device_label(&whisper), "CPU");
-        assert!(!selected_model_device_support(&config).supports_gpu());
+        assert!(!descriptors.is_empty());
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor.capabilities.cpu)
+        );
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| !descriptor.capabilities.gpu)
+        );
     }
 
     #[test]

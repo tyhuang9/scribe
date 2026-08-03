@@ -227,7 +227,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
 const MODELS: &[ModelManifest] = &[
     whisper_manifest(
         "whisper_cpp_tiny_en",
-        "Fast English",
+        "English Tiny",
         ModelGuidance {
             description: "Small local English model for low-resource machines.",
             storage: "~75 MB",
@@ -242,7 +242,7 @@ const MODELS: &[ModelManifest] = &[
     ),
     whisper_manifest(
         "whisper_cpp_base_en",
-        "Balanced English",
+        "English Base",
         ModelGuidance {
             description: "Local English model with a balanced speed and quality profile.",
             storage: "~150 MB",
@@ -257,7 +257,7 @@ const MODELS: &[ModelManifest] = &[
     ),
     whisper_manifest(
         "whisper_cpp_small_en",
-        "Accurate English",
+        "English Small",
         ModelGuidance {
             description: "More accurate local English model for longer dictation and clean audio.",
             storage: "~470 MB",
@@ -272,7 +272,7 @@ const MODELS: &[ModelManifest] = &[
     ),
     whisper_manifest(
         "whisper_cpp_medium_en",
-        "Highest accuracy English",
+        "English Medium",
         ModelGuidance {
             description: "Higher-accuracy local English model for machines with more memory.",
             storage: "~1.5 GB",

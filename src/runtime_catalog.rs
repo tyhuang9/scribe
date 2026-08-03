@@ -7,10 +7,6 @@ pub enum DeviceSupport {
 }
 
 impl DeviceSupport {
-    pub fn supports_gpu(self) -> bool {
-        matches!(self, Self::CpuAndGpu)
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::CpuOnly => "CPU",

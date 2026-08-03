@@ -9,11 +9,86 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config;
+use crate::config::AppConfig;
 use crate::models::{
     SttModelInfo, sherpa_model_download_url, vosk_model_download_url, whisper_cpp_download_url,
 };
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+pub(crate) fn download_configured_model(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    destination: &Path,
+    expected_total_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+    progress: &dyn Fn(ModelDownloadProgress),
+) -> Result<PathBuf, String> {
+    let download_model = model
+        .download_model
+        .as_deref()
+        .ok_or_else(|| format!("{} does not have a supported download", model.name))?;
+    match model.backend.as_str() {
+        "whisper.cpp" => download_whisper_cpp_model(
+            download_model,
+            destination,
+            &model.id,
+            expected_total_bytes,
+            expected_sha256,
+            progress,
+        ),
+        "faster-whisper" => {
+            let runtime = crate::stt::faster_whisper::resolve_faster_whisper_executable(config)
+                .ok_or_else(|| {
+                    "Install the faster-whisper compatibility runtime before downloading this model."
+                        .to_owned()
+                })?;
+            download_faster_whisper_model(
+                &runtime,
+                download_model,
+                destination,
+                &model.id,
+                expected_total_bytes,
+                progress,
+            )
+        }
+        "Vosk" => {
+            let runtime = crate::stt::vosk::resolve_vosk_executable(config).ok_or_else(|| {
+                "Install the Vosk compatibility runtime before downloading this model.".to_owned()
+            })?;
+            download_vosk_model(
+                &runtime,
+                download_model,
+                destination,
+                &model.id,
+                expected_total_bytes,
+                progress,
+            )
+        }
+        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
+            let runtime =
+                crate::stt::sherpa_onnx::resolve_executable_for_backend(config, &model.backend)
+                    .ok_or_else(|| {
+                        format!(
+                            "Install the {} compatibility runtime before downloading this model.",
+                            model.backend
+                        )
+                    })?;
+            download_sherpa_model(
+                &runtime,
+                model,
+                download_model,
+                destination,
+                &model.id,
+                expected_total_bytes,
+                progress,
+            )
+        }
+        backend => Err(format!(
+            "Managed downloader for compatibility provider {backend} is not available."
+        )),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelDownloadProgress {

@@ -30,12 +30,6 @@ pub struct SttProviderAdapter {
     pub device_detection_supported: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeDevice {
-    pub id: String,
-    pub name: String,
-}
-
 pub fn provider_adapters() -> &'static [SttProviderAdapter] {
     static PROVIDER_ADAPTERS: OnceLock<Vec<SttProviderAdapter>> = OnceLock::new();
     PROVIDER_ADAPTERS.get_or_init(|| {
@@ -104,10 +98,6 @@ impl SttProviderAdapter {
 
     pub fn can_uninstall_model(self, model: &SttModelInfo) -> bool {
         model.install_status == ModelInstallStatus::Installed
-    }
-
-    pub fn detect_devices(self, _config: &AppConfig) -> Vec<RuntimeDevice> {
-        Vec::new()
     }
 }
 
