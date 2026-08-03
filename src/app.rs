@@ -23,12 +23,15 @@ use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
 use crate::models::{
-    ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptResult, TranscriptionStatus,
-    format_bytes,
+    ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
 };
 use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
+use crate::transcription::{
+    RequestId, SessionId, TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest,
+    TranscriptionService,
+};
 use crate::tray::{TrayCommand, TrayService};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
@@ -83,12 +86,18 @@ enum TriggerObservation {
 }
 
 struct ActiveRecording {
+    session_id: SessionId,
     session: RecordingSession,
     source: RecordingSource,
     stop_requested: bool,
     started_at: Instant,
     max_duration_seconds: u32,
     latency: LatencyTrace,
+}
+
+struct PlaygroundRunState {
+    pending_requests: HashMap<RequestId, String>,
+    audio_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,11 +254,15 @@ enum PlaygroundAction {
 enum AppEvent {
     TranscriptionDone {
         source: RecordingSource,
-        result: TranscriptResult,
+        session_id: SessionId,
+        request_id: RequestId,
+        result: Box<TranscriptionOutcome>,
         latency: Option<LatencyTrace>,
     },
     TranscriptionFailed {
         source: RecordingSource,
+        session_id: SessionId,
+        request_id: RequestId,
         model_id: String,
         message: String,
         latency: Option<LatencyTrace>,
@@ -1014,6 +1027,12 @@ pub struct LocalTranscriberApp {
     playground_ranking_mode: RankingMode,
     playground_pending: usize,
     playground_audio_path: Option<PathBuf>,
+    next_session_id: u64,
+    next_request_id: u64,
+    active_transcription_session: Option<SessionId>,
+    active_transcription_request: Option<RequestId>,
+    active_playground_session: Option<SessionId>,
+    playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
@@ -1068,6 +1087,12 @@ impl LocalTranscriberApp {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
+            next_session_id: 1,
+            next_request_id: 1,
+            active_transcription_session: None,
+            active_transcription_request: None,
+            active_playground_session: None,
+            playground_runs: HashMap::new(),
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
@@ -1252,6 +1277,24 @@ impl LocalTranscriberApp {
         self.start_recording_at(source, Instant::now(), TriggerObservation::AppAction);
     }
 
+    fn allocate_session_id(&mut self) -> SessionId {
+        let session_id = SessionId(self.next_session_id);
+        self.next_session_id = self
+            .next_session_id
+            .checked_add(1)
+            .expect("session identifier space exhausted");
+        session_id
+    }
+
+    fn allocate_request_id(&mut self) -> RequestId {
+        let request_id = RequestId(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("request identifier space exhausted");
+        request_id
+    }
+
     fn start_recording_at(
         &mut self,
         source: RecordingSource,
@@ -1289,14 +1332,32 @@ impl LocalTranscriberApp {
             self.reset_playground_for_run();
         }
 
+        let session_id = self.allocate_session_id();
+
         match audio::start_recording(
             self.config.max_recording_seconds,
             self.config.audio_input_device_name.clone(),
         ) {
             Ok(session) => {
+                match source {
+                    RecordingSource::Transcribe => {
+                        self.active_playground_session = None;
+                        self.playground_pending = 0;
+                        self.playground_audio_path = None;
+                        self.refresh_playground_runtime_statuses();
+                        self.active_transcription_session = Some(session_id);
+                        self.active_transcription_request = None;
+                    }
+                    RecordingSource::Playground => {
+                        self.active_transcription_session = None;
+                        self.active_transcription_request = None;
+                        self.active_playground_session = Some(session_id);
+                    }
+                }
                 latency.recorder_started_at = Some(Instant::now());
                 let path = session.audio_path.display().to_string();
                 self.active_recording = Some(ActiveRecording {
+                    session_id,
                     session,
                     source,
                     stop_requested: false,
@@ -1350,10 +1411,10 @@ impl LocalTranscriberApp {
             active
                 .session
                 .try_finish()
-                .map(|result| (active.source, result))
+                .map(|result| (active.source, active.session_id, result))
         });
 
-        if let Some((source, result)) = finished {
+        if let Some((source, session_id, result)) = finished {
             let mut active = self
                 .active_recording
                 .take()
@@ -1364,15 +1425,30 @@ impl LocalTranscriberApp {
                     self.status = TranscriptionStatus::Transcribing;
                     self.status_message = format!("Transcribing {}", audio_path.display());
                     match source {
-                        RecordingSource::Transcribe => {
-                            self.dispatch_default_transcription(audio_path, active.latency)
-                        }
+                        RecordingSource::Transcribe => self.dispatch_default_transcription(
+                            session_id,
+                            audio_path,
+                            active.latency,
+                        ),
                         RecordingSource::Playground => {
-                            self.dispatch_playground_transcriptions(audio_path)
+                            self.dispatch_playground_transcriptions(session_id, audio_path)
                         }
                     }
                 }
                 Err(message) => {
+                    match source {
+                        RecordingSource::Transcribe => {
+                            if self.active_transcription_session == Some(session_id) {
+                                self.active_transcription_session = None;
+                                self.active_transcription_request = None;
+                            }
+                        }
+                        RecordingSource::Playground => {
+                            if self.active_playground_session == Some(session_id) {
+                                self.active_playground_session = None;
+                            }
+                        }
+                    }
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Recording failed: {message}");
                 }
@@ -1477,22 +1553,118 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn transcription_event_is_current(
+        &self,
+        source: RecordingSource,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> bool {
+        match source {
+            RecordingSource::Transcribe => {
+                self.active_playground_session.is_none()
+                    && self.active_transcription_session == Some(session_id)
+                    && self.active_transcription_request == Some(request_id)
+            }
+            RecordingSource::Playground => {
+                self.active_transcription_session.is_none()
+                    && self.active_playground_session == Some(session_id)
+                    && self
+                        .playground_runs
+                        .get(&session_id)
+                        .is_some_and(|run| run.pending_requests.contains_key(&request_id))
+            }
+        }
+    }
+
+    fn expected_playground_model_id(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> Option<&str> {
+        self.playground_runs
+            .get(&session_id)?
+            .pending_requests
+            .get(&request_id)
+            .map(String::as_str)
+    }
+
+    fn reject_transcription_correlation(
+        &mut self,
+        source: RecordingSource,
+        session_id: SessionId,
+        request_id: RequestId,
+        message: &str,
+    ) {
+        self.status = TranscriptionStatus::Error;
+        self.status_message = message.to_owned();
+        if source == RecordingSource::Playground {
+            let expected_model_id = self
+                .expected_playground_model_id(session_id, request_id)
+                .map(str::to_owned);
+            if let Some(expected_model_id) = expected_model_id
+                && let Some(card) = self
+                    .playground_cards
+                    .iter_mut()
+                    .find(|card| card.model.id == expected_model_id)
+            {
+                card.status = ModelRuntimeStatus::Error(message.to_owned());
+                card.transcript.clear();
+                card.latency_ms = None;
+            }
+        }
+    }
+
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::TranscriptionDone {
                     source,
+                    session_id,
+                    request_id,
                     result,
                     latency,
                 } => {
+                    let current =
+                        self.transcription_event_is_current(source, session_id, request_id);
+                    if result.session_id != session_id || result.request_id != request_id {
+                        if current {
+                            self.reject_transcription_correlation(
+                                source,
+                                session_id,
+                                request_id,
+                                "Transcription service returned mismatched correlation IDs",
+                            );
+                        }
+                        self.cleanup_after_job(source, session_id, request_id);
+                        continue;
+                    }
+                    if !current {
+                        self.cleanup_after_job(source, session_id, request_id);
+                        continue;
+                    }
+                    if source == RecordingSource::Playground
+                        && self.expected_playground_model_id(session_id, request_id)
+                            != Some(result.model_id.as_str())
+                    {
+                        self.reject_transcription_correlation(
+                            source,
+                            session_id,
+                            request_id,
+                            "Transcription service returned the wrong model for a Playground request",
+                        );
+                        self.cleanup_after_job(source, session_id, request_id);
+                        continue;
+                    }
+
                     let mut latency = latency.map(|mut latency| {
                         latency.ui_result_at = Some(Instant::now());
                         latency
                     });
                     match source {
                         RecordingSource::Transcribe => {
-                            let segment_count = result.segments.len();
+                            let segment_count = result.transcript.segments.len();
                             let timed_segments = result
+                                .transcript
                                 .segments
                                 .iter()
                                 .filter(|segment| {
@@ -1500,19 +1672,20 @@ impl LocalTranscriberApp {
                                 })
                                 .count();
                             let segment_text_bytes = result
+                                .transcript
                                 .segments
                                 .iter()
                                 .map(|segment| segment.text.len())
                                 .sum::<usize>();
                             let stdout_bytes = result.stdout.len();
                             let stderr_bytes = result.stderr.len();
-                            self.transcript = result.text.clone();
+                            self.transcript = result.transcript.text.clone();
                             self.status = TranscriptionStatus::Idle;
                             let completion_message = format!(
                                 "{} via {} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
                                 result.model_name,
-                                result.backend,
-                                result.duration_ms.unwrap_or_default(),
+                                result.backend_label,
+                                result.processing_duration_ms.unwrap_or_default(),
                                 segment_count,
                                 timed_segments,
                                 segment_text_bytes,
@@ -1544,17 +1717,36 @@ impl LocalTranscriberApp {
                             self.latest_latency = latency;
                         }
                         RecordingSource::Playground => {
-                            self.apply_playground_result(result);
+                            self.apply_playground_result(*result);
                         }
                     }
-                    self.cleanup_after_job(source);
+                    self.cleanup_after_job(source, session_id, request_id);
                 }
                 AppEvent::TranscriptionFailed {
                     source,
+                    session_id,
+                    request_id,
                     model_id,
                     message,
                     latency,
                 } => {
+                    if !self.transcription_event_is_current(source, session_id, request_id) {
+                        self.cleanup_after_job(source, session_id, request_id);
+                        continue;
+                    }
+                    if source == RecordingSource::Playground
+                        && self.expected_playground_model_id(session_id, request_id)
+                            != Some(model_id.as_str())
+                    {
+                        self.reject_transcription_correlation(
+                            source,
+                            session_id,
+                            request_id,
+                            "Transcription service returned the wrong model for a Playground request",
+                        );
+                        self.cleanup_after_job(source, session_id, request_id);
+                        continue;
+                    }
                     if let Some(mut latency) = latency {
                         latency.ui_result_at = Some(Instant::now());
                         self.latest_latency = Some(latency);
@@ -1565,6 +1757,7 @@ impl LocalTranscriberApp {
                             self.status_message = message;
                         }
                         RecordingSource::Playground => {
+                            self.status = TranscriptionStatus::Error;
                             if let Some(card) = self
                                 .playground_cards
                                 .iter_mut()
@@ -1577,7 +1770,7 @@ impl LocalTranscriberApp {
                             self.status_message = message;
                         }
                     }
-                    self.cleanup_after_job(source);
+                    self.cleanup_after_job(source, session_id, request_id);
                 }
                 AppEvent::ModelDownloadProgress {
                     model_id,
@@ -1714,9 +1907,24 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn cleanup_after_job(&mut self, source: RecordingSource) {
+    fn cleanup_after_job(
+        &mut self,
+        source: RecordingSource,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) {
         match source {
             RecordingSource::Transcribe => {
+                if self.active_transcription_session != Some(session_id)
+                    || self.active_transcription_request != Some(request_id)
+                {
+                    return;
+                }
+                self.active_transcription_session = None;
+                self.active_transcription_request = None;
+                if self.active_playground_session.is_some() {
+                    return;
+                }
                 self.status = if self.status == TranscriptionStatus::Error {
                     TranscriptionStatus::Error
                 } else {
@@ -1724,32 +1932,83 @@ impl LocalTranscriberApp {
                 };
             }
             RecordingSource::Playground => {
-                self.playground_pending = self.playground_pending.saturating_sub(1);
-                if self.playground_pending == 0 {
-                    self.status = TranscriptionStatus::Idle;
-                    self.status_message = "Model playground finished".to_owned();
-                    if let Some(path) = self.playground_audio_path.take() {
-                        let _ = fs::remove_file(path);
+                let mut completed_audio_path = None;
+                let mut remaining = None;
+                if let Some(run) = self.playground_runs.get_mut(&session_id)
+                    && run.pending_requests.remove(&request_id).is_some()
+                {
+                    remaining = Some(run.pending_requests.len());
+                    if run.pending_requests.is_empty() {
+                        completed_audio_path = Some(run.audio_path.clone());
                     }
+                }
+
+                if completed_audio_path.is_some() {
+                    self.playground_runs.remove(&session_id);
+                }
+
+                if self.active_playground_session == Some(session_id)
+                    && let Some(remaining) = remaining
+                {
+                    self.playground_pending = remaining;
+                }
+
+                if self.active_playground_session == Some(session_id)
+                    && completed_audio_path.is_some()
+                {
+                    self.active_playground_session = None;
+                    if self.status != TranscriptionStatus::Error {
+                        self.status = TranscriptionStatus::Idle;
+                        self.status_message = "Model playground finished".to_owned();
+                    }
+                    self.playground_audio_path = None;
+                }
+
+                if let Some(path) = completed_audio_path {
+                    let _ = fs::remove_file(path);
                 }
             }
         }
     }
 
-    fn dispatch_default_transcription(&mut self, audio_path: PathBuf, mut latency: LatencyTrace) {
+    fn dispatch_default_transcription(
+        &mut self,
+        session_id: SessionId,
+        audio_path: PathBuf,
+        mut latency: LatencyTrace,
+    ) {
         let Some(model) = self.selected_model() else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "No default model selected".to_owned();
+            if self.active_transcription_session == Some(session_id) {
+                self.active_transcription_session = None;
+                self.active_transcription_request = None;
+            }
             let _ = fs::remove_file(audio_path);
             return;
         };
 
+        let request_id = self.allocate_request_id();
+        if self.active_transcription_session != Some(session_id) {
+            let _ = fs::remove_file(audio_path);
+            return;
+        }
+        self.active_transcription_request = Some(request_id);
         latency.transcription_dispatched_at = Some(Instant::now());
         let config = self.config.clone();
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            let result = stt::transcribe_with_config(&config, audio_path.clone(), model.clone());
+            let service = TranscriptionService::new(config);
+            let mut request = TranscriptionRequest::new(
+                session_id,
+                request_id,
+                audio_path.clone(),
+                model.id.clone(),
+            );
+            request.model_path = model.local_path.clone();
+            request.options = TranscriptionOptions::default();
+            let result = service.transcribe_file(request);
             let completed_at = Instant::now();
             latency.transcription_job_completed_at = Some(completed_at);
             let _ = fs::remove_file(&audio_path);
@@ -1759,13 +2018,17 @@ impl LocalTranscriberApp {
                     latency.final_text_ready_at = Some(completed_at);
                     let _ = tx.send(AppEvent::TranscriptionDone {
                         source: RecordingSource::Transcribe,
-                        result,
+                        session_id,
+                        request_id,
+                        result: Box::new(result),
                         latency: Some(latency),
                     });
                 }
                 Err(err) => {
                     let _ = tx.send(AppEvent::TranscriptionFailed {
                         source: RecordingSource::Transcribe,
+                        session_id,
+                        request_id,
                         model_id: model.id,
                         message: err.to_string(),
                         latency: Some(latency),
@@ -1775,11 +2038,21 @@ impl LocalTranscriberApp {
         });
     }
 
-    fn dispatch_playground_transcriptions(&mut self, audio_path: PathBuf) {
+    fn dispatch_playground_transcriptions(&mut self, session_id: SessionId, audio_path: PathBuf) {
         let models = self.playground_selected_models();
         if let Some(message) = self.playground_run_block_reason() {
+            if self.active_playground_session == Some(session_id) {
+                self.active_playground_session = None;
+                self.playground_pending = 0;
+                self.playground_audio_path = None;
+            }
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
+            let _ = fs::remove_file(audio_path);
+            return;
+        }
+
+        if self.active_playground_session != Some(session_id) {
             let _ = fs::remove_file(audio_path);
             return;
         }
@@ -1789,7 +2062,22 @@ impl LocalTranscriberApp {
         let audio_duration_ms = audio::wav_duration_ms(&audio_path);
         let config = self.config.clone();
 
-        for model in models {
+        let requests = models
+            .into_iter()
+            .map(|model| (self.allocate_request_id(), model))
+            .collect::<Vec<_>>();
+        self.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: requests
+                    .iter()
+                    .map(|(request_id, model)| (*request_id, model.id.clone()))
+                    .collect(),
+                audio_path: audio_path.clone(),
+            },
+        );
+
+        for (request_id, model) in requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
@@ -1807,17 +2095,26 @@ impl LocalTranscriberApp {
             let config = config.clone();
             let audio_path = audio_path.clone();
             thread::spawn(move || {
-                match stt::transcribe_with_config(&config, audio_path, model.clone()) {
+                let service = TranscriptionService::new(config);
+                let mut request =
+                    TranscriptionRequest::new(session_id, request_id, audio_path, model.id.clone());
+                request.model_path = model.local_path.clone();
+                request.options = TranscriptionOptions::default();
+                match service.transcribe_file(request) {
                     Ok(result) => {
                         let _ = tx.send(AppEvent::TranscriptionDone {
                             source: RecordingSource::Playground,
-                            result,
+                            session_id,
+                            request_id,
+                            result: Box::new(result),
                             latency: None,
                         });
                     }
                     Err(err) => {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
+                            session_id,
+                            request_id,
                             model_id: model.id,
                             message: err.to_string(),
                             latency: None,
@@ -1845,17 +2142,18 @@ impl LocalTranscriberApp {
         self.playground_audio_path = None;
     }
 
-    fn apply_playground_result(&mut self, result: TranscriptResult) {
-        let is_active_model = result.model_id == self.config.selected_default_model;
-        let transcript = result.text;
+    fn apply_playground_result(&mut self, result: TranscriptionOutcome) {
+        let is_active_model = result.model_id.as_str() == self.config.selected_default_model;
+        let duration_ms = result.processing_duration_ms;
+        let transcript = result.transcript.text;
         if let Some(card) = self
             .playground_cards
             .iter_mut()
-            .find(|card| card.model.id == result.model_id)
+            .find(|card| card.model.id == result.model_id.as_str())
         {
             card.status = ModelRuntimeStatus::Ready;
             card.transcript = transcript.clone();
-            card.latency_ms = result.duration_ms;
+            card.latency_ms = duration_ms;
         }
         if is_active_model && !self.playground_reference_user_edited {
             self.playground_reference_transcript = transcript;
@@ -6134,12 +6432,546 @@ mod layout_tests {
 
         let mut app = test_app();
         app.config.debug_mode = true;
+        let session_id = SessionId(7);
+        let request_id = RequestId(9);
+        app.active_playground_session = Some(session_id);
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(request_id, "test-model".to_owned())]),
+                audio_path: temp_path.clone(),
+            },
+        );
 
-        app.cleanup_after_job(RecordingSource::Playground);
+        app.cleanup_after_job(RecordingSource::Playground, session_id, request_id);
 
         assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn correlation_identifiers_are_monotonic() {
+        let mut app = test_app();
+
+        assert_eq!(app.allocate_session_id(), SessionId(1));
+        assert_eq!(app.allocate_session_id(), SessionId(2));
+        assert_eq!(app.allocate_request_id(), RequestId(1));
+        assert_eq!(app.allocate_request_id(), RequestId(2));
+    }
+
+    #[test]
+    fn current_normal_success_is_applied_and_completed() {
+        let mut app = test_app();
+        app.config.auto_insert_transcript = false;
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_transcription_session = Some(SessionId(1));
+        app.active_transcription_request = Some(RequestId(10));
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(1),
+                    RequestId(10),
+                    "accepted result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "accepted result");
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert!(app.status_message.contains("finished in 42 ms"));
+        assert_eq!(app.active_transcription_session, None);
+        assert_eq!(app.active_transcription_request, None);
+    }
+
+    #[test]
+    fn current_normal_failure_is_applied_and_completed() {
+        let mut app = test_app();
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_transcription_session = Some(SessionId(1));
+        app.active_transcription_request = Some(RequestId(10));
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                model_id: "whisper_cpp_base_en".to_owned(),
+                message: "runtime stopped".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(app.status_message, "runtime stopped");
+        assert_eq!(app.active_transcription_session, None);
+        assert_eq!(app.active_transcription_request, None);
+    }
+
+    #[test]
+    fn current_playground_result_finishes_and_cleans_audio_once() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "scribe-playground-current-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"wav").unwrap();
+
+        let mut app = test_app();
+        let model_id = app.playground_cards[0].model.id.clone();
+        let session_id = SessionId(3);
+        let request_id = RequestId(30);
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_playground_session = Some(session_id);
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(temp_path.clone());
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(request_id, model_id.clone())]),
+                audio_path: temp_path.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    request_id,
+                    &model_id,
+                    "accepted playground result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!temp_path.exists());
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.playground_audio_path, None);
+        assert_eq!(app.active_playground_session, None);
+        assert!(!app.playground_runs.contains_key(&session_id));
+        let card = app
+            .playground_cards
+            .iter()
+            .find(|card| card.model.id == model_id)
+            .unwrap();
+        assert_eq!(card.transcript, "accepted playground result");
+    }
+
+    #[test]
+    fn current_playground_failure_finishes_and_cleans_audio_once() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "scribe-playground-current-failure-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"wav").unwrap();
+
+        let mut app = test_app();
+        let model_id = app.playground_cards[0].model.id.clone();
+        let session_id = SessionId(4);
+        let request_id = RequestId(40);
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_playground_session = Some(session_id);
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(temp_path.clone());
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(request_id, model_id.clone())]),
+                audio_path: temp_path.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id,
+                model_id: model_id.clone(),
+                message: "expected failure".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!temp_path.exists());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert_eq!(app.status_message, "expected failure");
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.active_playground_session, None);
+        assert!(!app.playground_runs.contains_key(&session_id));
+        let card = app
+            .playground_cards
+            .iter()
+            .find(|card| card.model.id == model_id)
+            .unwrap();
+        assert_eq!(
+            card.status,
+            ModelRuntimeStatus::Error("expected failure".to_owned())
+        );
+    }
+
+    #[test]
+    fn mismatched_service_ids_are_rejected_without_output() {
+        let mut app = test_app();
+        app.config.auto_insert_transcript = false;
+        app.transcript = "preserve me".to_owned();
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_transcription_session = Some(SessionId(4));
+        app.active_transcription_request = Some(RequestId(40));
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(4),
+                request_id: RequestId(40),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(4),
+                    RequestId(41),
+                    "must not be applied",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "preserve me");
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("mismatched correlation IDs"));
+        assert_eq!(app.active_transcription_session, None);
+        assert_eq!(app.active_transcription_request, None);
+    }
+
+    #[test]
+    fn playground_correlation_error_is_not_overwritten_by_cleanup() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "scribe-playground-mismatch-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"wav").unwrap();
+        let mut app = test_app();
+        let model_id = app.playground_cards[0].model.id.clone();
+        let session_id = SessionId(5);
+        let request_id = RequestId(50);
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_playground_session = Some(session_id);
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(temp_path.clone());
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(request_id, model_id.clone())]),
+                audio_path: temp_path.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    RequestId(51),
+                    &model_id,
+                    "must not be applied",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!temp_path.exists());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("mismatched correlation IDs"));
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.active_playground_session, None);
+        let card = app
+            .playground_cards
+            .iter()
+            .find(|card| card.model.id == model_id)
+            .unwrap();
+        assert!(matches!(card.status, ModelRuntimeStatus::Error(_)));
+    }
+
+    #[test]
+    fn playground_wrong_model_result_is_rejected() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "scribe-playground-wrong-model-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"wav").unwrap();
+        let mut app = test_app();
+        let expected_model_id = app.playground_cards[0].model.id.clone();
+        let session_id = SessionId(6);
+        let request_id = RequestId(60);
+        app.status = TranscriptionStatus::Transcribing;
+        app.active_playground_session = Some(session_id);
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(temp_path.clone());
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(request_id, expected_model_id.clone())]),
+                audio_path: temp_path.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    request_id,
+                    "wrong-model",
+                    "must not be applied",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!temp_path.exists());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("wrong model"));
+        let card = app
+            .playground_cards
+            .iter()
+            .find(|card| card.model.id == expected_model_id)
+            .unwrap();
+        assert!(matches!(card.status, ModelRuntimeStatus::Error(_)));
+        assert!(card.transcript.is_empty());
+    }
+
+    #[test]
+    fn stale_normal_events_cannot_replace_text_or_status() {
+        let mut app = test_app();
+        app.transcript = "newer transcript".to_owned();
+        app.status = TranscriptionStatus::Listening;
+        app.status_message = "newer session is listening".to_owned();
+        app.active_transcription_session = Some(SessionId(2));
+        app.active_transcription_request = Some(RequestId(20));
+
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(1),
+                    RequestId(10),
+                    "obsolete success",
+                )),
+                latency: None,
+            })
+            .unwrap();
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(1),
+                request_id: RequestId(11),
+                model_id: "whisper_cpp_base_en".to_owned(),
+                message: "obsolete failure".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "newer transcript");
+        assert_eq!(app.status, TranscriptionStatus::Listening);
+        assert_eq!(app.status_message, "newer session is listening");
+        assert_eq!(app.active_transcription_session, Some(SessionId(2)));
+        assert_eq!(app.active_transcription_request, Some(RequestId(20)));
+    }
+
+    #[test]
+    fn cross_source_completion_cannot_overwrite_the_newer_session() {
+        let mut app = test_app();
+        app.transcript = "preserve me".to_owned();
+        app.status = TranscriptionStatus::Listening;
+        app.status_message = "Playground is listening".to_owned();
+        app.active_transcription_session = Some(SessionId(1));
+        app.active_transcription_request = Some(RequestId(10));
+        app.active_playground_session = Some(SessionId(2));
+
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(1),
+                    RequestId(10),
+                    "obsolete normal result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(app.transcript, "preserve me");
+        assert_eq!(app.status, TranscriptionStatus::Listening);
+        assert_eq!(app.status_message, "Playground is listening");
+        assert_eq!(app.active_playground_session, Some(SessionId(2)));
+    }
+
+    #[test]
+    fn stale_playground_completion_cannot_overwrite_newer_normal_session() {
+        let stale_audio = std::env::temp_dir().join(format!(
+            "scribe-playground-superseded-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&stale_audio, b"wav").unwrap();
+        let mut app = test_app();
+        app.transcript = "preserve me".to_owned();
+        app.status = TranscriptionStatus::Listening;
+        app.status_message = "Normal dictation is listening".to_owned();
+        app.active_transcription_session = Some(SessionId(2));
+        app.active_transcription_request = Some(RequestId(20));
+        app.playground_runs.insert(
+            SessionId(1),
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(
+                    RequestId(10),
+                    "whisper_cpp_base_en".to_owned(),
+                )]),
+                audio_path: stale_audio.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(1),
+                    RequestId(10),
+                    "obsolete playground result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!stale_audio.exists());
+        assert_eq!(app.transcript, "preserve me");
+        assert_eq!(app.status, TranscriptionStatus::Listening);
+        assert_eq!(app.status_message, "Normal dictation is listening");
+        assert_eq!(app.active_transcription_session, Some(SessionId(2)));
+        assert_eq!(app.active_transcription_request, Some(RequestId(20)));
+
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Playground,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                model_id: "whisper_cpp_base_en".to_owned(),
+                message: "obsolete playground failure".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(app.transcript, "preserve me");
+        assert_eq!(app.status, TranscriptionStatus::Listening);
+        assert_eq!(app.status_message, "Normal dictation is listening");
+    }
+
+    #[test]
+    fn stale_playground_result_cleans_only_its_own_audio() {
+        let old_audio = std::env::temp_dir().join(format!(
+            "scribe-playground-stale-old-{}.wav",
+            std::process::id()
+        ));
+        let current_audio = std::env::temp_dir().join(format!(
+            "scribe-playground-stale-current-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&old_audio, b"old wav").unwrap();
+        fs::write(&current_audio, b"current wav").unwrap();
+
+        let mut app = test_app();
+        app.playground_cards[0].transcript = "current result".to_owned();
+        app.playground_cards[0].status = ModelRuntimeStatus::Running;
+        app.active_playground_session = Some(SessionId(2));
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(current_audio.clone());
+        app.playground_runs.insert(
+            SessionId(1),
+            PlaygroundRunState {
+                pending_requests: HashMap::from([
+                    (RequestId(10), "whisper_cpp_base_en".to_owned()),
+                    (RequestId(11), "whisper_cpp_base_en".to_owned()),
+                ]),
+                audio_path: old_audio.clone(),
+            },
+        );
+        app.playground_runs.insert(
+            SessionId(2),
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(
+                    RequestId(20),
+                    "whisper_cpp_base_en".to_owned(),
+                )]),
+                audio_path: current_audio.clone(),
+            },
+        );
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id: SessionId(1),
+                request_id: RequestId(10),
+                result: Box::new(test_transcription_outcome(
+                    SessionId(1),
+                    RequestId(10),
+                    "obsolete playground result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(old_audio.exists());
+        assert_eq!(app.playground_runs[&SessionId(1)].pending_requests.len(), 1);
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Playground,
+                session_id: SessionId(1),
+                request_id: RequestId(11),
+                model_id: "whisper_cpp_base_en".to_owned(),
+                message: "obsolete playground failure".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(!old_audio.exists());
+        assert!(current_audio.exists());
+        assert!(!app.playground_runs.contains_key(&SessionId(1)));
+        assert!(app.playground_runs.contains_key(&SessionId(2)));
+        assert_eq!(app.playground_pending, 1);
+        assert_eq!(app.playground_audio_path, Some(current_audio.clone()));
+        assert_eq!(app.playground_cards[0].transcript, "current result");
+        assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
+
+        fs::remove_file(current_audio).unwrap();
     }
 
     #[test]
@@ -6576,10 +7408,48 @@ mod layout_tests {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
+            next_session_id: 1,
+            next_request_id: 1,
+            active_transcription_session: None,
+            active_transcription_request: None,
+            active_playground_session: None,
+            playground_runs: HashMap::new(),
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
             quit_requested: false,
+        }
+    }
+
+    fn test_transcription_outcome(
+        session_id: SessionId,
+        request_id: RequestId,
+        text: &str,
+    ) -> TranscriptionOutcome {
+        test_transcription_outcome_for_model(session_id, request_id, "whisper_cpp_base_en", text)
+    }
+
+    fn test_transcription_outcome_for_model(
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &str,
+        text: &str,
+    ) -> TranscriptionOutcome {
+        TranscriptionOutcome {
+            session_id,
+            request_id,
+            model_id: model_id.into(),
+            model_name: "whisper.cpp base.en".to_owned(),
+            backend_label: "whisper.cpp".to_owned(),
+            transcript: crate::transcription::Transcript {
+                text: text.to_owned(),
+                segments: Vec::new(),
+                detected_language: None,
+                duration_ms: None,
+            },
+            stdout: String::new(),
+            stderr: String::new(),
+            processing_duration_ms: Some(42),
         }
     }
 
