@@ -1,6 +1,6 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 1 matrix (2026-08-03). No manual desktop, microphone,
+**Status:** living Phase 2 matrix (2026-08-03). No manual desktop, microphone,
 model-runtime, tray, hotkey, or paste test was executed during the Phase 0/1
 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
@@ -68,6 +68,23 @@ do not prove that a real microphone/runtime/target application works on a
 desktop. Execute `REC-04`, `STT-01`, `STT-02`, `STT-05`, and `OUT-01` manually
 on Windows before treating the wrapped path as release-verified.
 
+## Automated Phase 2 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS — 222 discovered, 218 passed, 0 failed, 4 ignored environment-required tests |
+| Debug native fixture | ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` with pinned v1.9.1 package, base.en, and JFK WAV | PASS — non-empty final text, CPU resolution, cold model load, then retained warm reuse |
+| Native latency benchmark | ignored `native_runtime_jfk_cold_and_warm_benchmark` | PASS — five cold and 20 warm runs; cold total median/p95 1,172/1,188 ms; warm 785/798 ms |
+| Release build/package | `cargo build --release --all-features`; verified PowerShell bundle script | PASS — release package staged only after exact size/SHA-256 validation |
+| Release native fixture | release ignored service smoke against `target/release/runtimes/whisper_cpp` | PASS |
+| Runtime boundary/integrity | boundary scan, tampered-file rejection, manifest/hash tests, GPU resolution tests | PASS |
+
+These results verify one Windows CPU runtime/model fixture in-process. They do
+not verify a live desktop, microphone, hotkey, overlay, target window, paste,
+memory/idle CPU, Unicode model path, cancellation, or any other model. All
+manual rows remain NOT VERIFIED.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -112,12 +129,12 @@ on Windows before treating the wrapped path as release-verified.
 | --- | --- | --- | --- | --- | --- |
 | STT-01 | Win/Linux/macOS | P1, P2, P3, P4 | Install/select the known-good model; transcribe fixture through the normal flow. | Non-empty final transcript appears, backend/model identity is visible in diagnostics, and exactly one finalized output is produced. | **NOT VERIFIED** |
 | STT-02 | Win/Linux/macOS | P1, P2, P3 | Run the same WAV in Playground for every installed/ready model. | Each selected ready model completes independently; missing runtime/model blocks only that card with repair guidance. | **NOT VERIFIED** |
-| STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle. | Current batch runtime behavior is stable; record cold/warm state and process startup time. Model warm retention is a future feature. | **NOT VERIFIED** |
+| STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | Windows primary runtime reports immediate warm reuse, then lazily unloads/reloads after the five-minute TTL; other platforms preserve the compatibility path. Record load/decode metrics. | **NOT VERIFIED** |
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | No child process is started; actionable status identifies what to install/repair; no paste occurs. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Kill the short-lived runtime process or force a non-zero exit during transcription. | Failure is surfaced, app returns to Idle/Error, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | If a model advertises streaming, observe transcript while speaking; otherwise record that only final batch text appears. | Current baseline is expected to be final-only; do not claim first-partial/streaming support without evidence. | **NOT VERIFIED** |
-| STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/Prefer GPU/CPU-only performance mode where supported; run fixture on each available mode. | Requested mode is honored or rejected with a clear message; record resolved backend/device and errors. | **NOT VERIFIED** |
+| STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
 
 ## Output, clipboard, and target safety
 
