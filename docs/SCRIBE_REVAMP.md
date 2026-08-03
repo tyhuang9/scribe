@@ -941,7 +941,7 @@ Final Phase 4 verification on 2026-08-03:
 | Format | `cargo fmt --all -- --check` | PASS |
 | Compile | `cargo check --all-targets --all-features` | PASS |
 | Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
-| Tests | `cargo test --all-targets --all-features` | PASS: 282 discovered, 277 passed, 0 failed, 5 environment-required ignored |
+| Tests | `cargo test --all-targets --all-features` | PASS: 283 discovered, 278 passed, 0 failed, 5 environment-required ignored |
 | Debug build | `cargo build --all-features` | PASS |
 | Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary test | PASS: one logical handler; normalized service/router boundary retained |
 

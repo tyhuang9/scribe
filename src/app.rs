@@ -1228,6 +1228,9 @@ impl LocalTranscriberApp {
     }
 
     fn effective_status(&self) -> TranscriptionStatus {
+        if self.status == TranscriptionStatus::Error {
+            return TranscriptionStatus::Error;
+        }
         match self.session_coordinator.phase() {
             DictationPhase::StartingCapture | DictationPhase::Capturing => {
                 TranscriptionStatus::Listening
@@ -7358,6 +7361,22 @@ mod layout_tests {
         assert_eq!(app.playground_audio_path, None);
         assert!(!audio.exists());
         assert_ne!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
+    }
+
+    #[test]
+    fn active_session_does_not_hide_an_actionable_error_badge() {
+        let mut app = test_app();
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(8),
+            RequestId(80),
+            "whisper_cpp_base_en",
+        );
+        app.status = TranscriptionStatus::Error;
+        app.status_message = "Failed to save settings".to_owned();
+
+        assert_eq!(app.effective_status(), TranscriptionStatus::Error);
     }
 
     #[test]
