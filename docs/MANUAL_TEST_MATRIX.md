@@ -1,7 +1,7 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 3 matrix (2026-08-03). No manual desktop, microphone,
-model-runtime, tray, hotkey, or paste test was executed during the Phase 0-3
+**Status:** living Phase 4 matrix (2026-08-03). No manual desktop, microphone,
+model-runtime, tray, hotkey, or paste test was executed during the Phase 0-4
 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
@@ -102,6 +102,22 @@ These automated results verify catalog truthfulness and retain the Phase 2
 primary vertical runtime slice. They do not promote a model, prove live desktop
 behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 
+## Automated Phase 4 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 281 discovered, 276 passed, 0 failed, 5 ignored environment-required tests |
+| Session authority | Coordinator transition, stop-priority, cancellation, correlation, stale/duplicate/out-of-order, preload, comparison, and exactly-once output gates | PASS |
+| Settings durability | Legacy/missing/invalid/truncated/future inputs; field salvage; unknown-field round trip; corrupt and rollback backup; debounce; injected atomic failure; transactional save ordering | PASS |
+| Cancellation/privacy | Pre-dispatch cancellation ticket; stale-registration rejection; Windows Job Object/Unix process-group tree termination; bounded registry drain; recorder shutdown and PCM deletion; failed-start cleanup; Unix private-file setup | PASS automated paths; live microphone/process-exit behavior remains NOT VERIFIED |
+| Architecture boundary | Rust boundary tests and `wsl.exe python3 scripts/check-catalog-boundaries.py` | PASS - exactly one logical handler; concrete selection remains private to the router |
+
+Phase 4 automated tests prove state and persistence behavior under deterministic
+inputs. They do not prove real desktop focus, microphone driver shutdown,
+process termination during OS shutdown, or live paste behavior. Those rows
+remain NOT VERIFIED.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -119,7 +135,7 @@ behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | UI-01 | Win/Linux/macOS | P1 | Launch Scribe; visit each current page (Transcribe, Models, Playground, Settings); close and relaunch. | Window opens without panic; page navigation and close/reopen behavior are stable. Capture startup log/screenshot. | **NOT VERIFIED** |
-| UI-02 | Win/Linux/macOS | P1, P7 | Change a setting, restart, and inspect the value. Then load a config with one unknown/invalid field in the isolated data dir. | Valid settings persist; invalid data does not erase all valid settings; user receives actionable recovery. **Target behavior is not implemented yet.** | **NOT VERIFIED** |
+| UI-02 | Win/Linux/macOS | P1, P7 | Change a setting, restart, and inspect the value. Then load a config with one unknown/invalid field in the isolated data dir. | Valid settings persist; invalid data does not erase all valid settings; the original is backed up before a lossy salvage. Automated migration tests pass; verify the desktop-visible recovery behavior here. | **NOT VERIFIED** |
 | UI-03 | Win/Linux/macOS | P1 | Toggle theme/performance/audio/input settings available in the current build; verify labels and disabled states. | Controls are keyboard reachable, labels are understandable, and unavailable runtime actions explain why. | **NOT VERIFIED** |
 | UI-04 | Win/Linux/macOS | P1 | If tray is supported, hide window, open tray menu, Show, Hide, Start/Stop Recording, Copy Last Transcript, Quit. | Tray commands affect the app exactly once; Quit exits; no duplicate recording. Capture tray menu and status. | **NOT VERIFIED** |
 | UI-05 | Linux (X11/Wayland) | P1, P6 | Run once with tray/hotkey defaults and once with explicit `SCRIBE_ENABLE_GLOBAL_HOTKEY=1`; try `SCRIBE_DISABLE_TRAY=1`. | Unsupported session paths fail visibly and main window remains usable; no silent process exit. | **NOT VERIFIED** |
@@ -139,7 +155,7 @@ behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 | REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and temporary recording directory. | Capture begins after stream start, WAV finalizes, transcription starts, and temporary file cleanup follows current policy. Capture exact latency phases. | **NOT VERIFIED** |
 | REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture. | Microphone failure is visible, no hang occurs, and app returns to a valid Idle/Error state without paste. | **NOT VERIFIED** |
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
-| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists); immediately start another normal or Playground session. | Cancel never pastes; pending work is cleaned up; the implemented session/request checks reject stale completion without overwriting the next session. Native abort is automated, but the live coordinator path still requires this manual check. | **NOT VERIFIED** |
+| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization; immediately start another normal or Playground session; repeat once through tray Quit. | Cancel never pastes; native and transitional work acknowledges cancellation; pending PCM is deleted; stale completion cannot overwrite the next session. Coordinator/process/cleanup paths are automated, but the live path still requires this check. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 
@@ -176,7 +192,7 @@ behavior, or satisfy native streaming. All manual rows remain NOT VERIFIED.
 | DL-03 | Win/Linux/macOS | P1, disposable data dir, network | Interrupt extraction/installation; restart app. | Staging is cleaned or safely quarantined; previous known-good install remains usable. | **NOT VERIFIED** |
 | DL-04 | Win/Linux/macOS | P1, disposable data dir | Install runtime, remove it while no transcription is running, then try a model. | Runtime status transitions are visible; removal does not delete unrelated models; repair action is offered. | **NOT VERIFIED** |
 | SET-01 | Win/Linux/macOS | P1, P7 | Edit hotkey, recording mode, active model, microphone, performance mode, theme, and auto-insert; restart. | Values persist with no silent reset; invalid values are rejected or salvaged. | **NOT VERIFIED** |
-| SET-02 | Win/Linux/macOS | P1, P7 | Copy the config aside, corrupt one field/file, launch, then inspect backup/recovery. | Valid fields survive; corrupt file is backed up before defaults are regenerated. **Target migration behavior is not implemented yet.** | **NOT VERIFIED** |
+| SET-02 | Win/Linux/macOS | P1, P7 | Copy the config aside, corrupt one field/file, launch, then inspect backup/recovery. Repeat with a valid legacy flat config. | Valid fields survive; corrupt input receives a timestamped backup; legacy input receives a pre-migration backup; future root/section/install fields survive the rewrite. | **NOT VERIFIED** |
 | PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect current data directory after successful and failed transcription. | Current baseline removes temporary WAV after jobs and stores latest transcript in memory; durable history/audio retention is a future feature. Record actual files without exposing transcript content. | **NOT VERIFIED** |
 | PRIV-02 | Win/Linux/macOS | P1, P7 | If a later build exposes history modes, exercise Off, Transcript only, and Transcript + audio; pin one entry and clear unpinned. | Audio is off by default, pinned entries survive cleanup, and delete-audio does not delete transcript metadata. | **NOT VERIFIED** |
 | RECOV-01 | Win/Linux/macOS | P1, P2, P3 | Force microphone, runtime, output, and config failures one at a time; start a fresh dictation after each. | Each failure has a user-facing stage/message, no stale result leaks into the next run, and Idle is recoverable. | **NOT VERIFIED** |

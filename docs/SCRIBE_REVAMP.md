@@ -1,6 +1,6 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 3 implemented on its stacked branch (2026-08-03). This document
+**Status:** Phase 4 implemented on its stacked branch (2026-08-03). This document
 preserves the Phase 0 audit and records each implemented phase against the
 consolidated revamp plan. It does not claim that uncompleted later phases are
 implemented.
@@ -319,7 +319,7 @@ streaming mode, cold/warm state, and fixture checksum alongside each sample.
 | --- | --- | --- | --- |
 | Runtime/model compatibility is aspirational | **High** | No transcribe-cpp/ORT dependency or curated load/transcribe smoke evidence exists; current model labels are not proof of support. | Pin runtime/artifact revisions; run contract and platform matrix; leave entries Experimental/Incompatible until evidence passes. |
 | Audio callback can block on a mutexed WAV writer | **High** | `src/audio.rs` writes through `Arc<Mutex<Option<WavWriter>>>` in the cpal callback. | Move capture to a bounded native queue/ring buffer and keep filesystem/model work off the callback. |
-| Phase 0 sessions were not correlated; facade-level issue resolved in Phase 1 | **Low** remaining | Phase 1 adds session/request IDs, cross-source supersession, model correlation, and stale-event rejection before output. The authoritative coordinator/cancellation state machine is still pending. | Preserve these guards and consolidate them into the Phase 4 coordinator before streaming work. |
+| Phase 0 sessions were not correlated; facade-level issue resolved in Phase 1 | **Resolved in Phase 4** | The authoritative coordinator now owns one active session, legal transitions, request/model/sequence correlation, cancellation, stop priority, and terminal outcomes. | Preserve the coordinator boundary while Phase 7 begins emitting incremental updates. |
 | Output/permissions differ by desktop and target integrity | **Medium** | Enigo/clipboard behavior, Wayland restrictions, macOS Accessibility, and elevated Windows targets were not manually run. | Execute the platform matrix; capture target identity and fall back to clipboard without guessing. |
 | Download integrity and rollback are incomplete | **Medium** | Model metadata has estimated sizes but no hash/revision; current installer paths are backend-specific. | Add partial/resume, exact size/hash, staged smoke test, atomic activation, and previous-known-good rollback. |
 | Privacy/history behavior is not durable yet | **Low** | Current temporary WAV is removed after jobs and latest transcript is in memory; there is no history retention subsystem. | Default to transcript-only history, audio off, explicit retention, and startup reconciliation when history lands. |
@@ -842,3 +842,127 @@ native crash isolation is incomplete; only base.en on Windows CPU has current
 native fixture evidence; no desktop/microphone/target/paste row was executed;
 and the optional native-streaming requirement remains a concrete NO-GO until
 the Phase 7 comparator and complete candidate evidence harness exist.
+
+## Phase 4 checkpoint - authoritative sessions and typed settings
+
+Phase 4 replaces the test-only session reducer with the application authority
+and migrates the flat configuration into a durable sectioned schema. It does
+not add a runtime handler or promote a model: the application still ships
+exactly **one logical handler**, `TranscribeCppRuntime`, and all four normalized
+models remain **Experimental**.
+
+### Session coordinator and concurrent model loading
+
+`SessionCoordinator` is the sole source of truth for one active Dictation or
+Comparison session. It owns checked monotonic session/request allocation and
+the legal phase path:
+
+```text
+Idle -> StartingCapture -> Capturing -> FinalizingCapture
+     -> Transcribing -> Output -> Idle
+```
+
+Cancellation retires any active phase. Request events are accepted only when
+the session, purpose, request, model, and sequence match the current state;
+duplicates, stale completions, out-of-order updates, and wrong-model results
+fail closed. Explicit stop outranks endpoint and maximum-duration stop reasons.
+Normal output can begin only after its only final request succeeds, and the
+coordinator is completed immediately after the one output attempt. Comparison
+sessions wait for every registered request and retain request-scoped cleanup.
+
+The normal dictation path starts neutral `TranscriptionService::preload_model`
+work immediately after capture enters `Capturing`. Load completion remains
+correlated to the initiating session and model. A stale completion is ignored;
+a preload failure is non-fatal because the final service request may retry the
+same validated runtime path. This overlaps model loading with capture without
+adding an async runtime or exposing a concrete runtime above the service.
+
+Superseding a run cancels native work and registered transitional process
+trees before retiring the coordinator. An opaque service ticket captures both
+native and compatibility cancellation generations before audio preparation is
+dispatched; a request cancelled before process registration cannot start later.
+Transitional Unix children use a dedicated process group, while Windows wraps
+each child and its descendants in a kill-on-close Job Object. Quit waits a
+bounded interval for request/process registry drain and transient-audio cleanup.
+Playground state is reset before the new microphone attempt, so a
+capture-start failure cannot leave obsolete cards in Running state.
+
+### Versioned settings and recovery behavior
+
+`AppConfig` schema version 1 is split into General, Recording, Streaming,
+Output, Overlay, History, Performance, and Developer sections. Streaming,
+Overlay, and History intentionally contain only preserved extension data until
+their real Phase 5/7/10 behaviors exist; no disconnected controls or fake
+settings were added.
+
+Legacy flat keys and compatibility aliases migrate field by field. Missing or
+invalid values fall back only at the affected field, invalid managed-install
+metadata does not discard a valid record, and unknown root, section, and nested
+install fields survive round trips. A syntactically or structurally corrupt
+document is copied to a timestamped `corrupt` backup before a salvaged document
+is written. Every valid document that changes during migration receives a
+timestamped `pre-v1-migration` backup, preserving rollback to Phase 3.
+
+Normal UI edits are coalesced through an approximately 300 ms debounce. Quit
+and `on_exit` flush pending settings. Runtime activation remains transactional;
+after its immediate durable save it clears any older scheduled snapshot so the
+snapshot cannot erase new runtime metadata. Writes use a same-directory
+create-new temporary file, flush and file sync, atomic replacement, Unix parent
+sync, and bounded Windows sharing-violation retries. Unix settings directories
+and files are restricted to `0700` and `0600` respectively.
+
+### PCM lifecycle hardening at the Phase 4 boundary
+
+Phase 6 still owns the planned replacement of callback WAV writes with the
+native fixed-capacity ring. Phase 4 nevertheless closes exit-path privacy gaps
+in the inherited recorder: recordings are created with collision-resistant
+process-qualified names, `create_new`, and private Unix permissions; failed
+startup removes a partial file; Quit and `on_exit` wait up to two seconds for
+recorder finalization and delete the WAV; and startup scavenges recording files
+older than 24 hours. This is hardening of the preserved vertical slice, not a
+claim that Phase 6 native capture is complete.
+
+### Tests and measured results
+
+Phase 4 adds coverage for legal/illegal transitions, busy/overflow behavior,
+explicit-stop priority, cancellation in every phase, stale/cross-purpose/wrong
+model events, sequence and duplicate rejection, multiple comparison requests,
+preload correlation, preload dispatch during capture, settings migration and
+salvage, corrupt and pre-migration backups, future-field preservation, debounce,
+atomic replacement failure, transactional-save ordering, transitional process
+cancellation generation races, process-tree termination, bounded cancellation
+acknowledgement, Playground supersession, and recorder shutdown/deletion.
+
+Final Phase 4 verification on 2026-08-03:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format | `cargo fmt --all -- --check` | PASS |
+| Compile | `cargo check --all-targets --all-features` | PASS |
+| Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Tests | `cargo test --all-targets --all-features` | PASS: 281 discovered, 276 passed, 0 failed, 5 environment-required ignored |
+| Debug build | `cargo build --all-features` | PASS |
+| Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary test | PASS: one logical handler; normalized service/router boundary retained |
+
+No comparable before/after latency claim is made in Phase 4. The decoding path
+and fixture artifact are unchanged; the new preload overlap requires a live
+microphone/hotkey run to measure and no such desktop run was available. The
+saved Phase 0-versus-Phase 2 benchmark remains the current valid performance
+evidence.
+
+### Risks, unverified behavior, and Phase 5 entry
+
+- **Medium:** live Windows hotkey, microphone, preload overlap, cancellation,
+  target focus, and exactly-once paste remain manually unverified. Execute the
+  matrix before release claims.
+- **Medium:** Phase 6 must replace the inherited callback WAV writer; a hard
+  process termination can still leave a file newer than the 24-hour scavenger
+  threshold.
+- **Low:** two simultaneously running Scribe processes can still race whole-file
+  settings snapshots. Add single-instance enforcement or revision-aware locking
+  during platform hardening.
+- **Unverified:** no macOS/Linux compile or desktop exercise was performed in
+  this Windows checkpoint; no model compatibility status changed.
+
+Phase 5 may now consume coordinator state and typed Overlay settings while
+keeping all concrete runtime selection private to `RuntimeRouter`.
