@@ -9,6 +9,7 @@ mod models;
 mod runtime_catalog;
 mod stt;
 mod text_output;
+mod transcription;
 mod tray;
 
 use eframe::egui;
