@@ -3,59 +3,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
+#[cfg(test)]
 use crate::transcription::AccelerationPreference;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AppConfig {
-    pub selected_default_model: String,
-    #[serde(default, alias = "playground_enabled_models", alias = "enabled_models")]
-    pub playground_selected_models: Vec<String>,
-    #[serde(default)]
-    pub playground_model_order: Vec<String>,
-    #[serde(default)]
-    pub managed_models: HashMap<String, ManagedModelInstall>,
-    #[serde(default)]
-    pub managed_runtimes: HashMap<String, ManagedRuntimeInstall>,
-    pub hotkey: String,
-    #[serde(default)]
-    pub hotkey_mode: HotkeyMode,
-    pub whisper_executable_path: Option<PathBuf>,
-    #[serde(
-        default = "default_legacy_acceleration_preference",
-        alias = "whisper_compute_mode"
-    )]
-    pub acceleration_preference: AccelerationPreference,
-    #[serde(default)]
-    pub whisper_gpu_device: u32,
-    #[serde(default = "default_whisper_cuda_backend_path")]
-    pub whisper_cuda_backend_path: Option<PathBuf>,
-    #[serde(default = "default_whisper_cuda_library_paths")]
-    pub whisper_cuda_library_paths: Vec<PathBuf>,
-    #[serde(default = "default_model_storage_dir")]
-    pub model_storage_dir: PathBuf,
-    #[serde(default)]
-    pub theme_mode: ThemeMode,
-    #[serde(default)]
-    pub audio_input_device_name: Option<String>,
-    pub model_paths: HashMap<String, PathBuf>,
-    pub last_used_backend: String,
-    pub debug_mode: bool,
-    pub max_recording_seconds: u32,
-    #[serde(default = "default_true")]
-    pub close_to_tray: bool,
-    #[serde(default = "default_true")]
-    pub auto_insert_transcript: bool,
-    #[serde(default = "default_true")]
-    pub restore_clipboard_after_insert: bool,
-    #[serde(default = "default_paste_delay_ms")]
-    pub paste_delay_ms: u64,
-}
+#[path = "settings/mod.rs"]
+pub mod settings;
+
+#[allow(unused_imports)]
+pub use settings::{
+    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
+    OutputSettings, OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore,
+    StreamingSettings,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedModelInstall {
@@ -177,36 +142,6 @@ impl HotkeyMode {
     }
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            playground_selected_models: vec!["whisper_cpp_tiny_en".to_owned()],
-            playground_model_order: default_playground_model_order(),
-            managed_models: HashMap::new(),
-            managed_runtimes: HashMap::new(),
-            hotkey: "Ctrl+Shift+Space".to_owned(),
-            hotkey_mode: HotkeyMode::Toggle,
-            whisper_executable_path: None,
-            acceleration_preference: AccelerationPreference::Auto,
-            whisper_gpu_device: 0,
-            whisper_cuda_backend_path: default_whisper_cuda_backend_path(),
-            whisper_cuda_library_paths: default_whisper_cuda_library_paths(),
-            model_storage_dir: default_model_storage_dir(),
-            theme_mode: ThemeMode::Light,
-            audio_input_device_name: None,
-            model_paths: HashMap::new(),
-            last_used_backend: "whisper.cpp".to_owned(),
-            debug_mode: false,
-            max_recording_seconds: 30,
-            close_to_tray: true,
-            auto_insert_transcript: false,
-            restore_clipboard_after_insert: true,
-            paste_delay_ms: default_paste_delay_ms(),
-        }
-    }
-}
-
 pub fn project_dirs() -> Result<ProjectDirs> {
     scribe_project_dirs()
 }
@@ -255,30 +190,20 @@ fn legacy_config_file_path() -> Result<PathBuf> {
     Ok(legacy_project_dirs()?.config_dir().join("config.json"))
 }
 
-fn read_config_file(path: &PathBuf) -> Result<AppConfig> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config {}", path.display()))?;
-    serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", path.display()))
+fn read_config_file(path: &Path) -> Result<AppConfig> {
+    settings::load_from_path(path)
 }
 
 pub fn save_config(config: &AppConfig) -> Result<()> {
     let path = config_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let content = serde_json::to_string_pretty(config)?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    settings::save_to_path(&path, config)
 }
 
 pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     default_model_catalog()
         .into_iter()
         .map(|mut model| {
-            let configured_path = config.model_paths.get(&model.id).cloned();
+            let configured_path = config.general.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path = downloaded_model_path(config, &model);
             let explicit_path =
@@ -310,7 +235,7 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
 pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
     configured_models(config)
         .into_iter()
-        .find(|model| model.id == config.selected_default_model)
+        .find(|model| model.id == config.general.selected_default_model)
 }
 
 pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelInfo> {
@@ -321,10 +246,12 @@ pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelI
         .collect::<HashMap<_, _>>();
 
     config
+        .general
         .playground_model_order
         .iter()
         .filter(|id| {
             config
+                .general
                 .playground_selected_models
                 .iter()
                 .any(|selected| selected == *id)
@@ -334,10 +261,10 @@ pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelI
 }
 
 pub fn model_storage_dir(config: &AppConfig) -> PathBuf {
-    if config.model_storage_dir.as_os_str().is_empty() {
+    if config.general.model_storage_dir.as_os_str().is_empty() {
         default_model_storage_dir()
     } else {
-        config.model_storage_dir.clone()
+        config.general.model_storage_dir.clone()
     }
 }
 
@@ -349,6 +276,7 @@ pub fn runtime_storage_dir() -> PathBuf {
 
 pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
     config
+        .general
         .managed_models
         .get(&model.id)
         .map(|install| install.path.clone())
@@ -475,6 +403,7 @@ pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option
 
 pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
     config
+        .general
         .managed_runtimes
         .get(&runtime_id_for_backend(backend))
         .map(|install| install.path.clone())
@@ -493,52 +422,46 @@ pub fn normalize_config(config: &mut AppConfig) {
         .collect::<Vec<_>>();
 
     migrate_legacy_model_ids(config);
-    if config.model_storage_dir.as_os_str().is_empty() {
-        config.model_storage_dir = default_model_storage_dir();
+    if config.general.model_storage_dir.as_os_str().is_empty() {
+        config.general.model_storage_dir = default_model_storage_dir();
     }
     apply_managed_model_metadata(config);
-    if let Some(device_name) = &config.audio_input_device_name
+    if let Some(device_name) = &config.recording.audio_input_device_name
         && device_name.trim().is_empty()
     {
-        config.audio_input_device_name = None;
+        config.recording.audio_input_device_name = None;
     }
-    if config.whisper_gpu_device > 16 {
-        config.whisper_gpu_device = 0;
+    if config.performance.whisper_gpu_device > 16 {
+        config.performance.whisper_gpu_device = 0;
     }
     config
+        .performance
         .whisper_cuda_library_paths
         .retain(|path| !path.as_os_str().is_empty());
-    dedup_paths_preserving_order(&mut config.whisper_cuda_library_paths);
+    dedup_paths_preserving_order(&mut config.performance.whisper_cuda_library_paths);
 
-    if !config.selected_default_model.is_empty()
+    if !config.general.selected_default_model.is_empty()
         && !catalog
             .iter()
-            .any(|model| model.id == config.selected_default_model)
+            .any(|model| model.id == config.general.selected_default_model)
     {
-        config.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
     }
 
     config
+        .general
         .playground_selected_models
         .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
-    dedup_preserving_order(&mut config.playground_selected_models);
+    dedup_preserving_order(&mut config.general.playground_selected_models);
 
     normalize_playground_order(config, &catalog_ids);
 
-    if config.max_recording_seconds == 0 {
-        config.max_recording_seconds = 30;
+    if config.recording.max_recording_seconds == 0 {
+        config.recording.max_recording_seconds = 30;
     }
-    if config.paste_delay_ms == 0 {
-        config.paste_delay_ms = default_paste_delay_ms();
+    if config.output.paste_delay_ms == 0 {
+        config.output.paste_delay_ms = default_paste_delay_ms();
     }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_legacy_acceleration_preference() -> AccelerationPreference {
-    AccelerationPreference::Cpu
 }
 
 fn default_whisper_cuda_backend_path() -> Option<PathBuf> {
@@ -582,19 +505,23 @@ fn default_playground_model_order() -> Vec<String> {
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
     let storage_dir = model_storage_dir(config);
-    config.managed_models.retain(|_, install| {
+    config.general.managed_models.retain(|_, install| {
         !install.path.as_os_str().is_empty() && install.path.starts_with(&storage_dir)
     });
 
-    for (id, path) in &config.model_paths {
+    for (id, path) in &config.general.model_paths {
         if path.exists() && path.starts_with(&storage_dir) {
-            config.managed_models.entry(id.clone()).or_insert_with(|| {
-                ManagedModelInstall::app_managed(path.clone(), "legacy-model-path")
-            });
+            config
+                .general
+                .managed_models
+                .entry(id.clone())
+                .or_insert_with(|| {
+                    ManagedModelInstall::app_managed(path.clone(), "legacy-model-path")
+                });
         }
     }
 
-    for install in config.managed_models.values_mut() {
+    for install in config.general.managed_models.values_mut() {
         if install.path.as_os_str().is_empty() {
             install.path = PathBuf::new();
         }
@@ -616,24 +543,29 @@ fn migrate_legacy_model_ids(config: &mut AppConfig) {
     ];
 
     for (old_id, new_id) in migrations {
-        if config.selected_default_model == old_id {
-            config.selected_default_model = new_id.to_owned();
+        if config.general.selected_default_model == old_id {
+            config.general.selected_default_model = new_id.to_owned();
         }
-        for id in &mut config.playground_selected_models {
+        for id in &mut config.general.playground_selected_models {
             if id == old_id {
                 *id = new_id.to_owned();
             }
         }
-        for id in &mut config.playground_model_order {
+        for id in &mut config.general.playground_model_order {
             if id == old_id {
                 *id = new_id.to_owned();
             }
         }
-        if let Some(path) = config.model_paths.remove(old_id) {
-            config.model_paths.entry(new_id.to_owned()).or_insert(path);
-        }
-        if let Some(install) = config.managed_models.remove(old_id) {
+        if let Some(path) = config.general.model_paths.remove(old_id) {
             config
+                .general
+                .model_paths
+                .entry(new_id.to_owned())
+                .or_insert(path);
+        }
+        if let Some(install) = config.general.managed_models.remove(old_id) {
+            config
+                .general
                 .managed_models
                 .entry(new_id.to_owned())
                 .or_insert(install);
@@ -641,26 +573,30 @@ fn migrate_legacy_model_ids(config: &mut AppConfig) {
     }
 
     config
+        .general
         .model_paths
         .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
     config
+        .general
         .managed_models
         .retain(|id, _| !legacy_ids.iter().any(|legacy_id| legacy_id == &id.as_str()));
 }
 
 fn normalize_playground_order(config: &mut AppConfig, catalog_ids: &[String]) {
     config
+        .general
         .playground_model_order
         .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
-    dedup_preserving_order(&mut config.playground_model_order);
+    dedup_preserving_order(&mut config.general.playground_model_order);
 
     for id in catalog_ids {
         if !config
+            .general
             .playground_model_order
             .iter()
             .any(|existing| existing == id)
         {
-            config.playground_model_order.push(id.clone());
+            config.general.playground_model_order.push(id.clone());
         }
     }
 }
@@ -727,42 +663,49 @@ mod tests {
         }"#;
 
         let mut config: AppConfig = serde_json::from_str(old_config).unwrap();
-        assert!(config.playground_model_order.is_empty());
+        assert!(config.general.playground_model_order.is_empty());
 
         normalize_config(&mut config);
 
-        assert!(config.playground_model_order.len() >= default_model_catalog().len());
+        assert!(config.general.playground_model_order.len() >= default_model_catalog().len());
         assert!(
             config
+                .general
                 .playground_model_order
                 .iter()
                 .any(|id| id == "faster_whisper_turbo")
         );
-        assert!(config.close_to_tray);
-        assert!(config.auto_insert_transcript);
-        assert!(config.restore_clipboard_after_insert);
-        assert_eq!(config.hotkey_mode, HotkeyMode::Toggle);
-        assert_eq!(config.paste_delay_ms, 75);
-        assert_eq!(config.theme_mode, ThemeMode::Light);
-        assert_eq!(config.acceleration_preference, AccelerationPreference::Cpu);
+        assert!(config.general.close_to_tray);
+        assert!(config.output.auto_insert_transcript);
+        assert!(config.output.restore_clipboard_after_insert);
+        assert_eq!(config.recording.hotkey_mode, HotkeyMode::Toggle);
+        assert_eq!(config.output.paste_delay_ms, 75);
+        assert_eq!(config.general.theme_mode, ThemeMode::Light);
         assert_eq!(
-            config.playground_selected_models,
+            config.performance.acceleration_preference,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(
+            config.general.playground_selected_models,
             vec!["whisper_cpp_tiny_en".to_owned()]
         );
-        assert_eq!(config.whisper_gpu_device, 0);
-        assert!(config.whisper_cuda_library_paths.len() <= 3);
-        assert!(config.audio_input_device_name.is_none());
-        assert!(!config.model_storage_dir.as_os_str().is_empty());
-        assert!(config.model_storage_dir.ends_with("models"));
+        assert_eq!(config.performance.whisper_gpu_device, 0);
+        assert!(config.performance.whisper_cuda_library_paths.len() <= 3);
+        assert!(config.recording.audio_input_device_name.is_none());
+        assert!(!config.general.model_storage_dir.as_os_str().is_empty());
+        assert!(config.general.model_storage_dir.ends_with("models"));
     }
 
     #[test]
     fn new_default_config_uses_auto_performance() {
         let config = AppConfig::default();
 
-        assert_eq!(config.acceleration_preference, AccelerationPreference::Auto);
-        assert_eq!(config.whisper_gpu_device, 0);
-        assert!(!config.auto_insert_transcript);
+        assert_eq!(
+            config.performance.acceleration_preference,
+            AccelerationPreference::Auto
+        );
+        assert_eq!(config.performance.whisper_gpu_device, 0);
+        assert!(!config.output.auto_insert_transcript);
     }
 
     #[test]
@@ -774,26 +717,29 @@ mod tests {
 
     #[test]
     fn legacy_whisper_compute_key_migrates_to_neutral_acceleration_key() {
-        let legacy = serde_json::to_value(AppConfig::default()).unwrap();
-        let mut object = legacy.as_object().unwrap().clone();
-        object.remove("acceleration_preference");
-        object.insert(
-            "whisper_compute_mode".to_owned(),
-            serde_json::Value::String("prefer_gpu".to_owned()),
+        let object = serde_json::json!({
+            "selected_default_model": "whisper_cpp_tiny_en",
+            "whisper_compute_mode": "prefer_gpu"
+        });
+
+        let config: AppConfig = serde_json::from_value(object).unwrap();
+        assert_eq!(
+            config.performance.acceleration_preference,
+            AccelerationPreference::Gpu
         );
 
-        let config: AppConfig = serde_json::from_value(object.into()).unwrap();
-        assert_eq!(config.acceleration_preference, AccelerationPreference::Gpu);
-
         let serialized = serde_json::to_value(config).unwrap();
-        assert_eq!(serialized["acceleration_preference"], "gpu");
+        assert_eq!(serialized["performance"]["acceleration_preference"], "gpu");
         assert!(serialized.get("whisper_compute_mode").is_none());
     }
 
     #[test]
     fn hotkey_mode_uses_stable_snake_case_names() {
         let config = AppConfig {
-            hotkey_mode: HotkeyMode::HoldToTalk,
+            recording: RecordingSettings {
+                hotkey_mode: HotkeyMode::HoldToTalk,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -801,36 +747,42 @@ mod tests {
         assert!(serialized.contains(r#""hotkey_mode":"hold_to_talk""#));
 
         let parsed: AppConfig = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed.hotkey_mode, HotkeyMode::HoldToTalk);
+        assert_eq!(parsed.recording.hotkey_mode, HotkeyMode::HoldToTalk);
     }
 
     #[test]
     fn invalid_gpu_device_normalizes_to_default() {
         let mut config = AppConfig {
-            whisper_gpu_device: 99,
+            performance: PerformanceSettings {
+                whisper_gpu_device: 99,
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
 
-        assert_eq!(config.whisper_gpu_device, 0);
+        assert_eq!(config.performance.whisper_gpu_device, 0);
     }
 
     #[test]
     fn duplicate_cuda_library_paths_normalize_to_unique_paths() {
         let mut config = AppConfig {
-            whisper_cuda_library_paths: vec![
-                PathBuf::from("/tmp/cuda"),
-                PathBuf::from("/tmp/cuda"),
-                PathBuf::new(),
-            ],
+            performance: PerformanceSettings {
+                whisper_cuda_library_paths: vec![
+                    PathBuf::from("/tmp/cuda"),
+                    PathBuf::from("/tmp/cuda"),
+                    PathBuf::new(),
+                ],
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
 
         assert_eq!(
-            config.whisper_cuda_library_paths,
+            config.performance.whisper_cuda_library_paths,
             vec![PathBuf::from("/tmp/cuda")]
         );
     }
@@ -838,30 +790,36 @@ mod tests {
     #[test]
     fn empty_playground_selection_remains_empty_after_normalize() {
         let mut config = AppConfig {
-            playground_selected_models: Vec::new(),
+            general: GeneralSettings {
+                playground_selected_models: Vec::new(),
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
 
-        assert!(config.playground_selected_models.is_empty());
-        assert_eq!(config.selected_default_model, "whisper_cpp_tiny_en");
+        assert!(config.general.playground_selected_models.is_empty());
+        assert_eq!(config.general.selected_default_model, "whisper_cpp_tiny_en");
     }
 
     #[test]
     fn playground_selection_normalizes_invalid_and_duplicate_ids() {
         let mut config = AppConfig {
-            playground_selected_models: vec![
-                "faster_whisper_medium_en_gpu".to_owned(),
-                "invalid".to_owned(),
-                "faster_whisper_medium_en_gpu".to_owned(),
-            ],
+            general: GeneralSettings {
+                playground_selected_models: vec![
+                    "faster_whisper_medium_en_gpu".to_owned(),
+                    "invalid".to_owned(),
+                    "faster_whisper_medium_en_gpu".to_owned(),
+                ],
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
         assert_eq!(
-            config.playground_selected_models,
+            config.general.playground_selected_models,
             ["faster_whisper_medium_en_gpu"]
         );
     }
@@ -869,17 +827,18 @@ mod tests {
     #[test]
     fn legacy_playground_selection_keys_deserialize_and_new_key_serializes() {
         for key in ["playground_enabled_models", "enabled_models"] {
-            let mut value = serde_json::to_value(AppConfig::default()).unwrap();
-            value
-                .as_object_mut()
-                .unwrap()
-                .remove("playground_selected_models");
+            let mut value = serde_json::json!({
+                "selected_default_model": "whisper_cpp_tiny_en"
+            });
             value
                 .as_object_mut()
                 .unwrap()
                 .insert(key.to_owned(), serde_json::json!(["whisper_cpp_base_en"]));
             let config: AppConfig = serde_json::from_value(value).unwrap();
-            assert_eq!(config.playground_selected_models, ["whisper_cpp_base_en"]);
+            assert_eq!(
+                config.general.playground_selected_models,
+                ["whisper_cpp_base_en"]
+            );
         }
 
         let serialized = serde_json::to_string(&AppConfig::default()).unwrap();
@@ -901,18 +860,21 @@ mod tests {
         fs::write(model_dir.join("ggml-small.en.bin"), b"small").unwrap();
 
         let mut config = AppConfig {
-            model_storage_dir: root.clone(),
-            playground_selected_models: vec![
-                "whisper_cpp_tiny_en".to_owned(),
-                "whisper_cpp_base_en".to_owned(),
-                "whisper_cpp_medium_en".to_owned(),
-            ],
-            playground_model_order: vec![
-                "whisper_cpp_small_en".to_owned(),
-                "whisper_cpp_medium_en".to_owned(),
-                "whisper_cpp_base_en".to_owned(),
-                "whisper_cpp_tiny_en".to_owned(),
-            ],
+            general: GeneralSettings {
+                model_storage_dir: root.clone(),
+                playground_selected_models: vec![
+                    "whisper_cpp_tiny_en".to_owned(),
+                    "whisper_cpp_base_en".to_owned(),
+                    "whisper_cpp_medium_en".to_owned(),
+                ],
+                playground_model_order: vec![
+                    "whisper_cpp_small_en".to_owned(),
+                    "whisper_cpp_medium_en".to_owned(),
+                    "whisper_cpp_base_en".to_owned(),
+                    "whisper_cpp_tiny_en".to_owned(),
+                ],
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
         normalize_config(&mut config);
@@ -928,7 +890,10 @@ mod tests {
     #[test]
     fn downloaded_model_path_resolves_inside_storage_dir() {
         let config = AppConfig {
-            model_storage_dir: PathBuf::from("/tmp/scribe-models"),
+            general: GeneralSettings {
+                model_storage_dir: PathBuf::from("/tmp/scribe-models"),
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
         let model = default_model_catalog()
@@ -1023,8 +988,11 @@ mod tests {
             temp_dir.join("missing-model.bin"),
         );
         let config = AppConfig {
-            model_storage_dir: temp_dir.clone(),
-            model_paths,
+            general: GeneralSettings {
+                model_storage_dir: temp_dir.clone(),
+                model_paths,
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
@@ -1053,8 +1021,11 @@ mod tests {
         let mut model_paths = HashMap::new();
         model_paths.insert("whisper_cpp_base_en".to_owned(), model_path.clone());
         let mut config = AppConfig {
-            model_storage_dir: app_storage,
-            model_paths,
+            general: GeneralSettings {
+                model_storage_dir: app_storage,
+                model_paths,
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
@@ -1138,8 +1109,11 @@ mod tests {
         let mut model_paths = HashMap::new();
         model_paths.insert("whisper_cpp_base_en".to_owned(), external_path.clone());
         let mut config = AppConfig {
-            model_storage_dir: app_storage,
-            model_paths,
+            general: GeneralSettings {
+                model_storage_dir: app_storage,
+                model_paths,
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
@@ -1168,7 +1142,10 @@ mod tests {
         fs::write(model_dir.join("config.json"), b"{}").unwrap();
 
         let config = AppConfig {
-            model_storage_dir: temp_dir.clone(),
+            general: GeneralSettings {
+                model_storage_dir: temp_dir.clone(),
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
         let model = configured_models(&config)

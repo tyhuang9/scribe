@@ -22,5 +22,8 @@ tray-icon = { version = "0.23.1", default-features = false }
 ureq = "2"
 winit = "0.29"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [build-dependencies]
 cc = "1"
