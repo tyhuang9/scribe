@@ -2,8 +2,8 @@ mod pipeline;
 mod ring_buffer;
 
 use std::fs;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,12 @@ const DEFAULT_RING_SECONDS: usize = 2;
 const MIN_RING_SAMPLES: usize = 65_536;
 const MAX_RING_SAMPLES: usize = 2_000_000;
 const MAX_STREAM_RESTARTS: u32 = 2;
+const MAX_DRAIN_SAMPLES_PER_TICK: usize = 4_096;
+const STREAM_RESTART_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000 * (config::MAX_RECORDING_SECONDS as usize + 2);
+pub(super) const MIN_INPUT_SAMPLE_RATE: u32 = 8_000;
+pub(super) const MAX_INPUT_SAMPLE_RATE: u32 = 384_000;
+pub(super) const MAX_INPUT_CHANNELS: u16 = 32;
 const FAULT_NONE: u8 = 0;
 const FAULT_OVERFLOW: u8 = 1;
 const FAULT_STREAM: u8 = 2;
@@ -67,6 +73,16 @@ impl VadOptions {
         if self.endpoint.is_zero() {
             return Err(CaptureError::InvalidOptions(
                 "endpoint must be greater than zero",
+            ));
+        }
+        if self.speech_confirmation > Duration::from_secs(1)
+            || self.pause > Duration::from_secs(3)
+            || self.endpoint > Duration::from_secs(5)
+            || self.pre_roll > Duration::from_secs(2)
+            || self.post_roll > Duration::from_secs(2)
+        {
+            return Err(CaptureError::InvalidOptions(
+                "VAD timings exceed the supported capture bounds",
             ));
         }
         Ok(())
@@ -143,11 +159,11 @@ pub struct CaptureCompletion {
 pub enum CaptureError {
     #[error("invalid audio capture options: {0}")]
     InvalidOptions(&'static str),
-    #[error("microphone input format has zero channels or sample rate")]
-    InvalidInputFormat,
+    #[error("unsupported microphone input format: {sample_rate} Hz, {channels} channels")]
+    InvalidInputFormat { sample_rate: u32, channels: u16 },
     #[error("failed to enumerate microphone devices: {0}")]
     DeviceEnumeration(String),
-    #[error("microphone {requested:?} was not found and no default input is available")]
+    #[error("requested microphone {requested:?} is unavailable")]
     NoInputDevice { requested: Option<String> },
     #[error("failed to read microphone input configuration: {0}")]
     InputConfiguration(String),
@@ -159,12 +175,14 @@ pub enum CaptureError {
     PlayStream(String),
     #[error("microphone format changed while recovering the input stream")]
     InputFormatChanged,
-    #[error("microphone input stream failed after {restarts} restart attempts")]
-    InputStreamFailed { restarts: u32 },
+    #[error("microphone input stream failed after {restarts} restart attempts: {last_error}")]
+    InputStreamFailed { restarts: u32, last_error: String },
     #[error("audio capture buffer overflowed and dropped {dropped_samples} samples")]
     BufferOverflow { dropped_samples: usize },
     #[error("failed to prepare captured audio: {0}")]
     Preparation(String),
+    #[error("prepared audio exceeded the in-memory limit of {maximum_frames} frames")]
+    PreparedAudioLimit { maximum_frames: usize },
     #[error("audio recorder did not start within {0:?}")]
     StartTimeout(Duration),
     #[error("audio recorder did not stop within {0:?}")]
@@ -181,6 +199,7 @@ pub struct RecordingSession {
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl RecordingSession {
@@ -189,11 +208,15 @@ impl RecordingSession {
     }
 
     pub fn try_finish(&self) -> Option<Result<CaptureCompletion, CaptureError>> {
-        match self.finished_rx.try_recv() {
+        let result = match self.finished_rx.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some(Err(CaptureError::WorkerDisconnected)),
+        };
+        if result.is_some() {
+            self.join_worker();
         }
+        result
     }
 
     pub fn latest_levels(&self) -> LevelSnapshot {
@@ -209,10 +232,35 @@ impl RecordingSession {
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<(), CaptureError> {
         self.stop();
-        match self.finished_rx.recv_timeout(timeout) {
+        let result = match self.finished_rx.recv_timeout(timeout) {
             Ok(Ok(_completion)) => Ok(()),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(CaptureError::StopTimeout(timeout)),
+        };
+        if matches!(result, Err(CaptureError::StopTimeout(_))) {
+            self.reap_worker();
+        } else {
+            self.join_worker();
+        }
+        result
+    }
+
+    fn take_worker(&self) -> Option<thread::JoinHandle<()>> {
+        self.worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn join_worker(&self) {
+        if let Some(worker) = self.take_worker() {
+            let _ = worker.join();
+        }
+    }
+
+    fn reap_worker(&self) {
+        if let Some(worker) = self.take_worker() {
+            spawn_worker_reaper(worker);
         }
     }
 
@@ -224,7 +272,7 @@ impl RecordingSession {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_requested);
         let (finished_tx, finished_rx) = bounded(1);
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let started = Instant::now();
             while !worker_stop.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(2)
             {
@@ -263,8 +311,24 @@ impl RecordingSession {
             rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             level_observed: Arc::new(AtomicBool::new(false)),
+            worker: Mutex::new(Some(worker)),
         }
     }
+}
+
+impl Drop for RecordingSession {
+    fn drop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.reap_worker();
+    }
+}
+
+fn spawn_worker_reaper(worker: thread::JoinHandle<()>) {
+    let _ = thread::Builder::new()
+        .name("scribe-audio-reaper".to_owned())
+        .spawn(move || {
+            let _ = worker.join();
+        });
 }
 
 pub fn start_recording(
@@ -284,7 +348,7 @@ pub fn start_recording(
     let worker_rms = Arc::clone(&rms_bits);
     let worker_peak = Arc::clone(&peak_bits);
     let worker_observed = Arc::clone(&level_observed);
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("scribe-audio-capture".to_owned())
         .spawn(move || {
             let result = capture_worker(
@@ -311,10 +375,15 @@ pub fn start_recording(
             rms_bits,
             peak_bits,
             level_observed,
+            worker: Mutex::new(Some(worker)),
         }),
-        Ok(Err(error)) => Err(error),
+        Ok(Err(error)) => {
+            let _ = worker.join();
+            Err(error)
+        }
         Err(_) => {
             stop_requested.store(true, Ordering::Release);
+            spawn_worker_reaper(worker);
             Err(CaptureError::StartTimeout(START_TIMEOUT))
         }
     }
@@ -338,8 +407,11 @@ fn capture_worker(
         .map_err(|error| CaptureError::InputConfiguration(error.to_string()))?;
     let format = InputFormat::from_supported(&supported)?;
     let config: cpal::StreamConfig = supported.into();
-    if format.sample_rate == 0 || format.channels == 0 {
-        return Err(CaptureError::InvalidInputFormat);
+    if !input_format_is_credible(format.sample_rate, format.channels) {
+        return Err(CaptureError::InvalidInputFormat {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+        });
     }
 
     let ring_capacity = usize::try_from(format.sample_rate)
@@ -347,7 +419,7 @@ fn capture_worker(
         .saturating_mul(format.channels as usize)
         .saturating_mul(DEFAULT_RING_SECONDS)
         .clamp(MIN_RING_SAMPLES, MAX_RING_SAMPLES);
-    let (producer, consumer) = ring_buffer(ring_capacity);
+    let (producer, mut consumer) = ring_buffer(ring_capacity);
     let fault = Arc::new(AtomicU8::new(FAULT_NONE));
     let dropped_samples = Arc::new(AtomicUsize::new(0));
     let mut stream = Some(build_stream(
@@ -375,12 +447,21 @@ fn capture_worker(
         level_observed,
     )?;
     let capture_started = Instant::now();
-    let maximum_duration = Duration::from_secs(max_duration_seconds.max(1) as u64);
+    let maximum_duration = Duration::from_secs(
+        max_duration_seconds
+            .clamp(1, config::MAX_RECORDING_SECONDS)
+            .into(),
+    );
     let mut explicit_stop: Option<(Instant, usize, Duration)> = None;
     let mut restart_policy = RestartPolicy::new(MAX_STREAM_RESTARTS);
 
     let (stop_reason, stop_trigger_elapsed) = loop {
-        drain_ring(&consumer, &mut pipeline);
+        drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK);
+        if pipeline.limit_exceeded() {
+            return Err(CaptureError::PreparedAudioLimit {
+                maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
+            });
+        }
 
         match fault.load(Ordering::Acquire) {
             FAULT_OVERFLOW => {
@@ -390,27 +471,33 @@ fn capture_worker(
             }
             FAULT_STREAM => {
                 drop(stream.take());
-                if !restart_policy.try_restart() {
-                    return Err(CaptureError::InputStreamFailed {
-                        restarts: restart_policy.attempts,
-                    });
-                }
-                let current = device
-                    .default_input_config()
-                    .map_err(|error| CaptureError::InputConfiguration(error.to_string()))?;
-                ensure_restart_format(format, InputFormat::from_supported(&current)?)?;
-                fault.store(FAULT_NONE, Ordering::Release);
-                let restarted = build_stream(
-                    &device,
-                    &config,
-                    format.sample_format,
-                    consumer.producer_for_restart(),
-                    Arc::clone(&fault),
-                    Arc::clone(&dropped_samples),
-                )?;
-                restarted
-                    .play()
-                    .map_err(|error| CaptureError::PlayStream(error.to_string()))?;
+                let restarted =
+                    retry_stream_start(&mut restart_policy, STREAM_RESTART_BACKOFF, || {
+                        let restarted_device =
+                            select_input_device(&host, input_device_name.as_deref())?;
+                        let current = restarted_device
+                            .default_input_config()
+                            .map_err(|error| CaptureError::InputConfiguration(error.to_string()))?;
+                        ensure_restart_format(format, InputFormat::from_supported(&current)?)?;
+                        let producer = consumer.producer_for_restart().ok_or_else(|| {
+                            CaptureError::BuildStream(
+                                "the previous microphone callback did not quiesce".to_owned(),
+                            )
+                        })?;
+                        fault.store(FAULT_NONE, Ordering::Release);
+                        let restarted = build_stream(
+                            &restarted_device,
+                            &config,
+                            format.sample_format,
+                            producer,
+                            Arc::clone(&fault),
+                            Arc::clone(&dropped_samples),
+                        )?;
+                        restarted
+                            .play()
+                            .map_err(|error| CaptureError::PlayStream(error.to_string()))?;
+                        Ok(restarted)
+                    })?;
                 stream = Some(restarted);
             }
             _ => {}
@@ -421,27 +508,28 @@ fn capture_worker(
             explicit_stop = Some((Instant::now(), pipeline.source_frames(), elapsed));
         }
 
-        if let Some((stop_seen, source_frame, trigger_elapsed)) = explicit_stop {
-            let post_roll_frames =
-                duration_to_source_frames(options.vad.post_roll, format.sample_rate);
-            if pipeline.source_frames() >= source_frame.saturating_add(post_roll_frames)
-                || stop_seen.elapsed() >= options.vad.post_roll
-            {
-                break (CaptureStopReason::Explicit, trigger_elapsed);
-            }
-        } else if let Some(reason) = select_stop_reason(
-            false,
+        let explicit_post_roll_complete =
+            explicit_stop.is_some_and(|(stop_seen, source_frame, _)| {
+                let post_roll_frames =
+                    duration_to_source_frames(options.vad.post_roll, format.sample_rate);
+                pipeline.source_frames() >= source_frame.saturating_add(post_roll_frames)
+                    || stop_seen.elapsed() >= options.vad.post_roll
+            });
+        if let Some(reason) = select_stop_reason(
+            explicit_stop.is_some(),
+            explicit_post_roll_complete,
             pipeline.endpoint_triggered(),
             elapsed >= maximum_duration,
         ) {
-            break (reason, elapsed);
+            let trigger_elapsed = explicit_stop.map_or(elapsed, |(_, _, trigger)| trigger);
+            break (reason, trigger_elapsed);
         }
 
         thread::sleep(Duration::from_millis(2));
     };
 
     drop(stream.take());
-    drain_ring(&consumer, &mut pipeline);
+    drain_ring_all(&mut consumer, &mut pipeline);
     if fault.load(Ordering::Acquire) == FAULT_OVERFLOW {
         return Err(CaptureError::BufferOverflow {
             dropped_samples: dropped_samples.load(Ordering::Relaxed).max(1),
@@ -469,10 +557,19 @@ fn capture_worker(
     })
 }
 
-fn drain_ring(consumer: &Consumer, pipeline: &mut Pipeline) {
-    while let Some(sample) = consumer.pop() {
+fn drain_ring_bounded(consumer: &mut Consumer, pipeline: &mut Pipeline, maximum: usize) -> usize {
+    let mut drained = 0;
+    while drained < maximum
+        && let Some(sample) = consumer.pop()
+    {
         pipeline.push_interleaved(sample);
+        drained += 1;
     }
+    drained
+}
+
+fn drain_ring_all(consumer: &mut Consumer, pipeline: &mut Pipeline) {
+    while drain_ring_bounded(consumer, pipeline, MAX_DRAIN_SAMPLES_PER_TICK) != 0 {}
 }
 
 fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
@@ -481,12 +578,13 @@ fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
 }
 
 fn select_stop_reason(
-    explicit: bool,
+    explicit_pending: bool,
+    explicit_post_roll_complete: bool,
     endpoint: bool,
     maximum_duration: bool,
 ) -> Option<CaptureStopReason> {
-    if explicit {
-        Some(CaptureStopReason::Explicit)
+    if explicit_pending {
+        explicit_post_roll_complete.then_some(CaptureStopReason::Explicit)
     } else if endpoint {
         Some(CaptureStopReason::Endpoint)
     } else if maximum_duration {
@@ -522,6 +620,11 @@ impl InputFormat {
     }
 }
 
+fn input_format_is_credible(sample_rate: u32, channels: u16) -> bool {
+    (MIN_INPUT_SAMPLE_RATE..=MAX_INPUT_SAMPLE_RATE).contains(&sample_rate)
+        && (1..=MAX_INPUT_CHANNELS).contains(&channels)
+}
+
 fn ensure_restart_format(expected: InputFormat, current: InputFormat) -> Result<(), CaptureError> {
     if current == expected {
         Ok(())
@@ -552,11 +655,33 @@ impl RestartPolicy {
     }
 }
 
+fn retry_stream_start<T>(
+    policy: &mut RestartPolicy,
+    backoff: Duration,
+    mut attempt: impl FnMut() -> Result<T, CaptureError>,
+) -> Result<T, CaptureError> {
+    let mut last_error = "no restart attempt was available".to_owned();
+    while policy.try_restart() {
+        if policy.attempts > 1 && !backoff.is_zero() {
+            thread::sleep(backoff);
+        }
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error @ CaptureError::InputFormatChanged) => return Err(error),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(CaptureError::InputStreamFailed {
+        restarts: policy.attempts,
+        last_error,
+    })
+}
+
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    producer: Producer,
+    mut producer: Producer,
     fault: Arc<AtomicU8>,
     dropped_samples: Arc<AtomicUsize>,
 ) -> Result<cpal::Stream, CaptureError> {
@@ -568,7 +693,7 @@ fn build_stream(
         cpal::SampleFormat::F32 => device.build_input_stream(
             config,
             move |data: &[f32], _| {
-                enqueue_samples(data, &producer, &fault, &dropped_samples, normalize_f32)
+                enqueue_samples(data, &mut producer, &fault, &dropped_samples, normalize_f32)
             },
             error_callback,
             None,
@@ -576,7 +701,7 @@ fn build_stream(
         cpal::SampleFormat::I16 => device.build_input_stream(
             config,
             move |data: &[i16], _| {
-                enqueue_samples(data, &producer, &fault, &dropped_samples, normalize_i16)
+                enqueue_samples(data, &mut producer, &fault, &dropped_samples, normalize_i16)
             },
             error_callback,
             None,
@@ -584,7 +709,7 @@ fn build_stream(
         cpal::SampleFormat::U16 => device.build_input_stream(
             config,
             move |data: &[u16], _| {
-                enqueue_samples(data, &producer, &fault, &dropped_samples, normalize_u16)
+                enqueue_samples(data, &mut producer, &fault, &dropped_samples, normalize_u16)
             },
             error_callback,
             None,
@@ -605,7 +730,7 @@ fn mark_stream_fault(fault: &AtomicU8) {
 
 fn enqueue_samples<T: Copy>(
     data: &[T],
-    producer: &Producer,
+    producer: &mut Producer,
     fault: &AtomicU8,
     dropped_samples: &AtomicUsize,
     normalize: fn(T) -> f32,
@@ -657,6 +782,9 @@ fn select_input_device(
                 return Ok(device);
             }
         }
+        return Err(CaptureError::NoInputDevice {
+            requested: Some(target_name.to_owned()),
+        });
     }
 
     host.default_input_device()
@@ -707,16 +835,7 @@ pub fn input_device_names() -> Result<Vec<String>> {
 }
 
 fn recording_dir() -> Result<std::path::PathBuf> {
-    let dir = config::cache_dir()?.join("recordings");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create recording directory {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to secure recording directory {}", dir.display()))?;
-    }
-    Ok(dir)
+    Ok(config::cache_dir()?.join("recordings"))
 }
 
 #[cfg(test)]
@@ -738,12 +857,12 @@ mod tests {
 
     #[test]
     fn callback_overflow_sets_a_structured_fault_and_counts_drops() {
-        let (producer, consumer) = ring_buffer(2);
+        let (mut producer, mut consumer) = ring_buffer(2);
         let fault = AtomicU8::new(FAULT_NONE);
         let dropped = AtomicUsize::new(0);
         enqueue_samples(
             &[1_i16, 2, 3, 4],
-            &producer,
+            &mut producer,
             &fault,
             &dropped,
             normalize_i16,
@@ -758,15 +877,16 @@ mod tests {
     #[test]
     fn explicit_stop_has_priority_over_endpoint_and_maximum_duration() {
         assert_eq!(
-            select_stop_reason(true, true, true),
+            select_stop_reason(true, true, true, true),
             Some(CaptureStopReason::Explicit)
         );
+        assert_eq!(select_stop_reason(true, false, true, true), None);
         assert_eq!(
-            select_stop_reason(false, true, true),
+            select_stop_reason(false, false, true, true),
             Some(CaptureStopReason::Endpoint)
         );
         assert_eq!(
-            select_stop_reason(false, false, true),
+            select_stop_reason(false, false, false, true),
             Some(CaptureStopReason::MaximumDuration)
         );
     }
@@ -778,6 +898,54 @@ mod tests {
         assert!(policy.try_restart());
         assert!(!policy.try_restart());
         assert_eq!(policy.attempts, 2);
+    }
+
+    #[test]
+    fn complete_stream_rebuild_is_retried_until_it_succeeds() {
+        let mut policy = RestartPolicy::new(2);
+        let mut attempts = 0;
+        let result = retry_stream_start(&mut policy, Duration::ZERO, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CaptureError::BuildStream(
+                    "injected first failure".to_owned(),
+                ))
+            } else {
+                Ok("restarted")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "restarted");
+        assert_eq!(attempts, 2);
+        assert_eq!(policy.attempts, 2);
+    }
+
+    #[test]
+    fn stream_rebuild_exhaustion_retains_the_last_structured_error() {
+        let mut policy = RestartPolicy::new(2);
+        let error = retry_stream_start::<()>(&mut policy, Duration::ZERO, || {
+            Err(CaptureError::PlayStream(
+                "device is still absent".to_owned(),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CaptureError::InputStreamFailed {
+                restarts: 2,
+                last_error: "failed to start microphone input stream: device is still absent"
+                    .to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn credible_input_format_bounds_reject_resource_amplification() {
+        assert!(input_format_is_credible(8_000, 1));
+        assert!(input_format_is_credible(384_000, 32));
+        assert!(!input_format_is_credible(1, 1));
+        assert!(!input_format_is_credible(48_000, 33));
     }
 
     #[test]
@@ -826,6 +994,29 @@ mod tests {
         drop(audio);
 
         session.stop_and_discard(Duration::from_secs(1)).unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_a_recording_session_requests_stop_and_reaps_its_worker() {
+        let audio = Arc::new(PreparedAudio {
+            samples: vec![0.25; 160],
+            sample_rate: crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            source_sample_rate: crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            source_channels: 1,
+            source_frames: 160,
+        });
+        let weak = Arc::downgrade(&audio);
+        let session =
+            RecordingSession::simulated(Some(Arc::clone(&audio)), CaptureStopReason::Explicit);
+        drop(audio);
+
+        drop(session);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while weak.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
         assert!(weak.upgrade().is_none());
     }
 }

@@ -24,6 +24,8 @@ pub use settings::{
     RecordingSettings, SettingsStore, StreamingSettings,
 };
 
+pub const MAX_RECORDING_SECONDS: u32 = 600;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedModelInstall {
     pub path: PathBuf,
@@ -547,6 +549,10 @@ pub fn normalize_config(config: &mut AppConfig) {
     if config.recording.max_recording_seconds == 0 {
         config.recording.max_recording_seconds = 30;
     }
+    config.recording.max_recording_seconds = config
+        .recording
+        .max_recording_seconds
+        .min(MAX_RECORDING_SECONDS);
     config.recording.speech_confirmation_ms =
         config.recording.speech_confirmation_ms.clamp(50, 1_000);
     config.recording.internal_pause_ms = config
@@ -830,6 +836,19 @@ mod tests {
         assert_eq!(config.recording.endpoint_silence_ms, 300);
         assert_eq!(config.recording.pre_roll_ms, 2_000);
         assert_eq!(config.recording.post_roll_ms, 2_000);
+    }
+
+    #[test]
+    fn recording_duration_is_bounded_for_hand_edited_settings() {
+        let mut config = AppConfig::default();
+        config.recording.max_recording_seconds = u32::MAX;
+
+        normalize_config(&mut config);
+
+        assert_eq!(
+            config.recording.max_recording_seconds,
+            MAX_RECORDING_SECONDS
+        );
     }
 
     #[test]

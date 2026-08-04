@@ -12,9 +12,10 @@ pub const PREPARED_SAMPLE_RATE: u32 = 16_000;
 /// Decoded speech audio in Scribe's runtime-neutral input format.
 ///
 /// `samples` always contains finite mono `f32` values in `[-1.0, 1.0]` at
-/// [`PREPARED_SAMPLE_RATE`]. Source metadata describes the decoded WAV before
-/// downmixing and resampling; it is retained for diagnostics and duration
-/// calculations without exposing a model or runtime type.
+/// [`PREPARED_SAMPLE_RATE`]. Source metadata describes the native input stream
+/// or decoded WAV before downmixing and resampling; it is retained for
+/// diagnostics and duration calculations without exposing a model or runtime
+/// type.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedAudio {
     pub samples: Vec<f32>,

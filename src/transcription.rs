@@ -37,6 +37,8 @@ use crate::runtime_router::{
     RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Identifies one user dictation session.
 ///
 /// The application allocates monotonically increasing values. The service only
@@ -456,15 +458,26 @@ impl RuntimeWorker {
 impl Drop for RuntimeWorkerInner {
     fn drop(&mut self) {
         let (reply, response) = sync_channel(1);
-        let _ = self.commands.send(RuntimeCommand::Shutdown { reply });
-        let _ = response.recv();
-        if let Some(worker) = self
+        let shutdown_completed = self
+            .commands
+            .try_send(RuntimeCommand::Shutdown { reply })
+            .is_ok()
+            && response.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).is_ok();
+        let worker = self
             .worker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+            .take();
+        if shutdown_completed && let Some(worker) = worker {
             let _ = worker.join();
+        } else if let Some(worker) = worker {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                eprintln!(
+                    "Scribe runtime worker did not shut down within {RUNTIME_SHUTDOWN_TIMEOUT:?}; detaching it"
+                );
+            }
         }
     }
 }

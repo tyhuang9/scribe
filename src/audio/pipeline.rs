@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 
-use super::{CaptureError, CaptureStopReason, LevelSnapshot, VadOptions};
+use super::{
+    CaptureError, CaptureStopReason, LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES, VadOptions,
+    input_format_is_credible,
+};
 
 const VAD_FRAME_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
 const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 25;
@@ -21,6 +24,7 @@ pub(super) struct Pipeline {
     channel_sum: f64,
     resampler: StreamingLinearResampler,
     prepared: Vec<f32>,
+    limit_exceeded: bool,
     levels: LevelTracker,
     vad_enabled: bool,
     vad: VadTracker,
@@ -36,8 +40,11 @@ impl Pipeline {
         peak_bits: Arc<AtomicU32>,
         level_observed: Arc<AtomicBool>,
     ) -> Result<Self, CaptureError> {
-        if source_sample_rate == 0 || source_channels == 0 {
-            return Err(CaptureError::InvalidInputFormat);
+        if !input_format_is_credible(source_sample_rate, source_channels) {
+            return Err(CaptureError::InvalidInputFormat {
+                sample_rate: source_sample_rate,
+                channels: source_channels,
+            });
         }
         vad.validate()?;
         Ok(Self {
@@ -48,6 +55,7 @@ impl Pipeline {
             channel_sum: 0.0,
             resampler: StreamingLinearResampler::new(source_sample_rate, PREPARED_SAMPLE_RATE),
             prepared: Vec::new(),
+            limit_exceeded: false,
             levels: LevelTracker::new(level_bits, peak_bits, level_observed),
             vad_enabled,
             vad: VadTracker::new(vad),
@@ -67,11 +75,17 @@ impl Pipeline {
         self.source_frames += 1;
 
         let prepared = &mut self.prepared;
+        let limit_exceeded = &mut self.limit_exceeded;
         let levels = &mut self.levels;
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
         self.resampler.push(mono, |output| {
-            prepared.push(output);
+            push_bounded(
+                prepared,
+                limit_exceeded,
+                output,
+                MAX_CAPTURE_PREPARED_FRAMES,
+            );
             levels.push(output);
             if vad_enabled {
                 vad.push(output);
@@ -81,6 +95,10 @@ impl Pipeline {
 
     pub(super) fn source_frames(&self) -> usize {
         self.source_frames
+    }
+
+    pub(super) fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
     }
 
     pub(super) fn endpoint_triggered(&self) -> bool {
@@ -99,16 +117,28 @@ impl Pipeline {
         stop_reason: CaptureStopReason,
     ) -> Result<Option<PreparedAudio>, CaptureError> {
         let prepared = &mut self.prepared;
+        let limit_exceeded = &mut self.limit_exceeded;
         let levels = &mut self.levels;
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
         self.resampler.finish(|output| {
-            prepared.push(output);
+            push_bounded(
+                prepared,
+                limit_exceeded,
+                output,
+                MAX_CAPTURE_PREPARED_FRAMES,
+            );
             levels.push(output);
             if vad_enabled {
                 vad.push(output);
             }
         });
+
+        if self.limit_exceeded {
+            return Err(CaptureError::PreparedAudioLimit {
+                maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
+            });
+        }
 
         if !self.vad_enabled {
             if self.prepared.is_empty() || self.source_frames == 0 {
@@ -141,7 +171,11 @@ impl Pipeline {
         if start >= end {
             return Ok(None);
         }
-        let mut samples = self.prepared[start..end].to_vec();
+        let mut samples = self.prepared;
+        samples.truncate(end);
+        if start > 0 {
+            samples.drain(..start);
+        }
         normalize_loudness(&mut samples);
         let source_frames = prepared_to_source_frames(samples.len(), self.source_sample_rate);
         PreparedAudio::from_captured_mono(
@@ -152,6 +186,14 @@ impl Pipeline {
         )
         .map(Some)
         .map_err(|error| CaptureError::Preparation(error.to_string()))
+    }
+}
+
+fn push_bounded(samples: &mut Vec<f32>, exceeded: &mut bool, sample: f32, maximum: usize) {
+    if samples.len() < maximum {
+        samples.push(sample);
+    } else {
+        *exceeded = true;
     }
 }
 
@@ -545,6 +587,18 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sample_accumulation_fails_closed_at_its_bound() {
+        let mut samples = Vec::new();
+        let mut exceeded = false;
+        push_bounded(&mut samples, &mut exceeded, 1.0, 2);
+        push_bounded(&mut samples, &mut exceeded, 2.0, 2);
+        push_bounded(&mut samples, &mut exceeded, 3.0, 2);
+
+        assert_eq!(samples, [1.0, 2.0]);
+        assert!(exceeded);
+    }
+
+    #[test]
     fn levels_publish_only_on_the_25hz_boundary() {
         let (rms, peak, observed) = level_state();
         let mut pipeline = Pipeline::new(
@@ -591,6 +645,44 @@ mod tests {
         assert!(!pipeline.endpoint_triggered());
         push_mono_ms(&mut pipeline, 10, 0.0);
         assert!(pipeline.endpoint_triggered());
+    }
+
+    #[test]
+    fn paused_speech_can_resume_before_a_later_endpoint() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        push_mono_ms(&mut pipeline, 150, 0.2);
+        push_mono_ms(&mut pipeline, 450, 0.0);
+        assert_eq!(pipeline.vad.state, VadState::Paused);
+
+        push_mono_ms(&mut pipeline, 100, 0.2);
+        assert_eq!(pipeline.vad.state, VadState::Active);
+        assert!(!pipeline.endpoint_triggered());
+
+        push_mono_ms(&mut pipeline, 900, 0.0);
+        assert!(pipeline.endpoint_triggered());
+    }
+
+    #[test]
+    fn repeated_sub_confirmation_bursts_do_not_start_speech() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        for _ in 0..4 {
+            push_mono_ms(&mut pipeline, 140, 0.2);
+            push_mono_ms(&mut pipeline, 20, 0.0);
+        }
+
+        assert_eq!(pipeline.vad.state, VadState::Waiting);
+        assert!(pipeline.vad.speech_start_frame.is_none());
+        assert!(!pipeline.endpoint_triggered());
+    }
+
+    #[test]
+    fn sustained_background_below_activation_adapts_without_false_speech() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        push_mono_ms(&mut pipeline, 3_000, 0.01);
+
+        assert!(pipeline.vad.noise_floor > 0.003);
+        assert_eq!(pipeline.vad.state, VadState::Waiting);
+        assert!(pipeline.vad.speech_start_frame.is_none());
     }
 
     #[test]

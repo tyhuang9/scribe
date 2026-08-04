@@ -4393,7 +4393,10 @@ impl LocalTranscriberApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Maximum recording seconds");
                     if ui
-                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
+                        .add(
+                            egui::DragValue::new(&mut max_duration)
+                                .clamp_range(1..=config::MAX_RECORDING_SECONDS as i32),
+                        )
                         .changed()
                     {
                         self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
@@ -7057,60 +7060,66 @@ mod layout_tests {
     }
 
     #[test]
-    fn endpoint_no_speech_completion_never_dispatches_or_pastes() {
-        let mut app = test_app();
-        app.transcript = "keep prior transcript".to_owned();
-        let session_id = app
-            .session_coordinator
-            .begin(SessionPurpose::Dictation)
-            .unwrap();
-        app.pending_recording = Some(PendingRecording {
-            session_id,
-            source: RecordingSource::Transcribe,
-            stop_requested: false,
-            max_duration_seconds: 30,
-            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
-            abandon: Arc::new(AtomicBool::new(false)),
-        });
-        app.tx
-            .send(AppEvent::CaptureReady {
+    fn reachable_no_speech_completions_never_dispatch_or_paste() {
+        for stop_reason in [
+            CaptureStopReason::MaximumDuration,
+            CaptureStopReason::Explicit,
+        ] {
+            let mut app = test_app();
+            app.transcript = "keep prior transcript".to_owned();
+            let session_id = app
+                .session_coordinator
+                .begin(SessionPurpose::Dictation)
+                .unwrap();
+            app.pending_recording = Some(PendingRecording {
                 session_id,
-                result: Ok(RecordingSession::simulated(
-                    None,
-                    CaptureStopReason::Endpoint,
-                )),
-            })
-            .unwrap();
-        app.poll_events();
-        app.active_recording.as_ref().unwrap().session.stop();
-
-        for _ in 0..100 {
-            app.poll_recording();
-            if app.active_recording.is_none() {
-                break;
+                source: RecordingSource::Transcribe,
+                stop_requested: false,
+                max_duration_seconds: 30,
+                latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+                abandon: Arc::new(AtomicBool::new(false)),
+            });
+            app.tx
+                .send(AppEvent::CaptureReady {
+                    session_id,
+                    result: Ok(RecordingSession::simulated(None, stop_reason)),
+                })
+                .unwrap();
+            app.poll_events();
+            if stop_reason == CaptureStopReason::Explicit {
+                app.stop_recording();
+            } else {
+                app.active_recording.as_ref().unwrap().session.stop();
             }
-            thread::sleep(Duration::from_millis(5));
-        }
 
-        assert!(app.active_recording.is_none());
-        assert_eq!(app.status, TranscriptionStatus::Idle);
-        assert_eq!(
-            app.status_message,
-            "No speech detected; nothing was pasted."
-        );
-        assert_eq!(app.transcript, "keep prior transcript");
-        assert!(app.pending_output.is_none());
-        assert_eq!(
-            app.session_coordinator.last_terminal().unwrap().outcome,
-            crate::core::TerminalOutcome::Cancelled
-        );
-        assert!(
-            app.latest_latency
-                .as_ref()
-                .unwrap()
-                .stop_requested_at
-                .is_some()
-        );
+            for _ in 0..100 {
+                app.poll_recording();
+                if app.active_recording.is_none() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            assert!(app.active_recording.is_none());
+            assert_eq!(app.status, TranscriptionStatus::Idle);
+            assert_eq!(
+                app.status_message,
+                "No speech detected; nothing was pasted."
+            );
+            assert_eq!(app.transcript, "keep prior transcript");
+            assert!(app.pending_output.is_none());
+            assert_eq!(
+                app.session_coordinator.last_terminal().unwrap().outcome,
+                crate::core::TerminalOutcome::Cancelled
+            );
+            assert!(
+                app.latest_latency
+                    .as_ref()
+                    .unwrap()
+                    .stop_requested_at
+                    .is_some()
+            );
+        }
     }
 
     #[test]

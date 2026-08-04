@@ -740,6 +740,12 @@ mod tests {
             "selected_default_model": "whisper_cpp_base_en",
             "enabled_models": ["whisper_cpp_base_en"],
             "hotkey": "Alt+Space",
+            "vad_enabled": false,
+            "speech_confirmation_ms": 180,
+            "internal_pause_ms": 520,
+            "endpoint_silence_ms": 980,
+            "pre_roll_ms": 280,
+            "post_roll_ms": 220,
             "whisper_compute_mode": "prefer_gpu",
             "future_legacy_key": {"kept": true}
         }));
@@ -751,6 +757,12 @@ mod tests {
             ["whisper_cpp_base_en"]
         );
         assert_eq!(config.recording.hotkey, "Alt+Space");
+        assert!(!config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 180);
+        assert_eq!(config.recording.internal_pause_ms, 520);
+        assert_eq!(config.recording.endpoint_silence_ms, 980);
+        assert_eq!(config.recording.pre_roll_ms, 280);
+        assert_eq!(config.recording.post_roll_ms, 220);
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Gpu

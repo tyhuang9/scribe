@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,8 +19,12 @@ pub(super) fn ring_buffer(capacity: usize) -> (Producer, Consumer) {
     (
         Producer {
             shared: Arc::clone(&shared),
+            _not_sync: PhantomData,
         },
-        Consumer { shared },
+        Consumer {
+            shared,
+            _not_sync: PhantomData,
+        },
     )
 }
 
@@ -35,10 +41,13 @@ unsafe impl Sync for Shared {}
 
 pub(super) struct Producer {
     shared: Arc<Shared>,
+    // CPAL may move the callback between threads, but it must never invoke two
+    // producers concurrently. `Cell` keeps this handle `Send` and `!Sync`.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl Producer {
-    pub(super) fn push(&self, sample: f32) -> Result<(), f32> {
+    pub(super) fn push(&mut self, sample: f32) -> Result<(), f32> {
         let write = self.shared.write.load(Ordering::Relaxed);
         let read = self.shared.read.load(Ordering::Acquire);
         if write.wrapping_sub(read) >= self.shared.slots.len() {
@@ -58,10 +67,11 @@ impl Producer {
 
 pub(super) struct Consumer {
     shared: Arc<Shared>,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl Consumer {
-    pub(super) fn pop(&self) -> Option<f32> {
+    pub(super) fn pop(&mut self) -> Option<f32> {
         let read = self.shared.read.load(Ordering::Relaxed);
         let write = self.shared.write.load(Ordering::Acquire);
         if read == write {
@@ -78,10 +88,11 @@ impl Consumer {
         Some(sample)
     }
 
-    pub(super) fn producer_for_restart(&self) -> Producer {
-        Producer {
+    pub(super) fn producer_for_restart(&mut self) -> Option<Producer> {
+        (Arc::strong_count(&self.shared) == 1).then(|| Producer {
             shared: Arc::clone(&self.shared),
-        }
+            _not_sync: PhantomData,
+        })
     }
 }
 
@@ -93,7 +104,7 @@ mod tests {
 
     #[test]
     fn fifo_wrap_and_overflow_are_bounded() {
-        let (producer, consumer) = ring_buffer(3);
+        let (mut producer, mut consumer) = ring_buffer(3);
         producer.push(1.0).unwrap();
         producer.push(2.0).unwrap();
         producer.push(3.0).unwrap();
@@ -112,8 +123,9 @@ mod tests {
     #[test]
     fn concurrent_producer_and_consumer_preserve_every_sample() {
         const SAMPLE_COUNT: usize = 100_000;
-        let (producer, consumer) = ring_buffer(127);
+        let (producer, mut consumer) = ring_buffer(127);
         let writer = thread::spawn(move || {
+            let mut producer = producer;
             for value in 0..SAMPLE_COUNT {
                 let sample = value as f32;
                 while producer.push(sample).is_err() {
@@ -133,5 +145,16 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn restart_producer_requires_the_previous_producer_to_be_gone() {
+        let (producer, mut consumer) = ring_buffer(2);
+        assert!(consumer.producer_for_restart().is_none());
+        drop(producer);
+
+        let mut restarted = consumer.producer_for_restart().unwrap();
+        restarted.push(7.0).unwrap();
+        assert_eq!(consumer.pop(), Some(7.0));
     }
 }
