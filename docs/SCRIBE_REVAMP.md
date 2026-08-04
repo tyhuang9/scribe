@@ -1295,3 +1295,144 @@ Phase 7 can consume the canonical native pipeline and authoritative
 session/sequence boundary to add bounded rolling preview. Tentative text must
 remain overlay-only, with one active decode and only the newest pending
 snapshot retained.
+
+## Phase 7 - Incremental transcription and stabilization
+
+Phase 7 is implemented as rolling batch preview inside the existing native
+boundary. It does not claim that the primary runtime has acquired a native
+streaming API. The final handler count remains **one**:
+`TranscribeCppRuntime`, selected only by `RuntimeRouter`. `OnnxSpeechRuntime`
+was not added because the named Zipformer candidate still lacks the complete
+pinned package, shared-corpus quality, lifecycle, cancellation, crash, memory,
+and platform evidence required by the Phase 3 gate.
+
+### Implemented data flow and decisions
+
+```text
+CPAL callback -> fixed SPSC ring -> native capture/DSP worker
+  -> canonical 16 kHz buffer -> opaque replace-latest preview publisher
+  -> one rolling scheduler -> TranscriptionService -> RuntimeRouter
+  -> TranscribeCppRuntime -> committed/tentative text event
+  -> SessionCoordinator correlation gate -> overlay only
+
+capture stop -> close preview mailbox/drop pending -> bound active decode
+  -> full PreparedAudio final pass -> final overlay replacement
+  -> existing exactly-once output path
+```
+
+- The capture worker publishes at exact 4,000-frame/250 ms boundaries. Each
+  snapshot contains at most the newest 48,000 frames/3 seconds; the stabilizer
+  treats 10,400 frames/650 ms as rolling-boundary overlap.
+- Snapshot normalization operates on a cloned window. A deterministic test
+  feeds identical audio through preview-on and preview-off pipelines and proves
+  the final `PreparedAudio` values are identical.
+- One named scheduler decode worker may be active and a capacity-one mailbox
+  retains only the newest pending snapshot. Closing drops pending work. The
+  normal stop path transfers the join handle into app-owned drain state and
+  polls without blocking egui. It allows two seconds for a measured sub-second
+  decode to finish, then requests cancellation once. If acknowledgement is
+  still absent two seconds later, the handle remains owned and new dictation
+  stays blocked until the worker exits; no timed-out worker is detached.
+- `TranscriptionService::transcribe_preview` calls only the primary native
+  worker. It rejects transitional legacy models instead of using the CLI/WAV
+  fallback; the full-utterance final path retains its Phase 6 fallback policy.
+- Stable-prefix reconciliation requires two compatible passes and a 700 ms
+  horizon, caps comparison context at 60 words, rejects stale correlation
+  sequences, deduplicates rolling overlap, and keeps display punctuation/case
+  tentative until repeated.
+- `SessionCoordinator` owns a separate preview request so preview sequencing
+  cannot complete or block the final request. Every text event is accepted by
+  the coordinator before it reaches `OverlayController`.
+- Tentative and committed preview text never mutates the application transcript,
+  `PendingOutput`, clipboard, paste, Playground result, or any third-party
+  application. The final full-pass result allocates a newer overlay revision,
+  clears tentative text, and remains the only output candidate.
+- Preview uses a current settings snapshot, just like preload and final decode,
+  while retaining the same warm native worker. Native segment timestamps are
+  converted to absolute canonical-audio frames; untimed segments retain the
+  conservative fallback alignment.
+- The pinned fixture exposed Whisper's `[BLANK_AUDIO]` sentinel as the first
+  nominally non-empty result. The private primary-runtime adapter now removes
+  that model-specific sentinel, so it is neither rendered nor counted as first
+  speech text.
+- Advanced settings expose only real behavior: `Auto`, `Rolling preview`, and
+  `Final text only`. `Auto` currently selects rolling batch preview because no
+  model advertises proven native streaming. Playground remains final-only.
+  Timing and stability constants are intentionally not configurable.
+
+### Compatibility and streaming status
+
+| Model/runtime state | Phase 7 result |
+| --- | --- |
+| Logical runtime handlers | **1** - `TranscribeCppRuntime` only |
+| Native `SpeechStream` capability | **False** for every catalog model; no native-streaming claim |
+| Rolling preview | Available only through the primary native router path; legacy CLI adapters fail closed to final-only |
+| `whisper_cpp_tiny_en`, `base_en`, `small_en`, `medium_en` | Remain **Experimental**; no model promoted |
+| Supported models | **0** |
+| Zipformer / `OnnxSpeechRuntime` | **NO-GO**, not shipped; no new evidence satisfies the complete gate |
+
+### Automated verification and measured evidence
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/lint/build | `cargo fmt --all -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo build --all-features` | **PASS** |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 398 discovered, 392 passed, 0 failed, 6 environment-gated tests ignored |
+| Preview scheduling/DSP | Targeted `streaming::tests` and native pipeline tests | **PASS** - exact cadence/window bounds, one-active/newest-pending, non-blocking retained-handle drain, final-audio identity, exact 650 ms boundary, 699/700 ms horizon, case/punctuation correction, non-empty deletion/reappearance, repeated words, overlap, bounded context, and sequence rejection |
+| Output isolation | App/coordinator/overlay tests | **PASS** - stale/wrong-model/late-after-close updates rejected; tentative text changes only overlay state; final revision supersedes partials and emits once; Playground/final-only never starts preview |
+| Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source scans | **PASS** - one handler; concrete selection remains private; app shell cannot construct or publish PCM preview snapshots |
+| Pinned release fixture | Exact ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` | **PASS** after stabilization - v1.9.1/base.en/CPU; load 294 ms, first decode 795 ms, warm decode 793 ms, unload/reload passed |
+| Final-pass release benchmark | Exact ignored 5-cold/20-warm `native_runtime_jfk_cold_and_warm_benchmark` | **PASS** - cold total median/p95 1,087/1,099 ms; cold load 289/292 ms; warm total 781/800 ms; warm decode 780/798 ms |
+| Rolling first-speech benchmark | Exact ignored 5-cold/20-warm `rolling_preview_jfk_first_partial_benchmark` | **PASS** - artifact size/hash and expected JFK speech validated; scheduler-start to first real speech text after filtering the blank sentinel: cold median/p95 2,039/2,049 ms; warm median/p95 1,730/1,754 ms |
+
+The fixture measurements used the same Windows machine, pinned CPU package,
+base.en artifact (147,964,211 bytes; SHA-256
+`a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`),
+and JFK WAV (352,078 bytes; SHA-256
+`59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`).
+The preview benchmark is a scheduler-level fixture harness. It releases cloned
+canonical fixture frames on the configured 250 ms cadence and exercises native
+decode, but bypasses the production capture `Pipeline` and does not include a
+real hotkey, microphone startup, driver buffering, overlay painting, or target
+output. Its result is therefore a deterministic scheduler-start approximation,
+not verified desktop hotkey-to-first-partial latency. Raw milliseconds were:
+`cold=[2049,2047,2029,2039,2036]` and
+`warm=[1766,1748,1711,1716,1727,1730,1714,1743,1741,1726,1713,1724,1740,1726,1739,1726,1754,1743,1734,1741]`.
+
+For comparison, Phase 6 measured cold final total 1,177/1,189 ms and warm final
+total 817/884 ms. Phase 7 measured 1,087/1,099 ms and 781/800 ms respectively.
+The runs were not interleaved and Phase 7 did not change final inference, so the
+difference is recorded as run-to-run variance, not an improvement claim. Phase
+0's repeated-process base.en median/p95 was 1,279.5/1,452.8 ms and is not
+directly comparable to retained-native timing. Phase 6 had no first-speech
+path, so the truthful 1,730/1,754 ms warm result has no before value and does
+not satisfy the Zipformer gate's 800 ms target.
+
+One pre-review parallel suite run reproduced the legacy process-registration
+race: another test advanced the global cancellation generation before the
+fixture process registered. The test now retries only that pre-registration
+race while retaining the registered-process termination assertion. The final
+full parallel suite passed all 392 runnable tests, including the hardened case.
+
+### Risks and Phase 8 entry
+
+- **High - desktop evidence:** no real Windows microphone/hotkey/overlay run
+  has verified first-partial latency, correction behavior, focus preservation,
+  or exactly-once paste with preview enabled. Execute the updated manual rows.
+- **Medium - preview load:** CPU rolling inference can occupy the one native
+  worker and measured warm first real speech is about 1.7 seconds. Stop closes
+  pending work, drains normally for two seconds, and cancels only a slower
+  decode. Cancellation can discard warm state before the final pass. Measure
+  stop-to-final under live speech and tune only with saved evidence.
+- **Medium - alignment quality:** the retained runtime provides segment rather
+  than word timing, so words are distributed within each timed segment and
+  untimed segments use fallback window alignment. The reconciler is
+  deterministic and conservative, but corpus-level correction/duplication
+  quality is not yet measured.
+- **Low - compatibility:** preview failure is nonfatal and visibly degrades to
+  the existing final pass. No compatibility status or native-streaming flag was
+  inflated.
+
+Phase 8 can now harden final-pass shutdown and output safety on top of a tested
+overlay-only preview path. The release remains **NO-GO** until the manual
+Windows vertical slice, native-streaming Definition of Done, supported-model
+evidence, and final latency matrix are complete.

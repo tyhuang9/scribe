@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 6 matrix (2026-08-04). No manual desktop, microphone,
+**Status:** living Phase 7 matrix (2026-08-04). No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-6 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-7 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -156,6 +156,26 @@ prove real device recovery, acoustic VAD quality, first-syllable retention,
 meter cadence on a physical driver, or any desktop output behavior. Those rows
 remain NOT VERIFIED.
 
+## Automated Phase 7 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/lint/build | `cargo fmt --all -- --check`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 398 discovered, 392 passed, 0 failed, 6 environment-gated tests ignored |
+| Rolling scheduler/stabilizer | Exact cadence/window, one-active/newest-pending, retained-handle non-blocking drain, exact 650 ms boundary, 699/700 ms horizon, two-pass stability, case/punctuation correction, non-empty deletion/reappearance, repeated-word, overlap, bounded-context, and correlation tests | PASS |
+| Native audio boundary | Preview window normalization and final-audio identity; source scan prevents app-shell snapshot/PCM publication | PASS - preview PCM stays in native capture/service workers |
+| Output isolation | Coordinator-first acceptance, overlay-only partials, monotonic final replacement, Playground/final-only exclusion | PASS - tentative text cannot create `PendingOutput` or replace the application transcript |
+| Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` and Rust boundary tests | PASS - one `TranscribeCppRuntime`; no ONNX handler or native-streaming claim |
+| Pinned release smoke/final benchmark | Exact ignored base.en/JFK service smoke and 5-cold/20-warm final benchmark | PASS - cold total median/p95 1,087/1,099 ms; warm total 781/800 ms |
+| Rolling first speech text | Exact ignored 5-cold/20-warm scheduler-level fixture harness with artifact hashes and expected speech checks | PASS as non-desktop evidence - cold median/p95 2,039/2,049 ms; warm 1,730/1,754 ms; `[BLANK_AUDIO]` is filtered privately and not counted |
+
+The rolling latency harness includes 250 ms cloned canonical frame publication
+and native decode, but bypasses the production capture pipeline and does not
+include a real hotkey, microphone driver, overlay paint, or target application.
+All desktop rows remain NOT VERIFIED. Four catalog models
+remain Experimental, zero are Supported, native streaming remains false, and
+the Zipformer/second-handler decision remains NO-GO.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -210,7 +230,7 @@ remain NOT VERIFIED.
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | No child process is started; actionable status identifies what to install/repair; no paste occurs. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Kill the short-lived runtime process or force a non-zero exit during transcription. | Failure is surfaced, app returns to Idle/Error, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
 | STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
-| STT-07 | Win/Linux/macOS | P1, P2, P3 | If a model advertises streaming, observe transcript while speaking; otherwise record that only final batch text appears. | Current baseline is expected to be final-only; do not claim first-partial/streaming support without evidence. | **NOT VERIFIED** |
+| STT-07 | Win/Linux/macOS | P1, P2, P3 | In Advanced, run Auto, Rolling preview, and Final text only against the same utterance; repeat once in Playground. Capture the committed/tentative overlay states and first-partial latency. | Auto and Rolling use bounded batch preview only for the primary native model; Final text only and Playground emit no partials. Tentative text stays in the overlay, corrections do not backspace another app, and the final result replaces the preview once. No model advertises native streaming. | **NOT VERIFIED** |
 | STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
 | STT-09 | Windows | P1, P3 | Record the exact sherpa-onnx v1.13.4 and streaming Zipformer prerequisites; attempt the evidence harness only after a native package, pinned model, shared corpus, and Phase 7 comparator exist. | Any missing measurement remains NO-GO. A second logical handler appears only if every first-partial, 30% improvement, RTF, cancellation, WER, lifecycle, crash, memory, and platform threshold passes. | **NOT VERIFIED / CURRENT NO-GO** |
 
