@@ -4391,12 +4391,13 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Capture limits"));
                 let mut max_duration = self.config.recording.max_recording_seconds as i32;
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Maximum recording seconds");
+                    let label = ui.label("Maximum recording seconds");
                     if ui
                         .add(
                             egui::DragValue::new(&mut max_duration)
                                 .clamp_range(1..=config::MAX_RECORDING_SECONDS as i32),
                         )
+                        .labelled_by(label.id)
                         .changed()
                     {
                         self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
@@ -4419,12 +4420,13 @@ impl LocalTranscriberApp {
                     let mut speech_confirmation =
                         self.config.recording.speech_confirmation_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Speech confirmation ms");
+                        let label = ui.label("Speech confirmation ms");
                         if ui
                             .add(
                                 egui::DragValue::new(&mut speech_confirmation)
                                     .clamp_range(50..=1000),
                             )
+                            .labelled_by(label.id)
                             .changed()
                         {
                             self.config.recording.speech_confirmation_ms =
@@ -4439,9 +4441,10 @@ impl LocalTranscriberApp {
                     });
                     let mut internal_pause = self.config.recording.internal_pause_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Internal pause ms");
+                        let label = ui.label("Internal pause ms");
                         if ui
                             .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
+                            .labelled_by(label.id)
                             .changed()
                         {
                             self.config.recording.internal_pause_ms = internal_pause
@@ -4457,13 +4460,14 @@ impl LocalTranscriberApp {
                     });
                     let mut endpoint_silence = self.config.recording.endpoint_silence_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("End after silence ms");
+                        let label = ui.label("End after silence ms");
                         if ui
                             .add(
                                 egui::DragValue::new(&mut endpoint_silence).clamp_range(
                                     self.config.recording.internal_pause_ms as i32..=5000,
                                 ),
                             )
+                            .labelled_by(label.id)
                             .changed()
                         {
                             self.config.recording.endpoint_silence_ms = endpoint_silence
@@ -4474,9 +4478,10 @@ impl LocalTranscriberApp {
                     });
                     let mut pre_roll = self.config.recording.pre_roll_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Pre-roll ms");
+                        let label = ui.label("Pre-roll ms");
                         if ui
                             .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
+                            .labelled_by(label.id)
                             .changed()
                         {
                             self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
@@ -4485,9 +4490,10 @@ impl LocalTranscriberApp {
                     });
                     let mut post_roll = self.config.recording.post_roll_ms as i32;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Post-roll ms");
+                        let label = ui.label("Post-roll ms");
                         if ui
                             .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
+                            .labelled_by(label.id)
                             .changed()
                         {
                             self.config.recording.post_roll_ms = post_roll.max(0) as u32;
@@ -9932,6 +9938,60 @@ mod layout_tests {
             assert_eq!(progress.numeric_value(), None);
             assert_eq!(progress.min_numeric_value(), None);
             assert_eq!(progress.max_numeric_value(), None);
+        }
+    }
+
+    #[test]
+    fn capture_numeric_controls_have_programmatic_accessible_names() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Advanced;
+        app.config.recording.vad_enabled = true;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_advanced_settings(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let spin_buttons = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::SpinButton)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "Maximum recording seconds",
+            "Speech confirmation ms",
+            "Internal pause ms",
+            "End after silence ms",
+            "Pre-roll ms",
+            "Post-roll ms",
+        ] {
+            let label_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.name() == Some(expected))
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing AccessKit label {expected:?}"));
+            assert!(
+                spin_buttons
+                    .iter()
+                    .any(|(_, node)| node.labelled_by().contains(&label_id)),
+                "no spin button is programmatically labelled by {expected:?}"
+            );
         }
     }
 
