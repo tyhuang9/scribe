@@ -333,7 +333,14 @@ impl StagedRuntime {
 #[derive(Debug)]
 pub(crate) struct FileReplacement {
     destination: PathBuf,
-    rollback_path: Option<PathBuf>,
+    state: FileReplacementState,
+}
+
+#[derive(Debug)]
+enum FileReplacementState {
+    Unchanged,
+    Created,
+    Replaced { rollback_path: PathBuf },
 }
 
 impl FileReplacement {
@@ -341,29 +348,35 @@ impl FileReplacement {
         &self.destination
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), InstallError> {
-        if let Some(rollback) = self.rollback_path.take() {
-            remove_path_if_exists(&rollback)?;
+    pub(crate) fn commit(self) -> Result<(), InstallError> {
+        if let FileReplacementState::Replaced { rollback_path } = self.state {
+            remove_path_if_exists(&rollback_path)?;
         }
         Ok(())
     }
 
-    pub(crate) fn rollback(mut self) -> Result<(), InstallError> {
-        remove_path_if_exists(&self.destination)?;
-        if let Some(rollback) = self.rollback_path.take() {
-            durable_rename(&rollback, &self.destination).map_err(|error| {
-                failed(format!(
-                    "failed to restore previous model {}: {error}",
-                    self.destination.display()
-                ))
-            })?;
-            sync_parent(&self.destination).map_err(|error| {
-                InstallError::RecoveryRequired(format!(
-                    "restored previous model {}, but the rename was not made durable: {error}",
-                    self.destination.display()
-                ))
-            })?;
+    pub(crate) fn rollback(self) -> Result<(), InstallError> {
+        match self.state {
+            FileReplacementState::Unchanged => return Ok(()),
+            FileReplacementState::Created => {
+                remove_path_if_exists(&self.destination)?;
+            }
+            FileReplacementState::Replaced { rollback_path } => {
+                remove_path_if_exists(&self.destination)?;
+                durable_rename(&rollback_path, &self.destination).map_err(|error| {
+                    failed(format!(
+                        "failed to restore previous model {}: {error}",
+                        self.destination.display()
+                    ))
+                })?;
+            }
         }
+        sync_parent(&self.destination).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "rolled back model {}, but the change was not made durable: {error}",
+                self.destination.display()
+            ))
+        })?;
         Ok(())
     }
 }
@@ -902,7 +915,7 @@ impl DownloadedArtifact {
         if self.path == self.destination {
             return Ok(FileReplacement {
                 destination: self.destination,
-                rollback_path: None,
+                state: FileReplacementState::Unchanged,
             });
         }
         verify_file(&self.path, self.size_bytes, &self.sha256)?;
@@ -958,7 +971,10 @@ impl DownloadedArtifact {
         }
         Ok(FileReplacement {
             destination: self.destination,
-            rollback_path: previous,
+            state: match previous {
+                Some(rollback_path) => FileReplacementState::Replaced { rollback_path },
+                None => FileReplacementState::Created,
+            },
         })
     }
 }
@@ -2109,6 +2125,54 @@ mod tests {
             &[Some(8)]
         );
         assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reused_verified_model_rollback_is_a_noop() {
+        let root = unique_root("reused-model-rollback");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("model.bin");
+        let bytes = b"existing verified model";
+        fs::write(&destination, bytes).unwrap();
+        let replacement = DownloadedArtifact {
+            id: "fixture".to_owned(),
+            path: destination.clone(),
+            destination: destination.clone(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+        .activate()
+        .unwrap();
+
+        replacement.rollback().unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert!(!file_rollback_path(&destination).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reused_verified_model_commit_is_a_noop() {
+        let root = unique_root("reused-model-commit");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("model.bin");
+        let bytes = b"existing verified model";
+        fs::write(&destination, bytes).unwrap();
+        let replacement = DownloadedArtifact {
+            id: "fixture".to_owned(),
+            path: destination.clone(),
+            destination: destination.clone(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+        .activate()
+        .unwrap();
+
+        replacement.commit().unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert!(!file_rollback_path(&destination).unwrap().exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1618,10 +1618,10 @@ of Supported models remains **0**.
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/check/lint | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings` | **PASS** |
-| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 472 discovered, 466 passed, 0 failed, 6 environment-gated tests ignored |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 474 discovered, 468 passed, 0 failed, 6 environment-gated tests ignored |
 | Debug/release builds | `cargo build --all-features`; `cargo build --release --all-features` | **PASS** |
 | Architecture boundary | Exact `runtime_router::tests::concrete_runtime_boundary_is_confined_to_the_router` plus the full source-boundary suite | **PASS** - exactly one logical handler; concrete runtime selection remains router-private |
-| Download/install failure injection | In-process HTTP, archive, activation, removal, and recovery tests | **PASS** - resume, ignored/invalid Range, cancellation, size/hash failure, traversal/extra/missing entries, smoke failure, activation/rollback, config-fingerprint mismatch, and interrupted removal covered |
+| Download/install failure injection | In-process HTTP, archive, activation, removal, and recovery tests | **PASS** - resume, ignored/invalid Range, cancellation, size/hash failure, traversal/extra/missing entries, smoke failure, activation/rollback, unchanged-model commit/rollback, config-fingerprint mismatch, and interrupted removal covered |
 | Exact pinned runtime smoke | `local-transcriber.exe --scribe-install-smoke-parent ... cpu` against a temporary exact 13-file package | **PASS** - health 4,098 ms; load 4,341 ms; decode 732 ms; unload/reload 4,051 ms; exit 0 |
 | Pinned model/service fixture | Exact ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` with v1.9.1/base.en/JFK/CPU | **PASS** - first load 4,501 ms; first decode 840 ms; warm load 0 ms; warm decode 806 ms |
 
