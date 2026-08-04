@@ -20,8 +20,8 @@ pub mod settings;
 #[allow(unused_imports)]
 pub use settings::{
     AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
-    OutputSettings, OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore,
-    StreamingSettings,
+    OutputSettings, OverlayMode, OverlayPosition, OverlaySettings, PerformanceSettings,
+    RecordingSettings, SettingsStore, StreamingSettings,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
