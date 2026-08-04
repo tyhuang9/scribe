@@ -1385,9 +1385,9 @@ capture stop -> close preview mailbox/drop pending -> bound active decode
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/lint/build | `cargo fmt --all -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo build --all-features` | **PASS** |
-| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 404 discovered, 398 passed, 0 failed, 6 environment-gated tests ignored |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 405 discovered, 399 passed, 0 failed, 6 environment-gated tests ignored |
 | Preview scheduling/DSP | Targeted `streaming::tests` and native pipeline tests | **PASS** - exact cadence/window bounds, one-active/newest-pending, non-blocking retained-handle drain, final-audio identity, exact 650 ms boundary, 699/700 ms horizon, case/punctuation correction, non-empty deletion/reappearance, repeated words, overlap, bounded context, and sequence rejection |
-| Output isolation and accessibility | App/coordinator/overlay tests | **PASS** - stale/wrong-model/late-after-close updates rejected; tentative text changes only overlay state; final revision supersedes partials and emits once; Playground/final-only never starts preview; tentative text is inspectable but excluded from polite live announcements |
+| Output isolation and accessibility | App/coordinator/overlay tests | **PASS** - stale/wrong-model/late-after-close updates rejected; tentative text changes only overlay state; final revision supersedes partials and emits once; Playground/final-only never starts preview; stabilizer-shaped committed/tentative parts render with exactly one boundary space; tentative text is inspectable but excluded from polite live announcements |
 | Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source scans | **PASS** - one handler; concrete selection remains private; app shell cannot construct or publish PCM preview snapshots |
 | Pinned release fixture | Exact ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` | **PASS** after stabilization - v1.9.1/base.en/CPU; load 294 ms, first decode 795 ms, warm decode 793 ms, unload/reload passed |
 | Final-pass release benchmark | Exact ignored 5-cold/20-warm `native_runtime_jfk_cold_and_warm_benchmark` | **PASS** - cold total median/p95 1,087/1,099 ms; cold load 289/292 ms; warm total 781/800 ms; warm decode 780/798 ms |
@@ -1420,7 +1420,7 @@ One pre-review parallel suite run reproduced the legacy process-registration
 race: another test advanced the global cancellation generation before the
 fixture process registered. The test now retries only that pre-registration
 race while retaining the registered-process termination assertion. The final
-full parallel suite passed all 398 runnable tests, including the hardened case.
+full parallel suite passed all 399 runnable tests, including the hardened case.
 
 ### Risks and Phase 8 entry
 

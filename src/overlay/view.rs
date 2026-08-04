@@ -214,25 +214,11 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
         return;
     }
 
-    let mut text = egui::text::LayoutJob::default();
-    text.append(
+    let text = transcript_layout(
         &state.transcript.committed,
-        0.0,
-        egui::TextFormat {
-            color: Color32::WHITE,
-            ..Default::default()
-        },
-    );
-    text.append(
         &state.transcript.tentative,
-        0.0,
-        egui::TextFormat {
-            color: Color32::from_rgb(162, 173, 190),
-            italics: true,
-            ..Default::default()
-        },
+        ui.available_width(),
     );
-    text.wrap.max_width = ui.available_width();
     let response = ui.label(text);
     let accessible_text = if state.transcript.tentative.is_empty() {
         format!("Committed transcript: {}", state.transcript.committed)
@@ -253,6 +239,36 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
             builder.set_live(egui::accesskit::Live::Polite);
         });
     }
+}
+
+fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::text::LayoutJob {
+    let mut text = egui::text::LayoutJob::default();
+    text.append(
+        committed,
+        0.0,
+        egui::TextFormat {
+            color: Color32::WHITE,
+            ..Default::default()
+        },
+    );
+    if !committed.is_empty()
+        && !tentative.is_empty()
+        && !committed.ends_with(char::is_whitespace)
+        && !tentative.starts_with(char::is_whitespace)
+    {
+        text.append(" ", 0.0, egui::TextFormat::default());
+    }
+    text.append(
+        tentative,
+        0.0,
+        egui::TextFormat {
+            color: Color32::from_rgb(162, 173, 190),
+            italics: true,
+            ..Default::default()
+        },
+    );
+    text.wrap.max_width = max_width;
+    text
 }
 
 fn mark_polite_live_region(context: &egui::Context, id: egui::Id) {
@@ -314,6 +330,15 @@ mod tests {
     }
 
     #[test]
+    fn stabilizer_shaped_transcript_has_exactly_one_boundary_space() {
+        let layout = transcript_layout("Schedule a meeting with", "Alex tomorrow", LIVE_WIDTH);
+        assert_eq!(layout.text, "Schedule a meeting with Alex tomorrow");
+
+        let already_spaced = transcript_layout("hello ", "world", LIVE_WIDTH);
+        assert_eq!(already_spaced.text, "hello world");
+    }
+
+    #[test]
     fn transcript_and_status_are_polite_live_regions_without_controls() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -321,7 +346,7 @@ mod tests {
             phase: OverlayPhase::Listening,
             transcript: super::super::controller::OverlayTranscript {
                 committed: "hello".to_owned(),
-                tentative: " world".to_owned(),
+                tentative: "world".to_owned(),
                 revision: 1,
             },
             transcript_announcement: Some("Committed transcript: hello".to_owned()),
@@ -339,7 +364,7 @@ mod tests {
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live().is_none()
-                && node.name() == Some("Committed transcript: hello. Tentative transcript:  world")
+                && node.name() == Some("Committed transcript: hello. Tentative transcript: world")
         }));
         assert!(update.nodes.iter().all(|(_, node)| {
             node.live() != Some(egui::accesskit::Live::Polite)
