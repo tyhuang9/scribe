@@ -5,14 +5,15 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, FontFamily, FontId, Frame, Layout, Margin, RichText,
-    Rounding, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportCommand,
+    self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
+    ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
 };
 use serde::Deserialize;
 
@@ -21,12 +22,18 @@ use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
 use crate::compatibility_bridge::{self, ProviderHandle};
-use crate::config::{self, AppConfig, HotkeyMode, SettingsStore, ThemeMode};
+use crate::config::{
+    self, AppConfig, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore, ThemeMode,
+};
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
+};
+use crate::overlay::{
+    self, CapturedTarget, OverlayController, OverlayMode as NativeOverlayMode, OverlayPhase,
+    OverlayPosition as NativeOverlayPosition,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::text_output;
@@ -35,29 +42,17 @@ use crate::transcription::{
     TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
 };
 use crate::tray::{TrayCommand, TrayService};
+use crate::ui::{
+    AppPage, ThemePalette, about_page, configure_accessible_style, history_page,
+    minimum_primary_target_height, show_navigation, theme_palette, ui_palette,
+};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
+const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Tab {
-    Transcribe,
-    Models,
-    Playground,
-    Settings,
-}
-
-impl Tab {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Transcribe => "Transcribe",
-            Self::Models => "Models",
-            Self::Playground => "Model Playground",
-            Self::Settings => "Settings",
-        }
-    }
-}
+type Tab = AppPage;
 
 fn initial_tab() -> Tab {
     std::env::var("SCRIBE_START_TAB")
@@ -70,8 +65,11 @@ fn tab_from_env_value(value: &str) -> Option<Tab> {
     match value.trim().to_ascii_lowercase().as_str() {
         "transcribe" => Some(Tab::Transcribe),
         "models" | "model" => Some(Tab::Models),
-        "playground" | "model-playground" | "model playground" => Some(Tab::Playground),
-        "settings" => Some(Tab::Settings),
+        "general" | "settings" => Some(Tab::General),
+        "history" => Some(Tab::History),
+        "advanced" => Some(Tab::Advanced),
+        "about" => Some(Tab::About),
+        "debug" | "playground" | "model-playground" | "model playground" => Some(Tab::Debug),
         _ => None,
     }
 }
@@ -107,6 +105,15 @@ struct ActiveRecording {
     latency: LatencyTrace,
 }
 
+struct PendingRecording {
+    session_id: SessionId,
+    source: RecordingSource,
+    stop_requested: bool,
+    max_duration_seconds: u32,
+    latency: LatencyTrace,
+    abandon: Arc<AtomicBool>,
+}
+
 struct PlaygroundRunState {
     pending_requests: HashMap<RequestId, String>,
     audio_path: PathBuf,
@@ -124,6 +131,7 @@ struct LatencyTrace {
     trigger_observation: TriggerObservation,
     overlay_visible_at: Option<Instant>,
     recorder_started_at: Option<Instant>,
+    first_meter_update_at: Option<Instant>,
     model_load_started_at: Option<Instant>,
     model_loaded_at: Option<Instant>,
     first_partial_at: Option<Instant>,
@@ -146,6 +154,7 @@ impl LatencyTrace {
             trigger_observation,
             overlay_visible_at: None,
             recorder_started_at: None,
+            first_meter_update_at: None,
             model_load_started_at: None,
             model_loaded_at: None,
             first_partial_at: None,
@@ -175,6 +184,11 @@ impl LatencyTrace {
         if let Some(duration) = duration_between(Some(self.activation_at), self.recorder_started_at)
         {
             lines.push(format!("{trigger_label} to recorder ready: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(Some(self.activation_at), self.first_meter_update_at)
+        {
+            lines.push(format!("{trigger_label} to first meter update: {duration}"));
         }
         if let Some(duration) = duration_between(self.model_load_started_at, self.model_loaded_at) {
             lines.push(format!("Model load: {duration}"));
@@ -240,6 +254,24 @@ fn format_duration_ms(duration: Duration) -> String {
     format!("{} ms", duration.as_millis())
 }
 
+fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
+    if !overlay::overlay_focus_safety_available() {
+        return NativeOverlayMode::Off;
+    }
+    match mode {
+        OverlayMode::Live => NativeOverlayMode::Live,
+        OverlayMode::Minimal => NativeOverlayMode::Minimal,
+        OverlayMode::Off => NativeOverlayMode::Off,
+    }
+}
+
+fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
+    match position {
+        OverlayPosition::Top => NativeOverlayPosition::TopCenter,
+        OverlayPosition::Bottom => NativeOverlayPosition::BottomCenter,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PlaygroundCardState {
     descriptor: ModelDescriptor,
@@ -265,6 +297,10 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    CaptureReady {
+        session_id: SessionId,
+        result: Result<RecordingSession, String>,
+    },
     ModelPreloadFinished {
         session_id: SessionId,
         model_id: ModelId,
@@ -992,6 +1028,7 @@ pub struct LocalTranscriberApp {
     config_path: Option<PathBuf>,
     settings_store: Option<SettingsStore>,
     current_tab: Tab,
+    models_show_comparison: bool,
     status: TranscriptionStatus,
     transcript: String,
     status_message: String,
@@ -1002,6 +1039,7 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
+    pending_recording: Option<PendingRecording>,
     transcription_service: TranscriptionService,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1018,6 +1056,9 @@ pub struct LocalTranscriberApp {
     session_coordinator: SessionCoordinator,
     playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
+    captured_targets: HashMap<SessionId, CapturedTarget>,
+    overlay_controller: OverlayController,
+    overlay_hide_at: Option<Instant>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
     last_tray_state: Option<TrayUiState>,
@@ -1068,10 +1109,12 @@ impl LocalTranscriberApp {
             config_path,
             settings_store,
             current_tab: initial_tab(),
+            models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             status_message,
             active_recording: None,
+            pending_recording: None,
             transcription_service,
             tx,
             rx,
@@ -1080,6 +1123,9 @@ impl LocalTranscriberApp {
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
+            captured_targets: HashMap::new(),
+            overlay_controller: OverlayController::new(overlay::reduced_motion_preferred()),
+            overlay_hide_at: None,
             tray_service: None,
             last_tray_state: None,
             quit_requested: false,
@@ -1169,9 +1215,17 @@ impl LocalTranscriberApp {
     }
 
     fn stop_and_discard_active_recording(&mut self) {
+        if let Some(pending) = self.pending_recording.take() {
+            pending.abandon.store(true, Ordering::Release);
+            let _ = self.session_coordinator.cancel_active();
+            self.captured_targets.remove(&pending.session_id);
+            let _ = self.overlay_controller.hide(pending.session_id);
+        }
         let Some(active) = self.active_recording.take() else {
             return;
         };
+        self.captured_targets.remove(&active.session_id);
+        let _ = self.overlay_controller.hide(active.session_id);
         if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
             eprintln!("failed to stop and discard active recording: {err:#}");
         }
@@ -1202,7 +1256,9 @@ impl LocalTranscriberApp {
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.has_active_work() {
+        if self.capture_is_active() {
+            METER_REPAINT_DELAY
+        } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
             // Hotkey and tray events are integrated from update(), so idle still polls slowly.
@@ -1211,7 +1267,7 @@ impl LocalTranscriberApp {
     }
 
     fn has_active_work(&self) -> bool {
-        self.active_recording.is_some()
+        self.capture_is_active()
             || self.session_coordinator.phase() != DictationPhase::Idle
             || self.playground_pending > 0
             || matches!(
@@ -1225,6 +1281,108 @@ impl LocalTranscriberApp {
                 )
             })
             || !self.runtime_jobs.is_empty()
+    }
+
+    fn capture_is_active(&self) -> bool {
+        self.pending_recording.is_some() || self.active_recording.is_some()
+    }
+
+    fn recording_source(&self) -> Option<RecordingSource> {
+        self.active_recording
+            .as_ref()
+            .map(|active| active.source)
+            .or_else(|| {
+                self.pending_recording
+                    .as_ref()
+                    .map(|pending| pending.source)
+            })
+    }
+
+    fn current_audio_level(&self) -> f32 {
+        self.active_recording
+            .as_ref()
+            .map_or(0.0, |active| active.session.latest_level())
+    }
+
+    fn sync_overlay_state(&mut self) {
+        let Some(session_id) = self.session_coordinator.active_session_id() else {
+            if self
+                .overlay_hide_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                && let Some(session_id) = self.overlay_controller.state().session_id
+            {
+                let _ = self.overlay_controller.hide(session_id);
+                self.captured_targets.remove(&session_id);
+                self.overlay_hide_at = None;
+            }
+            return;
+        };
+
+        let mode = if self.session_coordinator.active_purpose() == Some(SessionPurpose::Dictation) {
+            effective_native_overlay_mode(self.config.overlay.mode)
+        } else {
+            NativeOverlayMode::Off
+        };
+        if self.overlay_controller.state().session_id != Some(session_id) {
+            self.overlay_controller.begin_session(session_id, mode);
+        } else {
+            self.overlay_controller.set_mode(mode);
+        }
+
+        if self.status == TranscriptionStatus::Error {
+            let _ =
+                self.overlay_controller
+                    .show_error(session_id, self.status_message.clone(), true);
+            return;
+        }
+
+        let phase = match self.session_coordinator.phase() {
+            DictationPhase::Idle => OverlayPhase::Hidden,
+            DictationPhase::StartingCapture => OverlayPhase::Preparing,
+            DictationPhase::Capturing => OverlayPhase::Listening,
+            DictationPhase::FinalizingCapture => OverlayPhase::Finalizing,
+            DictationPhase::Transcribing => OverlayPhase::Processing,
+            DictationPhase::Output => OverlayPhase::Pasting,
+        };
+        let _ = self.overlay_controller.set_phase(session_id, phase);
+        let level = self.current_audio_level();
+        if let Some(active) = self.active_recording.as_mut()
+            && active.session_id == session_id
+            && active.latency.first_meter_update_at.is_none()
+        {
+            active.latency.first_meter_update_at = Some(Instant::now());
+        }
+        let _ = self
+            .overlay_controller
+            .update_audio_level(session_id, level, level);
+        let elapsed = self
+            .active_recording
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .map(|active| active.started_at.elapsed())
+            .or_else(|| {
+                self.pending_recording
+                    .as_ref()
+                    .filter(|pending| pending.session_id == session_id)
+                    .map(|pending| pending.latency.activation_at.elapsed())
+            });
+        if let Some(elapsed) = elapsed {
+            let _ = self.overlay_controller.update_elapsed(session_id, elapsed);
+        }
+    }
+
+    fn finish_overlay_success(&mut self, session_id: SessionId) {
+        let _ = self
+            .overlay_controller
+            .set_phase(session_id, OverlayPhase::Success);
+        self.overlay_hide_at = Some(Instant::now() + Duration::from_millis(900));
+    }
+
+    fn finish_overlay_error(&mut self, session_id: SessionId, message: &str) {
+        let _ = self
+            .overlay_controller
+            .show_error(session_id, message.to_owned(), true);
+        self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(3));
     }
 
     fn effective_status(&self) -> TranscriptionStatus {
@@ -1324,7 +1482,7 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
-        if self.active_recording.is_some() {
+        if self.capture_is_active() {
             return;
         }
         if source == RecordingSource::Playground
@@ -1359,6 +1517,11 @@ impl LocalTranscriberApp {
         }
 
         self.supersede_active_session();
+        // Capture the external destination before any overlay/window state can
+        // change. The platform adapter rejects every window owned by Scribe.
+        let captured_target = (source == RecordingSource::Transcribe)
+            .then(overlay::capture_foreground_target)
+            .flatten();
 
         let session_id = match self.session_coordinator.begin(source.purpose()) {
             Ok(session_id) => session_id,
@@ -1368,47 +1531,51 @@ impl LocalTranscriberApp {
                 return;
             }
         };
-
-        match audio::start_recording(
-            self.config.recording.max_recording_seconds,
-            self.config.recording.audio_input_device_name.clone(),
-        ) {
-            Ok(session) => {
-                if let Err(err) = self.session_coordinator.capture_started(session_id) {
-                    session.stop();
-                    let _ = self.session_coordinator.fail(session_id);
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not enter capture state: {err}");
-                    return;
-                }
-                if source == RecordingSource::Transcribe {
-                    self.playground_pending = 0;
-                    self.playground_audio_path = None;
-                    self.refresh_playground_runtime_statuses();
-                }
-                latency.recorder_started_at = Some(Instant::now());
-                let path = session.audio_path.display().to_string();
-                self.active_recording = Some(ActiveRecording {
-                    session_id,
-                    session,
-                    source,
-                    stop_requested: false,
-                    started_at: Instant::now(),
-                    max_duration_seconds: self.config.recording.max_recording_seconds,
-                    latency,
-                });
-                if let Some(model) = preload_model {
-                    self.start_model_preload(session_id, model);
-                }
-                self.status = TranscriptionStatus::Listening;
-                self.status_message = format!("Listening. Temporary WAV: {path}");
-            }
-            Err(err) => {
-                let _ = self.session_coordinator.fail(session_id);
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Microphone failed: {err}");
-            }
+        if let Some(target) = captured_target {
+            self.captured_targets.insert(session_id, target);
         }
+        let overlay_mode = if source == RecordingSource::Transcribe {
+            effective_native_overlay_mode(self.config.overlay.mode)
+        } else {
+            NativeOverlayMode::Off
+        };
+        self.overlay_controller
+            .begin_session(session_id, overlay_mode);
+        self.overlay_hide_at = None;
+        if overlay_mode != NativeOverlayMode::Off {
+            latency.overlay_visible_at = Some(Instant::now());
+        }
+
+        let max_duration_seconds = self.config.recording.max_recording_seconds;
+        let input_device_name = self.config.recording.audio_input_device_name.clone();
+        let abandon = Arc::new(AtomicBool::new(false));
+        self.pending_recording = Some(PendingRecording {
+            session_id,
+            source,
+            stop_requested: false,
+            max_duration_seconds,
+            latency,
+            abandon: abandon.clone(),
+        });
+        self.status = TranscriptionStatus::Listening;
+        self.status_message = "Preparing microphone and local model".to_owned();
+
+        if let Some(model) = preload_model {
+            self.start_model_preload(session_id, model);
+        }
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = audio::start_recording(max_duration_seconds, input_device_name)
+                .map_err(|err| err.to_string());
+            if abandon.load(Ordering::Acquire) {
+                if let Ok(session) = result {
+                    let _ = session.stop_and_discard(Duration::from_secs(2));
+                }
+                return;
+            }
+            let _ = tx.send(AppEvent::CaptureReady { session_id, result });
+        });
     }
 
     fn start_model_preload(&mut self, session_id: SessionId, model: SttModelInfo) {
@@ -1424,6 +1591,11 @@ impl LocalTranscriberApp {
             && active.session_id == session_id
         {
             active.latency.model_load_started_at = Some(Instant::now());
+        }
+        if let Some(pending) = self.pending_recording.as_mut()
+            && pending.session_id == session_id
+        {
+            pending.latency.model_load_started_at = Some(Instant::now());
         }
         let service = self.transcription_service.with_config(self.config.clone());
         let tx = self.tx.clone();
@@ -1451,8 +1623,13 @@ impl LocalTranscriberApp {
         let Some(previous_session) = self.session_coordinator.active_session_id() else {
             return;
         };
+        if let Some(pending) = self.pending_recording.take() {
+            pending.abandon.store(true, Ordering::Release);
+        }
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
+        self.captured_targets.remove(&previous_session);
+        let _ = self.overlay_controller.hide(previous_session);
         if let Some(run) = self.playground_runs.remove(&previous_session) {
             let _ = fs::remove_file(run.audio_path);
         }
@@ -1462,6 +1639,17 @@ impl LocalTranscriberApp {
     }
 
     fn stop_recording(&mut self) {
+        if let Some(pending) = self.pending_recording.as_mut()
+            && !pending.stop_requested
+        {
+            let _ = self
+                .session_coordinator
+                .request_stop(pending.session_id, StopReason::Explicit);
+            pending.stop_requested = true;
+            pending.latency.stop_requested_at = Some(Instant::now());
+            self.status_message = "Cancelling microphone startup".to_owned();
+            return;
+        }
         if let Some(active) = self.active_recording.as_mut()
             && !active.stop_requested
         {
@@ -1484,7 +1672,7 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
-        if self.active_recording.is_some() {
+        if self.capture_is_active() {
             self.stop_recording();
         } else {
             self.start_recording_at(
@@ -1550,7 +1738,7 @@ impl LocalTranscriberApp {
             match hotkey_recording_action(
                 self.config.recording.hotkey_mode,
                 observed.event,
-                self.active_recording.as_ref().map(|active| active.source),
+                self.recording_source(),
             ) {
                 Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
                     RecordingSource::Transcribe,
@@ -1581,7 +1769,7 @@ impl LocalTranscriberApp {
             return;
         };
 
-        let current = tray_ui_state(self.active_recording.is_some(), &self.transcript);
+        let current = tray_ui_state(self.capture_is_active(), &self.transcript);
         if !tray_state_needs_sync(self.last_tray_state, current) {
             return;
         }
@@ -1700,6 +1888,67 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                AppEvent::CaptureReady { session_id, result } => {
+                    let Some(mut pending) = self.pending_recording.take() else {
+                        if let Ok(session) = result {
+                            let _ = session.stop_and_discard(Duration::from_secs(2));
+                        }
+                        continue;
+                    };
+                    if pending.session_id != session_id
+                        || self.session_coordinator.active_session_id() != Some(session_id)
+                    {
+                        pending.abandon.store(true, Ordering::Release);
+                        if let Ok(session) = result {
+                            let _ = session.stop_and_discard(Duration::from_secs(2));
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(session) => {
+                            if let Err(err) = self.session_coordinator.capture_started(session_id) {
+                                let _ = session.stop_and_discard(Duration::from_secs(2));
+                                let _ = self.session_coordinator.fail(session_id);
+                                self.status = TranscriptionStatus::Error;
+                                self.status_message =
+                                    format!("Could not enter capture state: {err}");
+                                continue;
+                            }
+                            if pending.source == RecordingSource::Transcribe {
+                                self.playground_pending = 0;
+                                self.playground_audio_path = None;
+                                self.refresh_playground_runtime_statuses();
+                            }
+                            pending.latency.recorder_started_at = Some(Instant::now());
+                            let stop_requested = pending.stop_requested;
+                            self.active_recording = Some(ActiveRecording {
+                                session_id,
+                                session,
+                                source: pending.source,
+                                stop_requested,
+                                started_at: Instant::now(),
+                                max_duration_seconds: pending.max_duration_seconds,
+                                latency: pending.latency,
+                            });
+                            if stop_requested {
+                                if let Some(active) = self.active_recording.as_ref() {
+                                    active.session.stop();
+                                }
+                                self.status_message = "Stopping recording".to_owned();
+                            } else {
+                                self.status = TranscriptionStatus::Listening;
+                                self.status_message = "Listening".to_owned();
+                            }
+                        }
+                        Err(message) => {
+                            let _ = self.session_coordinator.fail(session_id);
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = format!("Microphone failed: {message}");
+                            let overlay_message = self.status_message.clone();
+                            self.finish_overlay_error(session_id, &overlay_message);
+                        }
+                    }
+                }
                 AppEvent::ModelPreloadFinished {
                     session_id,
                     model_id,
@@ -1722,6 +1971,16 @@ impl LocalTranscriberApp {
                             format!("Listening. Model loaded in {load_duration_ms} ms.")
                         };
                     }
+                    if let Some(pending) = self.pending_recording.as_mut()
+                        && pending.session_id == session_id
+                    {
+                        pending.latency.model_loaded_at = Some(Instant::now());
+                        self.status_message = if load_duration_ms == 0 {
+                            "Preparing microphone. Model is warm.".to_owned()
+                        } else {
+                            format!("Preparing microphone. Model loaded in {load_duration_ms} ms.")
+                        };
+                    }
                 }
                 AppEvent::ModelPreloadFailed {
                     session_id,
@@ -1742,6 +2001,15 @@ impl LocalTranscriberApp {
                     {
                         self.status_message = format!(
                             "Listening. Model warm-up was unavailable; final transcription will retry safely: {message}"
+                        );
+                    }
+                    if self
+                        .pending_recording
+                        .as_ref()
+                        .is_some_and(|pending| pending.session_id == session_id)
+                    {
+                        self.status_message = format!(
+                            "Preparing microphone. Model warm-up was unavailable; final transcription will retry safely: {message}"
                         );
                     }
                 }
@@ -1834,6 +2102,12 @@ impl LocalTranscriberApp {
                             let stdout_bytes = result.stdout.len();
                             let stderr_bytes = result.stderr.len();
                             self.transcript = result.transcript.text.clone();
+                            let _ = self.overlay_controller.update_transcript(
+                                session_id,
+                                self.transcript.clone(),
+                                "",
+                                1,
+                            );
                             self.status = TranscriptionStatus::Idle;
                             let completion_message = format!(
                                 "{} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
@@ -1845,13 +2119,15 @@ impl LocalTranscriberApp {
                                 stdout_bytes,
                                 stderr_bytes
                             );
+                            let mut output_error = None;
                             if self.config.output.auto_insert_transcript {
                                 if let Some(latency) = latency.as_mut() {
                                     latency.output_started_at = Some(Instant::now());
                                 }
-                                let output_result = text_output::write_to_focused_app(
+                                let output_result = text_output::write_to_captured_target(
                                     &self.transcript,
                                     &self.config,
+                                    self.captured_targets.get(&session_id),
                                 );
                                 if let Some(latency) = latency.as_mut() {
                                     let completed_at = Instant::now();
@@ -1864,11 +2140,22 @@ impl LocalTranscriberApp {
                                     "{completion_message}. {}",
                                     output_result.status_message()
                                 );
+                                if let text_output::TextOutputResult::Failed(message) =
+                                    output_result
+                                {
+                                    self.status = TranscriptionStatus::Error;
+                                    output_error = Some(message);
+                                }
                             } else {
                                 self.status_message = completion_message;
                             }
                             self.latest_latency = latency;
                             let _ = self.session_coordinator.complete(session_id);
+                            if let Some(message) = output_error {
+                                self.finish_overlay_error(session_id, &message);
+                            } else {
+                                self.finish_overlay_success(session_id);
+                            }
                         }
                         RecordingSource::Playground => {
                             self.apply_playground_result(*result);
@@ -1939,8 +2226,9 @@ impl LocalTranscriberApp {
                     match source {
                         RecordingSource::Transcribe => {
                             self.status = TranscriptionStatus::Error;
-                            self.status_message = message;
+                            self.status_message = message.clone();
                             let _ = self.session_coordinator.fail(session_id);
+                            self.finish_overlay_error(session_id, &message);
                         }
                         RecordingSource::Playground => {
                             self.status = TranscriptionStatus::Error;
@@ -2449,7 +2737,7 @@ impl LocalTranscriberApp {
     }
 
     fn playground_selector_busy(&self) -> bool {
-        self.active_recording.is_some() || self.playground_pending > 0
+        self.capture_is_active() || self.playground_pending > 0
     }
 
     fn open_playground_selector(&mut self, opener_id: Option<egui::Id>) {
@@ -2620,7 +2908,7 @@ impl LocalTranscriberApp {
 
     fn runtime_consumer_activity(&self, runtime_id: &str) -> RuntimeConsumerActivity {
         RuntimeConsumerActivity {
-            recording: self.active_recording.is_some(),
+            recording: self.capture_is_active(),
             transcribing: self.effective_status() == TranscriptionStatus::Transcribing,
             playground_jobs: self.playground_pending > 0,
             model_download: model_download_uses_runtime(
@@ -2880,7 +3168,6 @@ impl eframe::App for LocalTranscriberApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx, frame);
-        let colors = theme_palette(ctx);
         paint_viewport_background(ctx);
         self.handle_close_request(ctx);
         self.poll_tray(ctx);
@@ -2893,42 +3180,30 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_settings_save();
         self.sync_tray_state();
 
-        egui::SidePanel::left("navigation")
-            .frame(
-                Frame::none()
-                    .fill(colors.sidebar_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .inner_margin(Margin::symmetric(14.0, 16.0)),
-            )
-            .resizable(false)
-            .exact_width(200.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Scribe")
-                        .font(FontId::proportional(20.0))
-                        .color(colors.primary)
-                        .strong(),
-                );
-                ui.label(RichText::new("Local-First STT").small().weak());
-                ui.add_space(22.0);
-                nav_button(ui, &mut self.current_tab, Tab::Transcribe);
-                nav_button(ui, &mut self.current_tab, Tab::Models);
-                nav_button(ui, &mut self.current_tab, Tab::Playground);
-                nav_button(ui, &mut self.current_tab, Tab::Settings);
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    sidebar_link(ui, "Privacy");
-                    sidebar_link(ui, "Help");
-                });
-            });
+        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
 
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
                 Tab::Transcribe => self.ui_transcribe(ui),
+                Tab::General => self.ui_general_settings(ui),
+                Tab::Models if self.models_show_comparison => self.ui_playground(ui),
                 Tab::Models => self.ui_models(ui),
-                Tab::Playground => self.ui_playground(ui),
-                Tab::Settings => self.ui_settings(ui),
+                Tab::History => self.ui_history(ui),
+                Tab::Advanced => self.ui_advanced_settings(ui),
+                Tab::About => self.ui_about(ui),
+                Tab::Debug => self.ui_playground(ui),
             });
+
+        self.sync_overlay_state();
+        let overlay_session_id = self.overlay_controller.state().session_id;
+        let target = overlay_session_id.and_then(|id| self.captured_targets.get(&id));
+        overlay::show_overlay_viewport(
+            ctx,
+            self.overlay_controller.state(),
+            target,
+            native_overlay_position(self.config.overlay.position),
+        );
 
         ctx.request_repaint_after(self.next_repaint_delay());
     }
@@ -3006,7 +3281,7 @@ impl LocalTranscriberApp {
                     },
                     |ui| {
                         if ui.add(small_button(ui, "Edit")).clicked() {
-                            requested_tab = Some(Tab::Settings);
+                            requested_tab = Some(Tab::General);
                         }
                     },
                 );
@@ -3015,7 +3290,7 @@ impl LocalTranscriberApp {
                 self.current_tab = tab;
             }
 
-            if !ready && self.active_recording.is_none() {
+            if !ready && !self.capture_is_active() {
                 ui.add_space(12.0);
                 panel(ui, |ui| {
                     let setup_message = runtime_status
@@ -3038,7 +3313,7 @@ impl LocalTranscriberApp {
             ui.add_space(12.0);
             recessed_panel(ui, 110.0, |ui| {
                 ui.vertical_centered(|ui| {
-                    let listening = self.active_recording.is_some();
+                    let listening = self.capture_is_active();
                     let button_text = if listening {
                         "Stop Listening"
                     } else {
@@ -3077,6 +3352,14 @@ impl LocalTranscriberApp {
                                 .desired_width(220.0)
                                 .text(recording_timer_text(active)),
                         );
+                        let level = self.current_audio_level();
+                        ui.add(
+                            egui::ProgressBar::new(level)
+                                .desired_width(220.0)
+                                .text(format!("Input level {:.0}%", level * 100.0)),
+                        );
+                    } else if self.pending_recording.is_some() {
+                        ui.label(RichText::new("Preparing microphone").small().weak());
                     } else if ready {
                         ui.label(
                             RichText::new("System audio & microphone active")
@@ -3125,6 +3408,26 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Models Catalog", status, &status_message, |ui| {
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(section_heading("Compare installed models"));
+                        ui.label(mut_text(
+                            "Record one local sample and compare the selected installed models.",
+                        ));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(primary_small_button(ui, "Open comparison"))
+                            .clicked()
+                        {
+                            self.models_show_comparison = true;
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(12.0);
             panel(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     model_search_filter_control(ui, &mut self.model_search);
@@ -3369,24 +3672,30 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
+            if self.current_tab == Tab::Models {
+                if ui.add(small_button(ui, "Back to models")).clicked() {
+                    self.models_show_comparison = false;
+                }
+                ui.add_space(12.0);
+            }
             panel(ui, |ui| {
                 let run_blocked = self.playground_run_block_reason();
                 let selector_busy = self.playground_selector_busy();
                 ui.horizontal_wrapped(|ui| {
-                    let text = if self.active_recording.is_some() {
+                    let text = if self.capture_is_active() {
                         "Stop Recording"
                     } else {
                         "Start Test Recording"
                     };
                     let recording_button = add_enabled_button(
                         ui,
-                        self.active_recording.is_some() || run_blocked.is_none(),
+                        self.capture_is_active() || run_blocked.is_none(),
                         primary_small_button(ui, text),
                         run_blocked.as_deref(),
                     )
                     .on_hover_text("Record one audio sample and run every selected ready model.");
                     if recording_button.clicked() {
-                        if self.active_recording.is_some() {
+                        if self.capture_is_active() {
                             self.stop_recording();
                         } else {
                             self.start_recording(RecordingSource::Playground);
@@ -3773,10 +4082,10 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn ui_settings(&mut self, ui: &mut Ui) {
+    fn ui_general_settings(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
-        page(ui, "Settings", status, &status_message, |ui| {
+        page(ui, "General", status, &status_message, |ui| {
             card(ui, |ui| {
                 ui.label(section_heading("General"));
                 ui.add_space(8.0);
@@ -3785,34 +4094,21 @@ impl LocalTranscriberApp {
                     self.config.general.close_to_tray = close_to_tray;
                     self.save_config();
                 }
-                let mut auto_insert = self.config.output.auto_insert_transcript;
-                if ui
-                    .checkbox(&mut auto_insert, "Insert transcript into focused app")
-                    .changed()
-                {
-                    self.config.output.auto_insert_transcript = auto_insert;
-                    self.save_config();
-                }
-                ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
-                    let mut restore_clipboard = self.config.output.restore_clipboard_after_insert;
-                    if ui
-                        .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                        .changed()
-                    {
-                        self.config.output.restore_clipboard_after_insert = restore_clipboard;
-                        self.save_config();
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(section_heading("Active model"));
+                let model_name = self
+                    .transcription_service
+                    .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
+                    .map(|descriptor| descriptor.display_name)
+                    .unwrap_or("No model selected");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(body_strong(model_name));
+                    if ui.add(small_button(ui, "Manage models")).clicked() {
+                        self.current_tab = Tab::Models;
                     }
-                    let mut paste_delay = self.config.output.paste_delay_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Paste delay ms");
-                        if ui
-                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
-                            .changed()
-                        {
-                            self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
-                            self.save_config();
-                        }
-                    });
                 });
             });
 
@@ -3864,46 +4160,6 @@ impl LocalTranscriberApp {
                 });
             });
 
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Performance"));
-                ui.add_space(8.0);
-                let gpu_available = self
-                    .transcription_service
-                    .model_descriptor(&crate::transcription::ModelId::new(
-                        &self.config.general.selected_default_model,
-                    ))
-                    .is_ok_and(|descriptor| descriptor.capabilities.gpu);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Transcription device");
-                    let mut preference = self.config.performance.acceleration_preference;
-                    ComboBox::from_id_source("transcription-device-mode")
-                        .selected_text(preference.label())
-                        .show_ui(ui, |ui| {
-                            for mode in AccelerationPreference::ALL {
-                                let enabled = mode != AccelerationPreference::Gpu || gpu_available;
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut preference, mode, mode.label());
-                                });
-                            }
-                        });
-                    if preference != self.config.performance.acceleration_preference {
-                        self.config.performance.acceleration_preference = preference;
-                        self.save_config();
-                    }
-                });
-                if !gpu_available {
-                    ui.add_space(4.0);
-                    wrapped_label(
-                        ui,
-                        mut_text(
-                            "The active model is verified for CPU use only. GPU mode is enabled only for a model whose compatibility evidence advertises it.",
-                        ),
-                    );
-                }
-            });
-
-            ui.add_space(12.0);
             card(ui, |ui| {
                 ui.label(section_heading("Audio"));
                 ui.add_space(8.0);
@@ -3939,17 +4195,6 @@ impl LocalTranscriberApp {
                         self.refresh_audio_devices();
                     }
                 });
-                let mut max_duration = self.config.recording.max_recording_seconds as i32;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Max recording seconds");
-                    if ui
-                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
-                        .changed()
-                    {
-                        self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
-                        self.save_config();
-                    }
-                });
             });
 
             ui.add_space(12.0);
@@ -3974,18 +4219,189 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    let before = self.config.overlay.mode;
+                    ui.label("Dictation overlay");
+                    ui.add_enabled_ui(overlay::overlay_focus_safety_available(), |ui| {
+                        ComboBox::from_id_source("overlay-mode")
+                            .selected_text(self.config.overlay.mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in OverlayMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.config.overlay.mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                    });
+                    if before != self.config.overlay.mode {
+                        self.save_config();
+                    }
+                });
+                if !overlay::overlay_focus_safety_available() {
+                    ui.colored_label(
+                        ui_palette(ui).warning,
+                        "The overlay is forced Off because no-focus window safety is not verified on this platform.",
+                    );
+                }
+            });
+        });
+    }
+
+    fn ui_history(&mut self, ui: &mut Ui) {
+        let status = self.effective_status();
+        let status_message = self.status_message.clone();
+        let transcript = self.transcript.clone();
+        page(ui, "History", status, &status_message, |ui| {
+            if history_page(ui, &transcript) {
+                self.copy_transcript_to_clipboard();
+            }
+        });
+    }
+
+    fn ui_about(&mut self, ui: &mut Ui) {
+        let status = self.effective_status();
+        let status_message = self.status_message.clone();
+        let model_dir = config::model_storage_dir(&self.config);
+        let config_path = self.config_path.clone();
+        page(ui, "About", status, &status_message, |ui| {
+            about_page(ui, &model_dir, config_path.as_deref());
+        });
+    }
+
+    fn ui_advanced_settings(&mut self, ui: &mut Ui) {
+        let status = self.effective_status();
+        let status_message = self.status_message.clone();
+        page(ui, "Advanced", status, &status_message, |ui| {
+            card(ui, |ui| {
+                ui.label(section_heading("Output"));
+                ui.add_space(8.0);
+                let mut auto_insert = self.config.output.auto_insert_transcript;
+                if ui
+                    .checkbox(
+                        &mut auto_insert,
+                        "Insert final transcript into captured app",
+                    )
+                    .changed()
+                {
+                    self.config.output.auto_insert_transcript = auto_insert;
+                    self.save_config();
+                }
+                ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
+                    let mut restore_clipboard = self.config.output.restore_clipboard_after_insert;
+                    if ui
+                        .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
+                        .changed()
+                    {
+                        self.config.output.restore_clipboard_after_insert = restore_clipboard;
+                        self.save_config();
+                    }
+                    let mut paste_delay = self.config.output.paste_delay_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Paste delay ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                            .changed()
+                        {
+                            self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
+                            self.save_config();
+                        }
+                    });
+                });
             });
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Runtime"));
-                ui.label(RichText::new("Models run only when transcription starts. No cloud speech service, account sync, or always-on listener is enabled.").weak());
+                ui.label(section_heading("Capture limits"));
+                let mut max_duration = self.config.recording.max_recording_seconds as i32;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Maximum recording seconds");
+                    if ui
+                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
+                        .changed()
+                    {
+                        self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
+                        self.save_config();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let before = self.config.overlay.position;
+                    ui.label("Overlay position");
+                    ComboBox::from_id_source("overlay-position")
+                        .selected_text(self.config.overlay.position.label())
+                        .show_ui(ui, |ui| {
+                            for position in OverlayPosition::ALL {
+                                ui.selectable_value(
+                                    &mut self.config.overlay.position,
+                                    position,
+                                    position.label(),
+                                );
+                            }
+                        });
+                    if before != self.config.overlay.position {
+                        self.save_config();
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(section_heading("Performance"));
+                let gpu_available = self
+                    .transcription_service
+                    .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
+                    .is_ok_and(|descriptor| descriptor.capabilities.gpu);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Transcription device");
+                    let mut preference = self.config.performance.acceleration_preference;
+                    ComboBox::from_id_source("advanced-transcription-device-mode")
+                        .selected_text(preference.label())
+                        .show_ui(ui, |ui| {
+                            for mode in AccelerationPreference::ALL {
+                                ui.add_enabled_ui(
+                                    mode != AccelerationPreference::Gpu || gpu_available,
+                                    |ui| {
+                                        ui.selectable_value(&mut preference, mode, mode.label());
+                                    },
+                                );
+                            }
+                        });
+                    if preference != self.config.performance.acceleration_preference {
+                        self.config.performance.acceleration_preference = preference;
+                        self.save_config();
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(section_heading("Developer"));
+                let mut debug_mode = self.config.developer.debug_mode;
+                if ui
+                    .checkbox(&mut debug_mode, "Enable local model Playground")
+                    .changed()
+                {
+                    self.config.developer.debug_mode = debug_mode;
+                    if !debug_mode && self.current_tab == Tab::Debug {
+                        self.current_tab = Tab::Advanced;
+                    }
+                    self.save_config();
+                }
+                ui.label(mut_text(
+                    "Debug enables the existing functional local comparison tools. It does not enable cloud processing.",
+                ));
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(section_heading("Diagnostics"));
                 if let Some(latency) = &self.latest_latency {
-                    ui.add_space(8.0);
-                    ui.label(section_heading("Last Latency"));
                     for line in latency.summary_lines() {
                         ui.label(mut_text(line));
                     }
+                } else {
+                    ui.label(mut_text("No completed session latency is available yet."));
                 }
                 if self.tray_service.is_none() {
                     ui.colored_label(
@@ -4003,89 +4419,6 @@ impl LocalTranscriberApp {
 
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ThemePalette {
-    shell_bg: Color32,
-    content_bg: Color32,
-    sidebar_bg: Color32,
-    card_bg: Color32,
-    panel_bg: Color32,
-    active_card_bg: Color32,
-    text: Color32,
-    muted_text: Color32,
-    border: Color32,
-    border_strong: Color32,
-    primary: Color32,
-    accent: Color32,
-    success: Color32,
-    warning: Color32,
-    error: Color32,
-    primary_button_bg: Color32,
-    primary_button_text: Color32,
-}
-
-impl ThemePalette {
-    fn from_visuals(visuals: &egui::Visuals) -> Self {
-        if visuals.dark_mode {
-            Self::dark()
-        } else {
-            Self::light()
-        }
-    }
-
-    fn light() -> Self {
-        Self {
-            shell_bg: Color32::from_rgb(247, 249, 251),
-            content_bg: Color32::from_rgb(247, 249, 251),
-            sidebar_bg: Color32::WHITE,
-            card_bg: Color32::WHITE,
-            panel_bg: Color32::from_rgb(248, 250, 252),
-            active_card_bg: Color32::from_rgb(239, 246, 255),
-            text: Color32::from_rgb(29, 33, 42),
-            muted_text: Color32::from_rgb(85, 95, 109),
-            border: Color32::from_rgb(226, 232, 240),
-            border_strong: Color32::from_rgb(203, 213, 225),
-            primary: Color32::from_rgb(6, 10, 18),
-            accent: Color32::from_rgb(37, 99, 235),
-            success: Color32::from_rgb(22, 163, 74),
-            warning: Color32::from_rgb(202, 138, 4),
-            error: Color32::from_rgb(220, 38, 38),
-            primary_button_bg: Color32::from_rgb(6, 10, 18),
-            primary_button_text: Color32::WHITE,
-        }
-    }
-
-    fn dark() -> Self {
-        Self {
-            shell_bg: Color32::from_rgb(15, 18, 24),
-            content_bg: Color32::from_rgb(15, 18, 24),
-            sidebar_bg: Color32::from_rgb(20, 24, 32),
-            card_bg: Color32::from_rgb(26, 31, 41),
-            panel_bg: Color32::from_rgb(22, 27, 36),
-            active_card_bg: Color32::from_rgb(25, 42, 68),
-            text: Color32::from_rgb(236, 241, 247),
-            muted_text: Color32::from_rgb(156, 166, 179),
-            border: Color32::from_rgb(53, 61, 76),
-            border_strong: Color32::from_rgb(76, 86, 104),
-            primary: Color32::from_rgb(247, 250, 252),
-            accent: Color32::from_rgb(96, 165, 250),
-            success: Color32::from_rgb(74, 222, 128),
-            warning: Color32::from_rgb(251, 191, 36),
-            error: Color32::from_rgb(248, 113, 113),
-            primary_button_bg: Color32::from_rgb(37, 99, 235),
-            primary_button_text: Color32::WHITE,
-        }
-    }
-}
-
-fn theme_palette(ctx: &egui::Context) -> ThemePalette {
-    ThemePalette::from_visuals(&ctx.style().visuals)
-}
-
-fn ui_palette(ui: &Ui) -> ThemePalette {
-    ThemePalette::from_visuals(ui.visuals())
-}
-
 #[derive(Clone, Copy)]
 enum ChipTone {
     Neutral,
@@ -4096,26 +4429,7 @@ enum ChipTone {
 }
 
 fn configure_stitch_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(10.0, 6.0);
-    style.spacing.interact_size = Vec2::new(24.0, 28.0);
-    style.text_styles.insert(
-        TextStyle::Heading,
-        FontId::new(24.0, FontFamily::Proportional),
-    );
-    style
-        .text_styles
-        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-    style.text_styles.insert(
-        TextStyle::Button,
-        FontId::new(13.0, FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        TextStyle::Small,
-        FontId::new(12.0, FontFamily::Proportional),
-    );
-    ctx.set_style(style);
+    configure_accessible_style(ctx);
 }
 
 fn paint_viewport_background(ctx: &egui::Context) {
@@ -5107,37 +5421,6 @@ fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
         .min(available - trailing_width)
 }
 
-fn nav_button(ui: &mut Ui, current_tab: &mut Tab, tab: Tab) {
-    let colors = ui_palette(ui);
-    let selected = *current_tab == tab;
-    let response = ui.add_sized(
-        [ui.available_width(), 34.0],
-        Button::new(RichText::new(tab.label()).color(if selected {
-            colors.text
-        } else {
-            colors.muted_text
-        }))
-        .fill(if selected {
-            colors.card_bg
-        } else {
-            colors.shell_bg
-        })
-        .stroke(if selected {
-            Stroke::new(1.0, colors.border_strong)
-        } else {
-            Stroke::NONE
-        })
-        .rounding(Rounding::same(6.0)),
-    );
-    if response.clicked() {
-        *current_tab = tab;
-    }
-}
-
-fn sidebar_link(ui: &mut Ui, label: &str) {
-    ui.label(RichText::new(label).small().weak());
-}
-
 fn primary_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
     let colors = ui_palette(ui);
     Button::new(
@@ -5161,7 +5444,7 @@ fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
     .fill(colors.primary_button_bg)
     .stroke(Stroke::new(1.0, colors.primary_button_bg))
     .rounding(Rounding::same(5.0))
-    .min_size(Vec2::new(72.0, 30.0))
+    .min_size(Vec2::new(72.0, minimum_primary_target_height()))
 }
 
 fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
@@ -5170,7 +5453,7 @@ fn small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border_strong))
         .rounding(Rounding::same(5.0))
-        .min_size(Vec2::new(68.0, 30.0))
+        .min_size(Vec2::new(68.0, minimum_primary_target_height()))
 }
 
 fn add_enabled_button<'a>(
@@ -6275,11 +6558,8 @@ mod layout_tests {
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
         assert_eq!(tab_from_env_value("models"), Some(Tab::Models));
-        assert_eq!(
-            tab_from_env_value("model playground"),
-            Some(Tab::Playground)
-        );
-        assert_eq!(tab_from_env_value("settings"), Some(Tab::Settings));
+        assert_eq!(tab_from_env_value("model playground"), Some(Tab::Debug));
+        assert_eq!(tab_from_env_value("settings"), Some(Tab::General));
         assert_eq!(tab_from_env_value("unknown"), None);
     }
 
@@ -6311,7 +6591,15 @@ mod layout_tests {
 
     #[test]
     fn app_shell_pages_paint_within_viewport_at_minimum_and_wide_widths() {
-        for tab in [Tab::Transcribe, Tab::Models, Tab::Playground, Tab::Settings] {
+        for tab in [
+            Tab::Transcribe,
+            Tab::General,
+            Tab::Models,
+            Tab::History,
+            Tab::Advanced,
+            Tab::About,
+            Tab::Debug,
+        ] {
             for width in [840.0, 1440.0, 4096.0] {
                 let output = render_app_tab(tab, width);
                 let max_painted_x = max_visible_painted_x(&output);
@@ -6326,7 +6614,7 @@ mod layout_tests {
 
     #[test]
     fn model_pages_do_not_expand_across_repaints() {
-        for tab in [Tab::Models, Tab::Playground] {
+        for tab in [Tab::Models, Tab::Debug] {
             let max_painted_x = render_app_tab_repeatedly(tab, 840.0, 8)
                 .into_iter()
                 .fold(0.0_f32, f32::max);
@@ -6531,6 +6819,7 @@ mod layout_tests {
             trigger_observation: TriggerObservation::AppAction,
             overlay_visible_at: None,
             recorder_started_at: Some(base + Duration::from_millis(10)),
+            first_meter_update_at: Some(base + Duration::from_millis(15)),
             model_load_started_at: Some(base + Duration::from_millis(20)),
             model_loaded_at: Some(base + Duration::from_millis(70)),
             first_partial_at: None,
@@ -6550,6 +6839,7 @@ mod layout_tests {
             trace.summary_lines(),
             vec![
                 "App action to recorder ready: 10 ms",
+                "App action to first meter update: 15 ms",
                 "Model load: 50 ms",
                 "Stop to WAV finalized: 40 ms",
                 "Transcription job: 500 ms",
@@ -6570,6 +6860,7 @@ mod layout_tests {
             trigger_observation: TriggerObservation::HotkeyPoll,
             overlay_visible_at: None,
             recorder_started_at: Some(base + Duration::from_millis(10)),
+            first_meter_update_at: None,
             model_load_started_at: None,
             model_loaded_at: None,
             first_partial_at: None,
@@ -7521,7 +7812,7 @@ mod layout_tests {
         let mut observed_width = 0.0;
 
         let _ = ctx.run(raw_input, |ctx| {
-            let mut current_tab = Tab::Playground;
+            let mut current_tab = Tab::Debug;
             show_test_navigation(ctx, &mut current_tab);
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
@@ -7630,9 +7921,12 @@ mod layout_tests {
                 .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| match app.current_tab {
                     Tab::Transcribe => app.ui_transcribe(ui),
+                    Tab::General => app.ui_general_settings(ui),
                     Tab::Models => app.ui_models(ui),
-                    Tab::Playground => app.ui_playground(ui),
-                    Tab::Settings => app.ui_settings(ui),
+                    Tab::History => app.ui_history(ui),
+                    Tab::Advanced => app.ui_advanced_settings(ui),
+                    Tab::About => app.ui_about(ui),
+                    Tab::Debug => app.ui_playground(ui),
                 });
         })
     }
@@ -7721,9 +8015,12 @@ mod layout_tests {
                     .frame(content_panel_frame(ctx))
                     .show(ctx, |ui| match app.current_tab {
                         Tab::Transcribe => app.ui_transcribe(ui),
+                        Tab::General => app.ui_general_settings(ui),
                         Tab::Models => app.ui_models(ui),
-                        Tab::Playground => app.ui_playground(ui),
-                        Tab::Settings => app.ui_settings(ui),
+                        Tab::History => app.ui_history(ui),
+                        Tab::Advanced => app.ui_advanced_settings(ui),
+                        Tab::About => app.ui_about(ui),
+                        Tab::Debug => app.ui_playground(ui),
                     });
             });
             max_x_by_frame.push(max_painted_x(&output));
@@ -7733,23 +8030,7 @@ mod layout_tests {
     }
 
     fn show_test_navigation(ctx: &egui::Context, current_tab: &mut Tab) {
-        let colors = theme_palette(ctx);
-        egui::SidePanel::left("test-navigation")
-            .frame(
-                Frame::none()
-                    .fill(colors.sidebar_bg)
-                    .stroke(Stroke::new(1.0, colors.border))
-                    .inner_margin(Margin::symmetric(14.0, 16.0)),
-            )
-            .resizable(false)
-            .exact_width(200.0)
-            .show(ctx, |ui| {
-                ui.label("Scribe");
-                nav_button(ui, current_tab, Tab::Transcribe);
-                nav_button(ui, current_tab, Tab::Models);
-                nav_button(ui, current_tab, Tab::Playground);
-                nav_button(ui, current_tab, Tab::Settings);
-            });
+        show_navigation(ctx, current_tab, true);
     }
 
     fn max_visible_painted_x(output: &egui::FullOutput) -> f32 {
@@ -7802,10 +8083,12 @@ mod layout_tests {
             config_path: None,
             settings_store: None,
             current_tab: Tab::Models,
+            models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             status_message: "Ready".to_owned(),
             active_recording: None,
+            pending_recording: None,
             transcription_service,
             tx,
             rx,
@@ -7814,6 +8097,9 @@ mod layout_tests {
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
+            captured_targets: HashMap::new(),
+            overlay_controller: OverlayController::new(false),
+            overlay_hide_at: None,
             tray_service: None,
             last_tray_state: None,
             quit_requested: false,

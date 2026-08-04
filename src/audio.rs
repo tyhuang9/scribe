@@ -1,6 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +19,7 @@ pub struct RecordingSession {
     pub audio_path: PathBuf,
     stop_tx: Sender<()>,
     finished_rx: Receiver<Result<PathBuf, String>>,
+    level_bits: Arc<AtomicU32>,
 }
 
 impl RecordingSession {
@@ -26,6 +29,12 @@ impl RecordingSession {
 
     pub fn try_finish(&self) -> Option<Result<PathBuf, String>> {
         self.finished_rx.try_recv().ok()
+    }
+
+    /// Returns the latest native input peak in the inclusive `0.0..=1.0` range.
+    /// Only this aggregate value crosses into UI state; microphone PCM remains in Rust.
+    pub fn latest_level(&self) -> f32 {
+        f32::from_bits(self.level_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
     }
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<()> {
@@ -113,6 +122,8 @@ pub fn start_recording(
     let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
     let (started_tx, started_rx) = bounded::<Result<(), String>>(1);
     let worker_path = audio_path.clone();
+    let level_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+    let worker_level_bits = level_bits.clone();
 
     thread::spawn(move || {
         let result = record_to_wav(
@@ -121,6 +132,7 @@ pub fn start_recording(
             max_duration_seconds,
             input_device_name,
             started_tx,
+            worker_level_bits,
         );
         let _ = finished_tx.send(result.map(|_| worker_path).map_err(|err| err.to_string()));
     });
@@ -139,6 +151,7 @@ pub fn start_recording(
             audio_path,
             stop_tx,
             finished_rx,
+            level_bits,
         }),
         Err(message) => {
             let _ = finished_rx.recv_timeout(Duration::from_secs(1));
@@ -178,6 +191,7 @@ fn record_to_wav(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
     started_tx: Sender<Result<(), String>>,
+    level_bits: Arc<AtomicU32>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = select_input_device(&host, input_device_name.as_deref())?;
@@ -222,22 +236,28 @@ fn record_to_wav(
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
-            move |data: &[f32], _| write_f32(data, &writer_for_callback),
+            move |data: &[f32], _| write_f32(data, &writer_for_callback, &level_bits),
             err_fn,
             None,
         )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| write_i16(data, &writer_for_callback),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| write_u16(data, &writer_for_callback),
-            err_fn,
-            None,
-        )?,
+        cpal::SampleFormat::I16 => {
+            let level_bits = level_bits.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| write_i16(data, &writer_for_callback, &level_bits),
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let level_bits = level_bits.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _| write_u16(data, &writer_for_callback, &level_bits),
+                err_fn,
+                None,
+            )?
+        }
         other => {
             let message = format!("unsupported microphone sample format: {other:?}");
             let _ = started_tx.send(Err(message.clone()));
@@ -291,7 +311,8 @@ fn select_input_device(host: &cpal::Host, input_device_name: Option<&str>) -> Re
     })
 }
 
-fn write_f32(input: &[f32], writer: &SharedWavWriter) {
+fn write_f32(input: &[f32], writer: &SharedWavWriter, level_bits: &AtomicU32) {
+    publish_level(level_bits, peak_f32(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -303,7 +324,8 @@ fn write_f32(input: &[f32], writer: &SharedWavWriter) {
     }
 }
 
-fn write_i16(input: &[i16], writer: &SharedWavWriter) {
+fn write_i16(input: &[i16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
+    publish_level(level_bits, peak_i16(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -313,7 +335,8 @@ fn write_i16(input: &[i16], writer: &SharedWavWriter) {
     }
 }
 
-fn write_u16(input: &[u16], writer: &SharedWavWriter) {
+fn write_u16(input: &[u16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
+    publish_level(level_bits, peak_u16(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -322,6 +345,38 @@ fn write_u16(input: &[u16], writer: &SharedWavWriter) {
             let _ = writer.write_sample(centered.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
     }
+}
+
+fn publish_level(level_bits: &AtomicU32, level: f32) {
+    level_bits.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+fn peak_f32(input: &[f32]) -> f32 {
+    input
+        .iter()
+        .copied()
+        .filter(|sample| sample.is_finite())
+        .map(f32::abs)
+        .fold(0.0, f32::max)
+        .clamp(0.0, 1.0)
+}
+
+fn peak_i16(input: &[i16]) -> f32 {
+    input
+        .iter()
+        .copied()
+        .map(|sample| (sample as i32).unsigned_abs() as f32 / 32768.0)
+        .fold(0.0, f32::max)
+        .clamp(0.0, 1.0)
+}
+
+fn peak_u16(input: &[u16]) -> f32 {
+    input
+        .iter()
+        .copied()
+        .map(|sample| (sample as i32 - 32768).unsigned_abs() as f32 / 32768.0)
+        .fold(0.0, f32::max)
+        .clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -352,6 +407,7 @@ mod tests {
             audio_path: path.clone(),
             stop_tx,
             finished_rx,
+            level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
         };
 
         session.stop_and_discard(Duration::from_secs(1)).unwrap();
@@ -378,6 +434,7 @@ mod tests {
             audio_path: path.clone(),
             stop_tx,
             finished_rx,
+            level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
         };
 
         let error = session
@@ -386,5 +443,16 @@ mod tests {
 
         assert!(error.to_string().contains("recorder failed"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn native_level_conversion_is_clamped_and_format_neutral() {
+        assert_eq!(peak_f32(&[]), 0.0);
+        assert_eq!(peak_f32(&[f32::NAN, -0.5, 2.0]), 1.0);
+        assert_eq!(peak_i16(&[0, -16384]), 0.5);
+        assert_eq!(peak_i16(&[i16::MIN]), 1.0);
+        assert_eq!(peak_u16(&[32768]), 0.0);
+        assert_eq!(peak_u16(&[0]), 1.0);
+        assert!(peak_u16(&[u16::MAX]) < 1.0);
     }
 }

@@ -8,6 +8,7 @@ mod hotkey;
 mod managed_downloads;
 mod model_catalog;
 mod models;
+mod overlay;
 mod prepared_audio;
 mod runtime_catalog;
 mod runtime_router;
@@ -15,6 +16,7 @@ mod stt;
 mod text_output;
 mod transcription;
 mod tray;
+mod ui;
 
 use eframe::egui;
 
