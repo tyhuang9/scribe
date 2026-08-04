@@ -255,6 +255,7 @@ fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::
         && !tentative.is_empty()
         && !committed.ends_with(char::is_whitespace)
         && !tentative.starts_with(char::is_whitespace)
+        && !tentative.starts_with(is_left_binding_punctuation)
     {
         text.append(" ", 0.0, egui::TextFormat::default());
     }
@@ -269,6 +270,13 @@ fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::
     );
     text.wrap.max_width = max_width;
     text
+}
+
+fn is_left_binding_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ',' | '!' | '?' | ':' | ';' | '%' | ')' | ']' | '}' | '…'
+    )
 }
 
 fn mark_polite_live_region(context: &egui::Context, id: egui::Id) {
@@ -336,6 +344,14 @@ mod tests {
 
         let already_spaced = transcript_layout("hello ", "world", LIVE_WIDTH);
         assert_eq!(already_spaced.text, "hello world");
+    }
+
+    #[test]
+    fn standalone_closing_punctuation_binds_to_the_committed_prefix() {
+        for punctuation in [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…"] {
+            let layout = transcript_layout("hello", punctuation, LIVE_WIDTH);
+            assert_eq!(layout.text, format!("hello{punctuation}"));
+        }
     }
 
     #[test]
