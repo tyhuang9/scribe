@@ -5,8 +5,8 @@ use std::time::Duration;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 
 use super::{
-    CaptureError, CaptureStopReason, LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES, VadOptions,
-    input_format_is_credible,
+    CaptureError, CaptureOptions, CaptureStopReason, LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES,
+    VadOptions, input_format_is_credible,
 };
 
 const VAD_FRAME_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
@@ -34,8 +34,7 @@ impl Pipeline {
     pub(super) fn new(
         source_sample_rate: u32,
         source_channels: u16,
-        vad_enabled: bool,
-        vad: VadOptions,
+        options: CaptureOptions,
         level_bits: Arc<AtomicU32>,
         peak_bits: Arc<AtomicU32>,
         level_observed: Arc<AtomicBool>,
@@ -46,7 +45,7 @@ impl Pipeline {
                 channels: source_channels,
             });
         }
-        vad.validate()?;
+        options.vad.validate()?;
         Ok(Self {
             source_sample_rate,
             source_channels,
@@ -57,8 +56,8 @@ impl Pipeline {
             prepared: Vec::new(),
             limit_exceeded: false,
             levels: LevelTracker::new(level_bits, peak_bits, level_observed),
-            vad_enabled,
-            vad: VadTracker::new(vad),
+            vad_enabled: options.vad_enabled,
+            vad: VadTracker::new(options.vad, options.endpointing_enabled),
         })
     }
 
@@ -366,6 +365,7 @@ enum VadState {
 
 struct VadTracker {
     options: VadOptions,
+    endpointing_enabled: bool,
     state: VadState,
     sum_squares: f64,
     frame_samples: usize,
@@ -380,9 +380,10 @@ struct VadTracker {
 }
 
 impl VadTracker {
-    fn new(options: VadOptions) -> Self {
+    fn new(options: VadOptions, endpointing_enabled: bool) -> Self {
         Self {
             options,
+            endpointing_enabled,
             state: VadState::Waiting,
             sum_squares: 0.0,
             frame_samples: 0,
@@ -453,8 +454,9 @@ impl VadTracker {
                     self.last_voice_frame = frame_end;
                 } else {
                     self.update_noise_floor(rms);
-                    if frame_end.saturating_sub(self.last_voice_frame)
-                        >= duration_to_prepared_frames(self.options.endpoint)
+                    if self.endpointing_enabled
+                        && frame_end.saturating_sub(self.last_voice_frame)
+                            >= duration_to_prepared_frames(self.options.endpoint)
                     {
                         self.endpoint_frame = Some(frame_end);
                     }
@@ -485,8 +487,7 @@ mod tests {
         Pipeline::new(
             source_rate,
             channels,
-            true,
-            VadOptions::default(),
+            CaptureOptions::default(),
             rms,
             peak,
             observed,
@@ -604,8 +605,7 @@ mod tests {
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
-            true,
-            VadOptions::default(),
+            CaptureOptions::default(),
             Arc::clone(&rms),
             Arc::clone(&peak),
             Arc::clone(&observed),
@@ -645,6 +645,35 @@ mod tests {
         assert!(!pipeline.endpoint_triggered());
         push_mono_ms(&mut pipeline, 10, 0.0);
         assert!(pipeline.endpoint_triggered());
+    }
+
+    #[test]
+    fn hold_to_talk_vad_keeps_tracking_speech_after_endpoint_length_silence() {
+        let (rms, peak, observed) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
+            rms,
+            peak,
+            observed,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 150, 0.2);
+        push_mono_ms(&mut pipeline, 900, 0.0);
+        push_mono_ms(&mut pipeline, 200, 0.3);
+
+        assert!(pipeline.vad.speech_start_frame.is_some());
+        assert!(pipeline.vad.endpoint_frame.is_none());
+        assert!(!pipeline.endpoint_triggered());
+        let prepared = pipeline
+            .finish(CaptureStopReason::MaximumDuration)
+            .unwrap()
+            .unwrap();
+        assert!(prepared.duration_ms() >= 1_200);
     }
 
     #[test]
@@ -743,8 +772,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
-            false,
-            VadOptions::default(),
+            CaptureOptions {
+                vad_enabled: false,
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
             rms,
             peak,
             observed,

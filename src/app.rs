@@ -57,6 +57,8 @@ const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
     CaptureOptions {
         vad_enabled: config.recording.vad_enabled,
+        endpointing_enabled: config.recording.vad_enabled
+            && config.recording.hotkey_mode == HotkeyMode::Toggle,
         vad: VadOptions::new(
             Duration::from_millis(config.recording.speech_confirmation_ms.into()),
             Duration::from_millis(config.recording.internal_pause_ms.into()),
@@ -4407,7 +4409,7 @@ impl LocalTranscriberApp {
                 ui.add_space(6.0);
                 let mut vad_enabled = self.config.recording.vad_enabled;
                 if ui
-                    .checkbox(&mut vad_enabled, "Stop after speech ends")
+                    .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
                     .on_hover_text(
                         "Uses local adaptive voice detection. An explicit shortcut release or Stop action always takes priority.",
                     )
@@ -7141,11 +7143,31 @@ mod layout_tests {
         let options = capture_options_from_config(&config);
 
         assert!(!options.vad_enabled);
+        assert!(!options.endpointing_enabled);
         assert_eq!(options.vad.speech_confirmation, Duration::from_millis(175));
         assert_eq!(options.vad.pause, Duration::from_millis(525));
         assert_eq!(options.vad.endpoint, Duration::from_millis(975));
         assert_eq!(options.vad.pre_roll, Duration::from_millis(300));
         assert_eq!(options.vad.post_roll, Duration::from_millis(225));
+    }
+
+    #[test]
+    fn silence_endpointing_is_limited_to_toggle_mode() {
+        let mut config = AppConfig::default();
+        config.recording.vad_enabled = true;
+
+        config.recording.hotkey_mode = HotkeyMode::Toggle;
+        let toggle = capture_options_from_config(&config);
+        assert!(toggle.vad_enabled);
+        assert!(toggle.endpointing_enabled);
+
+        config.recording.hotkey_mode = HotkeyMode::HoldToTalk;
+        let hold = capture_options_from_config(&config);
+        assert!(hold.vad_enabled, "hold mode still uses VAD for trimming");
+        assert!(
+            !hold.endpointing_enabled,
+            "hold mode must wait for shortcut release or the duration limit"
+        );
     }
 
     #[test]

@@ -104,6 +104,7 @@ impl Default for VadOptions {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CaptureOptions {
     pub vad_enabled: bool,
+    pub endpointing_enabled: bool,
     pub vad: VadOptions,
 }
 
@@ -111,6 +112,7 @@ impl CaptureOptions {
     pub fn new(vad: VadOptions) -> Self {
         Self {
             vad_enabled: true,
+            endpointing_enabled: true,
             vad,
         }
     }
@@ -440,8 +442,7 @@ fn capture_worker(
     let mut pipeline = Pipeline::new(
         format.sample_rate,
         format.channels,
-        options.vad_enabled,
-        options.vad,
+        options,
         rms_bits,
         peak_bits,
         level_observed,
