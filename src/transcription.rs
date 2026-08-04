@@ -1965,6 +1965,102 @@ mod tests {
 
     #[test]
     #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
+    fn rolling_preview_jfk_first_partial_benchmark() {
+        use std::time::Instant;
+
+        let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
+        let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
+        let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
+        let audio = PreparedAudio::from_wav_path(audio_path).unwrap();
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(cli);
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+
+        let run_preview = |service: &TranscriptionService, run_id: u64| {
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            let (publisher, mut handle) = service
+                .start_rolling_preview(
+                    SessionId(12_000 + run_id),
+                    RequestId(13_000 + run_id),
+                    model_id,
+                    Some(model_path.clone()),
+                )
+                .unwrap();
+            let started = Instant::now();
+            let interval = crate::prepared_audio::PREPARED_SAMPLE_RATE as usize
+                * crate::streaming::DECODE_INTERVAL_MS as usize
+                / 1_000;
+            let window = crate::prepared_audio::PREPARED_SAMPLE_RATE as usize
+                * crate::streaming::ROLLING_WINDOW_MS as usize
+                / 1_000;
+            let mut next_end = interval;
+            let deadline = started + Duration::from_secs(30);
+            let first_partial = loop {
+                let elapsed_intervals = (started.elapsed().as_millis()
+                    / u128::from(crate::streaming::DECODE_INTERVAL_MS))
+                    as usize;
+                let due_end = elapsed_intervals
+                    .saturating_mul(interval)
+                    .min(audio.samples.len());
+                while next_end <= due_end && next_end <= audio.samples.len() {
+                    let start = next_end.saturating_sub(window);
+                    assert!(
+                        publisher
+                            .publish_window(start as u64, audio.samples[start..next_end].to_vec())
+                            .unwrap()
+                    );
+                    next_end = next_end.saturating_add(interval);
+                }
+                if let Some(event) = handle.try_next() {
+                    match event {
+                        PreviewEvent::Update { update, .. }
+                            if !update.committed.is_empty() || !update.tentative.is_empty() =>
+                        {
+                            break started.elapsed().as_millis();
+                        }
+                        PreviewEvent::Update { .. } => {}
+                        PreviewEvent::Error { error, .. } => {
+                            panic!("rolling preview failed: {error}")
+                        }
+                    }
+                }
+                assert!(Instant::now() < deadline, "rolling preview timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            handle.close();
+            assert!(handle.stop_and_join(Duration::from_secs(5)));
+            first_partial
+        };
+
+        let mut cold_first_partial = Vec::new();
+        for run_id in 0..5 {
+            let service = TranscriptionService::new(config.clone());
+            cold_first_partial.push(run_preview(&service, run_id));
+        }
+
+        let service = TranscriptionService::new(config);
+        service
+            .preload_model(
+                &ModelId::new("whisper_cpp_base_en"),
+                Some(model_path.clone()),
+            )
+            .unwrap();
+        let mut warm_first_partial = Vec::new();
+        for run_id in 0..20 {
+            warm_first_partial.push(run_preview(&service, 100 + run_id));
+        }
+
+        eprintln!(
+            "rolling_preview_jfk first_partial_cold_median_ms={} first_partial_cold_p95_ms={} first_partial_warm_median_ms={} first_partial_warm_p95_ms={}",
+            percentile(&cold_first_partial, 50),
+            percentile(&cold_first_partial, 95),
+            percentile(&warm_first_partial, 50),
+            percentile(&warm_first_partial, 95),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
     fn native_runtime_cancellation_interrupts_active_decode() {
         let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
         let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
