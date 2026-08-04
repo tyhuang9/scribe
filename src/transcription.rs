@@ -13,9 +13,9 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -344,6 +344,9 @@ enum RuntimeCommand {
     Unload {
         reply: SyncSender<Result<(), RuntimeError>>,
     },
+    Shutdown {
+        reply: SyncSender<Result<(), RuntimeError>>,
+    },
 }
 
 /// A bounded, dedicated native worker. Application-created task threads may
@@ -351,18 +354,28 @@ enum RuntimeCommand {
 /// is serialized on the one named native worker.
 #[derive(Clone)]
 struct RuntimeWorker {
+    inner: Arc<RuntimeWorkerInner>,
+}
+
+struct RuntimeWorkerInner {
     commands: SyncSender<RuntimeCommand>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl RuntimeWorker {
     fn new(router: RuntimeRouter) -> Self {
         cleanup_stale_temporary_audio();
         let (commands, receiver) = sync_channel(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("scribe-native-runtime".to_owned())
             .spawn(move || runtime_worker_loop(router, receiver))
             .expect("Scribe could not create its native runtime worker");
-        Self { commands }
+        Self {
+            inner: Arc::new(RuntimeWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker)),
+            }),
+        }
     }
 
     fn transcribe(
@@ -374,7 +387,8 @@ impl RuntimeWorker {
         cancellation_snapshot: u64,
     ) -> Result<RuntimeExecution, RuntimeError> {
         let (reply, response) = sync_channel(1);
-        self.commands
+        self.inner
+            .commands
             .send(RuntimeCommand::Transcribe {
                 model,
                 preference,
@@ -395,7 +409,8 @@ impl RuntimeWorker {
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
         let (reply, response) = sync_channel(1);
-        self.commands
+        self.inner
+            .commands
             .send(RuntimeCommand::Load {
                 model,
                 preference,
@@ -413,7 +428,8 @@ impl RuntimeWorker {
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
         let (reply, response) = sync_channel(1);
-        self.commands
+        self.inner
+            .commands
             .send(RuntimeCommand::Health {
                 model,
                 preference,
@@ -427,12 +443,29 @@ impl RuntimeWorker {
 
     fn unload(&self) -> Result<(), RuntimeError> {
         let (reply, response) = sync_channel(1);
-        self.commands
+        self.inner
+            .commands
             .send(RuntimeCommand::Unload { reply })
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?;
         response
             .recv()
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
+    }
+}
+
+impl Drop for RuntimeWorkerInner {
+    fn drop(&mut self) {
+        let (reply, response) = sync_channel(1);
+        let _ = self.commands.send(RuntimeCommand::Shutdown { reply });
+        let _ = response.recv();
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -479,6 +512,11 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
             }
             Ok(RuntimeCommand::Unload { reply }) => {
                 let _ = reply.send(router.unload_all());
+            }
+            Ok(RuntimeCommand::Shutdown { reply }) => {
+                let result = router.unload_all();
+                let _ = reply.send(result);
+                break;
             }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = router.unload_all();
@@ -1600,6 +1638,19 @@ mod tests {
 
         assert_eq!(outcome.session_id, SessionId(11));
         assert_eq!(outcome.request_id, RequestId(29));
+    }
+
+    #[test]
+    fn last_runtime_worker_handle_synchronously_shuts_down_its_thread() {
+        let worker = RuntimeWorker::new(RuntimeRouter::new());
+        let retained = worker.clone();
+        let weak = Arc::downgrade(&worker.inner);
+
+        drop(worker);
+        assert!(weak.upgrade().is_some());
+        drop(retained);
+
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
