@@ -18,7 +18,8 @@ use eframe::egui::{
 use serde::Deserialize;
 
 use crate::audio::{
-    self, CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, VadOptions,
+    self, CaptureCompletion, CaptureError, CaptureOptions, CaptureStopReason, LevelSnapshot,
+    RecordingSession, VadOptions,
 };
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
@@ -56,6 +57,8 @@ const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
+const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
 
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
     CaptureOptions {
@@ -140,6 +143,35 @@ struct PendingOutput {
     completion_message: String,
     config: AppConfig,
     latency: Option<LatencyTrace>,
+}
+
+struct FinishedCapture {
+    session_id: SessionId,
+    source: RecordingSource,
+    result: Result<CaptureCompletion, CaptureError>,
+    stop_requested: bool,
+    started_at: Instant,
+    latency: LatencyTrace,
+}
+
+enum PreviewDrainAction {
+    Continue,
+    FinishCapture(Box<FinishedCapture>),
+    Fail {
+        session_id: SessionId,
+        message: String,
+    },
+    Cancel {
+        session_id: SessionId,
+    },
+}
+
+struct PendingPreviewDrain {
+    preview: RollingPreviewHandle,
+    action: PreviewDrainAction,
+    closed_at: Instant,
+    cancel_requested_at: Option<Instant>,
+    timeout_reported: bool,
 }
 
 struct PlaygroundRunState {
@@ -1075,6 +1107,7 @@ pub struct LocalTranscriberApp {
     pending_recording: Option<PendingRecording>,
     pending_output: Option<PendingOutput>,
     rolling_preview: Option<RollingPreviewHandle>,
+    pending_preview_drain: Option<PendingPreviewDrain>,
     transcription_service: TranscriptionService,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1151,6 +1184,7 @@ impl LocalTranscriberApp {
             pending_recording: None,
             pending_output: None,
             rolling_preview: None,
+            pending_preview_drain: None,
             transcription_service,
             tx,
             rx,
@@ -1320,7 +1354,9 @@ impl LocalTranscriberApp {
     }
 
     fn capture_is_active(&self) -> bool {
-        self.pending_recording.is_some() || self.active_recording.is_some()
+        self.pending_recording.is_some()
+            || self.active_recording.is_some()
+            || self.pending_preview_drain.is_some()
     }
 
     fn recording_source(&self) -> Option<RecordingSource> {
@@ -1331,6 +1367,14 @@ impl LocalTranscriberApp {
                 self.pending_recording
                     .as_ref()
                     .map(|pending| pending.source)
+            })
+            .or_else(|| {
+                self.pending_preview_drain
+                    .as_ref()
+                    .and_then(|pending| match &pending.action {
+                        PreviewDrainAction::FinishCapture(capture) => Some(capture.source),
+                        _ => None,
+                    })
             })
     }
 
@@ -1455,7 +1499,24 @@ impl LocalTranscriberApp {
             return;
         }
         let message = message.into();
-        self.close_rolling_preview(session_id, Duration::ZERO);
+        if self.begin_preview_drain(
+            session_id,
+            PreviewDrainAction::Fail {
+                session_id,
+                message: message.clone(),
+            },
+        ) {
+            self.status_message = "Stopping live preview after an error".to_owned();
+            return;
+        }
+        self.fail_dictation_session_now(session_id, message);
+    }
+
+    fn fail_dictation_session_now(&mut self, session_id: SessionId, message: impl Into<String>) {
+        if self.session_coordinator.active_session_id() != Some(session_id) {
+            return;
+        }
+        let message = message.into();
         let _ = self.session_coordinator.fail(session_id);
         self.pending_output = None;
         self.status = TranscriptionStatus::Error;
@@ -1685,7 +1746,7 @@ impl LocalTranscriberApp {
                 .session_coordinator
                 .start_preview(session_id, model_id.clone())
             {
-                Ok(request_id) => match self.transcription_service.start_rolling_preview(
+                Ok(request_id) => match self.current_transcription_service().start_rolling_preview(
                     session_id,
                     request_id,
                     model_id.clone(),
@@ -1765,7 +1826,7 @@ impl LocalTranscriberApp {
         {
             pending.latency.model_load_started_at = Some(Instant::now());
         }
-        let service = self.transcription_service.with_config(self.config.clone());
+        let service = self.current_transcription_service();
         let tx = self.tx.clone();
         thread::spawn(
             move || match service.preload_model(&model_id, model.local_path) {
@@ -1787,6 +1848,10 @@ impl LocalTranscriberApp {
         );
     }
 
+    fn current_transcription_service(&self) -> TranscriptionService {
+        self.transcription_service.with_config(self.config.clone())
+    }
+
     fn supersede_active_session(&mut self) {
         let Some(previous_session) = self.session_coordinator.active_session_id() else {
             return;
@@ -1795,7 +1860,19 @@ impl LocalTranscriberApp {
             pending.abandon.store(true, Ordering::Release);
         }
         self.pending_output = None;
-        self.close_rolling_preview(previous_session, Duration::ZERO);
+        if self.begin_preview_drain(
+            previous_session,
+            PreviewDrainAction::Cancel {
+                session_id: previous_session,
+            },
+        ) {
+            self.transcription_service.cancel_active();
+            if let Some(pending) = self.pending_preview_drain.as_mut() {
+                pending.cancel_requested_at = Some(Instant::now());
+            }
+            self.status_message = "Cancelling the previous live preview".to_owned();
+            return;
+        }
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
         self.captured_targets.remove(&previous_session);
@@ -1805,27 +1882,131 @@ impl LocalTranscriberApp {
         self.refresh_playground_runtime_statuses();
     }
 
-    fn close_rolling_preview(&mut self, session_id: SessionId, grace: Duration) {
-        let Some(mut preview) = self.rolling_preview.take() else {
+    /// Closes preview input and transfers the join handle into app-owned drain
+    /// state. The UI thread only polls this state; it never waits for decoder
+    /// completion. While the handle is retained, new capture is fail-closed.
+    fn begin_preview_drain(&mut self, session_id: SessionId, action: PreviewDrainAction) -> bool {
+        if let Some(pending) = self.pending_preview_drain.as_mut() {
+            if pending.preview.identity().session_id == session_id {
+                pending.action = action;
+                return true;
+            }
+            return false;
+        }
+        let Some(preview) = self.rolling_preview.take() else {
+            return false;
+        };
+        if preview.identity().session_id != session_id {
+            self.rolling_preview = Some(preview);
+            return false;
+        }
+        preview.close();
+        self.pending_preview_drain = Some(PendingPreviewDrain {
+            preview,
+            action,
+            closed_at: Instant::now(),
+            cancel_requested_at: None,
+            timeout_reported: false,
+        });
+        true
+    }
+
+    fn has_preview_for_session(&self, session_id: SessionId) -> bool {
+        self.rolling_preview
+            .as_ref()
+            .is_some_and(|preview| preview.identity().session_id == session_id)
+            || self
+                .pending_preview_drain
+                .as_ref()
+                .is_some_and(|pending| pending.preview.identity().session_id == session_id)
+    }
+
+    fn poll_preview_drain(&mut self) {
+        let service = self.transcription_service.clone();
+        self.poll_preview_drain_at(Instant::now(), move || service.cancel_active());
+    }
+
+    fn poll_preview_drain_at(&mut self, now: Instant, request_cancel: impl FnOnce()) {
+        let Some(pending) = self.pending_preview_drain.as_mut() else {
             return;
         };
-        let identity = preview.identity().clone();
-        preview.close();
-        if identity.session_id == session_id {
-            let _ = self.session_coordinator.finish_preview(
-                identity.session_id,
-                identity.request_id,
-                &identity.model_id,
-            );
-        }
-        if !preview.stop_and_join(grace) {
-            self.transcription_service.cancel_active();
-            if !preview.stop_and_join(Duration::from_secs(2)) {
-                eprintln!(
-                    "rolling preview did not stop within the cancellation timeout for session {}",
-                    identity.session_id.0
-                );
+        if !pending.preview.is_finished() {
+            if pending.cancel_requested_at.is_none()
+                && now.saturating_duration_since(pending.closed_at) >= PREVIEW_FINISH_GRACE
+            {
+                request_cancel();
+                pending.cancel_requested_at = Some(now);
+                self.status_message = "Cancelling a slow live preview before finalizing".to_owned();
+            } else if pending.cancel_requested_at.is_some_and(|cancelled_at| {
+                now.saturating_duration_since(cancelled_at) >= PREVIEW_CANCEL_ACK_WARNING
+            }) && !pending.timeout_reported
+            {
+                pending.timeout_reported = true;
+                self.status = TranscriptionStatus::Error;
+                self.status_message = "Live preview has not acknowledged cancellation; new dictation is blocked until the native worker exits".to_owned();
             }
+            return;
+        }
+
+        let mut pending = self
+            .pending_preview_drain
+            .take()
+            .expect("preview drain checked above");
+        let identity = pending.preview.identity().clone();
+        if !pending.preview.stop_and_join(Duration::ZERO) {
+            self.pending_preview_drain = Some(pending);
+            return;
+        }
+        let _ = self.session_coordinator.finish_preview(
+            identity.session_id,
+            identity.request_id,
+            &identity.model_id,
+        );
+        match pending.action {
+            PreviewDrainAction::Continue => {
+                if self
+                    .active_recording
+                    .as_ref()
+                    .is_some_and(|active| active.session_id == identity.session_id)
+                {
+                    self.status = TranscriptionStatus::Listening;
+                    self.status_message =
+                        "Listening. Live preview stopped; the final pass remains enabled."
+                            .to_owned();
+                }
+            }
+            PreviewDrainAction::FinishCapture(capture) => self.finish_capture(*capture),
+            PreviewDrainAction::Fail {
+                session_id,
+                message,
+            } => self.fail_dictation_session_now(session_id, message),
+            PreviewDrainAction::Cancel { session_id } => {
+                let _ = self.session_coordinator.cancel_active();
+                self.captured_targets.remove(&session_id);
+                let _ = self.overlay_controller.hide(session_id);
+                self.playground_runs.remove(&session_id);
+                self.playground_pending = 0;
+                self.refresh_playground_runtime_statuses();
+            }
+        }
+    }
+
+    fn shutdown_rolling_preview(&mut self) {
+        let preview = self
+            .pending_preview_drain
+            .take()
+            .map(|pending| pending.preview)
+            .or_else(|| self.rolling_preview.take());
+        let Some(mut preview) = preview else {
+            return;
+        };
+        preview.close();
+        self.transcription_service.cancel_active();
+        if !preview.stop_and_join(Duration::from_secs(2)) {
+            eprintln!(
+                "rolling preview did not stop before process exit for session {}",
+                preview.identity().session_id.0
+            );
         }
     }
 
@@ -1885,7 +2066,8 @@ impl LocalTranscriberApp {
                     self.status_message = format!(
                         "Listening. Live preview stopped; the final pass remains enabled: {error}"
                     );
-                    self.close_rolling_preview(identity.session_id, Duration::from_millis(50));
+                    let _ =
+                        self.begin_preview_drain(identity.session_id, PreviewDrainAction::Continue);
                 }
             }
         }
@@ -1945,70 +2127,90 @@ impl LocalTranscriberApp {
         });
 
         if let Some((source, session_id, result)) = finished {
-            let mut active = self
+            let active = self
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
-            match result {
-                Ok(completion) => {
-                    if !active.stop_requested {
-                        let reason = match completion.stop_reason {
-                            CaptureStopReason::Explicit => StopReason::Explicit,
-                            CaptureStopReason::Endpoint => StopReason::Endpoint,
-                            CaptureStopReason::MaximumDuration => StopReason::MaximumDuration,
-                        };
-                        if let Err(err) = self.session_coordinator.request_stop(session_id, reason)
-                        {
-                            self.fail_dictation_session(
-                                session_id,
-                                format!("Rejected capture stop reason: {err}"),
-                            );
-                            return;
-                        }
-                        let observed_at = active
-                            .started_at
-                            .checked_add(completion.metrics.stop_trigger_elapsed)
-                            .unwrap_or_else(Instant::now)
-                            .min(Instant::now());
-                        active.latency.stop_requested_at = Some(observed_at);
-                    }
-                    debug_assert!(self.session_coordinator.stop_reason().is_some());
-                    self.close_rolling_preview(session_id, Duration::from_millis(250));
-                    active.latency.capture_finalized_at = Some(Instant::now());
-                    if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
-                        self.fail_dictation_session(
+            let capture = FinishedCapture {
+                session_id,
+                source,
+                result,
+                stop_requested: active.stop_requested,
+                started_at: active.started_at,
+                latency: active.latency,
+            };
+            if self.has_preview_for_session(session_id) {
+                let scheduled = self.begin_preview_drain(
+                    session_id,
+                    PreviewDrainAction::FinishCapture(Box::new(capture)),
+                );
+                debug_assert!(scheduled);
+                self.status_message = "Finalizing live preview before the full pass".to_owned();
+            } else {
+                self.finish_capture(capture);
+            }
+        }
+    }
+
+    fn finish_capture(&mut self, mut capture: FinishedCapture) {
+        let session_id = capture.session_id;
+        match capture.result {
+            Ok(completion) => {
+                if !capture.stop_requested {
+                    let reason = match completion.stop_reason {
+                        CaptureStopReason::Explicit => StopReason::Explicit,
+                        CaptureStopReason::Endpoint => StopReason::Endpoint,
+                        CaptureStopReason::MaximumDuration => StopReason::MaximumDuration,
+                    };
+                    if let Err(err) = self.session_coordinator.request_stop(session_id, reason) {
+                        self.fail_dictation_session_now(
                             session_id,
-                            format!("Rejected stale capture result: {err}"),
+                            format!("Rejected capture stop reason: {err}"),
                         );
                         return;
                     }
-                    let Some(audio) = completion.audio else {
-                        let _ = self.session_coordinator.cancel_active();
-                        self.status = TranscriptionStatus::Idle;
-                        self.status_message = "No speech detected; nothing was pasted.".to_owned();
-                        self.latest_latency = Some(active.latency);
-                        self.finish_overlay_error(session_id, "No speech detected");
-                        return;
-                    };
-                    self.status = TranscriptionStatus::Transcribing;
-                    self.status_message = format!(
-                        "Transcribing {} ms of locally prepared audio",
-                        audio.duration_ms()
+                    let observed_at = capture
+                        .started_at
+                        .checked_add(completion.metrics.stop_trigger_elapsed)
+                        .unwrap_or_else(Instant::now)
+                        .min(Instant::now());
+                    capture.latency.stop_requested_at = Some(observed_at);
+                }
+                debug_assert!(self.session_coordinator.stop_reason().is_some());
+                capture.latency.capture_finalized_at = Some(Instant::now());
+                if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
+                    self.fail_dictation_session_now(
+                        session_id,
+                        format!("Rejected stale capture result: {err}"),
                     );
-                    match source {
-                        RecordingSource::Transcribe => {
-                            self.dispatch_default_transcription(session_id, audio, active.latency)
-                        }
-                        RecordingSource::Playground => {
-                            self.dispatch_playground_transcriptions(session_id, audio)
-                        }
+                    return;
+                }
+                let Some(audio) = completion.audio else {
+                    let _ = self.session_coordinator.cancel_active();
+                    self.status = TranscriptionStatus::Idle;
+                    self.status_message = "No speech detected; nothing was pasted.".to_owned();
+                    self.latest_latency = Some(capture.latency);
+                    self.finish_overlay_error(session_id, "No speech detected");
+                    return;
+                };
+                self.status = TranscriptionStatus::Transcribing;
+                self.status_message = format!(
+                    "Transcribing {} ms of locally prepared audio",
+                    audio.duration_ms()
+                );
+                match capture.source {
+                    RecordingSource::Transcribe => {
+                        self.dispatch_default_transcription(session_id, audio, capture.latency)
+                    }
+                    RecordingSource::Playground => {
+                        self.dispatch_playground_transcriptions(session_id, audio)
                     }
                 }
-                Err(error) => {
-                    active.latency.capture_finalized_at = Some(Instant::now());
-                    self.latest_latency = Some(active.latency);
-                    self.fail_dictation_session(session_id, format!("Recording failed: {error}"));
-                }
+            }
+            Err(error) => {
+                capture.latency.capture_finalized_at = Some(Instant::now());
+                self.latest_latency = Some(capture.latency);
+                self.fail_dictation_session_now(session_id, format!("Recording failed: {error}"));
             }
         }
     }
@@ -2067,6 +2269,7 @@ impl LocalTranscriberApp {
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
                 self.stop_and_discard_active_recording();
+                self.shutdown_rolling_preview();
                 if !self
                     .transcription_service
                     .cancel_active_and_wait(Duration::from_secs(2))
@@ -3385,7 +3588,9 @@ impl eframe::App for LocalTranscriberApp {
             self.poll_hotkey();
         }
         self.poll_rolling_preview();
+        self.poll_preview_drain();
         self.poll_recording();
+        self.poll_preview_drain();
         // Pending output was created in the prior frame, allowing the overlay
         // to present the correlated Output/Pasting phase before any blocking
         // clipboard or synthetic-input work begins.
@@ -3424,9 +3629,7 @@ impl eframe::App for LocalTranscriberApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_and_discard_active_recording();
-        if let Some(session_id) = self.session_coordinator.active_session_id() {
-            self.close_rolling_preview(session_id, Duration::ZERO);
-        }
+        self.shutdown_rolling_preview();
         if !self
             .transcription_service
             .cancel_active_and_wait(Duration::from_secs(2))
@@ -6895,6 +7098,7 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::audio::CaptureMetrics;
     use crate::streaming::StreamIdentity;
     use crate::transcription::StreamUpdate;
 
@@ -7785,6 +7989,143 @@ mod layout_tests {
         assert_eq!(
             app.session_coordinator.last_terminal().unwrap().outcome,
             crate::core::TerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn blocked_preview_is_drained_without_blocking_and_finalizes_capture_once() {
+        use std::cell::Cell;
+        use std::sync::{Condvar, Mutex, mpsc};
+
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        app.session_coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+
+        let identity = StreamIdentity {
+            session_id,
+            request_id,
+            model_id,
+            sequence: 0,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let (publisher, preview) = RollingPreviewHandle::simulated(identity, move |snapshot| {
+            started_tx.send(snapshot.identity.sequence).unwrap();
+            let (lock, wake) = &*worker_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        assert!(publisher.publish_window(0, vec![0.0; 1_600]).unwrap());
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert!(publisher.publish_window(0, vec![0.0; 1_600]).unwrap());
+        app.rolling_preview = Some(preview);
+
+        let started_at = Instant::now();
+        let capture = FinishedCapture {
+            session_id,
+            source: RecordingSource::Transcribe,
+            result: Ok(CaptureCompletion {
+                audio: None,
+                stop_reason: CaptureStopReason::Explicit,
+                metrics: CaptureMetrics {
+                    duration: Duration::from_millis(100),
+                    stop_trigger_elapsed: Duration::from_millis(100),
+                    speech_trigger_elapsed: None,
+                    source_sample_rate: 16_000,
+                    source_channels: 1,
+                    source_frames: 1_600,
+                    prepared_frames: 0,
+                    dropped_samples: 0,
+                    stream_restarts: 0,
+                },
+            }),
+            stop_requested: true,
+            started_at,
+            latency: LatencyTrace::started_at(started_at, TriggerObservation::HotkeyPoll),
+        };
+        assert!(app.begin_preview_drain(
+            session_id,
+            PreviewDrainAction::FinishCapture(Box::new(capture))
+        ));
+
+        let poll_started = Instant::now();
+        app.poll_preview_drain_at(poll_started, || panic!("cancelled before grace"));
+        assert!(poll_started.elapsed() < Duration::from_millis(50));
+        assert!(app.pending_preview_drain.is_some());
+        assert!(app.capture_is_active());
+
+        app.start_recording_at(
+            RecordingSource::Transcribe,
+            Instant::now(),
+            TriggerObservation::HotkeyPoll,
+        );
+        assert_eq!(
+            app.session_coordinator.active_session_id(),
+            Some(session_id)
+        );
+
+        let cancel_calls = Cell::new(0_u32);
+        let cancel_at =
+            app.pending_preview_drain.as_ref().unwrap().closed_at + PREVIEW_FINISH_GRACE;
+        app.poll_preview_drain_at(cancel_at, || cancel_calls.set(cancel_calls.get() + 1));
+        app.poll_preview_drain_at(cancel_at + Duration::from_millis(1), || {
+            cancel_calls.set(cancel_calls.get() + 1)
+        });
+        assert_eq!(cancel_calls.get(), 1);
+        assert!(app.pending_preview_drain.is_some());
+        app.poll_preview_drain_at(cancel_at + PREVIEW_CANCEL_ACK_WARNING, || {
+            panic!("cancellation must only be requested once")
+        });
+        assert!(app.pending_preview_drain.is_some());
+        assert!(app.capture_is_active());
+        assert!(app.status_message.contains("new dictation is blocked"));
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        for _ in 0..100 {
+            app.poll_preview_drain_at(Instant::now(), || panic!("duplicate cancellation"));
+            if app.pending_preview_drain.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(app.pending_preview_drain.is_none());
+        assert!(!app.capture_is_active());
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(
+            app.status_message,
+            "No speech detected; nothing was pasted."
+        );
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "the pending snapshot should be dropped when preview closes"
+        );
+        app.poll_preview_drain_at(Instant::now(), || panic!("already finalized"));
+        assert_eq!(
+            app.status_message,
+            "No speech detected; nothing was pasted."
         );
     }
 
@@ -8792,6 +9133,7 @@ mod layout_tests {
             pending_recording: None,
             pending_output: None,
             rolling_preview: None,
+            pending_preview_drain: None,
             transcription_service,
             tx,
             rx,
@@ -8806,6 +9148,25 @@ mod layout_tests {
             last_tray_state: None,
             quit_requested: false,
         }
+    }
+
+    #[test]
+    fn preview_service_snapshot_uses_current_acceleration_settings() {
+        let mut app = test_app();
+        app.config.performance.acceleration_preference = AccelerationPreference::Cpu;
+
+        assert_eq!(
+            app.current_transcription_service()
+                .configured_acceleration_preference(),
+            AccelerationPreference::Cpu
+        );
+
+        app.config.performance.acceleration_preference = AccelerationPreference::Gpu;
+        assert_eq!(
+            app.current_transcription_service()
+                .configured_acceleration_preference(),
+            AccelerationPreference::Gpu
+        );
     }
 
     fn seed_test_request(
@@ -10873,6 +11234,104 @@ mod layout_tests {
         assert_eq!(app.overlay_controller.state().transcript.tentative, "world");
         assert_eq!(app.transcript, "previous final");
         assert!(app.pending_output.is_none());
+    }
+
+    #[test]
+    fn late_preview_after_close_cannot_replace_final_or_duplicate_output() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let preview_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        app.apply_rolling_preview_event(PreviewEvent::Update {
+            identity: StreamIdentity {
+                session_id,
+                request_id: preview_id,
+                model_id: model_id.clone(),
+                sequence: 1,
+            },
+            update: StreamUpdate {
+                committed: "preview".to_owned(),
+                tentative: "draft".to_owned(),
+            },
+        });
+        app.session_coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        app.session_coordinator
+            .finish_preview(session_id, preview_id, &model_id)
+            .unwrap();
+        app.session_coordinator
+            .capture_finalized(session_id)
+            .unwrap();
+        let final_request = app
+            .session_coordinator
+            .start_request(session_id, model_id.clone())
+            .unwrap();
+
+        app.apply_rolling_preview_event(PreviewEvent::Update {
+            identity: StreamIdentity {
+                session_id,
+                request_id: preview_id,
+                model_id: model_id.clone(),
+                sequence: 2,
+            },
+            update: StreamUpdate {
+                committed: "late".to_owned(),
+                tentative: "replacement".to_owned(),
+            },
+        });
+        assert_eq!(
+            app.overlay_controller.state().transcript.committed,
+            "preview"
+        );
+        assert_eq!(app.overlay_controller.state().transcript.tentative, "draft");
+
+        app.session_coordinator
+            .complete_request(session_id, final_request, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.transcript = "final text".to_owned();
+        app.overlay_controller
+            .replace_with_final(session_id, app.transcript.clone());
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            transcript: app.transcript.clone(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: None,
+        });
+        let calls = Cell::new(0_u32);
+        for _ in 0..2 {
+            app.poll_pending_output_with(|text, _, _| {
+                assert_eq!(text, "final text");
+                calls.set(calls.get() + 1);
+                text_output::TextOutputResult::Inserted
+            });
+        }
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            app.overlay_controller.state().transcript.committed,
+            "final text"
+        );
+        assert!(
+            app.overlay_controller
+                .state()
+                .transcript
+                .tentative
+                .is_empty()
+        );
     }
 
     #[test]

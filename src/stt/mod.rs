@@ -506,56 +506,72 @@ mod tests {
     #[test]
     fn cancellation_terminates_a_registered_process_tree() {
         let _test_lock = cancellation_test_lock();
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let snapshot = cancellation_snapshot();
-        std::thread::spawn(move || {
-            #[cfg(windows)]
-            let mut command = {
-                let mut command = Command::new("powershell.exe");
-                command.args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Start-Sleep -Milliseconds 300; $child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -NoNewWindow -PassThru; Wait-Process -Id $child.Id",
-                ]);
-                command
-            };
-            #[cfg(unix)]
-            let mut command = {
-                let mut command = Command::new("sh");
-                command.args(["-c", "sleep 0.3; sleep 30 & wait"]);
-                command
-            };
-            let _ = tx.send(run_cancellable_command(&mut command, snapshot));
-        });
+        for attempt in 1..=5 {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let snapshot = cancellation_snapshot();
+            std::thread::spawn(move || {
+                #[cfg(windows)]
+                let mut command = {
+                    let mut command = Command::new("powershell.exe");
+                    command.args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Start-Sleep -Milliseconds 300; $child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -NoNewWindow -PassThru; Wait-Process -Id $child.Id",
+                    ]);
+                    command
+                };
+                #[cfg(unix)]
+                let mut command = {
+                    let mut command = Command::new("sh");
+                    command.args(["-c", "sleep 0.3; sleep 30 & wait"]);
+                    command
+                };
+                let _ = tx.send(run_cancellable_command(&mut command, snapshot));
+            });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while active_legacy_state()
-            .0
-            .lock()
-            .map(|state| state.processes.is_empty())
-            .unwrap_or(true)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut ended_before_registration = false;
+            while std::time::Instant::now() < deadline {
+                if active_legacy_state()
+                    .0
+                    .lock()
+                    .is_ok_and(|state| !state.processes.is_empty())
+                {
+                    break;
+                }
+                if rx.try_recv().is_ok() {
+                    ended_before_registration = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if ended_before_registration {
+                // Other parallel tests intentionally advance the global
+                // cancellation generation. Retry until this test observes its
+                // own registered process instead of asserting on that race.
+                continue;
+            }
+            assert!(
+                active_legacy_state()
+                    .0
+                    .lock()
+                    .is_ok_and(|state| !state.processes.is_empty()),
+                "legacy process was not registered after {attempt} attempts"
+            );
+            std::thread::sleep(Duration::from_millis(700));
+
+            assert!(cancel_active_processes_and_wait(Duration::from_secs(3)));
+
+            let output = rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("cancelled process acknowledged termination")
+                .expect("legacy process launched");
+            assert!(!output.status.success());
+            return;
         }
-        assert!(
-            active_legacy_state()
-                .0
-                .lock()
-                .is_ok_and(|state| !state.processes.is_empty()),
-            "legacy process was not registered"
-        );
-        std::thread::sleep(Duration::from_millis(700));
-
-        assert!(cancel_active_processes_and_wait(Duration::from_secs(3)));
-
-        let output = rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .expect("cancelled process acknowledged termination")
-            .expect("legacy process launched");
-        assert!(!output.status.success());
+        panic!("parallel cancellation prevented process registration in five attempts");
     }
 
     #[test]

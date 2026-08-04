@@ -645,7 +645,8 @@ mod tests {
                 ))
                 .unwrap();
             Ok(StreamUpdate::default())
-        });
+        })
+        .unwrap();
         let publisher = preview_session.audio_publisher(
             SessionId(3),
             RequestId(5),

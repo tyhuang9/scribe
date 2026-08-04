@@ -1,7 +1,7 @@
 //! Runtime-neutral primitives for bounded incremental transcription.
 //!
-//! This module intentionally contains no application-shell or side-effect code.
-//! It owns only the data and deterministic rules that those layers share.
+//! This module contains no application-shell code. It owns the bounded native
+//! preview worker plus the data and deterministic rules shared by its callers.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -361,7 +361,7 @@ pub struct RollingPreviewSession<E> {
 }
 
 impl<E: Send + 'static> RollingPreviewSession<E> {
-    pub fn new<F>(mut decode: F) -> Self
+    pub fn new<F>(mut decode: F) -> std::io::Result<Self>
     where
         F: FnMut(PreviewSnapshot) -> Result<StreamUpdate, E> + Send + 'static,
     {
@@ -369,24 +369,26 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
         let worker_mailbox = mailbox.clone();
         let updates: ReplaceLatestMailbox<PreviewEvent<E>> = ReplaceLatestMailbox::new();
         let worker_updates = updates.clone();
-        let worker = thread::spawn(move || {
-            while let Some(active) = worker_mailbox.claim() {
-                let snapshot = active.finish();
-                let identity = snapshot.identity.clone();
-                let event = match decode(snapshot) {
-                    Ok(update) => PreviewEvent::Update { identity, update },
-                    Err(error) => PreviewEvent::Error { identity, error },
-                };
-                // A slow presentation consumer must not stall decoding or retain an obsolete
-                // partial; the result mailbox replaces it with this result.
-                let _ = worker_updates.publish(event);
-            }
-        });
-        Self {
+        let worker = thread::Builder::new()
+            .name("scribe-rolling-preview".to_owned())
+            .spawn(move || {
+                while let Some(active) = worker_mailbox.claim() {
+                    let snapshot = active.finish();
+                    let identity = snapshot.identity.clone();
+                    let event = match decode(snapshot) {
+                        Ok(update) => PreviewEvent::Update { identity, update },
+                        Err(error) => PreviewEvent::Error { identity, error },
+                    };
+                    // A slow presentation consumer must not stall decoding or retain an obsolete
+                    // partial; the result mailbox replaces it with this result.
+                    let _ = worker_updates.publish(event);
+                }
+            })?;
+        Ok(Self {
             mailbox,
             updates,
             worker: Some(worker),
-        }
+        })
     }
 
     /// Valid snapshots are scheduled without waiting for the decoder.
@@ -421,6 +423,11 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
     /// Returns at most one text-only preview event and never blocks.
     pub fn try_next(&self) -> Option<PreviewEvent<E>> {
         self.updates.try_claim().map(ActiveMailboxItem::finish)
+    }
+
+    /// Reports whether the named preview worker has exited without waiting.
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Stops future work and waits no longer than `timeout`. A `false` result
@@ -480,7 +487,6 @@ impl HypothesisWord {
         }
     }
 
-    #[cfg(test)]
     pub fn at_absolute_frames(mut self, start_frame: u64, end_frame: u64) -> Self {
         self.start_frame = Some(start_frame);
         self.end_frame = Some(end_frame);
@@ -877,9 +883,12 @@ mod tests {
     #[test]
     fn application_shell_cannot_construct_or_publish_pcm_preview_snapshots() {
         let app_source = include_str!("app.rs");
-        assert!(!app_source.contains("PreviewSnapshot"));
-        assert!(!app_source.contains("publish_window"));
-        assert!(!app_source.contains("snapshot.audio"));
+        let test_module = app_source.find("mod layout_tests").unwrap();
+        let test_attribute = app_source[..test_module].rfind("#[cfg(test)]").unwrap();
+        let production_source = &app_source[..test_attribute];
+        assert!(!production_source.contains("PreviewSnapshot"));
+        assert!(!production_source.contains("publish_window"));
+        assert!(!production_source.contains("snapshot.audio"));
     }
 
     #[test]
@@ -960,7 +969,8 @@ mod tests {
                 committed: format!("committed {sequence}"),
                 tentative: String::new(),
             })
-        });
+        })
+        .unwrap();
 
         assert!(session.try_update(snapshot(1)));
         assert_eq!(
@@ -1006,7 +1016,8 @@ mod tests {
                 released = wake.wait(released).unwrap();
             }
             Ok(StreamUpdate::default())
-        });
+        })
+        .unwrap();
 
         assert!(session.try_update(snapshot(1)));
         assert_eq!(
@@ -1079,6 +1090,54 @@ mod tests {
     }
 
     #[test]
+    fn case_correction_requires_the_corrected_display_form_to_repeat() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let words = |sequence, ending: &str| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame: 48_000,
+            words: vec![
+                HypothesisWord::new("hello").at_absolute_frames(4_000, 8_000),
+                HypothesisWord::new(ending).at_absolute_frames(12_000, 16_000),
+            ],
+        };
+
+        stabilizer.push(words(1, "World")).unwrap();
+        let corrected = stabilizer.push(words(2, "world")).unwrap();
+        assert_eq!(corrected.committed, "hello");
+        assert_eq!(corrected.tentative, "world");
+        let repeated = stabilizer.push(words(3, "world")).unwrap();
+        assert_eq!(repeated.committed, "hello world");
+        assert!(repeated.tentative.is_empty());
+    }
+
+    #[test]
+    fn missing_word_can_reappear_without_rewriting_the_committed_prefix() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer
+            .push(hypothesis(1, 0, 48_000, "we really agree"))
+            .unwrap();
+        let missing = stabilizer
+            .push(hypothesis(2, 0, 48_000, "we agree"))
+            .unwrap();
+        assert_eq!(missing.committed, "we");
+        assert_eq!(missing.tentative, "agree");
+
+        let reappeared = stabilizer
+            .push(hypothesis(3, 0, 48_000, "we really agree"))
+            .unwrap();
+        assert_eq!(reappeared.committed, "we");
+        assert_eq!(reappeared.tentative, "really agree");
+        let stable = stabilizer
+            .push(hypothesis(4, 0, 48_000, "we really agree"))
+            .unwrap();
+        assert_eq!(stable.committed, "we really");
+        assert_eq!(stable.tentative, "agree");
+    }
+
+    #[test]
     fn repeated_words_at_a_window_overlap_are_not_duplicated() {
         let mut stabilizer =
             TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
@@ -1091,6 +1150,35 @@ mod tests {
 
         assert_eq!(state.committed, "go go");
         assert_eq!(state.tentative, "now please");
+    }
+
+    #[test]
+    fn repeated_words_are_deduplicated_after_normal_consecutive_updates() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let opening = |sequence| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame: 48_000,
+            words: vec![
+                HypothesisWord::new("go").at_absolute_frames(0, 4_000),
+                HypothesisWord::new("go").at_absolute_frames(5_000, 8_000),
+            ],
+        };
+        stabilizer.push(opening(1)).unwrap();
+        assert_eq!(stabilizer.push(opening(2)).unwrap().committed, "go go");
+        stabilizer
+            .push(hypothesis(3, 0, 48_000, "go go now"))
+            .unwrap();
+        stabilizer
+            .push(hypothesis(4, 0, 48_000, "go go now"))
+            .unwrap();
+        let rolled = stabilizer
+            .push(hypothesis(5, 0, 48_000, "go now please"))
+            .unwrap();
+
+        assert_eq!(rolled.committed, "go go");
+        assert_eq!(rolled.tentative, "now please");
     }
 
     #[test]
@@ -1220,6 +1308,43 @@ mod tests {
                 .committed
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn overlap_boundary_commits_at_exactly_six_fifty_ms_but_not_one_frame_before() {
+        let run = |edge_start| {
+            let mut stabilizer = TranscriptStabilizer::new(
+                SessionId(7),
+                RequestId(11),
+                ModelId::new("preview-model"),
+            );
+            let opening = |sequence| TranscriptHypothesis {
+                identity: identity(sequence),
+                window_start_frame: 0,
+                window_end_frame: 48_000,
+                words: vec![HypothesisWord::new("hello").at_absolute_frames(0, 8_000)],
+            };
+            stabilizer.push(opening(1)).unwrap();
+            stabilizer.push(opening(2)).unwrap();
+            let rolled = |sequence| TranscriptHypothesis {
+                identity: identity(sequence),
+                window_start_frame: 0,
+                window_end_frame: 48_000,
+                words: vec![
+                    HypothesisWord::new("hello").at_absolute_frames(0, 8_000),
+                    HypothesisWord::new("edge").at_absolute_frames(edge_start, 16_000),
+                ],
+            };
+            stabilizer.push(rolled(3)).unwrap();
+            stabilizer.push(rolled(4)).unwrap()
+        };
+
+        let one_frame_before = run(10_399);
+        assert_eq!(one_frame_before.committed, "hello");
+        assert_eq!(one_frame_before.tentative, "edge");
+        let exact = run(10_400);
+        assert_eq!(exact.committed, "hello edge");
+        assert!(exact.tentative.is_empty());
     }
 
     #[test]

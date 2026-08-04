@@ -133,6 +133,8 @@ pub enum CoordinatorError {
     DuplicateCompletion(RequestId),
     #[error("a rolling preview request is already active")]
     PreviewAlreadyActive,
+    #[error("the rolling preview request must finish before capture finalization")]
+    PreviewStillActive,
     #[error("request {request_id:?} expected model {expected}, got {actual}")]
     WrongModel {
         request_id: RequestId,
@@ -300,6 +302,9 @@ impl SessionCoordinator {
     }
 
     pub fn capture_finalized(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        if self.active_ref(session_id)?.preview.is_some() {
+            return Err(CoordinatorError::PreviewStillActive);
+        }
         self.transition(
             session_id,
             DictationPhase::Capturing,
@@ -823,6 +828,29 @@ mod tests {
                 .unwrap()
         );
         coordinator.begin_output(session_id).unwrap();
+    }
+
+    #[test]
+    fn capture_cannot_finalize_until_the_preview_scheduler_is_closed() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        let preview_id = coordinator
+            .start_preview(session_id, model("balanced"))
+            .unwrap();
+        coordinator.capture_started(session_id).unwrap();
+        coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+
+        assert_eq!(
+            coordinator.capture_finalized(session_id),
+            Err(CoordinatorError::PreviewStillActive)
+        );
+        assert_eq!(coordinator.phase(), DictationPhase::Capturing);
+        coordinator
+            .finish_preview(session_id, preview_id, &model("balanced"))
+            .unwrap();
+        coordinator.capture_finalized(session_id).unwrap();
     }
 
     #[test]

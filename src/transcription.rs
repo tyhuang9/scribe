@@ -31,13 +31,13 @@ pub use crate::model_catalog::{
 };
 use crate::model_catalog::{model_descriptor, model_descriptors, runtime_model_manifest};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
-use crate::prepared_audio::PreparedAudio;
+use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
     NativeBootstrapFailure, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeModel,
     RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 use crate::streaming::{
-    PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
+    HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
     TranscriptHypothesis, TranscriptStabilizer,
 };
 
@@ -174,6 +174,59 @@ pub struct TranscriptSegment {
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub confidence: Option<f32>,
+}
+
+fn transcript_hypothesis(
+    identity: StreamIdentity,
+    window_start_frame: u64,
+    window_end_frame: u64,
+    transcript: &Transcript,
+) -> TranscriptHypothesis {
+    let window_frames = window_end_frame.saturating_sub(window_start_frame);
+    let mut words = Vec::new();
+    for segment in &transcript.segments {
+        let displays = segment.text.split_whitespace().collect::<Vec<_>>();
+        if displays.is_empty() {
+            continue;
+        }
+        let timed_span = segment
+            .start_ms
+            .zip(segment.end_ms)
+            .and_then(|(start, end)| {
+                let frames_per_ms = u64::from(PREPARED_SAMPLE_RATE) / 1_000;
+                let start_frame = start.saturating_mul(frames_per_ms).min(window_frames);
+                let end_frame = end.saturating_mul(frames_per_ms).min(window_frames);
+                (end_frame > start_frame).then_some((start_frame, end_frame))
+            });
+        for (index, display) in displays.iter().enumerate() {
+            let mut word = HypothesisWord::new(*display);
+            if let Some((start_frame, end_frame)) = timed_span {
+                let count = displays.len() as u64;
+                let span = end_frame - start_frame;
+                let word_start = start_frame + span.saturating_mul(index as u64) / count;
+                let word_end = start_frame + span.saturating_mul(index as u64 + 1) / count;
+                word = word.at_absolute_frames(
+                    window_start_frame.saturating_add(word_start),
+                    window_start_frame.saturating_add(word_end),
+                );
+            }
+            words.push(word);
+        }
+    }
+    if words.is_empty() {
+        return TranscriptHypothesis::from_text(
+            identity,
+            window_start_frame,
+            window_end_frame,
+            &transcript.text,
+        );
+    }
+    TranscriptHypothesis {
+        identity,
+        window_start_frame,
+        window_end_frame,
+        words,
+    }
 }
 
 /// Caller-selected decoding behavior.
@@ -349,8 +402,31 @@ impl RollingPreviewHandle {
         self.session.close();
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.session.is_finished()
+    }
+
     pub(crate) fn stop_and_join(&mut self, timeout: Duration) -> bool {
         self.session.stop_and_join(timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated<F>(
+        identity: StreamIdentity,
+        decode: F,
+    ) -> std::io::Result<(PreviewAudioPublisher, Self)>
+    where
+        F: FnMut(crate::streaming::PreviewSnapshot) -> Result<StreamUpdate, anyhow::Error>
+            + Send
+            + 'static,
+    {
+        let session = RollingPreviewSession::new(decode)?;
+        let publisher = session.audio_publisher(
+            identity.session_id,
+            identity.request_id,
+            identity.model_id.clone(),
+        );
+        Ok((publisher, Self { identity, session }))
     }
 }
 
@@ -600,6 +676,11 @@ impl TranscriptionService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn configured_acceleration_preference(&self) -> AccelerationPreference {
+        self.config.performance.acceleration_preference
+    }
+
     /// Returns the normalized, runtime-neutral model catalog. Concrete
     /// runtime requirements and artifact routing remain private below this
     /// service boundary.
@@ -774,11 +855,11 @@ impl TranscriptionService {
             request.model_path = model_path.clone();
             request.options = TranscriptionOptions::default();
             let outcome = service.transcribe_preview(request)?;
-            let hypothesis = TranscriptHypothesis::from_text(
+            let hypothesis = transcript_hypothesis(
                 hypothesis_identity,
                 window_start_frame,
                 window_end_frame,
-                outcome.transcript.text,
+                &outcome.transcript,
             );
             let state = stabilizer
                 .push(hypothesis)
@@ -787,7 +868,8 @@ impl TranscriptionService {
                 committed: state.committed,
                 tentative: state.tentative,
             })
-        });
+        })
+        .map_err(|error| anyhow!("failed to start rolling preview worker: {error}"))?;
         let publisher = session.audio_publisher(session_id, request_id, model_id);
         Ok((publisher, RollingPreviewHandle { identity, session }))
     }
@@ -1384,6 +1466,78 @@ mod tests {
         })
     }
 
+    #[test]
+    fn preview_hypothesis_preserves_and_offsets_native_segment_timing() {
+        let identity = StreamIdentity {
+            session_id: SessionId(1),
+            request_id: RequestId(2),
+            model_id: ModelId::new("whisper_cpp_base_en"),
+            sequence: 3,
+        };
+        let transcript = Transcript {
+            text: "hello timed world".to_owned(),
+            segments: vec![
+                TranscriptSegment {
+                    text: "hello timed".to_owned(),
+                    start_ms: Some(100),
+                    end_ms: Some(500),
+                    confidence: None,
+                },
+                TranscriptSegment {
+                    text: "world".to_owned(),
+                    start_ms: None,
+                    end_ms: None,
+                    confidence: None,
+                },
+            ],
+            detected_language: None,
+            duration_ms: Some(1_000),
+        };
+
+        let hypothesis = transcript_hypothesis(identity, 16_000, 32_000, &transcript);
+
+        assert_eq!(hypothesis.words.len(), 3);
+        assert_eq!(hypothesis.words[0].start_frame, Some(17_600));
+        assert_eq!(hypothesis.words[0].end_frame, Some(20_800));
+        assert_eq!(hypothesis.words[1].start_frame, Some(20_800));
+        assert_eq!(hypothesis.words[1].end_frame, Some(24_000));
+        assert_eq!(hypothesis.words[2].start_frame, None);
+        assert_eq!(hypothesis.words[2].end_frame, None);
+    }
+
+    #[test]
+    fn preview_hypothesis_falls_back_to_full_text_without_segments() {
+        let identity = StreamIdentity {
+            session_id: SessionId(1),
+            request_id: RequestId(2),
+            model_id: ModelId::new("whisper_cpp_base_en"),
+            sequence: 3,
+        };
+        let transcript = Transcript {
+            text: "fallback words".to_owned(),
+            segments: Vec::new(),
+            detected_language: None,
+            duration_ms: None,
+        };
+
+        let hypothesis = transcript_hypothesis(identity, 0, 16_000, &transcript);
+
+        assert_eq!(
+            hypothesis
+                .words
+                .iter()
+                .map(|word| word.display.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fallback", "words"]
+        );
+        assert!(
+            hypothesis
+                .words
+                .iter()
+                .all(|word| word.start_frame.is_none() && word.end_frame.is_none())
+        );
+    }
+
     fn legacy_result() -> LegacyTranscriptResult {
         LegacyTranscriptResult {
             model_id: "faster_whisper_tiny_en".to_owned(),
@@ -1966,11 +2120,37 @@ mod tests {
     #[test]
     #[ignore = "requires the same local pinned whisper.cpp package, base.en model, and JFK fixture as the service smoke test"]
     fn rolling_preview_jfk_first_partial_benchmark() {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
         use std::time::Instant;
 
         let cli = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_CLI").unwrap());
         let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
         let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
+        let verify_file = |path: &Path, expected_size: u64, expected_sha256: &str| {
+            assert_eq!(fs::metadata(path).unwrap().len(), expected_size);
+            let mut file = fs::File::open(path).unwrap();
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            assert_eq!(format!("{:x}", hasher.finalize()), expected_sha256);
+        };
+        verify_file(
+            &model_path,
+            147_964_211,
+            "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        );
+        verify_file(
+            &audio_path,
+            352_078,
+            "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+        );
         let audio = PreparedAudio::from_wav_path(audio_path).unwrap();
         let mut config = AppConfig::default();
         config.developer.whisper_executable_path = Some(cli);
@@ -2016,6 +2196,18 @@ mod tests {
                         PreviewEvent::Update { update, .. }
                             if !update.committed.is_empty() || !update.tentative.is_empty() =>
                         {
+                            let text = format!("{} {}", update.committed, update.tentative)
+                                .to_ascii_lowercase();
+                            assert!(
+                                ["and", "fellow", "americans", "country", "ask"].iter().any(
+                                    |expected| text.split_whitespace().any(|word| {
+                                        word.trim_matches(|character: char| {
+                                            !character.is_alphanumeric()
+                                        }) == *expected
+                                    })
+                                ),
+                                "first partial did not contain an expected JFK fixture word: {text:?}"
+                            );
                             break started.elapsed().as_millis();
                         }
                         PreviewEvent::Update { .. } => {}
@@ -2051,7 +2243,7 @@ mod tests {
         }
 
         eprintln!(
-            "rolling_preview_jfk first_partial_cold_median_ms={} first_partial_cold_p95_ms={} first_partial_warm_median_ms={} first_partial_warm_p95_ms={}",
+            "rolling_preview_jfk cold_samples_ms={cold_first_partial:?} warm_samples_ms={warm_first_partial:?} first_partial_cold_median_ms={} first_partial_cold_p95_ms={} first_partial_warm_median_ms={} first_partial_warm_p95_ms={}",
             percentile(&cold_first_partial, 50),
             percentile(&cold_first_partial, 95),
             percentile(&warm_first_partial, 50),

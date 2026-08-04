@@ -872,6 +872,9 @@ impl NativeWhisperHandle {
         if let Some(error) = callback_state.error {
             return Err(RuntimeError::Callback(error));
         }
+        callback_state
+            .segments
+            .retain(|segment| !is_blank_audio_segment(&segment.text));
         let text = assemble_segment_text(&callback_state.segments);
         Ok(Transcript {
             text,
@@ -895,6 +898,10 @@ fn assemble_segment_text(segments: &[TranscriptSegment]) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+fn is_blank_audio_segment(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("[BLANK_AUDIO]")
 }
 
 struct AbortState<'a> {
@@ -1165,6 +1172,14 @@ mod tests {
         ];
 
         assert_eq!(assemble_segment_text(&segments), "Hello world.");
+    }
+
+    #[test]
+    fn private_whisper_adapter_recognizes_blank_audio_sentinel() {
+        assert!(is_blank_audio_segment(" [BLANK_AUDIO] "));
+        assert!(is_blank_audio_segment("[blank_audio]"));
+        assert!(!is_blank_audio_segment("blank audio"));
+        assert!(!is_blank_audio_segment("[music]"));
     }
 
     #[test]

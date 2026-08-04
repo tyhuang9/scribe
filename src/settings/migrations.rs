@@ -951,6 +951,40 @@ mod tests {
     }
 
     #[test]
+    fn every_streaming_mode_round_trips_and_invalid_mode_is_salvaged() {
+        for (stored, expected) in [
+            ("auto", StreamingMode::Auto),
+            ("rolling", StreamingMode::Rolling),
+            ("final_only", StreamingMode::FinalOnly),
+        ] {
+            let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "streaming": {"mode": stored}
+            }));
+            assert_eq!(config.streaming.mode, expected);
+            assert!(!diagnostics.invalid_values_salvaged);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["streaming"]["mode"],
+                stored
+            );
+        }
+
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "streaming": {
+                "mode": "native_streaming_claim",
+                "future_alignment": {"kept": true}
+            }
+        }));
+        assert_eq!(config.streaming.mode, StreamingMode::Auto);
+        assert!(diagnostics.invalid_values_salvaged);
+        assert_eq!(
+            config.streaming.unknown["future_alignment"],
+            json!({"kept": true})
+        );
+    }
+
+    #[test]
     fn managed_install_salvages_bad_optional_metadata_and_preserves_future_fields() {
         let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
             "schema_version": CURRENT_SCHEMA_VERSION,
