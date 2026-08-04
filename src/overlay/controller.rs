@@ -73,7 +73,15 @@ pub struct OverlayTranscript {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OverlayError {
     pub message: String,
-    pub recoverable: bool,
+    pub recovery: OverlayRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayRecovery {
+    #[default]
+    None,
+    Retry,
+    WaitForPreview,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +91,8 @@ pub struct OverlayViewState {
     pub phase: OverlayPhase,
     pub audio_level: OverlayAudioLevel,
     pub transcript: OverlayTranscript,
+    pub transcript_announcement: Option<String>,
+    pub notice: Option<String>,
     pub error: Option<OverlayError>,
     pub elapsed: Option<Duration>,
     pub reduced_motion: bool,
@@ -96,6 +106,8 @@ impl Default for OverlayViewState {
             phase: OverlayPhase::Hidden,
             audio_level: OverlayAudioLevel::default(),
             transcript: OverlayTranscript::default(),
+            transcript_announcement: None,
+            notice: None,
             error: None,
             elapsed: None,
             reduced_motion: false,
@@ -153,6 +165,9 @@ impl OverlayController {
         if !self.is_current(session_id) {
             return false;
         }
+        if self.state.phase != phase {
+            self.state.notice = None;
+        }
         self.state.phase = phase;
         if phase != OverlayPhase::Error {
             self.state.error = None;
@@ -183,8 +198,12 @@ impl OverlayController {
             return false;
         }
 
+        let committed = committed.into();
+        self.state.transcript_announcement =
+            committed_delta(&self.state.transcript.committed, &committed)
+                .map(|delta| format!("Committed transcript: {delta}"));
         self.state.transcript = OverlayTranscript {
-            committed: committed.into(),
+            committed,
             tentative: tentative.into(),
             revision,
         };
@@ -207,8 +226,11 @@ impl OverlayController {
             .last_transcript_revision
             .and_then(|previous| previous.checked_add(1))
             .unwrap_or(1);
+        let committed = committed.into();
+        self.state.transcript_announcement = (!committed.trim().is_empty())
+            .then(|| format!("Final transcript: {}", committed.trim()));
         self.state.transcript = OverlayTranscript {
-            committed: committed.into(),
+            committed,
             tentative: String::new(),
             revision,
         };
@@ -228,7 +250,7 @@ impl OverlayController {
         &mut self,
         session_id: SessionId,
         message: impl Into<String>,
-        recoverable: bool,
+        recovery: OverlayRecovery,
     ) -> bool {
         if !self.is_current(session_id) {
             return false;
@@ -236,8 +258,23 @@ impl OverlayController {
         self.state.phase = OverlayPhase::Error;
         self.state.error = Some(OverlayError {
             message: message.into(),
-            recoverable,
+            recovery,
         });
+        true
+    }
+
+    pub fn show_preview_unavailable(
+        &mut self,
+        session_id: SessionId,
+        message: impl Into<String>,
+    ) -> bool {
+        if !self.is_current(session_id) {
+            return false;
+        }
+        self.state.phase = OverlayPhase::Listening;
+        self.state.notice = Some(message.into());
+        self.state.transcript.tentative.clear();
+        self.state.transcript_announcement = None;
         true
     }
 
@@ -259,6 +296,11 @@ impl OverlayController {
     fn is_current(&self, session_id: SessionId) -> bool {
         self.state.session_id == Some(session_id)
     }
+}
+
+fn committed_delta<'a>(previous: &str, current: &'a str) -> Option<&'a str> {
+    let delta = current.strip_prefix(previous).unwrap_or(current).trim();
+    (!delta.is_empty()).then_some(delta)
 }
 
 #[cfg(test)]
@@ -297,7 +339,51 @@ mod tests {
         assert_eq!(controller.state().transcript.committed, "Hello world.");
         assert!(controller.state().transcript.tentative.is_empty());
         assert_eq!(controller.state().transcript.revision, 42);
+        assert_eq!(
+            controller.state().transcript_announcement.as_deref(),
+            Some("Final transcript: Hello world.")
+        );
         assert!(!controller.replace_with_final(SessionId(6), "stale"));
+    }
+
+    #[test]
+    fn only_newly_committed_text_is_announced_during_preview() {
+        let mut controller = OverlayController::new(false);
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+
+        assert!(controller.update_transcript(SessionId(7), "hello", " world", 1));
+        assert_eq!(
+            controller.state().transcript_announcement.as_deref(),
+            Some("Committed transcript: hello")
+        );
+        assert!(controller.update_transcript(SessionId(7), "hello", " there", 2));
+        assert!(controller.state().transcript_announcement.is_none());
+        assert!(controller.update_transcript(SessionId(7), "hello world", "", 3));
+        assert_eq!(
+            controller.state().transcript_announcement.as_deref(),
+            Some("Committed transcript: world")
+        );
+    }
+
+    #[test]
+    fn preview_unavailable_notice_clears_stale_tentative_text() {
+        let mut controller = OverlayController::new(false);
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+        controller.update_transcript(SessionId(7), "stable", " stale", 1);
+
+        assert!(controller.show_preview_unavailable(
+            SessionId(7),
+            "Live preview stopped; final transcription continues."
+        ));
+
+        assert_eq!(controller.state().phase, OverlayPhase::Listening);
+        assert_eq!(controller.state().transcript.committed, "stable");
+        assert!(controller.state().transcript.tentative.is_empty());
+        assert_eq!(
+            controller.state().notice.as_deref(),
+            Some("Live preview stopped; final transcription continues.")
+        );
+        assert!(controller.state().transcript_announcement.is_none());
     }
 
     #[test]

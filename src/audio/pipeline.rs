@@ -116,24 +116,27 @@ impl Pipeline {
     /// Clones and normalizes only completed rolling windows. The full capture
     /// buffer remains untouched so enabling preview cannot alter final audio.
     pub(super) fn publish_due_previews(&mut self) {
-        let Some(publisher) = self.preview_publisher.clone() else {
+        let Some(publisher) = self.preview_publisher.as_ref() else {
             return;
         };
-        while self.prepared.len() >= self.next_preview_frame {
-            let end = self.next_preview_frame;
-            let start = end.saturating_sub(PREVIEW_WINDOW_FRAMES);
-            let mut samples = self.prepared[start..end].to_vec();
-            normalize_loudness(&mut samples);
-            match publisher.publish_window(start as u64, samples) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => {
-                    self.preview_publisher = None;
-                    return;
-                }
-            }
-            self.next_preview_frame = self
-                .next_preview_frame
-                .saturating_add(PREVIEW_INTERVAL_FRAMES);
+        if self.prepared.len() < self.next_preview_frame {
+            return;
+        }
+        // If capture processing catches up after a delay, older due windows
+        // are already obsolete under replace-latest scheduling. Publish only
+        // the newest complete cadence boundary to avoid burst allocations and
+        // stale decodes.
+        let missed_intervals =
+            (self.prepared.len() - self.next_preview_frame) / PREVIEW_INTERVAL_FRAMES;
+        let end = self
+            .next_preview_frame
+            .saturating_add(missed_intervals.saturating_mul(PREVIEW_INTERVAL_FRAMES));
+        self.next_preview_frame = end.saturating_add(PREVIEW_INTERVAL_FRAMES);
+        let start = end.saturating_sub(PREVIEW_WINDOW_FRAMES);
+        let mut samples = self.prepared[start..end].to_vec();
+        normalize_loudness(&mut samples);
+        if !matches!(publisher.publish_window(start as u64, samples), Ok(true)) {
+            self.preview_publisher = None;
         }
     }
 
@@ -709,6 +712,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(preview_final, final_only);
+    }
+
+    #[test]
+    fn delayed_preview_publication_skips_obsolete_cadence_windows() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((
+                    snapshot.identity.sequence,
+                    snapshot.window_start_frame,
+                    snapshot.window_end_frame,
+                ))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(3),
+            RequestId(5),
+            ModelId::new("preview-model"),
+        );
+        let (rms, peak, observed) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad_enabled: false,
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
+            rms,
+            peak,
+            observed,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+
+        for _ in 0..(8 * PREVIEW_INTERVAL_FRAMES) {
+            pipeline.push_interleaved(0.1);
+        }
+        pipeline.publish_due_previews();
+
+        assert_eq!(
+            snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (1, 0, (8 * PREVIEW_INTERVAL_FRAMES) as u64)
+        );
+        assert!(snapshot_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
     }
 
     #[test]

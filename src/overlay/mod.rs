@@ -6,7 +6,7 @@ mod view;
 // integration currently names only the controller, mode, and phase directly.
 #[allow(unused_imports)]
 pub use controller::{
-    OverlayAudioLevel, OverlayController, OverlayError, OverlayMode, OverlayPhase,
+    OverlayAudioLevel, OverlayController, OverlayError, OverlayMode, OverlayPhase, OverlayRecovery,
     OverlayTranscript, OverlayViewState,
 };
 pub use platform::{

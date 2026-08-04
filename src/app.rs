@@ -37,7 +37,7 @@ use crate::models::{
 };
 use crate::overlay::{
     self, CapturedTarget, OverlayController, OverlayMode as NativeOverlayMode, OverlayPhase,
-    OverlayPosition as NativeOverlayPosition,
+    OverlayPosition as NativeOverlayPosition, OverlayRecovery,
 };
 use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewEvent;
@@ -328,6 +328,18 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
 
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
     source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
+}
+
+fn streaming_mode_selector(ui: &mut Ui, mode: &mut StreamingMode) -> bool {
+    let before = *mode;
+    ComboBox::new("advanced-streaming-mode", "Preview mode")
+        .selected_text(mode.label())
+        .show_ui(ui, |ui| {
+            for candidate in StreamingMode::ALL {
+                ui.selectable_value(mode, candidate, candidate.label());
+            }
+        });
+    *mode != before
 }
 
 fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
@@ -1416,9 +1428,20 @@ impl LocalTranscriberApp {
         }
 
         if self.status == TranscriptionStatus::Error {
-            let _ =
-                self.overlay_controller
-                    .show_error(session_id, self.status_message.clone(), true);
+            let recovery = if self
+                .pending_preview_drain
+                .as_ref()
+                .is_some_and(|pending| pending.timeout_reported)
+            {
+                OverlayRecovery::WaitForPreview
+            } else {
+                OverlayRecovery::None
+            };
+            let _ = self.overlay_controller.show_error(
+                session_id,
+                self.status_message.clone(),
+                recovery,
+            );
             return;
         }
 
@@ -1468,10 +1491,11 @@ impl LocalTranscriberApp {
     }
 
     fn finish_overlay_error(&mut self, session_id: SessionId, message: &str) {
-        if self
-            .overlay_controller
-            .show_error(session_id, message.to_owned(), true)
-        {
+        if self.overlay_controller.show_error(
+            session_id,
+            message.to_owned(),
+            OverlayRecovery::Retry,
+        ) {
             self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(3));
         }
     }
@@ -2065,6 +2089,10 @@ impl LocalTranscriberApp {
                 ) {
                     self.status_message = format!(
                         "Listening. Live preview stopped; the final pass remains enabled: {error}"
+                    );
+                    let _ = self.overlay_controller.show_preview_unavailable(
+                        identity.session_id,
+                        "Live preview stopped; final transcription continues.",
                     );
                     let _ =
                         self.begin_preview_drain(identity.session_id, PreviewDrainAction::Continue);
@@ -4870,16 +4898,8 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Live transcription"));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Preview mode");
                     let mut mode = self.config.streaming.mode;
-                    ComboBox::from_id_source("advanced-streaming-mode")
-                        .selected_text(mode.label())
-                        .show_ui(ui, |ui| {
-                            for candidate in StreamingMode::ALL {
-                                ui.selectable_value(&mut mode, candidate, candidate.label());
-                            }
-                        });
-                    if mode != self.config.streaming.mode {
+                    if streaming_mode_selector(ui, &mut mode) {
                         self.config.streaming.mode = mode;
                         self.save_config();
                     }
@@ -11352,5 +11372,23 @@ mod layout_tests {
             RecordingSource::Playground,
             StreamingMode::Auto
         ));
+    }
+
+    #[test]
+    fn streaming_mode_selector_has_an_accessible_name() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut mode = StreamingMode::Auto;
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert!(!streaming_mode_selector(ui, &mut mode));
+            });
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ComboBox && node.name() == Some("Preview mode")
+        }));
     }
 }
