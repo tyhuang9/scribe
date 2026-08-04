@@ -1,6 +1,6 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 4 implemented on its stacked branch (2026-08-03). This document
+**Status:** Phase 5 implemented on its stacked branch (2026-08-03). This document
 preserves the Phase 0 audit and records each implemented phase against the
 consolidated revamp plan. It does not claim that uncompleted later phases are
 implemented.
@@ -967,3 +967,165 @@ evidence.
 
 Phase 5 may now consume coordinator state and typed Overlay settings while
 keeping all concrete runtime selection private to `RuntimeRouter`.
+
+## Phase 5 checkpoint - native shell, overlay, and target-safe output
+
+Phase 5 replaces the stale six-backend-oriented shell with runtime-neutral
+navigation and adds a pre-created native dictation overlay driven only by real
+coordinator, level, transcript, and error state. It does not change runtime or
+model compatibility: the application still contains exactly **one logical
+runtime handler**, `TranscribeCppRuntime`; the four normalized primary models
+remain **Experimental**; no model is **Supported**; and the exact Zipformer
+candidate remains a documented **NO-GO** with no `OnnxSpeechRuntime` shipped.
+
+### Shell, connected pages, and accessibility
+
+The main shell now exposes Transcribe, General, Models, History, Advanced, and
+About. Debug is visible only when the persisted Developer setting enables it.
+Model comparison remains the existing functional comparison workflow and is
+also reachable inside Models; no duplicate comparison system was created.
+General and Advanced expose only settings already connected to application
+behavior. History truthfully shows only the latest in-memory transcript until
+Phase 10 adds persistent storage, search, and retention.
+
+Reusable controls enforce at least a 44 px primary interaction height. The
+shell and overlay use the checked-in Scribe light/dark tokens, visible focus,
+keyboard navigation, non-color phase cues, and AccessKit labels. Overlay text
+is a polite live region that distinguishes committed and tentative content;
+the real microphone level has a named numeric progress semantic. Navigation
+exposes a landmark, heading, and selected state, with a high-contrast visible
+dot/bold cue rather than color alone. Light semantic text tokens are covered by
+4.5:1 contrast tests. Reduced-motion state is obtained from the Windows system
+setting; the overlay has no decorative animation that must be disabled.
+
+### Pre-created overlay and platform boundary
+
+An immediate eframe secondary viewport with a stable identity is submitted on
+every frame from application startup, including while hidden. It is borderless,
+transparent, always-on-top, excluded from the taskbar, inactive, and mouse
+passthrough at the toolkit level. Live mode shows phase, elapsed time, measured
+audio levels, committed text, and a visually separate tentative suffix;
+Minimal shows a compact phase/level presentation; Off remains hidden. The
+application never invents transcript fragments or download progress.
+
+On Windows, the platform adapter additionally applies `WS_EX_NOACTIVATE`,
+`WS_EX_TOOLWINDOW`, and `WS_EX_TRANSPARENT`, uses non-activating topmost window
+positioning, and places the viewport within the captured target monitor's DPI-
+aware work area. The original foreground handle and process are captured
+before coordinator state changes can reveal the overlay. Every Scribe-owned
+window is rejected by process identity. The viewport remains hidden unless the
+actual HWND reports all required extended styles and non-activating placement
+succeeds; lookup or Win32 call failure therefore fails closed. Other platforms
+keep the effective overlay mode Off until equivalent no-focus enforcement
+exists.
+
+These implementation properties are covered by deterministic state, geometry,
+and source tests. Physical Windows focus, taskbar, multi-monitor, mixed-DPI,
+screen-reader, and click-through behavior remain **NOT VERIFIED** until the
+manual matrix is executed.
+
+### Concurrent capture startup, real levels, and safe output
+
+Microphone startup now runs on a native worker so the UI can display Preparing
+immediately. Model preload is dispatched for the same correlated session while
+capture opens, and an explicit stop during pending startup is retained and
+applied before a returned stream can become active. The current CPAL callback
+publishes only a lock-free atomic aggregate level to the UI; no sample frames
+cross into egui, JavaScript, webview events, or general UI IPC. This is an
+interim Phase 5 meter: the inherited callback still writes WAV data behind a
+mutex and Phase 6 must replace that path with the fixed-capacity SPSC ring and
+native preparation worker.
+
+Final output now carries an opaque captured target through the session. On
+Windows, automatic paste is attempted exactly once only when that exact target
+is still foreground immediately before output and the clipboard still contains
+the finalized text Scribe placed there. A missing, closed, changed, or Scribe-
+owned target results in copy-only fallback with no synthetic keystroke. An
+external clipboard change before paste suppresses the keystroke without
+overwriting the external value; the final text remains visible in Scribe. On
+Windows, the clipboard sequence generation is also checked so same-text changes
+to HTML, RTF, or other formats cannot masquerade as Scribe's clipboard write.
+Clipboard restoration occurs only when the final transcript still owns the
+clipboard, so an external clipboard change is not overwritten. Target
+reactivation and image-format restoration remain Phase 8 work. macOS and Linux
+conservatively use copy-only output because foreground-target safety is not yet
+implemented there.
+
+The Windows paste driver revalidates the target immediately before injection
+and submits Control-down, V-down, V-up, and Control-up in one `SendInput` batch.
+If Windows accepts only a prefix, Scribe makes a best-effort V/Control release
+batch before reporting copy-only fallback. Any safe fallback is shown as an
+attention state in the overlay instead of the generic success state.
+
+Output is staged for the next UI update after the correlated coordinator enters
+`Output`, so the overlay can present the real Pasting phase before clipboard or
+synthetic-input work begins. Starting a newer session retires that pending
+output before it can run. Terminal dictation failures use one cleanup path that
+shows Error, schedules the overlay to hide, and releases its captured target;
+starting another session also retires any prior success/error target promptly.
+
+Tentative text is owned only by `OverlayController`; the application output
+path receives the completed full-utterance result and never types tentative
+text or backspaces corrections.
+
+### Latency instrumentation and verification
+
+The existing trace now separately records the first real native-callback meter update. Capture
+startup and preload are concurrent, and overlay visibility is stamped when the
+viewport visibility command is dispatched. That stamp is not evidence of a
+physically presented frame. No live hotkey/microphone run was available, so
+Phase 5 makes no before/after latency claim. The saved Phase 0-versus-Phase 2
+same-fixture measurements remain the latest valid comparison.
+
+Final Phase 5 verification on 2026-08-03:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format | `cargo fmt --all -- --check` | PASS |
+| Compile | `cargo check --all-targets --all-features` | PASS |
+| Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Tests | `cargo test --all-targets --all-features` | PASS: 323 discovered, 318 passed, 0 failed, 5 environment-required ignored |
+| Debug build | `cargo build --all-features` | PASS |
+| Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary tests | PASS: one logical handler; concrete runtime selection remains private to the router |
+
+The relevant deterministic coverage includes typed overlay settings and
+unknown-field preservation; stale overlay session/revision rejection; Live,
+Minimal, Off, hidden-viewport, accessibility, and geometry behavior; current-
+process target rejection; target loss/change; exactly-once paste; clipboard
+content/generation ownership races and failures; partial input-batch cleanup;
+fail-closed HWND hardening; terminal overlay cleanup; a visible Pasting frame;
+aggregate level availability/conversion; navigation landmark/selection,
+semantic-token contrast, Debug gating, and explicit stop while capture startup
+is pending. The final QA regressions additionally drive capture readiness after
+that pending stop through WAV finalization and exactly one transcription
+dispatch, exercise preload completion on both sides of capture readiness,
+prove stale success/error events cannot arm the newer overlay's hide deadline,
+expire a real hide deadline and retire its captured target, and verify
+application-level output consumption is exactly once. Windows input injection
+tests cover every partial batch length, the exact V/Control release sequence,
+cleanup failure without retry, and the no-cleanup success path.
+
+### Risks, unverified behavior, and Phase 6 entry
+
+- **High release risk:** no real Windows hotkey, microphone, foreground target,
+  paste, overlay focus/taskbar/click-through, screen-reader, multi-monitor, or
+  mixed-DPI row has passed. Run the updated matrix and retain evidence.
+- **Medium privacy/performance risk:** the inherited callback still locks and
+  writes WAV samples. Phase 6 must move all PCM through the fixed-capacity ring,
+  prepare canonical mono 16 kHz `f32` once, and delete the obsolete callback
+  file path.
+- **Medium output risk:** Phase 5 validates but does not reactivate a captured
+  target. An HWND/PID can theoretically be reused, and no foreground check can
+  be atomic with another process changing focus. Phase 8 owns process-handle/
+  target-lifetime hardening, reactivation plus revalidation, richer clipboard
+  restoration, and final output failure injection.
+- **Medium portability risk:** non-Windows platforms intentionally suppress the
+  overlay and auto-paste. Native safe adapters or a documented conservative
+  support decision are still required.
+- **Low maintainability risk:** `app.rs` remains large, although shell pages,
+  controls, theme, overlay state/view, and platform integration now have
+  dedicated modules. Continue bounded extraction as later phases introduce
+  audio, streaming, output, and history ownership; do not duplicate systems.
+
+Phase 6 can now replace the remaining callback/file capture path while reusing
+the real overlay level/state interface and the authoritative session boundary.
