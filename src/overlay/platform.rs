@@ -1,9 +1,11 @@
 use std::fmt;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TargetIdentity {
     native_handle: isize,
+    thread_id: u32,
     process_id: u32,
+    process_creation_time: u64,
 }
 
 /// Opaque identity for the external window that had focus when dictation
@@ -11,6 +13,7 @@ struct TargetIdentity {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct CapturedTarget {
     identity: TargetIdentity,
+    window_property_token: usize,
 }
 
 impl fmt::Debug for CapturedTarget {
@@ -27,8 +30,11 @@ impl CapturedTarget {
         Self {
             identity: TargetIdentity {
                 native_handle,
+                thread_id: 1,
                 process_id,
+                process_creation_time: 1,
             },
+            window_property_token: 1,
         }
     }
 }
@@ -109,6 +115,18 @@ pub fn captured_target_is_foreground(target: &CapturedTarget) -> bool {
     imp::captured_target_is_foreground(target)
 }
 
+/// Requests foreground activation for the exact captured target, then verifies
+/// it immediately. Windows may deny activation; that denial is not bypassed.
+pub fn reactivate_and_verify_captured_target(target: &CapturedTarget) -> bool {
+    imp::reactivate_and_verify_captured_target(target)
+}
+
+/// Retires Scribe's generation marker without disturbing a newer capture of
+/// the same HWND. Window destruction also removes the scalar property.
+pub fn release_captured_target(target: &CapturedTarget) {
+    imp::release_captured_target(target);
+}
+
 pub fn overlay_window_bounds(
     target: Option<&CapturedTarget>,
     spec: OverlayWindowSpec,
@@ -141,20 +159,29 @@ pub fn overlay_focus_safety_available() -> bool {
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::c_void;
-    use std::mem::size_of;
+    use std::mem::{size_of, zeroed};
     use std::process;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+    use windows_sys::Win32::Foundation::{
+        BOOL, CloseHandle, FILETIME, HWND, LPARAM, POINT, RECT, STILL_ACTIVE,
+    };
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
     };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST,
+        EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetPropW, GetWindowLongPtrW,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindow,
         SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        SWP_SHOWWINDOW, SetForegroundWindow, SetPropW, SetWindowLongPtrW, SetWindowPos,
+        SystemParametersInfoW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
     use super::{
@@ -162,24 +189,46 @@ mod imp {
         TargetIdentity, calculate_window_bounds,
     };
 
-    trait ForegroundWindowProbe {
-        fn foreground_identity(&mut self) -> Option<(isize, u32)>;
+    trait CapturedTargetProbe {
+        fn foreground_identity(&mut self) -> Option<TargetIdentity>;
+        fn install_window_property(&mut self, identity: TargetIdentity) -> Option<usize>;
+        fn window_property_matches(&mut self, token: usize, identity: TargetIdentity) -> bool;
+        fn release_window_property(&mut self, token: usize, identity: TargetIdentity);
+        fn identity_for_window(&mut self, native_handle: isize) -> Option<TargetIdentity>;
+        fn set_foreground_window(&mut self, native_handle: isize) -> bool;
     }
 
-    struct SystemForegroundWindowProbe;
+    struct SystemCapturedTargetProbe;
 
-    impl ForegroundWindowProbe for SystemForegroundWindowProbe {
-        fn foreground_identity(&mut self) -> Option<(isize, u32)> {
+    impl CapturedTargetProbe for SystemCapturedTargetProbe {
+        fn foreground_identity(&mut self) -> Option<TargetIdentity> {
             let window = unsafe { GetForegroundWindow() };
-            if window.is_null() {
-                return None;
-            }
-            window_process_id(window).map(|process_id| (window as isize, process_id))
+            window_identity(window)
+        }
+
+        fn identity_for_window(&mut self, native_handle: isize) -> Option<TargetIdentity> {
+            window_identity(native_handle as HWND)
+        }
+
+        fn install_window_property(&mut self, identity: TargetIdentity) -> Option<usize> {
+            install_window_property(identity)
+        }
+
+        fn window_property_matches(&mut self, token: usize, identity: TargetIdentity) -> bool {
+            window_property_matches(token, identity)
+        }
+
+        fn release_window_property(&mut self, token: usize, identity: TargetIdentity) {
+            remove_window_property_if_matches(token, identity);
+        }
+
+        fn set_foreground_window(&mut self, native_handle: isize) -> bool {
+            unsafe { SetForegroundWindow(native_handle as HWND) != 0 }
         }
     }
 
     pub(super) fn capture_foreground_target() -> Option<CapturedTarget> {
-        capture_external_target_with(&mut SystemForegroundWindowProbe, process::id())
+        capture_external_target_with(&mut SystemCapturedTargetProbe, process::id())
     }
 
     fn capture_external_target_with<P>(
@@ -187,22 +236,83 @@ mod imp {
         current_process_id: u32,
     ) -> Option<CapturedTarget>
     where
-        P: ForegroundWindowProbe,
+        P: CapturedTargetProbe,
     {
-        let (native_handle, process_id) = probe.foreground_identity()?;
-        if native_handle == 0 || process_id == 0 || process_id == current_process_id {
+        let identity = probe.foreground_identity()?;
+        if !is_external_identity(identity, current_process_id) {
             return None;
         }
-        Some(CapturedTarget {
-            identity: TargetIdentity {
-                native_handle,
-                process_id,
-            },
-        })
+        let window_property_token = probe.install_window_property(identity)?;
+        let target = CapturedTarget {
+            identity,
+            window_property_token,
+        };
+        if probe.foreground_identity() == Some(identity)
+            && probe.window_property_matches(window_property_token, identity)
+        {
+            Some(target)
+        } else {
+            probe.release_window_property(window_property_token, identity);
+            None
+        }
     }
 
     pub(super) fn captured_target_is_foreground(target: &CapturedTarget) -> bool {
-        capture_foreground_target().is_some_and(|current| current == *target)
+        captured_target_is_foreground_with(&mut SystemCapturedTargetProbe, process::id(), target)
+    }
+
+    pub(super) fn captured_target_is_valid(target: &CapturedTarget) -> bool {
+        captured_target_is_valid_with(&mut SystemCapturedTargetProbe, process::id(), target)
+    }
+
+    pub(super) fn reactivate_and_verify_captured_target(target: &CapturedTarget) -> bool {
+        reactivate_and_verify_captured_target_with(
+            &mut SystemCapturedTargetProbe,
+            process::id(),
+            target,
+        )
+    }
+
+    pub(super) fn release_captured_target(target: &CapturedTarget) {
+        remove_window_property_if_matches(target.window_property_token, target.identity);
+    }
+
+    fn captured_target_is_valid_with<P>(
+        probe: &mut P,
+        current_process_id: u32,
+        target: &CapturedTarget,
+    ) -> bool
+    where
+        P: CapturedTargetProbe,
+    {
+        is_external_identity(target.identity, current_process_id)
+            && probe.identity_for_window(target.identity.native_handle) == Some(target.identity)
+            && probe.window_property_matches(target.window_property_token, target.identity)
+    }
+
+    fn captured_target_is_foreground_with<P>(
+        probe: &mut P,
+        current_process_id: u32,
+        target: &CapturedTarget,
+    ) -> bool
+    where
+        P: CapturedTargetProbe,
+    {
+        probe.foreground_identity() == Some(target.identity)
+            && captured_target_is_valid_with(probe, current_process_id, target)
+    }
+
+    fn reactivate_and_verify_captured_target_with<P>(
+        probe: &mut P,
+        current_process_id: u32,
+        target: &CapturedTarget,
+    ) -> bool
+    where
+        P: CapturedTargetProbe,
+    {
+        captured_target_is_valid_with(probe, current_process_id, target)
+            && probe.set_foreground_window(target.identity.native_handle)
+            && captured_target_is_foreground_with(probe, current_process_id, target)
     }
 
     pub(super) fn overlay_window_bounds(
@@ -310,13 +420,15 @@ mod imp {
 
     fn monitor_and_dpi(target: Option<&CapturedTarget>) -> Option<(*mut c_void, u32)> {
         if let Some(target) = target {
-            let window = target.identity.native_handle as HWND;
-            if window_process_id(window) == Some(target.identity.process_id) {
-                let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
-                if !monitor.is_null() {
-                    return Some((monitor, effective_monitor_dpi(monitor)));
-                }
+            if !captured_target_is_valid(target) {
+                return None;
             }
+            let window = target.identity.native_handle as HWND;
+            let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
+            if !monitor.is_null() {
+                return Some((monitor, effective_monitor_dpi(monitor)));
+            }
+            return None;
         }
 
         let mut cursor = POINT { x: 0, y: 0 };
@@ -338,15 +450,129 @@ mod imp {
         if result == 0 && dpi_x > 0 { dpi_x } else { 96 }
     }
 
-    fn window_process_id(window: HWND) -> Option<u32> {
+    static TARGET_WITNESS_PROPERTY: OnceLock<Vec<u16>> = OnceLock::new();
+    static NEXT_TARGET_WITNESS: AtomicUsize = AtomicUsize::new(1);
+
+    fn target_witness_property_name() -> &'static [u16] {
+        TARGET_WITNESS_PROPERTY.get_or_init(|| {
+            let creation_time = process_creation_time(process::id()).unwrap_or(0);
+            format!("Scribe.TargetWitness.{}.{}", process::id(), creation_time)
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect()
+        })
+    }
+
+    fn install_window_property(identity: TargetIdentity) -> Option<usize> {
+        let token = NEXT_TARGET_WITNESS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next != 0)
+            })
+            .ok()?;
+        let window = identity.native_handle as HWND;
+        let value = token as *mut c_void;
+        if unsafe { SetPropW(window, target_witness_property_name().as_ptr(), value) } == 0 {
+            return None;
+        }
+        window_property_matches(token, identity).then_some(token)
+    }
+
+    fn window_property_matches(token: usize, identity: TargetIdentity) -> bool {
+        token != 0
+            && unsafe {
+                GetPropW(
+                    identity.native_handle as HWND,
+                    target_witness_property_name().as_ptr(),
+                ) == token as *mut c_void
+            }
+    }
+
+    fn remove_window_property_if_matches(token: usize, identity: TargetIdentity) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::RemovePropW;
+
+        if window_property_matches(token, identity) {
+            let _ = unsafe {
+                RemovePropW(
+                    identity.native_handle as HWND,
+                    target_witness_property_name().as_ptr(),
+                )
+            };
+        }
+    }
+
+    fn is_external_identity(identity: TargetIdentity, current_process_id: u32) -> bool {
+        identity.native_handle != 0
+            && identity.thread_id != 0
+            && identity.process_id != 0
+            && identity.process_creation_time != 0
+            && identity.process_id != current_process_id
+    }
+
+    fn window_identity(window: HWND) -> Option<TargetIdentity> {
+        if window.is_null() || unsafe { IsWindow(window) } == 0 {
+            return None;
+        }
+        let (thread_id, process_id) = window_thread_process_id(window)?;
+        let process_creation_time = process_creation_time(process_id)?;
+        Some(TargetIdentity {
+            native_handle: window as isize,
+            thread_id,
+            process_id,
+            process_creation_time,
+        })
+    }
+
+    fn window_thread_process_id(window: HWND) -> Option<(u32, u32)> {
         if window.is_null() {
             return None;
         }
         let mut process_id = 0;
-        unsafe {
-            GetWindowThreadProcessId(window, &mut process_id);
+        let thread_id = unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+        (thread_id != 0 && process_id != 0).then_some((thread_id, process_id))
+    }
+
+    fn process_creation_time(process_id: u32) -> Option<u64> {
+        if process_id == 0 {
+            return None;
         }
-        (process_id != 0).then_some(process_id)
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
+            return None;
+        }
+
+        let result = (|| {
+            let mut exit_code = 0;
+            if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0
+                || exit_code != STILL_ACTIVE as u32
+            {
+                return None;
+            }
+
+            let mut creation_time: FILETIME = unsafe { zeroed() };
+            let mut exit_time: FILETIME = unsafe { zeroed() };
+            let mut kernel_time: FILETIME = unsafe { zeroed() };
+            let mut user_time: FILETIME = unsafe { zeroed() };
+            if unsafe {
+                GetProcessTimes(
+                    process,
+                    &mut creation_time,
+                    &mut exit_time,
+                    &mut kernel_time,
+                    &mut user_time,
+                )
+            } == 0
+            {
+                return None;
+            }
+
+            let fingerprint = u64::from(creation_time.dwLowDateTime)
+                | (u64::from(creation_time.dwHighDateTime) << 32);
+            (fingerprint != 0).then_some(fingerprint)
+        })();
+        unsafe {
+            CloseHandle(process);
+        }
+        result
     }
 
     struct WindowSearch {
@@ -372,7 +598,9 @@ mod imp {
 
     unsafe extern "system" fn search_window_callback(window: HWND, parameter: LPARAM) -> BOOL {
         let search = unsafe { &mut *(parameter as *mut WindowSearch) };
-        if window_process_id(window) != Some(search.process_id) {
+        if window_thread_process_id(window).map(|(_, process_id)| process_id)
+            != Some(search.process_id)
+        {
             return 1;
         }
 
@@ -392,30 +620,256 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::collections::VecDeque;
 
-        struct FakeProbe(Option<(isize, u32)>);
+        struct FakeProbe {
+            foreground: VecDeque<Option<TargetIdentity>>,
+            windows: VecDeque<Option<TargetIdentity>>,
+            property_token: Option<usize>,
+            property_matches: bool,
+            released_properties: Vec<(usize, TargetIdentity)>,
+            activation_succeeds: bool,
+            activations: Vec<isize>,
+        }
 
-        impl ForegroundWindowProbe for FakeProbe {
-            fn foreground_identity(&mut self) -> Option<(isize, u32)> {
-                self.0
+        impl Default for FakeProbe {
+            fn default() -> Self {
+                Self {
+                    foreground: VecDeque::new(),
+                    windows: VecDeque::new(),
+                    property_token: Some(1),
+                    property_matches: true,
+                    released_properties: Vec::new(),
+                    activation_succeeds: false,
+                    activations: Vec::new(),
+                }
+            }
+        }
+
+        impl CapturedTargetProbe for FakeProbe {
+            fn foreground_identity(&mut self) -> Option<TargetIdentity> {
+                self.foreground.pop_front().flatten()
+            }
+
+            fn install_window_property(&mut self, _identity: TargetIdentity) -> Option<usize> {
+                self.property_token
+            }
+
+            fn window_property_matches(&mut self, token: usize, _identity: TargetIdentity) -> bool {
+                self.property_matches && Some(token) == self.property_token
+            }
+
+            fn release_window_property(&mut self, token: usize, identity: TargetIdentity) {
+                self.released_properties.push((token, identity));
+            }
+
+            fn identity_for_window(&mut self, _native_handle: isize) -> Option<TargetIdentity> {
+                self.windows.pop_front().flatten()
+            }
+
+            fn set_foreground_window(&mut self, native_handle: isize) -> bool {
+                self.activations.push(native_handle);
+                self.activation_succeeds
+            }
+        }
+
+        fn identity(
+            native_handle: isize,
+            thread_id: u32,
+            process_id: u32,
+            process_creation_time: u64,
+        ) -> TargetIdentity {
+            TargetIdentity {
+                native_handle,
+                thread_id,
+                process_id,
+                process_creation_time,
+            }
+        }
+
+        fn target(identity: TargetIdentity) -> CapturedTarget {
+            CapturedTarget {
+                identity,
+                window_property_token: 1,
             }
         }
 
         #[test]
-        fn capture_rejects_every_window_owned_by_current_process() {
-            let mut probe = FakeProbe(Some((44, 9001)));
+        fn capture_rejects_window_property_installation_failure() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let mut probe = FakeProbe {
+                foreground: [Some(target_identity)].into(),
+                property_token: None,
+                ..Default::default()
+            };
+
+            assert_eq!(capture_external_target_with(&mut probe, 9001), None);
+            assert!(probe.released_properties.is_empty());
+        }
+
+        #[test]
+        fn capture_rejects_property_loss_during_revalidation() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let mut probe = FakeProbe {
+                foreground: [Some(target_identity), Some(target_identity)].into(),
+                property_matches: false,
+                ..Default::default()
+            };
+
+            assert_eq!(capture_external_target_with(&mut probe, 9001), None);
+            assert_eq!(probe.released_properties, [(1, target_identity)]);
+        }
+
+        #[test]
+        fn capture_rejects_scribe_window() {
+            let mut probe = FakeProbe {
+                foreground: [Some(identity(44, 7, 9001, 11))].into(),
+                ..Default::default()
+            };
 
             assert_eq!(capture_external_target_with(&mut probe, 9001), None);
         }
 
         #[test]
-        fn capture_accepts_an_external_window_identity() {
-            let mut probe = FakeProbe(Some((44, 9002)));
+        fn capture_rejects_inaccessible_or_dead_foreground_process() {
+            let mut probe = FakeProbe {
+                foreground: [None].into(),
+                ..Default::default()
+            };
+
+            assert_eq!(capture_external_target_with(&mut probe, 9001), None);
+        }
+
+        #[test]
+        fn capture_rejects_foreground_changes_during_capture() {
+            let original_identity = identity(44, 7, 9002, 11);
+            let mut probe = FakeProbe {
+                foreground: [Some(original_identity), Some(identity(45, 8, 9003, 12))].into(),
+                ..Default::default()
+            };
+
+            assert_eq!(capture_external_target_with(&mut probe, 9001), None);
+            assert_eq!(probe.released_properties, [(1, original_identity)]);
+        }
+
+        #[test]
+        fn capture_accepts_a_stable_external_window_identity() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let mut probe = FakeProbe {
+                foreground: [Some(target_identity), Some(target_identity)].into(),
+                ..Default::default()
+            };
 
             let target = capture_external_target_with(&mut probe, 9001).unwrap();
 
             assert_eq!(target.identity.native_handle, 44);
+            assert_eq!(target.identity.thread_id, 7);
             assert_eq!(target.identity.process_id, 9002);
+            assert_eq!(target.identity.process_creation_time, 11);
+        }
+
+        #[test]
+        fn validation_rejects_inaccessible_or_dead_process() {
+            let target = target(identity(44, 7, 9002, 11));
+            let mut probe = FakeProbe {
+                windows: [None].into(),
+                ..Default::default()
+            };
+
+            assert!(!captured_target_is_valid_with(&mut probe, 9001, &target));
+        }
+
+        #[test]
+        fn validation_rejects_scribe_target() {
+            let target = target(identity(44, 7, 9001, 11));
+            let mut probe = FakeProbe::default();
+
+            assert!(!captured_target_is_valid_with(&mut probe, 9001, &target));
+        }
+
+        #[test]
+        fn validation_rejects_hwnd_pid_and_fingerprint_reuse() {
+            let target = target(identity(44, 7, 9002, 11));
+            let mut probe = FakeProbe {
+                windows: [Some(identity(44, 7, 9002, 12))].into(),
+                ..Default::default()
+            };
+
+            assert!(!captured_target_is_valid_with(&mut probe, 9001, &target));
+        }
+
+        #[test]
+        fn validation_rejects_destroyed_target_even_after_exact_hwnd_reuse() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let target = target(target_identity);
+            let mut probe = FakeProbe {
+                windows: [Some(target_identity)].into(),
+                property_matches: false,
+                ..Default::default()
+            };
+
+            assert!(!captured_target_is_valid_with(&mut probe, 9001, &target));
+        }
+
+        #[test]
+        fn validation_accepts_the_exact_live_target() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let target = target(target_identity);
+            let mut probe = FakeProbe {
+                windows: [Some(target_identity)].into(),
+                ..Default::default()
+            };
+
+            assert!(captured_target_is_valid_with(&mut probe, 9001, &target));
+        }
+
+        #[test]
+        fn reactivation_rejects_windows_activation_denial() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let target = target(target_identity);
+            let mut probe = FakeProbe {
+                windows: [Some(target_identity)].into(),
+                activation_succeeds: false,
+                ..Default::default()
+            };
+
+            assert!(!reactivate_and_verify_captured_target_with(
+                &mut probe, 9001, &target
+            ));
+            assert_eq!(probe.activations, [44]);
+        }
+
+        #[test]
+        fn reactivation_rejects_focus_changes_after_activation() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let target = target(target_identity);
+            let mut probe = FakeProbe {
+                windows: [Some(target_identity), Some(target_identity)].into(),
+                foreground: [Some(identity(45, 8, 9003, 12))].into(),
+                activation_succeeds: true,
+                ..Default::default()
+            };
+
+            assert!(!reactivate_and_verify_captured_target_with(
+                &mut probe, 9001, &target
+            ));
+        }
+
+        #[test]
+        fn reactivation_succeeds_only_when_the_exact_target_is_foreground() {
+            let target_identity = identity(44, 7, 9002, 11);
+            let target = target(target_identity);
+            let mut probe = FakeProbe {
+                windows: [Some(target_identity), Some(target_identity)].into(),
+                foreground: [Some(target_identity)].into(),
+                activation_succeeds: true,
+                ..Default::default()
+            };
+
+            assert!(reactivate_and_verify_captured_target_with(
+                &mut probe, 9001, &target
+            ));
+            assert_eq!(probe.activations, [44]);
         }
     }
 }
@@ -431,6 +885,16 @@ mod imp {
     pub(super) fn captured_target_is_foreground(_target: &CapturedTarget) -> bool {
         false
     }
+
+    pub(super) fn captured_target_is_valid(_target: &CapturedTarget) -> bool {
+        false
+    }
+
+    pub(super) fn reactivate_and_verify_captured_target(_target: &CapturedTarget) -> bool {
+        false
+    }
+
+    pub(super) fn release_captured_target(_target: &CapturedTarget) {}
 
     pub(super) fn overlay_window_bounds(
         _target: Option<&CapturedTarget>,
