@@ -141,7 +141,7 @@ closed in the current implementation.
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
-| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 356 discovered, 351 passed, 0 failed, 5 environment-required tests ignored |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 358 discovered, 353 passed, 0 failed, 5 environment-required tests ignored |
 | Native capture/DSP | SPSC FIFO/wrap/concurrency/overflow; conversion/downmix/resample/normalization; 25 Hz RMS/peak; adaptive VAD, timing, pre/post-roll, no-speech, and disabled-VAD tests | PASS automated paths; physical microphones and driver timing remain NOT VERIFIED |
 | Stop/error recovery | Explicit-over-endpoint/max priority; structured overflow/stream/format faults; two-attempt restart bound; no-speech no-output; in-memory audio ownership | PASS deterministic injection; live unplug/restart remains NOT VERIFIED |
 | Settings | Defaults, ordered range normalization, field salvage, and future Recording-field round trip | PASS |
@@ -198,7 +198,7 @@ remain NOT VERIFIED.
 | REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture; reconnect before the second bounded retry. Repeat with a changed device format. | Missing device is actionable; same-format recovery resumes within at most two attempts; exhaustion or format change fails visibly; no hang or paste occurs and a fresh session can start. | **NOT VERIFIED** |
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
 | REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization; immediately start another normal or Playground session; repeat once through tray Quit. | Cancel never pastes; in-memory PCM is released; stale completion cannot overwrite the next session; explicit stop wins if inferred endpoint/max occurs at the same boundary. Coordinator/ownership paths are automated, but the live race still requires this check. | **NOT VERIFIED** |
-| REC-05 | Win/Linux/macOS | P1, P2 | With defaults, begin in silence, speak after at least 250 ms, pause for 450 ms and resume, then finish with at least 900 ms silence. Repeat with VAD disabled and with an immediate shortcut stop. | First syllable is retained by pre-roll; 450 ms pause does not finalize; 900 ms silence endpoints; VAD disabled never endpoints; explicit stop retains about 200 ms post-roll and outranks inferred silence. Record actual timings and audio evidence only with consent. | **NOT VERIFIED** |
+| REC-05 | Win/Linux/macOS | P1, P2 | In Toggle mode with defaults, begin in silence, speak after at least 250 ms, pause for 450 ms and resume, then finish with at least 900 ms silence. Repeat in Hold-to-talk, with VAD disabled, and with an immediate shortcut stop. | First syllable is retained by pre-roll; 450 ms pause does not finalize; 900 ms silence endpoints only in Toggle mode; Hold-to-talk waits for release; VAD disabled never endpoints; explicit stop retains about 200 ms post-roll and outranks inferred silence. Record actual timings and audio evidence only with consent. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 

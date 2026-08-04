@@ -1,6 +1,6 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 5 implemented on its stacked branch (2026-08-03). This document
+**Status:** Phase 6 implemented on its stacked branch (2026-08-04). This document
 preserves the Phase 0 audit and records each implemented phase against the
 consolidated revamp plan. It does not claim that uncompleted later phases are
 implemented.
@@ -1180,10 +1180,13 @@ was introduced.
 The worker records an explicit stop as soon as it observes the shortcut/UI
 request and then retains up to the configured post-roll before finalizing.
 Explicit stop outranks inferred endpoint and maximum duration in both the audio
-worker and authoritative coordinator. With VAD enabled, silence/no confirmed
-speech returns no audio, transitions the session to a cancelled terminal state,
-pastes nothing, and leaves the prior transcript untouched. With VAD disabled,
-capture never infers an endpoint and returns the complete canonical recording.
+worker and authoritative coordinator. VAD runs in both shortcut modes when
+enabled so trimming and no-speech behavior stay consistent, but silence may end
+capture only in Toggle mode; Hold-to-talk waits for shortcut release or the
+maximum duration. Silence/no confirmed speech returns no audio, transitions the
+session to a cancelled terminal state, pastes nothing, and leaves the prior
+transcript untouched. With VAD disabled, capture never infers an endpoint and
+returns the complete canonical recording.
 
 The app receives structured capture state, levels, metrics, errors, and the
 final `Arc<PreparedAudio>` only. It sends no PCM through a webview, JavaScript,
@@ -1229,7 +1232,7 @@ Final Phase 6 verification on 2026-08-04:
 | Format | `cargo fmt --all -- --check` | PASS |
 | Compile | `cargo check --all-targets --all-features` | PASS |
 | Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
-| Tests | `cargo test --all-targets --all-features` | PASS: 356 discovered, 351 passed, 0 failed, 5 environment-required ignored |
+| Tests | `cargo test --all-targets --all-features` | PASS: 358 discovered, 353 passed, 0 failed, 5 environment-required ignored |
 | Debug build | `cargo build --all-features` | PASS |
 | Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary tests | PASS: one logical handler; concrete selection remains private to the router |
 | Native service fixture | ignored exact JFK service smoke, pinned v1.9.1/base.en/CPU | PASS: non-empty final text; first load 4,135 ms, first decode 776 ms, retained decode 785 ms; explicit unload/reload passed |
@@ -1253,7 +1256,8 @@ downmix, 48 kHz and 44.1 kHz resampling, finite/range and bounded loudness
 normalization, ring wrap/overflow/concurrency, exact 25 Hz meter publication,
 restart token handoff, bounded worker drain, adaptive noise floor, speech
 confirmation, pause/endpoint timing, pre/post-roll, no-speech, VAD-disabled
-capture, explicit stop priority, structured stream faults, complete bounded
+capture, Toggle-only silence endpointing, Hold-to-talk release ownership,
+explicit stop priority, structured stream faults, complete bounded
 restart, input-format/resource bounds, in-memory audio ownership and drop,
 background adaptation, sub-confirmation bursts, paused-speech resumption,
 settings salvage/legacy migration/unknown-field round trip, stale session
