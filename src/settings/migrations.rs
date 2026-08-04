@@ -78,12 +78,10 @@ fn parse_sectioned(mut root: Map<String, Value>, diagnostics: &mut ParseDiagnost
         take_section(&mut root, "recording", &[], diagnostics),
         diagnostics,
     );
-    let streaming = parse_streaming(take_section(
-        &mut root,
-        "streaming",
-        &["transcription"],
+    let streaming = parse_streaming(
+        take_section(&mut root, "streaming", &["transcription"], diagnostics),
         diagnostics,
-    ));
+    );
     let output = parse_output(
         take_section(&mut root, "output", &[], diagnostics),
         diagnostics,
@@ -493,8 +491,13 @@ fn parse_recording(
     }
 }
 
-fn parse_streaming(section: Map<String, Value>) -> StreamingSettings {
+fn parse_streaming(
+    mut section: Map<String, Value>,
+    diagnostics: &mut ParseDiagnostics,
+) -> StreamingSettings {
+    let defaults = StreamingSettings::default();
     StreamingSettings {
+        mode: take(&mut section, "mode", &[], defaults.mode, diagnostics),
         unknown: into_unknown(section),
     }
 }
@@ -731,7 +734,7 @@ fn into_unknown(values: Map<String, Value>) -> UnknownFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HotkeyMode, OverlayMode, OverlayPosition};
+    use crate::config::{HotkeyMode, OverlayMode, OverlayPosition, StreamingMode};
     use serde_json::json;
 
     #[test]
@@ -925,6 +928,25 @@ mod tests {
         assert_eq!(
             serialized["recording"]["future_endpointing"],
             json!({"mode": "adaptive"})
+        );
+    }
+
+    #[test]
+    fn streaming_mode_and_unknown_values_round_trip() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "streaming": {
+                "mode": "rolling",
+                "future_alignment": {"timestamps": true}
+            }
+        }));
+
+        assert_eq!(config.streaming.mode, StreamingMode::Rolling);
+        assert!(!diagnostics.invalid_values_salvaged);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["streaming"]["future_alignment"],
+            json!({"timestamps": true})
         );
     }
 

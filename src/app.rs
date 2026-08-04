@@ -25,7 +25,8 @@ use crate::benchmark::{
 };
 use crate::compatibility_bridge::{self, ProviderHandle};
 use crate::config::{
-    self, AppConfig, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore, ThemeMode,
+    self, AppConfig, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore, StreamingMode,
+    ThemeMode,
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
@@ -38,10 +39,12 @@ use crate::overlay::{
     OverlayPosition as NativeOverlayPosition,
 };
 use crate::prepared_audio::PreparedAudio;
+use crate::streaming::PreviewEvent;
 use crate::text_output;
 use crate::transcription::{
-    AccelerationPreference, CompatibilityStatus, ModelDescriptor, ModelId, RequestId, SessionId,
-    TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
+    AccelerationPreference, CompatibilityStatus, ModelDescriptor, ModelId, RequestId,
+    RollingPreviewHandle, SessionId, TranscriptionOptions, TranscriptionOutcome,
+    TranscriptionRequest, TranscriptionService,
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
@@ -289,6 +292,10 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
         OverlayMode::Minimal => NativeOverlayMode::Minimal,
         OverlayMode::Off => NativeOverlayMode::Off,
     }
+}
+
+fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
+    source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
 }
 
 fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
@@ -1067,6 +1074,7 @@ pub struct LocalTranscriberApp {
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
     pending_output: Option<PendingOutput>,
+    rolling_preview: Option<RollingPreviewHandle>,
     transcription_service: TranscriptionService,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1142,6 +1150,7 @@ impl LocalTranscriberApp {
             active_recording: None,
             pending_recording: None,
             pending_output: None,
+            rolling_preview: None,
             transcription_service,
             tx,
             rx,
@@ -1446,6 +1455,7 @@ impl LocalTranscriberApp {
             return;
         }
         let message = message.into();
+        self.close_rolling_preview(session_id, Duration::ZERO);
         let _ = self.session_coordinator.fail(session_id);
         self.pending_output = None;
         self.status = TranscriptionStatus::Error;
@@ -1665,6 +1675,42 @@ impl LocalTranscriberApp {
         let max_duration_seconds = self.config.recording.max_recording_seconds;
         let input_device_name = self.config.recording.audio_input_device_name.clone();
         let capture_options = capture_options_from_config(&self.config);
+        let mut preview_publisher = None;
+        let mut preview_status = None;
+        if rolling_preview_enabled(source, self.config.streaming.mode)
+            && let Some(model) = preload_model.as_ref()
+        {
+            let model_id = ModelId::new(model.id.clone());
+            match self
+                .session_coordinator
+                .start_preview(session_id, model_id.clone())
+            {
+                Ok(request_id) => match self.transcription_service.start_rolling_preview(
+                    session_id,
+                    request_id,
+                    model_id.clone(),
+                    model.local_path.clone(),
+                ) {
+                    Ok((publisher, handle)) => {
+                        preview_publisher = Some(publisher);
+                        self.rolling_preview = Some(handle);
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .session_coordinator
+                            .finish_preview(session_id, request_id, &model_id);
+                        preview_status = Some(format!(
+                            "Preparing microphone. Live preview is unavailable; the final pass remains enabled: {error}"
+                        ));
+                    }
+                },
+                Err(error) => {
+                    preview_status = Some(format!(
+                        "Preparing microphone. Live preview could not start; the final pass remains enabled: {error}"
+                    ));
+                }
+            }
+        }
         let abandon = Arc::new(AtomicBool::new(false));
         self.pending_recording = Some(PendingRecording {
             session_id,
@@ -1675,7 +1721,8 @@ impl LocalTranscriberApp {
             abandon: abandon.clone(),
         });
         self.status = TranscriptionStatus::Listening;
-        self.status_message = "Preparing microphone and local model".to_owned();
+        self.status_message =
+            preview_status.unwrap_or_else(|| "Preparing microphone and local model".to_owned());
 
         if let Some(model) = preload_model {
             self.start_model_preload(session_id, model);
@@ -1683,8 +1730,12 @@ impl LocalTranscriberApp {
 
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result =
-                audio::start_recording(max_duration_seconds, input_device_name, capture_options);
+            let result = audio::start_recording(
+                max_duration_seconds,
+                input_device_name,
+                capture_options,
+                preview_publisher,
+            );
             if abandon.load(Ordering::Acquire) {
                 if let Ok(session) = result {
                     let _ = session.stop_and_discard(Duration::from_secs(2));
@@ -1744,6 +1795,7 @@ impl LocalTranscriberApp {
             pending.abandon.store(true, Ordering::Release);
         }
         self.pending_output = None;
+        self.close_rolling_preview(previous_session, Duration::ZERO);
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
         self.captured_targets.remove(&previous_session);
@@ -1751,6 +1803,92 @@ impl LocalTranscriberApp {
         self.playground_runs.remove(&previous_session);
         self.playground_pending = 0;
         self.refresh_playground_runtime_statuses();
+    }
+
+    fn close_rolling_preview(&mut self, session_id: SessionId, grace: Duration) {
+        let Some(mut preview) = self.rolling_preview.take() else {
+            return;
+        };
+        let identity = preview.identity().clone();
+        preview.close();
+        if identity.session_id == session_id {
+            let _ = self.session_coordinator.finish_preview(
+                identity.session_id,
+                identity.request_id,
+                &identity.model_id,
+            );
+        }
+        if !preview.stop_and_join(grace) {
+            self.transcription_service.cancel_active();
+            if !preview.stop_and_join(Duration::from_secs(2)) {
+                eprintln!(
+                    "rolling preview did not stop within the cancellation timeout for session {}",
+                    identity.session_id.0
+                );
+            }
+        }
+    }
+
+    fn poll_rolling_preview(&mut self) {
+        let Some(event) = self
+            .rolling_preview
+            .as_ref()
+            .and_then(RollingPreviewHandle::try_next)
+        else {
+            return;
+        };
+        self.apply_rolling_preview_event(event);
+    }
+
+    fn apply_rolling_preview_event(&mut self, event: PreviewEvent<anyhow::Error>) {
+        match event {
+            PreviewEvent::Update { identity, update } => {
+                if self
+                    .session_coordinator
+                    .accept_preview_update(
+                        identity.session_id,
+                        identity.request_id,
+                        &identity.model_id,
+                        identity.sequence,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                if !update.committed.is_empty() || !update.tentative.is_empty() {
+                    if let Some(active) = self.active_recording.as_mut()
+                        && active.session_id == identity.session_id
+                        && active.latency.first_partial_at.is_none()
+                    {
+                        active.latency.first_partial_at = Some(Instant::now());
+                    }
+                    if let Some(pending) = self.pending_recording.as_mut()
+                        && pending.session_id == identity.session_id
+                        && pending.latency.first_partial_at.is_none()
+                    {
+                        pending.latency.first_partial_at = Some(Instant::now());
+                    }
+                }
+                let _ = self.overlay_controller.update_transcript(
+                    identity.session_id,
+                    update.committed,
+                    update.tentative,
+                    identity.sequence,
+                );
+            }
+            PreviewEvent::Error { identity, error } => {
+                if self.session_coordinator.is_current_preview(
+                    identity.session_id,
+                    identity.request_id,
+                    &identity.model_id,
+                ) {
+                    self.status_message = format!(
+                        "Listening. Live preview stopped; the final pass remains enabled: {error}"
+                    );
+                    self.close_rolling_preview(identity.session_id, Duration::from_millis(50));
+                }
+            }
+        }
     }
 
     fn stop_recording(&mut self) {
@@ -1835,6 +1973,7 @@ impl LocalTranscriberApp {
                         active.latency.stop_requested_at = Some(observed_at);
                     }
                     debug_assert!(self.session_coordinator.stop_reason().is_some());
+                    self.close_rolling_preview(session_id, Duration::from_millis(250));
                     active.latency.capture_finalized_at = Some(Instant::now());
                     if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
                         self.fail_dictation_session(
@@ -2249,12 +2388,9 @@ impl LocalTranscriberApp {
                             let stdout_bytes = result.stdout.len();
                             let stderr_bytes = result.stderr.len();
                             self.transcript = result.transcript.text.clone();
-                            let _ = self.overlay_controller.update_transcript(
-                                session_id,
-                                self.transcript.clone(),
-                                "",
-                                1,
-                            );
+                            let _ = self
+                                .overlay_controller
+                                .replace_with_final(session_id, self.transcript.clone());
                             self.status = TranscriptionStatus::Idle;
                             let completion_message = format!(
                                 "{} finished in {} ms ({} segment(s), {} timed, {} text bytes, {} stdout bytes, {} stderr bytes)",
@@ -3248,6 +3384,7 @@ impl eframe::App for LocalTranscriberApp {
         if !self.capturing_hotkey {
             self.poll_hotkey();
         }
+        self.poll_rolling_preview();
         self.poll_recording();
         // Pending output was created in the prior frame, allowing the overlay
         // to present the correlated Output/Pasting phase before any blocking
@@ -3287,6 +3424,9 @@ impl eframe::App for LocalTranscriberApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_and_discard_active_recording();
+        if let Some(session_id) = self.session_coordinator.active_session_id() {
+            self.close_rolling_preview(session_id, Duration::ZERO);
+        }
         if !self
             .transcription_service
             .cancel_active_and_wait(Duration::from_secs(2))
@@ -4521,6 +4661,29 @@ impl LocalTranscriberApp {
                         self.save_config();
                     }
                 });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(section_heading("Live transcription"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Preview mode");
+                    let mut mode = self.config.streaming.mode;
+                    ComboBox::from_id_source("advanced-streaming-mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for candidate in StreamingMode::ALL {
+                                ui.selectable_value(&mut mode, candidate, candidate.label());
+                            }
+                        });
+                    if mode != self.config.streaming.mode {
+                        self.config.streaming.mode = mode;
+                        self.save_config();
+                    }
+                });
+                ui.label(mut_text(
+                    "Rolling preview uses 250 ms decode intervals, 3-second windows, 650 ms overlap, two stability passes, and a 700 ms horizon. Tentative text stays inside Scribe; only the full final pass may reach another application.",
+                ));
             });
 
             ui.add_space(12.0);
@@ -6732,6 +6895,8 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::streaming::StreamIdentity;
+    use crate::transcription::StreamUpdate;
 
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
@@ -8626,6 +8791,7 @@ mod layout_tests {
             active_recording: None,
             pending_recording: None,
             pending_output: None,
+            rolling_preview: None,
             transcription_service,
             tx,
             rx,
@@ -10662,5 +10828,70 @@ mod layout_tests {
         assert!(external_path.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn preview_updates_are_overlay_only_and_reject_stale_or_wrong_model_events() {
+        let mut app = test_app();
+        app.transcript = "previous final".to_owned();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+
+        let event =
+            |sequence, model_id: ModelId, committed: &str, tentative: &str| PreviewEvent::Update {
+                identity: StreamIdentity {
+                    session_id,
+                    request_id,
+                    model_id,
+                    sequence,
+                },
+                update: StreamUpdate {
+                    committed: committed.to_owned(),
+                    tentative: tentative.to_owned(),
+                },
+            };
+        app.apply_rolling_preview_event(event(1, model_id.clone(), "hello", "world"));
+
+        assert_eq!(app.transcript, "previous final");
+        assert!(app.pending_output.is_none());
+        assert_eq!(app.overlay_controller.state().transcript.committed, "hello");
+        assert_eq!(app.overlay_controller.state().transcript.tentative, "world");
+
+        app.apply_rolling_preview_event(event(1, model_id.clone(), "stale", "replacement"));
+        app.apply_rolling_preview_event(event(2, ModelId::new("wrong"), "wrong", "model"));
+        assert_eq!(app.overlay_controller.state().transcript.committed, "hello");
+        assert_eq!(app.overlay_controller.state().transcript.tentative, "world");
+        assert_eq!(app.transcript, "previous final");
+        assert!(app.pending_output.is_none());
+    }
+
+    #[test]
+    fn playground_and_final_only_mode_never_start_rolling_preview() {
+        assert!(rolling_preview_enabled(
+            RecordingSource::Transcribe,
+            StreamingMode::Auto
+        ));
+        assert!(rolling_preview_enabled(
+            RecordingSource::Transcribe,
+            StreamingMode::Rolling
+        ));
+        assert!(!rolling_preview_enabled(
+            RecordingSource::Transcribe,
+            StreamingMode::FinalOnly
+        ));
+        assert!(!rolling_preview_enabled(
+            RecordingSource::Playground,
+            StreamingMode::Auto
+        ));
     }
 }

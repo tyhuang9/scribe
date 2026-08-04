@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW_MS};
 
 use super::{
     CaptureError, CaptureOptions, CaptureStopReason, LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES,
@@ -15,6 +16,10 @@ const TARGET_RMS: f32 = 0.1;
 const TARGET_PEAK_CEILING: f32 = 0.95;
 const MAX_NORMALIZATION_GAIN: f32 = 8.0;
 const MIN_NORMALIZABLE_RMS: f32 = 0.000_1;
+const PREVIEW_INTERVAL_FRAMES: usize =
+    PREPARED_SAMPLE_RATE as usize * DECODE_INTERVAL_MS as usize / 1_000;
+const PREVIEW_WINDOW_FRAMES: usize =
+    PREPARED_SAMPLE_RATE as usize * ROLLING_WINDOW_MS as usize / 1_000;
 
 pub(super) struct Pipeline {
     source_sample_rate: u32,
@@ -28,6 +33,8 @@ pub(super) struct Pipeline {
     levels: LevelTracker,
     vad_enabled: bool,
     vad: VadTracker,
+    preview_publisher: Option<PreviewAudioPublisher>,
+    next_preview_frame: usize,
 }
 
 impl Pipeline {
@@ -58,7 +65,17 @@ impl Pipeline {
             levels: LevelTracker::new(level_bits, peak_bits, level_observed),
             vad_enabled: options.vad_enabled,
             vad: VadTracker::new(options.vad, options.endpointing_enabled),
+            preview_publisher: None,
+            next_preview_frame: PREVIEW_INTERVAL_FRAMES,
         })
+    }
+
+    pub(super) fn with_preview_publisher(
+        mut self,
+        publisher: Option<PreviewAudioPublisher>,
+    ) -> Self {
+        self.preview_publisher = publisher;
+        self
     }
 
     pub(super) fn push_interleaved(&mut self, sample: f32) {
@@ -94,6 +111,30 @@ impl Pipeline {
 
     pub(super) fn source_frames(&self) -> usize {
         self.source_frames
+    }
+
+    /// Clones and normalizes only completed rolling windows. The full capture
+    /// buffer remains untouched so enabling preview cannot alter final audio.
+    pub(super) fn publish_due_previews(&mut self) {
+        let Some(publisher) = self.preview_publisher.clone() else {
+            return;
+        };
+        while self.prepared.len() >= self.next_preview_frame {
+            let end = self.next_preview_frame;
+            let start = end.saturating_sub(PREVIEW_WINDOW_FRAMES);
+            let mut samples = self.prepared[start..end].to_vec();
+            normalize_loudness(&mut samples);
+            match publisher.publish_window(start as u64, samples) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    self.preview_publisher = None;
+                    return;
+                }
+            }
+            self.next_preview_frame = self
+                .next_preview_frame
+                .saturating_add(PREVIEW_INTERVAL_FRAMES);
+        }
     }
 
     pub(super) fn limit_exceeded(&self) -> bool {
@@ -473,6 +514,10 @@ impl VadTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    use crate::streaming::RollingPreviewSession;
+    use crate::transcription::{ModelId, RequestId, SessionId, StreamUpdate};
 
     fn level_state() -> (Arc<AtomicU32>, Arc<AtomicU32>, Arc<AtomicBool>) {
         (
@@ -585,6 +630,84 @@ mod tests {
         let mut silence = vec![0.0; 100];
         normalize_loudness(&mut silence);
         assert!(silence.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn previews_publish_on_exact_cadence_with_bounded_windows_without_mutating_final_audio() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((
+                    snapshot.identity.sequence,
+                    snapshot.window_start_frame,
+                    snapshot.window_end_frame,
+                    snapshot.audio.samples.len(),
+                ))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        });
+        let publisher = preview_session.audio_publisher(
+            SessionId(3),
+            RequestId(5),
+            ModelId::new("preview-model"),
+        );
+        let disabled_vad = CaptureOptions {
+            vad_enabled: false,
+            endpointing_enabled: false,
+            ..CaptureOptions::default()
+        };
+        let (preview_rms, preview_peak, preview_observed) = level_state();
+        let mut with_preview = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            disabled_vad,
+            preview_rms,
+            preview_peak,
+            preview_observed,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+        let (final_rms, final_peak, final_observed) = level_state();
+        let mut final_only = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            disabled_vad,
+            final_rms,
+            final_peak,
+            final_observed,
+        )
+        .unwrap();
+
+        for interval in 1..=13 {
+            for frame in 0..PREVIEW_INTERVAL_FRAMES {
+                let sample = ((interval * PREVIEW_INTERVAL_FRAMES + frame) % 97) as f32 / 97.0;
+                with_preview.push_interleaved(sample);
+                final_only.push_interleaved(sample);
+            }
+            with_preview.publish_due_previews();
+            let (sequence, start, end, samples) = snapshot_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("each exact interval should schedule one snapshot");
+            let expected_end = interval * PREVIEW_INTERVAL_FRAMES;
+            let expected_start = expected_end.saturating_sub(PREVIEW_WINDOW_FRAMES);
+            assert_eq!(sequence, interval as u64);
+            assert_eq!(start, expected_start as u64);
+            assert_eq!(end, expected_end as u64);
+            assert_eq!(samples, expected_end - expected_start);
+            assert!(samples <= PREVIEW_WINDOW_FRAMES);
+        }
+
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        let preview_final = with_preview
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+        let final_only = final_only
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview_final, final_only);
     }
 
     #[test]

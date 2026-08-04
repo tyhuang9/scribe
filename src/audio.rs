@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::config;
 use crate::prepared_audio::PreparedAudio;
+use crate::streaming::PreviewAudioPublisher;
 
 use self::pipeline::Pipeline;
 use self::ring_buffer::{Consumer, Producer, ring_buffer};
@@ -337,6 +338,7 @@ pub fn start_recording(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
     options: CaptureOptions,
+    preview_publisher: Option<PreviewAudioPublisher>,
 ) -> Result<RecordingSession, CaptureError> {
     options.vad.validate()?;
     let stop_requested = Arc::new(AtomicBool::new(false));
@@ -357,6 +359,7 @@ pub fn start_recording(
                 max_duration_seconds,
                 input_device_name,
                 options,
+                preview_publisher,
                 worker_stop,
                 worker_rms,
                 worker_peak,
@@ -396,6 +399,7 @@ fn capture_worker(
     max_duration_seconds: u32,
     input_device_name: Option<String>,
     options: CaptureOptions,
+    preview_publisher: Option<PreviewAudioPublisher>,
     stop_requested: Arc<AtomicBool>,
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
@@ -446,7 +450,8 @@ fn capture_worker(
         rms_bits,
         peak_bits,
         level_observed,
-    )?;
+    )?
+    .with_preview_publisher(preview_publisher);
     let capture_started = Instant::now();
     let maximum_duration = Duration::from_secs(
         max_duration_seconds
@@ -458,6 +463,7 @@ fn capture_worker(
 
     let (stop_reason, stop_trigger_elapsed) = loop {
         drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK);
+        pipeline.publish_due_previews();
         if pipeline.limit_exceeded() {
             return Err(CaptureError::PreparedAudioLimit {
                 maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
@@ -531,6 +537,7 @@ fn capture_worker(
 
     drop(stream.take());
     drain_ring_all(&mut consumer, &mut pipeline);
+    pipeline.publish_due_previews();
     if fault.load(Ordering::Acquire) == FAULT_OVERFLOW {
         return Err(CaptureError::BufferOverflow {
             dropped_samples: dropped_samples.load(Ordering::Relaxed).max(1),

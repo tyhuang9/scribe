@@ -68,9 +68,31 @@ pub struct RecordingSettings {
     pub unknown: UnknownFields,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingMode {
+    #[default]
+    Auto,
+    Rolling,
+    FinalOnly,
+}
+
+impl StreamingMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Rolling, Self::FinalOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Rolling => "Rolling preview",
+            Self::FinalOnly => "Final text only",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamingSettings {
+    pub mode: StreamingMode,
     #[serde(flatten)]
     pub unknown: UnknownFields,
 }
@@ -209,6 +231,15 @@ impl Default for RecordingSettings {
             endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,
             pre_roll_ms: DEFAULT_PRE_ROLL_MS,
             post_roll_ms: DEFAULT_POST_ROLL_MS,
+            unknown: UnknownFields::new(),
+        }
+    }
+}
+
+impl Default for StreamingSettings {
+    fn default() -> Self {
+        Self {
+            mode: StreamingMode::Auto,
             unknown: UnknownFields::new(),
         }
     }

@@ -36,6 +36,10 @@ use crate::runtime_router::{
     NativeBootstrapFailure, RuntimeError, RuntimeExecution, RuntimeLoadExecution, RuntimeModel,
     RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
+use crate::streaming::{
+    PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
+    TranscriptHypothesis, TranscriptStabilizer,
+};
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -322,6 +326,32 @@ pub struct ModelLoadOutcome {
     pub resolved_acceleration: ResolvedAcceleration,
     pub model_load_duration_ms: u128,
     pub warm_model_reused: bool,
+}
+
+/// Text-only application handle for one rolling batch-preview session. Audio
+/// publication is split into a separate opaque producer handed straight to
+/// native capture, so UI coordination cannot inspect preview PCM.
+pub(crate) struct RollingPreviewHandle {
+    identity: StreamIdentity,
+    session: RollingPreviewSession<anyhow::Error>,
+}
+
+impl RollingPreviewHandle {
+    pub(crate) fn identity(&self) -> &StreamIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn try_next(&self) -> Option<PreviewEvent<anyhow::Error>> {
+        self.session.try_next()
+    }
+
+    pub(crate) fn close(&self) {
+        self.session.close();
+    }
+
+    pub(crate) fn stop_and_join(&mut self, timeout: Duration) -> bool {
+        self.session.stop_and_join(timeout)
+    }
 }
 
 enum RuntimeCommand {
@@ -702,6 +732,101 @@ impl TranscriptionService {
     pub fn transcribe(&self, request: TranscriptionRequest) -> Result<TranscriptionOutcome> {
         let task = self.begin_transcription_task()?;
         self.transcribe_task(request, task)
+    }
+
+    /// Starts the fixed Phase 7 rolling-preview scheduler for a primary native
+    /// model. This is batch preview, not a native streaming capability claim.
+    pub(crate) fn start_rolling_preview(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: ModelId,
+        model_path: Option<PathBuf>,
+    ) -> Result<(PreviewAudioPublisher, RollingPreviewHandle)> {
+        if !self.router.handles_model(&model_id) {
+            return Err(anyhow!(
+                "rolling preview is unavailable for this model's verified native runtime"
+            ));
+        }
+        // Resolve before capture starts so a missing artifact degrades to the
+        // final-only path instead of emitting repeated asynchronous errors.
+        self.resolve_runtime_model(self.resolve_model(&model_id, model_path.clone())?)?;
+
+        let identity = StreamIdentity {
+            session_id,
+            request_id,
+            model_id: model_id.clone(),
+            sequence: 0,
+        };
+        let service = self.clone();
+        let mut stabilizer = TranscriptStabilizer::new(session_id, request_id, model_id.clone());
+        let decode_model_id = model_id.clone();
+        let session = RollingPreviewSession::new(move |snapshot| {
+            let hypothesis_identity = snapshot.identity.clone();
+            let window_start_frame = snapshot.window_start_frame;
+            let window_end_frame = snapshot.window_end_frame;
+            let mut request = TranscriptionRequest::new(
+                session_id,
+                request_id,
+                Arc::clone(&snapshot.audio),
+                decode_model_id.clone(),
+            );
+            request.model_path = model_path.clone();
+            request.options = TranscriptionOptions::default();
+            let outcome = service.transcribe_preview(request)?;
+            let hypothesis = TranscriptHypothesis::from_text(
+                hypothesis_identity,
+                window_start_frame,
+                window_end_frame,
+                outcome.transcript.text,
+            );
+            let state = stabilizer
+                .push(hypothesis)
+                .map_err(|error| anyhow!(error))?;
+            Ok(StreamUpdate {
+                committed: state.committed,
+                tentative: state.tentative,
+            })
+        });
+        let publisher = session.audio_publisher(session_id, request_id, model_id);
+        Ok((publisher, RollingPreviewHandle { identity, session }))
+    }
+
+    /// Runs one rolling-preview batch strictly through the primary native
+    /// router path. Preview must never fall back to a CLI/process adapter,
+    /// because repeated filesystem/process work would violate the bounded
+    /// native preview contract. The final full-utterance request keeps its
+    /// existing compatibility fallback behavior.
+    pub(crate) fn transcribe_preview(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionOutcome> {
+        let task = self.begin_transcription_task()?;
+        let ticket = task.ticket;
+        if self.router.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(
+                "rolling preview was cancelled before native dispatch"
+            ));
+        }
+        if !self.router.handles_model(&request.model_id) {
+            return Err(anyhow!(
+                "rolling preview is unavailable for this model's verified native runtime"
+            ));
+        }
+        validate_default_options(&request.options)?;
+        let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
+        let runtime_model = self.resolve_runtime_model(model.clone())?;
+        let execution = self
+            .worker
+            .transcribe(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+                Arc::clone(&request.audio),
+                request.options.clone(),
+                ticket.native_generation,
+            )
+            .map_err(|error| anyhow!(error))?;
+        Ok(map_native_execution(request, model, execution))
     }
 
     pub fn transcribe_with_ticket(
@@ -1411,6 +1536,23 @@ mod tests {
                     .all(|language| *language == "en")
             );
         }
+    }
+
+    #[test]
+    fn rolling_preview_rejects_legacy_models_instead_of_using_cli_fallback() {
+        let service = TranscriptionService::new(AppConfig::default());
+        let result = service.start_rolling_preview(
+            SessionId(1),
+            RequestId(1),
+            ModelId::new("faster_whisper_tiny_en"),
+            None,
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("legacy models must not start rolling preview"),
+        };
+        assert!(error.to_string().contains("verified native runtime"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub mod settings;
 pub use settings::{
     AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
     OutputSettings, OverlayMode, OverlayPosition, OverlaySettings, PerformanceSettings,
-    RecordingSettings, SettingsStore, StreamingSettings,
+    RecordingSettings, SettingsStore, StreamingMode, StreamingSettings,
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
@@ -818,6 +818,7 @@ mod tests {
         assert_eq!(config.recording.endpoint_silence_ms, 900);
         assert_eq!(config.recording.pre_roll_ms, 250);
         assert_eq!(config.recording.post_roll_ms, 200);
+        assert_eq!(config.streaming.mode, StreamingMode::Auto);
     }
 
     #[test]

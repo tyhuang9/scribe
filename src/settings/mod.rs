@@ -6,7 +6,7 @@ pub use repository::SettingsStore;
 pub use schema::{
     AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
     OutputSettings, OverlayMode, OverlayPosition, OverlaySettings, PerformanceSettings,
-    RecordingSettings, StreamingSettings,
+    RecordingSettings, StreamingMode, StreamingSettings,
 };
 
 pub(crate) use migrations::parse_settings_value_with_diagnostics;

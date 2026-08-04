@@ -192,6 +192,30 @@ impl OverlayController {
         true
     }
 
+    /// Replaces every preview hypothesis with the authoritative full-pass
+    /// result. Revision ownership stays inside the controller so the final
+    /// update always supersedes any accepted partial sequence.
+    pub fn replace_with_final(
+        &mut self,
+        session_id: SessionId,
+        committed: impl Into<String>,
+    ) -> bool {
+        if !self.is_current(session_id) {
+            return false;
+        }
+        let revision = self
+            .last_transcript_revision
+            .and_then(|previous| previous.checked_add(1))
+            .unwrap_or(1);
+        self.state.transcript = OverlayTranscript {
+            committed: committed.into(),
+            tentative: String::new(),
+            revision,
+        };
+        self.last_transcript_revision = Some(revision);
+        true
+    }
+
     pub fn update_elapsed(&mut self, session_id: SessionId, elapsed: Duration) -> bool {
         if !self.is_current(session_id) {
             return false;
@@ -261,6 +285,19 @@ mod tests {
         assert!(controller.update_transcript(SessionId(7), "hello", " wor", 2));
         assert!(!controller.update_transcript(SessionId(7), "regressed", "", 2));
         assert_eq!(controller.state().transcript.committed, "hello");
+    }
+
+    #[test]
+    fn final_transcript_supersedes_any_preview_revision_and_clears_tentative() {
+        let mut controller = OverlayController::new(false);
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+        assert!(controller.update_transcript(SessionId(7), "hello", " wor", 41));
+
+        assert!(controller.replace_with_final(SessionId(7), "Hello world."));
+        assert_eq!(controller.state().transcript.committed, "Hello world.");
+        assert!(controller.state().transcript.tentative.is_empty());
+        assert_eq!(controller.state().transcript.revision, 42);
+        assert!(!controller.replace_with_final(SessionId(6), "stale"));
     }
 
     #[test]
