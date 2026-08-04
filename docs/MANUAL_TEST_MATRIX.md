@@ -161,10 +161,11 @@ remain NOT VERIFIED.
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/lint/build | `cargo fmt --all -- --check`; strict Clippy; `cargo build --all-features` | PASS |
-| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 398 discovered, 392 passed, 0 failed, 6 environment-gated tests ignored |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 404 discovered, 398 passed, 0 failed, 6 environment-gated tests ignored |
 | Rolling scheduler/stabilizer | Exact cadence/window, one-active/newest-pending, retained-handle non-blocking drain, exact 650 ms boundary, 699/700 ms horizon, two-pass stability, case/punctuation correction, non-empty deletion/reappearance, repeated-word, overlap, bounded-context, and correlation tests | PASS |
 | Native audio boundary | Preview window normalization and final-audio identity; source scan prevents app-shell snapshot/PCM publication | PASS - preview PCM stays in native capture/service workers |
 | Output isolation | Coordinator-first acceptance, overlay-only partials, monotonic final replacement, Playground/final-only exclusion | PASS - tentative text cannot create `PendingOutput` or replace the application transcript |
+| Overlay accessibility | AccessKit selector naming, inspectable non-live tentative text, committed/final-only live announcements, preview-degradation notice, typed recovery guidance, and inactive meter contrast | PASS automated semantics and contrast; physical keyboard/screen-reader/reduced-motion behavior remains NOT VERIFIED |
 | Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` and Rust boundary tests | PASS - one `TranscribeCppRuntime`; no ONNX handler or native-streaming claim |
 | Pinned release smoke/final benchmark | Exact ignored base.en/JFK service smoke and 5-cold/20-warm final benchmark | PASS - cold total median/p95 1,087/1,099 ms; warm total 781/800 ms |
 | Rolling first speech text | Exact ignored 5-cold/20-warm scheduler-level fixture harness with artifact hashes and expected speech checks | PASS as non-desktop evidence - cold median/p95 2,039/2,049 ms; warm 1,730/1,754 ms; `[BLANK_AUDIO]` is filtered privately and not counted |

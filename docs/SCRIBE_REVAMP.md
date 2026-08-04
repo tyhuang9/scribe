@@ -1322,7 +1322,9 @@ capture stop -> close preview mailbox/drop pending -> bound active decode
 
 - The capture worker publishes at exact 4,000-frame/250 ms boundaries. Each
   snapshot contains at most the newest 48,000 frames/3 seconds; the stabilizer
-  treats 10,400 frames/650 ms as rolling-boundary overlap.
+  treats 10,400 frames/650 ms as rolling-boundary overlap. If the capture
+  worker observes multiple elapsed intervals at once, it publishes only the
+  newest complete boundary instead of cloning obsolete catch-up windows.
 - Snapshot normalization operates on a cloned window. A deterministic test
   feeds identical audio through preview-on and preview-off pipelines and proves
   the final `PreparedAudio` values are identical.
@@ -1359,6 +1361,13 @@ capture stop -> close preview mailbox/drop pending -> bound active decode
   `Final text only`. `Auto` currently selects rolling batch preview because no
   model advertises proven native streaming. Playground remains final-only.
   Timing and stability constants are intentionally not configurable.
+- The mode selector has an explicit AccessKit name. The visible transcript
+  exposes both committed and tentative portions as non-live accessible text,
+  while a separate polite live node announces committed deltas and final text
+  only. Preview failure clears stale tentative text and announces that the
+  final pass continues. Typed recovery guidance distinguishes a retryable
+  terminal error from a still-draining preview worker, and inactive meter bars
+  retain at least 3:1 contrast against the overlay background.
 
 ### Compatibility and streaming status
 
@@ -1376,9 +1385,9 @@ capture stop -> close preview mailbox/drop pending -> bound active decode
 | Check | Command | Result |
 | --- | --- | --- |
 | Format/lint/build | `cargo fmt --all -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo build --all-features` | **PASS** |
-| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 398 discovered, 392 passed, 0 failed, 6 environment-gated tests ignored |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 404 discovered, 398 passed, 0 failed, 6 environment-gated tests ignored |
 | Preview scheduling/DSP | Targeted `streaming::tests` and native pipeline tests | **PASS** - exact cadence/window bounds, one-active/newest-pending, non-blocking retained-handle drain, final-audio identity, exact 650 ms boundary, 699/700 ms horizon, case/punctuation correction, non-empty deletion/reappearance, repeated words, overlap, bounded context, and sequence rejection |
-| Output isolation | App/coordinator/overlay tests | **PASS** - stale/wrong-model/late-after-close updates rejected; tentative text changes only overlay state; final revision supersedes partials and emits once; Playground/final-only never starts preview |
+| Output isolation and accessibility | App/coordinator/overlay tests | **PASS** - stale/wrong-model/late-after-close updates rejected; tentative text changes only overlay state; final revision supersedes partials and emits once; Playground/final-only never starts preview; tentative text is inspectable but excluded from polite live announcements |
 | Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source scans | **PASS** - one handler; concrete selection remains private; app shell cannot construct or publish PCM preview snapshots |
 | Pinned release fixture | Exact ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` | **PASS** after stabilization - v1.9.1/base.en/CPU; load 294 ms, first decode 795 ms, warm decode 793 ms, unload/reload passed |
 | Final-pass release benchmark | Exact ignored 5-cold/20-warm `native_runtime_jfk_cold_and_warm_benchmark` | **PASS** - cold total median/p95 1,087/1,099 ms; cold load 289/292 ms; warm total 781/800 ms; warm decode 780/798 ms |
@@ -1411,7 +1420,7 @@ One pre-review parallel suite run reproduced the legacy process-registration
 race: another test advanced the global cancellation generation before the
 fixture process registered. The test now retries only that pre-registration
 race while retaining the registered-process termination assertion. The final
-full parallel suite passed all 392 runnable tests, including the hardened case.
+full parallel suite passed all 398 runnable tests, including the hardened case.
 
 ### Risks and Phase 8 entry
 
