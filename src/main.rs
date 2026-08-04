@@ -5,6 +5,7 @@ mod compatibility_bridge;
 mod config;
 mod core;
 mod hotkey;
+mod installations;
 mod managed_downloads;
 mod model_catalog;
 mod models;
@@ -30,6 +31,9 @@ enum LinuxDisplayBackend {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {
+        std::process::exit(exit_code);
+    }
     configure_graphics_environment();
 
     let result = eframe::run_native(

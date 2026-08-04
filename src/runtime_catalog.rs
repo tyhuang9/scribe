@@ -1,5 +1,177 @@
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
+use crate::installations::{PinnedArtifact, RuntimeArchiveSpec, RuntimeFileSpec};
+use crate::model_catalog::RuntimeRequirement;
+
+const PRIMARY_RUNTIME_MANIFEST: &str =
+    include_str!("../runtime-manifests/whisper-cpp-v1.9.1-windows-x64.json");
+const PRIMARY_RUNTIME_ARCHIVE_URL: &str =
+    "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-bin-x64.zip";
+const PRIMARY_RUNTIME_ARCHIVE_SHA256: &str =
+    "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539";
+
+#[derive(Debug, Deserialize)]
+struct RuntimePackageDocument {
+    schema_version: u16,
+    logical_runtime: String,
+    package_id: String,
+    platform_triple: String,
+    archive_prefix: String,
+    upstream: RuntimeUpstreamDocument,
+    archive: RuntimeArchiveDocument,
+    entrypoints: RuntimeEntrypointsDocument,
+    files: Vec<RuntimeFileDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeUpstreamDocument {
+    tag: String,
+    commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeArchiveDocument {
+    url: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeEntrypointsDocument {
+    native_library: String,
+    compatibility_cli: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeFileDocument {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePackageInstallSpec {
+    pub(crate) requirement: RuntimeRequirement,
+    pub(crate) package_id: String,
+    pub(crate) version: String,
+    pub(crate) commit: String,
+    pub(crate) platform_triple: String,
+    pub(crate) archive: RuntimeArchiveSpec,
+    pub(crate) native_entrypoint: PathBuf,
+    pub(crate) compatibility_entrypoint: PathBuf,
+}
+
+pub(crate) fn primary_runtime_install_spec(
+    archive_destination: PathBuf,
+) -> Result<RuntimePackageInstallSpec, String> {
+    let document: RuntimePackageDocument = serde_json::from_str(PRIMARY_RUNTIME_MANIFEST)
+        .map_err(|error| format!("invalid embedded primary runtime manifest: {error}"))?;
+    validate_runtime_package(&document)?;
+    let files = document
+        .files
+        .iter()
+        .map(|file| {
+            let installed = PathBuf::from(&file.path);
+            let file_name = installed
+                .file_name()
+                .ok_or_else(|| format!("runtime file has no filename: {}", file.path))?;
+            Ok(RuntimeFileSpec {
+                archive_path: Path::new(&document.archive_prefix).join(file_name),
+                install_path: installed,
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(RuntimePackageInstallSpec {
+        requirement: RuntimeRequirement::PrimaryNative,
+        package_id: document.package_id.clone(),
+        version: document.upstream.tag,
+        commit: document.upstream.commit,
+        platform_triple: document.platform_triple,
+        archive: RuntimeArchiveSpec {
+            package_id: document.package_id.clone(),
+            artifact: PinnedArtifact {
+                id: document.package_id,
+                url: document.archive.url,
+                size_bytes: document.archive.size_bytes,
+                sha256: document.archive.sha256,
+                destination: archive_destination,
+            },
+            manifest_json: PRIMARY_RUNTIME_MANIFEST.to_owned(),
+            files,
+        },
+        native_entrypoint: PathBuf::from(document.entrypoints.native_library),
+        compatibility_entrypoint: PathBuf::from(document.entrypoints.compatibility_cli),
+    })
+}
+
+fn validate_runtime_package(document: &RuntimePackageDocument) -> Result<(), String> {
+    let expected_platform = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        return Err(
+            "the pinned primary runtime package is available only for Windows x64".to_owned(),
+        );
+    };
+    let safe_relative = |value: &str| {
+        let path = Path::new(value);
+        !value.is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+    };
+    let valid_hash =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if document.schema_version != 1
+        || document.logical_runtime != "transcribe-cpp"
+        || document.package_id != "whisper-cpp-v1.9.1-windows-x64-cpu"
+        || document.platform_triple != expected_platform
+        || document.archive_prefix != "Release"
+        || document.upstream.tag != "v1.9.1"
+        || document.upstream.commit != "f049fff95a089aa9969deb009cdd4892b3e74916"
+        || document.archive.url != PRIMARY_RUNTIME_ARCHIVE_URL
+        || document.archive.size_bytes != 7_982_101
+        || !document
+            .archive
+            .sha256
+            .eq_ignore_ascii_case(PRIMARY_RUNTIME_ARCHIVE_SHA256)
+        || !safe_relative(&document.entrypoints.native_library)
+        || !safe_relative(&document.entrypoints.compatibility_cli)
+        || document.files.is_empty()
+        || document.files.len() > 64
+    {
+        return Err(
+            "embedded primary runtime manifest violates the pinned package policy".to_owned(),
+        );
+    }
+    let mut paths = std::collections::HashSet::new();
+    for file in &document.files {
+        if !safe_relative(&file.path)
+            || !file.path.starts_with("bin/")
+            || file.size_bytes == 0
+            || !valid_hash(&file.sha256)
+            || !paths.insert(file.path.to_ascii_lowercase())
+        {
+            return Err(format!("invalid or duplicate runtime file: {}", file.path));
+        }
+    }
+    for entrypoint in [
+        &document.entrypoints.native_library,
+        &document.entrypoints.compatibility_cli,
+    ] {
+        if !document.files.iter().any(|file| &file.path == entrypoint) {
+            return Err(format!(
+                "runtime entrypoint is not allowlisted: {entrypoint}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceSupport {
     CpuOnly,
@@ -392,6 +564,33 @@ mod tests {
             backend_spec("whisper.cpp").unwrap().device_support,
             DeviceSupport::CpuOnly
         );
+    }
+
+    #[test]
+    fn primary_runtime_package_is_an_exact_single_handler_allowlist() {
+        if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert!(primary_runtime_install_spec(PathBuf::from("runtime.zip")).is_err());
+            return;
+        }
+        let package = primary_runtime_install_spec(PathBuf::from("runtime.zip")).unwrap();
+        assert_eq!(package.requirement, RuntimeRequirement::PrimaryNative);
+        assert_eq!(package.package_id, "whisper-cpp-v1.9.1-windows-x64-cpu");
+        assert_eq!(package.version, "v1.9.1");
+        assert_eq!(package.commit, "f049fff95a089aa9969deb009cdd4892b3e74916");
+        assert_eq!(package.platform_triple, "x86_64-pc-windows-msvc");
+        assert_eq!(package.native_entrypoint, Path::new("bin/whisper.dll"));
+        assert_eq!(
+            package.compatibility_entrypoint,
+            Path::new("bin/whisper-cli.exe")
+        );
+        assert_eq!(package.archive.files.len(), 13);
+        for file in &package.archive.files {
+            assert!(file.install_path.starts_with("bin"));
+            assert_eq!(
+                file.archive_path,
+                Path::new("Release").join(file.install_path.file_name().unwrap())
+            );
+        }
     }
 
     #[test]

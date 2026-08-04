@@ -87,6 +87,10 @@ pub(crate) fn primary_runtime_entrypoint(config: &AppConfig) -> Option<PathBuf> 
     stt::whisper_cpp::resolve_whisper_cpp_executable(config)
 }
 
+pub(crate) fn primary_bundled_runtime_package_root() -> Option<PathBuf> {
+    stt::whisper_cpp::bundled_runtime_package_root()
+}
+
 #[cfg(test)]
 pub(crate) fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     runtime_catalog::model_storage_estimate(&model.id)

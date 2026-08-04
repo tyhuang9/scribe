@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::super::normalize_config;
 use super::{AppConfig, parse_settings_value_with_diagnostics};
@@ -95,13 +96,52 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AppConfig> {
 }
 
 pub(crate) fn save_to_path(path: &Path, config: &AppConfig) -> Result<()> {
+    let content = serialized_config_bytes(config)?;
+    atomic_write_bytes(path, &content)
+}
+
+pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> {
+    let normalized = normalized_config(config);
+    let witness = serde_json::json!({
+        "managed_models": normalized.general.managed_models,
+        "managed_runtimes": normalized.general.managed_runtimes,
+        "model_paths": normalized.general.model_paths,
+    });
+    let canonical = canonical_json(witness);
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical)?)
+    ))
+}
+
+fn serialized_config_bytes(config: &AppConfig) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&normalized_config(config))?)
+}
+
+fn normalized_config(config: &AppConfig) -> AppConfig {
     let mut normalized = config.clone();
     normalize_config(&mut normalized);
     if normalized.schema_version <= super::super::CURRENT_SCHEMA_VERSION {
         normalized.schema_version = super::super::CURRENT_SCHEMA_VERSION;
     }
-    let content = serde_json::to_vec_pretty(&normalized)?;
-    atomic_write(path, &content)
+    normalized
+}
+
+fn canonical_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonical_json).collect()),
+        Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical_json(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
+    }
 }
 
 fn backup_corrupt(path: &Path) -> Result<PathBuf> {
@@ -141,7 +181,7 @@ fn backup_original(path: &Path, reason: &str) -> Result<PathBuf> {
     Ok(backup)
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<()> {
     atomic_write_with_replace(path, content, replace_file)
 }
 
@@ -430,7 +470,7 @@ mod tests {
         });
 
         for index in 0..20 {
-            atomic_write(&path, if index % 2 == 0 { &new } else { &old }).unwrap();
+            atomic_write_bytes(&path, if index % 2 == 0 { &new } else { &old }).unwrap();
         }
         reading.store(false, Ordering::Release);
         reader.join().unwrap();
@@ -481,6 +521,44 @@ mod tests {
         assert!(!store.flush().unwrap());
         let persisted: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.recording.hotkey, "Persisted transaction");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_config_fingerprint_is_stable_across_restart_and_unrelated_settings() {
+        let dir = test_dir("fingerprint");
+        let path = dir.join("config.json");
+        let mut config = AppConfig::default();
+        config.general.model_paths.insert(
+            "whisper_cpp_small_en".to_owned(),
+            PathBuf::from("models/small.bin"),
+        );
+        config.general.model_paths.insert(
+            "whisper_cpp_base_en".to_owned(),
+            PathBuf::from("models/base.bin"),
+        );
+        config.general.unknown.insert(
+            "future_z".to_owned(),
+            serde_json::json!({"beta": 2, "alpha": 1}),
+        );
+        config
+            .general
+            .unknown
+            .insert("future_a".to_owned(), serde_json::json!([3, 2, 1]));
+        let expected = artifact_config_fingerprint(&config).unwrap();
+
+        save_to_path(&path, &config).unwrap();
+        let restarted = load_from_path(&path).unwrap();
+
+        assert_eq!(artifact_config_fingerprint(&restarted).unwrap(), expected);
+        let mut changed = restarted;
+        changed.recording.hotkey = "Different".to_owned();
+        assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
+        changed.general.model_paths.insert(
+            "whisper_cpp_tiny_en".to_owned(),
+            PathBuf::from("models/tiny.bin"),
+        );
+        assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
         fs::remove_dir_all(dir).unwrap();
     }
 }

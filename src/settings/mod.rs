@@ -10,4 +10,6 @@ pub use schema::{
 };
 
 pub(crate) use migrations::parse_settings_value_with_diagnostics;
-pub(crate) use repository::{load_from_path, save_to_path};
+pub(crate) use repository::{
+    artifact_config_fingerprint, atomic_write_bytes, load_from_path, save_to_path,
+};

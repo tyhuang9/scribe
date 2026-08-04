@@ -60,7 +60,7 @@ impl ModelInstallStatus {
                     None => progress,
                 }
             }
-            Self::InstallingRuntime => "Preparing backend runtime".to_owned(),
+            Self::InstallingRuntime => "Verifying and installing artifacts".to_owned(),
             Self::Installed => "Installed".to_owned(),
             Self::Missing => "Missing file".to_owned(),
             Self::RuntimeError(message) => format!("Runtime error: {message}"),
@@ -462,7 +462,7 @@ mod tests {
         assert!(!ModelInstallStatus::NotInstalled.is_runnable());
         assert_eq!(
             ModelInstallStatus::InstallingRuntime.label(),
-            "Preparing backend runtime"
+            "Verifying and installing artifacts"
         );
     }
 

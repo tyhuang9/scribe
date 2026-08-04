@@ -10,34 +10,78 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::config::AppConfig;
+use crate::installations::{
+    DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
+    StagedRuntime, download_pinned_artifact, stage_runtime_archive,
+};
 use crate::models::{SttModelInfo, sherpa_model_download_url, vosk_model_download_url};
 use crate::transcription::ModelId;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(crate) fn download_model(
+pub(crate) fn prepare_model(
     config: &AppConfig,
     model_id: &ModelId,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<DownloadedArtifact, InstallError> {
     let model = config::configured_models(config)
         .into_iter()
         .find(|model| model.id == model_id.as_str())
-        .ok_or_else(|| format!("Unknown configured model: {model_id}"))?;
-    let destination = config::downloaded_model_path(config, &model)
-        .ok_or_else(|| "No model storage directory is configured.".to_owned())?;
-    let artifact = crate::model_catalog::runtime_model_manifest(model_id)
-        .ok_or_else(|| "The model has no normalized pinned artifact manifest.".to_owned())?;
+        .ok_or_else(|| InstallError::Failed(format!("Unknown configured model: {model_id}")))?;
+    let destination = config::downloaded_model_path(config, &model).ok_or_else(|| {
+        InstallError::Failed("No model storage directory is configured.".to_owned())
+    })?;
+    let artifact = crate::model_catalog::runtime_model_manifest(model_id).ok_or_else(|| {
+        InstallError::Failed("The model has no normalized pinned artifact manifest.".to_owned())
+    })?;
     let url = crate::model_catalog::runtime_model_download_url(model_id)
-        .ok_or_else(|| "The model has no pinned download URL.".to_owned())?;
-    download_whisper_cpp_model(
-        &url,
-        &destination,
-        model_id.as_str(),
-        artifact.artifact_size_bytes,
-        artifact.artifact_sha256,
+        .ok_or_else(|| InstallError::Failed("The model has no pinned download URL.".to_owned()))?;
+    download_pinned_artifact(
+        &PinnedArtifact {
+            id: model_id.as_str().to_owned(),
+            url,
+            size_bytes: artifact.artifact_size_bytes,
+            sha256: artifact.artifact_sha256.to_owned(),
+            destination,
+        },
+        cancellation,
         progress,
     )
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedRuntimeInstall {
+    pub(crate) staged: StagedRuntime,
+    pub(crate) installed_entrypoint: PathBuf,
+    pub(crate) version: String,
+    pub(crate) package_id: String,
+    pub(crate) archive_sha256: String,
+}
+
+pub(crate) fn prepare_primary_runtime(
+    target_root: &Path,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<PreparedRuntimeInstall, InstallError> {
+    let downloads = config::runtime_storage_dir().join(".downloads");
+    let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
+        .map_err(InstallError::Failed)?;
+    let staged = stage_runtime_archive(
+        &spec.archive,
+        target_root,
+        &spec.compatibility_entrypoint,
+        cancellation,
+        progress,
+    )?;
+    Ok(PreparedRuntimeInstall {
+        installed_entrypoint: target_root.join(&spec.compatibility_entrypoint),
+        staged,
+        version: spec.version,
+        package_id: spec.package_id,
+        archive_sha256: spec.archive.artifact.sha256,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +92,11 @@ pub(crate) struct ModelDownloadProgress {
     pub(crate) bytes_per_second: Option<u64>,
 }
 
+// Phase 9 normalized installs use `prepare_model` and the transactional
+// installer above. These unused helpers remain temporarily for private legacy
+// adapter/config compatibility and are scheduled for Phase 11 retirement; they
+// are not reachable from the normalized Models flow or runtime router.
+#[allow(dead_code)]
 fn download_whisper_cpp_model(
     url: &str,
     destination: &Path,
@@ -148,6 +197,7 @@ fn download_sherpa_model(
     })
 }
 
+#[allow(dead_code)]
 fn download_model_file(
     url: &str,
     destination: &Path,

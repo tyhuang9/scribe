@@ -610,13 +610,23 @@ fn default_playground_model_order() -> Vec<String> {
 }
 
 fn apply_managed_model_metadata(config: &mut AppConfig) {
+    let expected_paths = default_model_catalog()
+        .into_iter()
+        .filter_map(|model| {
+            downloaded_model_path(config, &model).map(|path| (model.id.clone(), path))
+        })
+        .collect::<HashMap<_, _>>();
     let storage_dir = model_storage_dir(config);
-    config.general.managed_models.retain(|_, install| {
-        !install.path.as_os_str().is_empty() && install.path.starts_with(&storage_dir)
+    config.general.managed_models.retain(|id, install| {
+        expected_paths.get(id) == Some(&install.path)
+            && safe_managed_model_path(&storage_dir, &install.path)
     });
 
     for (id, path) in &config.general.model_paths {
-        if path.exists() && path.starts_with(&storage_dir) {
+        if path.exists()
+            && expected_paths.get(id) == Some(path)
+            && safe_managed_model_path(&storage_dir, path)
+        {
             config
                 .general
                 .managed_models
@@ -632,6 +642,24 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
             install.path = PathBuf::new();
         }
     }
+}
+
+fn safe_managed_model_path(storage_dir: &Path, path: &Path) -> bool {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !path.starts_with(storage_dir)
+    {
+        return false;
+    }
+    if !path.exists() {
+        return true;
+    }
+    path.canonicalize()
+        .ok()
+        .zip(storage_dir.canonicalize().ok())
+        .is_some_and(|(path, storage)| path.starts_with(storage))
 }
 
 fn migrate_legacy_model_ids(config: &mut AppConfig) {
@@ -1316,5 +1344,84 @@ mod tests {
     fn runtime_ids_are_stable_slugs() {
         assert_eq!(runtime_id_for_backend("whisper.cpp"), "whisper_cpp");
         assert_eq!(runtime_id_for_backend("sherpa-onnx"), "sherpa_onnx");
+    }
+
+    #[test]
+    fn managed_metadata_rejects_parent_directory_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-managed-parent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = root.join("models");
+        fs::create_dir_all(&storage).unwrap();
+        let escaped = storage.join("..").join("external.bin");
+        fs::write(root.join("external.bin"), b"external").unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage;
+        config.general.managed_models.insert(
+            "whisper_cpp_base_en".to_owned(),
+            ManagedModelInstall::app_managed(escaped.clone(), "tampered"),
+        );
+        config
+            .general
+            .model_paths
+            .insert("whisper_cpp_base_en".to_owned(), escaped);
+
+        normalize_config(&mut config);
+
+        assert!(
+            !config
+                .general
+                .managed_models
+                .contains_key("whisper_cpp_base_en")
+        );
+        assert_eq!(fs::read(root.join("external.bin")).unwrap(), b"external");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_metadata_rejects_symlink_escape_from_catalog_path() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-managed-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = root.join("models");
+        let external = root.join("external.bin");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(&external, b"external").unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage;
+        let model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+        let expected = downloaded_model_path(&config, &model).unwrap();
+        fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&external, &expected).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&external, &expected).is_ok();
+        if !linked {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        config.general.managed_models.insert(
+            model.id.clone(),
+            ManagedModelInstall::app_managed(expected, "tampered"),
+        );
+
+        normalize_config(&mut config);
+
+        assert!(!config.general.managed_models.contains_key(&model.id));
+        assert_eq!(fs::read(external).unwrap(), b"external");
+        fs::remove_dir_all(root).unwrap();
     }
 }

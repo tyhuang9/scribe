@@ -13,10 +13,11 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -25,6 +26,9 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, AppConfig};
+use crate::installations::{
+    InstallCancellation, previous_runtime_root, rollback_to_previous_runtime, verify_runtime_tree,
+};
 #[allow(unused_imports)]
 pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
@@ -42,6 +46,10 @@ use crate::streaming::{
 };
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const INSTALL_SMOKE_TIMEOUT: Duration = Duration::from_secs(120);
+const INSTALL_SMOKE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
+const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
 
 /// Identifies one user dictation session.
 ///
@@ -85,7 +93,7 @@ impl AccelerationPreference {
 }
 
 /// Runtime-neutral compute device selected for one request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComputeDevice {
     Cpu,
     Gpu { name: String },
@@ -101,7 +109,7 @@ impl ComputeDevice {
 }
 
 /// Observable result of resolving an acceleration preference.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedAcceleration {
     pub requested: AccelerationPreference,
     pub resolved: ComputeDevice,
@@ -259,6 +267,66 @@ pub struct RuntimeCapabilities {
     /// Empty until a backend's language support is verified through this
     /// common contract rather than inferred from catalog prose.
     pub supported_languages: Vec<String>,
+}
+
+/// A fully staged model/runtime pair that has not yet been activated.
+/// Concrete runtime selection remains private to the router used by the
+/// service's dedicated verification worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstallationCandidate {
+    pub(crate) model_id: ModelId,
+    pub(crate) model_path: PathBuf,
+    pub(crate) runtime_package_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InstallSmoke {
+    pub(crate) resolved_acceleration: ResolvedAcceleration,
+    pub(crate) health_duration_ms: u128,
+    pub(crate) load_duration_ms: u128,
+    pub(crate) decode_duration_ms: u128,
+    pub(crate) reload_duration_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstallationBinding {
+    pub(crate) managed_runtime_id: String,
+    pub(crate) installed_package_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeRecovery {
+    pub(crate) managed_runtime_id: String,
+    pub(crate) entrypoint: PathBuf,
+    pub(crate) version: String,
+    pub(crate) archive_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifiedInstallationCapability {
+    Available { package_version: String },
+    Unavailable { reason: String },
+}
+
+/// Reports verified installation support for a normalized model. Concrete
+/// package and catalog selection stay below the application-facing service
+/// boundary, while callers can distinguish a legacy model from a normalized
+/// model whose package is unavailable on this platform.
+pub(crate) fn verified_installation_capability(
+    model_id: &ModelId,
+) -> Option<VerifiedInstallationCapability> {
+    runtime_model_manifest(model_id)?;
+    let archive = config::runtime_storage_dir()
+        .join(".downloads")
+        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+    Some(
+        match crate::runtime_catalog::primary_runtime_install_spec(archive) {
+            Ok(package) => VerifiedInstallationCapability::Available {
+                package_version: package.version,
+            },
+            Err(reason) => VerifiedInstallationCapability::Unavailable { reason },
+        },
+    )
 }
 
 /// A streaming decoder update with stable and revisable portions separated.
@@ -698,6 +766,67 @@ impl TranscriptionService {
             .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))
     }
 
+    pub(crate) fn installation_binding(&self, model_id: &ModelId) -> Result<InstallationBinding> {
+        let runtime_id = self
+            .router
+            .managed_runtime_id(model_id)
+            .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
+        let installed_package_root = configured_managed_runtime_root(&self.config, runtime_id)?
+            .or_else(|| primary_runtime_package_root(&self.config));
+        Ok(InstallationBinding {
+            managed_runtime_id: runtime_id.to_owned(),
+            installed_package_root,
+        })
+    }
+
+    /// Returns the deterministic catalog target without trusting persisted
+    /// runtime paths. Startup uses it to find recovery state even when a
+    /// managed-runtime settings record is absent or malformed.
+    pub(crate) fn recovery_installation_binding(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<InstallationBinding> {
+        let runtime_id = self
+            .router
+            .managed_runtime_id(model_id)
+            .ok_or_else(|| anyhow!("model {model_id} has no installable native runtime"))?;
+        Ok(InstallationBinding {
+            managed_runtime_id: runtime_id.to_owned(),
+            installed_package_root: Some(config::runtime_storage_dir().join(runtime_id)),
+        })
+    }
+
+    pub(crate) fn rollback_to_previous_runtime(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<Option<RuntimeRecovery>> {
+        let runtime_id = self
+            .router
+            .managed_runtime_id(model_id)
+            .ok_or_else(|| anyhow!("model {model_id} has no managed native runtime"))?;
+        let target = config::runtime_storage_dir().join(runtime_id);
+        let previous = previous_runtime_root(&target);
+        if !previous.exists() {
+            return Ok(None);
+        }
+        let archive = config::runtime_storage_dir()
+            .join(".downloads")
+            .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+        let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
+            .map_err(|error| anyhow!(error))?;
+        verify_runtime_tree(&previous, &spec.archive.files)
+            .map_err(|error| anyhow!("previous runtime failed manifest verification: {error}"))?;
+        if !rollback_to_previous_runtime(&target).map_err(|error| anyhow!(error))? {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeRecovery {
+            managed_runtime_id: runtime_id.to_owned(),
+            entrypoint: target.join(spec.compatibility_entrypoint),
+            version: spec.version,
+            archive_sha256: spec.archive.artifact.sha256,
+        }))
+    }
+
     /// Returns the conservative feature set for a configured model.
     pub fn capabilities_for(&self, model_id: &ModelId) -> Result<RuntimeCapabilities> {
         let model = self.resolve_model(model_id, None)?;
@@ -763,6 +892,98 @@ impl TranscriptionService {
             .map_err(|error| anyhow!(error))
     }
 
+    pub(crate) fn startup_runtime_health_and_load(
+        &self,
+        model_id: &ModelId,
+        model_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let model = self.resolve_model(model_id, model_path)?;
+        let runtime_model = self.resolve_runtime_model(model)?;
+        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        verify_runtime_model_artifact(&runtime_model)?;
+        let mut smoke_config = self.config.clone();
+        smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        self.with_config(smoke_config)
+            .verify_installation_candidate(
+                InstallationCandidate {
+                    model_id: runtime_model.id,
+                    model_path: runtime_model.path,
+                    runtime_package_root: runtime_model.package_root,
+                },
+                &InstallCancellation::default(),
+            )
+            .map(|_| ())
+    }
+
+    /// Verifies only the immutable package shipped beside the application.
+    /// Developer and managed runtime paths are deliberately excluded so a
+    /// recovery message can never claim that an arbitrary CLI was bundled.
+    pub(crate) fn startup_bundled_runtime_health_and_load(
+        &self,
+        model_id: &ModelId,
+        model_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let package_root = crate::compatibility_bridge::primary_bundled_runtime_package_root()
+            .ok_or_else(|| anyhow!("the application executable has no package directory"))?;
+        let model = self.resolve_model(model_id, model_path)?;
+        let path = model
+            .local_path
+            .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
+        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
+            anyhow!(
+                "model {} has no pinned size and SHA-256 evidence for verification",
+                model.name
+            )
+        })?;
+        let runtime_model = RuntimeModel {
+            id: model_id.clone(),
+            path,
+            package_root,
+            expected_size_bytes: manifest.artifact_size_bytes,
+            expected_sha256: manifest.artifact_sha256,
+        };
+        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        verify_runtime_model_artifact(&runtime_model)?;
+        let mut smoke_config = self.config.clone();
+        smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        self.with_config(smoke_config)
+            .verify_installation_candidate(
+                InstallationCandidate {
+                    model_id: runtime_model.id,
+                    model_path: runtime_model.path,
+                    runtime_package_root: runtime_model.package_root,
+                },
+                &InstallCancellation::default(),
+            )
+            .map(|_| ())
+    }
+
+    /// Verifies a selected model independently from runtime startup. Startup
+    /// recovery must never roll back a healthy runtime because model bytes are
+    /// missing or corrupt.
+    pub(crate) fn verify_model_artifact_for_installation(
+        &self,
+        model_id: &ModelId,
+        model_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let model = self.resolve_model(model_id, model_path)?;
+        let path = model
+            .local_path
+            .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
+        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
+            anyhow!(
+                "model {} has no pinned size and SHA-256 evidence for verification",
+                model.name
+            )
+        })?;
+        crate::installations::verify_file(
+            &path,
+            manifest.artifact_size_bytes,
+            manifest.artifact_sha256,
+        )
+        .map_err(|error| anyhow!("model integrity verification failed: {error}"))
+    }
+
     /// Requests lock-free cancellation of native work submitted before this
     /// call. Later requests capture the new generation and are unaffected.
     pub fn cancel_active(&self) {
@@ -805,6 +1026,155 @@ impl TranscriptionService {
     /// Drops all retained native model state on the dedicated worker.
     pub fn unload_runtime(&self) -> Result<()> {
         self.worker.unload().map_err(|error| anyhow!(error))
+    }
+
+    /// Exercises a staged artifact pair through a fresh private router before
+    /// either artifact becomes observable in active settings.
+    pub(crate) fn verify_installation_candidate(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        let executable = std::env::current_exe()
+            .map_err(|error| anyhow!("could not locate the installation smoke helper: {error}"))?;
+        let acceleration = match self.config.performance.acceleration_preference {
+            AccelerationPreference::Auto => "auto",
+            AccelerationPreference::Cpu => "cpu",
+            AccelerationPreference::Gpu => "gpu",
+        };
+        let mut child = Command::new(executable)
+            .arg(INSTALL_SMOKE_HELPER_FLAG)
+            .arg(candidate.model_id.as_str())
+            .arg(&candidate.model_path)
+            .arg(&candidate.runtime_package_root)
+            .arg(acceleration)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| anyhow!("could not start the isolated native smoke test: {error}"))?;
+        let started = Instant::now();
+        loop {
+            if cancellation.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "installation verification was cancelled; the isolated native smoke process was terminated"
+                ));
+            }
+            if started.elapsed() >= INSTALL_SMOKE_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "isolated native smoke test exceeded the {:?} deadline and was terminated",
+                    INSTALL_SMOKE_TIMEOUT
+                ));
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let output = child.wait_with_output().map_err(|error| {
+                        anyhow!("could not collect native smoke output: {error}")
+                    })?;
+                    if !output.status.success() {
+                        return Err(anyhow!(
+                            "isolated native smoke test failed with {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ));
+                    }
+                    return serde_json::from_slice(&output.stdout).map_err(|error| {
+                        anyhow!(
+                            "isolated native smoke test returned invalid diagnostics: {error}; stderr: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )
+                    });
+                }
+                Ok(None) => std::thread::sleep(INSTALL_SMOKE_POLL_INTERVAL),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("could not poll native smoke process: {error}"));
+                }
+            }
+        }
+    }
+
+    fn verify_installation_candidate_blocking(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        let manifest = runtime_model_manifest(&candidate.model_id).ok_or_else(|| {
+            anyhow!(
+                "model {} has no normalized pinned artifact manifest",
+                candidate.model_id
+            )
+        })?;
+        let runtime_model = RuntimeModel {
+            id: candidate.model_id,
+            path: candidate.model_path,
+            package_root: candidate.runtime_package_root,
+            expected_size_bytes: manifest.artifact_size_bytes,
+            expected_sha256: manifest.artifact_sha256,
+        };
+        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        let router = RuntimeRouter::new();
+        let worker = RuntimeWorker::new(router.clone());
+        let preference = self.config.performance.acceleration_preference;
+        ensure_install_not_cancelled(cancellation)?;
+
+        let health_started = Instant::now();
+        worker
+            .health_check(runtime_model.clone(), preference)
+            .map_err(|error| anyhow!("staged runtime health check failed: {error}"))?;
+        let health_duration_ms = health_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        let load_started = Instant::now();
+        let load = worker
+            .load(runtime_model.clone(), preference)
+            .map_err(|error| anyhow!("staged model load failed: {error}"))?;
+        let load_duration_ms = load_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        let audio = Arc::new(PreparedAudio::from_captured_mono(
+            vec![0.0; PREPARED_SAMPLE_RATE as usize],
+            PREPARED_SAMPLE_RATE,
+            1,
+            PREPARED_SAMPLE_RATE as usize,
+        )?);
+        let decode_started = Instant::now();
+        worker
+            .transcribe(
+                runtime_model.clone(),
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                router.cancellation_snapshot(),
+            )
+            .map_err(|error| anyhow!("staged transcription smoke failed: {error}"))?;
+        let decode_duration_ms = decode_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        worker
+            .unload()
+            .map_err(|error| anyhow!("staged runtime unload failed: {error}"))?;
+        let reload_started = Instant::now();
+        worker
+            .load(runtime_model, preference)
+            .map_err(|error| anyhow!("staged model reload failed: {error}"))?;
+        let reload_duration_ms = reload_started.elapsed().as_millis();
+        worker
+            .unload()
+            .map_err(|error| anyhow!("staged runtime final unload failed: {error}"))?;
+
+        Ok(InstallSmoke {
+            resolved_acceleration: load.diagnostics.resolved_acceleration,
+            health_duration_ms,
+            load_duration_ms,
+            decode_duration_ms,
+            reload_duration_ms,
+        })
     }
 
     /// Transcribes canonical prepared audio. The router receives the first
@@ -1044,18 +1414,23 @@ impl TranscriptionService {
             .local_path
             .clone()
             .ok_or_else(|| anyhow!("download {} before transcribing", model.name))?;
-        let package_root = primary_runtime_package_root(&self.config).ok_or_else(|| {
+        let model_id = ModelId::new(model.id.clone());
+        let package_root = match self.router.managed_runtime_id(&model_id) {
+            Some(runtime_id) => configured_managed_runtime_root(&self.config, runtime_id)?,
+            None => None,
+        }
+            .or_else(|| primary_runtime_package_root(&self.config))
+            .ok_or_else(|| {
             anyhow!(
                 "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
             )
         })?;
-        let manifest = runtime_model_manifest(&ModelId::new(model.id.clone()))
-            .ok_or_else(|| {
-                anyhow!(
-                    "model {} has no pinned size and SHA-256 evidence for in-process native loading",
-                    model.name
-                )
-            })?;
+        let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
+            anyhow!(
+                "model {} has no pinned size and SHA-256 evidence for in-process native loading",
+                model.name
+            )
+        })?;
         Ok(RuntimeModel {
             id: model.id.into(),
             path,
@@ -1083,6 +1458,116 @@ impl TranscriptionService {
     }
 }
 
+/// Runs the isolated install-smoke entrypoint before the desktop framework is
+/// initialized. The parent process owns the deadline and can terminate this
+/// process on cancellation, native crashes, or hangs.
+pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    let mode = args.next()?;
+    let isolated_parent = mode == std::ffi::OsStr::new(INSTALL_SMOKE_PARENT_FLAG);
+    if !isolated_parent && mode != std::ffi::OsStr::new(INSTALL_SMOKE_HELPER_FLAG) {
+        return None;
+    }
+    if !isolated_parent {
+        suppress_native_smoke_crash_dialogs();
+    }
+    let result = (|| -> Result<InstallSmoke> {
+        let model_id = args
+            .next()
+            .ok_or_else(|| anyhow!("missing model ID"))?
+            .into_string()
+            .map_err(|_| anyhow!("model ID is not valid Unicode"))?;
+        let model_path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
+        let runtime_package_root = args
+            .next()
+            .ok_or_else(|| anyhow!("missing runtime package root"))?;
+        let acceleration = args
+            .next()
+            .ok_or_else(|| anyhow!("missing acceleration preference"))?
+            .into_string()
+            .map_err(|_| anyhow!("acceleration preference is not valid Unicode"))?;
+        if args.next().is_some() {
+            return Err(anyhow!("unexpected installation smoke arguments"));
+        }
+        let acceleration = match acceleration.as_str() {
+            "auto" => AccelerationPreference::Auto,
+            "cpu" => AccelerationPreference::Cpu,
+            "gpu" => AccelerationPreference::Gpu,
+            _ => return Err(anyhow!("invalid acceleration preference")),
+        };
+        let mut config = AppConfig::default();
+        config.performance.acceleration_preference = acceleration;
+        let service = TranscriptionService::new(config);
+        let candidate = InstallationCandidate {
+            model_id: ModelId::new(model_id),
+            model_path: PathBuf::from(model_path),
+            runtime_package_root: PathBuf::from(runtime_package_root),
+        };
+        if isolated_parent {
+            service.verify_installation_candidate(candidate, &InstallCancellation::default())
+        } else {
+            service
+                .verify_installation_candidate_blocking(candidate, &InstallCancellation::default())
+        }
+    })();
+    match result {
+        Ok(smoke) => match serde_json::to_writer(std::io::stdout().lock(), &smoke) {
+            Ok(()) => Some(0),
+            Err(error) => {
+                eprintln!("could not serialize installation smoke diagnostics: {error}");
+                Some(1)
+            }
+        },
+        Err(error) => {
+            eprintln!("{error:#}");
+            Some(1)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn suppress_native_smoke_crash_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+    };
+
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    }
+}
+
+#[cfg(not(windows))]
+fn suppress_native_smoke_crash_dialogs() {}
+
+fn verify_runtime_model_artifact(runtime_model: &RuntimeModel) -> Result<()> {
+    crate::installations::verify_file(
+        &runtime_model.path,
+        runtime_model.expected_size_bytes,
+        runtime_model.expected_sha256,
+    )
+    .map_err(|error| anyhow!("model integrity verification failed: {error}"))
+}
+
+fn verify_primary_runtime_package_tree(package_root: &Path) -> Result<()> {
+    let archive = config::runtime_storage_dir()
+        .join(".downloads")
+        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
+        .map_err(|error| anyhow!("could not resolve the pinned runtime manifest: {error}"))?;
+    verify_runtime_tree(package_root, &spec.archive.files).map_err(|error| {
+        anyhow!("runtime package tree failed exact manifest verification: {error}")
+    })
+}
+
+fn ensure_install_not_cancelled(cancellation: &InstallCancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(anyhow!("installation verification was cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
 fn primary_runtime_package_root(config: &AppConfig) -> Option<PathBuf> {
     let entrypoint = crate::compatibility_bridge::primary_runtime_entrypoint(config)?;
     let bin_dir = entrypoint.parent()?;
@@ -1093,6 +1578,144 @@ fn primary_runtime_package_root(config: &AppConfig) -> Option<PathBuf> {
         bin_dir.parent().map(Path::to_path_buf)
     } else {
         Some(bin_dir.to_path_buf())
+    }
+}
+
+fn configured_managed_runtime_root(
+    config: &AppConfig,
+    runtime_id: &str,
+) -> Result<Option<PathBuf>> {
+    configured_managed_runtime_root_in(config, runtime_id, &config::runtime_storage_dir())
+}
+
+fn configured_managed_runtime_root_in(
+    config: &AppConfig,
+    runtime_id: &str,
+    storage_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(install) = config.general.managed_runtimes.get(runtime_id) else {
+        return Ok(None);
+    };
+    if install
+        .path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "managed runtime {runtime_id} contains a parent-directory path component"
+        ));
+    }
+    let expected = storage_dir.join(runtime_id);
+    if !install.path.starts_with(storage_dir) {
+        return Err(anyhow!(
+            "managed runtime {runtime_id} points outside its catalog target: configured {}, expected {}",
+            install.path.display(),
+            expected.display()
+        ));
+    }
+    if runtime_path_has_link_or_reparse_below(storage_dir, &expected)
+        || runtime_path_has_link_or_reparse_below(storage_dir, &install.path)
+    {
+        return Err(anyhow!(
+            "managed runtime {runtime_id} crosses a symbolic link or Windows reparse point"
+        ));
+    }
+    let archive = storage_dir
+        .join(".downloads")
+        .join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive)
+        .map_err(|error| anyhow!("could not resolve the pinned runtime entrypoint: {error}"))?;
+    let expected_entrypoint = expected.join(spec.compatibility_entrypoint);
+    let configured_entrypoint = install.path.canonicalize().map_err(|error| {
+        anyhow!(
+            "managed runtime {runtime_id} entrypoint {} is unavailable: {error}",
+            install.path.display()
+        )
+    })?;
+    let expected_entrypoint_canonical = expected_entrypoint.canonicalize().map_err(|error| {
+        anyhow!(
+            "managed runtime {runtime_id} pinned entrypoint {} is unavailable: {error}",
+            expected_entrypoint.display()
+        )
+    })?;
+    if configured_entrypoint != expected_entrypoint_canonical {
+        return Err(anyhow!(
+            "managed runtime {runtime_id} does not name its exact pinned entrypoint: configured {}, expected {}",
+            install.path.display(),
+            expected_entrypoint.display()
+        ));
+    }
+    let configured = package_root_from_entrypoint(&install.path).ok_or_else(|| {
+        anyhow!(
+            "managed runtime {runtime_id} has no package root for {}",
+            install.path.display()
+        )
+    })?;
+    let expected_canonical = expected.canonicalize().map_err(|error| {
+        anyhow!(
+            "managed runtime {runtime_id} target {} is unavailable: {error}",
+            expected.display()
+        )
+    })?;
+    let configured_canonical = configured.canonicalize().map_err(|error| {
+        anyhow!(
+            "managed runtime {runtime_id} configured root {} is unavailable: {error}",
+            configured.display()
+        )
+    })?;
+    if configured_canonical != expected_canonical {
+        return Err(anyhow!(
+            "managed runtime {runtime_id} points outside its catalog target: configured {}, expected {}",
+            configured.display(),
+            expected.display()
+        ));
+    }
+    Ok(Some(expected))
+}
+
+fn runtime_path_has_link_or_reparse_below(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return true;
+        }
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            return true;
+        };
+        if runtime_metadata_is_link_or_reparse(&metadata) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn runtime_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+}
+
+#[cfg(not(windows))]
+fn runtime_metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn package_root_from_entrypoint(entrypoint: &Path) -> Option<PathBuf> {
+    let parent = entrypoint.parent()?;
+    if parent
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+    {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
     }
 }
 
@@ -2300,6 +2923,112 @@ mod tests {
 
         assert!(cancellation_latency <= std::time::Duration::from_secs(2));
         assert!(error.to_string().contains("inference failed"));
+    }
+
+    #[test]
+    fn configured_managed_runtime_root_requires_exact_catalog_target() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-managed-runtime-root-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = root.join("runtimes");
+        let expected_root = storage.join("whisper_cpp");
+        let expected_entrypoint = expected_root.join("bin").join("whisper-cli.exe");
+        let external_entrypoint = root.join("external").join("bin").join("whisper-cli.exe");
+        fs::create_dir_all(expected_entrypoint.parent().unwrap()).unwrap();
+        fs::create_dir_all(external_entrypoint.parent().unwrap()).unwrap();
+        fs::write(&expected_entrypoint, b"expected").unwrap();
+        fs::write(&external_entrypoint, b"external").unwrap();
+        let mut config = AppConfig::default();
+        config.general.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall::app_managed(expected_entrypoint.clone(), "test"),
+        );
+
+        assert_eq!(
+            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage).unwrap(),
+            Some(expected_root.clone())
+        );
+
+        config.general.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall::app_managed(external_entrypoint, "test"),
+        );
+        assert!(
+            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
+                .unwrap_err()
+                .to_string()
+                .contains("outside its catalog target")
+        );
+
+        let arbitrary_entrypoint = expected_root.join("bin").join("arbitrary.exe");
+        fs::write(&arbitrary_entrypoint, b"arbitrary").unwrap();
+        config.general.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall::app_managed(arbitrary_entrypoint, "test"),
+        );
+        assert!(
+            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
+                .unwrap_err()
+                .to_string()
+                .contains("exact pinned entrypoint")
+        );
+
+        config.general.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall::app_managed(
+                expected_root.join("bin").join("..").join("whisper-cli.exe"),
+                "test",
+            ),
+        );
+        assert!(
+            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
+                .unwrap_err()
+                .to_string()
+                .contains("parent-directory")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_managed_runtime_root_rejects_symlinked_catalog_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-managed-runtime-link-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = root.join("runtimes");
+        let external = root.join("external");
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir_all(external.join("bin")).unwrap();
+        fs::write(external.join("bin").join("whisper-cli"), b"external").unwrap();
+        symlink(&external, storage.join("whisper_cpp")).unwrap();
+        let mut config = AppConfig::default();
+        config.general.managed_runtimes.insert(
+            "whisper_cpp".to_owned(),
+            config::ManagedRuntimeInstall::app_managed(
+                storage.join("whisper_cpp").join("bin").join("whisper-cli"),
+                "test",
+            ),
+        );
+
+        assert!(
+            configured_managed_runtime_root_in(&config, "whisper_cpp", &storage)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn percentile(values: &[u128], percentile: usize) -> u128 {
