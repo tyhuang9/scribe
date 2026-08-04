@@ -114,6 +114,14 @@ struct PendingRecording {
     abandon: Arc<AtomicBool>,
 }
 
+struct PendingOutput {
+    session_id: SessionId,
+    transcript: String,
+    completion_message: String,
+    config: AppConfig,
+    latency: Option<LatencyTrace>,
+}
+
 struct PlaygroundRunState {
     pending_requests: HashMap<RequestId, String>,
     audio_path: PathBuf,
@@ -1040,6 +1048,7 @@ pub struct LocalTranscriberApp {
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
+    pending_output: Option<PendingOutput>,
     transcription_service: TranscriptionService,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -1115,6 +1124,7 @@ impl LocalTranscriberApp {
             status_message,
             active_recording: None,
             pending_recording: None,
+            pending_output: None,
             transcription_service,
             tx,
             rx,
@@ -1215,6 +1225,7 @@ impl LocalTranscriberApp {
     }
 
     fn stop_and_discard_active_recording(&mut self) {
+        self.pending_output = None;
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
             let _ = self.session_coordinator.cancel_active();
@@ -1349,6 +1360,7 @@ impl LocalTranscriberApp {
         if let Some(active) = self.active_recording.as_mut()
             && active.session_id == session_id
             && active.latency.first_meter_update_at.is_none()
+            && active.session.has_level_update()
         {
             active.latency.first_meter_update_at = Some(Instant::now());
         }
@@ -1372,17 +1384,104 @@ impl LocalTranscriberApp {
     }
 
     fn finish_overlay_success(&mut self, session_id: SessionId) {
-        let _ = self
+        if self
             .overlay_controller
-            .set_phase(session_id, OverlayPhase::Success);
-        self.overlay_hide_at = Some(Instant::now() + Duration::from_millis(900));
+            .set_phase(session_id, OverlayPhase::Success)
+        {
+            self.overlay_hide_at = Some(Instant::now() + Duration::from_millis(900));
+        }
     }
 
     fn finish_overlay_error(&mut self, session_id: SessionId, message: &str) {
-        let _ = self
+        if self
             .overlay_controller
-            .show_error(session_id, message.to_owned(), true);
-        self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(3));
+            .show_error(session_id, message.to_owned(), true)
+        {
+            self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(3));
+        }
+    }
+
+    fn begin_overlay_session(
+        &mut self,
+        session_id: SessionId,
+        mode: NativeOverlayMode,
+        target: Option<CapturedTarget>,
+    ) {
+        if let Some(previous_session_id) = self.overlay_controller.state().session_id
+            && previous_session_id != session_id
+        {
+            self.captured_targets.remove(&previous_session_id);
+        }
+        if let Some(target) = target {
+            self.captured_targets.insert(session_id, target);
+        }
+        self.overlay_controller.begin_session(session_id, mode);
+        self.overlay_hide_at = None;
+    }
+
+    fn fail_dictation_session(&mut self, session_id: SessionId, message: impl Into<String>) {
+        if self.session_coordinator.active_session_id() != Some(session_id) {
+            return;
+        }
+        let message = message.into();
+        let _ = self.session_coordinator.fail(session_id);
+        self.pending_output = None;
+        self.status = TranscriptionStatus::Error;
+        self.status_message = message.clone();
+        self.finish_overlay_error(session_id, &message);
+    }
+
+    fn poll_pending_output(&mut self) {
+        self.poll_pending_output_with(text_output::write_to_captured_target);
+    }
+
+    fn poll_pending_output_with(
+        &mut self,
+        write_output: impl FnOnce(
+            &str,
+            &AppConfig,
+            Option<&CapturedTarget>,
+        ) -> text_output::TextOutputResult,
+    ) {
+        let Some(mut pending) = self.pending_output.take() else {
+            return;
+        };
+        if self.session_coordinator.active_session_id() != Some(pending.session_id)
+            || self.session_coordinator.phase() != DictationPhase::Output
+        {
+            return;
+        }
+
+        if let Some(latency) = pending.latency.as_mut() {
+            latency.output_started_at = Some(Instant::now());
+        }
+        let result = write_output(
+            &pending.transcript,
+            &pending.config,
+            self.captured_targets.get(&pending.session_id),
+        );
+        if let Some(latency) = pending.latency.as_mut() {
+            let completed_at = Instant::now();
+            if result == text_output::TextOutputResult::Inserted {
+                latency.paste_completed_at = Some(completed_at);
+            }
+            latency.output_completed_at = Some(completed_at);
+        }
+
+        let output_message = result.status_message();
+        self.status_message = format!("{}. {}", pending.completion_message, output_message);
+        self.latest_latency = pending.latency;
+        let _ = self.session_coordinator.complete(pending.session_id);
+        if let text_output::TextOutputResult::Failed(message) = result {
+            self.status = TranscriptionStatus::Error;
+            self.finish_overlay_error(pending.session_id, &message);
+        } else if result != text_output::TextOutputResult::Inserted {
+            self.status = TranscriptionStatus::Idle;
+            self.finish_overlay_error(pending.session_id, &output_message);
+        } else {
+            self.status = TranscriptionStatus::Idle;
+            self.finish_overlay_success(pending.session_id);
+        }
     }
 
     fn effective_status(&self) -> TranscriptionStatus {
@@ -1531,17 +1630,12 @@ impl LocalTranscriberApp {
                 return;
             }
         };
-        if let Some(target) = captured_target {
-            self.captured_targets.insert(session_id, target);
-        }
         let overlay_mode = if source == RecordingSource::Transcribe {
             effective_native_overlay_mode(self.config.overlay.mode)
         } else {
             NativeOverlayMode::Off
         };
-        self.overlay_controller
-            .begin_session(session_id, overlay_mode);
-        self.overlay_hide_at = None;
+        self.begin_overlay_session(session_id, overlay_mode, captured_target);
         if overlay_mode != NativeOverlayMode::Off {
             latency.overlay_visible_at = Some(Instant::now());
         }
@@ -1626,6 +1720,7 @@ impl LocalTranscriberApp {
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
         }
+        self.pending_output = None;
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
         self.captured_targets.remove(&previous_session);
@@ -1707,8 +1802,10 @@ impl LocalTranscriberApp {
                 Ok(audio_path) => {
                     if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
                         let _ = fs::remove_file(audio_path);
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message = format!("Rejected stale capture result: {err}");
+                        self.fail_dictation_session(
+                            session_id,
+                            format!("Rejected stale capture result: {err}"),
+                        );
                         return;
                     }
                     self.status = TranscriptionStatus::Transcribing;
@@ -1725,9 +1822,7 @@ impl LocalTranscriberApp {
                     }
                 }
                 Err(message) => {
-                    let _ = self.session_coordinator.fail(session_id);
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Recording failed: {message}");
+                    self.fail_dictation_session(session_id, format!("Recording failed: {message}"));
                 }
             }
         }
@@ -1866,6 +1961,10 @@ impl LocalTranscriberApp {
         request_id: RequestId,
         message: &str,
     ) {
+        if source == RecordingSource::Transcribe {
+            self.fail_dictation_session(session_id, message);
+            return;
+        }
         self.status = TranscriptionStatus::Error;
         self.status_message = message.to_owned();
         if source == RecordingSource::Playground {
@@ -1908,10 +2007,10 @@ impl LocalTranscriberApp {
                         Ok(session) => {
                             if let Err(err) = self.session_coordinator.capture_started(session_id) {
                                 let _ = session.stop_and_discard(Duration::from_secs(2));
-                                let _ = self.session_coordinator.fail(session_id);
-                                self.status = TranscriptionStatus::Error;
-                                self.status_message =
-                                    format!("Could not enter capture state: {err}");
+                                self.fail_dictation_session(
+                                    session_id,
+                                    format!("Could not enter capture state: {err}"),
+                                );
                                 continue;
                             }
                             if pending.source == RecordingSource::Transcribe {
@@ -1941,11 +2040,10 @@ impl LocalTranscriberApp {
                             }
                         }
                         Err(message) => {
-                            let _ = self.session_coordinator.fail(session_id);
-                            self.status = TranscriptionStatus::Error;
-                            self.status_message = format!("Microphone failed: {message}");
-                            let overlay_message = self.status_message.clone();
-                            self.finish_overlay_error(session_id, &overlay_message);
+                            self.fail_dictation_session(
+                                session_id,
+                                format!("Microphone failed: {message}"),
+                            );
                         }
                     }
                 }
@@ -2074,13 +2172,17 @@ impl LocalTranscriberApp {
                         }
                     };
 
-                    let mut latency = latency.map(|mut latency| {
+                    let latency = latency.map(|mut latency| {
                         latency.ui_result_at = Some(Instant::now());
                         latency
                     });
                     match source {
                         RecordingSource::Transcribe => {
-                            if self.session_coordinator.begin_output(session_id).is_err() {
+                            if let Err(err) = self.session_coordinator.begin_output(session_id) {
+                                self.fail_dictation_session(
+                                    session_id,
+                                    format!("Could not begin final output: {err}"),
+                                );
                                 self.cleanup_after_job(source, session_id, request_id);
                                 continue;
                             }
@@ -2119,41 +2221,23 @@ impl LocalTranscriberApp {
                                 stdout_bytes,
                                 stderr_bytes
                             );
-                            let mut output_error = None;
                             if self.config.output.auto_insert_transcript {
-                                if let Some(latency) = latency.as_mut() {
-                                    latency.output_started_at = Some(Instant::now());
-                                }
-                                let output_result = text_output::write_to_captured_target(
-                                    &self.transcript,
-                                    &self.config,
-                                    self.captured_targets.get(&session_id),
-                                );
-                                if let Some(latency) = latency.as_mut() {
-                                    let completed_at = Instant::now();
-                                    if output_result == text_output::TextOutputResult::Inserted {
-                                        latency.paste_completed_at = Some(completed_at);
-                                    }
-                                    latency.output_completed_at = Some(completed_at);
-                                }
+                                self.status = TranscriptionStatus::Transcribing;
                                 self.status_message = format!(
-                                    "{completion_message}. {}",
-                                    output_result.status_message()
+                                    "{completion_message}. Verifying the original target before paste."
                                 );
-                                if let text_output::TextOutputResult::Failed(message) =
-                                    output_result
-                                {
-                                    self.status = TranscriptionStatus::Error;
-                                    output_error = Some(message);
-                                }
+                                self.pending_output = Some(PendingOutput {
+                                    session_id,
+                                    transcript: self.transcript.clone(),
+                                    completion_message,
+                                    config: self.config.clone(),
+                                    latency,
+                                });
                             } else {
+                                self.status = TranscriptionStatus::Idle;
                                 self.status_message = completion_message;
-                            }
-                            self.latest_latency = latency;
-                            let _ = self.session_coordinator.complete(session_id);
-                            if let Some(message) = output_error {
-                                self.finish_overlay_error(session_id, &message);
-                            } else {
+                                self.latest_latency = latency;
+                                let _ = self.session_coordinator.complete(session_id);
                                 self.finish_overlay_success(session_id);
                             }
                         }
@@ -2225,10 +2309,7 @@ impl LocalTranscriberApp {
                     }
                     match source {
                         RecordingSource::Transcribe => {
-                            self.status = TranscriptionStatus::Error;
-                            self.status_message = message.clone();
-                            let _ = self.session_coordinator.fail(session_id);
-                            self.finish_overlay_error(session_id, &message);
+                            self.fail_dictation_session(session_id, &message);
                         }
                         RecordingSource::Playground => {
                             self.status = TranscriptionStatus::Error;
@@ -2461,9 +2542,7 @@ impl LocalTranscriberApp {
         mut latency: LatencyTrace,
     ) {
         let Some(model) = self.selected_model() else {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "No default model selected".to_owned();
-            let _ = self.session_coordinator.fail(session_id);
+            self.fail_dictation_session(session_id, "No default model selected");
             let _ = fs::remove_file(audio_path);
             return;
         };
@@ -2473,8 +2552,12 @@ impl LocalTranscriberApp {
             .start_request(session_id, ModelId::new(model.id.as_str()))
         {
             Ok(request_id) => request_id,
-            Err(_) => {
+            Err(err) => {
                 let _ = fs::remove_file(audio_path);
+                self.fail_dictation_session(
+                    session_id,
+                    format!("Could not begin transcription request: {err}"),
+                );
                 return;
             }
         };
@@ -2483,10 +2566,11 @@ impl LocalTranscriberApp {
         let task = match service.begin_transcription_task() {
             Ok(task) => task,
             Err(err) => {
-                let _ = self.session_coordinator.fail(session_id);
                 let _ = fs::remove_file(audio_path);
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Could not dispatch transcription: {err}");
+                self.fail_dictation_session(
+                    session_id,
+                    format!("Could not dispatch transcription: {err}"),
+                );
                 return;
             }
         };
@@ -3176,6 +3260,10 @@ impl eframe::App for LocalTranscriberApp {
             self.poll_hotkey();
         }
         self.poll_recording();
+        // Pending output was created in the prior frame, allowing the overlay
+        // to present the correlated Output/Pasting phase before any blocking
+        // clipboard or synthetic-input work begins.
+        self.poll_pending_output();
         self.poll_events();
         self.poll_settings_save();
         self.sync_tray_state();
@@ -6812,6 +6900,145 @@ mod layout_tests {
     }
 
     #[test]
+    fn explicit_stop_during_pending_capture_is_preserved() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+
+        app.stop_recording();
+
+        let pending = app.pending_recording.as_ref().unwrap();
+        assert!(pending.stop_requested);
+        assert!(pending.latency.stop_requested_at.is_some());
+        assert_eq!(
+            app.session_coordinator.stop_reason(),
+            Some(StopReason::Explicit)
+        );
+        assert_eq!(app.status_message, "Cancelling microphone startup");
+    }
+
+    #[test]
+    fn explicit_stop_before_capture_ready_finalizes_and_dispatches_once() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+
+        app.stop_recording();
+        let audio_path = test_wav_path("pending-stop");
+        write_test_wav(&audio_path);
+        app.tx
+            .send(AppEvent::CaptureReady {
+                session_id,
+                result: Ok(RecordingSession::simulated(audio_path.clone())),
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(app.active_recording.as_ref().unwrap().stop_requested);
+        assert_eq!(
+            app.session_coordinator.stop_reason(),
+            Some(StopReason::Explicit)
+        );
+
+        for _ in 0..100 {
+            app.poll_recording();
+            if app.active_recording.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.active_recording.is_none());
+        assert_eq!(
+            app.session_coordinator.pending_request_count(session_id),
+            Some(1)
+        );
+        for _ in 0..100 {
+            if !audio_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!audio_path.exists(), "finalized WAV was not consumed");
+        app.supersede_active_session();
+    }
+
+    #[test]
+    fn preload_completion_is_preserved_on_both_sides_of_capture_ready() {
+        for preload_first in [true, false] {
+            let mut app = test_app();
+            let session_id = app
+                .session_coordinator
+                .begin(SessionPurpose::Dictation)
+                .unwrap();
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            app.session_coordinator
+                .model_load_started(session_id, model_id.clone())
+                .unwrap();
+            app.pending_recording = Some(PendingRecording {
+                session_id,
+                source: RecordingSource::Transcribe,
+                stop_requested: false,
+                max_duration_seconds: 30,
+                latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+                abandon: Arc::new(AtomicBool::new(false)),
+            });
+            let audio_path = test_wav_path(if preload_first {
+                "preload-first"
+            } else {
+                "capture-first"
+            });
+            write_test_wav(&audio_path);
+            let preload_event = AppEvent::ModelPreloadFinished {
+                session_id,
+                model_id,
+                load_duration_ms: 7,
+            };
+            let capture_event = AppEvent::CaptureReady {
+                session_id,
+                result: Ok(RecordingSession::simulated(audio_path)),
+            };
+            if preload_first {
+                app.tx.send(preload_event).unwrap();
+                app.tx.send(capture_event).unwrap();
+            } else {
+                app.tx.send(capture_event).unwrap();
+                app.tx.send(preload_event).unwrap();
+            }
+
+            app.poll_events();
+
+            let active = app.active_recording.as_ref().unwrap();
+            assert!(active.latency.model_loaded_at.is_some());
+            assert!(matches!(
+                app.session_coordinator.active().unwrap().model_load(),
+                crate::core::ModelLoadState::Ready { .. }
+            ));
+            app.stop_and_discard_active_recording();
+        }
+    }
+
+    #[test]
     fn latency_summary_reports_observed_phases_and_total() {
         let base = Instant::now();
         let trace = LatencyTrace {
@@ -7077,6 +7304,163 @@ mod layout_tests {
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert!(app.status_message.contains("finished in 42 ms"));
         assert_eq!(app.session_coordinator.active_session_id(), None);
+    }
+
+    #[test]
+    fn automatic_output_is_deferred_until_after_a_pasting_frame() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = true;
+        app.status = TranscriptionStatus::Transcribing;
+        let session_id = SessionId(1);
+        let request_id = RequestId(10);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            "whisper_cpp_base_en",
+        );
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome(
+                    session_id,
+                    request_id,
+                    "accepted result",
+                )),
+                latency: None,
+            })
+            .unwrap();
+
+        app.poll_events();
+        app.sync_overlay_state();
+
+        assert!(app.pending_output.is_some());
+        assert_eq!(app.session_coordinator.phase(), DictationPhase::Output);
+        assert_eq!(app.overlay_controller.state().phase, OverlayPhase::Pasting);
+    }
+
+    #[test]
+    fn dictation_failure_schedules_overlay_cleanup() {
+        let mut app = test_app();
+        let session_id = SessionId(4);
+        seed_test_session(&mut app, RecordingSource::Transcribe, session_id);
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+
+        app.fail_dictation_session(session_id, "capture failed");
+
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(app.overlay_controller.state().phase, OverlayPhase::Error);
+        assert!(app.overlay_hide_at.is_some());
+        assert_eq!(app.status_message, "capture failed");
+    }
+
+    #[test]
+    fn stale_overlay_completion_cannot_hide_a_newer_session() {
+        let mut app = test_app();
+        let current = SessionId(12);
+        app.begin_overlay_session(current, NativeOverlayMode::Live, None);
+
+        app.finish_overlay_success(SessionId(11));
+        app.finish_overlay_error(SessionId(11), "stale failure");
+
+        assert_eq!(app.overlay_controller.state().session_id, Some(current));
+        assert_eq!(
+            app.overlay_controller.state().phase,
+            OverlayPhase::Preparing
+        );
+        assert!(app.overlay_hide_at.is_none());
+    }
+
+    #[test]
+    fn expired_overlay_deadline_hides_viewport_and_retires_target() {
+        let mut app = test_app();
+        let session_id = SessionId(13);
+        app.begin_overlay_session(
+            session_id,
+            NativeOverlayMode::Live,
+            Some(CapturedTarget::for_test(77, 88)),
+        );
+        app.finish_overlay_success(session_id);
+        app.overlay_hide_at = Some(Instant::now() - Duration::from_millis(1));
+
+        app.sync_overlay_state();
+
+        assert_eq!(app.overlay_controller.state().phase, OverlayPhase::Hidden);
+        assert!(!app.captured_targets.contains_key(&session_id));
+        assert!(app.overlay_hide_at.is_none());
+    }
+
+    #[test]
+    fn pending_output_is_applied_exactly_once_at_app_boundary() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        let session_id = SessionId(14);
+        let request_id = RequestId(15);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            transcript: "once".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: None,
+        });
+        let calls = Cell::new(0_u32);
+
+        app.poll_pending_output_with(|_, _, _| {
+            calls.set(calls.get() + 1);
+            text_output::TextOutputResult::Inserted
+        });
+        app.poll_pending_output_with(|_, _, _| {
+            calls.set(calls.get() + 1);
+            text_output::TextOutputResult::Inserted
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert!(app.pending_output.is_none());
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn new_overlay_session_retires_the_previous_target() {
+        let mut app = test_app();
+        let previous_session = SessionId(8);
+        app.begin_overlay_session(
+            previous_session,
+            NativeOverlayMode::Live,
+            Some(CapturedTarget::for_test(44, 55)),
+        );
+
+        app.begin_overlay_session(SessionId(9), NativeOverlayMode::Live, None);
+
+        assert!(!app.captured_targets.contains_key(&previous_session));
+        assert_eq!(
+            app.overlay_controller.state().session_id,
+            Some(SessionId(9))
+        );
     }
 
     #[test]
@@ -8056,6 +8440,31 @@ mod layout_tests {
             .fold(0.0_f32, f32::max)
     }
 
+    fn test_wav_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "scribe-app-{label}-{}-{nonce}.wav",
+            std::process::id()
+        ))
+    }
+
+    fn write_test_wav(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         config::normalize_config(&mut config);
@@ -8089,6 +8498,7 @@ mod layout_tests {
             status_message: "Ready".to_owned(),
             active_recording: None,
             pending_recording: None,
+            pending_output: None,
             transcription_service,
             tx,
             rx,

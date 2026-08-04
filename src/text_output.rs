@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
+#[cfg(not(target_os = "windows"))]
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings,
@@ -26,10 +27,24 @@ impl TextOutputOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyOnlyReason {
+    TargetUnavailable,
+    AutomationUnavailable,
+    PasteFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotInsertedReason {
+    ClipboardChanged,
+    ClipboardUnverifiable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextOutputResult {
     Inserted,
-    CopiedOnly,
+    CopiedOnly(CopyOnlyReason),
+    NotInserted(NotInsertedReason),
     Failed(String),
 }
 
@@ -37,10 +52,20 @@ impl TextOutputResult {
     pub fn status_message(&self) -> String {
         match self {
             Self::Inserted => "Transcript inserted into the focused app".to_owned(),
-            Self::CopiedOnly => {
-                "Transcript copied to clipboard; the target or paste automation was unavailable"
-                    .to_owned()
-            }
+            Self::CopiedOnly(CopyOnlyReason::TargetUnavailable) =>
+                "Transcript copied; the original target is no longer active, so Scribe did not paste"
+                    .to_owned(),
+            Self::CopiedOnly(CopyOnlyReason::AutomationUnavailable) =>
+                "Transcript copied; safe paste automation is unavailable on this desktop"
+                    .to_owned(),
+            Self::CopiedOnly(CopyOnlyReason::PasteFailed) =>
+                "Transcript copied; the paste command failed without retrying".to_owned(),
+            Self::NotInserted(NotInsertedReason::ClipboardChanged) =>
+                "Transcript was not pasted because another app changed the clipboard; the final text remains in Scribe"
+                    .to_owned(),
+            Self::NotInserted(NotInsertedReason::ClipboardUnverifiable) =>
+                "Transcript was not pasted because Scribe could not verify clipboard ownership; the final text remains in Scribe"
+                    .to_owned(),
             Self::Failed(message) => format!("Transcript output failed: {message}"),
         }
     }
@@ -62,7 +87,9 @@ pub fn write_to_captured_target(
         Ok(clipboard) => clipboard,
         Err(err) => return TextOutputResult::Failed(err.to_string()),
     };
-    let mut paste = EnigoPasteDriver;
+    let mut paste = SystemPasteDriver {
+        target: target.copied(),
+    };
     let mut verifier = SystemForegroundTargetVerifier;
 
     write_text_to_captured_target_with_drivers(
@@ -89,6 +116,13 @@ pub fn paste_automation_notice() -> Option<&'static str> {
 pub trait ClipboardDriver {
     fn get_text(&mut self) -> Result<String>;
     fn set_text(&mut self, text: String) -> Result<()>;
+
+    /// Returns an OS clipboard generation when the platform exposes one.
+    /// Content equality remains a secondary check, never the sole ownership
+    /// signal on Windows where rich clipboard formats may differ.
+    fn change_token(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub trait PasteDriver {
@@ -159,26 +193,40 @@ where
     if let Err(err) = clipboard.set_text(text.to_owned()) {
         return TextOutputResult::Failed(err.to_string());
     }
+    let owned_clipboard_token = clipboard.change_token();
 
     if !paste_available {
-        return TextOutputResult::CopiedOnly;
+        return TextOutputResult::CopiedOnly(CopyOnlyReason::AutomationUnavailable);
     }
 
     sleep_for_paste_delay(options.paste_delay_ms);
+    match clipboard.get_text() {
+        Ok(current) if current == text => {}
+        Ok(_) => return TextOutputResult::NotInserted(NotInsertedReason::ClipboardChanged),
+        Err(_) => {
+            return TextOutputResult::NotInserted(NotInsertedReason::ClipboardUnverifiable);
+        }
+    }
+    if owned_clipboard_token.is_some() && clipboard.change_token() != owned_clipboard_token {
+        return TextOutputResult::NotInserted(NotInsertedReason::ClipboardChanged);
+    }
     // Keep this check adjacent to the synthetic input. We intentionally do not
     // reactivate or guess a target: a focus change becomes clipboard-only.
     if !paste_is_authorized() {
-        return TextOutputResult::CopiedOnly;
+        return TextOutputResult::CopiedOnly(CopyOnlyReason::TargetUnavailable);
     }
     if paste.paste().is_err() {
-        return TextOutputResult::CopiedOnly;
+        return TextOutputResult::CopiedOnly(CopyOnlyReason::PasteFailed);
     }
 
     sleep_for_paste_delay(options.paste_delay_ms);
     if let Some(previous_clipboard) = previous_clipboard {
         // Do not overwrite a clipboard value changed independently while the
         // paste was in flight.
-        if clipboard.get_text().ok().as_deref() == Some(text) {
+        let generation_is_owned = owned_clipboard_token
+            .map(|token| clipboard.change_token() == Some(token))
+            .unwrap_or(true);
+        if generation_is_owned && clipboard.get_text().ok().as_deref() == Some(text) {
             let _ = clipboard.set_text(previous_clipboard);
         }
     }
@@ -228,9 +276,27 @@ impl ClipboardDriver for SystemClipboard {
             .set_text(text)
             .context("failed to set clipboard text")
     }
+
+    fn change_token(&mut self) -> Option<u64> {
+        system_clipboard_change_token()
+    }
 }
 
-struct EnigoPasteDriver;
+#[cfg(target_os = "windows")]
+fn system_clipboard_change_token() -> Option<u64> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+    Some(unsafe { GetClipboardSequenceNumber() } as u64)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_clipboard_change_token() -> Option<u64> {
+    None
+}
+
+struct SystemPasteDriver {
+    target: Option<CapturedTarget>,
+}
 
 struct SystemForegroundTargetVerifier;
 
@@ -240,26 +306,101 @@ impl ForegroundTargetVerifier for SystemForegroundTargetVerifier {
     }
 }
 
-impl PasteDriver for EnigoPasteDriver {
+impl PasteDriver for SystemPasteDriver {
     fn paste(&mut self) -> Result<()> {
-        let mut enigo = Enigo::new(&Settings::default())
-            .map_err(|err| anyhow!("failed to initialize keyboard automation: {err}"))?;
-        let modifier = paste_modifier_key();
+        #[cfg(target_os = "windows")]
+        {
+            let target = self
+                .target
+                .as_ref()
+                .ok_or_else(|| anyhow!("captured target is unavailable"))?;
+            if !captured_target_is_foreground(target) {
+                return Err(anyhow!("captured target changed before input injection"));
+            }
+            send_windows_paste_chord()
+        }
 
-        enigo
-            .key(modifier, Press)
-            .map_err(|err| anyhow!("failed to press paste modifier: {err}"))?;
-        let paste_result = enigo
-            .key(Key::Unicode('v'), Click)
-            .map_err(|err| anyhow!("failed to send paste key: {err}"));
-        let release_result = enigo
-            .key(modifier, Release)
-            .map_err(|err| anyhow!("failed to release paste modifier: {err}"));
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = self.target;
+            let mut enigo = Enigo::new(&Settings::default())
+                .map_err(|err| anyhow!("failed to initialize keyboard automation: {err}"))?;
+            let modifier = paste_modifier_key();
 
-        paste_result?;
-        release_result?;
-        Ok(())
+            enigo
+                .key(modifier, Press)
+                .map_err(|err| anyhow!("failed to press paste modifier: {err}"))?;
+            let paste_result = enigo
+                .key(Key::Unicode('v'), Click)
+                .map_err(|err| anyhow!("failed to send paste key: {err}"));
+            let release_result = enigo
+                .key(modifier, Release)
+                .map_err(|err| anyhow!("failed to release paste modifier: {err}"));
+
+            paste_result?;
+            release_result?;
+            Ok(())
+        }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_paste_chord() -> Result<()> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    send_windows_paste_chord_with(|inputs| unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_paste_chord_with(
+    mut send: impl FnMut(&[windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT]) -> u32,
+) -> Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+
+    const VIRTUAL_KEY_V: u16 = 0x56;
+    let keyboard_input = |virtual_key, flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: virtual_key,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        keyboard_input(VK_CONTROL, 0),
+        keyboard_input(VIRTUAL_KEY_V, 0),
+        keyboard_input(VIRTUAL_KEY_V, KEYEVENTF_KEYUP),
+        keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+    ];
+    let inserted = send(&inputs);
+    if inserted != inputs.len() as u32 {
+        // Windows may accept only a prefix of the batch. Always attempt to
+        // release both keys before reporting the failure so a partial
+        // Control-down cannot leave the user's keyboard state latched.
+        let releases = [
+            keyboard_input(VIRTUAL_KEY_V, KEYEVENTF_KEYUP),
+            keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+        ];
+        let _ = send(&releases);
+        return Err(anyhow!(
+            "Windows accepted {inserted} of {} paste input events",
+            inputs.len()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -267,7 +408,7 @@ fn paste_modifier_key() -> Key {
     Key::Meta
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn paste_modifier_key() -> Key {
     Key::Control
 }
@@ -360,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_failure_does_not_fail_insert() {
+    fn unverifiable_clipboard_ownership_prevents_paste() {
         let mut clipboard = FakeClipboard {
             fail_get: true,
             ..FakeClipboard::default()
@@ -370,9 +511,12 @@ mod tests {
         let result =
             write_text_with_drivers(&mut clipboard, &mut paste, "hello", fast_options(), true);
 
-        assert_eq!(result, TextOutputResult::Inserted);
+        assert_eq!(
+            result,
+            TextOutputResult::NotInserted(NotInsertedReason::ClipboardUnverifiable)
+        );
         assert_eq!(clipboard.text.as_deref(), Some("hello"));
-        assert_eq!(paste.calls, 1);
+        assert_eq!(paste.calls, 0);
     }
 
     #[test]
@@ -389,7 +533,10 @@ mod tests {
         let result =
             write_text_with_drivers(&mut clipboard, &mut paste, "hello", fast_options(), true);
 
-        assert_eq!(result, TextOutputResult::CopiedOnly);
+        assert_eq!(
+            result,
+            TextOutputResult::CopiedOnly(CopyOnlyReason::PasteFailed)
+        );
         assert_eq!(clipboard.text.as_deref(), Some("hello"));
         assert_eq!(paste.calls, 1);
     }
@@ -405,7 +552,10 @@ mod tests {
         let result =
             write_text_with_drivers(&mut clipboard, &mut paste, "hello", fast_options(), false);
 
-        assert_eq!(result, TextOutputResult::CopiedOnly);
+        assert_eq!(
+            result,
+            TextOutputResult::CopiedOnly(CopyOnlyReason::AutomationUnavailable)
+        );
         assert_eq!(clipboard.text.as_deref(), Some("hello"));
         assert_eq!(paste.calls, 0);
     }
@@ -433,7 +583,10 @@ mod tests {
             Some(&target),
         );
 
-        assert_eq!(result, TextOutputResult::CopiedOnly);
+        assert_eq!(
+            result,
+            TextOutputResult::CopiedOnly(CopyOnlyReason::TargetUnavailable)
+        );
         assert_eq!(clipboard.text.as_deref(), Some("hello"));
         assert_eq!(verifier.calls, 1);
         assert_eq!(paste.calls, 0);
@@ -458,7 +611,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(result, TextOutputResult::CopiedOnly);
+        assert_eq!(
+            result,
+            TextOutputResult::CopiedOnly(CopyOnlyReason::TargetUnavailable)
+        );
         assert_eq!(clipboard.text.as_deref(), Some("hello"));
         assert_eq!(verifier.calls, 0);
         assert_eq!(paste.calls, 0);
@@ -503,12 +659,10 @@ mod tests {
         impl ClipboardDriver for ClipboardChangedByPaste {
             fn get_text(&mut self) -> Result<String> {
                 self.reads += 1;
-                if self.reads == 1 {
-                    Ok(self.text.clone())
-                } else {
+                if self.reads == 3 {
                     self.text = "user change".to_owned();
-                    Ok(self.text.clone())
                 }
+                Ok(self.text.clone())
             }
 
             fn set_text(&mut self, text: String) -> Result<()> {
@@ -528,5 +682,145 @@ mod tests {
 
         assert_eq!(result, TextOutputResult::Inserted);
         assert_eq!(clipboard.text, "user change");
+    }
+
+    #[test]
+    fn clipboard_change_before_paste_prevents_synthetic_input() {
+        struct ClipboardChangedDuringDelay {
+            text: String,
+            reads: usize,
+        }
+
+        impl ClipboardDriver for ClipboardChangedDuringDelay {
+            fn get_text(&mut self) -> Result<String> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.text = "user change".to_owned();
+                }
+                Ok(self.text.clone())
+            }
+
+            fn set_text(&mut self, text: String) -> Result<()> {
+                self.text = text;
+                Ok(())
+            }
+        }
+
+        let mut clipboard = ClipboardChangedDuringDelay {
+            text: "before".to_owned(),
+            reads: 0,
+        };
+        let mut paste = FakePaste::default();
+
+        let result =
+            write_text_with_drivers(&mut clipboard, &mut paste, "hello", fast_options(), true);
+
+        assert_eq!(
+            result,
+            TextOutputResult::NotInserted(NotInsertedReason::ClipboardChanged)
+        );
+        assert_eq!(clipboard.text, "user change");
+        assert_eq!(paste.calls, 0);
+    }
+
+    #[test]
+    fn same_text_with_a_new_clipboard_generation_prevents_paste() {
+        struct SameTextNewGeneration {
+            text: String,
+            generation: u64,
+            token_reads: usize,
+        }
+
+        impl ClipboardDriver for SameTextNewGeneration {
+            fn get_text(&mut self) -> Result<String> {
+                Ok(self.text.clone())
+            }
+
+            fn set_text(&mut self, text: String) -> Result<()> {
+                self.text = text;
+                self.generation += 1;
+                Ok(())
+            }
+
+            fn change_token(&mut self) -> Option<u64> {
+                self.token_reads += 1;
+                if self.token_reads == 2 {
+                    self.generation += 1;
+                }
+                Some(self.generation)
+            }
+        }
+
+        let mut clipboard = SameTextNewGeneration {
+            text: "before".to_owned(),
+            generation: 4,
+            token_reads: 0,
+        };
+        let mut paste = FakePaste::default();
+
+        let result =
+            write_text_with_drivers(&mut clipboard, &mut paste, "hello", fast_options(), true);
+
+        assert_eq!(
+            result,
+            TextOutputResult::NotInserted(NotInsertedReason::ClipboardChanged)
+        );
+        assert_eq!(clipboard.text, "hello");
+        assert_eq!(paste.calls, 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn every_partial_windows_input_batch_releases_v_then_control() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_CONTROL};
+
+        for partial in 0..4 {
+            let mut batches = Vec::new();
+            let result = send_windows_paste_chord_with(|inputs| {
+                let keys = inputs
+                    .iter()
+                    .map(|input| unsafe { (input.Anonymous.ki.wVk, input.Anonymous.ki.dwFlags) })
+                    .collect::<Vec<_>>();
+                batches.push(keys);
+                if batches.len() == 1 {
+                    partial
+                } else {
+                    inputs.len() as u32
+                }
+            });
+
+            assert!(result.is_err());
+            assert_eq!(batches.len(), 2);
+            assert_eq!(
+                batches[1],
+                vec![(0x56, KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP)]
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_windows_key_release_cleanup_is_not_retried() {
+        let mut batch_lengths = Vec::new();
+        let result = send_windows_paste_chord_with(|inputs| {
+            batch_lengths.push(inputs.len());
+            0
+        });
+
+        assert!(result.is_err());
+        assert_eq!(batch_lengths, vec![4, 2]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn complete_windows_input_batch_needs_no_cleanup() {
+        let mut batch_lengths = Vec::new();
+        let result = send_windows_paste_chord_with(|inputs| {
+            batch_lengths.push(inputs.len());
+            inputs.len() as u32
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(batch_lengths, vec![4]);
     }
 }

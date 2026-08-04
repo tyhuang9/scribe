@@ -25,8 +25,19 @@ pub fn show_overlay_viewport(
 ) {
     let spec = window_spec(state.mode);
     let bounds = overlay_window_bounds(target, spec, position);
-    let builder = viewport_builder(state, bounds, context.pixels_per_point());
-    let visible = state.is_visible();
+    let requested_visible = state.is_visible();
+    // A hidden viewport is created first. It is allowed to become visible only
+    // after the native adapter verifies the no-activate/tool-window styles and
+    // non-activating placement on the actual HWND.
+    let hardened = harden_overlay_window(
+        OVERLAY_WINDOW_TITLE,
+        target,
+        spec,
+        position,
+        requested_visible,
+    );
+    let visible = requested_visible && hardened;
+    let builder = viewport_builder(state, bounds, context.pixels_per_point(), visible);
 
     context.show_viewport_immediate(
         overlay_viewport_id(),
@@ -38,7 +49,11 @@ pub fn show_overlay_viewport(
         },
     );
 
-    harden_overlay_window(OVERLAY_WINDOW_TITLE, target, spec, position, visible);
+    let post_creation_hardened =
+        harden_overlay_window(OVERLAY_WINDOW_TITLE, target, spec, position, visible);
+    if visible && !post_creation_hardened {
+        context.send_viewport_cmd_to(overlay_viewport_id(), egui::ViewportCommand::Visible(false));
+    }
 }
 
 pub fn overlay_viewport_id() -> egui::ViewportId {
@@ -64,6 +79,7 @@ fn viewport_builder(
     state: &OverlayViewState,
     physical_bounds: Option<OverlayWindowBounds>,
     pixels_per_point: f32,
+    visible: bool,
 ) -> egui::ViewportBuilder {
     let spec = window_spec(state.mode);
     let size = egui::vec2(spec.width_points, spec.height_points);
@@ -76,7 +92,7 @@ fn viewport_builder(
         .with_decorations(false)
         .with_transparent(true)
         .with_active(false)
-        .with_visible(state.is_visible())
+        .with_visible(visible)
         .with_taskbar(false)
         .with_close_button(false)
         .with_minimize_button(false)
@@ -141,8 +157,16 @@ fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
 }
 
 fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(74.0, 24.0), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(74.0, 24.0), Sense::hover());
     let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(
+            egui::WidgetType::ProgressIndicator,
+            "Microphone input level",
+        );
+        info.value = Some((level * 100.0).round() as f64);
+        info
+    });
     let bars = 7;
     let gap = 3.0;
     let bar_width = (rect.width() - gap * (bars - 1) as f32) / bars as f32;
@@ -205,7 +229,17 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
     );
     text.wrap.max_width = ui.available_width();
     let response = ui.label(text);
-    mark_polite_live_region(ui.ctx(), response.id);
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        let mut accessible_text = format!("Committed transcript: {}", state.transcript.committed);
+        if !state.transcript.tentative.is_empty() {
+            accessible_text.push_str(&format!(
+                ". Tentative transcript: {}",
+                state.transcript.tentative
+            ));
+        }
+        builder.set_name(accessible_text);
+        builder.set_live(egui::accesskit::Live::Polite);
+    });
 }
 
 fn mark_polite_live_region(context: &egui::Context, id: egui::Id) {
@@ -235,7 +269,7 @@ mod tests {
     #[test]
     fn hidden_overlay_builder_is_precreatable_and_non_interactive() {
         let state = OverlayViewState::default();
-        let builder = viewport_builder(&state, None, 1.0);
+        let builder = viewport_builder(&state, None, 1.0, false);
 
         assert_eq!(builder.title.as_deref(), Some(OVERLAY_WINDOW_TITLE));
         assert_eq!(builder.visible, Some(false));
@@ -287,7 +321,17 @@ mod tests {
 
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live() == Some(egui::accesskit::Live::Polite)
-                && node.name().is_some_and(|name| name.contains("hello"))
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("Committed transcript: hello"))
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("Tentative transcript:  world"))
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ProgressIndicator
+                && node.name() == Some("Microphone input level")
+                && node.numeric_value() == Some(0.0)
         }));
         assert!(
             update

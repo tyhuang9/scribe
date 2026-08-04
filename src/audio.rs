@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,7 @@ pub struct RecordingSession {
     stop_tx: Sender<()>,
     finished_rx: Receiver<Result<PathBuf, String>>,
     level_bits: Arc<AtomicU32>,
+    level_observed: Arc<AtomicBool>,
 }
 
 impl RecordingSession {
@@ -35,6 +36,11 @@ impl RecordingSession {
     /// Only this aggregate value crosses into UI state; microphone PCM remains in Rust.
     pub fn latest_level(&self) -> f32 {
         f32::from_bits(self.level_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
+
+    /// True after the native input callback has published at least one buffer.
+    pub fn has_level_update(&self) -> bool {
+        self.level_observed.load(Ordering::Acquire)
     }
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<()> {
@@ -57,6 +63,25 @@ impl RecordingSession {
                 .with_context(|| format!("failed to delete captured audio {}", path.display()))?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated(audio_path: PathBuf) -> Self {
+        let (stop_tx, stop_rx) = bounded::<()>(1);
+        let (finished_tx, finished_rx) = bounded::<Result<PathBuf, String>>(1);
+        let worker_path = audio_path.clone();
+        thread::spawn(move || {
+            if stop_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+                let _ = finished_tx.send(Ok(worker_path));
+            }
+        });
+        Self {
+            audio_path,
+            stop_tx,
+            finished_rx,
+            level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            level_observed: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -124,6 +149,8 @@ pub fn start_recording(
     let worker_path = audio_path.clone();
     let level_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let worker_level_bits = level_bits.clone();
+    let level_observed = Arc::new(AtomicBool::new(false));
+    let worker_level_observed = level_observed.clone();
 
     thread::spawn(move || {
         let result = record_to_wav(
@@ -133,6 +160,7 @@ pub fn start_recording(
             input_device_name,
             started_tx,
             worker_level_bits,
+            worker_level_observed,
         );
         let _ = finished_tx.send(result.map(|_| worker_path).map_err(|err| err.to_string()));
     });
@@ -152,6 +180,7 @@ pub fn start_recording(
             stop_tx,
             finished_rx,
             level_bits,
+            level_observed,
         }),
         Err(message) => {
             let _ = finished_rx.recv_timeout(Duration::from_secs(1));
@@ -192,6 +221,7 @@ fn record_to_wav(
     input_device_name: Option<String>,
     started_tx: Sender<Result<(), String>>,
     level_bits: Arc<AtomicU32>,
+    level_observed: Arc<AtomicBool>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = select_input_device(&host, input_device_name.as_deref())?;
@@ -236,24 +266,32 @@ fn record_to_wav(
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
-            move |data: &[f32], _| write_f32(data, &writer_for_callback, &level_bits),
+            move |data: &[f32], _| {
+                write_f32(data, &writer_for_callback, &level_bits, &level_observed)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I16 => {
             let level_bits = level_bits.clone();
+            let level_observed = level_observed.clone();
             device.build_input_stream(
                 &stream_config,
-                move |data: &[i16], _| write_i16(data, &writer_for_callback, &level_bits),
+                move |data: &[i16], _| {
+                    write_i16(data, &writer_for_callback, &level_bits, &level_observed)
+                },
                 err_fn,
                 None,
             )?
         }
         cpal::SampleFormat::U16 => {
             let level_bits = level_bits.clone();
+            let level_observed = level_observed.clone();
             device.build_input_stream(
                 &stream_config,
-                move |data: &[u16], _| write_u16(data, &writer_for_callback, &level_bits),
+                move |data: &[u16], _| {
+                    write_u16(data, &writer_for_callback, &level_bits, &level_observed)
+                },
                 err_fn,
                 None,
             )?
@@ -311,8 +349,13 @@ fn select_input_device(host: &cpal::Host, input_device_name: Option<&str>) -> Re
     })
 }
 
-fn write_f32(input: &[f32], writer: &SharedWavWriter, level_bits: &AtomicU32) {
-    publish_level(level_bits, peak_f32(input));
+fn write_f32(
+    input: &[f32],
+    writer: &SharedWavWriter,
+    level_bits: &AtomicU32,
+    level_observed: &AtomicBool,
+) {
+    publish_level(level_bits, level_observed, peak_f32(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -324,8 +367,13 @@ fn write_f32(input: &[f32], writer: &SharedWavWriter, level_bits: &AtomicU32) {
     }
 }
 
-fn write_i16(input: &[i16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
-    publish_level(level_bits, peak_i16(input));
+fn write_i16(
+    input: &[i16],
+    writer: &SharedWavWriter,
+    level_bits: &AtomicU32,
+    level_observed: &AtomicBool,
+) {
+    publish_level(level_bits, level_observed, peak_i16(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -335,8 +383,13 @@ fn write_i16(input: &[i16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
     }
 }
 
-fn write_u16(input: &[u16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
-    publish_level(level_bits, peak_u16(input));
+fn write_u16(
+    input: &[u16],
+    writer: &SharedWavWriter,
+    level_bits: &AtomicU32,
+    level_observed: &AtomicBool,
+) {
+    publish_level(level_bits, level_observed, peak_u16(input));
     if let Ok(mut guard) = writer.lock()
         && let Some(writer) = guard.as_mut()
     {
@@ -347,8 +400,9 @@ fn write_u16(input: &[u16], writer: &SharedWavWriter, level_bits: &AtomicU32) {
     }
 }
 
-fn publish_level(level_bits: &AtomicU32, level: f32) {
+fn publish_level(level_bits: &AtomicU32, level_observed: &AtomicBool, level: f32) {
     level_bits.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    level_observed.store(true, Ordering::Release);
 }
 
 fn peak_f32(input: &[f32]) -> f32 {
@@ -408,6 +462,7 @@ mod tests {
             stop_tx,
             finished_rx,
             level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            level_observed: Arc::new(AtomicBool::new(false)),
         };
 
         session.stop_and_discard(Duration::from_secs(1)).unwrap();
@@ -435,6 +490,7 @@ mod tests {
             stop_tx,
             finished_rx,
             level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            level_observed: Arc::new(AtomicBool::new(false)),
         };
 
         let error = session
@@ -454,5 +510,17 @@ mod tests {
         assert_eq!(peak_u16(&[32768]), 0.0);
         assert_eq!(peak_u16(&[0]), 1.0);
         assert!(peak_u16(&[u16::MAX]) < 1.0);
+    }
+
+    #[test]
+    fn level_is_not_observed_until_the_native_callback_publishes() {
+        let level_bits = AtomicU32::new(0.0_f32.to_bits());
+        let level_observed = AtomicBool::new(false);
+
+        assert!(!level_observed.load(Ordering::Acquire));
+        publish_level(&level_bits, &level_observed, 0.25);
+
+        assert!(level_observed.load(Ordering::Acquire));
+        assert_eq!(f32::from_bits(level_bits.load(Ordering::Relaxed)), 0.25);
     }
 }

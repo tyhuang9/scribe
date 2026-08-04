@@ -44,8 +44,8 @@ impl ThemePalette {
             border_strong: Color32::from_rgb(203, 213, 225),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
-            success: Color32::from_rgb(22, 163, 74),
-            warning: Color32::from_rgb(202, 138, 4),
+            success: Color32::from_rgb(22, 101, 52),
+            warning: Color32::from_rgb(146, 64, 14),
             error: Color32::from_rgb(220, 38, 38),
             primary_button_bg: Color32::from_rgb(6, 10, 18),
             primary_button_text: Color32::WHITE,
@@ -81,4 +81,36 @@ pub(crate) fn theme_palette(ctx: &egui::Context) -> ThemePalette {
 
 pub(crate) fn ui_palette(ui: &Ui) -> ThemePalette {
     ThemePalette::from_visuals(ui.visuals())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_semantic_text_tokens_meet_aa_on_white() {
+        let palette = ThemePalette::light();
+
+        assert!(contrast_ratio(palette.success, palette.card_bg) >= 4.5);
+        assert!(contrast_ratio(palette.warning, palette.card_bg) >= 4.5);
+        assert!(contrast_ratio(palette.error, palette.card_bg) >= 4.5);
+    }
+
+    fn contrast_ratio(a: Color32, b: Color32) -> f64 {
+        let a = relative_luminance(a);
+        let b = relative_luminance(b);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    fn relative_luminance(color: Color32) -> f64 {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
 }

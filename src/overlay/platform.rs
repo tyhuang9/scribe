@@ -123,8 +123,8 @@ pub fn harden_overlay_window(
     spec: OverlayWindowSpec,
     position: OverlayPosition,
     visible: bool,
-) {
-    imp::harden_overlay_window(exact_title, target, spec, position, visible);
+) -> bool {
+    imp::harden_overlay_window(exact_title, target, spec, position, visible)
 }
 
 pub fn reduced_motion_preferred() -> bool {
@@ -148,7 +148,7 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
     };
-    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
         GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST,
@@ -250,9 +250,9 @@ mod imp {
         spec: OverlayWindowSpec,
         position: OverlayPosition,
         visible: bool,
-    ) {
+    ) -> bool {
         let Some(window) = find_current_process_window_by_exact_title(exact_title) else {
-            return;
+            return false;
         };
 
         let current_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
@@ -265,9 +265,13 @@ mod imp {
                 SetWindowLongPtrW(window, GWL_EXSTYLE, hardened_style);
             }
         }
+        let applied_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
+        if applied_style & hardened_style != hardened_style {
+            return false;
+        }
 
         let Some(bounds) = overlay_window_bounds(target, spec, position) else {
-            return;
+            return false;
         };
         let visibility_flag = if visible {
             SWP_SHOWWINDOW
@@ -283,7 +287,7 @@ mod imp {
                 bounds.width,
                 bounds.height,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED | visibility_flag,
-            );
+            ) != 0
         }
     }
 
@@ -310,8 +314,7 @@ mod imp {
             if window_process_id(window) == Some(target.identity.process_id) {
                 let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
                 if !monitor.is_null() {
-                    let dpi = unsafe { GetDpiForWindow(window) }.max(96);
-                    return Some((monitor, dpi));
+                    return Some((monitor, effective_monitor_dpi(monitor)));
                 }
             }
         }
@@ -321,7 +324,18 @@ mod imp {
             return None;
         }
         let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-        (!monitor.is_null()).then_some((monitor, 96))
+        if monitor.is_null() {
+            return None;
+        }
+        Some((monitor, effective_monitor_dpi(monitor)))
+    }
+
+    fn effective_monitor_dpi(monitor: *mut c_void) -> u32 {
+        let mut dpi_x = 0;
+        let mut dpi_y = 0;
+        let result =
+            unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+        if result == 0 && dpi_x > 0 { dpi_x } else { 96 }
     }
 
     fn window_process_id(window: HWND) -> Option<u32> {
@@ -432,7 +446,8 @@ mod imp {
         _spec: OverlayWindowSpec,
         _position: OverlayPosition,
         _visible: bool,
-    ) {
+    ) -> bool {
+        false
     }
 
     pub(super) fn reduced_motion_preferred() -> bool {

@@ -82,7 +82,7 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
         *current = AppPage::Transcribe;
     }
     let colors = NavigationPalette::from_context(ctx);
-    egui::SidePanel::left("navigation")
+    let navigation = egui::SidePanel::left("navigation")
         .frame(
             Frame::none()
                 .fill(colors.sidebar)
@@ -92,12 +92,15 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
         .resizable(false)
         .exact_width(200.0)
         .show(ctx, |ui| {
-            ui.label(
+            let heading = ui.label(
                 RichText::new("Scribe")
                     .font(FontId::proportional(20.0))
                     .color(colors.brand)
                     .strong(),
             );
+            ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Heading);
+            });
             ui.label(RichText::new("Local-First STT").small().color(colors.muted));
             ui.add_space(18.0);
             for page in AppPage::normal_pages() {
@@ -115,6 +118,10 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
                 );
             });
         });
+    ctx.accesskit_node_builder(navigation.response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Navigation);
+        builder.set_name("Main navigation");
+    });
 }
 
 fn navigation_button(
@@ -124,24 +131,30 @@ fn navigation_button(
     colors: NavigationPalette,
 ) {
     let selected = *current == page;
+    let visible_label = if selected {
+        format!("● {}", page.label())
+    } else {
+        format!("  {}", page.label())
+    };
+    let mut label =
+        RichText::new(visible_label).color(if selected { colors.text } else { colors.muted });
+    if selected {
+        label = label.strong();
+    }
     let response = ui.add_sized(
         [ui.available_width(), 44.0],
-        Button::new(RichText::new(page.label()).color(if selected {
-            colors.text
-        } else {
-            colors.muted
-        }))
-        .fill(if selected {
-            colors.selected
-        } else {
-            colors.sidebar
-        })
-        .stroke(if selected {
-            Stroke::new(1.0, colors.border)
-        } else {
-            Stroke::NONE
-        })
-        .rounding(Rounding::same(6.0)),
+        Button::new(label)
+            .fill(if selected {
+                colors.selected
+            } else {
+                colors.sidebar
+            })
+            .stroke(if selected {
+                Stroke::new(1.0, colors.border)
+            } else {
+                Stroke::NONE
+            })
+            .rounding(Rounding::same(6.0)),
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, selected, page.label())
@@ -178,5 +191,35 @@ mod tests {
                 "About"
             ]
         );
+    }
+
+    #[test]
+    fn navigation_exposes_landmark_heading_and_selected_page() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut page = AppPage::Transcribe;
+
+        let output = ctx.run(Default::default(), |ctx| {
+            show_navigation(ctx, &mut page, false)
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Navigation)
+        );
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Heading)
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Transcribe")
+                && node.checked() == Some(egui::accesskit::Checked::True)
+        }));
     }
 }
