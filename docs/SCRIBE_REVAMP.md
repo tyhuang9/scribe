@@ -1129,3 +1129,165 @@ cleanup failure without retry, and the no-cleanup success path.
 
 Phase 6 can now replace the remaining callback/file capture path while reusing
 the real overlay level/state interface and the authoritative session boundary.
+
+## Phase 6 checkpoint - native audio pipeline, VAD, and endpointing
+
+Phase 6 removes microphone WAV transport from the normal and comparison paths.
+CPAL now feeds a fixed-capacity, preallocated SPSC ring; a dedicated native
+worker produces the one canonical mono 16 kHz `f32` `PreparedAudio` shared by
+normal and Playground final consumers and ready for Phase 7 preview snapshots.
+The application still contains exactly **one logical
+runtime handler**, `TranscribeCppRuntime`. All four normalized primary models
+remain **Experimental**, zero models are **Supported**, and the exact Zipformer
+candidate remains **NO-GO** without an `OnnxSpeechRuntime`.
+
+### Callback boundary and worker DSP
+
+The CPAL data callback now performs only sample-format conversion, bounded SPSC
+enqueue, atomic dropped-sample/fault updates, and return. Its stream-error
+callback performs one atomic fault update. Neither callback locks a mutex,
+allocates, writes a file, calls the UI, or blocks. The ring is allocated before
+the stream starts, has a two-second target capacity bounded between 65,536 and
+2,000,000 interleaved samples, and fails the capture with a structured overflow
+error rather than silently transcribing corrupt audio.
+
+The consumer worker owns channel downmixing, streaming linear resampling to
+16 kHz, finite/range normalization, deterministic bounded RMS normalization,
+25 Hz RMS/peak publication, adaptive noise-floor VAD, trimming, post-roll, and
+construction of `PreparedAudio`. Loudness normalization occurs only after VAD
+classification, targets 0.1 RMS, caps peaks at 0.95, and limits gain to 8x so
+the detector and meter always observe the unamplified signal. The legacy WAV
+decoder remains for fixtures and the private compatibility bridge; it is no
+longer the microphone application contract.
+
+The internal SPSC implementation uses one producer and one consumer with
+release/acquire publication. Both handles are statically `!Sync`, mutation
+requires exclusive access, and a restart producer can be minted only after the
+old callback-owned token is destroyed. Its wrap, full-buffer, restart-handoff,
+and 100,000-sample concurrency behavior is covered by deterministic tests. The
+worker drains at most 4,096 interleaved samples before rechecking stop and fault
+state. No new async runtime or audio dependency was added.
+
+### Endpointing, recovery, and application integration
+
+Typed Recording settings now persist and salvage VAD enablement plus the
+required defaults: 150 ms speech confirmation, 450 ms internal pause, 900 ms
+endpoint silence, 250 ms pre-roll, and 200 ms post-roll. Normalization clamps
+the timings into an ordered safe range while preserving future unknown fields.
+The Advanced controls edit these real values directly; no disconnected control
+was introduced.
+
+The worker records an explicit stop as soon as it observes the shortcut/UI
+request and then retains up to the configured post-roll before finalizing.
+Explicit stop outranks inferred endpoint and maximum duration in both the audio
+worker and authoritative coordinator. With VAD enabled, silence/no confirmed
+speech returns no audio, transitions the session to a cancelled terminal state,
+pastes nothing, and leaves the prior transcript untouched. With VAD disabled,
+capture never infers an endpoint and returns the complete canonical recording.
+
+The app receives structured capture state, levels, metrics, errors, and the
+final `Arc<PreparedAudio>` only. It sends no PCM through a webview, JavaScript,
+general UI event, or filesystem path. Normal dictation and Playground reuse the
+same in-memory audio; comparison requests clone the `Arc` and release it after
+the final correlated request. The latency trace now says `capture finalized`
+instead of claiming a WAV was written.
+
+Stream faults trigger at most two complete rebuild attempts, including fresh
+device enumeration, config lookup, stream construction, and play, with a
+bounded 50 ms backoff. A changed format fails visibly rather than mixing
+incompatible samples, and exhaustion retains the last structured error.
+Credible native input is bounded to 8-384 kHz and 1-32 channels. Loaded settings
+and the worker independently cap capture at 600 seconds; prepared PCM has a
+separate 602-second frame ceiling, and trimming compacts its owned buffer in
+place instead of doubling peak memory. Dropped sessions request stop and move a
+late worker to a named reaper rather than losing its join handle. Overflow,
+stream fault ordering, fail-then-succeed/exhausted restart, format change,
+resource bounds, and defensive drop are injected in tests. Physical device
+disconnect/recovery remains manual evidence, not an automated compatibility
+claim.
+
+### Runtime-worker failure found by the gate
+
+The first Phase 6 release benchmark attempt terminated with Windows
+`STATUS_ACCESS_VIOLATION` after the first cold native load. The cold loop dropped
+each `TranscriptionService`, but its worker thread could unload the dynamically
+loaded runtime concurrently with creation of the next service. The fix makes
+the last cloned worker handle send an explicit shutdown command, synchronously
+unload on the owning native worker, and join that thread. Shutdown waits at most
+five seconds for the native acknowledgement and detaches with a diagnostic if a
+malfunctioning runtime does not respond. A lifecycle test proves clones retain
+the worker and the normal final drop completes shutdown. The same
+5-cold/20-warm release command then passed; the failed attempt is retained here
+as diagnostic evidence rather than omitted.
+
+### Commands and measured results
+
+Final Phase 6 verification on 2026-08-04:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format | `cargo fmt --all -- --check` | PASS |
+| Compile | `cargo check --all-targets --all-features` | PASS |
+| Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Tests | `cargo test --all-targets --all-features` | PASS: 356 discovered, 351 passed, 0 failed, 5 environment-required ignored |
+| Debug build | `cargo build --all-features` | PASS |
+| Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary tests | PASS: one logical handler; concrete selection remains private to the router |
+| Native service fixture | ignored exact JFK service smoke, pinned v1.9.1/base.en/CPU | PASS: non-empty final text; first load 4,135 ms, first decode 776 ms, retained decode 785 ms; explicit unload/reload passed |
+| Release native benchmark | ignored exact 5-cold/20-warm JFK benchmark | PASS after synchronous worker-shutdown fix and review hardening: cold total median/p95 1,177/1,189 ms; cold load 335/356 ms; warm total 817/884 ms; warm decode 815/882 ms |
+
+The release benchmark used the same machine, CPU resolution, pinned base.en
+artifact, JFK fixture (352,078 bytes; SHA-256
+`59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`), and
+runtime package as the saved Phase 2 measurement. Phase 2 measured cold total
+median/p95 1,084/1,105 ms and warm total 782/796 ms. The final Phase 6 result is
+93/84 ms slower at cold median/p95 and 35/88 ms slower at warm median/p95.
+Because this phase did not change inference and the runs were not interleaved,
+this is recorded as observed variance, not an improvement or causal regression
+claim. No live microphone/hotkey/overlay/target run was available, so
+hotkey-to-overlay, hotkey-to-capture, first meter, first partial,
+stop-to-final, final-to-paste, total duration, memory, and idle CPU remain
+**NOT VERIFIED**.
+
+Automated coverage added in this phase includes sample-format conversion,
+downmix, 48 kHz and 44.1 kHz resampling, finite/range and bounded loudness
+normalization, ring wrap/overflow/concurrency, exact 25 Hz meter publication,
+restart token handoff, bounded worker drain, adaptive noise floor, speech
+confirmation, pause/endpoint timing, pre/post-roll, no-speech, VAD-disabled
+capture, explicit stop priority, structured stream faults, complete bounded
+restart, input-format/resource bounds, in-memory audio ownership and drop,
+background adaptation, sub-confirmation bursts, paused-speech resumption,
+settings salvage/legacy migration/unknown-field round trip, stale session
+safety, reachable explicit/max-duration no-speech no-output behavior, and
+synchronous runtime shutdown. AccessKit coverage also proves that the maximum
+duration and five VAD timing spin buttons are programmatically associated with
+their visible labels.
+
+### Risks, unverified behavior, and Phase 7 entry
+
+- **High release risk:** no real Windows microphone, unplug/restart, endpoint,
+  first-syllable, overflow-under-load, hotkey, overlay, target, or paste row has
+  passed. The manual matrix remains release-blocking evidence.
+- **Medium audio-quality risk:** the deterministic streaming linear resampler
+  does not apply a dedicated anti-alias low-pass filter. Add a measured
+  band-limited resampler only if fixture/listening evidence justifies its cost.
+- **Medium concurrency risk:** the reproduced normal-shutdown overlap is fixed
+  and the benchmark passed. If native unload exceeds the five-second shutdown
+  deadline, the worker is deliberately detached and a newly created service
+  could overlap that exceptional unload; a process-wide lifecycle gate and
+  repeated process-level stress remain Phase 11 work.
+- **Medium driver risk:** a permanently hung CPAL call leaves its capture worker
+  and named reaper alive. Repeated starts must be blocked or supervised by one
+  shared reaper before production; physical unplug/hang rows remain
+  release-blocking evidence.
+- **Medium portability risk:** CPAL compilation passed on the current Windows
+  host only. Real macOS/Linux device recovery and conservative output behavior
+  remain unverified.
+- **Low compatibility risk:** stale recovery WAV cleanup remains intentionally
+  available for older builds, and the private legacy adapter can still create
+  a short-lived canonical WAV for transitional providers. Neither is used by
+  normal microphone capture; removal waits for Phase 11 retirement evidence.
+
+Phase 7 can consume the canonical native pipeline and authoritative
+session/sequence boundary to add bounded rolling preview. Tentative text must
+remain overlay-only, with one active decode and only the newest pending
+snapshot retained.
