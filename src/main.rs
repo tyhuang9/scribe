@@ -70,8 +70,8 @@ fn main() -> eframe::Result<()> {
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([840.0, 600.0])
+            .with_inner_size([1180.0, 815.0])
+            .with_min_inner_size([960.0, 680.0])
             .with_resizable(true)
             .with_transparent(false),
         follow_system_theme: true,
@@ -197,10 +197,10 @@ mod tests {
     fn native_window_is_resizable_opaque_and_minimum_sized() {
         let options = native_options();
 
-        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1100.0, 760.0)));
+        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1180.0, 815.0)));
         assert_eq!(
             options.viewport.min_inner_size,
-            Some(egui::vec2(840.0, 600.0))
+            Some(egui::vec2(960.0, 680.0))
         );
         assert_eq!(options.viewport.resizable, Some(true));
         assert_eq!(options.viewport.transparent, Some(false));

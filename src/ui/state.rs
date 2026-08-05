@@ -85,7 +85,14 @@ pub(crate) enum TranscriptionEvent {
 impl TranscriptionState {
     pub(crate) fn apply(&mut self, event: TranscriptionEvent) {
         match event {
-            TranscriptionEvent::ModelReady(id) => {
+            TranscriptionEvent::ModelReady(id)
+                if matches!(
+                    self.phase,
+                    TranscriptionPhase::NoModel
+                        | TranscriptionPhase::ModelLoading
+                        | TranscriptionPhase::ModelError
+                ) =>
+            {
                 self.selected_model_id = Some(id);
                 self.phase = TranscriptionPhase::Ready;
                 self.notice = None;
@@ -135,7 +142,7 @@ impl TranscriptionState {
                 self.phase = TranscriptionPhase::NoSpeech;
                 self.notice = Some("No speech detected — nothing was added.".into());
             }
-            TranscriptionEvent::ModelFailed => {
+            TranscriptionEvent::ModelFailed if self.phase == TranscriptionPhase::ModelLoading => {
                 self.provisional_transcript.clear();
                 self.phase = TranscriptionPhase::ModelError;
             }
@@ -378,6 +385,42 @@ mod tests {
             SettingsSaveState::Failed.changed().saving().completed(true),
             SettingsSaveState::Saved
         );
+    }
+
+    #[test]
+    fn stale_model_events_do_not_interrupt_recording_or_finalization() {
+        for phase in [
+            TranscriptionPhase::Listening,
+            TranscriptionPhase::Finalizing,
+        ] {
+            let mut state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                provisional_transcript: "keep this".into(),
+                ..Default::default()
+            };
+
+            state.apply(TranscriptionEvent::ModelReady("stale-model".into()));
+            state.apply(TranscriptionEvent::ModelFailed);
+
+            assert_eq!(state.phase, phase);
+            assert_eq!(state.selected_model_id.as_deref(), Some("base.en"));
+            assert_eq!(state.provisional_transcript, "keep this");
+        }
+    }
+
+    #[test]
+    fn model_events_only_apply_during_model_setup() {
+        let mut loading = TranscriptionState {
+            phase: TranscriptionPhase::ModelLoading,
+            ..Default::default()
+        };
+        loading.apply(TranscriptionEvent::ModelFailed);
+        assert_eq!(loading.phase, TranscriptionPhase::ModelError);
+
+        loading.apply(TranscriptionEvent::ModelReady("base.en".into()));
+        assert_eq!(loading.phase, TranscriptionPhase::Ready);
+        assert_eq!(loading.selected_model_id.as_deref(), Some("base.en"));
     }
 
     #[test]

@@ -66,13 +66,15 @@ pub(crate) fn button(
         ButtonTone::Danger => (colors.error, Stroke::NONE, Color32::WHITE),
         ButtonTone::Text => (Color32::TRANSPARENT, Stroke::NONE, colors.text),
     };
-    ui.add(
+    let response = ui.add(
         Button::new(label.into().color(text))
             .fill(fill)
             .stroke(stroke)
             .rounding(Rounding::same(5.0))
             .min_size(Vec2::new(0.0, 40.0)),
-    )
+    );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
+    response
 }
 
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
@@ -100,7 +102,18 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Res
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(accessible_name);
     });
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
     response.on_hover_text(accessible_name)
+}
+
+pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            rounding,
+            Stroke::new(2.0, ui_palette(ui).accent),
+        );
+    }
 }
 
 pub(crate) fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) -> Response {
@@ -166,7 +179,7 @@ pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
         (
             colors.error_pale,
             colors.error_border,
-            colors.error,
+            colors.error_text,
             Icon::MicrophoneOff,
         )
     } else {
@@ -216,6 +229,12 @@ pub(crate) enum Icon {
     MicrophoneOff,
     Keyboard,
     Refresh,
+    Cpu,
+    Globe,
+    Gauge,
+    Folder,
+    Storage,
+    Plus,
 }
 
 pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
@@ -235,6 +254,12 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Stop => regular::STOP,
         Icon::MicrophoneOff => regular::MICROPHONE_SLASH,
         Icon::Keyboard => regular::KEYBOARD,
+        Icon::Cpu => regular::CPU,
+        Icon::Globe => regular::GLOBE,
+        Icon::Gauge => regular::GAUGE,
+        Icon::Folder => regular::FOLDER,
+        Icon::Storage => regular::HARD_DRIVES,
+        Icon::Plus => regular::PLUS,
     }
 }
 
@@ -280,5 +305,29 @@ mod tests {
             notice_width >= available_width - 1.0,
             "notice={notice_width}, available={available_width}"
         );
+    }
+
+    #[test]
+    fn focused_custom_control_paints_a_two_point_focus_ring() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(44.0, 44.0), Sense::click());
+                    response.request_focus();
+                    paint_focus_ring(ui, &response, Rounding::same(5.0));
+                    rect
+                });
+            },
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(
+            shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.stroke.width == 2.0
+        )));
     }
 }

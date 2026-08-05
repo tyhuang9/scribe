@@ -1,4 +1,4 @@
-//! Development-only fixture selection; shared screens live in `ui::screens`.
+//! Development-only deterministic fixtures. Actions update only local fixture state.
 
 use std::collections::BTreeSet;
 
@@ -6,11 +6,12 @@ use eframe::egui::{self, CentralPanel, Frame, ScrollArea};
 
 use super::{
     configure_accessible_style,
-    screens::{RecordingSettingsView, ScreenView, show_screen},
+    screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDownloadState, ModelSizeTier, ModelSpeedTier,
-        ModelViewModel, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ComparisonResult, ModelComparisonState, ModelDownloadState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     theme_palette,
 };
@@ -91,7 +92,7 @@ impl Fixture {
             Self::TranscribeListening => {
                 transcription.phase = TranscriptionPhase::Listening;
                 transcription.provisional_transcript =
-                    " …we discussed the importance of privacy and keeping all…".into();
+                    "…we discussed the importance of privacy and keeping all…".into();
             }
             Self::TranscribeFinalizing => transcription.phase = TranscriptionPhase::Finalizing,
             Self::TranscribeNoSpeech => {
@@ -113,6 +114,33 @@ impl Fixture {
                     .iter()
                     .map(|model| model.id.clone())
                     .collect::<BTreeSet<_>>();
+                comparison.audio_duration_ms = Some(8_000);
+                comparison.reference_transcript =
+                    Some("local-first architecture protects private speech".into());
+                comparison.results = vec![
+                    (
+                        "base.en".into(),
+                        ComparisonResult {
+                            output: Some("local-first architecture protects private speech".into()),
+                            processing_ms: Some(1_600),
+                            realtime_factor: Some(0.2),
+                            word_error_rate: Some(0.0),
+                            character_error_rate: Some(0.0),
+                            error: None,
+                        },
+                    ),
+                    (
+                        "tiny.en".into(),
+                        ComparisonResult {
+                            output: Some("local first architecture protects private speech".into()),
+                            processing_ms: Some(720),
+                            realtime_factor: Some(0.09),
+                            word_error_rate: Some(0.2),
+                            character_error_rate: Some(0.03),
+                            error: None,
+                        },
+                    ),
+                ];
             }
         }
         FixtureData {
@@ -140,6 +168,7 @@ fn model(
         active,
         recommended,
         download_state: ModelDownloadState::Installed,
+        disk_bytes: Some(ram_mb * 1_000_000),
         estimated_ram_bytes: Some(ram_mb * 1_000_000),
         language_summary: "English".into(),
         speed_tier: if active {
@@ -155,6 +184,8 @@ fn model(
         ..Default::default()
     }
 }
+
+#[derive(Clone)]
 struct FixtureData {
     route: UiRoute,
     transcription: TranscriptionState,
@@ -162,48 +193,50 @@ struct FixtureData {
     comparison: ModelComparisonState,
     settings: RecordingSettingsView,
 }
-
 pub(crate) fn fixture_from_env() -> Option<Fixture> {
     std::env::var("SCRIBE_UI_HARNESS")
         .ok()
         .and_then(|value| Fixture::parse(&value))
 }
+
 pub(crate) struct UiHarnessApp {
-    fixture: Fixture,
     page: AppPage,
+    data: FixtureData,
 }
 impl UiHarnessApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, fixture: Fixture) -> Self {
         configure_accessible_style(&cc.egui_ctx);
         Self {
-            fixture,
             page: fixture.page(),
+            data: fixture.data(),
         }
     }
 }
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        show_harness(ctx, self.fixture, &mut self.page);
+        let action = show_harness(ctx, &self.data, &mut self.page);
+        apply_action(&mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
     }
 }
-pub(crate) fn show_harness(ctx: &egui::Context, fixture: Fixture, page: &mut AppPage) {
-    show_navigation(ctx, page, false);
-    let data = fixture.data();
-    let route = match *page {
+
+fn harness_route(page: AppPage, fixture_route: UiRoute) -> UiRoute {
+    match page {
         AppPage::Transcribe => UiRoute::Transcribe,
         AppPage::Models => UiRoute::Models,
-        AppPage::General | AppPage::Advanced => UiRoute::Settings(SettingsTab::Recording),
+        AppPage::General | AppPage::Advanced => match fixture_route {
+            UiRoute::Settings(tab) => UiRoute::Settings(tab),
+            _ => UiRoute::Settings(SettingsTab::Recording),
+        },
         AppPage::History => UiRoute::History,
         AppPage::About => UiRoute::About,
         AppPage::Debug => UiRoute::Debug,
-    };
+    }
+}
+fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> ScreenAction {
+    show_navigation(ctx, page, false);
     let view = ScreenView {
-        route: if route == data.route {
-            data.route
-        } else {
-            route
-        },
+        route: harness_route(*page, data.route),
         transcription: &data.transcription,
         models: &data.models,
         comparison: &data.comparison,
@@ -218,49 +251,174 @@ pub(crate) fn show_harness(ctx: &egui::Context, fixture: Fixture, page: &mut App
         .show(ctx, |ui| {
             ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| show_screen(ui, &view));
-        });
+                .show(ui, |ui| render_screen(ui, &view))
+                .inner
+        })
+        .inner
+}
+
+fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
+    match action {
+        ScreenAction::None => {}
+        ScreenAction::AddModel | ScreenAction::ChangeModel => {
+            data.transcription.selected_model_id = Some("base.en".into());
+            data.transcription.phase = TranscriptionPhase::Ready;
+        }
+        ScreenAction::StartRecording => data.transcription.phase = TranscriptionPhase::Listening,
+        ScreenAction::StopRecording => data.transcription.phase = TranscriptionPhase::Finalizing,
+        ScreenAction::OpenAudioSettings => *page = AppPage::General,
+        ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
+        ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
+        ScreenAction::CopyTranscript => {}
+        ScreenAction::ToggleComparison => data.comparison.expanded = !data.comparison.expanded,
+        ScreenAction::ToggleComparisonModel(id) => {
+            if !data.comparison.selected_model_ids.insert(id.clone()) {
+                data.comparison.selected_model_ids.remove(&id);
+            }
+        }
+        ScreenAction::StartComparison => data.comparison.phase = ComparisonPhase::Recording,
+        ScreenAction::SetSettingsTab(tab) => {
+            data.route = UiRoute::Settings(tab);
+            *page = AppPage::General;
+        }
+        ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
+        ScreenAction::ToggleProvisionalFeedback => {
+            data.settings.provisional_feedback = !data.settings.provisional_feedback
+        }
+        ScreenAction::RefreshDevices | ScreenAction::ChangeShortcut => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn render(fixture: Fixture, width: f32) -> egui::FullOutput {
+    fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
         let mut page = fixture.page();
+        let data = fixture.data();
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::Vec2::new(width, 680.0),
+                    egui::Vec2::new(width, height),
                 )),
                 ..Default::default()
             },
-            |ctx| show_harness(ctx, fixture, &mut page),
+            |ctx| {
+                let _ = show_harness(ctx, &data, &mut page);
+            },
         )
     }
+    fn node_names(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.name().map(str::to_owned))
+            .collect()
+    }
     #[test]
-    fn every_fixture_renders_wide_and_compact_without_painting_outside_the_viewport() {
+    fn every_fixture_renders_at_native_preferred_and_minimum_dimensions() {
         for fixture in Fixture::ALL {
-            for width in [1180.0, 960.0] {
-                let output = render(fixture, width);
-                assert!(output.shapes.iter().all(|shape| shape.clip_rect.max.x <= width && shape.clip_rect.min.x >= 0.0));
+            for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+                let output = render(fixture, width, height);
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .all(|shape| shape.clip_rect.max.x <= width
+                            && shape.clip_rect.min.x >= 0.0
+                            && shape.clip_rect.max.y <= height
+                            && shape.clip_rect.min.y >= 0.0)
+                );
             }
         }
     }
     #[test]
-    fn icon_only_fixture_controls_have_accesskit_names() {
-        let output = render(Fixture::SettingsRecording, 960.0);
-        let update = output.platform_output.accesskit_update.unwrap();
-        assert!(
-            update
-                .nodes
-                .iter()
-                .any(|(_, node)| node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Refresh devices"))
+    fn every_fixture_exposes_its_visible_reference_content() {
+        for (fixture, expected) in [
+            (
+                Fixture::TranscribeNoModel,
+                "Add a speech model to start transcribing",
+            ),
+            (Fixture::TranscribeReady, "Start recording"),
+            (Fixture::TranscribeListening, "Listening"),
+            (Fixture::TranscribeFinalizing, "Finalizing transcript…"),
+            (
+                Fixture::TranscribeNoSpeech,
+                "No speech detected — nothing was added.",
+            ),
+            (
+                Fixture::TranscribeMicrophoneError,
+                "Scribe couldn’t access your microphone",
+            ),
+            (Fixture::ModelsInstalled, "Compare installed models"),
+            (Fixture::ModelsCompareExpanded, "80% accuracy"),
+            (Fixture::SettingsRecording, "Recording behavior"),
+        ] {
+            assert!(
+                node_names(&render(fixture, 1180.0, 815.0))
+                    .iter()
+                    .any(|name| name.contains(expected)),
+                "{fixture:?} missing {expected}"
+            );
+        }
+    }
+    #[test]
+    fn comparison_fixture_has_deterministic_reference_metrics() {
+        let data = Fixture::ModelsCompareExpanded.data();
+        assert_eq!(data.comparison.audio_duration_ms, Some(8_000));
+        assert_eq!(
+            data.comparison.reference_transcript.as_deref(),
+            Some("local-first architecture protects private speech")
         );
+        assert_eq!(data.comparison.results.len(), 2);
+        assert_eq!(data.comparison.results[1].1.word_error_rate, Some(0.2));
+    }
+    #[test]
+    fn harness_actions_mutate_only_visible_fixture_state() {
+        let mut data = Fixture::TranscribeReady.data();
+        let mut page = AppPage::Transcribe;
+        apply_action(&mut data, &mut page, ScreenAction::StartRecording);
+        assert_eq!(data.transcription.phase, TranscriptionPhase::Listening);
+        apply_action(&mut data, &mut page, ScreenAction::StopRecording);
+        assert_eq!(data.transcription.phase, TranscriptionPhase::Finalizing);
+        apply_action(&mut data, &mut page, ScreenAction::ClearTranscript);
+        assert!(data.transcription.committed_transcript.is_empty());
+    }
+    #[test]
+    fn settings_tab_action_persists_the_selected_route() {
+        let mut data = Fixture::SettingsRecording.data();
+        let mut page = AppPage::General;
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::SetSettingsTab(SettingsTab::Output),
+        );
+        assert_eq!(data.route, UiRoute::Settings(SettingsTab::Output));
+        assert_eq!(
+            harness_route(page, data.route),
+            UiRoute::Settings(SettingsTab::Output)
+        );
+    }
+    #[test]
+    fn comparison_toggle_persists_across_frames() {
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        apply_action(&mut data, &mut page, ScreenAction::ToggleComparison);
+        assert!(data.comparison.expanded);
+        apply_action(&mut data, &mut page, ScreenAction::ToggleComparison);
+        assert!(!data.comparison.expanded);
+    }
+    #[test]
+    fn icon_only_fixture_controls_have_accesskit_names() {
+        let names = node_names(&render(Fixture::SettingsRecording, 960.0, 680.0));
+        assert!(names.iter().any(|name| name == "Refresh devices"));
     }
     #[test]
     fn harness_parser_is_exact_and_fail_closed() {

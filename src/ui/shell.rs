@@ -1,7 +1,7 @@
 use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rounding, Sense, Stroke, Vec2};
 
 use super::{
-    controls::{Icon, icon_glyph},
+    controls::{Icon, icon_glyph, paint_focus_ring},
     theme_palette,
 };
 
@@ -195,6 +195,12 @@ fn secondary_navigation(
         if more.clicked() {
             ui.memory_mut(|memory| memory.toggle_popup(more.id));
         }
+        let expanded = ui.memory(|memory| memory.is_popup_open(more.id));
+        ui.ctx().accesskit_node_builder(more.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name("More navigation");
+            builder.set_expanded(expanded);
+        });
         egui::popup_below_widget(ui, more.id, &more, |ui| {
             if menu_item(ui, "History") {
                 *current = AppPage::History;
@@ -280,6 +286,7 @@ fn nav_full_button(
         egui::FontId::proportional(15.0),
         if active { text } else { muted },
     );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
     response
 }
 
@@ -308,6 +315,7 @@ fn nav_icon_button(
         egui::FontId::proportional(22.0),
         muted,
     );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
     response.on_hover_text(accessible_name)
 }
 
@@ -358,5 +366,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compact_more_control_has_name_and_expanded_semantics() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut page = AppPage::Transcribe;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(960.0, 680.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| show_navigation(ctx, &mut page, false),
+        );
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("More navigation")
+                        && node.is_expanded() == Some(false)
+                })
+        );
     }
 }
