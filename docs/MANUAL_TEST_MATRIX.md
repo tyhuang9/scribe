@@ -1,10 +1,10 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 0 scaffold (2026-08-03). No manual desktop, microphone,
-model-runtime, tray, hotkey, or paste test was executed during the automated
-Phase 0 work. Every row below is therefore marked **NOT VERIFIED** until an
-operator records evidence. Automated Rust checks are listed separately and are
-not a substitute for the platform rows.
+**Status:** living Phase 1 matrix (2026-08-03). No manual desktop, microphone,
+model-runtime, tray, hotkey, or paste test was executed during the Phase 0/1
+automated work. Every manual row below therefore remains **NOT VERIFIED** until
+an operator records evidence. Automated Rust checks are listed separately and
+are not a substitute for the platform rows.
 
 ## Test conditions and evidence rules
 
@@ -48,6 +48,26 @@ The final source gate was run at HEAD `536a85f813943dbc8beaa684fc5901ff281f6577`
 2026-08-03 14:20:24.998–14:20:30.146 `-05:00`). All commands emitted the same
 non-fatal warning: `could not canonicalize path C:\Users\huang`.
 
+## Automated Phase 1 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format gate | `cargo fmt --all -- --check` | PASS |
+| Compile/check | `cargo check --all-targets --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS — 200 discovered, 197 passed, 0 failed, 3 ignored environment-required smoke tests. |
+| Facade fixture smoke | `cargo test transcription::tests::transcription_service_jfk_smoke_uses_the_whisper_cpp_facade --all-features -- --ignored --exact` | PASS — local whisper.cpp 1.9.1 CLI + `base.en` + JFK WAV returned non-empty text and matching IDs/model metadata through `TranscriptionService`. |
+| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Build | `cargo build --all-features` | PASS |
+| Source boundary | `rg` scan for `transcribe_with_config` outside `src/stt/**` | PASS — the sole call outside `src/stt/**` is the private legacy bridge in `src/transcription.rs`; `src/app.rs` has none. |
+
+Phase 1 automated tests cover accepted and stale normal/Playground events,
+cross-source supersession in both directions, mismatched IDs, wrong-model
+responses, per-run multi-request cleanup, and service-side model validation.
+These tests prove coordinator event filtering and temporary-file ownership; they
+do not prove that a real microphone/runtime/target application works on a
+desktop. Execute `REC-04`, `STT-01`, `STT-02`, `STT-05`, and `OUT-01` manually
+on Windows before treating the wrapped path as release-verified.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -84,7 +104,7 @@ non-fatal warning: `could not canonicalize path C:\Users\huang`.
 | REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and temporary recording directory. | Capture begins after stream start, WAV finalizes, transcription starts, and temporary file cleanup follows current policy. Capture exact latency phases. | **NOT VERIFIED** |
 | REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture. | Microphone failure is visible, no hang occurs, and app returns to a valid Idle/Error state without paste. | **NOT VERIFIED** |
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
-| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists). | Cancel never pastes; pending work is cleaned up; stale completion cannot overwrite the next session. Session IDs are a future requirement. | **NOT VERIFIED** |
+| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization (if a cancel action exists); immediately start another normal or Playground session. | Cancel never pastes; pending work is cleaned up; the implemented session/request checks reject stale completion without overwriting the next session. Native worker cancellation is not implemented yet. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 
@@ -140,9 +160,9 @@ non-fatal warning: `could not canonicalize path C:\Users\huang`.
 
 ### Completion rule
 
-The Phase 0 matrix deliverable is complete when this scaffold is executable and
-its unrun rows are truthfully marked **NOT VERIFIED**. Platform/release sign-off
-requires a later dated PASS/FAIL/BLOCKED result with evidence in the owning test
-report. Do not change a row to PASS based solely on compilation or a unit test.
-Rows that cannot be run on a platform remain **NOT VERIFIED** and are listed as
-release risks until an explicit support decision is made.
+This living matrix remains valid only while each implemented phase updates its
+automated checkpoint and any affected manual steps. Platform/release sign-off
+requires a dated PASS/FAIL/BLOCKED result with evidence in the owning test
+report. Do not change a manual row to PASS based solely on compilation or a unit
+test. Rows that cannot be run on a platform remain **NOT VERIFIED** and are
+listed as release risks until an explicit support decision is made.
