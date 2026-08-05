@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 8 matrix (2026-08-04). No manual desktop, microphone,
+**Status:** living Phase 10 matrix (2026-08-04). No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-8 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-10 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -190,6 +190,25 @@ the Zipformer/second-handler decision remains NO-GO.
 | Runtime/PCM boundary | Catalog boundary script and existing source guards | PASS - one logical handler and native-only PCM remain unchanged |
 | Pinned native smoke | Exact ignored base.en/JFK service fixture | PASS - debug-harness first load 4,367 ms, first decode 801 ms, warm decode 792 ms; retained release numbers remain the comparable evidence |
 
+## Automated Phase 9 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Phase gates | Format/check/strict Clippy/debug+release build/full suite | PASS - 474 discovered, 468 passed, 0 failed, 6 ignored |
+| Transactional installation | Download/resume/hash/extraction/smoke/activation/removal/rollback failure injection | PASS |
+| Exact pinned package | Bounded parent smoke against exact 13-file whisper.cpp v1.9.1 Windows x64 package | PASS - no fault dialog; health/load/decode/unload-reload completed |
+| Architecture | Boundary guard and release package checks | PASS - exactly one logical runtime handler |
+
+## Automated Phase 10 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Phase gates | Format/check/strict Clippy/build/full suite | PASS - 523 discovered, 517 passed, 0 failed, 6 ignored |
+| History lifecycle | Focused database, audio, retention, retry, bounded release retry, retention-independent lease acknowledgement, deletion, reconciliation, process-lock, and app-correlation tests | PASS |
+| Playback and UI | Native playback tests plus AccessKit/history interaction tests | PASS - bounded native audio, callback-timestamp drain deadline, bounded shutdown, reliable terminal state, live/busy result announcements, structural contextual groups/actions, destructive focus restoration, expanded disclosures, state-specific disabled reasons, confirmations, and 44 px actions |
+| Privacy/output | Immutable final snapshot, neutral durable failures, one-shot fresh-target repaste, active-work/deletion/Off invalidation, and retry-no-output tests | PASS |
+| Architecture | Rust and script boundary guards | PASS - one logical runtime handler; PCM remains native |
+
 These are deterministic code-level checks, not a physical Windows paste run.
 OUT-01, OUT-05, OUT-06, target elevation, image clipboard round trips, and the
 new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
@@ -277,10 +296,21 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | DL-05 | Linux/macOS | P1, disposable data dir | Open runtime maintenance and attempt normalized managed runtime installation. | The UI reports that no verified pinned package exists for this platform; no staging/activation occurs and no support claim is shown. | **NOT VERIFIED** |
 | SET-01 | Win/Linux/macOS | P1, P7 | Edit hotkey, recording mode, active model, microphone, performance mode, theme, and auto-insert; restart. | Values persist with no silent reset; invalid values are rejected or salvaged. | **NOT VERIFIED** |
 | SET-02 | Win/Linux/macOS | P1, P7 | Copy the config aside, corrupt one field/file, launch, then inspect backup/recovery. Repeat with a valid legacy flat config. | Valid fields survive; corrupt input receives a timestamped backup; legacy input receives a pre-migration backup; future root/section/install fields survive the rewrite. | **NOT VERIFIED** |
-| PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect current data directory after successful, no-speech, overflow, and failed transcription. | Normal microphone and Playground paths create no WAV and release in-memory PCM after consumers finish. Only stale WAVs from older builds or the private transitional compatibility bridge may exist; durable history/audio retention is a future feature. Record actual files without exposing transcript content. | **NOT VERIFIED** |
-| PRIV-02 | Win/Linux/macOS | P1, P7 | If a later build exposes history modes, exercise Off, Transcript only, and Transcript + audio; pin one entry and clear unpinned. | Audio is off by default, pinned entries survive cleanup, and delete-audio does not delete transcript metadata. | **NOT VERIFIED** |
+| PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect the platform Scribe history directory after successful, no-speech, overflow, failed, and Playground transcription in default Transcript only mode. | Normal dictation stores transcript metadata only; no retained WAV exists. No-speech and Playground create no history row. PCM remains in native workers and is released after consumers finish. Record filenames/permissions without exposing transcript content. | **NOT VERIFIED** |
+| PRIV-02 | Win/Linux/macOS | P1, P7, disposable data dir | Exercise Off, Transcript only, and Transcript + audio; pin one entry; exceed the count cap; configure transcript/audio age limits; restart. | Off creates no new row. Transcript only is default and creates no audio. Transcript + audio creates one bounded mono 16 kHz WAV. Pinned entries survive automatic retention; delete-audio preserves transcript metadata; switching Off does not silently delete existing data. | **NOT VERIFIED** |
 | RECOV-01 | Win/Linux/macOS | P1, P2, P3 | Force microphone, runtime, output, and config failures one at a time; start a fresh dictation after each. | Each failure has a user-facing stage/message, no stale result leaks into the next run, and Idle is recoverable. | **NOT VERIFIED** |
-| RECOV-02 | Win/Linux/macOS | P1, P3 | If retry/history exists, fail a transcription with retained audio then retry. | Retry uses the retained recording and does not create duplicate output/history entries. | **NOT VERIFIED** |
+| RECOV-02 | Win/Linux/macOS | P1, P3, Transcript + audio | Fail a transcription with retained audio, press Retry, and observe the destination app. Repeat with corrupt/missing audio and interrupt/restart during retry. | Retry decodes the same row/audio, increments retry count only at a terminal outcome, never creates a duplicate row, and never pastes. Corrupt/missing audio remains Failed with actionable status; restart leaves no stranded Pending row. | **NOT VERIFIED** |
+
+## History, playback, retention, and repaste
+
+| ID | Platform | Prereq | Steps | Expected result/evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| HIST-01 | Win/Linux/macOS | P1, P7, history enabled | Create more than 20 unpinned entries; search literal `%`, `_`, transcript, model, and app text; use Load more; pin one entry. | Results are newest-first with no duplicate/gap across pages; wildcard characters are literal; the pinned row survives count retention. | **NOT VERIFIED** |
+| HIST-02 | Win/Linux/macOS | P1, P7 | Complete one row whose raw/final text differs; copy each, pin/unpin, delete audio, then confirm full deletion. | Raw and final text are separately visible/copyable. Pin state persists. Delete audio leaves metadata; full deletion removes the row and contained audio only after confirmation. | **NOT VERIFIED** |
+| HIST-03 | Win/Linux/macOS | P1, output device, retained audio | Play retained audio, Stop while loading and while playing, switch output device, and attempt a corrupt/oversized/replaced WAV. | UI shows one correlated pending/active state; Stop reliably clears it; canonical bounded audio plays natively; invalid audio fails without allocation spike, retry, or crash. | **NOT VERIFIED** |
+| HIST-04 | Windows | P1, P4, P7, completed history row | Arm Paste again, focus a fresh normal target, press the shortcut once. Repeat after expiry, deletion, History Off, UI/tray recording start, active retry, target close/change, and elevated target. | Only the first valid idle arm invokes safe output exactly once. Every invalidation clears private text; active recording hotkey performs normal Stop/Toggle and never pastes old history; unsafe targets are copy-only. | **NOT VERIFIED** |
+| HIST-05 | Windows | P1, disposable data dir | Start a dictation that creates Pending, force terminate, relaunch; repeat by launching a second Scribe while the first owns an active row. Interrupt full deletion before/after file removal. | Relaunch marks only abandoned Pending failed and reconciles the deletion journal. A second process cannot open/reconcile the same store. No unrelated file is touched. | **NOT VERIFIED** |
+| HIST-06 | Windows | P1, disposable data dir | Inspect owner/DACLs of history root, DB/WAL/SHM/lock, and audio; attempt junction/symlink/reparse substitution before launch. | Root/files are private to owner and LocalSystem; Scribe fails closed on reparse paths or insecure/unhardenable storage and never falls back to the working directory. | **NOT VERIFIED** |
 
 ## Platform coverage and sign-off
 

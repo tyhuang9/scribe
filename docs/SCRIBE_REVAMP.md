@@ -1662,3 +1662,123 @@ The release remains **NO-GO** until the Windows manual matrix,
 native-streaming Definition of Done, Supported-model evidence, and complete
 comparable desktop latency report pass. Phase 10 may now add durable history
 on top of the transactional artifact and settings boundary.
+
+## Phase 10 - History, retention, and retry
+
+Phase 10 adds one runtime-neutral history subsystem beneath the existing app
+coordinator. It does not add a transcription, audio, output, or model-management
+path. The logical runtime-handler count remains **one**
+(`TranscribeCppRuntime`), `OnnxSpeechRuntime` remains omitted, all four normalized
+Whisper artifacts remain **Experimental**, and **0** models are Supported.
+
+### Persistence, privacy, and lifecycle decisions
+
+- Bundled SQLite stores metadata in the platform Scribe data directory under
+  `history/history.sqlite3`; retained audio is a separate relative file beneath
+  `history/audio`. History-root resolution now fails closed instead of falling
+  back to the process working directory. Unix permissions are restricted to
+  `0700`/`0600`; Windows applies a protected owner/LocalSystem full-control DACL.
+  The database, WAL, SHM, lock, root, audio directory, and every audio path are
+  checked for links/reparse points before use.
+- One bounded native worker owns SQLite, WAL mode, full synchronous durability,
+  retention, audio staging, and reconciliation. A worker-owned cross-process
+  lock prevents a second Scribe process from converting the first process's
+  Pending rows to Failed or reconciling its audio. Startup converts only
+  abandoned Pending rows, completes deletion journals, clears missing audio,
+  and removes contained orphan/staging files.
+- Normal dictation reserves a monotonic correlated history ID and enqueues the
+  Pending row before decode. Queue admission is bounded to 100 ms and does not
+  wait for SQLite or WAV fsync, so optional history is not on the transcription
+  critical path. The single worker preserves create-before-complete/fail
+  ordering. A terminal completion is enqueued, then safe output proceeds
+  immediately from the immutable accepted final transcript; persistence is
+  observed asynchronously and a slow/unavailable store produces a visible
+  history warning without delaying paste.
+- Rows use `Pending`, `Completed`, and `Failed` lifecycle states with raw/final
+  text, runtime-neutral model ID, neutral metrics, pin state, optional coarse
+  executable basename, retry count, and neutral output result. Raw runtime and
+  filesystem errors are not persisted. Detailed failures remain transient;
+  durable history receives bounded user-safe failure text.
+- Retry requires a Failed row with retained canonical audio. Audio validation
+  and decoding use the same already-open handle and leave the row Failed while
+  the explicit retry runs. Only terminal `complete_retry` or `fail_retry`
+  atomically updates the same row and increments its count, so a slow read or
+  caller timeout cannot strand a row in Pending. Worker and UI retry leases are
+  retained until terminal acknowledgement, consumed on every terminal error,
+  and have an explicit idempotent release command with bounded retry for
+  command-admission/cancellation ambiguity. Once a release is admitted, its
+  background observer retains the receiver until acknowledgement or confirmed
+  worker disconnection; lease-removal acknowledgement is independent of any
+  later retention error. Active retry rows are protected from retention and
+  mutation. Retry never arms automatic output.
+- Settings default to `TranscriptOnly`, a maximum of 20 unpinned entries, no
+  age limit, audio Off, and application identity Off. `Off`, `TranscriptOnly`,
+  and `TranscriptAndAudio` are real behaviors. Optional transcript/audio age
+  retention and the count cap never remove pinned rows. Settings migration,
+  field salvage, atomic persistence, and unknown-field preservation remain the
+  existing typed-settings system rather than a duplicate store.
+- Retained audio is bounded to ten minutes of mono 16 kHz PCM16, staged and
+  durably renamed, decoded without a validate/reopen race, and kept out of egui
+  events. Native CPAL playback uses one bounded command worker; output callbacks
+  allocate nothing, playback uses the native callback timestamp and retains the
+  stream through the predicted queue delay, a full final callback buffer, and a
+  50 ms safety margin before declaring completion. Shutdown is bounded and
+  terminal state events cannot be dropped.
+- The History page provides real keyset pagination, literal-wildcard search,
+  final and distinct raw copy/view actions, pin/unpin, playback/stop, delete
+  audio, confirmed full deletion, and retry eligibility. One correlated
+  app-facing mutation is allowed at a time and retention edits coalesce to the
+  newest policy, preventing unbounded helper threads and reordered destructive
+  actions.
+- Paste Again is an explicit 30-second one-shot arm. It captures and validates
+  a fresh external target only when the hotkey is pressed, never reuses the
+  historical target, and uses the Phase 8 safe output boundary exactly once.
+  Starting/superseding work, retrying/deleting the row, disabling history,
+  expiry, or any active session clears the arm. Tentative text and retry results
+  are never pasted.
+- The accepted final transcript and output configuration are snapshotted before
+  history completion and immediately enter the existing safe-output state.
+  Later edits cannot change that queued immutable snapshot; canceling queued
+  output records `cancelled_by_user`. Correlation rejection consumes/fails the
+  owning history context, while genuinely stale events remain non-mutating.
+
+### Verification and measured evidence
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo build --all-features` | **PASS** |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 523 discovered, 517 passed, 0 failed, 6 environment-gated tests ignored |
+| History contract | Focused `history::tests` plus app lifecycle tests | **PASS** - schema/lifecycle, single-owner lock, queued create ordering, search/keyset pagination, retention/pins, staged audio, retry terminality, bounded retry of ambiguous release, retention-independent lease acknowledgement, output metadata, deletion journal, missing/orphan reconciliation, unsafe paths, immutable final output, arm invalidation, and no retry paste covered |
+| Native playback | `history_playback::tests` | **PASS** - bounded same-format/resampled multichannel fill, timestamp-derived multi-buffer drain deadline, correlated Stop, bounded shutdown, and invalid-ID rejection |
+| Settings/privacy/accessibility | Settings migration/repository and History UI tests | **PASS** - legacy/future-field preservation, salvage/bounds, transcript-only defaults, structural contextual groups containing their headings/actions, live atomic busy/results/error state, destructive focus management, labelled search, expanded disclosure state, non-color state text, state-specific disabled explanations, confirmation, and 44 px actions |
+| Architecture boundary | Rust boundary suite and `scripts/check-catalog-boundaries.py` | **PASS** - one logical runtime handler; no PCM or concrete runtime/model-family types cross into UI/history/output |
+
+Phase 10 changes persistence after capture and around the final result, not the
+native inference implementation, fixture, model artifact, or resolved backend.
+No desktop latency improvement is claimed. The comparable Phase 7 release
+measurements remain the current inference evidence: cold final total median/p95
+1,087/1,099 ms, warm final total 781/800 ms, and warm rolling first real speech
+1,730/1,754 ms. History queue admission is bounded but real hotkey-to-paste,
+disk-stall, memory, and idle-CPU effects still require saved Phase 11 desktop
+measurements on the same machine/corpus/backend.
+
+### Risks and Phase 11 entry
+
+- **High - desktop/privacy evidence:** real Windows history ACLs, search,
+  retention, playback, retry, fresh-target repaste, restart reconciliation, and
+  clipboard/focus races have not been exercised manually. The matrix remains
+  NOT VERIFIED.
+- **Medium - durability fault injection:** deterministic interruption,
+  deletion-journal, missing/orphan, and lock tests pass, but physical power-loss
+  and a genuinely stalled local disk have not been reproduced.
+- **Medium - cross-platform behavior:** SQLite/history compiles on supported
+  platforms and fails closed where permission hardening is unavailable; native
+  playback device behavior and platform data-directory permissions still need
+  the manual matrix.
+- **Low - retained private data:** switching History Off prevents new rows but
+  does not silently delete existing user data. Existing rows remain subject to
+  the user's configured retention or explicit deletion.
+
+The release remains **NO-GO** until Phase 11 diagnostics/hardening, the complete
+Windows manual matrix, Supported-model compatibility evidence, native-streaming
+Definition of Done, and comparable before/after desktop latency report pass.
