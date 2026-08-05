@@ -3,6 +3,9 @@ name = "local-transcriber"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+ui-harness = []
+
 [dependencies]
 anyhow = "1"
 arboard = "3.6"

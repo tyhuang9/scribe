@@ -1,0 +1,317 @@
+//! Backend-neutral UI contracts shared by production views and the development harness.
+
+use std::collections::BTreeSet;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SettingsTab {
+    #[default]
+    General,
+    Recording,
+    Output,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum UiRoute {
+    #[default]
+    Transcribe,
+    Models,
+    Settings(SettingsTab),
+    History,
+    About,
+    Debug,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TranscriptionPhase {
+    #[default]
+    NoModel,
+    Ready,
+    RequestingMicrophone,
+    Listening,
+    Finalizing,
+    NoSpeech,
+    MicrophoneError,
+    ModelLoading,
+    ModelError,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TranscriptionState {
+    pub phase: TranscriptionPhase,
+    pub selected_model_id: Option<String>,
+    pub committed_transcript: String,
+    pub provisional_transcript: String,
+    pub elapsed_ms: u64,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TranscriptionEvent {
+    ModelReady(String),
+    StartRequested,
+    MicrophoneGranted,
+    MicrophoneFailed,
+    Partial(String),
+    StopRequested,
+    FinalText(String),
+    NoSpeech,
+    ModelFailed,
+    Retry,
+    ModelRemoved,
+}
+
+impl TranscriptionState {
+    pub(crate) fn apply(&mut self, event: TranscriptionEvent) {
+        match event {
+            TranscriptionEvent::ModelReady(id) => {
+                self.selected_model_id = Some(id);
+                self.phase = TranscriptionPhase::Ready;
+                self.notice = None;
+            }
+            TranscriptionEvent::StartRequested
+                if matches!(
+                    self.phase,
+                    TranscriptionPhase::Ready
+                        | TranscriptionPhase::NoSpeech
+                        | TranscriptionPhase::MicrophoneError
+                ) =>
+            {
+                self.phase = TranscriptionPhase::RequestingMicrophone;
+                self.notice = None;
+            }
+            TranscriptionEvent::MicrophoneGranted
+                if self.phase == TranscriptionPhase::RequestingMicrophone =>
+            {
+                self.phase = TranscriptionPhase::Listening;
+            }
+            TranscriptionEvent::MicrophoneFailed
+                if self.phase == TranscriptionPhase::RequestingMicrophone =>
+            {
+                self.phase = TranscriptionPhase::MicrophoneError;
+                self.notice = Some("Scribe couldn't access your microphone".into());
+            }
+            TranscriptionEvent::Partial(text) if self.phase == TranscriptionPhase::Listening => {
+                self.provisional_transcript = text;
+            }
+            TranscriptionEvent::StopRequested if self.phase == TranscriptionPhase::Listening => {
+                self.phase = TranscriptionPhase::Finalizing;
+            }
+            TranscriptionEvent::FinalText(text) if self.phase == TranscriptionPhase::Finalizing => {
+                append_transcript(&mut self.committed_transcript, &text);
+                self.provisional_transcript.clear();
+                self.phase = TranscriptionPhase::Ready;
+            }
+            TranscriptionEvent::NoSpeech
+                if matches!(
+                    self.phase,
+                    TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
+                ) =>
+            {
+                self.provisional_transcript.clear();
+                self.phase = TranscriptionPhase::NoSpeech;
+                self.notice = Some("No speech detected — nothing was added.".into());
+            }
+            TranscriptionEvent::ModelFailed => {
+                self.provisional_transcript.clear();
+                self.phase = TranscriptionPhase::ModelError;
+            }
+            TranscriptionEvent::Retry if self.phase == TranscriptionPhase::MicrophoneError => {
+                self.phase = TranscriptionPhase::RequestingMicrophone;
+                self.notice = None;
+            }
+            TranscriptionEvent::ModelRemoved => {
+                self.selected_model_id = None;
+                self.provisional_transcript.clear();
+                self.phase = TranscriptionPhase::NoModel;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn append_transcript(transcript: &mut String, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !transcript.trim().is_empty() {
+        transcript.push(' ');
+    }
+    transcript.push_str(text);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelDownloadState {
+    #[default]
+    NotInstalled,
+    Queued,
+    Downloading,
+    Verifying,
+    Extracting,
+    Installed,
+    Failed,
+}
+
+impl ModelDownloadState {
+    pub(crate) fn normalize(self, next: Self) -> Self {
+        if self == Self::Installed && next != Self::Installed {
+            Self::Installed
+        } else {
+            next
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelCapabilities {
+    pub streaming_preview: bool,
+    pub translation: bool,
+    pub timestamps: bool,
+    pub language_detection: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelViewModel {
+    pub id: String,
+    pub display_name: String,
+    pub variant_label: String,
+    pub description: Option<String>,
+    pub runtime_group: String,
+    pub installed: bool,
+    pub active: bool,
+    pub recommended: bool,
+    pub download_state: ModelDownloadState,
+    pub languages: Vec<String>,
+    pub language_summary: String,
+    pub capabilities: ModelCapabilities,
+    pub error_message: Option<String>,
+}
+
+impl ModelViewModel {
+    pub(crate) fn normalize(mut self) -> Self {
+        if self.active {
+            self.installed = true;
+            self.download_state = ModelDownloadState::Installed;
+        } else if self.download_state == ModelDownloadState::Installed {
+            self.installed = true;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ComparisonPhase {
+    #[default]
+    Idle,
+    Recording,
+    Processing,
+    Complete,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ComparisonResult {
+    pub output: Option<String>,
+    pub processing_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelComparisonState {
+    pub expanded: bool,
+    pub selected_model_ids: BTreeSet<String>,
+    pub phase: ComparisonPhase,
+    pub audio_duration_ms: Option<u64>,
+    pub results: Vec<(String, ComparisonResult)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SettingsSaveState {
+    #[default]
+    Clean,
+    Dirty,
+    Saving,
+    Saved,
+    Failed,
+}
+
+impl SettingsSaveState {
+    pub(crate) fn changed(self) -> Self {
+        Self::Dirty
+    }
+
+    pub(crate) fn saving(self) -> Self {
+        Self::Saving
+    }
+
+    pub(crate) fn completed(self, success: bool) -> Self {
+        if success { Self::Saved } else { Self::Failed }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalization_appends_once_and_discards_provisional_text() {
+        let mut state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            committed_transcript: "Earlier text.".into(),
+            ..Default::default()
+        };
+        state.apply(TranscriptionEvent::Partial("unfinished".into()));
+        state.apply(TranscriptionEvent::StopRequested);
+        state.apply(TranscriptionEvent::FinalText("Final words.".into()));
+        state.apply(TranscriptionEvent::FinalText("Final words.".into()));
+
+        assert_eq!(state.phase, TranscriptionPhase::Ready);
+        assert_eq!(state.committed_transcript, "Earlier text. Final words.");
+        assert!(state.provisional_transcript.is_empty());
+    }
+
+    #[test]
+    fn no_speech_preserves_committed_transcript() {
+        let mut state = TranscriptionState {
+            phase: TranscriptionPhase::Finalizing,
+            committed_transcript: "Keep this.".into(),
+            provisional_transcript: "discard this".into(),
+            ..Default::default()
+        };
+        state.apply(TranscriptionEvent::NoSpeech);
+
+        assert_eq!(state.phase, TranscriptionPhase::NoSpeech);
+        assert_eq!(state.committed_transcript, "Keep this.");
+        assert!(state.provisional_transcript.is_empty());
+    }
+
+    #[test]
+    fn model_normalization_prevents_contradictory_active_state() {
+        let model = ModelViewModel {
+            active: true,
+            download_state: ModelDownloadState::Downloading,
+            ..Default::default()
+        }
+        .normalize();
+
+        assert!(model.installed);
+        assert_eq!(model.download_state, ModelDownloadState::Installed);
+        assert_eq!(
+            ModelDownloadState::Installed.normalize(ModelDownloadState::Downloading),
+            ModelDownloadState::Installed
+        );
+    }
+
+    #[test]
+    fn settings_save_state_reducer_has_a_simple_retry_path() {
+        assert_eq!(
+            SettingsSaveState::Clean.changed().saving().completed(false),
+            SettingsSaveState::Failed
+        );
+        assert_eq!(
+            SettingsSaveState::Failed.changed().saving().completed(true),
+            SettingsSaveState::Saved
+        );
+    }
+}
