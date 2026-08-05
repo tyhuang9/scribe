@@ -13,6 +13,7 @@ mod tray;
 
 use eframe::egui;
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxDisplayBackend {
     Auto,
@@ -95,6 +96,7 @@ fn linux_display_backend_preference() -> LinuxDisplayBackend {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn display_backend_preference(
     force_x11: bool,
     force_wayland: bool,
@@ -131,10 +133,10 @@ fn running_under_wsl() -> bool {
         .unwrap_or(false)
 }
 
-fn print_linux_display_help(err: &eframe::Error) {
+fn print_linux_display_help(_err: &eframe::Error) {
     #[cfg(target_os = "linux")]
     {
-        let message = err.to_string();
+        let message = _err.to_string();
         let lower_message = message.to_ascii_lowercase();
         if lower_message.contains("nocompositor")
             || lower_message.contains("wayland")

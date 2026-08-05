@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::{Result, anyhow};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -6,6 +8,12 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 pub enum HotkeyEvent {
     Pressed,
     Released,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ObservedHotkeyEvent {
+    pub event: HotkeyEvent,
+    pub observed_at: Instant,
 }
 
 pub struct HotkeyService {
@@ -46,12 +54,15 @@ impl HotkeyService {
         Ok(())
     }
 
-    pub fn poll_events(&self) -> Vec<HotkeyEvent> {
+    pub fn poll_events(&self) -> Vec<ObservedHotkeyEvent> {
         let registered_id = self.hotkey.map(|hotkey| hotkey.id());
         let mut events = Vec::new();
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
             if let Some(event) = event_from_global(event, registered_id) {
-                events.push(event);
+                events.push(ObservedHotkeyEvent {
+                    event,
+                    observed_at: Instant::now(),
+                });
             }
         }
         events

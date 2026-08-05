@@ -76,6 +76,12 @@ enum RecordingSource {
     Playground,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriggerObservation {
+    AppAction,
+    HotkeyPoll,
+}
+
 struct ActiveRecording {
     session: RecordingSession,
     source: RecordingSource,
@@ -94,49 +100,96 @@ struct TrayUiState {
 #[derive(Clone, Debug)]
 struct LatencyTrace {
     activation_at: Instant,
+    trigger_observation: TriggerObservation,
+    overlay_visible_at: Option<Instant>,
     recorder_started_at: Option<Instant>,
+    model_load_started_at: Option<Instant>,
+    model_loaded_at: Option<Instant>,
+    first_partial_at: Option<Instant>,
     stop_requested_at: Option<Instant>,
     wav_finalized_at: Option<Instant>,
     transcription_dispatched_at: Option<Instant>,
-    transcription_completed_at: Option<Instant>,
+    transcription_job_completed_at: Option<Instant>,
+    final_text_ready_at: Option<Instant>,
     ui_result_at: Option<Instant>,
+    output_started_at: Option<Instant>,
+    target_activated_at: Option<Instant>,
     paste_completed_at: Option<Instant>,
+    output_completed_at: Option<Instant>,
 }
 
 impl LatencyTrace {
-    fn started_now() -> Self {
+    fn started_at(activation_at: Instant, trigger_observation: TriggerObservation) -> Self {
         Self {
-            activation_at: Instant::now(),
+            activation_at,
+            trigger_observation,
+            overlay_visible_at: None,
             recorder_started_at: None,
+            model_load_started_at: None,
+            model_loaded_at: None,
+            first_partial_at: None,
             stop_requested_at: None,
             wav_finalized_at: None,
             transcription_dispatched_at: None,
-            transcription_completed_at: None,
+            transcription_job_completed_at: None,
+            final_text_ready_at: None,
             ui_result_at: None,
+            output_started_at: None,
+            target_activated_at: None,
             paste_completed_at: None,
+            output_completed_at: None,
         }
     }
 
     fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        let trigger_label = match self.trigger_observation {
+            TriggerObservation::AppAction => "App action",
+            TriggerObservation::HotkeyPoll => "Hotkey dequeued",
+        };
+        if let Some(duration) = duration_between(Some(self.activation_at), self.overlay_visible_at)
+        {
+            lines.push(format!("{trigger_label} to overlay visible: {duration}"));
+        }
         if let Some(duration) = duration_between(Some(self.activation_at), self.recorder_started_at)
         {
-            lines.push(format!("Activation to recorder ready: {duration}"));
+            lines.push(format!("{trigger_label} to recorder ready: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.model_load_started_at, self.model_loaded_at) {
+            lines.push(format!("Model load: {duration}"));
+        }
+        if let Some(duration) = duration_between(Some(self.activation_at), self.first_partial_at) {
+            lines.push(format!("{trigger_label} to first partial: {duration}"));
         }
         if let Some(duration) = duration_between(self.stop_requested_at, self.wav_finalized_at) {
             lines.push(format!("Stop to WAV finalized: {duration}"));
         }
         if let Some(duration) = duration_between(
             self.transcription_dispatched_at,
-            self.transcription_completed_at,
+            self.transcription_job_completed_at,
         ) {
             lines.push(format!("Transcription job: {duration}"));
         }
-        if let Some(duration) = duration_between(self.transcription_completed_at, self.ui_result_at)
+        if let Some(duration) = duration_between(self.stop_requested_at, self.final_text_ready_at) {
+            lines.push(format!("Stop to final text: {duration}"));
+        }
+        if let Some(duration) =
+            duration_between(self.transcription_job_completed_at, self.ui_result_at)
         {
             lines.push(format!("STT done to UI update: {duration}"));
         }
-        if let Some(duration) = duration_between(self.ui_result_at, self.paste_completed_at) {
+        if let Some(duration) = duration_between(self.output_started_at, self.target_activated_at) {
+            lines.push(format!("Output start to target activation: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.target_activated_at, self.paste_completed_at)
+        {
+            lines.push(format!("Target activation to paste: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.final_text_ready_at, self.paste_completed_at)
+        {
+            lines.push(format!("Final text ready to paste complete: {duration}"));
+        }
+        if let Some(duration) = duration_between(self.output_started_at, self.output_completed_at) {
             lines.push(format!("Focused-app output: {duration}"));
         }
         if let Some(duration) =
@@ -148,9 +201,10 @@ impl LatencyTrace {
     }
 
     fn final_observed_instant(&self) -> Option<Instant> {
-        self.paste_completed_at
+        self.output_completed_at
+            .or(self.paste_completed_at)
             .or(self.ui_result_at)
-            .or(self.transcription_completed_at)
+            .or(self.transcription_job_completed_at)
             .or(self.wav_finalized_at)
             .or(self.stop_requested_at)
             .or(self.recorder_started_at)
@@ -1195,6 +1249,15 @@ impl LocalTranscriberApp {
     }
 
     fn start_recording(&mut self, source: RecordingSource) {
+        self.start_recording_at(source, Instant::now(), TriggerObservation::AppAction);
+    }
+
+    fn start_recording_at(
+        &mut self,
+        source: RecordingSource,
+        activation_at: Instant,
+        trigger_observation: TriggerObservation,
+    ) {
         if self.active_recording.is_some() {
             return;
         }
@@ -1205,7 +1268,7 @@ impl LocalTranscriberApp {
             self.status_message = message;
             return;
         }
-        let mut latency = LatencyTrace::started_now();
+        let mut latency = LatencyTrace::started_at(activation_at, trigger_observation);
 
         if source == RecordingSource::Transcribe {
             let Some(model) = self.selected_model() else {
@@ -1263,10 +1326,22 @@ impl LocalTranscriberApp {
     }
 
     fn toggle_recording(&mut self) {
+        self.toggle_recording_at(Instant::now(), TriggerObservation::AppAction);
+    }
+
+    fn toggle_recording_at(
+        &mut self,
+        activation_at: Instant,
+        trigger_observation: TriggerObservation,
+    ) {
         if self.active_recording.is_some() {
             self.stop_recording();
         } else {
-            self.start_recording(RecordingSource::Transcribe);
+            self.start_recording_at(
+                RecordingSource::Transcribe,
+                activation_at,
+                trigger_observation,
+            );
         }
     }
 
@@ -1306,17 +1381,21 @@ impl LocalTranscriberApp {
     }
 
     fn poll_hotkey(&mut self) {
-        for event in self.hotkey_service.poll_events() {
+        for observed in self.hotkey_service.poll_events() {
             match hotkey_recording_action(
                 self.config.hotkey_mode,
-                event,
+                observed.event,
                 self.active_recording.as_ref().map(|active| active.source),
             ) {
-                Some(HotkeyRecordingAction::StartTranscribe) => {
-                    self.start_recording(RecordingSource::Transcribe)
-                }
+                Some(HotkeyRecordingAction::StartTranscribe) => self.start_recording_at(
+                    RecordingSource::Transcribe,
+                    observed.observed_at,
+                    TriggerObservation::HotkeyPoll,
+                ),
                 Some(HotkeyRecordingAction::Stop) => self.stop_recording(),
-                Some(HotkeyRecordingAction::Toggle) => self.toggle_recording(),
+                Some(HotkeyRecordingAction::Toggle) => {
+                    self.toggle_recording_at(observed.observed_at, TriggerObservation::HotkeyPoll)
+                }
                 None => {}
             }
         }
@@ -1441,12 +1520,19 @@ impl LocalTranscriberApp {
                                 stderr_bytes
                             );
                             if self.config.auto_insert_transcript {
+                                if let Some(latency) = latency.as_mut() {
+                                    latency.output_started_at = Some(Instant::now());
+                                }
                                 let output_result = text_output::write_to_focused_app(
                                     &self.transcript,
                                     &self.config,
                                 );
                                 if let Some(latency) = latency.as_mut() {
-                                    latency.paste_completed_at = Some(Instant::now());
+                                    let completed_at = Instant::now();
+                                    if output_result == text_output::TextOutputResult::Inserted {
+                                        latency.paste_completed_at = Some(completed_at);
+                                    }
+                                    latency.output_completed_at = Some(completed_at);
                                 }
                                 self.status_message = format!(
                                     "{completion_message}. {}",
@@ -1664,11 +1750,13 @@ impl LocalTranscriberApp {
 
         thread::spawn(move || {
             let result = stt::transcribe_with_config(&config, audio_path.clone(), model.clone());
-            latency.transcription_completed_at = Some(Instant::now());
+            let completed_at = Instant::now();
+            latency.transcription_job_completed_at = Some(completed_at);
             let _ = fs::remove_file(&audio_path);
 
             match result {
                 Ok(result) => {
+                    latency.final_text_ready_at = Some(completed_at);
                     let _ = tx.send(AppEvent::TranscriptionDone {
                         source: RecordingSource::Transcribe,
                         result,
@@ -5930,26 +6018,76 @@ mod layout_tests {
         let base = Instant::now();
         let trace = LatencyTrace {
             activation_at: base,
+            trigger_observation: TriggerObservation::AppAction,
+            overlay_visible_at: None,
             recorder_started_at: Some(base + Duration::from_millis(10)),
+            model_load_started_at: Some(base + Duration::from_millis(20)),
+            model_loaded_at: Some(base + Duration::from_millis(70)),
+            first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
             wav_finalized_at: Some(base + Duration::from_millis(140)),
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
-            transcription_completed_at: Some(base + Duration::from_millis(650)),
+            transcription_job_completed_at: Some(base + Duration::from_millis(650)),
+            final_text_ready_at: Some(base + Duration::from_millis(650)),
             ui_result_at: Some(base + Duration::from_millis(660)),
+            output_started_at: Some(base + Duration::from_millis(660)),
+            target_activated_at: None,
             paste_completed_at: Some(base + Duration::from_millis(735)),
+            output_completed_at: Some(base + Duration::from_millis(735)),
         };
 
         assert_eq!(
             trace.summary_lines(),
             vec![
-                "Activation to recorder ready: 10 ms",
+                "App action to recorder ready: 10 ms",
+                "Model load: 50 ms",
                 "Stop to WAV finalized: 40 ms",
                 "Transcription job: 500 ms",
+                "Stop to final text: 550 ms",
                 "STT done to UI update: 10 ms",
+                "Final text ready to paste complete: 85 ms",
                 "Focused-app output: 75 ms",
                 "Total observed: 735 ms",
             ]
         );
+    }
+
+    #[test]
+    fn failed_transcription_has_no_final_text_or_paste_metric() {
+        let base = Instant::now();
+        let trace = LatencyTrace {
+            activation_at: base,
+            trigger_observation: TriggerObservation::HotkeyPoll,
+            overlay_visible_at: None,
+            recorder_started_at: Some(base + Duration::from_millis(10)),
+            model_load_started_at: None,
+            model_loaded_at: None,
+            first_partial_at: None,
+            stop_requested_at: Some(base + Duration::from_millis(100)),
+            wav_finalized_at: Some(base + Duration::from_millis(140)),
+            transcription_dispatched_at: Some(base + Duration::from_millis(150)),
+            transcription_job_completed_at: Some(base + Duration::from_millis(650)),
+            final_text_ready_at: None,
+            ui_result_at: Some(base + Duration::from_millis(660)),
+            output_started_at: None,
+            target_activated_at: None,
+            paste_completed_at: None,
+            output_completed_at: None,
+        };
+
+        let summary = trace.summary_lines();
+        assert!(
+            summary
+                .iter()
+                .any(|line| line == "Hotkey dequeued to recorder ready: 10 ms")
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line == "Transcription job: 500 ms")
+        );
+        assert!(!summary.iter().any(|line| line.contains("final text")));
+        assert!(!summary.iter().any(|line| line.contains("paste")));
     }
 
     #[test]
