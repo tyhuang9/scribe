@@ -42,6 +42,18 @@ pub(crate) struct RecordingSettingsView {
     pub endpoint_silence_ms: u32,
     pub pre_roll_ms: u32,
     pub post_roll_ms: u32,
+    pub streaming_label: String,
+    pub acceleration_label: String,
+    pub gpu_available: bool,
+    pub overlay_position_label: String,
+    pub debug_mode: bool,
+    pub history_mode_label: String,
+    pub history_locked: bool,
+    pub max_history_entries: u32,
+    pub transcript_retention_days: Option<u32>,
+    pub audio_retention_days: Option<u32>,
+    pub store_application_identity: bool,
+    pub diagnostics: Vec<String>,
     pub save_state: SettingsSaveState,
 }
 
@@ -73,6 +85,18 @@ impl Default for RecordingSettingsView {
             endpoint_silence_ms: 900,
             pre_roll_ms: 250,
             post_roll_ms: 200,
+            streaming_label: "Auto".into(),
+            acceleration_label: "Auto".into(),
+            gpu_available: false,
+            overlay_position_label: "Bottom".into(),
+            debug_mode: false,
+            history_mode_label: "Off".into(),
+            history_locked: false,
+            max_history_entries: 100,
+            transcript_retention_days: None,
+            audio_retention_days: None,
+            store_application_identity: false,
+            diagnostics: Vec::new(),
             save_state: SettingsSaveState::Clean,
         }
     }
@@ -122,6 +146,15 @@ pub(crate) enum ScreenAction {
     SetEndpointSilenceMs(u32),
     SetPreRollMs(u32),
     SetPostRollMs(u32),
+    SetStreamingMode(String),
+    SetAcceleration(String),
+    SetOverlayPosition(String),
+    SetDebugMode(bool),
+    SetHistoryMode(String),
+    SetMaxHistoryEntries(u32),
+    SetTranscriptRetentionDays(Option<u32>),
+    SetAudioRetentionDays(Option<u32>),
+    SetStoreApplicationIdentity(bool),
 }
 
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
@@ -1235,10 +1268,15 @@ fn recording_settings_panel(
                     ("Pre-roll ms", settings.pre_roll_ms, 3),
                     ("Post-roll ms", settings.post_roll_ms, 4),
                 ] {
-                    setting_row(ui, label, |ui| {
+                    ui.horizontal(|ui| {
+                        let label_response = ui.add_sized(
+                            [270.0, 40.0],
+                            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+                        );
                         let mut edited = value as i64;
                         if ui
                             .add(egui::DragValue::new(&mut edited).clamp_range(0..=5_000))
+                            .labelled_by(label_response.id)
                             .changed()
                         {
                             *action = match action_for {
@@ -1250,6 +1288,9 @@ fn recording_settings_panel(
                             };
                         }
                     });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                 }
             }
         });
@@ -1459,6 +1500,133 @@ fn advanced_settings_panel(
             .color(ui_palette(ui).muted_text),
         );
     });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Live transcription").strong());
+        let mut streaming = settings.streaming_label.clone();
+        setting_row(ui, "Mode", |ui| {
+            ComboBox::from_id_source("streaming-mode")
+                .selected_text(&streaming)
+                .show_ui(ui, |ui| {
+                    for value in ["Auto", "Rolling preview", "Final text only"] {
+                        ui.selectable_value(&mut streaming, value.to_owned(), value);
+                    }
+                });
+        });
+        if streaming != settings.streaming_label {
+            *action = ScreenAction::SetStreamingMode(streaming);
+        }
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Performance").strong());
+        let mut acceleration = settings.acceleration_label.clone();
+        setting_row(ui, "Transcription device", |ui| {
+            ComboBox::from_id_source("advanced-transcription-device-mode")
+                .selected_text(&acceleration)
+                .show_ui(ui, |ui| {
+                    for value in ["Auto", "GPU", "CPU only"] {
+                        ui.add_enabled_ui(value != "GPU" || settings.gpu_available, |ui| {
+                            ui.selectable_value(&mut acceleration, value.to_owned(), value);
+                        });
+                    }
+                });
+        });
+        if acceleration != settings.acceleration_label {
+            *action = ScreenAction::SetAcceleration(acceleration);
+        }
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Overlay").strong());
+        let mut position = settings.overlay_position_label.clone();
+        setting_row(ui, "Overlay position", |ui| {
+            ComboBox::from_id_source("overlay-position")
+                .selected_text(&position)
+                .show_ui(ui, |ui| {
+                    for value in ["Top", "Bottom"] {
+                        ui.selectable_value(&mut position, value.to_owned(), value);
+                    }
+                });
+        });
+        if position != settings.overlay_position_label {
+            *action = ScreenAction::SetOverlayPosition(position);
+        }
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("History and privacy").strong());
+        if settings.history_locked {
+            ui.label(
+                RichText::new(
+                    "History retention is locked while a retained-audio retry owns its row.",
+                )
+                .color(ui_palette(ui).warning),
+            );
+        }
+        ui.add_enabled_ui(!settings.history_locked, |ui| {
+            let mut mode = settings.history_mode_label.clone();
+            setting_row(ui, "History storage", |ui| { ComboBox::from_id_source("history-storage-mode").selected_text(&mode).show_ui(ui, |ui| { for value in ["Off", "Transcript only", "Transcript and audio"] { ui.selectable_value(&mut mode, value.to_owned(), value); } }); });
+            if mode != settings.history_mode_label { *action = ScreenAction::SetHistoryMode(mode.clone()); }
+            if mode != "Off" {
+                let mut maximum = settings.max_history_entries as i64;
+                setting_row(ui, "Maximum unpinned entries", |ui| { if ui.add(egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
+                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, action, ScreenAction::SetTranscriptRetentionDays);
+                if mode == "Transcript and audio" {
+                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, action, ScreenAction::SetAudioRetentionDays);
+                }
+                let mut identity = settings.store_application_identity;
+                if ui.checkbox(&mut identity, "Store coarse application identity with new entries").on_hover_text("Stores only a coarse local application label, never a window title or document name.").changed() { *action = ScreenAction::SetStoreApplicationIdentity(identity); }
+            }
+        });
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Developer").strong());
+        let mut enabled = settings.debug_mode;
+        if ui
+            .checkbox(&mut enabled, "Enable local model Playground")
+            .changed()
+        {
+            *action = ScreenAction::SetDebugMode(enabled);
+        }
+    });
+    if !settings.diagnostics.is_empty() {
+        ui.add_space(16.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Diagnostics").strong());
+            for line in &settings.diagnostics {
+                ui.label(line);
+            }
+        });
+    }
+}
+
+fn optional_retention_control(
+    ui: &mut egui::Ui,
+    label: &str,
+    unlimited_label: &str,
+    configured_days: Option<u32>,
+    action: &mut ScreenAction,
+    update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
+) {
+    let mut limited = configured_days.is_some();
+    if ui.checkbox(&mut limited, label).changed() {
+        *action = update(limited.then_some(configured_days.unwrap_or(30)));
+    }
+    if limited {
+        let mut days = configured_days.unwrap_or(30) as i64;
+        setting_row(ui, "Days", |ui| {
+            if ui
+                .add(egui::DragValue::new(&mut days).clamp_range(1..=3_650))
+                .changed()
+            {
+                *action = update(Some(days as u32));
+            }
+        });
+    } else {
+        ui.label(RichText::new(unlimited_label).color(ui_palette(ui).muted_text));
+    }
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
@@ -1860,6 +2028,46 @@ mod tests {
                     node.name() == Some("Finish recording before changing recording settings.")
                 })
         );
+    }
+
+    #[test]
+    fn advanced_tab_exposes_history_privacy_and_developer_controls() {
+        let settings_view = RecordingSettingsView {
+            history_mode_label: "Transcript and audio".into(),
+            max_history_entries: 250,
+            transcript_retention_days: Some(90),
+            audio_retention_days: Some(30),
+            diagnostics: vec!["Tray integration is unavailable in this desktop session.".into()],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(
+                    ui,
+                    SettingsTab::Advanced,
+                    &TranscriptionState::default(),
+                    &settings_view,
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        for name in [
+            "History and privacy",
+            "History storage",
+            "Maximum unpinned entries",
+            "Transcript age limit",
+            "Audio age limit",
+            "Store coarse application identity with new entries",
+            "Enable local model Playground",
+            "Diagnostics",
+        ] {
+            assert!(
+                nodes.iter().any(|(_, node)| node.name() == Some(name)),
+                "missing {name}"
+            );
+        }
     }
 
     #[test]

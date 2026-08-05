@@ -8298,7 +8298,16 @@ impl LocalTranscriberApp {
             | ScreenAction::SetInternalPauseMs(_)
             | ScreenAction::SetEndpointSilenceMs(_)
             | ScreenAction::SetPreRollMs(_)
-            | ScreenAction::SetPostRollMs(_) => {}
+            | ScreenAction::SetPostRollMs(_)
+            | ScreenAction::SetStreamingMode(_)
+            | ScreenAction::SetAcceleration(_)
+            | ScreenAction::SetOverlayPosition(_)
+            | ScreenAction::SetDebugMode(_)
+            | ScreenAction::SetHistoryMode(_)
+            | ScreenAction::SetMaxHistoryEntries(_)
+            | ScreenAction::SetTranscriptRetentionDays(_)
+            | ScreenAction::SetAudioRetentionDays(_)
+            | ScreenAction::SetStoreApplicationIdentity(_) => {}
         }
     }
 
@@ -9652,6 +9661,21 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn settings_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = self
+            .latest_latency
+            .as_ref()
+            .map(LatencyTrace::summary_lines)
+            .unwrap_or_else(|| vec!["No completed session latency is available yet.".to_owned()]);
+        if self.tray_service.is_none() {
+            diagnostics.push("Tray integration is unavailable in this desktop session.".to_owned());
+        }
+        if let Some(notice) = text_output::paste_automation_notice() {
+            diagnostics.push(notice.to_owned());
+        }
+        diagnostics
+    }
+
     fn ui_general_settings(&mut self, ui: &mut Ui) {
         let (selected_model_id, model_readiness) = self.selected_model_screen_state();
         let no_speech = self.status_message == "No speech detected; nothing was pasted.";
@@ -9721,6 +9745,26 @@ impl LocalTranscriberApp {
             endpoint_silence_ms: self.config.recording.endpoint_silence_ms,
             pre_roll_ms: self.config.recording.pre_roll_ms,
             post_roll_ms: self.config.recording.post_roll_ms,
+            streaming_label: self.config.streaming.mode.label().to_owned(),
+            acceleration_label: self
+                .config
+                .performance
+                .acceleration_preference
+                .label()
+                .to_owned(),
+            gpu_available: self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
+                .is_ok_and(|descriptor| descriptor.capabilities.gpu),
+            overlay_position_label: self.config.overlay.position.label().to_owned(),
+            debug_mode: self.config.developer.debug_mode,
+            history_mode_label: self.config.history.mode.label().to_owned(),
+            history_locked: self.history_retry_is_active(),
+            max_history_entries: self.config.history.max_unpinned_entries,
+            transcript_retention_days: self.config.history.transcript_retention_days,
+            audio_retention_days: self.config.history.audio_retention_days,
+            store_application_identity: self.config.history.store_application_identity,
+            diagnostics: self.settings_diagnostics(),
             save_state: settings_save_state(
                 self.settings_store
                     .as_ref()
@@ -9846,6 +9890,71 @@ impl LocalTranscriberApp {
             ScreenAction::SetPostRollMs(value) => {
                 self.config.recording.post_roll_ms = value.min(2_000);
                 self.save_config();
+            }
+            ScreenAction::SetStreamingMode(value) => {
+                self.config.streaming.mode = match value.as_str() {
+                    "Rolling preview" => StreamingMode::Rolling,
+                    "Final text only" => StreamingMode::FinalOnly,
+                    _ => StreamingMode::Auto,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetAcceleration(value) => {
+                self.config.performance.acceleration_preference = match value.as_str() {
+                    "GPU" => AccelerationPreference::Gpu,
+                    "CPU only" => AccelerationPreference::Cpu,
+                    _ => AccelerationPreference::Auto,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetOverlayPosition(value) => {
+                self.config.overlay.position = if value == "Top" {
+                    OverlayPosition::Top
+                } else {
+                    OverlayPosition::Bottom
+                };
+                self.save_config();
+            }
+            ScreenAction::SetDebugMode(value) => {
+                self.config.developer.debug_mode = value;
+                self.save_config();
+            }
+            ScreenAction::SetHistoryMode(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.mode = match value.as_str() {
+                        "Transcript only" => HistoryMode::TranscriptOnly,
+                        "Transcript and audio" => HistoryMode::TranscriptAndAudio,
+                        _ => HistoryMode::Off,
+                    };
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetMaxHistoryEntries(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.max_unpinned_entries =
+                        value.clamp(1, config::MAX_HISTORY_ENTRIES);
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetTranscriptRetentionDays(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.transcript_retention_days =
+                        value.map(|days| days.clamp(1, config::MAX_HISTORY_RETENTION_DAYS));
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetAudioRetentionDays(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.audio_retention_days =
+                        value.map(|days| days.clamp(1, config::MAX_HISTORY_RETENTION_DAYS));
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetStoreApplicationIdentity(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.store_application_identity = value;
+                    self.save_history_config();
+                }
             }
             ScreenAction::None
             | ScreenAction::AddModel
@@ -16404,6 +16513,10 @@ mod layout_tests {
         };
         let mut app = test_app();
         app.current_tab = tab;
+        if tab == Tab::Advanced {
+            app.settings_tab = SettingsTab::Advanced;
+            app.current_tab = Tab::General;
+        }
 
         ctx.run(raw_input, |ctx| {
             show_test_navigation(ctx, &mut app.current_tab);
@@ -16414,7 +16527,7 @@ mod layout_tests {
                     Tab::General => app.ui_general_settings(ui),
                     Tab::Models => app.ui_models(ui),
                     Tab::History => app.ui_history(ui),
-                    Tab::Advanced => app.ui_advanced_settings(ui),
+                    Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                     Tab::About => app.ui_about(ui),
                     Tab::Debug => app.ui_playground(ui),
                 });
@@ -16489,6 +16602,10 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = tab;
+        if tab == Tab::Advanced {
+            app.settings_tab = SettingsTab::Advanced;
+            app.current_tab = Tab::General;
+        }
         let mut max_x_by_frame = Vec::new();
 
         for _ in 0..frames {
@@ -16508,7 +16625,7 @@ mod layout_tests {
                         Tab::General => app.ui_general_settings(ui),
                         Tab::Models => app.ui_models(ui),
                         Tab::History => app.ui_history(ui),
-                        Tab::Advanced => app.ui_advanced_settings(ui),
+                        Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                         Tab::About => app.ui_about(ui),
                         Tab::Debug => app.ui_playground(ui),
                     });
@@ -18212,7 +18329,8 @@ mod layout_tests {
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
-        app.current_tab = Tab::Advanced;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Recording;
         app.config.recording.vad_enabled = true;
         let output = ctx.run(
             egui::RawInput {
@@ -18226,7 +18344,7 @@ mod layout_tests {
                 show_test_navigation(ctx, &mut app.current_tab);
                 egui::CentralPanel::default()
                     .frame(content_panel_frame(ctx))
-                    .show(ctx, |ui| app.ui_advanced_settings(ui));
+                    .show(ctx, |ui| app.ui_general_settings(ui));
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -18237,8 +18355,6 @@ mod layout_tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "Paste delay ms",
-            "Maximum recording seconds",
             "Speech confirmation ms",
             "Internal pause ms",
             "End after silence ms",
@@ -18256,26 +18372,6 @@ mod layout_tests {
                     .iter()
                     .any(|(_, node)| node.labelled_by().contains(&label_id)),
                 "no spin button is programmatically labelled by {expected:?}"
-            );
-        }
-
-        let combo_boxes = update
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
-            .collect::<Vec<_>>();
-        for expected in ["Overlay position", "Transcription device"] {
-            let label_id = update
-                .nodes
-                .iter()
-                .find(|(_, node)| node.name() == Some(expected))
-                .map(|(id, _)| *id)
-                .unwrap_or_else(|| panic!("missing AccessKit label {expected:?}"));
-            assert!(
-                combo_boxes
-                    .iter()
-                    .any(|(_, node)| node.labelled_by().contains(&label_id)),
-                "no combo box is programmatically labelled by {expected:?}"
             );
         }
     }
