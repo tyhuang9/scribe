@@ -9801,17 +9801,19 @@ impl LocalTranscriberApp {
             ScreenAction::ApplyHotkey => self.apply_hotkey(),
             ScreenAction::SetTheme(value) => {
                 self.config.general.theme_mode = match value.as_str() {
+                    "Light" => ThemeMode::Light,
                     "Dark" => ThemeMode::Dark,
                     "System" => ThemeMode::System,
-                    _ => ThemeMode::Light,
+                    _ => return,
                 };
                 self.save_config();
             }
             ScreenAction::SetOverlayMode(value) => {
                 self.config.overlay.mode = match value.as_str() {
+                    "Live" => OverlayMode::Live,
                     "Minimal" => OverlayMode::Minimal,
                     "Off" => OverlayMode::Off,
-                    _ => OverlayMode::Live,
+                    _ => return,
                 };
                 self.save_config();
             }
@@ -9899,25 +9901,27 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetStreamingMode(value) => {
                 self.config.streaming.mode = match value.as_str() {
+                    "Auto" => StreamingMode::Auto,
                     "Rolling preview" => StreamingMode::Rolling,
                     "Final text only" => StreamingMode::FinalOnly,
-                    _ => StreamingMode::Auto,
+                    _ => return,
                 };
                 self.save_config();
             }
             ScreenAction::SetAcceleration(value) => {
                 self.config.performance.acceleration_preference = match value.as_str() {
+                    "Auto" => AccelerationPreference::Auto,
                     "GPU" => AccelerationPreference::Gpu,
                     "CPU only" => AccelerationPreference::Cpu,
-                    _ => AccelerationPreference::Auto,
+                    _ => return,
                 };
                 self.save_config();
             }
             ScreenAction::SetOverlayPosition(value) => {
-                self.config.overlay.position = if value == "Top" {
-                    OverlayPosition::Top
-                } else {
-                    OverlayPosition::Bottom
+                self.config.overlay.position = match value.as_str() {
+                    "Top" => OverlayPosition::Top,
+                    "Bottom" => OverlayPosition::Bottom,
+                    _ => return,
                 };
                 self.save_config();
             }
@@ -9932,9 +9936,10 @@ impl LocalTranscriberApp {
             ScreenAction::SetHistoryMode(value) => {
                 if !self.history_retry_is_active() {
                     self.config.history.mode = match value.as_str() {
+                        "Off" => HistoryMode::Off,
                         "Transcript only" => HistoryMode::TranscriptOnly,
                         "Transcript and audio" => HistoryMode::TranscriptAndAudio,
-                        _ => HistoryMode::Off,
+                        _ => return,
                     };
                     self.save_history_config();
                 }
@@ -16965,6 +16970,38 @@ mod layout_tests {
                 "handy-computer/large"
             ]
         );
+    }
+
+    #[test]
+    fn unknown_settings_labels_are_no_ops() {
+        let mut app = test_app();
+        app.config.general.theme_mode = ThemeMode::Dark;
+        app.config.overlay.mode = OverlayMode::Minimal;
+        app.config.streaming.mode = StreamingMode::Rolling;
+        app.config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        app.config.overlay.position = OverlayPosition::Top;
+        app.config.history.mode = HistoryMode::TranscriptAndAudio;
+
+        for action in [
+            ScreenAction::SetTheme("unknown".into()),
+            ScreenAction::SetOverlayMode("unknown".into()),
+            ScreenAction::SetStreamingMode("unknown".into()),
+            ScreenAction::SetAcceleration("unknown".into()),
+            ScreenAction::SetOverlayPosition("unknown".into()),
+            ScreenAction::SetHistoryMode("unknown".into()),
+        ] {
+            app.apply_settings_screen_action(action);
+        }
+
+        assert_eq!(app.config.general.theme_mode, ThemeMode::Dark);
+        assert_eq!(app.config.overlay.mode, OverlayMode::Minimal);
+        assert_eq!(app.config.streaming.mode, StreamingMode::Rolling);
+        assert_eq!(
+            app.config.performance.acceleration_preference,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(app.config.overlay.position, OverlayPosition::Top);
+        assert_eq!(app.config.history.mode, HistoryMode::TranscriptAndAudio);
     }
 
     #[test]
