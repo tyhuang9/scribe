@@ -25,8 +25,10 @@ pub(crate) struct ThemePalette {
     pub success_text: Color32,
     pub warning: Color32,
     pub error: Color32,
-    /// Accessible error copy on `error_pale`; use `error` for recording and danger fills.
+    /// Accessible error copy on `error_pale`.
     pub error_text: Color32,
+    /// Foreground used on the solid danger fill.
+    pub danger_button_text: Color32,
     pub error_pale: Color32,
     pub error_border: Color32,
     pub neutral_notice_text: Color32,
@@ -68,6 +70,7 @@ impl ThemePalette {
             warning: Color32::from_rgb(146, 64, 14),
             error: Color32::from_rgb(217, 45, 32),
             error_text: Color32::from_rgb(151, 27, 31),
+            danger_button_text: Color32::WHITE,
             error_pale: Color32::from_rgb(254, 228, 226),
             error_border: Color32::from_rgb(253, 162, 155),
             neutral_notice_text: Color32::from_rgb(71, 84, 103),
@@ -101,6 +104,7 @@ impl ThemePalette {
             warning: Color32::from_rgb(251, 191, 36),
             error: Color32::from_rgb(248, 113, 113),
             error_text: Color32::from_rgb(254, 202, 202),
+            danger_button_text: Color32::from_rgb(17, 19, 24),
             error_pale: Color32::from_rgb(77, 33, 36),
             error_border: Color32::from_rgb(153, 62, 65),
             neutral_notice_text: Color32::from_rgb(196, 205, 217),
@@ -129,8 +133,17 @@ mod tests {
         assert!(contrast_ratio(palette.success_text, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.warning, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
+        assert!(contrast_ratio(palette.danger_button_text, palette.error) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.card_bg) >= 4.5);
         assert!(contrast_ratio(palette.tertiary_text, palette.content_bg) >= 4.5);
+    }
+
+    #[test]
+    fn dark_danger_notice_and_button_foregrounds_meet_aa() {
+        let palette = ThemePalette::dark();
+
+        assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
+        assert!(contrast_ratio(palette.danger_button_text, palette.error) >= 4.5);
     }
 
     fn contrast_ratio(a: Color32, b: Color32) -> f64 {

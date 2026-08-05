@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum SettingsTab {
     #[default]
     General,
@@ -60,7 +60,7 @@ pub(crate) enum MicrophonePermission {
     Denied,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum RecordingMode {
     #[default]
     PressOnce,
@@ -150,7 +150,16 @@ impl TranscriptionState {
                 self.phase = TranscriptionPhase::RequestingMicrophone;
                 self.notice = None;
             }
-            TranscriptionEvent::ModelRemoved => {
+            TranscriptionEvent::ModelRemoved
+                if matches!(
+                    self.phase,
+                    TranscriptionPhase::Ready
+                        | TranscriptionPhase::NoSpeech
+                        | TranscriptionPhase::MicrophoneError
+                        | TranscriptionPhase::ModelError
+                        | TranscriptionPhase::NoModel
+                ) =>
+            {
                 self.selected_model_id = None;
                 self.provisional_transcript.clear();
                 self.phase = TranscriptionPhase::NoModel;
@@ -298,6 +307,27 @@ pub(crate) struct ModelComparisonState {
     pub results: Vec<(String, ComparisonResult)>,
 }
 
+impl ModelComparisonState {
+    pub(crate) fn can_start(&self) -> bool {
+        self.selected_model_ids.len() >= 2
+            && matches!(
+                self.phase,
+                ComparisonPhase::Idle | ComparisonPhase::Complete | ComparisonPhase::Error
+            )
+    }
+
+    pub(crate) fn begin(&mut self) -> bool {
+        if !self.can_start() {
+            return false;
+        }
+        self.phase = ComparisonPhase::Recording;
+        self.audio_duration_ms = None;
+        self.reference_transcript = None;
+        self.results.clear();
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SettingsSaveState {
     #[default]
@@ -406,6 +436,67 @@ mod tests {
             assert_eq!(state.phase, phase);
             assert_eq!(state.selected_model_id.as_deref(), Some("base.en"));
             assert_eq!(state.provisional_transcript, "keep this");
+        }
+    }
+
+    #[test]
+    fn model_removal_fails_closed_while_capture_or_model_loading_is_active() {
+        for phase in [
+            TranscriptionPhase::RequestingMicrophone,
+            TranscriptionPhase::Listening,
+            TranscriptionPhase::Finalizing,
+            TranscriptionPhase::ModelLoading,
+        ] {
+            let mut state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                provisional_transcript: "keep this".into(),
+                ..Default::default()
+            };
+
+            state.apply(TranscriptionEvent::ModelRemoved);
+
+            assert_eq!(state.phase, phase);
+            assert_eq!(state.selected_model_id.as_deref(), Some("base.en"));
+            assert_eq!(state.provisional_transcript, "keep this");
+        }
+    }
+
+    #[test]
+    fn comparison_rerun_requires_two_models_and_resets_previous_run() {
+        let mut comparison = ModelComparisonState {
+            phase: ComparisonPhase::Complete,
+            audio_duration_ms: Some(8_000),
+            reference_transcript: Some("old reference".into()),
+            results: vec![("base.en".into(), ComparisonResult::default())],
+            ..Default::default()
+        };
+        comparison.selected_model_ids.insert("base.en".into());
+        assert!(!comparison.can_start());
+        comparison.selected_model_ids.insert("tiny.en".into());
+        assert!(comparison.can_start());
+
+        assert!(comparison.begin());
+
+        assert_eq!(comparison.phase, ComparisonPhase::Recording);
+        assert_eq!(comparison.audio_duration_ms, None);
+        assert_eq!(comparison.reference_transcript, None);
+        assert!(comparison.results.is_empty());
+    }
+
+    #[test]
+    fn comparison_cannot_restart_while_busy() {
+        for phase in [ComparisonPhase::Recording, ComparisonPhase::Processing] {
+            let mut comparison = ModelComparisonState {
+                phase,
+                ..Default::default()
+            };
+            comparison
+                .selected_model_ids
+                .extend(["base.en".into(), "tiny.en".into()]);
+
+            assert!(!comparison.begin());
+            assert_eq!(comparison.phase, phase);
         }
     }
 

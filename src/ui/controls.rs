@@ -63,7 +63,7 @@ pub(crate) fn button(
             Stroke::new(1.0, colors.border_strong),
             colors.text,
         ),
-        ButtonTone::Danger => (colors.error, Stroke::NONE, Color32::WHITE),
+        ButtonTone::Danger => (colors.error, Stroke::NONE, colors.danger_button_text),
         ButtonTone::Text => (Color32::TRANSPARENT, Stroke::NONE, colors.text),
     };
     let response = ui.add(
@@ -103,7 +103,21 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Res
         builder.set_name(accessible_name);
     });
     paint_focus_ring(ui, &response, Rounding::same(5.0));
+    focus_tooltip(ui, &response, accessible_name);
     response.on_hover_text(accessible_name)
+}
+
+pub(crate) fn focus_tooltip(ui: &Ui, response: &Response, text: &str) {
+    if response.has_focus() {
+        egui::show_tooltip_for(
+            ui.ctx(),
+            response.id.with("focus-tooltip"),
+            &response.rect,
+            |ui| {
+                ui.label(text);
+            },
+        );
+    }
 }
 
 pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding) {

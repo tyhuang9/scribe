@@ -5,9 +5,7 @@ use eframe::egui::{
 };
 
 use super::{
-    controls::{
-        ButtonTone, Icon, badge, button, card, icon_glyph, keycap, notice, paint_focus_ring,
-    },
+    controls::{ButtonTone, Icon, badge, button, card, icon_glyph, keycap, paint_focus_ring},
     state::{
         ModelComparisonState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
         SettingsSaveState, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
@@ -213,13 +211,12 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
         } else {
         ui.add_space(16.0);
         if let Some(text) = &state.notice {
-            let response = notice(ui, text, state.phase == TranscriptionPhase::MicrophoneError);
-            ui.ctx().accesskit_node_builder(response.id, |builder| { builder.set_live(if state.phase == TranscriptionPhase::MicrophoneError { egui::accesskit::Live::Assertive } else { egui::accesskit::Live::Polite }); builder.set_live_atomic(); });
             if state.phase == TranscriptionPhase::MicrophoneError {
-                ui.horizontal(|ui| {
-                    if button(ui, "Open audio settings", ButtonTone::Text).clicked() { action = ScreenAction::OpenAudioSettings; }
-                    if button(ui, "Try again", ButtonTone::Secondary).clicked() { action = ScreenAction::RetryMicrophone; }
-                });
+                let alert_action = microphone_error_notice(ui, text);
+                if alert_action != ScreenAction::None { action = alert_action; }
+            } else {
+                let response = neutral_notice(ui, text);
+                ui.ctx().accesskit_node_builder(response.id, |builder| { builder.set_live(egui::accesskit::Live::Polite); builder.set_live_atomic(); });
             }
             ui.add_space(12.0);
         }
@@ -241,6 +238,81 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
         });
         }
     });
+    action
+}
+
+fn neutral_notice(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let colors = ui_palette(ui);
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
+        Frame::none()
+            .fill(colors.panel_bg)
+            .stroke(Stroke::new(1.0, colors.border))
+            .rounding(Rounding::same(5.0))
+            .inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(icon_glyph(Icon::Info))
+                            .size(18.0)
+                            .color(colors.neutral_notice_text),
+                    );
+                    ui.label(RichText::new(text).color(colors.neutral_notice_text));
+                });
+            });
+    })
+    .response
+}
+
+fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
+    let colors = ui_palette(ui);
+    let width = ui.available_width();
+    let mut action = ScreenAction::None;
+    let mut action_ids = Vec::new();
+    let alert =
+        ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
+            Frame::none()
+                .fill(colors.error_pale)
+                .stroke(Stroke::new(1.0, colors.error_border))
+                .rounding(Rounding::same(5.0))
+                .inner_margin(Margin::same(12.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(icon_glyph(Icon::MicrophoneOff))
+                                .size(18.0)
+                                .color(colors.error_text),
+                        );
+                        ui.label(RichText::new(text).color(colors.error_text));
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let open_settings = button(ui, "Open audio settings", ButtonTone::Text);
+                        action_ids.push(open_settings.id);
+                        if open_settings.clicked() {
+                            action = ScreenAction::OpenAudioSettings;
+                        }
+                        let retry = button(ui, "Try again", ButtonTone::Secondary);
+                        action_ids.push(retry.id);
+                        if retry.clicked() {
+                            action = ScreenAction::RetryMicrophone;
+                        }
+                    });
+                });
+        });
+    alert.response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, "Microphone access error")
+    });
+    ui.ctx()
+        .accesskit_node_builder(alert.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Alert);
+            builder.set_name("Microphone access error");
+            builder.set_live(egui::accesskit::Live::Assertive);
+            builder.set_live_atomic();
+            for id in &action_ids {
+                builder.push_controlled(id.value().into());
+            }
+        });
     action
 }
 
@@ -362,7 +434,7 @@ fn models(
                             .color(colors.muted_text),
                     );
                 });
-                if button(
+                let toggle = button(
                     ui,
                     icon_glyph(if comparison.expanded {
                         Icon::ChevronUp
@@ -371,8 +443,12 @@ fn models(
                     }),
                     ButtonTone::Text,
                 )
-                .clicked()
-                {
+                .on_hover_text(if comparison.expanded {
+                    "Collapse comparison"
+                } else {
+                    "Expand comparison"
+                });
+                if toggle.clicked() {
                     action = ScreenAction::ToggleComparison;
                 }
             });
@@ -390,13 +466,38 @@ fn models(
                             action = ScreenAction::ToggleComparisonModel(model.id.clone());
                         }
                     }
-                    if button(
-                        ui,
-                        format!("{}  Start test recording", icon_glyph(Icon::Microphone)),
-                        ButtonTone::Primary,
-                    )
-                    .clicked()
-                    {
+                    let start = ui.add_enabled(
+                        comparison.can_start(),
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "{}  Start test recording",
+                                icon_glyph(Icon::Microphone)
+                            ))
+                            .color(colors.primary_button_text),
+                        )
+                        .fill(colors.primary_button_bg)
+                        .min_size(Vec2::new(0.0, 40.0)),
+                    );
+                    ui.ctx().accesskit_node_builder(start.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Button);
+                        builder.set_name("Start test recording");
+                    });
+                    if !comparison.can_start() {
+                        ui.ctx().accesskit_node_builder(start.id, |builder| {
+                            builder.set_description(
+                                "Select at least two installed models before starting a comparison.",
+                            );
+                        });
+                        start.clone().on_hover_text(
+                            "Select at least two models before starting a comparison.",
+                        );
+                        ui.label(
+                            RichText::new("Select at least two models to start.")
+                                .small()
+                                .color(colors.muted_text),
+                        );
+                    }
+                    if start.clicked() {
                         action = ScreenAction::StartComparison;
                     }
                 });
@@ -508,78 +609,249 @@ fn settings(
         }
     });
     ui.add_space(20.0);
-    let tabs = ui.horizontal(|ui| {
-        for (tab, label) in [
-            (SettingsTab::General, "General"),
-            (SettingsTab::Recording, "Recording"),
-            (SettingsTab::Output, "Output"),
-            (SettingsTab::Advanced, "Advanced"),
-        ] {
-            let response = ui.selectable_label(tab == active_tab, label);
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Tab);
-                builder.set_name(label);
-                builder.set_selected(tab == active_tab);
-            });
-            paint_focus_ring(ui, &response, Rounding::same(2.0));
-            if response.clicked() {
-                action = ScreenAction::SetSettingsTab(tab);
-            }
-            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
-                action = ScreenAction::SetSettingsTab(next_tab(tab));
-            }
-            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
-                action = ScreenAction::SetSettingsTab(previous_tab(tab));
-            }
-        }
+    let mut tab_ids = Vec::new();
+    let mut tab_responses = Vec::new();
+    let mut focus_tab = None;
+    let tab_list_id = ui.make_persistent_id("settings-tab-list");
+    let ctx = ui.ctx().clone();
+    ctx.accesskit_node_builder(tab_list_id, |builder| {
+        builder.set_role(egui::accesskit::Role::TabList);
+        builder.set_name("Settings sections");
     });
-    ui.ctx()
-        .accesskit_node_builder(tabs.response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::TabList);
-            builder.set_name("Settings sections");
+    ctx.with_accessibility_parent(tab_list_id, || {
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (SettingsTab::General, "General"),
+                (SettingsTab::Recording, "Recording"),
+                (SettingsTab::Output, "Output"),
+                (SettingsTab::Advanced, "Advanced"),
+            ] {
+                let response = tab_control(ui, tab, label, tab == active_tab);
+                tab_ids.push((tab, response.id));
+                tab_responses.push((tab, response.clone()));
+                if response.clicked() {
+                    action = ScreenAction::SetSettingsTab(tab);
+                }
+            }
         });
+    });
+    if tab_responses
+        .iter()
+        .any(|(_, response)| response.has_focus())
+    {
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
+            focus_tab = Some(next_tab(active_tab));
+        } else if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
+            focus_tab = Some(previous_tab(active_tab));
+        }
+    }
+    if let Some(target) = focus_tab {
+        tab_responses
+            .iter()
+            .find(|(tab, _)| *tab == target)
+            .expect("settings tab target is rendered")
+            .1
+            .request_focus();
+        action = ScreenAction::SetSettingsTab(target);
+    }
     ui.separator();
     ui.add_space(16.0);
-    let panel = card(ui, |ui| {
+    let panel = ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 0.0),
+        Layout::top_down(Align::LEFT),
+        |ui| match active_tab {
+            SettingsTab::Recording => recording_settings_panel(ui, state, settings, &mut action),
+            SettingsTab::General => settings_placeholder(
+                ui,
+                "General settings",
+                "General settings are available in the production preferences view.",
+            ),
+            SettingsTab::Output => settings_placeholder(
+                ui,
+                "Output settings",
+                "Output settings are available in the production preferences view.",
+            ),
+            SettingsTab::Advanced => settings_placeholder(
+                ui,
+                "Advanced settings",
+                "Advanced settings are available in the production preferences view.",
+            ),
+        },
+    );
+    ui.ctx()
+        .accesskit_node_builder(panel.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::TabPanel);
+            builder.set_name(match active_tab {
+                SettingsTab::General => "General settings",
+                SettingsTab::Recording => "Recording settings",
+                SettingsTab::Output => "Output settings",
+                SettingsTab::Advanced => "Advanced settings",
+            });
+        });
+    let selected_tab_id = tab_ids
+        .iter()
+        .copied()
+        .find_map(|(tab, id)| (tab == active_tab).then_some(id))
+        .expect("selected settings tab is rendered");
+    for (_, tab_id) in tab_ids {
+        ui.ctx().accesskit_node_builder(tab_id, |builder| {
+            builder.push_controlled(panel.response.id.value().into());
+        });
+    }
+    ui.ctx()
+        .accesskit_node_builder(panel.response.id, |builder| {
+            builder.push_labelled_by(selected_tab_id.value().into());
+        });
+    action
+}
+
+fn tab_id(_: &egui::Ui, tab: SettingsTab) -> egui::Id {
+    egui::Id::new(("settings-tab", tab))
+}
+
+fn tab_control(ui: &mut egui::Ui, tab: SettingsTab, label: &str, selected: bool) -> egui::Response {
+    let colors = ui_palette(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 40.0), egui::Sense::hover());
+    let response = ui.interact(rect, tab_id(ui, tab), egui::Sense::click());
+    let fill = if selected {
+        colors.active_card_bg
+    } else if response.hovered() {
+        colors.panel_bg
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        colors.text,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Tab);
+        builder.set_name(label);
+        builder.set_selected(selected);
+    });
+    paint_focus_ring(ui, &response, Rounding::same(4.0));
+    response
+}
+
+fn radio_control(
+    ui: &mut egui::Ui,
+    mode: RecordingMode,
+    label: &str,
+    checked: bool,
+) -> egui::Response {
+    let colors = ui_palette(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(112.0, 40.0), egui::Sense::hover());
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("recording-mode", mode)),
+        egui::Sense::click(),
+    );
+    let fill = if checked {
+        colors.active_card_bg
+    } else if response.hovered() {
+        colors.panel_bg
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    ui.painter().circle_stroke(
+        rect.left_center() + Vec2::new(12.0, 0.0),
+        7.0,
+        Stroke::new(1.5, colors.muted_text),
+    );
+    if checked {
+        ui.painter().circle_filled(
+            rect.left_center() + Vec2::new(12.0, 0.0),
+            4.0,
+            colors.accent,
+        );
+    }
+    ui.painter().text(
+        rect.left_center() + Vec2::new(26.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        colors.text,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::RadioButton);
+        builder.set_name(label);
+        builder.set_checked(if checked {
+            egui::accesskit::Checked::True
+        } else {
+            egui::accesskit::Checked::False
+        });
+    });
+    paint_focus_ring(ui, &response, Rounding::same(4.0));
+    response
+}
+
+fn recording_settings_panel(
+    ui: &mut egui::Ui,
+    state: &TranscriptionState,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
+    let colors = ui_palette(ui);
+    card(ui, |ui| {
         ui.label(RichText::new("Recording behavior").strong());
         ui.add_space(12.0);
-        let mode_group = ui.horizontal(|ui| {
-            ui.add_sized(
-                [270.0, 40.0],
-                egui::Label::new(RichText::new("Mode").color(colors.muted_text)),
-            );
-            for (mode, label) in [
-                (RecordingMode::PressOnce, "Press once"),
-                (RecordingMode::Hold, "Hold"),
-            ] {
-                let response = ui.selectable_label(state.recording_mode == mode, label);
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::RadioButton);
-                    builder.set_name(label);
-                    builder.set_selected(state.recording_mode == mode);
-                });
-                if response.clicked() {
-                    action = ScreenAction::SetRecordingMode(mode);
-                }
-                if response.has_focus()
-                    && ui.input(|input| {
-                        input.key_pressed(egui::Key::ArrowRight)
-                            || input.key_pressed(egui::Key::ArrowLeft)
-                    })
-                {
-                    action = ScreenAction::SetRecordingMode(if mode == RecordingMode::PressOnce {
-                        RecordingMode::Hold
-                    } else {
-                        RecordingMode::PressOnce
-                    });
-                }
-            }
+        let mut radio_ids = Vec::new();
+        let radio_group_id = ui.make_persistent_id("recording-mode-group");
+        let ctx = ui.ctx().clone();
+        ctx.accesskit_node_builder(radio_group_id, |builder| {
+            builder.set_role(egui::accesskit::Role::RadioGroup);
+            builder.set_name("Recording mode");
         });
-        ui.ctx()
-            .accesskit_node_builder(mode_group.response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::RadioGroup);
-                builder.set_name("Recording mode");
+        ctx.with_accessibility_parent(radio_group_id, || {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [270.0, 40.0],
+                    egui::Label::new(RichText::new("Mode").color(colors.muted_text)),
+                );
+                for (mode, label) in [
+                    (RecordingMode::PressOnce, "Press once"),
+                    (RecordingMode::Hold, "Hold"),
+                ] {
+                    let response = radio_control(ui, mode, label, state.recording_mode == mode);
+                    radio_ids.push(response.id);
+                    if response.clicked() {
+                        *action = ScreenAction::SetRecordingMode(mode);
+                    }
+                    if response.has_focus()
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::ArrowRight)
+                                || input.key_pressed(egui::Key::ArrowLeft)
+                        })
+                    {
+                        let next = if mode == RecordingMode::PressOnce {
+                            RecordingMode::Hold
+                        } else {
+                            RecordingMode::PressOnce
+                        };
+                        ui.memory_mut(|memory| {
+                            memory.request_focus(ui.make_persistent_id(("recording-mode", next)))
+                        });
+                        *action = ScreenAction::SetRecordingMode(next);
+                    }
+                }
             });
+        });
+        let radio_group = radio_ids
+            .iter()
+            .map(|id| id.value().into())
+            .collect::<Vec<_>>();
+        for id in radio_ids {
+            ui.ctx().accesskit_node_builder(id, |builder| {
+                builder.set_radio_group(radio_group.clone());
+            });
+        }
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -595,7 +867,7 @@ fn settings(
             let mut enabled = settings.provisional_feedback;
             let response = ui.checkbox(&mut enabled, "Show provisional words while recording");
             if response.clicked() {
-                action = ScreenAction::ToggleProvisionalFeedback;
+                *action = ScreenAction::ToggleProvisionalFeedback;
             }
             ui.label(
                 RichText::new("Improves visual feedback but may use more CPU.")
@@ -603,10 +875,6 @@ fn settings(
                     .color(colors.muted_text),
             );
         });
-    });
-    ui.ctx().accesskit_node_builder(panel.id, |builder| {
-        builder.set_role(egui::accesskit::Role::TabPanel);
-        builder.set_name("Recording settings");
     });
     ui.add_space(16.0);
     card(ui, |ui| {
@@ -629,7 +897,7 @@ fn settings(
                 builder.set_name("Refresh devices");
             });
             if refresh.clicked() {
-                action = ScreenAction::RefreshDevices;
+                *action = ScreenAction::RefreshDevices;
             }
         });
         setting_row(ui, "Input level", |ui| {
@@ -651,11 +919,18 @@ fn settings(
                 keycap(ui, key);
             }
             if button(ui, "Change shortcut", ButtonTone::Secondary).clicked() {
-                action = ScreenAction::ChangeShortcut;
+                *action = ScreenAction::ChangeShortcut;
             }
         });
     });
-    action
+}
+
+fn settings_placeholder(ui: &mut egui::Ui, title: &str, message: &str) {
+    card(ui, |ui| {
+        ui.label(RichText::new(title).strong());
+        ui.add_space(8.0);
+        ui.label(RichText::new(message).color(ui_palette(ui).muted_text));
+    });
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
@@ -731,8 +1006,302 @@ fn size_label(tier: ModelSizeTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_route(route: UiRoute) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            ..Default::default()
+        };
+        let settings = RecordingSettingsView::default();
+        let comparison = ModelComparisonState::default();
+        ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route,
+                        transcription: &state,
+                        models: &[],
+                        comparison: &comparison,
+                        recording_settings: &settings,
+                    },
+                )
+            });
+        })
+    }
+
     #[test]
     fn elapsed_display_is_deterministic() {
         assert_eq!(format_elapsed(8_000), "00:08");
+    }
+
+    #[test]
+    fn microphone_error_alert_groups_message_and_recovery_actions() {
+        let mut state = TranscriptionState {
+            phase: TranscriptionPhase::MicrophoneError,
+            notice: Some("Scribe couldn’t access your microphone".into()),
+            ..Default::default()
+        };
+        state.selected_model_id = Some("base.en".into());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings = RecordingSettingsView::default();
+        let comparison = ModelComparisonState::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Transcribe,
+                        transcription: &state,
+                        models: &[],
+                        comparison: &comparison,
+                        recording_settings: &settings,
+                    },
+                )
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let alert = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Alert
+                    && node.name() == Some("Microphone access error")
+            })
+            .unwrap();
+        for name in ["Open audio settings", "Try again"] {
+            let button = nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
+                })
+                .unwrap();
+            assert!(
+                accesskit_descends_from(nodes, alert.0, button.0)
+                    || alert.1.controls().contains(&button.0)
+            );
+        }
+    }
+
+    fn accesskit_descends_from(
+        nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)],
+        ancestor: egui::accesskit::NodeId,
+        target: egui::accesskit::NodeId,
+    ) -> bool {
+        let mut pending = vec![ancestor];
+        while let Some(id) = pending.pop() {
+            let Some((_, node)) = nodes.iter().find(|(node_id, _)| *node_id == id) else {
+                continue;
+            };
+            if node.children().contains(&target) {
+                return true;
+            }
+            pending.extend(node.children());
+        }
+        false
+    }
+
+    #[test]
+    fn comparison_start_explains_its_two_model_requirement_when_disabled() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state = TranscriptionState::default();
+        let settings = RecordingSettingsView::default();
+        let comparison = ModelComparisonState {
+            expanded: true,
+            ..Default::default()
+        };
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &state,
+                        models: &[],
+                        comparison: &comparison,
+                        recording_settings: &settings,
+                    },
+                )
+            });
+        });
+        assert!(output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|(_, node)| {
+                node.name() == Some("Start test recording")
+                    && node.description()
+                        == Some("Select at least two installed models before starting a comparison.")
+            }));
+    }
+
+    #[test]
+    fn settings_panels_match_the_selected_tab() {
+        for (tab, expected, absent) in [
+            (
+                SettingsTab::General,
+                "General settings",
+                "Recording behavior",
+            ),
+            (
+                SettingsTab::Recording,
+                "Recording behavior",
+                "Output settings",
+            ),
+            (SettingsTab::Output, "Output settings", "Recording behavior"),
+            (
+                SettingsTab::Advanced,
+                "Advanced settings",
+                "Recording behavior",
+            ),
+        ] {
+            let output = render_route(UiRoute::Settings(tab));
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == egui::accesskit::Role::TabPanel
+                        && node.name()
+                            == Some(match tab {
+                                SettingsTab::General => "General settings",
+                                SettingsTab::Recording => "Recording settings",
+                                SettingsTab::Output => "Output settings",
+                                SettingsTab::Advanced => "Advanced settings",
+                            }))
+            );
+            assert!(nodes.iter().any(|(_, node)| node.name() == Some(expected)));
+            assert!(!nodes.iter().any(|(_, node)| node.name() == Some(absent)));
+        }
+    }
+
+    #[test]
+    fn custom_tabs_and_radios_have_only_their_native_selection_semantics() {
+        let output = render_route(UiRoute::Settings(SettingsTab::Recording));
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::TabList)
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::RadioGroup)
+        );
+        let selected_tab = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Tab
+                    && node.name() == Some("Recording")
+                    && node.is_selected() == Some(true)
+            })
+            .unwrap();
+        let panel = nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::TabPanel)
+            .unwrap();
+        assert!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Tab)
+                .all(|(_, node)| node.controls().contains(&panel.0))
+        );
+        assert!(panel.1.labelled_by().contains(&selected_tab.0));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::RadioButton
+                && node.name() == Some("Press once")
+                && node.checked() == Some(egui::accesskit::Checked::True)
+                && node.radio_group().len() == 2
+        }));
+    }
+
+    #[test]
+    fn repeated_arrow_keys_move_settings_tab_selection_and_focus() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state = TranscriptionState::default();
+        let settings_view = RecordingSettingsView::default();
+        let mut active = SettingsTab::General;
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, active, &state, &settings_view);
+                    ui.memory_mut(|memory| memory.request_focus(tab_id(ui, active)));
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, active, &state, &settings_view);
+                });
+            },
+        );
+        for expected in [SettingsTab::Recording, SettingsTab::Output] {
+            let mut arrow_action = ScreenAction::None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::ArrowRight,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        arrow_action = settings(ui, active, &state, &settings_view);
+                    });
+                },
+            );
+            assert_eq!(arrow_action, ScreenAction::SetSettingsTab(expected));
+            active = expected;
+            let output = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, active, &state, &settings_view);
+                    });
+                },
+            );
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Tab
+                            && node.is_selected() == Some(true)
+                            && node.name()
+                                == Some(match active {
+                                    SettingsTab::General => "General",
+                                    SettingsTab::Recording => "Recording",
+                                    SettingsTab::Output => "Output",
+                                    SettingsTab::Advanced => "Advanced",
+                                })
+                    })
+            );
+        }
     }
 }

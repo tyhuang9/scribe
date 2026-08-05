@@ -276,7 +276,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
                 data.comparison.selected_model_ids.remove(&id);
             }
         }
-        ScreenAction::StartComparison => data.comparison.phase = ComparisonPhase::Recording,
+        ScreenAction::StartComparison => {
+            let _ = data.comparison.begin();
+        }
         ScreenAction::SetSettingsTab(tab) => {
             data.route = UiRoute::Settings(tab);
             *page = AppPage::General;

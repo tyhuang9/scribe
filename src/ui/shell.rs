@@ -1,7 +1,7 @@
 use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rounding, Sense, Stroke, Vec2};
 
 use super::{
-    controls::{Icon, icon_glyph, paint_focus_ring},
+    controls::{Icon, focus_tooltip, icon_glyph, paint_focus_ring},
     theme_palette,
 };
 
@@ -316,6 +316,7 @@ fn nav_icon_button(
         muted,
     );
     paint_focus_ring(ui, &response, Rounding::same(5.0));
+    focus_tooltip(ui, &response, accessible_name);
     response.on_hover_text(accessible_name)
 }
 
