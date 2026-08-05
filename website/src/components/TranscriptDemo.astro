@@ -1,0 +1,29 @@
+<figure class="transcript-demo" aria-labelledby="transcript-demo-title">
+  <figcaption>
+    <p class="eyebrow">Static walkthrough</p>
+    <h2 id="transcript-demo-title">From recording to usable text</h2>
+    <p>This illustration shows the expected sequence. It is documentation, not a live recording control.</p>
+  </figcaption>
+  <ol class="transcript-states" role="list" aria-label="Illustrated transcript sequence">
+    <li>
+      <div class="transcript-state-heading"><span class="state-number">1</span><strong>Listening</strong><span class="state-badge">Recording</span></div>
+      <div class="waveform" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+      <p>Native workers capture and prepare microphone audio while the model begins loading.</p>
+    </li>
+    <li>
+      <div class="transcript-state-heading"><span class="state-number">2</span><strong>Live preview</strong><span class="state-badge">Tentative</span></div>
+      <p class="processing-line"><span aria-hidden="true"></span>Rolling batch preview stays inside Scribe</p>
+      <p>Committed text and a tentative suffix can appear in the overlay while you speak.</p>
+    </li>
+    <li>
+      <div class="transcript-state-heading"><span class="state-number">3</span><strong>Completed result</strong><span class="state-badge">Ready to review</span></div>
+      <blockquote>Bring the notes from Tuesday's planning meeting.</blockquote>
+      <p>A full-utterance pass produces the final transcript after capture stops.</p>
+    </li>
+    <li>
+      <div class="transcript-state-heading"><span class="state-number">4</span><strong>Copied or inserted</strong><span class="state-badge">Output</span></div>
+      <p class="output-line">Transcript copied to clipboard</p>
+      <p>Only final text is pasted, exactly once. Unsafe output falls back to the clipboard.</p>
+    </li>
+  </ol>
+</figure>

@@ -1,0 +1,25 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+---
+
+<StarlightPage
+  frontmatter={{
+    title: 'Page not found',
+    description: 'Return to Scribe documentation.',
+    template: 'splash',
+    pagefind: false,
+    prev: false,
+    next: false
+  }}
+>
+  <p>The page you requested is not part of the current Scribe documentation.</p>
+  <ul>
+    <li>Return to the <a href={base}>documentation home</a>.</li>
+    <li>Read <a href={`${base}install-and-run/`}>Install and run</a> to start Scribe from source.</li>
+    <li>Visit <a href={`${base}troubleshooting/`}>Troubleshooting</a> for local runtime, hotkey, clipboard, and platform guidance.</li>
+  </ul>
+</StarlightPage>

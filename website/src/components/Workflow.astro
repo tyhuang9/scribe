@@ -1,0 +1,27 @@
+---
+interface Step {
+  title: string;
+  body: string;
+  href: string;
+  linkText: string;
+}
+
+interface Props {
+  steps: Step[];
+}
+
+const { steps } = Astro.props;
+---
+
+<ol class="workflow" role="list">
+  {steps.map((step, index) => (
+    <li>
+      <span class="workflow-number" aria-hidden="true">{index + 1}</span>
+      <div>
+        <h3>{step.title}</h3>
+        <p>{step.body}</p>
+        <a href={step.href}>{step.linkText}</a>
+      </div>
+    </li>
+  ))}
+</ol>

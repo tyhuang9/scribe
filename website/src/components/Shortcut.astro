@@ -1,0 +1,11 @@
+---
+interface Props {
+  keys: string[];
+}
+
+const { keys } = Astro.props;
+---
+
+<span class="shortcut" aria-label={`Keyboard shortcut: ${keys.join(' plus ')}`}>
+  {keys.map((key, index) => <Fragment>{index > 0 && <span aria-hidden="true">+</span>}<kbd>{key}</kbd></Fragment>)}
+</span>
