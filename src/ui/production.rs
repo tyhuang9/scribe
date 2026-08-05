@@ -13,6 +13,7 @@ pub(crate) enum ModelReadiness {
     Error,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn transcription_state(
     status: TranscriptionStatus,
     selected_model_id: Option<String>,

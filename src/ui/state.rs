@@ -68,6 +68,7 @@ pub(crate) enum RecordingMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum TranscriptionEvent {
     ModelReady(String),
     StartRequested,
@@ -83,6 +84,7 @@ pub(crate) enum TranscriptionEvent {
 }
 
 impl TranscriptionState {
+    #[allow(dead_code)]
     pub(crate) fn apply(&mut self, event: TranscriptionEvent) {
         match event {
             TranscriptionEvent::ModelReady(id)
@@ -169,6 +171,7 @@ impl TranscriptionState {
     }
 }
 
+#[allow(dead_code)]
 fn append_transcript(transcript: &mut String, text: &str) {
     let text = text.trim();
     if text.is_empty() {
@@ -181,6 +184,7 @@ fn append_transcript(transcript: &mut String, text: &str) {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum ModelDownloadState {
     #[default]
     NotInstalled,
@@ -193,6 +197,7 @@ pub(crate) enum ModelDownloadState {
 }
 
 impl ModelDownloadState {
+    #[allow(dead_code)]
     pub(crate) fn normalize(self, next: Self) -> Self {
         if self == Self::Installed && next != Self::Installed {
             Self::Installed
@@ -211,6 +216,7 @@ pub(crate) struct ModelCapabilities {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum ModelSpeedTier {
     VeryFast,
     Fast,
@@ -221,6 +227,7 @@ pub(crate) enum ModelSpeedTier {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum ModelSizeTier {
     Tiny,
     Small,
@@ -266,6 +273,7 @@ pub(crate) struct ModelViewModel {
 }
 
 impl ModelViewModel {
+    #[allow(dead_code)]
     pub(crate) fn normalize(mut self) -> Self {
         if self.active {
             self.installed = true;
@@ -278,6 +286,7 @@ impl ModelViewModel {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum ComparisonPhase {
     #[default]
     Idle,
@@ -329,6 +338,7 @@ impl ModelComparisonState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum SettingsSaveState {
     #[default]
     Clean,
@@ -339,14 +349,17 @@ pub(crate) enum SettingsSaveState {
 }
 
 impl SettingsSaveState {
+    #[allow(dead_code)]
     pub(crate) fn changed(self) -> Self {
         Self::Dirty
     }
 
+    #[allow(dead_code)]
     pub(crate) fn saving(self) -> Self {
         Self::Saving
     }
 
+    #[allow(dead_code)]
     pub(crate) fn completed(self, success: bool) -> Self {
         if success { Self::Saved } else { Self::Failed }
     }

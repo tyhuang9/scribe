@@ -2007,8 +2007,10 @@ mod tests {
 
     #[test]
     fn recording_controls_explain_why_changes_are_disabled_while_busy() {
-        let mut state = TranscriptionState::default();
-        state.phase = TranscriptionPhase::Listening;
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            ..Default::default()
+        };
         let settings_view = RecordingSettingsView::default();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();

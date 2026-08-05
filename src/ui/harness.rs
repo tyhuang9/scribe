@@ -284,6 +284,19 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetEndpointSilenceMs(value) => data.settings.endpoint_silence_ms = value,
         ScreenAction::SetPreRollMs(value) => data.settings.pre_roll_ms = value,
         ScreenAction::SetPostRollMs(value) => data.settings.post_roll_ms = value,
+        ScreenAction::SetStreamingMode(value) => data.settings.streaming_label = value,
+        ScreenAction::SetAcceleration(value) => data.settings.acceleration_label = value,
+        ScreenAction::SetOverlayPosition(value) => data.settings.overlay_position_label = value,
+        ScreenAction::SetDebugMode(value) => data.settings.debug_mode = value,
+        ScreenAction::SetHistoryMode(value) => data.settings.history_mode_label = value,
+        ScreenAction::SetMaxHistoryEntries(value) => data.settings.max_history_entries = value,
+        ScreenAction::SetTranscriptRetentionDays(value) => {
+            data.settings.transcript_retention_days = value
+        }
+        ScreenAction::SetAudioRetentionDays(value) => data.settings.audio_retention_days = value,
+        ScreenAction::SetStoreApplicationIdentity(value) => {
+            data.settings.store_application_identity = value
+        }
     }
 }
 

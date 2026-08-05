@@ -77,6 +77,7 @@ pub(crate) fn button(
     response
 }
 
+#[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
     let colors = ui_palette(ui);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
@@ -187,6 +188,7 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         });
 }
 
+#[allow(dead_code)]
 pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
     let colors = ui_palette(ui);
     let (fill, stroke, color, icon) = if error {
