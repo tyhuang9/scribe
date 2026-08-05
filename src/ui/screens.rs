@@ -139,6 +139,8 @@ pub(crate) enum ScreenAction {
     SelectModel(String),
     InstallModel(String),
     CancelModelInstall(String),
+    RepairModelRuntime(String),
+    MaintainModelRuntime(String),
     ShowModelDetails(String),
     RequestModelRemoval(String),
     ConfirmModelRemoval(String),
@@ -873,16 +875,24 @@ fn models(
             });
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                let use_reason = (!model.ready).then_some("This installed model is not ready yet.");
-                let use_model = ui.add_enabled(
-                    !model.active && model.ready,
-                    egui::Button::new(if model.active { "Active" } else { "Use" }),
-                );
-                if let Some(reason) = use_reason {
-                    use_model.clone().on_hover_text(reason);
+                let primary = ui
+                    .add_enabled_ui(model.primary_action_enabled, |ui| {
+                        button(ui, &model.primary_action_label, ButtonTone::Secondary)
+                    })
+                    .inner;
+                if let Some(reason) = &model.primary_action_disabled_reason {
+                    ui.ctx().accesskit_node_builder(primary.id, |builder| {
+                        builder.set_description(reason.as_str());
+                    });
+                    focus_tooltip(ui, &primary, reason);
+                    primary.clone().on_hover_text(reason);
                 }
-                if use_model.clicked() {
-                    action = ScreenAction::SelectModel(model.id.clone());
+                if primary.clicked() {
+                    action = if model.primary_action_repairs_runtime {
+                        ScreenAction::RepairModelRuntime(model.id.clone())
+                    } else {
+                        ScreenAction::SelectModel(model.id.clone())
+                    };
                 }
                 if button(ui, "Details", ButtonTone::Text).clicked() {
                     action = ScreenAction::ShowModelDetails(model.id.clone());
@@ -1269,6 +1279,41 @@ fn models(
                                 .color(colors.muted_text),
                             );
                         }
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("Runtime maintenance")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(format!("Status: {}", model.runtime_status_label));
+                                if let Some(version) = &model.runtime_version_label {
+                                    ui.label(version);
+                                }
+                                if let Some(storage) = &model.runtime_storage_label {
+                                    ui.label(storage);
+                                }
+                                if let Some(detail) = &model.runtime_detail {
+                                    ui.label(RichText::new(detail).color(colors.muted_text));
+                                }
+                                if let Some(label) = &model.runtime_action_label {
+                                    let runtime_action = ui
+                                        .add_enabled_ui(model.runtime_action_enabled, |ui| {
+                                            button(ui, label, ButtonTone::Secondary)
+                                        })
+                                        .inner;
+                                    if let Some(reason) = &model.runtime_action_disabled_reason {
+                                        ui.ctx()
+                                            .accesskit_node_builder(runtime_action.id, |builder| {
+                                                builder.set_description(reason.as_str())
+                                            });
+                                        focus_tooltip(ui, &runtime_action, reason);
+                                        runtime_action.clone().on_hover_text(reason);
+                                    }
+                                    if runtime_action.clicked() {
+                                        action =
+                                            ScreenAction::MaintainModelRuntime(model.id.clone());
+                                    }
+                                }
+                            });
+                        ui.add_space(8.0);
                         if button(ui, "Close", ButtonTone::Secondary).clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }

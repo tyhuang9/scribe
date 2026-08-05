@@ -134,7 +134,11 @@ fn model(
         variant_label: variant_label.into(),
         installed: true,
         active,
+        ready: true,
         recommended,
+        primary_action_label: if active { "Active" } else { "Use" }.into(),
+        primary_action_enabled: !active,
+        runtime_status_label: "Ready".into(),
         download_state: ModelDownloadState::Installed,
         disk_bytes: Some(ram_mb * 1_000_000),
         estimated_ram_bytes: Some(ram_mb * 1_000_000),
@@ -234,6 +238,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         | ScreenAction::SelectModel(_)
         | ScreenAction::InstallModel(_)
         | ScreenAction::CancelModelInstall(_)
+        | ScreenAction::RepairModelRuntime(_)
+        | ScreenAction::MaintainModelRuntime(_)
         | ScreenAction::ShowModelDetails(_)
         | ScreenAction::RequestModelRemoval(_)
         | ScreenAction::ConfirmModelRemoval(_)

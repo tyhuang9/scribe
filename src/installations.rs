@@ -399,6 +399,14 @@ enum FileReplacementState {
 }
 
 impl FileReplacement {
+    #[cfg(test)]
+    pub(crate) fn created_for_test(destination: PathBuf) -> Self {
+        Self {
+            destination,
+            state: FileReplacementState::Created,
+        }
+    }
+
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
     }

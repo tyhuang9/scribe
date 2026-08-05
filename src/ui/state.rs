@@ -17,8 +17,13 @@ pub(crate) enum UiRoute {
     Transcribe,
     Models,
     Settings(SettingsTab),
+    // These routes remain part of the shared renderer contract even though
+    // this native shell currently routes the pages outside `ScreenView`.
+    #[allow(dead_code)]
     History,
+    #[allow(dead_code)]
     About,
+    #[allow(dead_code)]
     Debug,
 }
 
@@ -262,8 +267,19 @@ pub(crate) struct ModelViewModel {
     pub custom: bool,
     pub install_supported: bool,
     pub install_action_enabled: bool,
+    pub primary_action_label: String,
+    pub primary_action_enabled: bool,
+    pub primary_action_repairs_runtime: bool,
+    pub primary_action_disabled_reason: Option<String>,
     pub cancel_supported: bool,
     pub removal_supported: bool,
+    pub runtime_status_label: String,
+    pub runtime_detail: Option<String>,
+    pub runtime_version_label: Option<String>,
+    pub runtime_storage_label: Option<String>,
+    pub runtime_action_label: Option<String>,
+    pub runtime_action_enabled: bool,
+    pub runtime_action_disabled_reason: Option<String>,
     pub download_state: ModelDownloadState,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
