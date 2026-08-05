@@ -10,7 +10,7 @@ pub use controller::{
     OverlayTranscript, OverlayViewState,
 };
 pub use platform::{
-    CapturedTarget, OverlayPosition, capture_foreground_target, overlay_focus_safety_available,
-    reduced_motion_preferred,
+    CapturedTarget, OverlayPosition, capture_foreground_target,
+    captured_target_application_identity, overlay_focus_safety_available, reduced_motion_preferred,
 };
 pub use view::show_overlay_viewport;

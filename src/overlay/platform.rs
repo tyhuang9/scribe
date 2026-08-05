@@ -115,6 +115,12 @@ pub fn captured_target_is_foreground(target: &CapturedTarget) -> bool {
     imp::captured_target_is_foreground(target)
 }
 
+/// Returns only the executable filename for a still-valid captured target.
+/// Window titles and document paths are deliberately excluded.
+pub fn captured_target_application_identity(target: &CapturedTarget) -> Option<String> {
+    imp::captured_target_application_identity(target)
+}
+
 /// Requests foreground activation for the exact captured target, then verifies
 /// it immediately. Windows may deny activation; that denial is not bypassed.
 pub fn reactivate_and_verify_captured_target(target: &CapturedTarget) -> bool {
@@ -174,6 +180,7 @@ mod imp {
     };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
     use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -259,6 +266,43 @@ mod imp {
 
     pub(super) fn captured_target_is_foreground(target: &CapturedTarget) -> bool {
         captured_target_is_foreground_with(&mut SystemCapturedTargetProbe, process::id(), target)
+    }
+
+    pub(super) fn captured_target_application_identity(target: &CapturedTarget) -> Option<String> {
+        if !captured_target_is_valid(target) {
+            return None;
+        }
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                target.identity.process_id,
+            )
+        };
+        if process.is_null() {
+            return None;
+        }
+
+        let result = (|| {
+            let mut path = vec![0_u16; 32_768];
+            let mut length = u32::try_from(path.len()).ok()?;
+            if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) }
+                == 0
+            {
+                return None;
+            }
+            path.truncate(length as usize);
+            let filename = std::path::Path::new(&String::from_utf16_lossy(&path))
+                .file_name()?
+                .to_string_lossy()
+                .trim()
+                .to_owned();
+            (!filename.is_empty()).then_some(filename)
+        })();
+        unsafe {
+            CloseHandle(process);
+        }
+        result
     }
 
     pub(super) fn captured_target_is_valid(target: &CapturedTarget) -> bool {
@@ -884,6 +928,10 @@ mod imp {
 
     pub(super) fn captured_target_is_foreground(_target: &CapturedTarget) -> bool {
         false
+    }
+
+    pub(super) fn captured_target_application_identity(_target: &CapturedTarget) -> Option<String> {
+        None
     }
 
     pub(super) fn captured_target_is_valid(_target: &CapturedTarget) -> bool {

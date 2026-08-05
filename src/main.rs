@@ -4,6 +4,8 @@ mod benchmark;
 mod compatibility_bridge;
 mod config;
 mod core;
+mod history;
+mod history_playback;
 mod hotkey;
 mod installations;
 mod managed_downloads;

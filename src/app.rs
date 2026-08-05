@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -26,10 +26,15 @@ use crate::benchmark::{
 };
 use crate::compatibility_bridge::{self, ProviderHandle};
 use crate::config::{
-    self, AppConfig, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore, StreamingMode,
-    ThemeMode,
+    self, AppConfig, HistoryMode, HotkeyMode, OverlayMode, OverlayPosition, SettingsStore,
+    StreamingMode, ThemeMode,
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
+use crate::history::{
+    CompletedHistoryEntry, HistoryCursor, HistoryError, HistoryMetrics, HistoryPage, HistoryQuery,
+    HistoryRecord, HistoryRetentionPolicy, HistoryStatus, HistoryStore, NewHistoryEntry,
+};
+use crate::history_playback::{PlaybackEvent, PlaybackService};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::installations::{
     ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
@@ -55,8 +60,9 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, HistoryPageAction, ThemePalette, about_page, configure_accessible_style, history_page,
-    minimum_primary_target_height, show_navigation, theme_palette, ui_palette,
+    AppPage, HistoryPageAction, HistoryPageState, ThemePalette, about_page,
+    configure_accessible_style, history_page, minimum_primary_target_height, show_navigation,
+    theme_palette, ui_palette,
 };
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
@@ -65,6 +71,7 @@ const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
+const RETRY_RELEASE_ATTEMPTS: usize = 4;
 static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
@@ -79,6 +86,114 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
             Duration::from_millis(config.recording.pre_roll_ms.into()),
             Duration::from_millis(config.recording.post_roll_ms.into()),
         ),
+    }
+}
+
+fn history_retention_policy(config: &AppConfig) -> HistoryRetentionPolicy {
+    HistoryRetentionPolicy {
+        max_unpinned_entries: config.history.max_unpinned_entries,
+        transcript_retention_days: config.history.transcript_retention_days,
+        audio_retention_days: config.history.audio_retention_days,
+    }
+}
+
+enum RetryReleaseAttempt {
+    Acknowledged { retention_error: Option<String> },
+    Retryable(String),
+    WorkerDisconnected(String),
+}
+
+fn observe_accepted_retry_release(
+    reply: Receiver<crate::history::RetryReleaseAcknowledgement>,
+) -> RetryReleaseAttempt {
+    match reply.recv() {
+        Ok(acknowledgement) => RetryReleaseAttempt::Acknowledged {
+            retention_error: acknowledgement.retention_error,
+        },
+        Err(_) => {
+            RetryReleaseAttempt::WorkerDisconnected("release reply channel disconnected".into())
+        }
+    }
+}
+
+fn retry_release_until_acknowledged(
+    mut attempt: impl FnMut() -> RetryReleaseAttempt,
+    mut pause: impl FnMut(Duration),
+) -> (bool, Result<(), String>) {
+    let mut last_error = "retry lease release was not attempted".to_owned();
+    for attempt_index in 0..RETRY_RELEASE_ATTEMPTS {
+        match attempt() {
+            RetryReleaseAttempt::Acknowledged { retention_error } => {
+                return match retention_error {
+                    Some(error) => (
+                        true,
+                        Err(format!(
+                            "retry lease was released but retention failed: {error}"
+                        )),
+                    ),
+                    None => (true, Ok(())),
+                };
+            }
+            RetryReleaseAttempt::WorkerDisconnected(error) => {
+                return (
+                    true,
+                    Err(format!(
+                        "history worker disconnected while releasing retry ownership: {error}"
+                    )),
+                );
+            }
+            RetryReleaseAttempt::Retryable(error) => last_error = error,
+        }
+        if attempt_index + 1 < RETRY_RELEASE_ATTEMPTS {
+            pause(Duration::from_millis(25_u64 << attempt_index));
+        }
+    }
+    (
+        false,
+        Err(format!(
+            "retry lease release was not acknowledged after {RETRY_RELEASE_ATTEMPTS} attempts: {last_error}"
+        )),
+    )
+}
+
+fn release_history_retry_with_bounded_retry(
+    store: &HistoryStore,
+    history_id: i64,
+) -> (bool, Result<(), String>) {
+    retry_release_until_acknowledged(
+        || match store.enqueue_release_retry(history_id) {
+            // Once admission succeeds, keep the receiver and wait on this
+            // background thread. Dropping it on a timeout would lose a late
+            // acknowledgement after the worker had already removed the lease.
+            Ok(reply) => observe_accepted_retry_release(reply),
+            Err(HistoryError::WorkerUnavailable | HistoryError::WorkerStopped) => {
+                RetryReleaseAttempt::WorkerDisconnected("command channel disconnected".into())
+            }
+            Err(error) => RetryReleaseAttempt::Retryable(error.to_string()),
+        },
+        thread::sleep,
+    )
+}
+
+/// Persists a failed retry and, if that terminal request is not cleanly
+/// observed, queues an explicit idempotent lease release behind it. The caller
+/// keeps its UI-side lease until `retry_lease_released` is true.
+fn settle_failed_history_retry(
+    store: &HistoryStore,
+    history_id: i64,
+    failure: impl Into<String>,
+) -> (bool, Result<(), String>) {
+    match store.fail_retry(history_id, failure) {
+        Ok(_) => (true, Ok(())),
+        Err(terminal_error) => {
+            let (released, release_result) =
+                release_history_retry_with_bounded_retry(store, history_id);
+            let error = match release_result {
+                Ok(()) => terminal_error.to_string(),
+                Err(release_error) => format!("{terminal_error}; {release_error}"),
+            };
+            (released, Err(error))
+        }
     }
 }
 
@@ -146,10 +261,45 @@ struct PendingRecording {
 
 struct PendingOutput {
     session_id: SessionId,
+    history_id: Option<i64>,
     transcript: String,
     completion_message: String,
     config: AppConfig,
     latency: Option<LatencyTrace>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRequestKind {
+    Dictation,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryRequestContext {
+    id: i64,
+    kind: HistoryRequestKind,
+}
+
+struct PendingHistoryCompletion {
+    session_id: SessionId,
+    history_id: i64,
+    kind: HistoryRequestKind,
+    transcript: String,
+    output_config: AppConfig,
+    completion_message: String,
+    latency: Option<LatencyTrace>,
+}
+
+struct HistoryCapturePlan {
+    store: HistoryStore,
+    entry: NewHistoryEntry,
+    retain_audio: bool,
+}
+
+struct ArmedHistoryRepaste {
+    id: i64,
+    text: String,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -428,6 +578,41 @@ enum AppEvent {
         model_id: String,
         message: String,
         latency: Option<LatencyTrace>,
+    },
+    HistoryCompletionObserved {
+        history_id: i64,
+        retry_lease_released: bool,
+        result: Result<(), String>,
+    },
+    HistoryRetryStartFailed {
+        session_id: SessionId,
+        request_id: RequestId,
+        history_id: i64,
+        retry_lease_released: bool,
+        message: String,
+    },
+    HistoryPageLoaded {
+        query_id: u64,
+        append: bool,
+        search: String,
+        result: Result<HistoryPage, String>,
+    },
+    HistoryMutationFinished {
+        operation_id: u64,
+        message: String,
+        result: Result<(), String>,
+    },
+    HistoryPlaybackPathReady {
+        history_id: i64,
+        result: Result<Option<PathBuf>, String>,
+    },
+    HistoryOutputRecorded {
+        result: Result<(), String>,
+    },
+    HistoryRetryTerminalPersisted {
+        history_id: i64,
+        retry_lease_released: bool,
+        result: Result<(), String>,
     },
     ModelDownloadProgress {
         job_id: u64,
@@ -1505,6 +1690,28 @@ pub struct LocalTranscriberApp {
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
     pending_output: Option<PendingOutput>,
+    history_requests: HashMap<(SessionId, RequestId), HistoryRequestContext>,
+    leased_history_retry_ids: HashSet<i64>,
+    history_store: Option<HistoryStore>,
+    history_records: Vec<HistoryRecord>,
+    history_next: Option<HistoryCursor>,
+    history_search: String,
+    history_applied_search: String,
+    history_loading: bool,
+    history_query_sequence: u64,
+    active_history_query: Option<u64>,
+    history_refresh_pending: bool,
+    history_error: Option<String>,
+    history_delete_confirmation: Option<i64>,
+    history_confirmation_focus_pending: bool,
+    history_search_focus_pending: bool,
+    history_mutation_sequence: u64,
+    history_mutation_in_flight: Option<u64>,
+    pending_history_retention_policy: Option<HistoryRetentionPolicy>,
+    armed_history_repaste: Option<ArmedHistoryRepaste>,
+    history_playback: Option<PlaybackService>,
+    playing_history_id: Option<i64>,
+    history_playback_stopping: bool,
     rolling_preview: Option<RollingPreviewHandle>,
     pending_preview_drain: Option<PendingPreviewDrain>,
     transcription_service: TranscriptionService,
@@ -1535,7 +1742,7 @@ impl LocalTranscriberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_stitch_style(&cc.egui_ctx);
 
-        let (mut config, config_path, status_message) = match config::load_config() {
+        let (mut config, config_path, mut status_message) = match config::load_config() {
             Ok((config, path)) => (config, Some(path), "Ready".to_owned()),
             Err(err) => (
                 AppConfig::default(),
@@ -1552,6 +1759,31 @@ impl LocalTranscriberApp {
         let (tx, rx) = unbounded();
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
+        let history_root = config::history_storage_dir().map_err(|error| error.to_string());
+        let (history_store, history_error) = match history_root.and_then(|root| {
+            HistoryStore::open(root, history_retention_policy(&config))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(store) => {
+                let report = store.startup_reconciliation();
+                if report != Default::default() {
+                    status_message = format!(
+                        "History recovered: {} interrupted, {} deletion(s), {} missing audio reference(s), {} orphan/temp audio file(s).",
+                        report.interrupted_pending_failed,
+                        report.deletions_completed,
+                        report.missing_audio_cleared,
+                        report.orphan_audio_removed + report.temporary_audio_removed,
+                    );
+                }
+                (Some(store), None)
+            }
+            Err(error) => {
+                let message = format!("Local history is unavailable: {error}");
+                status_message = message.clone();
+                (None, Some(message))
+            }
+        };
+        let history_playback = PlaybackService::new().ok();
         let settings_store = config_path
             .clone()
             .map(|path| SettingsStore::new(path, SETTINGS_SAVE_DEBOUNCE));
@@ -1585,6 +1817,28 @@ impl LocalTranscriberApp {
             active_recording: None,
             pending_recording: None,
             pending_output: None,
+            history_requests: HashMap::new(),
+            leased_history_retry_ids: HashSet::new(),
+            history_store,
+            history_records: Vec::new(),
+            history_next: None,
+            history_search: String::new(),
+            history_applied_search: String::new(),
+            history_loading: false,
+            history_query_sequence: 0,
+            active_history_query: None,
+            history_refresh_pending: false,
+            history_error,
+            history_delete_confirmation: None,
+            history_confirmation_focus_pending: false,
+            history_search_focus_pending: false,
+            history_mutation_sequence: 0,
+            history_mutation_in_flight: None,
+            pending_history_retention_policy: None,
+            armed_history_repaste: None,
+            history_playback,
+            playing_history_id: None,
+            history_playback_stopping: false,
             rolling_preview: None,
             pending_preview_drain: None,
             transcription_service,
@@ -1728,6 +1982,8 @@ impl LocalTranscriberApp {
         {
             app.status_message = format!("Hotkey unavailable: {err}");
         }
+
+        app.request_history_page(false);
 
         app
     }
@@ -1947,6 +2203,76 @@ impl LocalTranscriberApp {
         self.refresh_playground_cards_from_config();
     }
 
+    fn save_history_config(&mut self) {
+        if self.config.history.mode == HistoryMode::Off {
+            self.armed_history_repaste = None;
+        }
+        self.save_config();
+        let policy = history_retention_policy(&self.config);
+        if self.history_mutation_in_flight.is_some() || self.history_retry_is_active() {
+            self.pending_history_retention_policy = Some(policy);
+        } else {
+            self.start_history_retention_mutation(policy);
+        }
+    }
+
+    fn start_history_retention_mutation(&mut self, policy: HistoryRetentionPolicy) {
+        if self.history_retry_is_active() {
+            self.pending_history_retention_policy = Some(policy);
+            self.status_message =
+                "History retention will apply after the active retry finishes".to_owned();
+            return;
+        }
+        self.start_history_mutation("History privacy settings updated", move |store| {
+            store
+                .set_retention_policy(policy)
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    fn history_retry_is_active(&self) -> bool {
+        !self.leased_history_retry_ids.is_empty()
+    }
+
+    fn apply_deferred_history_retention_if_idle(&mut self) {
+        if self.history_mutation_in_flight.is_none()
+            && !self.history_retry_is_active()
+            && let Some(policy) = self.pending_history_retention_policy.take()
+        {
+            self.start_history_retention_mutation(policy);
+        }
+    }
+
+    fn start_history_mutation(
+        &mut self,
+        message: &'static str,
+        operation: impl FnOnce(HistoryStore) -> Result<(), String> + Send + 'static,
+    ) {
+        // A mutation may enforce retention and remove the armed row. Clear the
+        // in-memory transcript before queuing any such operation.
+        self.armed_history_repaste = None;
+        if self.history_mutation_in_flight.is_some() {
+            self.status_message = "Wait for the current history operation to finish".to_owned();
+            return;
+        }
+        let Some(store) = self.history_store.clone() else {
+            self.history_error = Some("Local history is unavailable".to_owned());
+            return;
+        };
+        self.history_mutation_sequence = self.history_mutation_sequence.wrapping_add(1);
+        let operation_id = self.history_mutation_sequence;
+        self.history_mutation_in_flight = Some(operation_id);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = operation(store);
+            let _ = tx.send(AppEvent::HistoryMutationFinished {
+                operation_id,
+                message: message.to_owned(),
+                result,
+            });
+        });
+    }
+
     fn poll_settings_save(&mut self) {
         let Some(store) = self.settings_store.as_mut() else {
             return;
@@ -2027,6 +2353,10 @@ impl LocalTranscriberApp {
         self.capture_is_active()
             || self.session_coordinator.phase() != DictationPhase::Idle
             || self.playground_pending > 0
+            || self.history_loading
+            || self.history_mutation_in_flight.is_some()
+            || self.history_retry_is_active()
+            || self.playing_history_id.is_some()
             || matches!(
                 self.status,
                 TranscriptionStatus::Listening | TranscriptionStatus::Transcribing
@@ -2266,6 +2596,9 @@ impl LocalTranscriberApp {
         }
 
         let output_message = result.status_message();
+        if let Some(history_id) = pending.history_id {
+            self.record_history_output_outcome(history_id, &result);
+        }
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = pending.latency;
         let _ = self.session_coordinator.complete(pending.session_id);
@@ -2290,6 +2623,120 @@ impl LocalTranscriberApp {
         } else {
             self.status = TranscriptionStatus::Idle;
             self.finish_overlay_success(pending.session_id);
+        }
+    }
+
+    fn finish_transcription_after_history(&mut self, pending: PendingHistoryCompletion) {
+        match pending.kind {
+            HistoryRequestKind::Dictation => {
+                if pending.output_config.output.auto_insert_transcript {
+                    if let Err(error) = self.session_coordinator.begin_output(pending.session_id) {
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Could not begin final output: {error}");
+                        let _ = self.session_coordinator.fail(pending.session_id);
+                        return;
+                    }
+                    self.status = TranscriptionStatus::Transcribing;
+                    self.status_message = format!(
+                        "{}. Verifying the original target before paste.",
+                        pending.completion_message
+                    );
+                    self.pending_output = Some(PendingOutput {
+                        session_id: pending.session_id,
+                        history_id: Some(pending.history_id),
+                        transcript: pending.transcript,
+                        completion_message: pending.completion_message,
+                        config: pending.output_config,
+                        latency: pending.latency,
+                    });
+                } else {
+                    self.status = TranscriptionStatus::Idle;
+                    self.status_message = pending.completion_message;
+                    self.latest_latency = pending.latency;
+                    let _ = self.session_coordinator.complete(pending.session_id);
+                    self.finish_overlay_success(pending.session_id);
+                    self.record_history_output_label(pending.history_id, "not_requested");
+                }
+            }
+            HistoryRequestKind::Retry => {
+                self.status = TranscriptionStatus::Idle;
+                self.status_message = format!(
+                    "{}. History retry completed; nothing was pasted.",
+                    pending.completion_message
+                );
+                self.latest_latency = pending.latency;
+                let _ = self.session_coordinator.complete(pending.session_id);
+            }
+        }
+        self.request_history_page(false);
+    }
+
+    fn fail_history_entry(&self, history_id: i64, failure: impl Into<String>) {
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
+        let failure = failure.into();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = store
+                .fail(history_id, failure)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::HistoryOutputRecorded { result });
+        });
+    }
+
+    fn fail_history_retry(&self, history_id: i64, failure: impl Into<String>) {
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
+        let failure = failure.into();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let (retry_lease_released, result) =
+                settle_failed_history_retry(&store, history_id, failure);
+            let _ = tx.send(AppEvent::HistoryRetryTerminalPersisted {
+                history_id,
+                retry_lease_released,
+                result,
+            });
+        });
+    }
+
+    fn discard_history_entry(&self, history_id: i64) {
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = store.delete(history_id).map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::HistoryOutputRecorded { result });
+        });
+    }
+
+    fn finish_no_speech_history_context(&self, context: HistoryRequestContext) {
+        match context.kind {
+            HistoryRequestKind::Dictation => self.discard_history_entry(context.id),
+            HistoryRequestKind::Retry => self.fail_history_retry(context.id, "No speech detected"),
+        }
+    }
+
+    fn fail_history_context(&self, context: HistoryRequestContext, failure: impl Into<String>) {
+        let failure = failure.into();
+        match context.kind {
+            HistoryRequestKind::Dictation => self.fail_history_entry(context.id, failure),
+            HistoryRequestKind::Retry => self.fail_history_retry(context.id, failure),
+        }
+    }
+
+    fn fail_correlated_history_request(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        failure: impl Into<String>,
+    ) {
+        if let Some(context) = self.history_requests.remove(&(session_id, request_id)) {
+            self.fail_history_context(context, failure);
         }
     }
 
@@ -2390,6 +2837,11 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
+        if self.playing_history_id.is_some() {
+            self.status_message =
+                "Stop retained-audio playback before starting dictation".to_owned();
+            return;
+        }
         if let Some(message) = self.artifact_recovery_error.as_ref() {
             self.status = TranscriptionStatus::Error;
             self.status_message = message.clone();
@@ -2436,6 +2888,7 @@ impl LocalTranscriberApp {
             self.reset_playground_for_run();
         }
 
+        self.armed_history_repaste = None;
         self.supersede_active_session();
         // Capture the external destination before any overlay/window state can
         // change. The platform adapter rejects every window owned by Scribe.
@@ -2584,9 +3037,22 @@ impl LocalTranscriberApp {
     }
 
     fn supersede_active_session(&mut self) {
+        self.armed_history_repaste = None;
         let Some(previous_session) = self.session_coordinator.active_session_id() else {
             return;
         };
+        let superseded_history = self
+            .history_requests
+            .iter()
+            .filter_map(|(&(session_id, request_id), context)| {
+                (session_id == previous_session).then_some((request_id, *context))
+            })
+            .collect::<Vec<_>>();
+        for (request_id, context) in superseded_history {
+            self.history_requests
+                .remove(&(previous_session, request_id));
+            self.fail_history_context(context, "Dictation was superseded");
+        }
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
         }
@@ -2964,6 +3430,11 @@ impl LocalTranscriberApp {
 
     fn poll_hotkey(&mut self) {
         for observed in self.hotkey_service.poll_events() {
+            if observed.event == HotkeyEvent::Pressed
+                && self.consume_armed_history_repaste(observed.observed_at)
+            {
+                continue;
+            }
             match hotkey_recording_action(
                 self.config.recording.hotkey_mode,
                 observed.event,
@@ -3063,6 +3534,9 @@ impl LocalTranscriberApp {
         self.transcript.clear();
         self.raw_transcript.clear();
         if let Some(pending) = self.pending_output.take() {
+            if let Some(history_id) = pending.history_id {
+                self.record_history_output_label(history_id, "cancelled_by_user");
+            }
             let _ = self.session_coordinator.cancel_active();
             self.retire_captured_target(pending.session_id);
             let _ = self.overlay_controller.hide(pending.session_id);
@@ -3086,6 +3560,478 @@ impl LocalTranscriberApp {
                 self.status_message = format!("Clipboard failed: {err}");
             }
         }
+    }
+
+    fn request_history_page(&mut self, append: bool) {
+        if self.history_loading {
+            if !append {
+                self.history_refresh_pending = true;
+            }
+            return;
+        }
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
+        let before = if append { self.history_next } else { None };
+        if append && before.is_none() {
+            return;
+        }
+        let search = self.history_applied_search.clone();
+        let tx = self.tx.clone();
+        self.history_query_sequence = self.history_query_sequence.wrapping_add(1);
+        let query_id = self.history_query_sequence;
+        self.active_history_query = Some(query_id);
+        self.history_loading = true;
+        thread::spawn(move || {
+            let result = store
+                .search(HistoryQuery {
+                    text: (!search.is_empty()).then_some(search.clone()),
+                    before,
+                    limit: 20,
+                    ..HistoryQuery::default()
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::HistoryPageLoaded {
+                query_id,
+                append,
+                search,
+                result,
+            });
+        });
+    }
+
+    fn apply_history_action(&mut self, action: HistoryPageAction) {
+        match action {
+            HistoryPageAction::ApplySearch => {
+                self.history_applied_search = self.history_search.trim().to_owned();
+                self.history_records.clear();
+                self.history_next = None;
+                self.request_history_page(false);
+            }
+            HistoryPageAction::Refresh => self.request_history_page(false),
+            HistoryPageAction::LoadMore => self.request_history_page(true),
+            HistoryPageAction::Copy { text, label } => self.copy_text_to_clipboard(&text, label),
+            HistoryPageAction::ArmRepaste { id, text } => {
+                self.armed_history_repaste = Some(ArmedHistoryRepaste {
+                    id,
+                    text,
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                });
+                self.status_message = format!(
+                    "Paste armed for history entry {id}. Focus the destination and press {} within 30 seconds.",
+                    self.config.recording.hotkey
+                );
+            }
+            HistoryPageAction::TogglePinned { id, pinned } => {
+                self.start_history_mutation(
+                    if pinned {
+                        "History entry pinned"
+                    } else {
+                        "History entry unpinned"
+                    },
+                    move |store| {
+                        store
+                            .set_pinned(id, pinned)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                );
+            }
+            HistoryPageAction::Play(history_id) => {
+                let Some(store) = self.history_store.clone() else {
+                    return;
+                };
+                self.playing_history_id = Some(history_id);
+                self.history_playback_stopping = false;
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let result = store
+                        .validated_audio_path(history_id)
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::HistoryPlaybackPathReady { history_id, result });
+                });
+            }
+            HistoryPageAction::StopPlayback => {
+                self.history_playback_stopping = true;
+                self.status_message = "Stopping history playback".to_owned();
+                if let Some(playback) = self.history_playback.as_ref()
+                    && let Err(error) = playback.stop()
+                {
+                    if error == crate::history_playback::PlaybackCommandError::Disconnected {
+                        self.playing_history_id = None;
+                        self.history_playback_stopping = false;
+                    }
+                    self.status_message = format!("Could not stop history playback: {error}");
+                }
+                if self.history_playback.is_none() {
+                    self.playing_history_id = None;
+                    self.history_playback_stopping = false;
+                    self.status_message = "Native history playback is unavailable".to_owned();
+                }
+            }
+            HistoryPageAction::Retry(history_id) => self.start_history_retry(history_id),
+            HistoryPageAction::DeleteAudio(id) => {
+                self.start_history_mutation("Retained audio deleted", move |store| {
+                    store
+                        .delete_audio(id)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            }
+            HistoryPageAction::RequestDelete(id) => {
+                self.history_delete_confirmation = Some(id);
+                self.history_confirmation_focus_pending = true;
+            }
+            HistoryPageAction::ConfirmDelete(id) => {
+                self.history_delete_confirmation = None;
+                self.history_search_focus_pending = true;
+                self.delete_history_entry(id);
+            }
+            HistoryPageAction::CancelDelete => {
+                self.history_delete_confirmation = None;
+                self.history_search_focus_pending = true;
+            }
+        }
+    }
+
+    fn delete_history_entry(&mut self, id: i64) {
+        if self.playing_history_id == Some(id)
+            && let Some(playback) = self.history_playback.as_ref()
+        {
+            let _ = playback.stop();
+        }
+        if self.armed_history_repaste.as_ref().map(|armed| armed.id) == Some(id) {
+            self.armed_history_repaste = None;
+        }
+        self.start_history_mutation("History entry deleted", move |store| {
+            store.delete(id).map_err(|error| error.to_string())
+        });
+    }
+
+    fn start_history_retry(&mut self, history_id: i64) {
+        if self.has_active_work() {
+            self.status_message =
+                "Wait for the active dictation or playback before retrying history".to_owned();
+            return;
+        }
+        if self.playing_history_id.is_some() {
+            self.status_message = "Stop history playback before retrying".to_owned();
+            return;
+        }
+        let Some(record) = self
+            .history_records
+            .iter()
+            .find(|record| record.id == history_id)
+            .cloned()
+        else {
+            self.status_message = "History entry is no longer available".to_owned();
+            return;
+        };
+        if record.status != HistoryStatus::Failed || record.audio_path.is_none() {
+            self.status_message = "Retry requires a failed entry with retained audio".to_owned();
+            return;
+        }
+        let Some(model) = config::configured_models(&self.config)
+            .into_iter()
+            .find(|model| model.id == record.model_id)
+        else {
+            self.status_message =
+                "The model used by this history entry is no longer configured".to_owned();
+            return;
+        };
+        let runtime_status = runtime_status_for_model(&self.config, &model);
+        if runtime_status != ModelRuntimeStatus::Ready {
+            self.status_message = format!(
+                "The history model is not ready: {}",
+                setup_message_for_status(&runtime_status)
+            );
+            return;
+        }
+        let Some(store) = self.history_store.clone() else {
+            self.status_message = "Local history is unavailable".to_owned();
+            return;
+        };
+
+        self.supersede_active_session();
+        let session_id = match self.session_coordinator.begin(SessionPurpose::Dictation) {
+            Ok(id) => id,
+            Err(error) => {
+                self.status_message = format!("Could not start history retry: {error}");
+                return;
+            }
+        };
+        if self
+            .session_coordinator
+            .capture_started(session_id)
+            .and_then(|_| {
+                self.session_coordinator
+                    .request_stop(session_id, StopReason::Explicit)
+                    .map(|_| ())
+            })
+            .and_then(|_| self.session_coordinator.capture_finalized(session_id))
+            .is_err()
+        {
+            let _ = self.session_coordinator.fail(session_id);
+            self.status_message = "Could not initialize history retry state".to_owned();
+            return;
+        }
+        let request_id = match self
+            .session_coordinator
+            .start_request(session_id, ModelId::new(model.id.clone()))
+        {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.session_coordinator.fail(session_id);
+                self.status_message = format!("Could not start history retry: {error}");
+                return;
+            }
+        };
+        let service = self.transcription_service.with_config(self.config.clone());
+        let task = match service.begin_transcription_task() {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = self.session_coordinator.fail(session_id);
+                self.status_message = format!("Could not dispatch history retry: {error}");
+                return;
+            }
+        };
+        self.history_requests.insert(
+            (session_id, request_id),
+            HistoryRequestContext {
+                id: history_id,
+                kind: HistoryRequestKind::Retry,
+            },
+        );
+        self.leased_history_retry_ids.insert(history_id);
+        self.begin_overlay_session(session_id, NativeOverlayMode::Off, None);
+        self.status = TranscriptionStatus::Transcribing;
+        self.status_message = "Loading retained audio for history retry".to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let retry = match store.retry(history_id) {
+                Ok(retry) => retry,
+                Err(error) => {
+                    // Retry may have been dequeued before a caller-side reply
+                    // timeout. Queue terminal cleanup behind it so the row
+                    // cannot remain Pending in that ambiguous case.
+                    let (retry_lease_released, terminal_result) = settle_failed_history_retry(
+                        &store,
+                        history_id,
+                        "History retry could not be started",
+                    );
+                    let message = match terminal_result {
+                        Ok(()) => error.to_string(),
+                        Err(terminal_error) => format!(
+                            "{error}; terminal retry cleanup was not clean: {terminal_error}"
+                        ),
+                    };
+                    let _ = tx.send(AppEvent::HistoryRetryStartFailed {
+                        session_id,
+                        request_id,
+                        history_id,
+                        retry_lease_released,
+                        message,
+                    });
+                    return;
+                }
+            };
+            if retry.record.id != history_id || retry.record.model_id != model.id {
+                let message = "history retry returned mismatched record identity".to_owned();
+                let (retry_lease_released, terminal_result) = settle_failed_history_retry(
+                    &store,
+                    history_id,
+                    "History retry identity was rejected",
+                );
+                let message = match terminal_result {
+                    Ok(()) => message,
+                    Err(terminal_error) => {
+                        format!("{message}; terminal retry cleanup was not clean: {terminal_error}")
+                    }
+                };
+                let _ = tx.send(AppEvent::HistoryRetryStartFailed {
+                    session_id,
+                    request_id,
+                    history_id,
+                    retry_lease_released,
+                    message,
+                });
+                return;
+            }
+            let mut latency =
+                LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction);
+            latency.transcription_dispatched_at = Some(Instant::now());
+            let mut request = TranscriptionRequest::new(
+                session_id,
+                request_id,
+                Arc::new(retry.audio),
+                model.id.clone(),
+            );
+            request.model_path = model.local_path.clone();
+            request.options = TranscriptionOptions::default();
+            let result = service.transcribe_task(request, task);
+            latency.transcription_job_completed_at = Some(Instant::now());
+            match result {
+                Ok(result) => {
+                    let _ = tx.send(AppEvent::TranscriptionDone {
+                        source: RecordingSource::Transcribe,
+                        session_id,
+                        request_id,
+                        result: Box::new(result),
+                        latency: Some(latency),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AppEvent::TranscriptionFailed {
+                        source: RecordingSource::Transcribe,
+                        session_id,
+                        request_id,
+                        model_id: model.id,
+                        message: error.to_string(),
+                        latency: Some(latency),
+                    });
+                }
+            }
+        });
+    }
+
+    fn poll_history_playback(&mut self) {
+        while let Some(event) = self
+            .history_playback
+            .as_ref()
+            .and_then(PlaybackService::try_next_event)
+        {
+            match event {
+                PlaybackEvent::Started { history_id } => {
+                    self.playing_history_id = Some(history_id);
+                    if !self.history_playback_stopping {
+                        self.status_message =
+                            format!("Playing retained audio for entry {history_id}");
+                    }
+                }
+                PlaybackEvent::Completed { history_id } => {
+                    if self.playing_history_id == Some(history_id) {
+                        self.playing_history_id = None;
+                    }
+                    self.history_playback_stopping = false;
+                    self.status_message = "History playback finished".to_owned();
+                }
+                PlaybackEvent::Stopped { history_id } => {
+                    if self.playing_history_id == Some(history_id) {
+                        self.playing_history_id = None;
+                    }
+                    self.history_playback_stopping = false;
+                    self.status_message = "History playback stopped".to_owned();
+                }
+                PlaybackEvent::Failed { history_id, error } => {
+                    if self.playing_history_id == Some(history_id) {
+                        self.playing_history_id = None;
+                    }
+                    self.history_playback_stopping = false;
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("History playback failed: {error}");
+                }
+            }
+        }
+    }
+
+    fn consume_armed_history_repaste(&mut self, observed_at: Instant) -> bool {
+        self.consume_armed_history_repaste_with(
+            observed_at,
+            overlay::capture_foreground_target,
+            text_output::write_to_captured_target,
+        )
+    }
+
+    fn consume_armed_history_repaste_with<O>(
+        &mut self,
+        observed_at: Instant,
+        capture_target: impl FnOnce() -> Option<CapturedTarget>,
+        write_output: impl FnOnce(&str, &AppConfig, Option<&CapturedTarget>) -> O,
+    ) -> bool
+    where
+        O: Into<text_output::TextOutputOutcome>,
+    {
+        if self.has_active_work() {
+            self.armed_history_repaste = None;
+            return false;
+        }
+        let Some(armed) = self.armed_history_repaste.take() else {
+            return false;
+        };
+        if observed_at >= armed.expires_at {
+            self.status_message = "Paste-again request expired".to_owned();
+            return false;
+        }
+
+        let target = capture_target();
+        let mut output_config = self.config.clone();
+        output_config.output.auto_insert_transcript = true;
+        let outcome = write_output(&armed.text, &output_config, target.as_ref()).into();
+        if let Some(target) = target.as_ref() {
+            crate::overlay::platform::release_captured_target(target);
+        }
+        self.status = if matches!(outcome.result, text_output::TextOutputResult::Failed(_)) {
+            TranscriptionStatus::Error
+        } else {
+            TranscriptionStatus::Idle
+        };
+        self.status_message = format!(
+            "History entry {}: {}",
+            armed.id,
+            outcome.result.status_message()
+        );
+        self.record_history_output_outcome(armed.id, &outcome.result);
+        true
+    }
+
+    fn record_history_output_outcome(
+        &self,
+        history_id: i64,
+        result: &text_output::TextOutputResult,
+    ) {
+        let outcome = match result {
+            text_output::TextOutputResult::Inserted => "inserted",
+            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_) => {
+                "inserted_clipboard_restore_failed"
+            }
+            text_output::TextOutputResult::CopiedOnly(
+                text_output::CopyOnlyReason::TargetUnavailable,
+            ) => "copied_only_target_unavailable",
+            text_output::TextOutputResult::CopiedOnly(
+                text_output::CopyOnlyReason::AutomationUnavailable,
+            ) => "copied_only_automation_unavailable",
+            text_output::TextOutputResult::CopiedOnly(text_output::CopyOnlyReason::PasteFailed) => {
+                "copied_only_paste_failed"
+            }
+            text_output::TextOutputResult::CopiedOnly(
+                text_output::CopyOnlyReason::ClipboardSnapshotUnavailable,
+            ) => "copied_only_clipboard_snapshot_unavailable",
+            text_output::TextOutputResult::CopiedOnly(
+                text_output::CopyOnlyReason::ClipboardSnapshotUnsupported,
+            ) => "copied_only_clipboard_snapshot_unsupported",
+            text_output::TextOutputResult::CopiedOnly(
+                text_output::CopyOnlyReason::ClipboardSnapshotError,
+            ) => "copied_only_clipboard_snapshot_error",
+            text_output::TextOutputResult::NotInserted(_) => "not_inserted_clipboard_changed",
+            text_output::TextOutputResult::Failed(_) => "failed",
+        }
+        .to_owned();
+        self.record_history_output_label(history_id, outcome);
+    }
+
+    fn record_history_output_label(&self, history_id: i64, outcome: impl Into<String>) {
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
+        let outcome = outcome.into();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = store
+                .record_output_outcome(history_id, outcome)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::HistoryOutputRecorded { result });
+        });
     }
 
     fn transcription_event_is_current(
@@ -3264,6 +4210,190 @@ impl LocalTranscriberApp {
                         );
                     }
                 }
+                AppEvent::HistoryCompletionObserved {
+                    history_id,
+                    retry_lease_released,
+                    result,
+                } => {
+                    if retry_lease_released {
+                        self.leased_history_retry_ids.remove(&history_id);
+                    }
+                    if let Err(error) = result {
+                        self.history_error = Some(format!(
+                            "History entry {history_id} completion was not confirmed: {error}"
+                        ));
+                    }
+                    if self.current_tab == Tab::History {
+                        self.request_history_page(false);
+                    }
+                }
+                AppEvent::HistoryRetryStartFailed {
+                    session_id,
+                    request_id,
+                    history_id,
+                    retry_lease_released,
+                    message,
+                } => {
+                    if retry_lease_released {
+                        self.leased_history_retry_ids.remove(&history_id);
+                    }
+                    if self
+                        .history_requests
+                        .get(&(session_id, request_id))
+                        .copied()
+                        == Some(HistoryRequestContext {
+                            id: history_id,
+                            kind: HistoryRequestKind::Retry,
+                        })
+                    {
+                        self.history_requests.remove(&(session_id, request_id));
+                        let model_id = self
+                            .session_coordinator
+                            .request_model(session_id, request_id)
+                            .cloned();
+                        if let Some(model_id) = model_id {
+                            let _ = self
+                                .session_coordinator
+                                .fail_request(session_id, request_id, &model_id);
+                        }
+                        let _ = self.session_coordinator.fail(session_id);
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("History retry failed: {message}");
+                    }
+                }
+                AppEvent::HistoryPageLoaded {
+                    query_id,
+                    append,
+                    search,
+                    result,
+                } => {
+                    if self.active_history_query != Some(query_id) {
+                        continue;
+                    }
+                    self.active_history_query = None;
+                    self.history_loading = false;
+                    if self.history_refresh_pending {
+                        self.history_refresh_pending = false;
+                        self.request_history_page(false);
+                        continue;
+                    }
+                    if search != self.history_applied_search {
+                        self.request_history_page(false);
+                        continue;
+                    }
+                    match result {
+                        Ok(page) => {
+                            if append {
+                                self.history_records.extend(page.records);
+                            } else {
+                                self.history_records = page.records;
+                            }
+                            self.history_next = page.next;
+                            self.history_error = None;
+                        }
+                        Err(error) => self.history_error = Some(format!("History failed: {error}")),
+                    }
+                }
+                AppEvent::HistoryMutationFinished {
+                    operation_id,
+                    message,
+                    result,
+                } => {
+                    if self.history_mutation_in_flight != Some(operation_id) {
+                        continue;
+                    }
+                    self.history_mutation_in_flight = None;
+                    match result {
+                        Ok(()) => {
+                            self.status_message = message;
+                            self.history_error = None;
+                        }
+                        Err(error) => {
+                            self.history_error = Some(format!(
+                                "History operation outcome was not confirmed: {error}"
+                            ));
+                        }
+                    }
+                    self.request_history_page(false);
+                    if let Some(policy) = self.pending_history_retention_policy.take() {
+                        self.start_history_retention_mutation(policy);
+                    }
+                }
+                AppEvent::HistoryPlaybackPathReady { history_id, result } => {
+                    if self.playing_history_id != Some(history_id) {
+                        continue;
+                    }
+                    if self.history_playback_stopping {
+                        self.playing_history_id = None;
+                        self.history_playback_stopping = false;
+                        self.status_message = "History playback stopped".to_owned();
+                        continue;
+                    }
+                    match result {
+                        Ok(Some(path)) => match self.history_playback.as_ref() {
+                            Some(playback) => {
+                                if let Err(error) = playback.play(history_id, path) {
+                                    self.playing_history_id = None;
+                                    self.history_playback_stopping = false;
+                                    self.status_message =
+                                        format!("Could not start history playback: {error}");
+                                }
+                            }
+                            None => {
+                                self.playing_history_id = None;
+                                self.history_playback_stopping = false;
+                                self.status_message =
+                                    "Native history playback is unavailable".to_owned();
+                            }
+                        },
+                        Ok(None) => {
+                            self.playing_history_id = None;
+                            self.history_playback_stopping = false;
+                            self.status_message =
+                                "This history entry has no retained audio".to_owned();
+                            self.request_history_page(false);
+                        }
+                        Err(error) => {
+                            self.playing_history_id = None;
+                            self.history_playback_stopping = false;
+                            self.history_error =
+                                Some(format!("Could not load history audio: {error}"));
+                            self.request_history_page(false);
+                        }
+                    }
+                }
+                AppEvent::HistoryOutputRecorded { result } => match result {
+                    Ok(()) => {
+                        if self.current_tab == Tab::History {
+                            self.request_history_page(false);
+                        }
+                    }
+                    Err(error) => {
+                        self.history_error =
+                            Some(format!("Could not update history metadata: {error}"));
+                    }
+                },
+                AppEvent::HistoryRetryTerminalPersisted {
+                    history_id,
+                    retry_lease_released,
+                    result,
+                } => {
+                    if retry_lease_released {
+                        self.leased_history_retry_ids.remove(&history_id);
+                    }
+                    match result {
+                        Ok(()) => {
+                            if self.current_tab == Tab::History {
+                                self.request_history_page(false);
+                            }
+                        }
+                        Err(error) => {
+                            self.history_error = Some(format!(
+                                "Could not persist the terminal history retry state: {error}"
+                            ));
+                        }
+                    }
+                }
                 AppEvent::TranscriptionDone {
                     source,
                     session_id,
@@ -3275,6 +4405,11 @@ impl LocalTranscriberApp {
                         self.transcription_event_is_current(source, session_id, request_id);
                     if result.session_id != session_id || result.request_id != request_id {
                         if current {
+                            self.fail_correlated_history_request(
+                                session_id,
+                                request_id,
+                                "Transcription service returned mismatched correlation IDs",
+                            );
                             self.reject_transcription_correlation(
                                 source,
                                 session_id,
@@ -3313,6 +4448,11 @@ impl LocalTranscriberApp {
                     ) {
                         Ok(all_completed) => all_completed,
                         Err(err) => {
+                            self.fail_correlated_history_request(
+                                session_id,
+                                request_id,
+                                format!("Rejected transcription completion: {err}"),
+                            );
                             self.reject_transcription_correlation(
                                 source,
                                 session_id,
@@ -3331,9 +4471,14 @@ impl LocalTranscriberApp {
                     });
                     match source {
                         RecordingSource::Transcribe => {
+                            let history_context =
+                                self.history_requests.remove(&(session_id, request_id));
                             let Some(finalized_text) =
                                 FinalizedText::without_cleanup(result.transcript.text.clone())
                             else {
+                                if let Some(context) = history_context {
+                                    self.finish_no_speech_history_context(context);
+                                }
                                 if let Some(latency) = latency.as_mut() {
                                     latency.final_text_ready_at = None;
                                     latency.output_started_at = None;
@@ -3354,14 +4499,6 @@ impl LocalTranscriberApp {
                                 latency.final_text_ready_at = latency
                                     .transcription_job_completed_at
                                     .or_else(|| Some(Instant::now()));
-                            }
-                            if let Err(err) = self.session_coordinator.begin_output(session_id) {
-                                self.fail_dictation_session(
-                                    session_id,
-                                    format!("Could not begin final output: {err}"),
-                                );
-                                self.cleanup_after_job(source, session_id, request_id);
-                                continue;
                             }
                             let segment_count = result.transcript.segments.len();
                             let timed_segments = result
@@ -3396,13 +4533,120 @@ impl LocalTranscriberApp {
                                 stdout_bytes,
                                 stderr_bytes
                             );
-                            if self.config.output.auto_insert_transcript {
+                            if let Some(context) = history_context {
+                                let history_entry = CompletedHistoryEntry {
+                                    raw_text: self.raw_transcript.clone(),
+                                    final_text: self.transcript.clone(),
+                                    metrics: HistoryMetrics {
+                                        audio_duration_ms: result
+                                            .transcript
+                                            .duration_ms
+                                            .and_then(|value| u64::try_from(value).ok()),
+                                        processing_duration_ms: result
+                                            .processing_duration_ms
+                                            .and_then(|value| u64::try_from(value).ok()),
+                                        realtime_factor: result
+                                            .processing_duration_ms
+                                            .zip(result.transcript.duration_ms)
+                                            .filter(|(_, audio)| *audio > 0)
+                                            .map(|(processing, audio)| {
+                                                processing as f64 / audio as f64
+                                            }),
+                                    },
+                                };
+                                let pending = PendingHistoryCompletion {
+                                    session_id,
+                                    history_id: context.id,
+                                    kind: context.kind,
+                                    transcript: self.transcript.clone(),
+                                    output_config: self.config.clone(),
+                                    completion_message,
+                                    latency,
+                                };
+                                let queued = self
+                                    .history_store
+                                    .as_ref()
+                                    .ok_or_else(|| "history worker is unavailable".to_owned())
+                                    .and_then(|store| {
+                                        match context.kind {
+                                            HistoryRequestKind::Dictation => {
+                                                store.enqueue_complete(context.id, history_entry)
+                                            }
+                                            HistoryRequestKind::Retry => store
+                                                .enqueue_complete_retry(context.id, history_entry),
+                                        }
+                                        .map_err(|error| error.to_string())
+                                    });
+                                match queued {
+                                    Ok(completion) => {
+                                        let tx = self.tx.clone();
+                                        let is_retry = context.kind == HistoryRequestKind::Retry;
+                                        thread::spawn(move || {
+                                            let observed = if is_retry {
+                                                completion.recv().map_err(|error| error.to_string())
+                                            } else {
+                                                completion
+                                                    .recv_timeout(Duration::from_secs(2))
+                                                    .map_err(|error| error.to_string())
+                                            };
+                                            let result = observed.and_then(|result| {
+                                                result
+                                                    .map(|_| ())
+                                                    .map_err(|error| error.to_string())
+                                            });
+                                            let _ = tx.send(AppEvent::HistoryCompletionObserved {
+                                                history_id: context.id,
+                                                // Receiving a terminal reply, including an
+                                                // operation error, means the worker's
+                                                // failure-safe guard consumed the lease. A
+                                                // disconnected worker cannot retain one.
+                                                retry_lease_released: is_retry,
+                                                result,
+                                            });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        self.history_error = Some(format!(
+                                            "History completion was not queued: {error}"
+                                        ));
+                                        if context.kind == HistoryRequestKind::Retry
+                                            && let Some(store) = self.history_store.clone()
+                                        {
+                                            let tx = self.tx.clone();
+                                            thread::spawn(move || {
+                                                let (retry_lease_released, result) =
+                                                    release_history_retry_with_bounded_retry(
+                                                        &store, context.id,
+                                                    );
+                                                let _ = tx.send(
+                                                    AppEvent::HistoryRetryTerminalPersisted {
+                                                        history_id: context.id,
+                                                        retry_lease_released,
+                                                        result,
+                                                    },
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                                self.finish_transcription_after_history(pending);
+                            } else if self.config.output.auto_insert_transcript {
+                                if let Err(err) = self.session_coordinator.begin_output(session_id)
+                                {
+                                    self.fail_dictation_session(
+                                        session_id,
+                                        format!("Could not begin final output: {err}"),
+                                    );
+                                    self.cleanup_after_job(source, session_id, request_id);
+                                    continue;
+                                }
                                 self.status = TranscriptionStatus::Transcribing;
                                 self.status_message = format!(
                                     "{completion_message}. Verifying the original target before paste."
                                 );
                                 self.pending_output = Some(PendingOutput {
                                     session_id,
+                                    history_id: None,
                                     transcript: self.transcript.clone(),
                                     completion_message,
                                     config: self.config.clone(),
@@ -3467,6 +4711,11 @@ impl LocalTranscriberApp {
                     ) {
                         Ok(all_completed) => all_completed,
                         Err(err) => {
+                            self.fail_correlated_history_request(
+                                session_id,
+                                request_id,
+                                format!("Rejected transcription failure: {err}"),
+                            );
                             self.reject_transcription_correlation(
                                 source,
                                 session_id,
@@ -3484,6 +4733,11 @@ impl LocalTranscriberApp {
                     }
                     match source {
                         RecordingSource::Transcribe => {
+                            if let Some(context) =
+                                self.history_requests.remove(&(session_id, request_id))
+                            {
+                                self.fail_history_context(context, "Transcription failed");
+                            }
                             self.fail_dictation_session(session_id, &message);
                         }
                         RecordingSource::Playground => {
@@ -3927,7 +5181,39 @@ impl LocalTranscriberApp {
                 return;
             }
         };
-        latency.transcription_dispatched_at = Some(Instant::now());
+        let history_plan = if self.config.history.mode.stores_transcripts() {
+            self.history_store.clone().map(|store| {
+                let source_app = self
+                    .config
+                    .history
+                    .store_application_identity
+                    .then(|| {
+                        self.captured_targets
+                            .get(&session_id)
+                            .and_then(overlay::captured_target_application_identity)
+                    })
+                    .flatten();
+                HistoryCapturePlan {
+                    store,
+                    entry: NewHistoryEntry {
+                        raw_text: String::new(),
+                        model_id: model.id.clone(),
+                        source_app,
+                        metrics: HistoryMetrics {
+                            audio_duration_ms: u64::try_from(audio.duration_ms()).ok(),
+                            ..HistoryMetrics::default()
+                        },
+                    },
+                    retain_audio: self.config.history.mode.stores_audio(),
+                }
+            })
+        } else {
+            None
+        };
+        if self.config.history.mode.stores_transcripts() && history_plan.is_none() {
+            self.history_error
+                .get_or_insert_with(|| "Local history is unavailable".to_owned());
+        }
         let service = self.transcription_service.with_config(self.config.clone());
         let task = match service.begin_transcription_task() {
             Ok(task) => task,
@@ -3941,7 +5227,30 @@ impl LocalTranscriberApp {
         };
         let tx = self.tx.clone();
 
+        if let Some(plan) = history_plan {
+            let history_id = HistoryStore::reserve_id();
+            let retained_audio = plan.retain_audio.then(|| Arc::clone(&audio));
+            match plan
+                .store
+                .enqueue_pending(history_id, plan.entry, retained_audio)
+            {
+                Ok(_completion) => {
+                    self.history_requests.insert(
+                        (session_id, request_id),
+                        HistoryRequestContext {
+                            id: history_id,
+                            kind: HistoryRequestKind::Dictation,
+                        },
+                    );
+                }
+                Err(error) => {
+                    self.history_error = Some(format!("History was not queued: {error}"));
+                }
+            }
+        }
+
         thread::spawn(move || {
+            latency.transcription_dispatched_at = Some(Instant::now());
             let mut request =
                 TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
             request.model_path = model.local_path.clone();
@@ -4928,7 +6237,9 @@ impl eframe::App for LocalTranscriberApp {
         // to present the correlated Output/Pasting phase before any blocking
         // clipboard or synthetic-input work begins.
         self.poll_pending_output();
+        self.poll_history_playback();
         self.poll_events();
+        self.apply_deferred_history_retention_if_idle();
         self.poll_settings_save();
         self.sync_tray_state();
 
@@ -6051,21 +7362,37 @@ impl LocalTranscriberApp {
     fn ui_history(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
-        let transcript = self.transcript.clone();
-        let raw_transcript = self.raw_transcript.clone();
-        page(
-            ui,
-            "History",
-            status,
-            &status_message,
-            |ui| match history_page(ui, &transcript, &raw_transcript) {
-                Some(HistoryPageAction::CopyFinal) => self.copy_transcript_to_clipboard(),
-                Some(HistoryPageAction::CopyRaw) => {
-                    self.copy_text_to_clipboard(&raw_transcript, "Raw transcript")
-                }
-                None => {}
-            },
-        );
+        let has_more = self.history_next.is_some();
+        let work_active = self.has_active_work();
+        let playing = self.playing_history_id;
+        let armed = self.armed_history_repaste.as_ref().map(|armed| armed.id);
+        let focus_search = self.history_search_focus_pending;
+        let focus_delete_confirmation = self.history_confirmation_focus_pending;
+        let mut action = None;
+        page(ui, "History", status, &status_message, |ui| {
+            action = history_page(
+                ui,
+                HistoryPageState {
+                    search: &mut self.history_search,
+                    records: &self.history_records,
+                    has_more,
+                    loading: self.history_loading,
+                    error: self.history_error.as_deref(),
+                    confirm_delete: self.history_delete_confirmation,
+                    work_active,
+                    playing,
+                    playback_stopping: self.history_playback_stopping,
+                    armed_repaste: armed,
+                    focus_search,
+                    focus_delete_confirmation,
+                },
+            );
+        });
+        self.history_search_focus_pending = false;
+        self.history_confirmation_focus_pending = false;
+        if let Some(action) = action {
+            self.apply_history_action(action);
+        }
     }
 
     fn ui_about(&mut self, ui: &mut Ui) {
@@ -6255,7 +7582,7 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
-                    combo.response.labelled_by(label.id);
+                    combo.response.clone().labelled_by(label.id);
                     if before != self.config.overlay.position {
                         self.save_config();
                     }
@@ -6309,6 +7636,128 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
+                semantic_heading(ui, section_heading("History and privacy"));
+                let retry_active = self.history_retry_is_active();
+                let history_lock_reason = retry_active
+                    .then_some("Unavailable while a retained-audio retry owns its history row.");
+                if retry_active {
+                    let locked = ui.label(mut_text(
+                        "History retention is locked while a retained-audio retry owns its row.",
+                    ));
+                    ui.ctx().accesskit_node_builder(locked.id, |builder| {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    });
+                }
+                ui.add_enabled_ui(!retry_active, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let before = self.config.history.mode;
+                    let label = ui.label("History storage");
+                    let combo = ComboBox::from_id_source("history-storage-mode")
+                        .selected_text(self.config.history.mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in HistoryMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.config.history.mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    combo.response.clone().labelled_by(label.id);
+                    if let Some(reason) = history_lock_reason {
+                        ui.ctx()
+                            .accesskit_node_builder(combo.response.id, |builder| {
+                                builder.set_description(reason);
+                            });
+                    }
+                    if before != self.config.history.mode {
+                        self.save_history_config();
+                    }
+                });
+                ui.label(mut_text(match self.config.history.mode {
+                    HistoryMode::Off => {
+                        "New dictations are not added to history. Existing entries remain subject to configured retention and manual deletion."
+                    }
+                    HistoryMode::TranscriptOnly => {
+                        "Final and raw transcripts stay on this device. Microphone audio is not retained."
+                    }
+                    HistoryMode::TranscriptAndAudio => {
+                        "Transcripts and canonical mono 16 kHz audio stay on this device for playback and retry."
+                    }
+                }));
+
+                ui.add_space(8.0);
+                ui.add_enabled_ui(self.config.history.mode.stores_transcripts(), |ui| {
+                    let mut maximum = self.config.history.max_unpinned_entries as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("Maximum unpinned entries");
+                        let maximum_control = ui
+                            .add(
+                                egui::DragValue::new(&mut maximum)
+                                    .clamp_range(1..=config::MAX_HISTORY_ENTRIES as i32),
+                            )
+                            .labelled_by(label.id);
+                        if let Some(reason) = history_lock_reason {
+                            ui.ctx().accesskit_node_builder(
+                                maximum_control.id,
+                                |builder| builder.set_description(reason),
+                            );
+                        }
+                        if maximum_control.changed() {
+                            self.config.history.max_unpinned_entries = maximum.max(1) as u32;
+                            self.save_history_config();
+                        }
+                    });
+
+                    if optional_retention_days_control(
+                        ui,
+                        "Transcript age limit",
+                        "Keep transcripts until deleted",
+                        &mut self.config.history.transcript_retention_days,
+                        history_lock_reason,
+                    ) {
+                        self.save_history_config();
+                    }
+
+                    if self.config.history.mode.stores_audio()
+                        && optional_retention_days_control(
+                            ui,
+                            "Audio age limit",
+                            "Keep retained audio until its entry is deleted",
+                            &mut self.config.history.audio_retention_days,
+                            history_lock_reason,
+                        )
+                    {
+                        self.save_history_config();
+                    }
+
+                    let mut store_identity = self.config.history.store_application_identity;
+                    let identity_control = ui
+                        .checkbox(
+                            &mut store_identity,
+                            "Store coarse application identity with new entries",
+                        )
+                        .on_hover_text(
+                            "Stores only a coarse local application label, never a window title or document name.",
+                        );
+                    if let Some(reason) = history_lock_reason {
+                        ui.ctx().accesskit_node_builder(
+                            identity_control.id,
+                            |builder| builder.set_description(reason),
+                        );
+                    }
+                    if identity_control.changed() {
+                        self.config.history.store_application_identity = store_identity;
+                        self.save_history_config();
+                    }
+                });
+                });
+            });
+
+            ui.add_space(12.0);
+            card(ui, |ui| {
                 semantic_heading(ui, section_heading("Developer"));
                 let mut debug_mode = self.config.developer.debug_mode;
                 if ui
@@ -6348,6 +7797,56 @@ impl LocalTranscriberApp {
             });
         });
     }
+}
+
+fn optional_retention_days_control(
+    ui: &mut Ui,
+    label_text: &str,
+    unlimited_text: &str,
+    value: &mut Option<u32>,
+    disabled_reason: Option<&str>,
+) -> bool {
+    let mut limited = value.is_some();
+    let limit_control = ui.checkbox(&mut limited, label_text);
+    if let Some(reason) = disabled_reason {
+        ui.ctx()
+            .accesskit_node_builder(limit_control.id, |builder| {
+                builder.set_description(reason);
+            });
+    }
+    let mut changed = limit_control.changed();
+    if !limited {
+        if value.take().is_some() {
+            changed = true;
+        }
+        ui.label(mut_text(unlimited_text));
+        return changed;
+    }
+
+    let mut days = value.unwrap_or(30) as i32;
+    ui.horizontal_wrapped(|ui| {
+        let label = ui.label("Days");
+        let days_control = ui
+            .add(
+                egui::DragValue::new(&mut days)
+                    .clamp_range(1..=config::MAX_HISTORY_RETENTION_DAYS as i32),
+            )
+            .labelled_by(label.id);
+        if let Some(reason) = disabled_reason {
+            ui.ctx().accesskit_node_builder(days_control.id, |builder| {
+                builder.set_description(reason);
+            });
+        }
+        if days_control.changed() {
+            changed = true;
+        }
+    });
+    let normalized = days.max(1) as u32;
+    if *value != Some(normalized) {
+        *value = Some(normalized);
+        changed = true;
+    }
+    changed
 }
 
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
@@ -9259,6 +10758,26 @@ mod layout_tests {
     #[test]
     fn empty_final_result_is_clean_no_speech_and_never_arms_output() {
         let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-no-speech-history-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        let history_store = HistoryStore::open(&history_root, HistoryRetentionPolicy::default())
+            .expect("history store");
+        let history_record = history_store
+            .create_pending(
+                NewHistoryEntry {
+                    raw_text: String::new(),
+                    model_id: "whisper_cpp_base_en".into(),
+                    source_app: None,
+                    metrics: HistoryMetrics::default(),
+                },
+                Some(test_prepared_audio().as_ref()),
+            )
+            .expect("pending history");
+        app.history_store = Some(history_store.clone());
         app.config.output.auto_insert_transcript = true;
         app.status = TranscriptionStatus::Transcribing;
         app.transcript = "previous final".to_owned();
@@ -9271,6 +10790,13 @@ mod layout_tests {
             session_id,
             request_id,
             "whisper_cpp_base_en",
+        );
+        app.history_requests.insert(
+            (session_id, request_id),
+            HistoryRequestContext {
+                id: history_record.id,
+                kind: HistoryRequestKind::Dictation,
+            },
         );
         app.overlay_controller
             .begin_session(session_id, NativeOverlayMode::Live);
@@ -9318,6 +10844,21 @@ mod layout_tests {
         assert!(latency.target_activated_at.is_none());
         assert!(latency.paste_completed_at.is_none());
         assert!(latency.output_completed_at.is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let page = history_store.search(HistoryQuery::default()).unwrap();
+            if page.records.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no-speech history was not discarded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(app);
+        drop(history_store);
+        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]
@@ -9433,6 +10974,7 @@ mod layout_tests {
             .begin_session(session_id, NativeOverlayMode::Live);
         app.pending_output = Some(PendingOutput {
             session_id,
+            history_id: None,
             transcript: "once".to_owned(),
             completion_message: "Complete".to_owned(),
             config: app.config.clone(),
@@ -9456,6 +10998,401 @@ mod layout_tests {
             app.session_coordinator.last_terminal().unwrap().outcome,
             crate::core::TerminalOutcome::Completed
         );
+    }
+
+    #[test]
+    fn armed_history_repaste_is_consumed_exactly_once() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        app.armed_history_repaste = Some(ArmedHistoryRepaste {
+            id: 42,
+            text: "paste once".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        let calls = Cell::new(0_u32);
+
+        assert!(app.consume_armed_history_repaste_with(
+            Instant::now(),
+            || None,
+            |text, config, target| {
+                calls.set(calls.get() + 1);
+                assert_eq!(text, "paste once");
+                assert!(config.output.auto_insert_transcript);
+                assert!(target.is_none());
+                text_output::TextOutputResult::CopiedOnly(
+                    text_output::CopyOnlyReason::TargetUnavailable,
+                )
+            },
+        ));
+        assert!(!app.consume_armed_history_repaste_with(
+            Instant::now(),
+            || None,
+            |_, _, _| -> text_output::TextOutputResult {
+                panic!("a consumed repaste must never output again")
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn active_session_clears_armed_repaste_without_output() {
+        use std::cell::Cell;
+
+        let mut app = test_app();
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(70),
+            RequestId(71),
+            "whisper_cpp_base_en",
+        );
+        app.armed_history_repaste = Some(ArmedHistoryRepaste {
+            id: 42,
+            text: "private old text".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        let calls = Cell::new(0_u32);
+
+        assert!(!app.consume_armed_history_repaste_with(
+            Instant::now(),
+            || None,
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                text_output::TextOutputResult::Inserted
+            },
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(app.armed_history_repaste.is_none());
+    }
+
+    #[test]
+    fn history_completion_uses_immutable_final_text_and_config() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = true;
+        let output_config = app.config.clone();
+        let session_id = SessionId(72);
+        let request_id = RequestId(73);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.transcript = "edited after finalization".to_owned();
+
+        app.finish_transcription_after_history(PendingHistoryCompletion {
+            session_id,
+            history_id: 17,
+            kind: HistoryRequestKind::Dictation,
+            transcript: "accepted final".to_owned(),
+            output_config,
+            completion_message: "Complete".to_owned(),
+            latency: None,
+        });
+
+        assert_eq!(
+            app.pending_output
+                .as_ref()
+                .map(|pending| pending.transcript.as_str()),
+            Some("accepted final")
+        );
+    }
+
+    #[test]
+    fn deleting_an_entry_clears_its_armed_repaste() {
+        let mut app = test_app();
+        app.armed_history_repaste = Some(ArmedHistoryRepaste {
+            id: 19,
+            text: "private old text".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+
+        app.delete_history_entry(19);
+
+        assert!(app.armed_history_repaste.is_none());
+    }
+
+    #[test]
+    fn any_history_mutation_clears_armed_repaste_before_retention() {
+        let mut app = test_app();
+        app.armed_history_repaste = Some(ArmedHistoryRepaste {
+            id: 23,
+            text: "private old text".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+
+        app.start_history_mutation("test mutation", |_| Ok(()));
+
+        assert!(app.armed_history_repaste.is_none());
+    }
+
+    #[test]
+    fn retention_is_deferred_while_retry_owns_history_row() {
+        let mut app = test_app();
+        app.history_requests.insert(
+            (SessionId(80), RequestId(81)),
+            HistoryRequestContext {
+                id: 20,
+                kind: HistoryRequestKind::Retry,
+            },
+        );
+        app.leased_history_retry_ids.insert(20);
+        let policy = HistoryRetentionPolicy {
+            max_unpinned_entries: 1,
+            transcript_retention_days: Some(1),
+            audio_retention_days: Some(1),
+        };
+
+        app.start_history_retention_mutation(policy);
+
+        assert_eq!(app.pending_history_retention_policy, Some(policy));
+        assert!(app.history_mutation_in_flight.is_none());
+        assert!(app.has_active_work());
+
+        app.tx
+            .send(AppEvent::HistoryRetryTerminalPersisted {
+                history_id: 20,
+                retry_lease_released: false,
+                result: Err("release was not acknowledged".into()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.history_retry_is_active());
+
+        app.tx
+            .send(AppEvent::HistoryRetryTerminalPersisted {
+                history_id: 20,
+                retry_lease_released: true,
+                result: Ok(()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.history_retry_is_active());
+    }
+
+    #[test]
+    fn transient_retry_release_failure_is_retried_until_acknowledged() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let (released, result) = retry_release_until_acknowledged(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    RetryReleaseAttempt::Retryable("queue temporarily full".into())
+                } else {
+                    RetryReleaseAttempt::Acknowledged {
+                        retention_error: None,
+                    }
+                }
+            },
+            |duration| pauses.push(duration),
+        );
+
+        assert!(released);
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            pauses,
+            vec![Duration::from_millis(25), Duration::from_millis(50)]
+        );
+    }
+
+    #[test]
+    fn retention_error_does_not_revoke_retry_release_acknowledgement() {
+        let (released, result) = retry_release_until_acknowledged(
+            || RetryReleaseAttempt::Acknowledged {
+                retention_error: Some("injected retention failure".into()),
+            },
+            |_| panic!("an acknowledged release must not retry"),
+        );
+
+        assert!(released);
+        assert!(result.unwrap_err().contains("retention failed"));
+    }
+
+    #[test]
+    fn accepted_retry_release_waits_for_a_late_acknowledgement() {
+        let (reply, receiver) = crossbeam_channel::bounded(1);
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            reply
+                .send(crate::history::RetryReleaseAcknowledgement::default())
+                .unwrap();
+        });
+
+        let result = observe_accepted_retry_release(receiver);
+        sender.join().unwrap();
+        assert!(matches!(
+            result,
+            RetryReleaseAttempt::Acknowledged {
+                retention_error: None
+            }
+        ));
+    }
+
+    #[test]
+    fn mutation_invalidates_in_flight_history_page_before_controls_reenable() {
+        let mut app = test_app();
+        let history_root = std::env::temp_dir().join(format!(
+            "scribe-history-query-generation-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&history_root);
+        let store = HistoryStore::open(&history_root, HistoryRetentionPolicy::default()).unwrap();
+        let record = store
+            .create_pending(
+                NewHistoryEntry {
+                    raw_text: "fresh".into(),
+                    model_id: "model".into(),
+                    source_app: None,
+                    metrics: HistoryMetrics::default(),
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .complete(
+                record.id,
+                CompletedHistoryEntry {
+                    raw_text: "fresh".into(),
+                    final_text: "fresh".into(),
+                    metrics: HistoryMetrics::default(),
+                },
+            )
+            .unwrap();
+        app.history_store = Some(store.clone());
+        app.history_loading = true;
+        app.active_history_query = Some(7);
+        app.request_history_page(false);
+        assert!(app.history_refresh_pending);
+        app.tx
+            .send(AppEvent::HistoryPageLoaded {
+                query_id: 7,
+                append: false,
+                search: String::new(),
+                result: Ok(HistoryPage {
+                    records: Vec::new(),
+                    next: None,
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.history_loading);
+        assert!(app.active_history_query.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.history_loading {
+            app.poll_events();
+            assert!(
+                Instant::now() < deadline,
+                "fresh history query did not finish"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.history_records.len(), 1);
+        assert_eq!(app.history_records[0].id, record.id);
+        drop(app);
+        drop(store);
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    #[test]
+    fn recording_is_blocked_until_history_playback_is_terminal() {
+        let mut app = test_app();
+        app.playing_history_id = Some(21);
+        app.history_playback_stopping = true;
+
+        app.start_recording_at(
+            RecordingSource::Transcribe,
+            Instant::now(),
+            TriggerObservation::AppAction,
+        );
+
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert!(app.status_message.contains("Stop retained-audio playback"));
+    }
+
+    #[test]
+    fn stop_during_playback_path_loading_keeps_ownership_until_path_result() {
+        let mut app = test_app();
+        app.history_playback = Some(PlaybackService::new().expect("playback worker"));
+        app.playing_history_id = Some(22);
+
+        app.apply_history_action(HistoryPageAction::StopPlayback);
+
+        assert_eq!(app.playing_history_id, Some(22));
+        assert!(app.history_playback_stopping);
+        app.tx
+            .send(AppEvent::HistoryPlaybackPathReady {
+                history_id: 22,
+                result: Ok(Some(PathBuf::from("must-not-open.wav"))),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.playing_history_id.is_none());
+        assert!(!app.history_playback_stopping);
+    }
+
+    #[test]
+    fn expired_history_repaste_does_not_output() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.armed_history_repaste = Some(ArmedHistoryRepaste {
+            id: 7,
+            text: "expired".to_owned(),
+            expires_at: now,
+        });
+
+        assert!(!app.consume_armed_history_repaste_with(
+            now,
+            || None,
+            |_, _, _| -> text_output::TextOutputResult {
+                panic!("expired repaste must not output")
+            },
+        ));
+        assert!(app.armed_history_repaste.is_none());
+    }
+
+    #[test]
+    fn completed_history_retry_never_arms_automatic_output() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = true;
+        app.transcript = "retried transcript".to_owned();
+        let session_id = SessionId(61);
+        let request_id = RequestId(62);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+
+        app.finish_transcription_after_history(PendingHistoryCompletion {
+            session_id,
+            history_id: 9,
+            kind: HistoryRequestKind::Retry,
+            transcript: "retried transcript".to_owned(),
+            output_config: app.config.clone(),
+            completion_message: "Retry finished".to_owned(),
+            latency: None,
+        });
+
+        assert!(app.pending_output.is_none());
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert!(app.status_message.contains("nothing was pasted"));
     }
 
     #[test]
@@ -9485,6 +11422,7 @@ mod layout_tests {
         app.status = TranscriptionStatus::Transcribing;
         app.pending_output = Some(PendingOutput {
             session_id,
+            history_id: None,
             transcript: "final text edited after it was queued".to_owned(),
             completion_message: "Complete".to_owned(),
             config: app.config.clone(),
@@ -9532,6 +11470,7 @@ mod layout_tests {
         let paste = activation + Duration::from_millis(1);
         app.pending_output = Some(PendingOutput {
             session_id,
+            history_id: None,
             transcript: "once".to_owned(),
             completion_message: "Complete".to_owned(),
             config: app.config.clone(),
@@ -10721,6 +12660,28 @@ mod layout_tests {
             active_recording: None,
             pending_recording: None,
             pending_output: None,
+            history_requests: HashMap::new(),
+            leased_history_retry_ids: HashSet::new(),
+            history_store: None,
+            history_records: Vec::new(),
+            history_next: None,
+            history_search: String::new(),
+            history_applied_search: String::new(),
+            history_loading: false,
+            history_query_sequence: 0,
+            active_history_query: None,
+            history_refresh_pending: false,
+            history_error: None,
+            history_delete_confirmation: None,
+            history_confirmation_focus_pending: false,
+            history_search_focus_pending: false,
+            history_mutation_sequence: 0,
+            history_mutation_in_flight: None,
+            pending_history_retention_policy: None,
+            armed_history_repaste: None,
+            history_playback: None,
+            playing_history_id: None,
+            history_playback_stopping: false,
             rolling_preview: None,
             pending_preview_drain: None,
             transcription_service,
@@ -12188,6 +14149,7 @@ mod layout_tests {
         app.transcript = "final text".to_owned();
         app.pending_output = Some(PendingOutput {
             session_id: SessionId(1),
+            history_id: None,
             transcript: app.transcript.clone(),
             completion_message: "Complete".to_owned(),
             config: app.config.clone(),
@@ -12241,25 +14203,118 @@ mod layout_tests {
     fn page_and_history_card_titles_are_semantic_headings() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        let records = [HistoryRecord {
+            id: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+            status: HistoryStatus::Completed,
+            raw_text: "raw final".to_owned(),
+            final_text: Some("clean final".to_owned()),
+            model_id: "whisper_cpp_base_en".to_owned(),
+            metrics: HistoryMetrics::default(),
+            pinned: false,
+            source_app: None,
+            audio_path: None,
+            failure: None,
+            retry_count: 0,
+            output_outcome: None,
+        }];
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 page(ui, "History", TranscriptionStatus::Idle, "Ready", |ui| {
-                    history_page(ui, "clean final", "raw final");
+                    history_page(
+                        ui,
+                        HistoryPageState {
+                            search: &mut String::new(),
+                            records: &records,
+                            has_more: false,
+                            loading: false,
+                            error: None,
+                            confirm_delete: Some(1),
+                            work_active: false,
+                            playing: None,
+                            playback_stopping: false,
+                            armed_repaste: None,
+                            focus_search: false,
+                            focus_delete_confirmation: true,
+                        },
+                    );
                 });
             });
         });
         let update = output.platform_output.accesskit_update.unwrap();
 
-        for expected in ["History", "Latest finalized text", "Raw model text"] {
-            assert!(update.nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::Heading && node.name() == Some(expected)
-            }));
-        }
-        for expected in ["Copy finalized transcript", "Copy raw transcript"] {
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("History")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Heading
+                && node
+                    .name()
+                    .is_some_and(|name| name.starts_with("Completed - "))
+        }));
+        for expected in ["Copy", "Paste again", "Pin", "Delete entry"] {
             assert!(update.nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(expected)
             }));
         }
+        let group = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Group
+                    && node
+                        .name()
+                        .is_some_and(|name| name.contains("model whisper_cpp_base_en"))
+            })
+            .expect("missing contextual history group");
+        let contextual_heading_id = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading
+                    && node
+                        .name()
+                        .is_some_and(|name| name.starts_with("Completed - "))
+            })
+            .map(|(id, _)| *id)
+            .expect("missing contextual history heading");
+        let delete_id = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Delete entry")
+            })
+            .map(|(id, _)| *id)
+            .expect("missing history delete action");
+        assert!(group.1.children().contains(&contextual_heading_id));
+        assert!(group.1.children().contains(&delete_id));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some("1 history entries loaded")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Delete entry")
+                && node
+                    .description()
+                    .is_some_and(|description| description.contains("whisper_cpp_base_en"))
+        }));
+        let focused = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == update.focus)
+            .map(|(_, node)| node);
+        assert_eq!(focused.and_then(|node| node.name()), Some("Cancel"));
+        let disclosure = update
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.name() == Some("Raw transcript"))
+            .expect("missing raw transcript disclosure");
+        assert_eq!(disclosure.is_expanded(), Some(false));
     }
 
     #[test]
@@ -13077,6 +15132,7 @@ mod layout_tests {
             .replace_with_final(session_id, app.transcript.clone());
         app.pending_output = Some(PendingOutput {
             session_id,
+            history_id: None,
             transcript: app.transcript.clone(),
             completion_message: "Complete".to_owned(),
             config: app.config.clone(),
