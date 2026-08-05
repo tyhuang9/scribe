@@ -70,13 +70,14 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCapabilities,
-    ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
-    ModelManagementState, ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-    RecordingMode, RecordingSettingsView, ScreenAction, ScreenView, SettingsTab, ThemePalette,
-    UiRoute, about_page, configure_accessible_style, history_page, minimum_primary_target_height,
-    recording_mode, render_screen, settings_save_state, show_navigation, theme_palette,
-    transcription_state, ui_palette,
+    AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
+    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
+    ModelCompatibility, ModelDialog, ModelDownloadState, ModelManagementState, ModelReadiness,
+    ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode, RecordingSettingsView,
+    ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, about_page,
+    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
+    render_screen, settings_save_state, show_navigation, theme_palette, transcription_state,
+    ui_palette,
 };
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
@@ -1253,6 +1254,11 @@ enum AppEvent {
         request_id: RequestId,
         result: Box<TranscriptionOutcome>,
         latency: Option<LatencyTrace>,
+    },
+    PlaygroundModelStarted {
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: String,
     },
     TranscriptionFailed {
         source: RecordingSource,
@@ -2677,6 +2683,8 @@ pub struct LocalTranscriberApp {
     settings_tab: SettingsTab,
     models_show_comparison: bool,
     model_comparison: ModelComparisonState,
+    comparison_run_model_ids: Option<Vec<String>>,
+    comparison_started_at: Option<Instant>,
     model_management: ModelManagementState,
     status: TranscriptionStatus,
     transcript: String,
@@ -2843,6 +2851,8 @@ impl LocalTranscriberApp {
             settings_tab: SettingsTab::General,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
+            comparison_run_model_ids: None,
+            comparison_started_at: None,
             model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -3265,7 +3275,19 @@ impl LocalTranscriberApp {
     }
 
     fn playground_selected_models(&self) -> Vec<SttModelInfo> {
-        config::playground_selected_installed_models(&self.config)
+        let Some(selected_ids) = self.comparison_run_model_ids.as_ref() else {
+            return config::playground_selected_installed_models(&self.config);
+        };
+        let configured = config::configured_models(&self.config);
+        selected_ids
+            .iter()
+            .filter_map(|id| {
+                configured
+                    .iter()
+                    .find(|model| &model.id == id && model.install_status.is_runnable())
+                    .cloned()
+            })
+            .collect()
     }
 
     fn save_config(&mut self) {
@@ -6194,6 +6216,28 @@ impl LocalTranscriberApp {
                     }
                     self.cleanup_after_job(source, session_id, request_id);
                 }
+                AppEvent::PlaygroundModelStarted {
+                    session_id,
+                    request_id,
+                    model_id,
+                } => {
+                    if !self.transcription_event_is_current(
+                        RecordingSource::Playground,
+                        session_id,
+                        request_id,
+                    ) || self.expected_playground_model_id(session_id, request_id)
+                        != Some(model_id.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(card) = self
+                        .playground_cards
+                        .iter_mut()
+                        .find(|card| card.descriptor.id.as_str() == model_id)
+                    {
+                        card.status = ModelRuntimeStatus::Running;
+                    }
+                }
                 AppEvent::TranscriptionFailed {
                     source,
                     session_id,
@@ -6876,36 +6920,26 @@ impl LocalTranscriberApp {
                     return;
                 }
             };
-            let task = match service.begin_transcription_task() {
-                Ok(task) => task,
-                Err(err) => {
-                    let _ = self.session_coordinator.fail(session_id);
-                    self.playground_pending = 0;
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not dispatch model comparison: {err}");
-                    return;
-                }
-            };
-            requests.push((request_id, model, task));
+            requests.push((request_id, model));
         }
         self.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: requests
                     .iter()
-                    .map(|(request_id, model, _)| (*request_id, model.id.clone()))
+                    .map(|(request_id, model)| (*request_id, model.id.clone()))
                     .collect(),
                 _audio: Arc::clone(&audio),
             },
         );
 
-        for (_, model, _) in &requests {
+        for (_, model) in &requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
                 .find(|card| card.descriptor.id.as_str() == model.id)
             {
-                card.status = ModelRuntimeStatus::Running;
+                card.status = ModelRuntimeStatus::Ready;
                 card.transcript.clear();
                 card.latency_ms = None;
                 card.audio_duration_ms = audio_duration_ms;
@@ -6914,13 +6948,34 @@ impl LocalTranscriberApp {
             }
         }
 
-        for (request_id, model, task) in requests {
-            let tx = self.tx.clone();
-            let service = service.clone();
-            let audio = Arc::clone(&audio);
-            thread::spawn(move || {
-                let mut request =
-                    TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            for (request_id, model) in requests {
+                let _ = tx.send(AppEvent::PlaygroundModelStarted {
+                    session_id,
+                    request_id,
+                    model_id: model.id.clone(),
+                });
+                let task = match service.begin_transcription_task() {
+                    Ok(task) => task,
+                    Err(err) => {
+                        let _ = tx.send(AppEvent::TranscriptionFailed {
+                            source: RecordingSource::Playground,
+                            session_id,
+                            request_id,
+                            model_id: model.id,
+                            message: err.to_string(),
+                            latency: None,
+                        });
+                        continue;
+                    }
+                };
+                let mut request = TranscriptionRequest::new(
+                    session_id,
+                    request_id,
+                    Arc::clone(&audio),
+                    model.id.clone(),
+                );
                 request.model_path = model.local_path.clone();
                 request.options = TranscriptionOptions::default();
                 match service.transcribe_task(request, task) {
@@ -6944,14 +6999,16 @@ impl LocalTranscriberApp {
                         });
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     fn reset_playground_for_run(&mut self) {
-        self.playground_cards = cards_from_config(&self.config, &self.transcription_service)
-            .into_iter()
-            .collect();
+        self.playground_cards = cards_for_models(
+            &self.config,
+            &self.transcription_service,
+            self.playground_selected_models(),
+        );
         for card in &mut self.playground_cards {
             card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
             card.transcript.clear();
@@ -7041,9 +7098,16 @@ impl LocalTranscriberApp {
     }
 
     fn playground_run_block_reason(&self) -> Option<String> {
-        if self.playground_cards.is_empty() {
+        let models = self.playground_selected_models();
+        if models.is_empty() {
             return Some(
-                if self.config.general.playground_selected_models.is_empty() {
+                if self
+                    .comparison_run_model_ids
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                    || (self.comparison_run_model_ids.is_none()
+                        && self.config.general.playground_selected_models.is_empty())
+                {
                     "Choose models to test before starting a test recording.".to_owned()
                 } else {
                     "Install the selected Playground models before starting a test recording."
@@ -7051,13 +7115,13 @@ impl LocalTranscriberApp {
                 },
             );
         }
-        self.playground_cards
+        models
             .iter()
-            .find(|card| card.status != ModelRuntimeStatus::Ready)
-            .map(|card| {
+            .find(|model| runtime_status_for_model(&self.config, model) != ModelRuntimeStatus::Ready)
+            .map(|model| {
                 format!(
                     "{} is not ready. Repair or install its runtime from Models before running the Playground.",
-                    card.descriptor.display_name
+                    model.name
                 )
             })
     }
@@ -8296,6 +8360,10 @@ impl LocalTranscriberApp {
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
+            | ScreenAction::StopComparison
+            | ScreenAction::EditComparisonReference(_)
+            | ScreenAction::ApplyComparisonReference
+            | ScreenAction::ClearComparisonReference
             | ScreenAction::SetSettingsTab(_)
             | ScreenAction::SetCloseToTray(_)
             | ScreenAction::SetRecordingMode(_)
@@ -8599,6 +8667,7 @@ impl LocalTranscriberApp {
                     && model.compatibility != ModelCompatibility::Incompatible
             })
         });
+        self.sync_model_comparison_state();
         let action = render_screen(
             ui,
             &ScreenView {
@@ -8612,6 +8681,98 @@ impl LocalTranscriberApp {
             },
         );
         self.apply_model_management_action(action);
+    }
+
+    fn sync_model_comparison_state(&mut self) {
+        let Some(model_ids) = self.comparison_run_model_ids.clone() else {
+            return;
+        };
+        let pending_model_ids = self
+            .playground_runs
+            .values()
+            .flat_map(|run| run.pending_requests.values().cloned())
+            .collect::<HashSet<_>>();
+        let reference = self
+            .model_comparison
+            .reference_transcript
+            .as_deref()
+            .filter(|reference| !reference.trim().is_empty())
+            .map(str::to_owned);
+
+        self.model_comparison.recording_elapsed_ms = self
+            .comparison_started_at
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        self.model_comparison.audio_duration_ms = self
+            .playground_cards
+            .iter()
+            .find_map(|card| card.audio_duration_ms)
+            .and_then(|duration| u64::try_from(duration).ok());
+        self.model_comparison.results = model_ids
+            .iter()
+            .map(|model_id| {
+                let card = self
+                    .playground_cards
+                    .iter()
+                    .find(|card| card.descriptor.id.as_str() == model_id);
+                let phase = match card.map(|card| &card.status) {
+                    Some(ModelRuntimeStatus::Running) => ComparisonResultPhase::Processing,
+                    Some(ModelRuntimeStatus::Error(_)) => ComparisonResultPhase::Error,
+                    Some(_) if card.and_then(|card| card.latency_ms).is_some() => {
+                        ComparisonResultPhase::Complete
+                    }
+                    _ if pending_model_ids.contains(model_id) => ComparisonResultPhase::Pending,
+                    _ => ComparisonResultPhase::Pending,
+                };
+                let output = card
+                    .map(|card| card.transcript.clone())
+                    .filter(|output| !output.trim().is_empty());
+                let processing_ms = card
+                    .and_then(|card| card.latency_ms)
+                    .and_then(|duration| u64::try_from(duration).ok());
+                let realtime_factor = processing_ms
+                    .zip(self.model_comparison.audio_duration_ms)
+                    .filter(|(_, audio)| *audio > 0)
+                    .map(|(processing, audio)| processing as f32 / audio as f32);
+                let word_error_rate = reference
+                    .as_deref()
+                    .zip(output.as_deref())
+                    .map(|(reference, output)| benchmark::calculate_wer(reference, output) as f32);
+                let error = card.and_then(|card| match &card.status {
+                    ModelRuntimeStatus::Error(error) => Some(error.clone()),
+                    _ => None,
+                });
+                (
+                    model_id.clone(),
+                    ComparisonResult {
+                        phase,
+                        output,
+                        processing_ms,
+                        realtime_factor,
+                        word_error_rate,
+                        error,
+                    },
+                )
+            })
+            .collect();
+
+        self.model_comparison.phase =
+            if self.recording_source() == Some(RecordingSource::Playground) {
+                ComparisonPhase::Recording
+            } else if self.playground_pending > 0 {
+                ComparisonPhase::Processing
+            } else if self
+                .model_comparison
+                .results
+                .iter()
+                .any(|(_, result)| result.phase == ComparisonResultPhase::Complete)
+            {
+                ComparisonPhase::Complete
+            } else if self.comparison_started_at.is_some() {
+                ComparisonPhase::Error
+            } else {
+                ComparisonPhase::Idle
+            };
     }
 
     fn model_management_catalog(&self) -> Vec<ModelViewModel> {
@@ -8764,13 +8925,61 @@ impl LocalTranscriberApp {
                 self.model_comparison.expanded = !self.model_comparison.expanded
             }
             ScreenAction::ToggleComparisonModel(id) => {
-                if !self.model_comparison.selected_model_ids.insert(id.clone()) {
+                if matches!(
+                    self.model_comparison.phase,
+                    ComparisonPhase::Recording | ComparisonPhase::Processing
+                ) {
+                    self.model_comparison.selection_feedback =
+                        Some("Model selection is locked during a comparison.".to_owned());
+                } else if self.model_comparison.selected_model_ids.contains(&id) {
                     self.model_comparison.selected_model_ids.remove(&id);
+                    self.model_comparison.selection_feedback = None;
+                } else if self.model_comparison.selected_model_ids.len() >= 4 {
+                    self.model_comparison.selection_feedback =
+                        Some("A comparison can include at most four models.".to_owned());
+                } else {
+                    self.model_comparison.selected_model_ids.insert(id);
+                    self.model_comparison.selection_feedback = None;
                 }
             }
             ScreenAction::StartComparison => {
-                self.status_message =
-                    "Model comparison is not scheduled from this screen yet.".to_owned();
+                if !self.model_comparison.begin() {
+                    self.model_comparison.selection_feedback = Some(
+                        "Select two to four ready models before starting a comparison.".to_owned(),
+                    );
+                } else {
+                    self.comparison_run_model_ids = Some(
+                        self.model_comparison
+                            .selected_model_ids
+                            .iter()
+                            .cloned()
+                            .collect(),
+                    );
+                    self.comparison_started_at = Some(Instant::now());
+                    self.start_recording(RecordingSource::Playground);
+                    if self.recording_source() != Some(RecordingSource::Playground) {
+                        self.model_comparison.phase = ComparisonPhase::Error;
+                    }
+                }
+            }
+            ScreenAction::StopComparison => {
+                if self.recording_source() == Some(RecordingSource::Playground) {
+                    self.stop_recording();
+                }
+            }
+            ScreenAction::EditComparisonReference(reference) => {
+                self.model_comparison.reference_draft = reference;
+            }
+            ScreenAction::ApplyComparisonReference => {
+                let reference = self.model_comparison.reference_draft.trim();
+                self.model_comparison.reference_transcript =
+                    (!reference.is_empty()).then(|| reference.to_owned());
+                self.sync_model_comparison_state();
+            }
+            ScreenAction::ClearComparisonReference => {
+                self.model_comparison.reference_draft.clear();
+                self.model_comparison.reference_transcript = None;
+                self.sync_model_comparison_state();
             }
             ScreenAction::InstallModel(id) => {
                 if let Some(model) = config::configured_models(&self.config)
@@ -9523,6 +9732,8 @@ impl LocalTranscriberApp {
                         if self.capture_is_active() {
                             self.stop_recording();
                         } else {
+                            self.comparison_run_model_ids = None;
+                            self.comparison_started_at = None;
                             self.start_recording(RecordingSource::Playground);
                         }
                     }
@@ -10243,7 +10454,11 @@ impl LocalTranscriberApp {
             | ScreenAction::CopyTranscript
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
-            | ScreenAction::StartComparison => {}
+            | ScreenAction::StartComparison
+            | ScreenAction::StopComparison
+            | ScreenAction::EditComparisonReference(_)
+            | ScreenAction::ApplyComparisonReference
+            | ScreenAction::ClearComparisonReference => {}
         }
     }
 
@@ -13401,12 +13616,24 @@ fn cards_from_config(
     config: &AppConfig,
     service: &TranscriptionService,
 ) -> Vec<PlaygroundCardState> {
+    cards_for_models(
+        config,
+        service,
+        config::playground_selected_installed_models(config),
+    )
+}
+
+fn cards_for_models(
+    config: &AppConfig,
+    service: &TranscriptionService,
+    models: Vec<SttModelInfo>,
+) -> Vec<PlaygroundCardState> {
     let descriptors = service
         .model_descriptors()
         .into_iter()
         .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
         .collect::<HashMap<_, _>>();
-    config::playground_selected_installed_models(config)
+    models
         .into_iter()
         .filter_map(|model| {
             let descriptor = descriptors.get(&model.id)?.clone();
@@ -16129,6 +16356,118 @@ mod layout_tests {
     }
 
     #[test]
+    fn comparison_runs_one_model_at_a_time_and_keeps_success_after_failure() {
+        let mut app = test_app();
+        app.transcript = "keep active transcript".to_owned();
+        let first_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
+        let second_id = "comparison_second_model".to_owned();
+        let mut second_card = app.playground_cards[0].clone();
+        second_card.descriptor.id = ModelId::new(&second_id);
+        app.playground_cards.push(second_card);
+        for card in &mut app.playground_cards {
+            card.status = ModelRuntimeStatus::Ready;
+            card.audio_duration_ms = Some(1_000);
+        }
+
+        let session_id = SessionId(44);
+        let first_request = RequestId(440);
+        let second_request = RequestId(441);
+        app.session_coordinator.seed_active_for_test(
+            session_id,
+            SessionPurpose::Comparison,
+            [
+                (first_request, ModelId::new(&first_id)),
+                (second_request, ModelId::new(&second_id)),
+            ],
+        );
+        app.playground_pending = 2;
+        app.comparison_run_model_ids = Some(vec![first_id.clone(), second_id.clone()]);
+        app.comparison_started_at = Some(Instant::now());
+        app.model_comparison
+            .selected_model_ids
+            .extend([first_id.clone(), second_id.clone()]);
+        app.model_comparison.reference_draft = "hello world".to_owned();
+        app.model_comparison.reference_transcript = Some("hello world".to_owned());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([
+                    (first_request, first_id.clone()),
+                    (second_request, second_id.clone()),
+                ]),
+                _audio: audio,
+            },
+        );
+
+        app.tx
+            .send(AppEvent::PlaygroundModelStarted {
+                session_id,
+                request_id: first_request,
+                model_id: first_id.clone(),
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
+        assert_eq!(app.playground_cards[1].status, ModelRuntimeStatus::Ready);
+
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id: first_request,
+                model_id: first_id.clone(),
+                message: "first failed".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+        app.tx
+            .send(AppEvent::PlaygroundModelStarted {
+                session_id,
+                request_id: second_request,
+                model_id: second_id.clone(),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(
+            app.playground_cards[0].status,
+            ModelRuntimeStatus::Error(_)
+        ));
+        assert_eq!(app.playground_cards[1].status, ModelRuntimeStatus::Running);
+        assert_eq!(app.playground_pending, 1);
+        assert!(released.upgrade().is_some());
+
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id: second_request,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    second_request,
+                    &second_id,
+                    "hello world",
+                )),
+                latency: None,
+            })
+            .unwrap();
+        app.poll_events();
+        app.sync_model_comparison_state();
+
+        assert!(released.upgrade().is_none());
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.model_comparison.phase, ComparisonPhase::Complete);
+        assert_eq!(app.transcript, "keep active transcript");
+        assert_eq!(app.model_comparison.results.len(), 2);
+        assert_eq!(
+            app.model_comparison.results[0].1.phase,
+            ComparisonResultPhase::Error
+        );
+        assert_eq!(app.model_comparison.results[1].1.word_error_rate, Some(0.0));
+    }
+
+    #[test]
     fn mismatched_service_ids_are_rejected_without_output() {
         let mut app = test_app();
         app.config.output.auto_insert_transcript = false;
@@ -17007,6 +17346,8 @@ mod layout_tests {
             settings_tab: SettingsTab::General,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
+            comparison_run_model_ids: None,
+            comparison_started_at: None,
             model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),

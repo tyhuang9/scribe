@@ -9,9 +9,10 @@ use super::{
         ButtonTone, Icon, badge, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
-        ModelComparisonState, ModelDialog, ModelDownloadState, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RecordingMode, SettingsSaveState, SettingsTab,
-        TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ComparisonResultPhase, ModelComparisonState, ModelDialog,
+        ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        RecordingMode, SettingsSaveState, SettingsTab, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     ui_palette,
 };
@@ -131,6 +132,10 @@ pub(crate) enum ScreenAction {
     ToggleComparison,
     ToggleComparisonModel(String),
     StartComparison,
+    StopComparison,
+    EditComparisonReference(String),
+    ApplyComparisonReference,
+    ClearComparisonReference,
     SelectModel(String),
     InstallModel(String),
     CancelModelInstall(String),
@@ -960,62 +965,161 @@ fn models(
                             && model.ready
                             && model.compatibility != super::state::ModelCompatibility::Incompatible
                     }) {
-                        let mut checked = comparison.selected_model_ids.contains(&model.id);
-                        let response = ui.checkbox(&mut checked, &model.display_name);
+                        let selected = comparison.selected_model_ids.contains(&model.id);
+                        let selection_disabled = matches!(
+                            comparison.phase,
+                            ComparisonPhase::Recording | ComparisonPhase::Processing
+                        ) || (!selected
+                            && comparison.selected_model_ids.len() >= 4);
+                        let mut checked = selected;
+                        let response = ui.add_enabled(
+                            !selection_disabled,
+                            egui::Checkbox::new(&mut checked, &model.display_name),
+                        );
                         ui.ctx().accesskit_node_builder(response.id, |builder| {
                             builder.set_role(egui::accesskit::Role::CheckBox);
                             builder.set_name(model.display_name.as_str());
                         });
+                        if selection_disabled {
+                            let reason = if matches!(
+                                comparison.phase,
+                                ComparisonPhase::Recording | ComparisonPhase::Processing
+                            ) {
+                                "Model selection is locked during a comparison."
+                            } else {
+                                "A comparison can include at most four models."
+                            };
+                            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_description(reason);
+                            });
+                            response.clone().on_hover_text(reason);
+                        }
                         if response.clicked() {
                             action = ScreenAction::ToggleComparisonModel(model.id.clone());
                         }
                     }
-                    let disabled_reason = comparison_start_disabled_reason(comparison);
-                    let start = ui.add_enabled(
-                        disabled_reason.is_none(),
-                        egui::Button::new(
-                            RichText::new(format!(
-                                "{}  Start test recording",
-                                icon_glyph(Icon::Microphone)
-                            ))
-                            .color(colors.primary_button_text),
-                        )
-                        .fill(colors.primary_button_bg)
-                        .min_size(Vec2::new(0.0, 40.0)),
-                    );
-                    ui.ctx().accesskit_node_builder(start.id, |builder| {
-                        builder.set_role(egui::accesskit::Role::Button);
-                        builder.set_name("Start test recording");
-                    });
-                    if let Some(reason) = disabled_reason {
-                        ui.ctx().accesskit_node_builder(start.id, |builder| {
-                            builder.set_description(reason);
+                    if comparison.phase == ComparisonPhase::Recording {
+                        ui.label(format!(
+                            "Recording {:.1}s",
+                            comparison.recording_elapsed_ms as f32 / 1_000.0
+                        ));
+                        let stop =
+                            ui.add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Stop recording"));
+                        ui.ctx().accesskit_node_builder(stop.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Button);
+                            builder.set_name("Stop comparison recording");
                         });
-                        start.clone().on_hover_text(reason);
-                        ui.label(RichText::new(reason).small().color(colors.muted_text));
+                        if stop.clicked() {
+                            action = ScreenAction::StopComparison;
+                        }
+                    } else {
+                        let disabled_reason = comparison_start_disabled_reason(comparison);
+                        let start = ui.add_enabled(
+                            disabled_reason.is_none(),
+                            egui::Button::new(
+                                RichText::new(format!(
+                                    "{}  Start test recording",
+                                    icon_glyph(Icon::Microphone)
+                                ))
+                                .color(colors.primary_button_text),
+                            )
+                            .fill(colors.primary_button_bg)
+                            .min_size(Vec2::new(0.0, 44.0)),
+                        );
+                        ui.ctx().accesskit_node_builder(start.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Button);
+                            builder.set_name("Start test recording");
+                        });
+                        if let Some(reason) = disabled_reason {
+                            ui.ctx().accesskit_node_builder(start.id, |builder| {
+                                builder.set_description(reason);
+                            });
+                            start.clone().on_hover_text(reason);
+                            ui.label(RichText::new(reason).small().color(colors.muted_text));
+                        }
+                        if start.clicked() {
+                            action = ScreenAction::StartComparison;
+                        }
                     }
-                    if start.clicked() {
-                        action = ScreenAction::StartComparison;
+                });
+                if let Some(feedback) = comparison.selection_feedback.as_deref() {
+                    ui.label(RichText::new(feedback).small().color(colors.warning));
+                }
+                ui.separator();
+                ui.label(RichText::new("Reference transcript (optional)").strong());
+                let mut reference_draft = comparison.reference_draft.clone();
+                let reference = ui.add(
+                    egui::TextEdit::multiline(&mut reference_draft)
+                        .id_source("comparison-reference-transcript")
+                        .hint_text("Paste the words that were spoken")
+                        .desired_rows(3),
+                );
+                ui.ctx().accesskit_node_builder(reference.id, |builder| {
+                    builder.set_name("Reference transcript");
+                    builder.set_description(
+                        "Optional reference text used to calculate word error rate after the run.",
+                    );
+                });
+                if reference.changed() {
+                    action = ScreenAction::EditComparisonReference(reference_draft);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Apply reference"))
+                        .clicked()
+                    {
+                        action = ScreenAction::ApplyComparisonReference;
                     }
+                    if ui
+                        .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Clear reference"))
+                        .clicked()
+                    {
+                        action = ScreenAction::ClearComparisonReference;
+                    }
+                    ui.label(
+                        RichText::new(if comparison.reference_transcript.is_some() {
+                            "Reference applied"
+                        } else {
+                            "No reference applied"
+                        })
+                        .small()
+                        .color(colors.muted_text),
+                    );
                 });
                 ui.separator();
                 Grid::new("comparison-results")
                     .striped(true)
                     .min_col_width(115.0)
                     .show(ui, |ui| {
-                        for heading in
-                            ["Model", "Duration", "Processing time", "Output", "Accuracy"]
-                        {
+                        for heading in [
+                            "Model",
+                            "Status",
+                            "Audio",
+                            "Processing",
+                            "RTF",
+                            "Output",
+                            "Accuracy",
+                        ] {
                             ui.label(RichText::new(heading).strong().small());
                         }
                         ui.end_row();
-                        for model in models {
+                        for model in models
+                            .iter()
+                            .filter(|model| comparison.selected_model_ids.contains(&model.id))
+                        {
                             let result = comparison
                                 .results
                                 .iter()
                                 .find(|(id, _)| id == &model.id)
                                 .map(|(_, result)| result);
-                            ui.label(&model.variant_label);
+                            ui.label(&model.display_name);
+                            ui.label(match result.map(|result| result.phase) {
+                                Some(ComparisonResultPhase::Pending) => "Queued",
+                                Some(ComparisonResultPhase::Processing) => "Processing",
+                                Some(ComparisonResultPhase::Complete) => "Complete",
+                                Some(ComparisonResultPhase::Error) => "Failed",
+                                None => "Not run",
+                            });
                             ui.label(
                                 comparison.audio_duration_ms.map_or("—".into(), |ms| {
                                     format!("{:.1}s", ms as f32 / 1_000.0)
@@ -1030,16 +1134,38 @@ fn models(
                             );
                             ui.label(
                                 result
-                                    .and_then(|r| r.output.as_deref())
-                                    .unwrap_or("No data"),
+                                    .and_then(|r| r.realtime_factor)
+                                    .map_or("â€”".into(), |rtf| format!("{rtf:.2}x")),
                             );
+                            if let Some(error) = result.and_then(|result| result.error.as_deref()) {
+                                egui::CollapsingHeader::new("View error")
+                                    .id_source(("comparison-error", &model.id))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(error).color(colors.warning));
+                                    });
+                            } else if let Some(output) =
+                                result.and_then(|result| result.output.as_deref())
+                            {
+                                egui::CollapsingHeader::new("View output")
+                                    .id_source(("comparison-output", &model.id))
+                                    .show(ui, |ui| {
+                                        ui.label(output);
+                                    });
+                            } else {
+                                ui.label("No data");
+                            }
                             ui.label(
                                 match (
                                     comparison.reference_transcript.as_deref(),
                                     result.and_then(|r| r.word_error_rate),
                                 ) {
-                                    (Some(_), Some(rate)) => {
-                                        format!("{:.0}% accuracy", (1.0 - rate) * 100.0)
+                                    (Some(reference), Some(rate))
+                                        if !reference.trim().is_empty() =>
+                                    {
+                                        format!(
+                                            "{:.0}% accuracy",
+                                            ((1.0 - rate).clamp(0.0, 1.0)) * 100.0
+                                        )
                                     }
                                     _ => "Add a reference transcript to measure".into(),
                                 },
@@ -1200,6 +1326,8 @@ fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option
         Some("Wait for the current comparison to finish before starting another.")
     } else if comparison.selected_model_ids.len() < 2 {
         Some("Select at least two installed models before starting a comparison.")
+    } else if comparison.selected_model_ids.len() > 4 {
+        Some("Select no more than four installed models for a comparison.")
     } else {
         None
     }
@@ -2384,6 +2512,12 @@ mod tests {
             node.role() == egui::accesskit::Role::Button
                 && node.name() == Some("Collapse comparison")
         }));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Reference transcript"))
+        );
     }
 
     #[test]
@@ -2400,6 +2534,17 @@ mod tests {
         assert_eq!(
             comparison_start_disabled_reason(&comparison),
             Some("Wait for the current comparison to finish before starting another.")
+        );
+
+        comparison.phase = super::super::state::ComparisonPhase::Complete;
+        comparison.selected_model_ids.extend(
+            ["small.en", "medium.en", "large.en"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            comparison_start_disabled_reason(&comparison),
+            Some("Select no more than four installed models for a comparison.")
         );
     }
 

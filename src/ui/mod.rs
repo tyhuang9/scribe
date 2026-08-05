@@ -16,9 +16,10 @@ pub(crate) use production::{
 pub(crate) use screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen};
 pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
-    MicrophonePermission, ModelCapabilities, ModelComparisonState, ModelCompatibility, ModelDialog,
-    ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-    RecordingMode, SettingsTab, UiRoute,
+    ComparisonPhase, ComparisonResult, ComparisonResultPhase, MicrophonePermission,
+    ModelCapabilities, ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
+    ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
+    SettingsTab, UiRoute,
 };
 pub(crate) use theme::{ThemePalette, theme_palette, ui_palette};
 

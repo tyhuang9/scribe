@@ -316,13 +316,22 @@ pub(crate) enum ComparisonPhase {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ComparisonResultPhase {
+    #[default]
+    Pending,
+    Processing,
+    Complete,
+    Error,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ComparisonResult {
+    pub phase: ComparisonResultPhase,
     pub output: Option<String>,
     pub processing_ms: Option<u64>,
     pub realtime_factor: Option<f32>,
     pub word_error_rate: Option<f32>,
-    pub character_error_rate: Option<f32>,
     pub error: Option<String>,
 }
 
@@ -332,13 +341,16 @@ pub(crate) struct ModelComparisonState {
     pub selected_model_ids: BTreeSet<String>,
     pub phase: ComparisonPhase,
     pub audio_duration_ms: Option<u64>,
+    pub recording_elapsed_ms: u64,
+    pub reference_draft: String,
     pub reference_transcript: Option<String>,
+    pub selection_feedback: Option<String>,
     pub results: Vec<(String, ComparisonResult)>,
 }
 
 impl ModelComparisonState {
     pub(crate) fn can_start(&self) -> bool {
-        self.selected_model_ids.len() >= 2
+        (2..=4).contains(&self.selected_model_ids.len())
             && matches!(
                 self.phase,
                 ComparisonPhase::Idle | ComparisonPhase::Complete | ComparisonPhase::Error
@@ -351,7 +363,8 @@ impl ModelComparisonState {
         }
         self.phase = ComparisonPhase::Recording;
         self.audio_duration_ms = None;
-        self.reference_transcript = None;
+        self.recording_elapsed_ms = 0;
+        self.selection_feedback = None;
         self.results.clear();
         true
     }
@@ -513,8 +526,23 @@ mod tests {
 
         assert_eq!(comparison.phase, ComparisonPhase::Recording);
         assert_eq!(comparison.audio_duration_ms, None);
-        assert_eq!(comparison.reference_transcript, None);
+        assert_eq!(
+            comparison.reference_transcript.as_deref(),
+            Some("old reference")
+        );
         assert!(comparison.results.is_empty());
+    }
+
+    #[test]
+    fn comparison_selection_is_capped_at_four_models() {
+        let mut comparison = ModelComparisonState::default();
+        comparison.selected_model_ids.extend(
+            ["one", "two", "three", "four", "five"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+
+        assert!(!comparison.can_start());
     }
 
     #[test]

@@ -7,9 +7,9 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ModelComparisonState, ModelDownloadState, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase, TranscriptionState,
-        UiRoute,
+        ComparisonPhase, ModelComparisonState, ModelDownloadState, ModelManagementState,
+        ModelSizeTier, ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase,
+        TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -256,6 +256,19 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::StartComparison => {
             let _ = data.comparison.begin();
+        }
+        ScreenAction::StopComparison => data.comparison.phase = ComparisonPhase::Processing,
+        ScreenAction::EditComparisonReference(reference) => {
+            data.comparison.reference_draft = reference
+        }
+        ScreenAction::ApplyComparisonReference => {
+            let reference = data.comparison.reference_draft.trim();
+            data.comparison.reference_transcript =
+                (!reference.is_empty()).then(|| reference.to_owned());
+        }
+        ScreenAction::ClearComparisonReference => {
+            data.comparison.reference_draft.clear();
+            data.comparison.reference_transcript = None;
         }
         ScreenAction::SetSettingsTab(tab) => {
             data.route = UiRoute::Settings(tab);
