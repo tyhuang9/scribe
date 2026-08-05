@@ -64,12 +64,20 @@ struct RequestState {
 }
 
 #[derive(Clone, Debug)]
+struct PreviewState {
+    request_id: RequestId,
+    model_id: ModelId,
+    last_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ActiveSession {
     session_id: SessionId,
     purpose: SessionPurpose,
     phase: DictationPhase,
     stop_reason: Option<StopReason>,
     model_load: ModelLoadState,
+    preview: Option<PreviewState>,
     requests: HashMap<RequestId, RequestState>,
 }
 
@@ -123,6 +131,10 @@ pub enum CoordinatorError {
     UnknownRequest(RequestId),
     #[error("request {0:?} has already completed")]
     DuplicateCompletion(RequestId),
+    #[error("a rolling preview request is already active")]
+    PreviewAlreadyActive,
+    #[error("the rolling preview request must finish before capture finalization")]
+    PreviewStillActive,
     #[error("request {request_id:?} expected model {expected}, got {actual}")]
     WrongModel {
         request_id: RequestId,
@@ -204,6 +216,7 @@ impl SessionCoordinator {
             phase: DictationPhase::Transcribing,
             stop_reason: Some(StopReason::Explicit),
             model_load: ModelLoadState::NotStarted,
+            preview: None,
             requests,
         });
     }
@@ -250,6 +263,7 @@ impl SessionCoordinator {
             phase: DictationPhase::StartingCapture,
             stop_reason: None,
             model_load: ModelLoadState::NotStarted,
+            preview: None,
             requests: HashMap::new(),
         });
         Ok(session_id)
@@ -288,6 +302,9 @@ impl SessionCoordinator {
     }
 
     pub fn capture_finalized(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        if self.active_ref(session_id)?.preview.is_some() {
+            return Err(CoordinatorError::PreviewStillActive);
+        }
         self.transition(
             session_id,
             DictationPhase::Capturing,
@@ -377,6 +394,122 @@ impl SessionCoordinator {
             },
         );
         Ok(request_id)
+    }
+
+    pub fn start_preview(
+        &mut self,
+        session_id: SessionId,
+        model_id: ModelId,
+    ) -> Result<RequestId, CoordinatorError> {
+        let active = self.active_ref(session_id)?;
+        if active.purpose != SessionPurpose::Dictation
+            || !matches!(
+                active.phase,
+                DictationPhase::StartingCapture | DictationPhase::Capturing
+            )
+        {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: active.phase,
+            });
+        }
+        if active.preview.is_some() {
+            return Err(CoordinatorError::PreviewAlreadyActive);
+        }
+        let request_id = RequestId(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or(CoordinatorError::RequestIdExhausted)?;
+        self.active_mut(session_id)?.preview = Some(PreviewState {
+            request_id,
+            model_id,
+            last_sequence: None,
+        });
+        Ok(request_id)
+    }
+
+    pub fn accept_preview_update(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+        sequence: u64,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        if !matches!(
+            active.phase,
+            DictationPhase::StartingCapture | DictationPhase::Capturing
+        ) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: active.phase,
+            });
+        }
+        let preview = active
+            .preview
+            .as_mut()
+            .filter(|preview| preview.request_id == request_id)
+            .ok_or(CoordinatorError::UnknownRequest(request_id))?;
+        if &preview.model_id != model_id {
+            return Err(CoordinatorError::WrongModel {
+                request_id,
+                expected: preview.model_id.clone(),
+                actual: model_id.clone(),
+            });
+        }
+        if let Some(previous) = preview.last_sequence
+            && sequence <= previous
+        {
+            return Err(CoordinatorError::StaleSequence {
+                previous,
+                actual: sequence,
+            });
+        }
+        preview.last_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub fn finish_preview(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        let preview = active
+            .preview
+            .as_ref()
+            .filter(|preview| preview.request_id == request_id)
+            .ok_or(CoordinatorError::UnknownRequest(request_id))?;
+        if &preview.model_id != model_id {
+            return Err(CoordinatorError::WrongModel {
+                request_id,
+                expected: preview.model_id.clone(),
+                actual: model_id.clone(),
+            });
+        }
+        active.preview = None;
+        Ok(())
+    }
+
+    pub fn is_current_preview(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+    ) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.session_id == session_id
+                && active.purpose == SessionPurpose::Dictation
+                && matches!(
+                    active.phase,
+                    DictationPhase::StartingCapture | DictationPhase::Capturing
+                )
+                && active.preview.as_ref().is_some_and(|preview| {
+                    preview.request_id == request_id && &preview.model_id == model_id
+                })
+        })
     }
 
     #[allow(dead_code)] // Phase 7 calls this for committed/tentative updates.
@@ -657,6 +790,98 @@ mod tests {
             coordinator.last_terminal().unwrap().outcome,
             TerminalOutcome::Completed
         );
+    }
+
+    #[test]
+    fn preview_sequence_is_separate_from_final_request_completion() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        let preview_id = coordinator
+            .start_preview(session_id, model("balanced"))
+            .unwrap();
+        coordinator.capture_started(session_id).unwrap();
+        coordinator
+            .accept_preview_update(session_id, preview_id, &model("balanced"), 2)
+            .unwrap();
+        assert_eq!(
+            coordinator.accept_preview_update(session_id, preview_id, &model("balanced"), 1),
+            Err(CoordinatorError::StaleSequence {
+                previous: 2,
+                actual: 1,
+            })
+        );
+
+        coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        coordinator
+            .finish_preview(session_id, preview_id, &model("balanced"))
+            .unwrap();
+        coordinator.capture_finalized(session_id).unwrap();
+        let final_id = coordinator
+            .start_request(session_id, model("balanced"))
+            .unwrap();
+        assert_ne!(preview_id, final_id);
+        assert!(
+            coordinator
+                .complete_request(session_id, final_id, &model("balanced"))
+                .unwrap()
+        );
+        coordinator.begin_output(session_id).unwrap();
+    }
+
+    #[test]
+    fn capture_cannot_finalize_until_the_preview_scheduler_is_closed() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        let preview_id = coordinator
+            .start_preview(session_id, model("balanced"))
+            .unwrap();
+        coordinator.capture_started(session_id).unwrap();
+        coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+
+        assert_eq!(
+            coordinator.capture_finalized(session_id),
+            Err(CoordinatorError::PreviewStillActive)
+        );
+        assert_eq!(coordinator.phase(), DictationPhase::Capturing);
+        coordinator
+            .finish_preview(session_id, preview_id, &model("balanced"))
+            .unwrap();
+        coordinator.capture_finalized(session_id).unwrap();
+    }
+
+    #[test]
+    fn preview_rejects_wrong_model_stale_session_and_updates_after_finish() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        let preview_id = coordinator
+            .start_preview(session_id, model("balanced"))
+            .unwrap();
+
+        assert!(matches!(
+            coordinator.accept_preview_update(session_id, preview_id, &model("different"), 1),
+            Err(CoordinatorError::WrongModel { .. })
+        ));
+        assert!(matches!(
+            coordinator.accept_preview_update(
+                SessionId(session_id.0 + 1),
+                preview_id,
+                &model("balanced"),
+                1
+            ),
+            Err(CoordinatorError::StaleSession(_))
+        ));
+        coordinator
+            .finish_preview(session_id, preview_id, &model("balanced"))
+            .unwrap();
+        assert!(!coordinator.is_current_preview(session_id, preview_id, &model("balanced")));
+        assert!(matches!(
+            coordinator.accept_preview_update(session_id, preview_id, &model("balanced"), 1),
+            Err(CoordinatorError::UnknownRequest(_))
+        ));
     }
 
     #[test]

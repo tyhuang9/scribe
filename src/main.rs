@@ -12,6 +12,7 @@ mod overlay;
 mod prepared_audio;
 mod runtime_catalog;
 mod runtime_router;
+mod streaming;
 mod stt;
 mod text_output;
 mod transcription;

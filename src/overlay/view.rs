@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 
-use super::controller::{OverlayMode, OverlayPhase, OverlayViewState};
+use super::controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState};
 use super::platform::{
     CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec, harden_overlay_window,
     overlay_window_bounds,
@@ -184,7 +184,7 @@ fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState) {
         let color = if active {
             Color32::from_rgb(91, 201, 158)
         } else {
-            Color32::from_rgb(64, 76, 94)
+            Color32::from_rgb(100, 112, 132)
         };
         ui.painter().rect_filled(bar, 2.0, color);
     }
@@ -192,10 +192,10 @@ fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState) {
 
 fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
     if let Some(error) = &state.error {
-        let suffix = if error.recoverable {
-            " You can retry."
-        } else {
-            ""
+        let suffix = match error.recovery {
+            OverlayRecovery::None => "",
+            OverlayRecovery::Retry => " You can retry.",
+            OverlayRecovery::WaitForPreview => " Wait for the current preview worker to exit.",
         };
         let response = ui.label(
             RichText::new(format!("{}{suffix}", error.message))
@@ -205,21 +205,62 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
         return;
     }
 
+    if let Some(notice) = &state.notice {
+        let response = ui.label(RichText::new(notice).color(Color32::from_rgb(255, 211, 132)));
+        mark_polite_live_region(ui.ctx(), response.id);
+    }
+
     if state.transcript.committed.is_empty() && state.transcript.tentative.is_empty() {
         return;
     }
 
+    let text = transcript_layout(
+        &state.transcript.committed,
+        &state.transcript.tentative,
+        ui.available_width(),
+    );
+    let response = ui.label(text);
+    let accessible_text = if state.transcript.tentative.is_empty() {
+        format!("Committed transcript: {}", state.transcript.committed)
+    } else {
+        format!(
+            "Committed transcript: {}. Tentative transcript: {}",
+            state.transcript.committed, state.transcript.tentative
+        )
+    };
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name(accessible_text);
+    });
+    if let Some(announcement) = &state.transcript_announcement {
+        let response = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::StaticText);
+            builder.set_name(announcement.as_str());
+            builder.set_live(egui::accesskit::Live::Polite);
+        });
+    }
+}
+
+fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::text::LayoutJob {
     let mut text = egui::text::LayoutJob::default();
     text.append(
-        &state.transcript.committed,
+        committed,
         0.0,
         egui::TextFormat {
             color: Color32::WHITE,
             ..Default::default()
         },
     );
+    if !committed.is_empty()
+        && !tentative.is_empty()
+        && !committed.ends_with(char::is_whitespace)
+        && !tentative.starts_with(char::is_whitespace)
+        && !tentative.starts_with(is_left_binding_punctuation)
+    {
+        text.append(" ", 0.0, egui::TextFormat::default());
+    }
     text.append(
-        &state.transcript.tentative,
+        tentative,
         0.0,
         egui::TextFormat {
             color: Color32::from_rgb(162, 173, 190),
@@ -227,19 +268,15 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
             ..Default::default()
         },
     );
-    text.wrap.max_width = ui.available_width();
-    let response = ui.label(text);
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        let mut accessible_text = format!("Committed transcript: {}", state.transcript.committed);
-        if !state.transcript.tentative.is_empty() {
-            accessible_text.push_str(&format!(
-                ". Tentative transcript: {}",
-                state.transcript.tentative
-            ));
-        }
-        builder.set_name(accessible_text);
-        builder.set_live(egui::accesskit::Live::Polite);
-    });
+    text.wrap.max_width = max_width;
+    text
+}
+
+fn is_left_binding_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ',' | '!' | '?' | ':' | ';' | '%' | ')' | ']' | '}' | '…'
+    )
 }
 
 fn mark_polite_live_region(context: &egui::Context, id: egui::Id) {
@@ -301,6 +338,23 @@ mod tests {
     }
 
     #[test]
+    fn stabilizer_shaped_transcript_has_exactly_one_boundary_space() {
+        let layout = transcript_layout("Schedule a meeting with", "Alex tomorrow", LIVE_WIDTH);
+        assert_eq!(layout.text, "Schedule a meeting with Alex tomorrow");
+
+        let already_spaced = transcript_layout("hello ", "world", LIVE_WIDTH);
+        assert_eq!(already_spaced.text, "hello world");
+    }
+
+    #[test]
+    fn standalone_closing_punctuation_binds_to_the_committed_prefix() {
+        for punctuation in [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…"] {
+            let layout = transcript_layout("hello", punctuation, LIVE_WIDTH);
+            assert_eq!(layout.text, format!("hello{punctuation}"));
+        }
+    }
+
+    #[test]
     fn transcript_and_status_are_polite_live_regions_without_controls() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -308,9 +362,10 @@ mod tests {
             phase: OverlayPhase::Listening,
             transcript: super::super::controller::OverlayTranscript {
                 committed: "hello".to_owned(),
-                tentative: " world".to_owned(),
+                tentative: "world".to_owned(),
                 revision: 1,
             },
+            transcript_announcement: Some("Committed transcript: hello".to_owned()),
             ..OverlayViewState::default()
         };
 
@@ -321,12 +376,17 @@ mod tests {
 
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live() == Some(egui::accesskit::Live::Polite)
-                && node
+                && node.name() == Some("Committed transcript: hello")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.live().is_none()
+                && node.name() == Some("Committed transcript: hello. Tentative transcript: world")
+        }));
+        assert!(update.nodes.iter().all(|(_, node)| {
+            node.live() != Some(egui::accesskit::Live::Polite)
+                || !node
                     .name()
-                    .is_some_and(|name| name.contains("Committed transcript: hello"))
-                && node
-                    .name()
-                    .is_some_and(|name| name.contains("Tentative transcript:  world"))
+                    .is_some_and(|name| name.contains("Tentative transcript"))
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ProgressIndicator
@@ -339,5 +399,50 @@ mod tests {
                 .iter()
                 .all(|(_, node)| node.role() != egui::accesskit::Role::Button)
         );
+    }
+
+    #[test]
+    fn blocked_preview_error_announces_wait_guidance_instead_of_retry() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let state = OverlayViewState {
+            phase: OverlayPhase::Error,
+            error: Some(super::super::controller::OverlayError {
+                message: "Live preview has not acknowledged cancellation".to_owned(),
+                recovery: OverlayRecovery::WaitForPreview,
+            }),
+            ..OverlayViewState::default()
+        };
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            render_overlay(context, &state);
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.live() == Some(egui::accesskit::Live::Polite)
+                && node.name().is_some_and(|name| {
+                    name.contains("Wait for the current preview worker to exit")
+                        && !name.contains("You can retry")
+                })
+        }));
+    }
+
+    #[test]
+    fn inactive_meter_bars_meet_three_to_one_non_text_contrast() {
+        fn linear(channel: u8) -> f32 {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: Color32) -> f32 {
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        }
+        let foreground = luminance(Color32::from_rgb(100, 112, 132));
+        let background = luminance(Color32::from_rgb(20, 25, 34));
+
+        assert!((foreground + 0.05) / (background + 0.05) >= 3.0);
     }
 }
