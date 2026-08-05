@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 5 matrix (2026-08-03). No manual desktop, microphone,
+**Status:** living Phase 6 matrix (2026-08-04). No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-5 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-6 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -136,6 +136,26 @@ placement, AccessKit announcements, and safe interaction with real target
 applications. Non-Windows overlay and automatic paste intentionally fail
 closed in the current implementation.
 
+## Automated Phase 6 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 358 discovered, 353 passed, 0 failed, 5 environment-required tests ignored |
+| Native capture/DSP | SPSC FIFO/wrap/concurrency/overflow; conversion/downmix/resample/normalization; 25 Hz RMS/peak; adaptive VAD, timing, pre/post-roll, no-speech, and disabled-VAD tests | PASS automated paths; physical microphones and driver timing remain NOT VERIFIED |
+| Stop/error recovery | Explicit-over-endpoint/max priority; structured overflow/stream/format faults; two-attempt restart bound; no-speech no-output; in-memory audio ownership | PASS deterministic injection; live unplug/restart remains NOT VERIFIED |
+| Settings | Defaults, ordered range normalization, field salvage, and future Recording-field round trip | PASS |
+| Accessibility semantics | AccessKit relationships for maximum-duration and all five VAD timing spin buttons | PASS automated semantics; physical screen-reader behavior remains NOT VERIFIED |
+| Architecture boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary test | PASS - exactly one logical handler; runtime/model-family selection remains private |
+| Pinned primary fixture | Exact ignored JFK service smoke | PASS - non-empty final text through the retained v1.9.1/base.en CPU runtime |
+| Release latency fixture | Exact ignored 5-cold/20-warm JFK benchmark | Initial run exposed `STATUS_ACCESS_VIOLATION`; synchronous final-worker shutdown fixed it. Final rerun PASS - cold total median/p95 1,177/1,189 ms; warm 817/884 ms. |
+
+Phase 6 proves that normal capture no longer writes callback WAVs and that the
+native worker produces one canonical in-memory `PreparedAudio`. It does not
+prove real device recovery, acoustic VAD quality, first-syllable retention,
+meter cadence on a physical driver, or any desktop output behavior. Those rows
+remain NOT VERIFIED.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -162,7 +182,7 @@ closed in the current implementation.
 | UI-08 | Windows | P1, P2, P4 | With overlay Live, begin dictation from another app; verify taskbar, Alt+Tab, mouse interaction through the overlay, and original target focus. Repeat in Minimal and Off. | The overlay has no taskbar/Alt+Tab entry, is always on top without activation, is mouse-pass-through, and does not redirect keyboard input. Live shows real phase/level/text, Minimal is compact, and Off stays hidden. | **NOT VERIFIED** |
 | UI-09 | Linux/macOS | P1, P2 | Select Live or Minimal and begin dictation. | Until a native no-focus adapter exists, the effective overlay remains Off and the UI explains the conservative limitation; no focus-stealing window appears. | **NOT VERIFIED** |
 | UI-10 | Windows | P1, P2, P6 | Navigate all main pages and controls by keyboard, inspect visible focus, run a screen reader while overlay state changes, and enable the OS reduced-motion setting. | All controls are reachable and labeled, focus is visible, state is not conveyed by color alone, primary app controls are at least 44 px, overlay announcements are polite, and no disallowed motion occurs. | **NOT VERIFIED** |
-| UI-11 | Windows | P1, P2 | Start capture and speak softly/loudly, then stay silent; compare overlay meter with input. | The meter reflects real aggregate input at a throttled UI cadence, clamps safely, and displays no fabricated activity. Record first-meter latency. | **NOT VERIFIED** |
+| UI-11 | Windows | P1, P2 | Start capture and speak softly/loudly, then stay silent; compare overlay meter with input. | The meter reflects distinct native RMS and peak values at the 25 Hz worker cadence, clamps safely, and displays no fabricated activity. Record first-meter latency. | **NOT VERIFIED** |
 
 ## Hotkeys and recording lifecycle
 
@@ -174,10 +194,11 @@ closed in the current implementation.
 | HK-04 | Win/Linux/macOS | P1, P2 | Configure Toggle mode; press once, speak, press again. | First press starts and second press finalizes exactly one session. | **NOT VERIFIED** |
 | HK-05 | Win/Linux/macOS | P1, P2 | Configure Hold mode; press/release without speech; then press/release twice rapidly. | No-speech path does not paste empty/partial text; rapid events do not create overlapping sessions. | **NOT VERIFIED** |
 | HK-06 | Win/Linux/macOS | P1 | Register a shortcut known to be used by another app; restart/reconfigure. | Conflict is reported; app remains usable through visible Start/Stop control. | **NOT VERIFIED** |
-| REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and temporary recording directory. | Capture begins after stream start, WAV finalizes, transcription starts, and temporary file cleanup follows current policy. Capture exact latency phases. | **NOT VERIFIED** |
-| REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture. | Microphone failure is visible, no hang occurs, and app returns to a valid Idle/Error state without paste. | **NOT VERIFIED** |
+| REC-01 | Win/Linux/macOS | P1, P2 | Record fixture for 3–5 seconds; stop; inspect status and the recovery-recording directory. | Capture begins after stream start, preserves configured post-roll, prepares mono 16 kHz audio in memory, starts transcription, and creates no normal capture WAV. Capture exact latency phases. | **NOT VERIFIED** |
+| REC-02 | Win/Linux/macOS | P1, P2 | Select a missing microphone/device, then unplug the active device during capture; reconnect before the second bounded retry. Repeat with a changed device format. | Missing device is actionable; same-format recovery resumes within at most two attempts; exhaustion or format change fails visibly; no hang or paste occurs and a fresh session can start. | **NOT VERIFIED** |
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
-| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization; immediately start another normal or Playground session; repeat once through tray Quit. | Cancel never pastes; native and transitional work acknowledges cancellation; pending PCM is deleted; stale completion cannot overwrite the next session. Coordinator/process/cleanup paths are automated, but the live path still requires this check. | **NOT VERIFIED** |
+| REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization; immediately start another normal or Playground session; repeat once through tray Quit. | Cancel never pastes; in-memory PCM is released; stale completion cannot overwrite the next session; explicit stop wins if inferred endpoint/max occurs at the same boundary. Coordinator/ownership paths are automated, but the live race still requires this check. | **NOT VERIFIED** |
+| REC-05 | Win/Linux/macOS | P1, P2 | In Toggle mode with defaults, begin in silence, speak after at least 250 ms, pause for 450 ms and resume, then finish with at least 900 ms silence. Repeat in Hold-to-talk, with VAD disabled, and with an immediate shortcut stop. | First syllable is retained by pre-roll; 450 ms pause does not finalize; 900 ms silence endpoints only in Toggle mode; Hold-to-talk waits for release; VAD disabled never endpoints; explicit stop retains about 200 ms post-roll and outranks inferred silence. Record actual timings and audio evidence only with consent. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 
@@ -215,7 +236,7 @@ closed in the current implementation.
 | DL-04 | Win/Linux/macOS | P1, disposable data dir | Install runtime, remove it while no transcription is running, then try a model. | Runtime status transitions are visible; removal does not delete unrelated models; repair action is offered. | **NOT VERIFIED** |
 | SET-01 | Win/Linux/macOS | P1, P7 | Edit hotkey, recording mode, active model, microphone, performance mode, theme, and auto-insert; restart. | Values persist with no silent reset; invalid values are rejected or salvaged. | **NOT VERIFIED** |
 | SET-02 | Win/Linux/macOS | P1, P7 | Copy the config aside, corrupt one field/file, launch, then inspect backup/recovery. Repeat with a valid legacy flat config. | Valid fields survive; corrupt input receives a timestamped backup; legacy input receives a pre-migration backup; future root/section/install fields survive the rewrite. | **NOT VERIFIED** |
-| PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect current data directory after successful and failed transcription. | Current baseline removes temporary WAV after jobs and stores latest transcript in memory; durable history/audio retention is a future feature. Record actual files without exposing transcript content. | **NOT VERIFIED** |
+| PRIV-01 | Win/Linux/macOS | P1, P7 | Inspect current data directory after successful, no-speech, overflow, and failed transcription. | Normal microphone and Playground paths create no WAV and release in-memory PCM after consumers finish. Only stale WAVs from older builds or the private transitional compatibility bridge may exist; durable history/audio retention is a future feature. Record actual files without exposing transcript content. | **NOT VERIFIED** |
 | PRIV-02 | Win/Linux/macOS | P1, P7 | If a later build exposes history modes, exercise Off, Transcript only, and Transcript + audio; pin one entry and clear unpinned. | Audio is off by default, pinned entries survive cleanup, and delete-audio does not delete transcript metadata. | **NOT VERIFIED** |
 | RECOV-01 | Win/Linux/macOS | P1, P2, P3 | Force microphone, runtime, output, and config failures one at a time; start a fresh dictation after each. | Each failure has a user-facing stage/message, no stale result leaks into the next run, and Idle is recoverable. | **NOT VERIFIED** |
 | RECOV-02 | Win/Linux/macOS | P1, P3 | If retry/history exists, fail a transcription with retained audio then retry. | Retry uses the retained recording and does not create duplicate output/history entries. | **NOT VERIFIED** |
@@ -224,7 +245,7 @@ closed in the current implementation.
 
 | Platform/session | Required rows | Operator/evidence | Status |
 | --- | --- | --- | --- |
-| Windows 11 desktop, standard-integrity target | UI, HK, REC, STT, OUT, DL, SET, RECOV | **NOT VERIFIED** — no Windows GUI/microphone/runtime run through Phase 5. | **NOT VERIFIED** |
+| Windows 11 desktop, standard-integrity target | UI, HK, REC, STT, OUT, DL, SET, RECOV | **NOT VERIFIED** — no Windows GUI/microphone run through Phase 6; only the pinned non-GUI native fixture ran. | **NOT VERIFIED** |
 | Windows elevated target (if supported) | OUT-01, OUT-05, OUT-06 | **NOT VERIFIED** — SendInput integrity boundary not exercised. | **NOT VERIFIED** |
 | Ubuntu/Debian X11 | UI, HK-02, REC, STT, OUT-02, DL, SET | **NOT VERIFIED** — no Linux desktop/audio run in Phase 0. | **NOT VERIFIED** |
 | Linux Wayland | UI, HK-02, REC, STT, OUT-03, RECOV | **NOT VERIFIED** — clipboard/paste and global-hotkey portal behavior not exercised. | **NOT VERIFIED** |

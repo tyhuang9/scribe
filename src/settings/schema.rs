@@ -12,6 +12,11 @@ use super::super::{
 use crate::transcription::AccelerationPreference;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_SPEECH_CONFIRMATION_MS: u32 = 150;
+pub const DEFAULT_INTERNAL_PAUSE_MS: u32 = 450;
+pub const DEFAULT_ENDPOINT_SILENCE_MS: u32 = 900;
+pub const DEFAULT_PRE_ROLL_MS: u32 = 250;
+pub const DEFAULT_POST_ROLL_MS: u32 = 200;
 pub type UnknownFields = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +58,12 @@ pub struct RecordingSettings {
     pub hotkey_mode: HotkeyMode,
     pub audio_input_device_name: Option<String>,
     pub max_recording_seconds: u32,
+    pub vad_enabled: bool,
+    pub speech_confirmation_ms: u32,
+    pub internal_pause_ms: u32,
+    pub endpoint_silence_ms: u32,
+    pub pre_roll_ms: u32,
+    pub post_roll_ms: u32,
     #[serde(flatten)]
     pub unknown: UnknownFields,
 }
@@ -192,6 +203,12 @@ impl Default for RecordingSettings {
             hotkey_mode: HotkeyMode::Toggle,
             audio_input_device_name: None,
             max_recording_seconds: 30,
+            vad_enabled: true,
+            speech_confirmation_ms: DEFAULT_SPEECH_CONFIRMATION_MS,
+            internal_pause_ms: DEFAULT_INTERNAL_PAUSE_MS,
+            endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,
+            pre_roll_ms: DEFAULT_PRE_ROLL_MS,
+            post_roll_ms: DEFAULT_POST_ROLL_MS,
             unknown: UnknownFields::new(),
         }
     }

@@ -12,9 +12,10 @@ pub const PREPARED_SAMPLE_RATE: u32 = 16_000;
 /// Decoded speech audio in Scribe's runtime-neutral input format.
 ///
 /// `samples` always contains finite mono `f32` values in `[-1.0, 1.0]` at
-/// [`PREPARED_SAMPLE_RATE`]. Source metadata describes the decoded WAV before
-/// downmixing and resampling; it is retained for diagnostics and duration
-/// calculations without exposing a model or runtime type.
+/// [`PREPARED_SAMPLE_RATE`]. Source metadata describes the native input stream
+/// or decoded WAV before downmixing and resampling; it is retained for
+/// diagnostics and duration calculations without exposing a model or runtime
+/// type.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedAudio {
     pub samples: Vec<f32>,
@@ -25,6 +26,42 @@ pub struct PreparedAudio {
 }
 
 impl PreparedAudio {
+    /// Builds canonical in-memory audio produced by the native capture worker.
+    pub(crate) fn from_captured_mono(
+        mut samples: Vec<f32>,
+        source_sample_rate: u32,
+        source_channels: u16,
+        source_frames: usize,
+    ) -> Result<Self> {
+        ensure!(
+            source_sample_rate > 0,
+            "source sample rate must be non-zero"
+        );
+        ensure!(source_channels > 0, "source channel count must be non-zero");
+        ensure!(
+            source_frames > 0,
+            "captured audio contains no source frames"
+        );
+        ensure!(
+            !samples.is_empty(),
+            "captured audio contains no prepared samples"
+        );
+        for sample in &mut samples {
+            ensure!(
+                sample.is_finite(),
+                "captured audio contains a non-finite sample"
+            );
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+        Ok(Self {
+            samples,
+            sample_rate: PREPARED_SAMPLE_RATE,
+            source_sample_rate,
+            source_channels,
+            source_frames,
+        })
+    }
+
     /// Decodes and prepares a WAV file from disk.
     #[allow(
         dead_code,
@@ -251,6 +288,20 @@ mod tests {
                 "sample {index}: expected {expected}, got {actual}"
             );
         }
+    }
+
+    #[test]
+    fn captured_audio_constructor_clamps_finite_samples_and_rejects_non_finite_samples() {
+        let prepared =
+            PreparedAudio::from_captured_mono(vec![-2.0, -0.25, 2.0], 48_000, 2, 9).unwrap();
+        assert_eq!(prepared.samples, [-1.0, -0.25, 1.0]);
+
+        assert!(
+            PreparedAudio::from_captured_mono(vec![f32::NAN], 48_000, 1, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("non-finite")
+        );
     }
 
     #[test]

@@ -17,7 +17,9 @@ use eframe::egui::{
 };
 use serde::Deserialize;
 
-use crate::audio::{self, RecordingSession};
+use crate::audio::{
+    self, CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, VadOptions,
+};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
@@ -51,6 +53,21 @@ const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
+    CaptureOptions {
+        vad_enabled: config.recording.vad_enabled,
+        endpointing_enabled: config.recording.vad_enabled
+            && config.recording.hotkey_mode == HotkeyMode::Toggle,
+        vad: VadOptions::new(
+            Duration::from_millis(config.recording.speech_confirmation_ms.into()),
+            Duration::from_millis(config.recording.internal_pause_ms.into()),
+            Duration::from_millis(config.recording.endpoint_silence_ms.into()),
+            Duration::from_millis(config.recording.pre_roll_ms.into()),
+            Duration::from_millis(config.recording.post_roll_ms.into()),
+        ),
+    }
+}
 
 type Tab = AppPage;
 
@@ -124,7 +141,7 @@ struct PendingOutput {
 
 struct PlaygroundRunState {
     pending_requests: HashMap<RequestId, String>,
-    audio_path: PathBuf,
+    _audio: Arc<PreparedAudio>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,7 +161,7 @@ struct LatencyTrace {
     model_loaded_at: Option<Instant>,
     first_partial_at: Option<Instant>,
     stop_requested_at: Option<Instant>,
-    wav_finalized_at: Option<Instant>,
+    capture_finalized_at: Option<Instant>,
     transcription_dispatched_at: Option<Instant>,
     transcription_job_completed_at: Option<Instant>,
     final_text_ready_at: Option<Instant>,
@@ -167,7 +184,7 @@ impl LatencyTrace {
             model_loaded_at: None,
             first_partial_at: None,
             stop_requested_at: None,
-            wav_finalized_at: None,
+            capture_finalized_at: None,
             transcription_dispatched_at: None,
             transcription_job_completed_at: None,
             final_text_ready_at: None,
@@ -204,8 +221,9 @@ impl LatencyTrace {
         if let Some(duration) = duration_between(Some(self.activation_at), self.first_partial_at) {
             lines.push(format!("{trigger_label} to first partial: {duration}"));
         }
-        if let Some(duration) = duration_between(self.stop_requested_at, self.wav_finalized_at) {
-            lines.push(format!("Stop to WAV finalized: {duration}"));
+        if let Some(duration) = duration_between(self.stop_requested_at, self.capture_finalized_at)
+        {
+            lines.push(format!("Stop to audio finalized: {duration}"));
         }
         if let Some(duration) = duration_between(
             self.transcription_dispatched_at,
@@ -248,7 +266,7 @@ impl LatencyTrace {
             .or(self.paste_completed_at)
             .or(self.ui_result_at)
             .or(self.transcription_job_completed_at)
-            .or(self.wav_finalized_at)
+            .or(self.capture_finalized_at)
             .or(self.stop_requested_at)
             .or(self.recorder_started_at)
     }
@@ -307,7 +325,7 @@ enum PlaygroundAction {
 enum AppEvent {
     CaptureReady {
         session_id: SessionId,
-        result: Result<RecordingSession, String>,
+        result: Result<RecordingSession, audio::CaptureError>,
     },
     ModelPreloadFinished {
         session_id: SessionId,
@@ -1061,7 +1079,6 @@ pub struct LocalTranscriberApp {
     playground_reference_user_edited: bool,
     playground_ranking_mode: RankingMode,
     playground_pending: usize,
-    playground_audio_path: Option<PathBuf>,
     session_coordinator: SessionCoordinator,
     playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
@@ -1129,7 +1146,6 @@ impl LocalTranscriberApp {
             tx,
             rx,
             playground_pending: 0,
-            playground_audio_path: None,
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
@@ -1310,9 +1326,15 @@ impl LocalTranscriberApp {
     }
 
     fn current_audio_level(&self) -> f32 {
+        self.current_audio_levels().peak
+    }
+
+    fn current_audio_levels(&self) -> LevelSnapshot {
         self.active_recording
             .as_ref()
-            .map_or(0.0, |active| active.session.latest_level())
+            .map_or_else(LevelSnapshot::default, |active| {
+                active.session.latest_levels()
+            })
     }
 
     fn sync_overlay_state(&mut self) {
@@ -1356,7 +1378,7 @@ impl LocalTranscriberApp {
             DictationPhase::Output => OverlayPhase::Pasting,
         };
         let _ = self.overlay_controller.set_phase(session_id, phase);
-        let level = self.current_audio_level();
+        let levels = self.current_audio_levels();
         if let Some(active) = self.active_recording.as_mut()
             && active.session_id == session_id
             && active.latency.first_meter_update_at.is_none()
@@ -1366,7 +1388,7 @@ impl LocalTranscriberApp {
         }
         let _ = self
             .overlay_controller
-            .update_audio_level(session_id, level, level);
+            .update_audio_level(session_id, levels.rms, levels.peak);
         let elapsed = self
             .active_recording
             .as_ref()
@@ -1642,6 +1664,7 @@ impl LocalTranscriberApp {
 
         let max_duration_seconds = self.config.recording.max_recording_seconds;
         let input_device_name = self.config.recording.audio_input_device_name.clone();
+        let capture_options = capture_options_from_config(&self.config);
         let abandon = Arc::new(AtomicBool::new(false));
         self.pending_recording = Some(PendingRecording {
             session_id,
@@ -1660,8 +1683,8 @@ impl LocalTranscriberApp {
 
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = audio::start_recording(max_duration_seconds, input_device_name)
-                .map_err(|err| err.to_string());
+            let result =
+                audio::start_recording(max_duration_seconds, input_device_name, capture_options);
             if abandon.load(Ordering::Acquire) {
                 if let Ok(session) = result {
                     let _ = session.stop_and_discard(Duration::from_secs(2));
@@ -1725,11 +1748,8 @@ impl LocalTranscriberApp {
         let _ = self.session_coordinator.cancel_active();
         self.captured_targets.remove(&previous_session);
         let _ = self.overlay_controller.hide(previous_session);
-        if let Some(run) = self.playground_runs.remove(&previous_session) {
-            let _ = fs::remove_file(run.audio_path);
-        }
+        self.playground_runs.remove(&previous_session);
         self.playground_pending = 0;
-        self.playground_audio_path = None;
         self.refresh_playground_runtime_statuses();
     }
 
@@ -1791,38 +1811,64 @@ impl LocalTranscriberApp {
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
-            if !active.stop_requested {
-                let _ = self
-                    .session_coordinator
-                    .request_stop(session_id, StopReason::MaximumDuration);
-            }
-            debug_assert!(self.session_coordinator.stop_reason().is_some());
-            active.latency.wav_finalized_at = Some(Instant::now());
             match result {
-                Ok(audio_path) => {
+                Ok(completion) => {
+                    if !active.stop_requested {
+                        let reason = match completion.stop_reason {
+                            CaptureStopReason::Explicit => StopReason::Explicit,
+                            CaptureStopReason::Endpoint => StopReason::Endpoint,
+                            CaptureStopReason::MaximumDuration => StopReason::MaximumDuration,
+                        };
+                        if let Err(err) = self.session_coordinator.request_stop(session_id, reason)
+                        {
+                            self.fail_dictation_session(
+                                session_id,
+                                format!("Rejected capture stop reason: {err}"),
+                            );
+                            return;
+                        }
+                        let observed_at = active
+                            .started_at
+                            .checked_add(completion.metrics.stop_trigger_elapsed)
+                            .unwrap_or_else(Instant::now)
+                            .min(Instant::now());
+                        active.latency.stop_requested_at = Some(observed_at);
+                    }
+                    debug_assert!(self.session_coordinator.stop_reason().is_some());
+                    active.latency.capture_finalized_at = Some(Instant::now());
                     if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
-                        let _ = fs::remove_file(audio_path);
                         self.fail_dictation_session(
                             session_id,
                             format!("Rejected stale capture result: {err}"),
                         );
                         return;
                     }
+                    let Some(audio) = completion.audio else {
+                        let _ = self.session_coordinator.cancel_active();
+                        self.status = TranscriptionStatus::Idle;
+                        self.status_message = "No speech detected; nothing was pasted.".to_owned();
+                        self.latest_latency = Some(active.latency);
+                        self.finish_overlay_error(session_id, "No speech detected");
+                        return;
+                    };
                     self.status = TranscriptionStatus::Transcribing;
-                    self.status_message = format!("Transcribing {}", audio_path.display());
+                    self.status_message = format!(
+                        "Transcribing {} ms of locally prepared audio",
+                        audio.duration_ms()
+                    );
                     match source {
-                        RecordingSource::Transcribe => self.dispatch_default_transcription(
-                            session_id,
-                            audio_path,
-                            active.latency,
-                        ),
+                        RecordingSource::Transcribe => {
+                            self.dispatch_default_transcription(session_id, audio, active.latency)
+                        }
                         RecordingSource::Playground => {
-                            self.dispatch_playground_transcriptions(session_id, audio_path)
+                            self.dispatch_playground_transcriptions(session_id, audio)
                         }
                     }
                 }
-                Err(message) => {
-                    self.fail_dictation_session(session_id, format!("Recording failed: {message}"));
+                Err(error) => {
+                    active.latency.capture_finalized_at = Some(Instant::now());
+                    self.latest_latency = Some(active.latency);
+                    self.fail_dictation_session(session_id, format!("Recording failed: {error}"));
                 }
             }
         }
@@ -2015,7 +2061,6 @@ impl LocalTranscriberApp {
                             }
                             if pending.source == RecordingSource::Transcribe {
                                 self.playground_pending = 0;
-                                self.playground_audio_path = None;
                                 self.refresh_playground_runtime_statuses();
                             }
                             pending.latency.recorder_started_at = Some(Instant::now());
@@ -2493,18 +2538,16 @@ impl LocalTranscriberApp {
                 };
             }
             RecordingSource::Playground => {
-                let mut completed_audio_path = None;
+                let mut completed = false;
                 let mut remaining = None;
                 if let Some(run) = self.playground_runs.get_mut(&session_id)
                     && run.pending_requests.remove(&request_id).is_some()
                 {
                     remaining = Some(run.pending_requests.len());
-                    if run.pending_requests.is_empty() {
-                        completed_audio_path = Some(run.audio_path.clone());
-                    }
+                    completed = run.pending_requests.is_empty();
                 }
 
-                if completed_audio_path.is_some() {
+                if completed {
                     self.playground_runs.remove(&session_id);
                 }
 
@@ -2520,16 +2563,12 @@ impl LocalTranscriberApp {
                     self.playground_pending = remaining;
                 }
 
-                if (owns_active || owns_terminal) && completed_audio_path.is_some() {
-                    if self.status != TranscriptionStatus::Error {
-                        self.status = TranscriptionStatus::Idle;
-                        self.status_message = "Model playground finished".to_owned();
-                    }
-                    self.playground_audio_path = None;
-                }
-
-                if let Some(path) = completed_audio_path {
-                    let _ = fs::remove_file(path);
+                if (owns_active || owns_terminal)
+                    && completed
+                    && self.status != TranscriptionStatus::Error
+                {
+                    self.status = TranscriptionStatus::Idle;
+                    self.status_message = "Model playground finished".to_owned();
                 }
             }
         }
@@ -2538,12 +2577,11 @@ impl LocalTranscriberApp {
     fn dispatch_default_transcription(
         &mut self,
         session_id: SessionId,
-        audio_path: PathBuf,
+        audio: Arc<PreparedAudio>,
         mut latency: LatencyTrace,
     ) {
         let Some(model) = self.selected_model() else {
             self.fail_dictation_session(session_id, "No default model selected");
-            let _ = fs::remove_file(audio_path);
             return;
         };
 
@@ -2553,7 +2591,6 @@ impl LocalTranscriberApp {
         {
             Ok(request_id) => request_id,
             Err(err) => {
-                let _ = fs::remove_file(audio_path);
                 self.fail_dictation_session(
                     session_id,
                     format!("Could not begin transcription request: {err}"),
@@ -2566,7 +2603,6 @@ impl LocalTranscriberApp {
         let task = match service.begin_transcription_task() {
             Ok(task) => task,
             Err(err) => {
-                let _ = fs::remove_file(audio_path);
                 self.fail_dictation_session(
                     session_id,
                     format!("Could not dispatch transcription: {err}"),
@@ -2577,24 +2613,8 @@ impl LocalTranscriberApp {
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            let prepared = PreparedAudio::from_wav_path(&audio_path).map(Arc::new);
-            let _ = fs::remove_file(&audio_path);
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    let _ = tx.send(AppEvent::TranscriptionFailed {
-                        source: RecordingSource::Transcribe,
-                        session_id,
-                        request_id,
-                        model_id: model.id,
-                        message: format!("Audio preparation failed: {err}"),
-                        latency: Some(latency),
-                    });
-                    return;
-                }
-            };
             let mut request =
-                TranscriptionRequest::new(session_id, request_id, prepared, model.id.clone());
+                TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
             request.model_path = model.local_path.clone();
             request.options = TranscriptionOptions::default();
             let result = service.transcribe_task(request, task);
@@ -2626,28 +2646,28 @@ impl LocalTranscriberApp {
         });
     }
 
-    fn dispatch_playground_transcriptions(&mut self, session_id: SessionId, audio_path: PathBuf) {
+    fn dispatch_playground_transcriptions(
+        &mut self,
+        session_id: SessionId,
+        audio: Arc<PreparedAudio>,
+    ) {
         let models = self.playground_selected_models();
         if let Some(message) = self.playground_run_block_reason() {
             let _ = self.session_coordinator.fail(session_id);
             self.playground_pending = 0;
-            self.playground_audio_path = None;
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            let _ = fs::remove_file(audio_path);
             return;
         }
 
         if self.session_coordinator.active_session_id() != Some(session_id)
             || self.session_coordinator.active_purpose() != Some(SessionPurpose::Comparison)
         {
-            let _ = fs::remove_file(audio_path);
             return;
         }
 
-        self.playground_audio_path = Some(audio_path.clone());
         self.playground_pending = models.len();
-        let audio_duration_ms = audio::wav_duration_ms(&audio_path);
+        let audio_duration_ms = Some(audio.duration_ms());
         let service = self.transcription_service.with_config(self.config.clone());
 
         let mut requests = Vec::with_capacity(models.len());
@@ -2660,10 +2680,8 @@ impl LocalTranscriberApp {
                 Err(err) => {
                     let _ = self.session_coordinator.fail(session_id);
                     self.playground_pending = 0;
-                    self.playground_audio_path = None;
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Could not start model comparison: {err}");
-                    let _ = fs::remove_file(audio_path);
                     return;
                 }
             };
@@ -2672,10 +2690,8 @@ impl LocalTranscriberApp {
                 Err(err) => {
                     let _ = self.session_coordinator.fail(session_id);
                     self.playground_pending = 0;
-                    self.playground_audio_path = None;
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Could not dispatch model comparison: {err}");
-                    let _ = fs::remove_file(audio_path);
                     return;
                 }
             };
@@ -2688,7 +2704,7 @@ impl LocalTranscriberApp {
                     .iter()
                     .map(|(request_id, model, _)| (*request_id, model.id.clone()))
                     .collect(),
-                audio_path: audio_path.clone(),
+                _audio: Arc::clone(&audio),
             },
         );
 
@@ -2707,64 +2723,38 @@ impl LocalTranscriberApp {
             }
         }
 
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let prepared = PreparedAudio::from_wav_path(&audio_path).map(Arc::new);
-            let _ = fs::remove_file(&audio_path);
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    for (request_id, model, _) in requests {
+        for (request_id, model, task) in requests {
+            let tx = self.tx.clone();
+            let service = service.clone();
+            let audio = Arc::clone(&audio);
+            thread::spawn(move || {
+                let mut request =
+                    TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
+                request.model_path = model.local_path.clone();
+                request.options = TranscriptionOptions::default();
+                match service.transcribe_task(request, task) {
+                    Ok(result) => {
+                        let _ = tx.send(AppEvent::TranscriptionDone {
+                            source: RecordingSource::Playground,
+                            session_id,
+                            request_id,
+                            result: Box::new(result),
+                            latency: None,
+                        });
+                    }
+                    Err(err) => {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
                             request_id,
                             model_id: model.id,
-                            message: format!("Audio preparation failed: {err}"),
+                            message: err.to_string(),
                             latency: None,
                         });
                     }
-                    return;
                 }
-            };
-
-            for (request_id, model, task) in requests {
-                let tx = tx.clone();
-                let service = service.clone();
-                let prepared = prepared.clone();
-                thread::spawn(move || {
-                    let mut request = TranscriptionRequest::new(
-                        session_id,
-                        request_id,
-                        prepared,
-                        model.id.clone(),
-                    );
-                    request.model_path = model.local_path.clone();
-                    request.options = TranscriptionOptions::default();
-                    match service.transcribe_task(request, task) {
-                        Ok(result) => {
-                            let _ = tx.send(AppEvent::TranscriptionDone {
-                                source: RecordingSource::Playground,
-                                session_id,
-                                request_id,
-                                result: Box::new(result),
-                                latency: None,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(AppEvent::TranscriptionFailed {
-                                source: RecordingSource::Playground,
-                                session_id,
-                                request_id,
-                                model_id: model.id,
-                                message: err.to_string(),
-                                latency: None,
-                            });
-                        }
-                    }
-                });
-            }
-        });
+            });
+        }
     }
 
     fn reset_playground_for_run(&mut self) {
@@ -2783,7 +2773,6 @@ impl LocalTranscriberApp {
             self.playground_reference_transcript.clear();
         }
         self.playground_pending = 0;
-        self.playground_audio_path = None;
     }
 
     fn apply_playground_result(&mut self, result: TranscriptionOutcome) {
@@ -4404,14 +4393,115 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Capture limits"));
                 let mut max_duration = self.config.recording.max_recording_seconds as i32;
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Maximum recording seconds");
+                    let label = ui.label("Maximum recording seconds");
                     if ui
-                        .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
+                        .add(
+                            egui::DragValue::new(&mut max_duration)
+                                .clamp_range(1..=config::MAX_RECORDING_SECONDS as i32),
+                        )
+                        .labelled_by(label.id)
                         .changed()
                     {
                         self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
                         self.save_config();
                     }
+                });
+                ui.add_space(6.0);
+                let mut vad_enabled = self.config.recording.vad_enabled;
+                if ui
+                    .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
+                    .on_hover_text(
+                        "Uses local adaptive voice detection. An explicit shortcut release or Stop action always takes priority.",
+                    )
+                    .changed()
+                {
+                    self.config.recording.vad_enabled = vad_enabled;
+                    self.save_config();
+                }
+                ui.add_enabled_ui(self.config.recording.vad_enabled, |ui| {
+                    let mut speech_confirmation =
+                        self.config.recording.speech_confirmation_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("Speech confirmation ms");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut speech_confirmation)
+                                    .clamp_range(50..=1000),
+                            )
+                            .labelled_by(label.id)
+                            .changed()
+                        {
+                            self.config.recording.speech_confirmation_ms =
+                                speech_confirmation.max(50) as u32;
+                            self.config.recording.internal_pause_ms = self
+                                .config
+                                .recording
+                                .internal_pause_ms
+                                .max(self.config.recording.speech_confirmation_ms);
+                            self.save_config();
+                        }
+                    });
+                    let mut internal_pause = self.config.recording.internal_pause_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("Internal pause ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
+                            .labelled_by(label.id)
+                            .changed()
+                        {
+                            self.config.recording.internal_pause_ms = internal_pause
+                                .max(self.config.recording.speech_confirmation_ms as i32)
+                                as u32;
+                            self.config.recording.endpoint_silence_ms = self
+                                .config
+                                .recording
+                                .endpoint_silence_ms
+                                .max(self.config.recording.internal_pause_ms);
+                            self.save_config();
+                        }
+                    });
+                    let mut endpoint_silence = self.config.recording.endpoint_silence_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("End after silence ms");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut endpoint_silence).clamp_range(
+                                    self.config.recording.internal_pause_ms as i32..=5000,
+                                ),
+                            )
+                            .labelled_by(label.id)
+                            .changed()
+                        {
+                            self.config.recording.endpoint_silence_ms = endpoint_silence
+                                .max(self.config.recording.internal_pause_ms as i32)
+                                as u32;
+                            self.save_config();
+                        }
+                    });
+                    let mut pre_roll = self.config.recording.pre_roll_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("Pre-roll ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
+                            .labelled_by(label.id)
+                            .changed()
+                        {
+                            self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
+                            self.save_config();
+                        }
+                    });
+                    let mut post_roll = self.config.recording.post_roll_ms as i32;
+                    ui.horizontal_wrapped(|ui| {
+                        let label = ui.label("Post-roll ms");
+                        if ui
+                            .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
+                            .labelled_by(label.id)
+                            .changed()
+                        {
+                            self.config.recording.post_roll_ms = post_roll.max(0) as u32;
+                            self.save_config();
+                        }
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.overlay.position;
@@ -6944,12 +7034,13 @@ mod layout_tests {
         });
 
         app.stop_recording();
-        let audio_path = test_wav_path("pending-stop");
-        write_test_wav(&audio_path);
         app.tx
             .send(AppEvent::CaptureReady {
                 session_id,
-                result: Ok(RecordingSession::simulated(audio_path.clone())),
+                result: Ok(RecordingSession::simulated(
+                    Some(test_prepared_audio()),
+                    CaptureStopReason::Explicit,
+                )),
             })
             .unwrap();
         app.poll_events();
@@ -6973,14 +7064,110 @@ mod layout_tests {
             app.session_coordinator.pending_request_count(session_id),
             Some(1)
         );
-        for _ in 0..100 {
-            if !audio_path.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!audio_path.exists(), "finalized WAV was not consumed");
         app.supersede_active_session();
+    }
+
+    #[test]
+    fn reachable_no_speech_completions_never_dispatch_or_paste() {
+        for stop_reason in [
+            CaptureStopReason::MaximumDuration,
+            CaptureStopReason::Explicit,
+        ] {
+            let mut app = test_app();
+            app.transcript = "keep prior transcript".to_owned();
+            let session_id = app
+                .session_coordinator
+                .begin(SessionPurpose::Dictation)
+                .unwrap();
+            app.pending_recording = Some(PendingRecording {
+                session_id,
+                source: RecordingSource::Transcribe,
+                stop_requested: false,
+                max_duration_seconds: 30,
+                latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+                abandon: Arc::new(AtomicBool::new(false)),
+            });
+            app.tx
+                .send(AppEvent::CaptureReady {
+                    session_id,
+                    result: Ok(RecordingSession::simulated(None, stop_reason)),
+                })
+                .unwrap();
+            app.poll_events();
+            if stop_reason == CaptureStopReason::Explicit {
+                app.stop_recording();
+            } else {
+                app.active_recording.as_ref().unwrap().session.stop();
+            }
+
+            for _ in 0..100 {
+                app.poll_recording();
+                if app.active_recording.is_none() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            assert!(app.active_recording.is_none());
+            assert_eq!(app.status, TranscriptionStatus::Idle);
+            assert_eq!(
+                app.status_message,
+                "No speech detected; nothing was pasted."
+            );
+            assert_eq!(app.transcript, "keep prior transcript");
+            assert!(app.pending_output.is_none());
+            assert_eq!(
+                app.session_coordinator.last_terminal().unwrap().outcome,
+                crate::core::TerminalOutcome::Cancelled
+            );
+            assert!(
+                app.latest_latency
+                    .as_ref()
+                    .unwrap()
+                    .stop_requested_at
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_recording_settings_drive_native_capture_options() {
+        let mut config = AppConfig::default();
+        config.recording.vad_enabled = false;
+        config.recording.speech_confirmation_ms = 175;
+        config.recording.internal_pause_ms = 525;
+        config.recording.endpoint_silence_ms = 975;
+        config.recording.pre_roll_ms = 300;
+        config.recording.post_roll_ms = 225;
+
+        let options = capture_options_from_config(&config);
+
+        assert!(!options.vad_enabled);
+        assert!(!options.endpointing_enabled);
+        assert_eq!(options.vad.speech_confirmation, Duration::from_millis(175));
+        assert_eq!(options.vad.pause, Duration::from_millis(525));
+        assert_eq!(options.vad.endpoint, Duration::from_millis(975));
+        assert_eq!(options.vad.pre_roll, Duration::from_millis(300));
+        assert_eq!(options.vad.post_roll, Duration::from_millis(225));
+    }
+
+    #[test]
+    fn silence_endpointing_is_limited_to_toggle_mode() {
+        let mut config = AppConfig::default();
+        config.recording.vad_enabled = true;
+
+        config.recording.hotkey_mode = HotkeyMode::Toggle;
+        let toggle = capture_options_from_config(&config);
+        assert!(toggle.vad_enabled);
+        assert!(toggle.endpointing_enabled);
+
+        config.recording.hotkey_mode = HotkeyMode::HoldToTalk;
+        let hold = capture_options_from_config(&config);
+        assert!(hold.vad_enabled, "hold mode still uses VAD for trimming");
+        assert!(
+            !hold.endpointing_enabled,
+            "hold mode must wait for shortcut release or the duration limit"
+        );
     }
 
     #[test]
@@ -7003,12 +7190,6 @@ mod layout_tests {
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 abandon: Arc::new(AtomicBool::new(false)),
             });
-            let audio_path = test_wav_path(if preload_first {
-                "preload-first"
-            } else {
-                "capture-first"
-            });
-            write_test_wav(&audio_path);
             let preload_event = AppEvent::ModelPreloadFinished {
                 session_id,
                 model_id,
@@ -7016,7 +7197,10 @@ mod layout_tests {
             };
             let capture_event = AppEvent::CaptureReady {
                 session_id,
-                result: Ok(RecordingSession::simulated(audio_path)),
+                result: Ok(RecordingSession::simulated(
+                    Some(test_prepared_audio()),
+                    CaptureStopReason::Explicit,
+                )),
             };
             if preload_first {
                 app.tx.send(preload_event).unwrap();
@@ -7051,7 +7235,7 @@ mod layout_tests {
             model_loaded_at: Some(base + Duration::from_millis(70)),
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
-            wav_finalized_at: Some(base + Duration::from_millis(140)),
+            capture_finalized_at: Some(base + Duration::from_millis(140)),
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: Some(base + Duration::from_millis(650)),
@@ -7068,7 +7252,7 @@ mod layout_tests {
                 "App action to recorder ready: 10 ms",
                 "App action to first meter update: 15 ms",
                 "Model load: 50 ms",
-                "Stop to WAV finalized: 40 ms",
+                "Stop to audio finalized: 40 ms",
                 "Transcription job: 500 ms",
                 "Stop to final text: 550 ms",
                 "STT done to UI update: 10 ms",
@@ -7092,7 +7276,7 @@ mod layout_tests {
             model_loaded_at: None,
             first_partial_at: None,
             stop_requested_at: Some(base + Duration::from_millis(100)),
-            wav_finalized_at: Some(base + Duration::from_millis(140)),
+            capture_finalized_at: Some(base + Duration::from_millis(140)),
             transcription_dispatched_at: Some(base + Duration::from_millis(150)),
             transcription_job_completed_at: Some(base + Duration::from_millis(650)),
             final_text_ready_at: None,
@@ -7153,13 +7337,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn playground_cleanup_deletes_temp_audio_even_when_debug_mode_is_set() {
-        let temp_path = std::env::temp_dir().join(format!(
-            "scribe-playground-cleanup-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&temp_path, b"wav").unwrap();
-
+    fn playground_cleanup_releases_shared_audio_even_when_debug_mode_is_set() {
         let mut app = test_app();
         app.config.developer.debug_mode = true;
         let session_id = SessionId(7);
@@ -7172,18 +7350,19 @@ mod layout_tests {
             "test-model",
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(temp_path.clone());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         app.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: HashMap::from([(request_id, "test-model".to_owned())]),
-                audio_path: temp_path.clone(),
+                _audio: audio,
             },
         );
 
         app.cleanup_after_job(RecordingSource::Playground, session_id, request_id);
 
-        assert!(!temp_path.exists());
+        assert!(released.upgrade().is_none());
     }
 
     #[test]
@@ -7494,12 +7673,6 @@ mod layout_tests {
 
     #[test]
     fn current_playground_result_finishes_and_cleans_audio_once() {
-        let temp_path = std::env::temp_dir().join(format!(
-            "scribe-playground-current-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&temp_path, b"wav").unwrap();
-
         let mut app = test_app();
         let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(3);
@@ -7513,12 +7686,13 @@ mod layout_tests {
             &model_id,
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(temp_path.clone());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         app.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: HashMap::from([(request_id, model_id.clone())]),
-                audio_path: temp_path.clone(),
+                _audio: audio,
             },
         );
         app.tx
@@ -7538,10 +7712,9 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(!temp_path.exists());
+        assert!(released.upgrade().is_none());
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert_eq!(app.playground_pending, 0);
-        assert_eq!(app.playground_audio_path, None);
         assert_eq!(app.session_coordinator.active_session_id(), None);
         assert!(!app.playground_runs.contains_key(&session_id));
         let card = app
@@ -7554,12 +7727,6 @@ mod layout_tests {
 
     #[test]
     fn current_playground_failure_finishes_and_cleans_audio_once() {
-        let temp_path = std::env::temp_dir().join(format!(
-            "scribe-playground-current-failure-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&temp_path, b"wav").unwrap();
-
         let mut app = test_app();
         let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(4);
@@ -7573,12 +7740,13 @@ mod layout_tests {
             &model_id,
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(temp_path.clone());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         app.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: HashMap::from([(request_id, model_id.clone())]),
-                audio_path: temp_path.clone(),
+                _audio: audio,
             },
         );
         app.tx
@@ -7594,7 +7762,7 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(!temp_path.exists());
+        assert!(released.upgrade().is_none());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert_eq!(app.status_message, "expected failure");
         assert_eq!(app.playground_pending, 0);
@@ -7648,11 +7816,6 @@ mod layout_tests {
 
     #[test]
     fn playground_correlation_error_is_not_overwritten_by_cleanup() {
-        let temp_path = std::env::temp_dir().join(format!(
-            "scribe-playground-mismatch-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&temp_path, b"wav").unwrap();
         let mut app = test_app();
         let model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(5);
@@ -7666,12 +7829,13 @@ mod layout_tests {
             &model_id,
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(temp_path.clone());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         app.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: HashMap::from([(request_id, model_id.clone())]),
-                audio_path: temp_path.clone(),
+                _audio: audio,
             },
         );
         app.tx
@@ -7691,7 +7855,7 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(!temp_path.exists());
+        assert!(released.upgrade().is_none());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("mismatched correlation IDs"));
         assert_eq!(app.playground_pending, 0);
@@ -7706,11 +7870,6 @@ mod layout_tests {
 
     #[test]
     fn playground_wrong_model_result_is_rejected() {
-        let temp_path = std::env::temp_dir().join(format!(
-            "scribe-playground-wrong-model-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&temp_path, b"wav").unwrap();
         let mut app = test_app();
         let expected_model_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
         let session_id = SessionId(6);
@@ -7724,12 +7883,13 @@ mod layout_tests {
             &expected_model_id,
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(temp_path.clone());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         app.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: HashMap::from([(request_id, expected_model_id.clone())]),
-                audio_path: temp_path.clone(),
+                _audio: audio,
             },
         );
         app.tx
@@ -7749,7 +7909,7 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(!temp_path.exists());
+        assert!(released.upgrade().is_none());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("wrong model"));
         let card = app
@@ -7845,11 +8005,8 @@ mod layout_tests {
 
     #[test]
     fn stale_playground_completion_cannot_overwrite_newer_normal_session() {
-        let stale_audio = std::env::temp_dir().join(format!(
-            "scribe-playground-superseded-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&stale_audio, b"wav").unwrap();
+        let stale_audio = test_prepared_audio();
+        let released = Arc::downgrade(&stale_audio);
         let mut app = test_app();
         app.transcript = "preserve me".to_owned();
         app.status = TranscriptionStatus::Listening;
@@ -7868,7 +8025,7 @@ mod layout_tests {
                     RequestId(10),
                     "whisper_cpp_base_en".to_owned(),
                 )]),
-                audio_path: stale_audio.clone(),
+                _audio: stale_audio,
             },
         );
         app.tx
@@ -7887,7 +8044,7 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(!stale_audio.exists());
+        assert!(released.upgrade().is_none());
         assert_eq!(app.transcript, "preserve me");
         assert_eq!(app.status, TranscriptionStatus::Listening);
         assert_eq!(app.status_message, "Normal dictation is listening");
@@ -7915,16 +8072,10 @@ mod layout_tests {
 
     #[test]
     fn stale_playground_result_cleans_only_its_own_audio() {
-        let old_audio = std::env::temp_dir().join(format!(
-            "scribe-playground-stale-old-{}.wav",
-            std::process::id()
-        ));
-        let current_audio = std::env::temp_dir().join(format!(
-            "scribe-playground-stale-current-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&old_audio, b"old wav").unwrap();
-        fs::write(&current_audio, b"current wav").unwrap();
+        let old_audio = test_prepared_audio();
+        let old_released = Arc::downgrade(&old_audio);
+        let current_audio = test_prepared_audio();
+        let current_retained = Arc::downgrade(&current_audio);
 
         let mut app = test_app();
         app.playground_cards[0].transcript = "current result".to_owned();
@@ -7937,7 +8088,6 @@ mod layout_tests {
             "whisper_cpp_base_en",
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(current_audio.clone());
         app.playground_runs.insert(
             SessionId(1),
             PlaygroundRunState {
@@ -7945,7 +8095,7 @@ mod layout_tests {
                     (RequestId(10), "whisper_cpp_base_en".to_owned()),
                     (RequestId(11), "whisper_cpp_base_en".to_owned()),
                 ]),
-                audio_path: old_audio.clone(),
+                _audio: old_audio,
             },
         );
         app.playground_runs.insert(
@@ -7955,7 +8105,7 @@ mod layout_tests {
                     RequestId(20),
                     "whisper_cpp_base_en".to_owned(),
                 )]),
-                audio_path: current_audio.clone(),
+                _audio: current_audio,
             },
         );
         app.tx
@@ -7974,7 +8124,7 @@ mod layout_tests {
 
         app.poll_events();
 
-        assert!(old_audio.exists());
+        assert!(old_released.upgrade().is_some());
         assert_eq!(app.playground_runs[&SessionId(1)].pending_requests.len(), 1);
         app.tx
             .send(AppEvent::TranscriptionFailed {
@@ -7988,25 +8138,19 @@ mod layout_tests {
             .unwrap();
         app.poll_events();
 
-        assert!(!old_audio.exists());
-        assert!(current_audio.exists());
+        assert!(old_released.upgrade().is_none());
+        assert!(current_retained.upgrade().is_some());
         assert!(!app.playground_runs.contains_key(&SessionId(1)));
         assert!(app.playground_runs.contains_key(&SessionId(2)));
         assert_eq!(app.playground_pending, 1);
-        assert_eq!(app.playground_audio_path, Some(current_audio.clone()));
         assert_eq!(app.playground_cards[0].transcript, "current result");
         assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
-
-        fs::remove_file(current_audio).unwrap();
     }
 
     #[test]
     fn superseding_playground_resets_cards_before_new_capture_can_fail() {
-        let audio = std::env::temp_dir().join(format!(
-            "scribe-playground-superseded-{}.wav",
-            std::process::id()
-        ));
-        fs::write(&audio, b"superseded wav").unwrap();
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
         let mut app = test_app();
         app.playground_cards[0].status = ModelRuntimeStatus::Running;
         seed_test_request(
@@ -8023,18 +8167,16 @@ mod layout_tests {
                     RequestId(70),
                     "whisper_cpp_base_en".to_owned(),
                 )]),
-                audio_path: audio.clone(),
+                _audio: audio,
             },
         );
         app.playground_pending = 1;
-        app.playground_audio_path = Some(audio.clone());
 
         app.supersede_active_session();
 
         assert_eq!(app.session_coordinator.active_session_id(), None);
         assert_eq!(app.playground_pending, 0);
-        assert_eq!(app.playground_audio_path, None);
-        assert!(!audio.exists());
+        assert!(released.upgrade().is_none());
         assert_ne!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
     }
 
@@ -8440,29 +8582,14 @@ mod layout_tests {
             .fold(0.0_f32, f32::max)
     }
 
-    fn test_wav_path(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "scribe-app-{label}-{}-{nonce}.wav",
-            std::process::id()
-        ))
-    }
-
-    fn write_test_wav(path: &Path) {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(path, spec).unwrap();
-        for _ in 0..1_600 {
-            writer.write_sample(0_i16).unwrap();
-        }
-        writer.finalize().unwrap();
+    fn test_prepared_audio() -> Arc<PreparedAudio> {
+        Arc::new(PreparedAudio {
+            samples: vec![0.0; 1_600],
+            sample_rate: crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            source_sample_rate: crate::prepared_audio::PREPARED_SAMPLE_RATE,
+            source_channels: 1,
+            source_frames: 1_600,
+        })
     }
 
     fn test_app() -> LocalTranscriberApp {
@@ -8503,7 +8630,6 @@ mod layout_tests {
             tx,
             rx,
             playground_pending: 0,
-            playground_audio_path: None,
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
@@ -9834,6 +9960,60 @@ mod layout_tests {
             assert_eq!(progress.numeric_value(), None);
             assert_eq!(progress.min_numeric_value(), None);
             assert_eq!(progress.max_numeric_value(), None);
+        }
+    }
+
+    #[test]
+    fn capture_numeric_controls_have_programmatic_accessible_names() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Advanced;
+        app.config.recording.vad_enabled = true;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_advanced_settings(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let spin_buttons = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::SpinButton)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "Maximum recording seconds",
+            "Speech confirmation ms",
+            "Internal pause ms",
+            "End after silence ms",
+            "Pre-roll ms",
+            "Post-roll ms",
+        ] {
+            let label_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.name() == Some(expected))
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing AccessKit label {expected:?}"));
+            assert!(
+                spin_buttons
+                    .iter()
+                    .any(|(_, node)| node.labelled_by().contains(&label_id)),
+                "no spin button is programmatically labelled by {expected:?}"
+            );
         }
     }
 

@@ -24,6 +24,8 @@ pub use settings::{
     RecordingSettings, SettingsStore, StreamingSettings,
 };
 
+pub const MAX_RECORDING_SECONDS: u32 = 600;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedModelInstall {
     pub path: PathBuf,
@@ -547,6 +549,22 @@ pub fn normalize_config(config: &mut AppConfig) {
     if config.recording.max_recording_seconds == 0 {
         config.recording.max_recording_seconds = 30;
     }
+    config.recording.max_recording_seconds = config
+        .recording
+        .max_recording_seconds
+        .min(MAX_RECORDING_SECONDS);
+    config.recording.speech_confirmation_ms =
+        config.recording.speech_confirmation_ms.clamp(50, 1_000);
+    config.recording.internal_pause_ms = config
+        .recording
+        .internal_pause_ms
+        .clamp(config.recording.speech_confirmation_ms.max(100), 3_000);
+    config.recording.endpoint_silence_ms = config
+        .recording
+        .endpoint_silence_ms
+        .clamp(config.recording.internal_pause_ms.max(300), 5_000);
+    config.recording.pre_roll_ms = config.recording.pre_roll_ms.min(2_000);
+    config.recording.post_roll_ms = config.recording.post_roll_ms.min(2_000);
     if config.output.paste_delay_ms == 0 {
         config.output.paste_delay_ms = default_paste_delay_ms();
     }
@@ -794,6 +812,43 @@ mod tests {
         );
         assert_eq!(config.performance.whisper_gpu_device, 0);
         assert!(!config.output.auto_insert_transcript);
+        assert!(config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 150);
+        assert_eq!(config.recording.internal_pause_ms, 450);
+        assert_eq!(config.recording.endpoint_silence_ms, 900);
+        assert_eq!(config.recording.pre_roll_ms, 250);
+        assert_eq!(config.recording.post_roll_ms, 200);
+    }
+
+    #[test]
+    fn endpointing_values_normalize_to_safe_ordered_ranges() {
+        let mut config = AppConfig::default();
+        config.recording.speech_confirmation_ms = 0;
+        config.recording.internal_pause_ms = 10;
+        config.recording.endpoint_silence_ms = 20;
+        config.recording.pre_roll_ms = 9_000;
+        config.recording.post_roll_ms = 9_000;
+
+        normalize_config(&mut config);
+
+        assert_eq!(config.recording.speech_confirmation_ms, 50);
+        assert_eq!(config.recording.internal_pause_ms, 100);
+        assert_eq!(config.recording.endpoint_silence_ms, 300);
+        assert_eq!(config.recording.pre_roll_ms, 2_000);
+        assert_eq!(config.recording.post_roll_ms, 2_000);
+    }
+
+    #[test]
+    fn recording_duration_is_bounded_for_hand_edited_settings() {
+        let mut config = AppConfig::default();
+        config.recording.max_recording_seconds = u32::MAX;
+
+        normalize_config(&mut config);
+
+        assert_eq!(
+            config.recording.max_recording_seconds,
+            MAX_RECORDING_SECONDS
+        );
     }
 
     #[test]

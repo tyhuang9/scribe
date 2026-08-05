@@ -226,6 +226,48 @@ fn migrate_legacy_flat(
         config.recording.max_recording_seconds,
         diagnostics,
     );
+    config.recording.vad_enabled = take(
+        &mut root,
+        "vad_enabled",
+        &[],
+        config.recording.vad_enabled,
+        diagnostics,
+    );
+    config.recording.speech_confirmation_ms = take(
+        &mut root,
+        "speech_confirmation_ms",
+        &[],
+        config.recording.speech_confirmation_ms,
+        diagnostics,
+    );
+    config.recording.internal_pause_ms = take(
+        &mut root,
+        "internal_pause_ms",
+        &[],
+        config.recording.internal_pause_ms,
+        diagnostics,
+    );
+    config.recording.endpoint_silence_ms = take(
+        &mut root,
+        "endpoint_silence_ms",
+        &[],
+        config.recording.endpoint_silence_ms,
+        diagnostics,
+    );
+    config.recording.pre_roll_ms = take(
+        &mut root,
+        "pre_roll_ms",
+        &[],
+        config.recording.pre_roll_ms,
+        diagnostics,
+    );
+    config.recording.post_roll_ms = take(
+        &mut root,
+        "post_roll_ms",
+        &[],
+        config.recording.post_roll_ms,
+        diagnostics,
+    );
     config.output.auto_insert_transcript = take(
         &mut root,
         "auto_insert_transcript",
@@ -403,6 +445,48 @@ fn parse_recording(
             "max_recording_seconds",
             &[],
             defaults.max_recording_seconds,
+            diagnostics,
+        ),
+        vad_enabled: take(
+            &mut section,
+            "vad_enabled",
+            &[],
+            defaults.vad_enabled,
+            diagnostics,
+        ),
+        speech_confirmation_ms: take(
+            &mut section,
+            "speech_confirmation_ms",
+            &[],
+            defaults.speech_confirmation_ms,
+            diagnostics,
+        ),
+        internal_pause_ms: take(
+            &mut section,
+            "internal_pause_ms",
+            &[],
+            defaults.internal_pause_ms,
+            diagnostics,
+        ),
+        endpoint_silence_ms: take(
+            &mut section,
+            "endpoint_silence_ms",
+            &[],
+            defaults.endpoint_silence_ms,
+            diagnostics,
+        ),
+        pre_roll_ms: take(
+            &mut section,
+            "pre_roll_ms",
+            &[],
+            defaults.pre_roll_ms,
+            diagnostics,
+        ),
+        post_roll_ms: take(
+            &mut section,
+            "post_roll_ms",
+            &[],
+            defaults.post_roll_ms,
             diagnostics,
         ),
         unknown: into_unknown(section),
@@ -656,6 +740,12 @@ mod tests {
             "selected_default_model": "whisper_cpp_base_en",
             "enabled_models": ["whisper_cpp_base_en"],
             "hotkey": "Alt+Space",
+            "vad_enabled": false,
+            "speech_confirmation_ms": 180,
+            "internal_pause_ms": 520,
+            "endpoint_silence_ms": 980,
+            "pre_roll_ms": 280,
+            "post_roll_ms": 220,
             "whisper_compute_mode": "prefer_gpu",
             "future_legacy_key": {"kept": true}
         }));
@@ -667,6 +757,12 @@ mod tests {
             ["whisper_cpp_base_en"]
         );
         assert_eq!(config.recording.hotkey, "Alt+Space");
+        assert!(!config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 180);
+        assert_eq!(config.recording.internal_pause_ms, 520);
+        assert_eq!(config.recording.endpoint_silence_ms, 980);
+        assert_eq!(config.recording.pre_roll_ms, 280);
+        assert_eq!(config.recording.post_roll_ms, 220);
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Gpu
@@ -685,6 +781,12 @@ mod tests {
 
         assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
         assert_eq!(config.recording.max_recording_seconds, 30);
+        assert!(config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 150);
+        assert_eq!(config.recording.internal_pause_ms, 450);
+        assert_eq!(config.recording.endpoint_silence_ms, 900);
+        assert_eq!(config.recording.pre_roll_ms, 250);
+        assert_eq!(config.recording.post_roll_ms, 200);
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.overlay.mode, OverlayMode::Live);
         assert_eq!(config.overlay.position, OverlayPosition::Bottom);
@@ -757,7 +859,14 @@ mod tests {
             "recording": {
                 "hotkey": "Ctrl+Alt+R",
                 "hotkey_mode": "not-a-mode",
-                "max_recording_seconds": "not-a-number"
+                "max_recording_seconds": "not-a-number",
+                "vad_enabled": "not-a-boolean",
+                "speech_confirmation_ms": "not-a-number",
+                "internal_pause_ms": 600,
+                "endpoint_silence_ms": 1200,
+                "pre_roll_ms": 300,
+                "post_roll_ms": 250,
+                "future_vad": {"strategy": "kept"}
             },
             "performance": {
                 "acceleration_preference": "not-an-accelerator",
@@ -773,12 +882,50 @@ mod tests {
         assert_eq!(config.recording.hotkey, "Ctrl+Alt+R");
         assert_eq!(config.recording.hotkey_mode, HotkeyMode::Toggle);
         assert_eq!(config.recording.max_recording_seconds, 30);
+        assert!(config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 150);
+        assert_eq!(config.recording.internal_pause_ms, 600);
+        assert_eq!(config.recording.endpoint_silence_ms, 1200);
+        assert_eq!(config.recording.pre_roll_ms, 300);
+        assert_eq!(config.recording.post_roll_ms, 250);
+        assert_eq!(
+            config.recording.unknown["future_vad"],
+            json!({"strategy": "kept"})
+        );
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
         );
         assert_eq!(config.performance.whisper_gpu_device, 4);
         assert!(diagnostics.invalid_values_salvaged);
+    }
+
+    #[test]
+    fn vad_fields_and_unknown_recording_values_round_trip() {
+        let config = parse_settings_value(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "recording": {
+                "vad_enabled": false,
+                "speech_confirmation_ms": 200,
+                "internal_pause_ms": 500,
+                "endpoint_silence_ms": 1000,
+                "pre_roll_ms": 275,
+                "post_roll_ms": 225,
+                "future_endpointing": {"mode": "adaptive"}
+            }
+        }));
+
+        assert!(!config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_confirmation_ms, 200);
+        assert_eq!(config.recording.internal_pause_ms, 500);
+        assert_eq!(config.recording.endpoint_silence_ms, 1000);
+        assert_eq!(config.recording.pre_roll_ms, 275);
+        assert_eq!(config.recording.post_roll_ms, 225);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["recording"]["future_endpointing"],
+            json!({"mode": "adaptive"})
+        );
     }
 
     #[test]
