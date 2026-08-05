@@ -1,0 +1,77 @@
+---
+title: Scribe documentation
+description: A practical guide to Scribe, the local-first desktop transcription app.
+---
+
+import StatusOverview from '../../components/StatusOverview.astro';
+import Shortcut from '../../components/Shortcut.astro';
+import TranscriptDemo from '../../components/TranscriptDemo.astro';
+import Workflow from '../../components/Workflow.astro';
+
+export const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+
+<div class="scribe-intro">
+  <p class="eyebrow">Desktop transcription</p>
+  <p class="intro-title">Documentation for a local utility.</p>
+  <p class="lede">Scribe captures microphone audio, transcribes it through one private local-runtime boundary, and keeps the result in your control.</p>
+  <p><a class="primary-link" href={`${base}install-and-run/`}>Install and run</a> <a href={`${base}project-status/`}>Read project status</a></p>
+  <p class="shortcut-note">Default hotkey <Shortcut keys={['Ctrl', 'Shift', 'Space']} />. Use the in-app Start/Stop control when a desktop session blocks global hotkeys.</p>
+</div>
+
+<StatusOverview />
+
+<TranscriptDemo />
+
+## First transcription: a fast start
+
+<Workflow steps={[
+  {
+    title: 'Prepare Scribe',
+    body: 'Start the app, install a trusted Experimental GGUF model or validate a local GGUF, then verify the microphone level and input-sensitivity threshold in General.',
+    href: `${base}install-and-run/`,
+    linkText: 'Install and run'
+  },
+  {
+    title: 'Record a short clip',
+    body: 'Use Start Listening, speak briefly, and stop. Model loading begins during capture and rolling preview text stays inside Scribe.',
+    href: `${base}first-transcription/`,
+    linkText: 'Make a first transcription'
+  },
+  {
+    title: 'Review before output',
+    body: 'Review the finalized transcript. Windows can paste it once into the captured target; every platform retains a clipboard fallback.',
+    href: `${base}history-output-and-privacy/`,
+    linkText: 'Understand output and privacy'
+  }
+]} />
+
+## Choose your path
+
+<div class="guide-grid">
+  <section>
+    <p class="path-label">Quick start</p>
+    <h3>Record and review</h3>
+    <p>Start with a short recording, then keep the transcript visible before you copy it or insert it into another app.</p>
+    <a href={`${base}first-transcription/`}>Start with a transcription</a>
+  </section>
+  <section>
+    <p class="path-label">Local models</p>
+    <h3>Choose an Experimental model</h3>
+    <p>The normal catalog offers trusted GGUF variants behind one logical runtime kind. The default path is in-process and none is Supported yet.</p>
+    <a href={`${base}models-and-runtimes/`}>Review models and runtimes</a>
+  </section>
+  <section>
+    <p class="path-label">Your platform</p>
+    <h3>Check your platform</h3>
+    <p>Permissions, hotkeys, and paste automation behave differently across Windows, Linux/WSL, and macOS.</p>
+    <a href={`${base}local-first-and-permissions/`}>Review permissions</a>
+  </section>
+</div>
+
+## Local-first means a narrow boundary
+
+Scribe has no cloud speech-to-text service, account, synchronization service, or plugin system. The normal GGUF path has no Python, localhost server, downloaded runtime package, or inference executable. Private legacy adapters remain for configuration/artifact migration and are not the normal UI path. An installed selected model may be loaded during startup integrity/health validation. Microphone PCM, preparation, VAD, preview, and final decoding remain in native workers; tentative text is never sent to another application.
+
+Need help with a local runtime, hotkey, clipboard, or platform issue? Start with <a href={`${base}troubleshooting/`}>Troubleshooting</a>.
+
+The detailed implementation reference remains the [repository README](https://github.com/tyhuang9/scribe/blob/main/README.md). For the current scope and source references, use <a href={`${base}project-status/`}>Project status</a>.

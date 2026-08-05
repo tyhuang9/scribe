@@ -1,0 +1,10 @@
+{
+  "name": "scribe",
+  "private": true,
+  "scripts": {
+    "docs:dev": "npm --prefix website run dev",
+    "docs:check": "npm --prefix website run check",
+    "docs:build": "npm --prefix website run build",
+    "docs:preview": "npm --prefix website run preview"
+  }
+}

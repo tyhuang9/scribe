@@ -8,3 +8,7 @@
 /graphify-out/
 /.graphify/
 /.graphify-cache/
+
+/website/node_modules/
+/website/.astro/
+/website/dist/
