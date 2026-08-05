@@ -1,7 +1,5 @@
 //! Development-only deterministic fixtures. Actions update only local fixture state.
 
-use std::collections::BTreeSet;
-
 use eframe::egui::{self, CentralPanel, Frame, ScrollArea};
 
 use super::{
@@ -9,9 +7,8 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ComparisonResult, ModelComparisonState, ModelDownloadState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase, TranscriptionState,
-        UiRoute,
+        ModelComparisonState, ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -109,38 +106,8 @@ impl Fixture {
             Self::ModelsCompareExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
                 comparison.expanded = true;
-                comparison.phase = ComparisonPhase::Complete;
-                comparison.selected_model_ids = models
-                    .iter()
-                    .map(|model| model.id.clone())
-                    .collect::<BTreeSet<_>>();
-                comparison.audio_duration_ms = Some(8_000);
-                comparison.reference_transcript =
-                    Some("local-first architecture protects private speech".into());
-                comparison.results = vec![
-                    (
-                        "base.en".into(),
-                        ComparisonResult {
-                            output: Some("local-first architecture protects private speech".into()),
-                            processing_ms: Some(1_600),
-                            realtime_factor: Some(0.2),
-                            word_error_rate: Some(0.0),
-                            character_error_rate: Some(0.0),
-                            error: None,
-                        },
-                    ),
-                    (
-                        "tiny.en".into(),
-                        ComparisonResult {
-                            output: Some("local first architecture protects private speech".into()),
-                            processing_ms: Some(720),
-                            realtime_factor: Some(0.09),
-                            word_error_rate: Some(0.2),
-                            character_error_rate: Some(0.03),
-                            error: None,
-                        },
-                    ),
-                ];
+                comparison.selected_model_ids =
+                    models.iter().map(|model| model.id.clone()).collect();
             }
         }
         FixtureData {
@@ -360,7 +327,7 @@ mod tests {
                 "Scribe couldn’t access your microphone",
             ),
             (Fixture::ModelsInstalled, "Compare installed models"),
-            (Fixture::ModelsCompareExpanded, "80% accuracy"),
+            (Fixture::ModelsCompareExpanded, "No data"),
             (Fixture::SettingsRecording, "Recording behavior"),
         ] {
             assert!(
@@ -372,15 +339,38 @@ mod tests {
         }
     }
     #[test]
-    fn comparison_fixture_has_deterministic_reference_metrics() {
+    fn comparison_panel_stays_near_the_bottom_without_infinite_scroll_spacing() {
+        for (fixture, minimum_top) in [
+            (Fixture::ModelsInstalled, 500.0),
+            (Fixture::ModelsCompareExpanded, 430.0),
+        ] {
+            let output = render(fixture, 1180.0, 815.0);
+            let bounds = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some("Compare installed models"))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .expect("comparison heading should expose finite geometry");
+            assert!(
+                bounds.y0 >= minimum_top && bounds.y1 <= 815.0,
+                "{fixture:?} comparison bounds were {bounds:?}"
+            );
+        }
+    }
+    #[test]
+    fn comparison_fixture_matches_the_pre_run_reference_state() {
         let data = Fixture::ModelsCompareExpanded.data();
-        assert_eq!(data.comparison.audio_duration_ms, Some(8_000));
-        assert_eq!(
-            data.comparison.reference_transcript.as_deref(),
-            Some("local-first architecture protects private speech")
-        );
-        assert_eq!(data.comparison.results.len(), 2);
-        assert_eq!(data.comparison.results[1].1.word_error_rate, Some(0.2));
+        assert!(data.comparison.expanded);
+        assert_eq!(data.comparison.selected_model_ids.len(), 2);
+        assert_eq!(data.comparison.audio_duration_ms, None);
+        assert_eq!(data.comparison.reference_transcript, None);
+        assert!(data.comparison.results.is_empty());
     }
     #[test]
     fn harness_actions_mutate_only_visible_fixture_state() {

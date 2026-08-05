@@ -117,6 +117,7 @@ fn selector_row(
 ) -> ScreenAction {
     let name = selected_model_name(state, models);
     let no_model = state.phase == TranscriptionPhase::NoModel;
+    let disabled_reason = model_selector_disabled_reason(state.phase);
     let mut action = ScreenAction::None;
     ui.horizontal(|ui| {
         let model_width = (ui.available_width() - 300.0).max(260.0);
@@ -135,11 +136,22 @@ fn selector_row(
                     );
                     ui.label(RichText::new(name).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let response = button(
-                            ui,
-                            if no_model { "Select" } else { "Change" },
-                            ButtonTone::Text,
-                        );
+                        let response = ui
+                            .add_enabled_ui(disabled_reason.is_none(), |ui| {
+                                button(
+                                    ui,
+                                    if no_model { "Select" } else { "Change" },
+                                    ButtonTone::Text,
+                                )
+                            })
+                            .inner;
+                        if let Some(reason) = disabled_reason {
+                            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_description(reason);
+                            });
+                            focus_tooltip(ui, &response, reason);
+                            response.clone().on_hover_text(reason);
+                        }
                         if response.clicked() {
                             action = if no_model {
                                 ScreenAction::AddModel
@@ -177,69 +189,281 @@ fn selector_row(
     action
 }
 
-fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAction {
+fn model_selector_disabled_reason(phase: TranscriptionPhase) -> Option<&'static str> {
+    match phase {
+        TranscriptionPhase::RequestingMicrophone => {
+            Some("Model selection is unavailable while microphone access is being requested.")
+        }
+        TranscriptionPhase::Listening => Some("Model selection is unavailable while recording."),
+        TranscriptionPhase::Finalizing => {
+            Some("Model selection is unavailable while finalizing the current transcript.")
+        }
+        _ => None,
+    }
+}
+
+fn recording_square_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    accessible_name: &str,
+    fill: egui::Color32,
+    foreground: egui::Color32,
+    stroke: Stroke,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(50.0), egui::Sense::click());
+    ui.painter().rect(rect, Rounding::same(8.0), fill, stroke);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon_glyph(icon),
+        egui::FontId::proportional(22.0),
+        foreground,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Button);
+        builder.set_name(accessible_name);
+    });
+    paint_focus_ring(ui, &response, Rounding::same(8.0));
+    focus_tooltip(ui, &response, accessible_name);
+    response.on_hover_text(accessible_name)
+}
+
+fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
-    Frame::none().fill(colors.card_bg).stroke(Stroke::new(1.0, colors.border)).rounding(Rounding::same(5.0)).show(ui, |ui| {
-        ui.set_min_height(530.0);
-        if state.phase != TranscriptionPhase::NoModel {
-            Frame::none().fill(colors.panel_bg).inner_margin(Margin::symmetric(30.0, 20.0)).show(ui, |ui| {
-                ui.horizontal(|ui| match state.phase {
-                    TranscriptionPhase::Listening => {
-                        let stop = button(ui, format!("{}  Stop recording", icon_glyph(Icon::Stop)), ButtonTone::Danger);
-                        if stop.clicked() { action = ScreenAction::StopRecording; }
-                        ui.vertical(|ui| { let status = ui.label(RichText::new("Listening").strong().color(colors.error)); ui.ctx().accesskit_node_builder(status.id, |builder| { builder.set_live(egui::accesskit::Live::Polite); builder.set_live_atomic(); }); ui.label(format_elapsed(state.elapsed_ms)); });
-                    }
-                    TranscriptionPhase::Finalizing => { ui.spinner(); ui.vertical(|ui| { let status = ui.label(RichText::new("Finalizing transcript…").strong()); ui.ctx().accesskit_node_builder(status.id, |builder| { builder.set_live(egui::accesskit::Live::Polite); builder.set_live_atomic(); }); ui.label("This may take a moment."); }); }
-                    _ => {
-                        let start = button(ui, format!("{}  Start recording", icon_glyph(Icon::Microphone)), ButtonTone::Primary);
-                        if start.clicked() { action = ScreenAction::StartRecording; }
-                        ui.label(match state.recording_mode { RecordingMode::Hold => format!("Hold {} to record", state.hotkey), RecordingMode::PressOnce => format!("Press {} to toggle", state.hotkey) });
+    ui.horizontal(|ui| match state.phase {
+        TranscriptionPhase::Listening => {
+            let stop = recording_square_button(
+                ui,
+                Icon::Stop,
+                "Stop recording",
+                colors.error_pale,
+                colors.error_text,
+                Stroke::NONE,
+            );
+            if stop.clicked() {
+                action = ScreenAction::StopRecording;
+            }
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot_rect.center(), 4.0, colors.error);
+                    let status = ui.label(RichText::new("Listening").strong().color(colors.error));
+                    ui.ctx().accesskit_node_builder(status.id, |builder| {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    });
+                });
+                ui.label(format_elapsed(state.elapsed_ms));
+            });
+        }
+        TranscriptionPhase::Finalizing => {
+            ui.spinner();
+            ui.vertical(|ui| {
+                let status = ui.label(RichText::new("Finalizing transcript…").strong());
+                ui.ctx().accesskit_node_builder(status.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
+                ui.label("This may take a moment.");
+            });
+        }
+        _ => {
+            let start = recording_square_button(
+                ui,
+                Icon::Microphone,
+                "Start recording",
+                colors.primary_button_bg,
+                colors.primary_button_text,
+                Stroke::NONE,
+            );
+            if start.clicked() {
+                action = ScreenAction::StartRecording;
+            }
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Start recording").strong());
+                ui.label(match state.recording_mode {
+                    RecordingMode::Hold => format!("Hold {} to record", state.hotkey),
+                    RecordingMode::PressOnce => format!("Press {} to toggle", state.hotkey),
+                });
+            });
+        }
+    });
+    action
+}
+
+fn no_model_empty_state(ui: &mut egui::Ui) -> ScreenAction {
+    let colors = ui_palette(ui);
+    let mut action = ScreenAction::None;
+    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+        ui.add_space(130.0);
+        Frame::none()
+            .fill(colors.panel_bg)
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(icon_glyph(Icon::Models))
+                        .size(30.0)
+                        .color(colors.muted_text),
+                );
+            });
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Add a speech model to start transcribing")
+                .size(18.0)
+                .strong(),
+        );
+        ui.label("Your audio stays on this device.");
+        ui.add_space(12.0);
+        if button(ui, "Add model", ButtonTone::Primary).clicked() {
+            action = ScreenAction::AddModel;
+        }
+    });
+    action
+}
+
+fn no_model_recovery_callout(ui: &mut egui::Ui) -> ScreenAction {
+    let colors = ui_palette(ui);
+    let mut action = ScreenAction::None;
+    Frame::none()
+        .fill(colors.panel_bg)
+        .stroke(Stroke::new(1.0, colors.border))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(icon_glyph(Icon::Models))
+                        .size(24.0)
+                        .color(colors.muted_text),
+                );
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Add a speech model to continue transcribing").strong());
+                    ui.label(
+                        RichText::new("Your existing transcript is still available below.")
+                            .color(colors.muted_text),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if button(ui, "Add model", ButtonTone::Primary).clicked() {
+                        action = ScreenAction::AddModel;
                     }
                 });
             });
-            ui.separator();
-        }
-        if state.phase == TranscriptionPhase::NoModel {
-            ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                ui.add_space(130.0);
-                Frame::none().fill(colors.panel_bg).rounding(Rounding::same(8.0)).inner_margin(Margin::same(12.0)).show(ui, |ui| { ui.label(RichText::new(icon_glyph(Icon::Models)).size(30.0).color(colors.muted_text)); });
-                ui.add_space(12.0);
-                ui.label(RichText::new("Add a speech model to start transcribing").size(18.0).strong());
-                ui.label("Your audio stays on this device.");
-                ui.add_space(12.0);
-                if button(ui, "Add model", ButtonTone::Primary).clicked() { action = ScreenAction::AddModel; }
-            });
-        } else {
-        ui.add_space(16.0);
-        if let Some(text) = &state.notice {
-            if state.phase == TranscriptionPhase::MicrophoneError {
-                let alert_action = microphone_error_notice(ui, text);
-                if alert_action != ScreenAction::None { action = alert_action; }
-            } else {
-                let response = neutral_notice(ui, text);
-                ui.ctx().accesskit_node_builder(response.id, |builder| { builder.set_live(egui::accesskit::Live::Polite); builder.set_live_atomic(); });
-            }
-            ui.add_space(12.0);
-        }
-        if state.committed_transcript.trim().is_empty() { ui.label(RichText::new("Your transcript will appear here.").color(colors.tertiary_text)); } else { let response = ui.label(&state.committed_transcript); ui.ctx().accesskit_node_builder(response.id, |builder| { builder.set_live(egui::accesskit::Live::Polite); builder.set_live_atomic(); }); }
-        if !state.provisional_transcript.is_empty() { ui.add_space(8.0); ui.label(RichText::new(&state.provisional_transcript).italics().color(colors.tertiary_text)); }
-        ui.add_space(10.0);
-        if let Some(model_id) = &state.selected_model_id { badge(ui, &model_id.to_ascii_uppercase(), None); }
-        let remaining = (220.0 - ui.min_rect().height()).max(24.0);
-        ui.add_space(remaining);
-        ui.separator();
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let enabled = !matches!(state.phase, TranscriptionPhase::Listening | TranscriptionPhase::Finalizing);
-            let copy = ui.add_enabled(enabled && !state.committed_transcript.is_empty(), egui::Button::new(format!("{}  Copy", icon_glyph(Icon::Copy))).min_size(Vec2::new(96.0, 40.0)));
-            if !copy.enabled() { ui.ctx().accesskit_node_builder(copy.id, |builder| builder.set_description("Copy is unavailable while recording or until a final transcript exists.")); }
-            if copy.clicked() { action = ScreenAction::CopyTranscript; }
-            let clear = ui.add_enabled(enabled && !state.committed_transcript.is_empty(), egui::Button::new("Clear").min_size(Vec2::new(72.0, 40.0)));
-            if !clear.enabled() { ui.ctx().accesskit_node_builder(clear.id, |builder| builder.set_description("Clear is unavailable while recording or until a final transcript exists.")); }
-            if clear.clicked() { action = ScreenAction::ClearTranscript; }
         });
-        }
-    });
+    action
+}
+
+fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAction {
+    let colors = ui_palette(ui);
+    let mut action = ScreenAction::None;
+    Frame::none()
+        .fill(colors.card_bg)
+        .stroke(Stroke::new(1.0, colors.border))
+        .rounding(Rounding::same(5.0))
+        .show(ui, |ui| {
+            ui.set_min_height(530.0);
+            if state.phase != TranscriptionPhase::NoModel {
+                Frame::none()
+                    .fill(colors.panel_bg)
+                    .inner_margin(Margin::symmetric(30.0, 20.0))
+                    .show(ui, |ui| {
+                        action = recording_status_header(ui, state);
+                    });
+                ui.separator();
+            }
+
+            let has_committed_transcript = !state.committed_transcript.trim().is_empty();
+            if state.phase == TranscriptionPhase::NoModel && !has_committed_transcript {
+                action = no_model_empty_state(ui);
+            } else {
+                ui.add_space(16.0);
+                if state.phase == TranscriptionPhase::NoModel {
+                    let recovery_action = no_model_recovery_callout(ui);
+                    if recovery_action != ScreenAction::None {
+                        action = recovery_action;
+                    }
+                    ui.add_space(16.0);
+                }
+                if let Some(text) = &state.notice {
+                    if state.phase == TranscriptionPhase::MicrophoneError {
+                        let alert_action = microphone_error_notice(ui, text);
+                        if alert_action != ScreenAction::None {
+                            action = alert_action;
+                        }
+                    } else {
+                        let response = neutral_notice(ui, text);
+                        ui.ctx().accesskit_node_builder(response.id, |builder| {
+                            builder.set_live(egui::accesskit::Live::Polite);
+                            builder.set_live_atomic();
+                        });
+                    }
+                    ui.add_space(12.0);
+                }
+                if state.committed_transcript.trim().is_empty() {
+                    ui.label(
+                        RichText::new("Your transcript will appear here.")
+                            .color(colors.tertiary_text),
+                    );
+                } else {
+                    let response = ui.label(&state.committed_transcript);
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    });
+                }
+                if !state.provisional_transcript.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(&state.provisional_transcript)
+                            .italics()
+                            .color(colors.tertiary_text),
+                    );
+                }
+                ui.add_space(10.0);
+                if let Some(model_id) = &state.selected_model_id {
+                    badge(ui, &model_id.to_ascii_uppercase(), None);
+                }
+                let remaining = (220.0 - ui.min_rect().height()).max(24.0);
+                ui.add_space(remaining);
+                ui.separator();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let enabled = !matches!(
+                        state.phase,
+                        TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
+                    );
+                    let copy = ui.add_enabled(
+                        enabled && has_committed_transcript,
+                        egui::Button::new(format!("{}  Copy", icon_glyph(Icon::Copy)))
+                            .min_size(Vec2::new(96.0, 40.0)),
+                    );
+                    if !copy.enabled() {
+                        ui.ctx().accesskit_node_builder(copy.id, |builder| {
+                            builder.set_description("Copy is unavailable while recording or until a final transcript exists.")
+                        });
+                    }
+                    if copy.clicked() {
+                        action = ScreenAction::CopyTranscript;
+                    }
+                    let clear = ui.add_enabled(
+                        enabled && has_committed_transcript,
+                        egui::Button::new("Clear").min_size(Vec2::new(72.0, 40.0)),
+                    );
+                    if !clear.enabled() {
+                        ui.ctx().accesskit_node_builder(clear.id, |builder| {
+                            builder.set_description("Clear is unavailable while recording or until a final transcript exists.")
+                        });
+                    }
+                    if clear.clicked() {
+                        action = ScreenAction::ClearTranscript;
+                    }
+                });
+            }
+        });
     action
 }
 
@@ -292,15 +516,17 @@ fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
                                 .size(18.0)
                                 .color(colors.error_text),
                         );
-                        ui.label(RichText::new(text).color(colors.error_text));
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                        let message_width = (ui.available_width() - 300.0).max(180.0);
+                        ui.add_sized(
+                            [message_width, 40.0],
+                            egui::Label::new(RichText::new(text).color(colors.error_text))
+                                .wrap(true),
+                        );
                         let open_settings = button(ui, "Open audio settings", ButtonTone::Text);
                         if open_settings.clicked() {
                             action = ScreenAction::OpenAudioSettings;
                         }
-                        let retry = button(ui, "Try again", ButtonTone::Secondary);
+                        let retry = button(ui, "Try again", ButtonTone::Danger);
                         if retry.clicked() {
                             action = ScreenAction::RetryMicrophone;
                         }
@@ -345,6 +571,25 @@ fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
     );
 }
 
+fn model_family_name(model: &ModelViewModel) -> &str {
+    model
+        .display_name
+        .strip_suffix(model.variant_label.as_str())
+        .map(str::trim_end)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(model.display_name.as_str())
+}
+
+fn models_footer_spacer(
+    remaining_height: f32,
+    comparison_expanded: bool,
+    has_storage_footer: bool,
+) -> f32 {
+    let comparison_height = if comparison_expanded { 330.0 } else { 92.0 };
+    let storage_height = if has_storage_footer { 40.0 } else { 0.0 };
+    (remaining_height - comparison_height - storage_height).max(16.0)
+}
+
 fn models(
     ui: &mut egui::Ui,
     models: &[ModelViewModel],
@@ -373,20 +618,21 @@ fn models(
             {
                 action = ScreenAction::AddModel;
             }
-            if button(
-                ui,
-                format!(
-                    "Compare  {}",
-                    icon_glyph(if comparison.expanded {
-                        Icon::ChevronUp
-                    } else {
-                        Icon::ChevronDown
-                    })
-                ),
-                ButtonTone::Secondary,
-            )
-            .clicked()
-            {
+            let compare_disabled_reason = (models.len() < 2)
+                .then_some("Install at least two compatible models to compare them.");
+            let compare = ui
+                .add_enabled_ui(compare_disabled_reason.is_none(), |ui| {
+                    button(ui, "Compare", ButtonTone::Secondary)
+                })
+                .inner;
+            if let Some(reason) = compare_disabled_reason {
+                ui.ctx().accesskit_node_builder(compare.id, |builder| {
+                    builder.set_description(reason);
+                });
+                focus_tooltip(ui, &compare, reason);
+                compare.clone().on_hover_text(reason);
+            }
+            if compare.clicked() {
                 action = ScreenAction::ToggleComparison;
             }
         });
@@ -395,7 +641,15 @@ fn models(
     for model in models {
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&model.display_name).strong());
+                ui.vertical(|ui| {
+                    ui.set_min_width(160.0);
+                    ui.label(RichText::new(model_family_name(model)).strong());
+                    ui.label(
+                        RichText::new(&model.variant_label)
+                            .small()
+                            .color(colors.muted_text),
+                    );
+                });
                 badge(
                     ui,
                     if model.active { "Active" } else { "Installed" },
@@ -414,7 +668,18 @@ fn models(
         });
         ui.add_space(8.0);
     }
-    ui.add_space((140.0 - (models.len() as f32 * 64.0)).max(8.0));
+    let used_bytes: u64 = models
+        .iter()
+        .map(|model| model.disk_bytes)
+        .collect::<Option<Vec<_>>>()
+        .map(|values| values.into_iter().sum())
+        .unwrap_or_default();
+    let visible_remaining_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(0.0);
+    ui.add_space(models_footer_spacer(
+        visible_remaining_height,
+        comparison.expanded,
+        used_bytes > 0,
+    ));
     Frame::none()
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border))
@@ -546,12 +811,6 @@ fn models(
                     });
             }
         });
-    let used_bytes: u64 = models
-        .iter()
-        .map(|model| model.disk_bytes)
-        .collect::<Option<Vec<_>>>()
-        .map(|values| values.into_iter().sum())
-        .unwrap_or_default();
     if used_bytes > 0 {
         ui.add_space(12.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1039,9 +1298,126 @@ mod tests {
         })
     }
 
+    fn render_transcribe(
+        state: &TranscriptionState,
+        models: &[ModelViewModel],
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings = RecordingSettingsView::default();
+        let comparison = ModelComparisonState::default();
+        ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Transcribe,
+                        transcription: state,
+                        models,
+                        comparison: &comparison,
+                        recording_settings: &settings,
+                    },
+                )
+            });
+        })
+    }
+
     #[test]
     fn elapsed_display_is_deterministic() {
         assert_eq!(format_elapsed(8_000), "00:08");
+    }
+
+    #[test]
+    fn reference_recording_controls_have_named_square_actions() {
+        for (phase, expected_name) in [
+            (TranscriptionPhase::Ready, "Start recording"),
+            (TranscriptionPhase::Listening, "Stop recording"),
+        ] {
+            let state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                ..Default::default()
+            };
+            let output = render_transcribe(&state, &[]);
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some(expected_name)
+            }));
+        }
+    }
+
+    #[test]
+    fn model_selector_explains_why_it_is_disabled_during_unsafe_phases() {
+        for (phase, reason) in [
+            (
+                TranscriptionPhase::Listening,
+                "Model selection is unavailable while recording.",
+            ),
+            (
+                TranscriptionPhase::Finalizing,
+                "Model selection is unavailable while finalizing the current transcript.",
+            ),
+        ] {
+            let state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                ..Default::default()
+            };
+            let models = vec![ModelViewModel {
+                id: "base.en".into(),
+                display_name: "whisper.cpp base.en".into(),
+                variant_label: "base.en".into(),
+                ..Default::default()
+            }];
+            let output = render_transcribe(&state, &models);
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Change") && node.description() == Some(reason)
+            }));
+        }
+    }
+
+    #[test]
+    fn no_model_recovery_keeps_committed_transcript_visible() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::NoModel,
+            committed_transcript: "Keep this transcript after model removal.".into(),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Add a speech model to continue transcribing")
+        }));
+        assert!(
+            nodes.iter().any(|(_, node)| {
+                node.name() == Some("Keep this transcript after model removal.")
+            })
+        );
+    }
+
+    #[test]
+    fn model_rows_separate_family_and_variant_labels() {
+        let model = ModelViewModel {
+            display_name: "whisper.cpp base.en".into(),
+            variant_label: "base.en".into(),
+            ..Default::default()
+        };
+        assert_eq!(model_family_name(&model), "whisper.cpp");
+
+        let custom = ModelViewModel {
+            display_name: "Local model".into(),
+            variant_label: "custom-v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(model_family_name(&custom), "Local model");
+    }
+
+    #[test]
+    fn model_footer_spacer_uses_remaining_height_and_panel_state() {
+        assert_eq!(models_footer_spacer(500.0, false, true), 368.0);
+        assert_eq!(models_footer_spacer(500.0, true, true), 130.0);
+        assert_eq!(models_footer_spacer(100.0, true, true), 16.0);
     }
 
     #[test]

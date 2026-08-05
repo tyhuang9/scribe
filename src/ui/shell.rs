@@ -191,7 +191,15 @@ fn secondary_navigation(
                 builder.set_expanded(disclosure.body_response.is_some());
             });
     } else {
-        let more = nav_icon_button(ui, Icon::About, "More navigation", false, selected, muted);
+        let more = nav_icon_button(
+            ui,
+            Icon::About,
+            "More navigation",
+            false,
+            selected,
+            text,
+            muted,
+        );
         if more.clicked() {
             ui.memory_mut(|memory| memory.toggle_popup(more.id));
         }
@@ -240,7 +248,7 @@ fn nav_button(
     let response = match mode {
         NavigationMode::Full => nav_full_button(ui, page, active, selected, text, muted),
         NavigationMode::Compact => {
-            nav_icon_button(ui, page.icon(), page.label(), active, selected, muted)
+            nav_icon_button(ui, page.icon(), page.label(), active, selected, text, muted)
         }
     };
     response
@@ -267,7 +275,7 @@ fn nav_full_button(
     let fill = if active {
         selected
     } else if response.hovered() {
-        Color32::from_white_alpha(18)
+        selected.gamma_multiply(0.45)
     } else {
         Color32::TRANSPARENT
     };
@@ -296,6 +304,7 @@ fn nav_icon_button(
     accessible_name: &str,
     active: bool,
     selected: Color32,
+    text: Color32,
     muted: Color32,
 ) -> egui::Response {
     let (rect, response) =
@@ -303,7 +312,7 @@ fn nav_icon_button(
     let fill = if active {
         selected
     } else if response.hovered() {
-        Color32::from_white_alpha(18)
+        selected.gamma_multiply(0.45)
     } else {
         Color32::TRANSPARENT
     };
@@ -313,7 +322,11 @@ fn nav_icon_button(
         egui::Align2::CENTER_CENTER,
         icon_glyph(icon),
         egui::FontId::proportional(22.0),
-        muted,
+        if active || response.hovered() {
+            text
+        } else {
+            muted
+        },
     );
     paint_focus_ring(ui, &response, Rounding::same(5.0));
     focus_tooltip(ui, &response, accessible_name);
