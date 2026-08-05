@@ -6,8 +6,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{self, AppConfig, WhisperComputeMode};
+use crate::config::{self, AppConfig};
 use crate::models::{SttModelInfo, TranscriptResult, TranscriptSegment, default_model_catalog};
+use crate::transcription::AccelerationPreference;
 
 use super::SttBackend;
 
@@ -18,7 +19,7 @@ pub struct WhisperCppBackend {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhisperCppOptions {
-    pub compute_mode: WhisperComputeMode,
+    pub compute_mode: AccelerationPreference,
     pub gpu_device: u32,
     pub cuda_backend_path: Option<PathBuf>,
     pub cuda_library_paths: Vec<PathBuf>,
@@ -27,7 +28,7 @@ pub struct WhisperCppOptions {
 impl Default for WhisperCppOptions {
     fn default() -> Self {
         Self {
-            compute_mode: WhisperComputeMode::Auto,
+            compute_mode: AccelerationPreference::Auto,
             gpu_device: 0,
             cuda_backend_path: None,
             cuda_library_paths: Vec::new(),
@@ -108,7 +109,7 @@ impl SttBackend for WhisperCppBackend {
                 stderr.trim()
             ));
         }
-        if self.options.compute_mode == WhisperComputeMode::PreferGpu
+        if self.options.compute_mode == AccelerationPreference::Gpu
             && whisper_reported_no_gpu(&stderr)
         {
             return Err(anyhow!(
@@ -145,14 +146,6 @@ pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
         bundled_runtime_root(),
         managed_runtime_roots(config),
         dev_runtime_paths(config),
-    )
-}
-
-pub fn resolve_whisper_cpp_packaged_executable(config: &AppConfig) -> Option<PathBuf> {
-    resolve_whisper_cpp_executable_from_candidates(
-        bundled_runtime_root(),
-        managed_runtime_roots(config),
-        [],
     )
 }
 
@@ -261,12 +254,12 @@ fn whisper_cli_args(
     ];
 
     match options.compute_mode {
-        WhisperComputeMode::Auto => {}
-        WhisperComputeMode::PreferGpu => {
+        AccelerationPreference::Auto => {}
+        AccelerationPreference::Gpu => {
             args.push(OsString::from("-dev"));
             args.push(OsString::from(options.gpu_device.to_string()));
         }
-        WhisperComputeMode::Cpu => {
+        AccelerationPreference::Cpu => {
             args.push(OsString::from("-ng"));
         }
     }
@@ -279,15 +272,15 @@ fn apply_whisper_environment(
     executable_path: &Path,
     options: &WhisperCppOptions,
 ) -> Result<()> {
-    let include_cuda_paths = options.compute_mode != WhisperComputeMode::Cpu;
+    let include_cuda_paths = options.compute_mode != AccelerationPreference::Cpu;
     let runtime_paths = bundled_runtime_library_paths(executable_path, include_cuda_paths);
-    let configured_paths = if options.compute_mode == WhisperComputeMode::Cpu {
+    let configured_paths = if options.compute_mode == AccelerationPreference::Cpu {
         Vec::new()
     } else {
         options.cuda_library_paths.clone()
     };
 
-    if options.compute_mode != WhisperComputeMode::Cpu
+    if options.compute_mode != AccelerationPreference::Cpu
         && let Some(backend_path) =
             bundled_cuda_backend_path(executable_path).or_else(|| options.cuda_backend_path.clone())
         && !backend_path.as_os_str().is_empty()
@@ -417,7 +410,7 @@ mod tests {
             Path::new("/models/ggml-small.en.bin"),
             Path::new("/tmp/audio.wav"),
             &WhisperCppOptions {
-                compute_mode: WhisperComputeMode::PreferGpu,
+                compute_mode: AccelerationPreference::Gpu,
                 gpu_device: 1,
                 ..WhisperCppOptions::default()
             },
@@ -443,7 +436,7 @@ mod tests {
             Path::new("/models/ggml-base.en.bin"),
             Path::new("/tmp/audio.wav"),
             &WhisperCppOptions {
-                compute_mode: WhisperComputeMode::Auto,
+                compute_mode: AccelerationPreference::Auto,
                 gpu_device: 0,
                 ..WhisperCppOptions::default()
             },
@@ -467,7 +460,7 @@ mod tests {
             Path::new("/models/ggml-base.en.bin"),
             Path::new("/tmp/audio.wav"),
             &WhisperCppOptions {
-                compute_mode: WhisperComputeMode::Cpu,
+                compute_mode: AccelerationPreference::Cpu,
                 gpu_device: 0,
                 ..WhisperCppOptions::default()
             },
@@ -541,7 +534,7 @@ mod tests {
             &mut command,
             &executable,
             &WhisperCppOptions {
-                compute_mode: WhisperComputeMode::Cpu,
+                compute_mode: AccelerationPreference::Cpu,
                 cuda_backend_path: Some(cuda_backend),
                 cuda_library_paths: vec![cuda_dir.clone()],
                 ..WhisperCppOptions::default()
@@ -572,7 +565,7 @@ mod tests {
             &mut command,
             &executable,
             &WhisperCppOptions {
-                compute_mode: WhisperComputeMode::PreferGpu,
+                compute_mode: AccelerationPreference::Gpu,
                 cuda_backend_path: Some(PathBuf::from(
                     "/usr/local/lib/ollama/cuda/libggml-cuda.so",
                 )),
@@ -700,7 +693,7 @@ mod tests {
         let backend = WhisperCppBackend::new(
             Some(executable),
             WhisperCppOptions {
-                compute_mode: WhisperComputeMode::PreferGpu,
+                compute_mode: AccelerationPreference::Gpu,
                 gpu_device: 0,
                 cuda_backend_path,
                 cuda_library_paths,

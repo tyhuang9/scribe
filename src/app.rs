@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,18 +20,19 @@ use crate::audio::{self, RecordingSession};
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
-use crate::config::{self, AppConfig, HotkeyMode, ThemeMode, WhisperComputeMode};
+use crate::config::{self, AppConfig, HotkeyMode, ThemeMode};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
 };
+use crate::prepared_audio::PreparedAudio;
 use crate::runtime_catalog;
 use crate::stt;
 use crate::text_output;
 use crate::transcription::{
-    RequestId, SessionId, TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest,
-    TranscriptionService,
+    AccelerationPreference, RequestId, SessionId, TranscriptionOptions, TranscriptionOutcome,
+    TranscriptionRequest, TranscriptionService,
 };
 use crate::tray::{TrayCommand, TrayService};
 
@@ -852,36 +854,19 @@ fn resolve_managed_runtime_executable(
     provider: &stt::SttProviderAdapter,
 ) -> Option<PathBuf> {
     let root = config::managed_runtime_path(config, provider.backend)?;
-    match provider.backend {
-        "whisper.cpp" => {
-            stt::whisper_cpp::resolve_whisper_cpp_executable_from_candidates([], [root], [])
-        }
-        "faster-whisper" => {
-            stt::faster_whisper::resolve_faster_whisper_executable_from_candidates([], [root], [])
-        }
-        "Vosk" => stt::vosk::resolve_vosk_executable_from_candidates([], [root], []),
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-            stt::sherpa_onnx::resolve_executable_from_candidates(
-                provider.runtime_id,
-                [],
-                [root],
-                [],
-            )
-        }
-        _ => None,
-    }
+    runtime_catalog::resolve_runtime_entrypoint(provider.runtime_id, [root])
 }
 
 fn packaged_runtime_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
-    match model.backend.as_str() {
-        "whisper.cpp" => stt::whisper_cpp::resolve_whisper_cpp_packaged_executable(config),
-        "faster-whisper" => stt::faster_whisper::resolve_faster_whisper_packaged_executable(config),
-        "Vosk" => stt::vosk::resolve_vosk_packaged_executable(config),
-        "sherpa-onnx" | "Moonshine" | "Parakeet" => {
-            stt::sherpa_onnx::resolve_packaged_executable_for_backend(config, &model.backend)
-        }
-        _ => None,
-    }
+    let provider = stt::provider_for_backend(&model.backend)?;
+    let bundled_root = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let managed_root = config::managed_runtime_path(config, &model.backend);
+    runtime_catalog::resolve_runtime_entrypoint(
+        provider.runtime_id,
+        bundled_root.into_iter().chain(managed_root),
+    )
 }
 
 fn runtime_install_source(
@@ -1015,6 +1000,7 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     active_recording: Option<ActiveRecording>,
+    transcription_service: TranscriptionService,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
@@ -1059,6 +1045,7 @@ impl LocalTranscriberApp {
         )));
 
         let (tx, rx) = unbounded();
+        let transcription_service = TranscriptionService::new(config.clone());
         let mut app = Self {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
@@ -1083,6 +1070,7 @@ impl LocalTranscriberApp {
             transcript: String::new(),
             status_message,
             active_recording: None,
+            transcription_service,
             tx,
             rx,
             playground_pending: 0,
@@ -1995,23 +1983,33 @@ impl LocalTranscriberApp {
         }
         self.active_transcription_request = Some(request_id);
         latency.transcription_dispatched_at = Some(Instant::now());
-        let config = self.config.clone();
+        let service = self.transcription_service.with_config(self.config.clone());
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            let service = TranscriptionService::new(config);
-            let mut request = TranscriptionRequest::new(
-                session_id,
-                request_id,
-                audio_path.clone(),
-                model.id.clone(),
-            );
+            let prepared = PreparedAudio::from_wav_path(&audio_path).map(Arc::new);
+            let _ = fs::remove_file(&audio_path);
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = tx.send(AppEvent::TranscriptionFailed {
+                        source: RecordingSource::Transcribe,
+                        session_id,
+                        request_id,
+                        model_id: model.id,
+                        message: format!("Audio preparation failed: {err}"),
+                        latency: Some(latency),
+                    });
+                    return;
+                }
+            };
+            let mut request =
+                TranscriptionRequest::new(session_id, request_id, prepared, model.id.clone());
             request.model_path = model.local_path.clone();
             request.options = TranscriptionOptions::default();
-            let result = service.transcribe_file(request);
+            let result = service.transcribe(request);
             let completed_at = Instant::now();
             latency.transcription_job_completed_at = Some(completed_at);
-            let _ = fs::remove_file(&audio_path);
 
             match result {
                 Ok(result) => {
@@ -2060,7 +2058,7 @@ impl LocalTranscriberApp {
         self.playground_audio_path = Some(audio_path.clone());
         self.playground_pending = models.len();
         let audio_duration_ms = audio::wav_duration_ms(&audio_path);
-        let config = self.config.clone();
+        let service = self.transcription_service.with_config(self.config.clone());
 
         let requests = models
             .into_iter()
@@ -2077,7 +2075,7 @@ impl LocalTranscriberApp {
             },
         );
 
-        for (request_id, model) in requests {
+        for (_, model) in &requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
@@ -2090,39 +2088,66 @@ impl LocalTranscriberApp {
                 card.peak_ram_mb = None;
                 card.peak_vram_mb = None;
             }
+        }
 
-            let tx = self.tx.clone();
-            let config = config.clone();
-            let audio_path = audio_path.clone();
-            thread::spawn(move || {
-                let service = TranscriptionService::new(config);
-                let mut request =
-                    TranscriptionRequest::new(session_id, request_id, audio_path, model.id.clone());
-                request.model_path = model.local_path.clone();
-                request.options = TranscriptionOptions::default();
-                match service.transcribe_file(request) {
-                    Ok(result) => {
-                        let _ = tx.send(AppEvent::TranscriptionDone {
-                            source: RecordingSource::Playground,
-                            session_id,
-                            request_id,
-                            result: Box::new(result),
-                            latency: None,
-                        });
-                    }
-                    Err(err) => {
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let prepared = PreparedAudio::from_wav_path(&audio_path).map(Arc::new);
+            let _ = fs::remove_file(&audio_path);
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    for (request_id, model) in requests {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
                             request_id,
                             model_id: model.id,
-                            message: err.to_string(),
+                            message: format!("Audio preparation failed: {err}"),
                             latency: None,
                         });
                     }
+                    return;
                 }
-            });
-        }
+            };
+
+            for (request_id, model) in requests {
+                let tx = tx.clone();
+                let service = service.clone();
+                let prepared = prepared.clone();
+                thread::spawn(move || {
+                    let mut request = TranscriptionRequest::new(
+                        session_id,
+                        request_id,
+                        prepared,
+                        model.id.clone(),
+                    );
+                    request.model_path = model.local_path.clone();
+                    request.options = TranscriptionOptions::default();
+                    match service.transcribe(request) {
+                        Ok(result) => {
+                            let _ = tx.send(AppEvent::TranscriptionDone {
+                                source: RecordingSource::Playground,
+                                session_id,
+                                request_id,
+                                result: Box::new(result),
+                                latency: None,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AppEvent::TranscriptionFailed {
+                                source: RecordingSource::Playground,
+                                session_id,
+                                request_id,
+                                model_id: model.id,
+                                message: err.to_string(),
+                                latency: None,
+                            });
+                        }
+                    }
+                });
+            }
+        });
     }
 
     fn reset_playground_for_run(&mut self) {
@@ -2390,6 +2415,8 @@ impl LocalTranscriberApp {
         };
 
         let expected_total_bytes = model_download_total_bytes(model);
+        let expected_sha256 =
+            runtime_catalog::model_artifact_spec(&model.id).and_then(|artifact| artifact.sha256);
         self.model_downloads.insert(
             model.id.clone(),
             ModelInstallStatus::Downloading {
@@ -2484,6 +2511,7 @@ impl LocalTranscriberApp {
                         &destination,
                         &model_id,
                         expected_total_bytes,
+                        expected_sha256,
                         &progress,
                     );
                     send_model_download_result(&tx, model_id, result);
@@ -3640,32 +3668,31 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Performance"));
                 ui.add_space(8.0);
                 let active_device_support = selected_model_device_support(&self.config);
-                let prefer_gpu_available = active_device_support.supports_gpu();
+                let gpu_available = active_device_support.supports_gpu();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Transcription device");
-                    let mut compute_mode = self.config.whisper_compute_mode;
+                    let mut preference = self.config.acceleration_preference;
                     ComboBox::from_id_source("transcription-device-mode")
-                        .selected_text(compute_mode.label())
+                        .selected_text(preference.label())
                         .show_ui(ui, |ui| {
-                            for mode in WhisperComputeMode::ALL {
-                                let enabled =
-                                    mode != WhisperComputeMode::PreferGpu || prefer_gpu_available;
+                            for mode in AccelerationPreference::ALL {
+                                let enabled = mode != AccelerationPreference::Gpu || gpu_available;
                                 ui.add_enabled_ui(enabled, |ui| {
-                                    ui.selectable_value(&mut compute_mode, mode, mode.label());
+                                    ui.selectable_value(&mut preference, mode, mode.label());
                                 });
                             }
                         });
-                    if compute_mode != self.config.whisper_compute_mode {
-                        self.config.whisper_compute_mode = compute_mode;
+                    if preference != self.config.acceleration_preference {
+                        self.config.acceleration_preference = preference;
                         self.save_config();
                     }
                 });
-                if !prefer_gpu_available {
+                if !gpu_available {
                     ui.add_space(4.0);
                     wrapped_label(
                         ui,
                         mut_text(
-                            "The active model backend is CPU-only. GPU mode is available for whisper.cpp and faster-whisper models.",
+                            "The active model backend is CPU-only. GPU mode remains available only for verified compatibility backends that advertise it.",
                         ),
                     );
                 }
@@ -6414,12 +6441,12 @@ mod layout_tests {
 
     #[test]
     fn performance_modes_are_layman_facing() {
-        let labels = WhisperComputeMode::ALL
+        let labels = AccelerationPreference::ALL
             .into_iter()
-            .map(WhisperComputeMode::label)
+            .map(AccelerationPreference::label)
             .collect::<Vec<_>>();
 
-        assert_eq!(labels, vec!["Auto", "Prefer GPU", "CPU only"]);
+        assert_eq!(labels, vec!["Auto", "GPU", "CPU only"]);
     }
 
     #[test]
@@ -7380,6 +7407,7 @@ mod layout_tests {
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
 
+        let transcription_service = TranscriptionService::new(config.clone());
         LocalTranscriberApp {
             hotkey_input: config.hotkey.clone(),
             model_search: String::new(),
@@ -7404,6 +7432,7 @@ mod layout_tests {
             transcript: String::new(),
             status_message: "Ready".to_owned(),
             active_recording: None,
+            transcription_service,
             tx,
             rx,
             playground_pending: 0,
@@ -7450,6 +7479,9 @@ mod layout_tests {
             stdout: String::new(),
             stderr: String::new(),
             processing_duration_ms: Some(42),
+            resolved_acceleration: None,
+            model_load_duration_ms: None,
+            warm_model_reused: false,
         }
     }
 
@@ -8760,6 +8792,14 @@ mod layout_tests {
             .unwrap();
 
         assert_eq!(model_device_label(&vosk), "CPU");
+        assert!(!selected_model_device_support(&config).supports_gpu());
+
+        config.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let whisper = config::configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+        assert_eq!(model_device_label(&whisper), "CPU");
         assert!(!selected_model_device_support(&config).supports_gpu());
     }
 

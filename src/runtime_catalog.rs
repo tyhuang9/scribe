@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceSupport {
     CpuOnly,
@@ -60,9 +62,9 @@ const BACKENDS: &[BackendSpec] = &[
         runtime_install_supported: true,
         transcription_supported: true,
         device_detection_supported: false,
-        device_support: DeviceSupport::CpuAndGpu,
+        device_support: DeviceSupport::CpuOnly,
         runtime_storage_estimate: "~20 MB+",
-        runtime_storage_detail: "~20 MB for the CPU runtime; CUDA bundles are larger",
+        runtime_storage_detail: "~20 MB for the verified CPU-only runtime package",
         development_runtime: Some(DevelopmentRuntimeSpec {
             script_name: "bundle-whisper-runtime.sh",
             destination_env: "SCRIBE_RUNTIME_DEST",
@@ -157,10 +159,34 @@ const BACKENDS: &[BackendSpec] = &[
 ];
 
 const MODEL_ARTIFACTS: &[ModelArtifactSpec] = &[
-    model_artifact("whisper_cpp_tiny_en", "~75 MB", Some(75 * MIB)),
-    model_artifact("whisper_cpp_base_en", "~150 MB", Some(150 * MIB)),
-    model_artifact("whisper_cpp_small_en", "~470 MB", Some(470 * MIB)),
-    model_artifact("whisper_cpp_medium_en", "~1.5 GB", Some(1536 * MIB)),
+    pinned_model_artifact(
+        "whisper_cpp_tiny_en",
+        "~75 MB",
+        77_704_715,
+        "5359861c739e955e79d9a303bcbc70fb988958b1",
+        "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+    ),
+    pinned_model_artifact(
+        "whisper_cpp_base_en",
+        "~150 MB",
+        147_964_211,
+        "5359861c739e955e79d9a303bcbc70fb988958b1",
+        "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+    ),
+    pinned_model_artifact(
+        "whisper_cpp_small_en",
+        "~470 MB",
+        487_614_201,
+        "5359861c739e955e79d9a303bcbc70fb988958b1",
+        "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+    ),
+    pinned_model_artifact(
+        "whisper_cpp_medium_en",
+        "~1.5 GB",
+        1_533_774_781,
+        "5359861c739e955e79d9a303bcbc70fb988958b1",
+        "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+    ),
     model_artifact("faster_whisper_tiny_en", "~75 MB", Some(75 * MIB)),
     model_artifact("faster_whisper_base_en", "~150 MB", Some(150 * MIB)),
     model_artifact("faster_whisper_small_en_gpu", "~470 MB", Some(470 * MIB)),
@@ -177,6 +203,22 @@ const MODEL_ARTIFACTS: &[ModelArtifactSpec] = &[
     model_artifact("moonshine", "~35 MB", Some(35 * MIB)),
     model_artifact("parakeet_0_6b", "~640 MB", Some(650 * MIB)),
 ];
+
+const fn pinned_model_artifact(
+    model_id: &'static str,
+    storage_estimate: &'static str,
+    download_bytes: u64,
+    version: &'static str,
+    sha256: &'static str,
+) -> ModelArtifactSpec {
+    ModelArtifactSpec {
+        model_id,
+        storage_estimate,
+        download_bytes: Some(download_bytes),
+        version: Some(version),
+        sha256: Some(sha256),
+    }
+}
 
 const fn model_artifact(
     model_id: &'static str,
@@ -216,6 +258,63 @@ pub fn runtime_version_for_runtime_id(runtime_id: &str) -> Option<&'static str> 
 
 pub fn development_runtime_spec(runtime_id: &str) -> Option<DevelopmentRuntimeSpec> {
     backend_spec_for_runtime_id(runtime_id).and_then(|spec| spec.development_runtime)
+}
+
+/// Resolves a packaged runtime entrypoint using catalog data only. This keeps
+/// UI/install code independent of concrete runtime modules; inference runtime
+/// selection remains exclusively inside `RuntimeRouter`.
+pub fn resolve_runtime_entrypoint(
+    runtime_id: &str,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    let spec = development_runtime_spec(runtime_id)?;
+    let relative = platform_executable_path(spec.executable_relative_path);
+    let file_name = relative.file_name()?.to_owned();
+    let mut seen = Vec::new();
+
+    for root in roots {
+        let candidates = if root.is_file() {
+            vec![root]
+        } else {
+            vec![
+                root.join("runtimes").join(runtime_id).join(&relative),
+                root.join(&relative),
+                root.join("bin").join(&file_name),
+                root.join(&file_name),
+            ]
+        };
+        for candidate in candidates {
+            if !candidate.as_os_str().is_empty()
+                && !seen.iter().any(|existing| existing == &candidate)
+            {
+                seen.push(candidate.clone());
+                if runtime_entrypoint_is_usable(runtime_id, &candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
+    match runtime_id {
+        "whisper_cpp" => path.is_file(),
+        "faster_whisper" => crate::stt::faster_whisper::is_faster_whisper_runtime_usable(path),
+        "vosk" => crate::stt::vosk::is_vosk_runtime_usable(path),
+        "sherpa_onnx" | "moonshine" | "parakeet" => {
+            crate::stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, path)
+        }
+        _ => false,
+    }
+}
+
+fn platform_executable_path(relative: &str) -> PathBuf {
+    let mut path = Path::new(relative).to_path_buf();
+    if cfg!(windows) && path.extension().is_none() {
+        path.set_extension("exe");
+    }
+    path
 }
 
 pub fn model_artifact_spec(model_id: &str) -> Option<&'static ModelArtifactSpec> {
@@ -327,5 +426,47 @@ mod tests {
                 model.id
             );
         }
+    }
+
+    #[test]
+    fn in_process_whisper_models_have_exact_pinned_artifacts() {
+        for model_id in [
+            "whisper_cpp_tiny_en",
+            "whisper_cpp_base_en",
+            "whisper_cpp_small_en",
+            "whisper_cpp_medium_en",
+        ] {
+            let artifact = model_artifact_spec(model_id).unwrap();
+            assert!(artifact.download_bytes.is_some());
+            assert!(artifact.version.is_some());
+            assert!(artifact.sha256.is_some_and(|hash| hash.len() == 64));
+        }
+        assert_eq!(
+            backend_spec("whisper.cpp").unwrap().device_support,
+            DeviceSupport::CpuOnly
+        );
+    }
+
+    #[test]
+    fn generic_runtime_entrypoint_resolution_uses_catalog_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let entrypoint = root
+            .join("runtimes")
+            .join("whisper_cpp")
+            .join(platform_executable_path("bin/whisper-cli"));
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, b"runtime").unwrap();
+
+        let resolved = resolve_runtime_entrypoint("whisper_cpp", [root.clone()]);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(resolved, Some(entrypoint));
     }
 }

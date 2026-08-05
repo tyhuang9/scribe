@@ -156,14 +156,6 @@ pub fn resolve_vosk_executable(config: &AppConfig) -> Option<PathBuf> {
     )
 }
 
-pub fn resolve_vosk_packaged_executable(config: &AppConfig) -> Option<PathBuf> {
-    resolve_vosk_executable_from_candidates(
-        bundled_runtime_root(),
-        managed_runtime_roots(config),
-        [],
-    )
-}
-
 fn bundled_runtime_root() -> Option<PathBuf> {
     env::current_exe()
         .ok()

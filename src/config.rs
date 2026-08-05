@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
+use crate::transcription::AccelerationPreference;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -25,8 +26,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub hotkey_mode: HotkeyMode,
     pub whisper_executable_path: Option<PathBuf>,
-    #[serde(default = "default_legacy_whisper_compute_mode")]
-    pub whisper_compute_mode: WhisperComputeMode,
+    #[serde(
+        default = "default_legacy_acceleration_preference",
+        alias = "whisper_compute_mode"
+    )]
+    pub acceleration_preference: AccelerationPreference,
     #[serde(default)]
     pub whisper_gpu_device: u32,
     #[serde(default = "default_whisper_cuda_backend_path")]
@@ -142,32 +146,6 @@ pub enum ThemeMode {
     System,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WhisperComputeMode {
-    #[default]
-    Auto,
-    #[serde(alias = "cuda")]
-    PreferGpu,
-    Cpu,
-}
-
-impl WhisperComputeMode {
-    pub const ALL: [WhisperComputeMode; 3] = [
-        WhisperComputeMode::Auto,
-        WhisperComputeMode::PreferGpu,
-        WhisperComputeMode::Cpu,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::PreferGpu => "Prefer GPU",
-            Self::Cpu => "CPU only",
-        }
-    }
-}
-
 impl ThemeMode {
     pub const ALL: [ThemeMode; 3] = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System];
 
@@ -210,7 +188,7 @@ impl Default for AppConfig {
             hotkey: "Ctrl+Shift+Space".to_owned(),
             hotkey_mode: HotkeyMode::Toggle,
             whisper_executable_path: None,
-            whisper_compute_mode: WhisperComputeMode::Auto,
+            acceleration_preference: AccelerationPreference::Auto,
             whisper_gpu_device: 0,
             whisper_cuda_backend_path: default_whisper_cuda_backend_path(),
             whisper_cuda_library_paths: default_whisper_cuda_library_paths(),
@@ -559,8 +537,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_legacy_whisper_compute_mode() -> WhisperComputeMode {
-    WhisperComputeMode::Cpu
+fn default_legacy_acceleration_preference() -> AccelerationPreference {
+    AccelerationPreference::Cpu
 }
 
 fn default_whisper_cuda_backend_path() -> Option<PathBuf> {
@@ -766,7 +744,7 @@ mod tests {
         assert_eq!(config.hotkey_mode, HotkeyMode::Toggle);
         assert_eq!(config.paste_delay_ms, 75);
         assert_eq!(config.theme_mode, ThemeMode::Light);
-        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cpu);
+        assert_eq!(config.acceleration_preference, AccelerationPreference::Cpu);
         assert_eq!(
             config.playground_selected_models,
             vec!["whisper_cpp_tiny_en".to_owned()]
@@ -782,16 +760,34 @@ mod tests {
     fn new_default_config_uses_auto_performance() {
         let config = AppConfig::default();
 
-        assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Auto);
+        assert_eq!(config.acceleration_preference, AccelerationPreference::Auto);
         assert_eq!(config.whisper_gpu_device, 0);
         assert!(!config.auto_insert_transcript);
     }
 
     #[test]
     fn old_cuda_value_deserializes_to_prefer_gpu() {
-        let mode: WhisperComputeMode = serde_json::from_str(r#""cuda""#).unwrap();
+        let mode: AccelerationPreference = serde_json::from_str(r#""cuda""#).unwrap();
 
-        assert_eq!(mode, WhisperComputeMode::PreferGpu);
+        assert_eq!(mode, AccelerationPreference::Gpu);
+    }
+
+    #[test]
+    fn legacy_whisper_compute_key_migrates_to_neutral_acceleration_key() {
+        let legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        let mut object = legacy.as_object().unwrap().clone();
+        object.remove("acceleration_preference");
+        object.insert(
+            "whisper_compute_mode".to_owned(),
+            serde_json::Value::String("prefer_gpu".to_owned()),
+        );
+
+        let config: AppConfig = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(config.acceleration_preference, AccelerationPreference::Gpu);
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["acceleration_preference"], "gpu");
+        assert!(serialized.get("whisper_compute_mode").is_none());
     }
 
     #[test]
