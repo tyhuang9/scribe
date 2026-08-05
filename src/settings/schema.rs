@@ -74,9 +74,51 @@ pub struct OutputSettings {
     pub unknown: UnknownFields,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayMode {
+    #[default]
+    Live,
+    Minimal,
+    Off,
+}
+
+impl OverlayMode {
+    pub const ALL: [Self; 3] = [Self::Live, Self::Minimal, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::Minimal => "Minimal",
+            Self::Off => "Off",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayPosition {
+    Top,
+    #[default]
+    Bottom,
+}
+
+impl OverlayPosition {
+    pub const ALL: [Self; 2] = [Self::Top, Self::Bottom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Top => "Top",
+            Self::Bottom => "Bottom",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlaySettings {
+    pub mode: OverlayMode,
+    pub position: OverlayPosition,
     #[serde(flatten)]
     pub unknown: UnknownFields,
 }
@@ -161,6 +203,16 @@ impl Default for OutputSettings {
             auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
             paste_delay_ms: default_paste_delay_ms(),
+            unknown: UnknownFields::new(),
+        }
+    }
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            mode: OverlayMode::Live,
+            position: OverlayPosition::Bottom,
             unknown: UnknownFields::new(),
         }
     }

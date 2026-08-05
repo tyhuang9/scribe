@@ -88,7 +88,10 @@ fn parse_sectioned(mut root: Map<String, Value>, diagnostics: &mut ParseDiagnost
         take_section(&mut root, "output", &[], diagnostics),
         diagnostics,
     );
-    let overlay = parse_overlay(take_section(&mut root, "overlay", &[], diagnostics));
+    let overlay = parse_overlay(
+        take_section(&mut root, "overlay", &[], diagnostics),
+        diagnostics,
+    );
     let history = parse_history(take_section(&mut root, "history", &[], diagnostics));
     let performance = parse_performance(
         take_section(&mut root, "performance", &[], diagnostics),
@@ -443,8 +446,20 @@ fn parse_output(
     }
 }
 
-fn parse_overlay(section: Map<String, Value>) -> OverlaySettings {
+fn parse_overlay(
+    mut section: Map<String, Value>,
+    diagnostics: &mut ParseDiagnostics,
+) -> OverlaySettings {
+    let defaults = OverlaySettings::default();
     OverlaySettings {
+        mode: take(&mut section, "mode", &[], defaults.mode, diagnostics),
+        position: take(
+            &mut section,
+            "position",
+            &[],
+            defaults.position,
+            diagnostics,
+        ),
         unknown: into_unknown(section),
     }
 }
@@ -632,7 +647,7 @@ fn into_unknown(values: Map<String, Value>) -> UnknownFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HotkeyMode;
+    use crate::config::{HotkeyMode, OverlayMode, OverlayPosition};
     use serde_json::json;
 
     #[test]
@@ -671,10 +686,57 @@ mod tests {
         assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
         assert_eq!(config.recording.max_recording_seconds, 30);
         assert_eq!(config.output.paste_delay_ms, 75);
+        assert_eq!(config.overlay.mode, OverlayMode::Live);
+        assert_eq!(config.overlay.position, OverlayPosition::Bottom);
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
         );
+    }
+
+    #[test]
+    fn overlay_settings_salvage_invalid_fields_and_preserve_future_values() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "overlay": {
+                "mode": "not-a-mode",
+                "position": "top",
+                "future_overlay": {"opacity": 0.75}
+            }
+        }));
+
+        assert_eq!(config.overlay.mode, OverlayMode::Live);
+        assert_eq!(config.overlay.position, OverlayPosition::Top);
+        assert_eq!(
+            config.overlay.unknown["future_overlay"],
+            json!({"opacity": 0.75})
+        );
+        assert!(diagnostics.invalid_values_salvaged);
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["overlay"]["future_overlay"],
+            json!({"opacity": 0.75})
+        );
+    }
+
+    #[test]
+    fn overlay_modes_and_positions_round_trip() {
+        for (mode, position) in [
+            (OverlayMode::Live, OverlayPosition::Top),
+            (OverlayMode::Minimal, OverlayPosition::Bottom),
+            (OverlayMode::Off, OverlayPosition::Bottom),
+        ] {
+            let config = parse_settings_value(json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "overlay": {
+                    "mode": mode,
+                    "position": position
+                }
+            }));
+            assert_eq!(config.overlay.mode, mode);
+            assert_eq!(config.overlay.position, position);
+        }
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 4 matrix (2026-08-03). No manual desktop, microphone,
-model-runtime, tray, hotkey, or paste test was executed during the Phase 0-4
-automated work. Every manual row below therefore remains **NOT VERIFIED** until
+**Status:** living Phase 5 matrix (2026-08-03). No manual desktop, microphone,
+model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
+during the Phase 0-5 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -118,6 +118,24 @@ inputs. They do not prove real desktop focus, microphone driver shutdown,
 process termination during OS shutdown, or live paste behavior. Those rows
 remain NOT VERIFIED.
 
+## Automated Phase 5 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 323 discovered, 318 passed, 0 failed, 5 ignored environment-required tests |
+| Overlay/settings | Typed Live/Minimal/Off and position migration; unknown-field preservation; stale session/revision rejection; stale completion/hide-deadline isolation; expired-deadline target cleanup; viewport/accessibility/geometry tests | PASS automated paths; physical presentation remains NOT VERIFIED |
+| Target/output safety | Current-process target rejection; missing/changed target copy-only; exact target and app-level output consumption exactly once; content and generation clipboard races; correlated one-frame-deferred output; every partial Windows input-batch length with exact key release | PASS automated paths; real foreground applications, rich clipboard formats, HWND lifetime, and integrity levels remain NOT VERIFIED |
+| Audio/UI boundary | Lock-free aggregate meter availability, conversion, and clamping tests; pending explicit stop is exercised through capture readiness, finalized WAV consumption, and one dispatch; preload completion is exercised before and after capture readiness; UI receives no PCM | PASS interim meter; callback WAV/mutex replacement remains Phase 6 work |
+| Architecture boundary | Rust boundary tests and `wsl.exe python3 scripts/check-catalog-boundaries.py` | PASS - exactly one logical handler; runtime/model-family selection remains private |
+
+Phase 5 automated tests prove deterministic controller and platform-adapter
+logic, not physical operating-system behavior. The Windows viewport must still
+be checked for no activation, taskbar exclusion, click-through, monitor/DPI
+placement, AccessKit announcements, and safe interaction with real target
+applications. Non-Windows overlay and automatic paste intentionally fail
+closed in the current implementation.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -134,13 +152,17 @@ remain NOT VERIFIED.
 
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
-| UI-01 | Win/Linux/macOS | P1 | Launch Scribe; visit each current page (Transcribe, Models, Playground, Settings); close and relaunch. | Window opens without panic; page navigation and close/reopen behavior are stable. Capture startup log/screenshot. | **NOT VERIFIED** |
+| UI-01 | Win/Linux/macOS | P1 | Launch Scribe; visit Transcribe, General, Models, History, Advanced, and About; enable Developer > Debug and visit Debug; close and relaunch. | Window opens without panic; page navigation and close/reopen behavior are stable. Debug is absent until enabled, and the functional comparison workflow is reachable from Models. Capture startup log/screenshot. | **NOT VERIFIED** |
 | UI-02 | Win/Linux/macOS | P1, P7 | Change a setting, restart, and inspect the value. Then load a config with one unknown/invalid field in the isolated data dir. | Valid settings persist; invalid data does not erase all valid settings; the original is backed up before a lossy salvage. Automated migration tests pass; verify the desktop-visible recovery behavior here. | **NOT VERIFIED** |
 | UI-03 | Win/Linux/macOS | P1 | Toggle theme/performance/audio/input settings available in the current build; verify labels and disabled states. | Controls are keyboard reachable, labels are understandable, and unavailable runtime actions explain why. | **NOT VERIFIED** |
 | UI-04 | Win/Linux/macOS | P1 | If tray is supported, hide window, open tray menu, Show, Hide, Start/Stop Recording, Copy Last Transcript, Quit. | Tray commands affect the app exactly once; Quit exits; no duplicate recording. Capture tray menu and status. | **NOT VERIFIED** |
 | UI-05 | Linux (X11/Wayland) | P1, P6 | Run once with tray/hotkey defaults and once with explicit `SCRIBE_ENABLE_GLOBAL_HOTKEY=1`; try `SCRIBE_DISABLE_TRAY=1`. | Unsupported session paths fail visibly and main window remains usable; no silent process exit. | **NOT VERIFIED** |
-| UI-06 | Win/Linux/macOS | P1, P5 | Start dictation with the target on each monitor and with mixed display scaling. | Current overlay/window (if enabled) appears on the intended monitor without stealing target focus. **Pre-created overlay is a future target.** | **NOT VERIFIED** |
+| UI-06 | Windows | P1, P5 | Start dictation with the target on each monitor and with mixed display scaling; repeat near each work-area edge. | The pre-created overlay appears in the selected top/bottom position within the captured target monitor's work area, uses appropriate physical sizing, and never steals target focus. | **NOT VERIFIED** |
 | UI-07 | Win/Linux/macOS | P1, P3 | Open Models and inspect every visible card, search, device choice, and runtime-maintenance row. | Exactly the four normalized primary entries are visible; each has an Experimental text cue/reason, CPU-only capability, no backend/family filter or badge, and no curated role. Existing legacy paths/files remain untouched. | **NOT VERIFIED** |
+| UI-08 | Windows | P1, P2, P4 | With overlay Live, begin dictation from another app; verify taskbar, Alt+Tab, mouse interaction through the overlay, and original target focus. Repeat in Minimal and Off. | The overlay has no taskbar/Alt+Tab entry, is always on top without activation, is mouse-pass-through, and does not redirect keyboard input. Live shows real phase/level/text, Minimal is compact, and Off stays hidden. | **NOT VERIFIED** |
+| UI-09 | Linux/macOS | P1, P2 | Select Live or Minimal and begin dictation. | Until a native no-focus adapter exists, the effective overlay remains Off and the UI explains the conservative limitation; no focus-stealing window appears. | **NOT VERIFIED** |
+| UI-10 | Windows | P1, P2, P6 | Navigate all main pages and controls by keyboard, inspect visible focus, run a screen reader while overlay state changes, and enable the OS reduced-motion setting. | All controls are reachable and labeled, focus is visible, state is not conveyed by color alone, primary app controls are at least 44 px, overlay announcements are polite, and no disallowed motion occurs. | **NOT VERIFIED** |
+| UI-11 | Windows | P1, P2 | Start capture and speak softly/loudly, then stay silent; compare overlay meter with input. | The meter reflects real aggregate input at a throttled UI cadence, clamps safely, and displays no fabricated activity. Record first-meter latency. | **NOT VERIFIED** |
 
 ## Hotkeys and recording lifecycle
 
@@ -179,7 +201,7 @@ remain NOT VERIFIED.
 | OUT-02 | Linux X11 | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on X11. | Clipboard + paste automation works where Enigo permits; capture output status and clipboard before/after. | **NOT VERIFIED** |
 | OUT-03 | Linux Wayland | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on Wayland. | If synthetic paste is blocked, final text is copied only with an explicit notice; no paste into an unrelated field. | **NOT VERIFIED** |
 | OUT-04 | macOS | P1, P2, P3, P4, P6, P7 | Grant Accessibility, repeat OUT-01; revoke permission and repeat. | Granted path inserts once; denied path falls back to clipboard/actionable error without focus theft. | **NOT VERIFIED** |
-| OUT-05 | Win/Linux/macOS | P1, P2, P3, P4 | Begin dictation in target A, switch focus to unrelated target B before completion. | Current baseline behavior must be recorded; target-window capture is a future requirement. Never accept a result pasted into an unrelated app as PASS. | **NOT VERIFIED** |
+| OUT-05 | Win/Linux/macOS | P1, P2, P3, P4 | Begin dictation in target A, switch focus to unrelated target B before completion. | On Windows, no synthetic key is sent and final text remains copied because the captured target no longer matches. On Linux/macOS, current behavior is conservatively copy-only. Never accept text pasted into B as PASS. | **NOT VERIFIED** |
 | OUT-06 | Win/Linux/macOS | P1, P2, P3, P4 | Close target app during finalization; then change clipboard from another app before restoration delay expires. | No unrelated paste; final text is recoverable from clipboard/status; restoration does not overwrite an independently changed clipboard. | **NOT VERIFIED** |
 | OUT-07 | Win/Linux/macOS | P1, P2, P3 | Disable auto-insert; transcribe fixture and use Copy Transcript. | No synthetic key input occurs; explicit copy places the final transcript on clipboard. | **NOT VERIFIED** |
 
@@ -202,7 +224,7 @@ remain NOT VERIFIED.
 
 | Platform/session | Required rows | Operator/evidence | Status |
 | --- | --- | --- | --- |
-| Windows 11 desktop, standard-integrity target | UI, HK, REC, STT, OUT, DL, SET, RECOV | **NOT VERIFIED** — no Windows GUI/microphone/runtime run in Phase 0. | **NOT VERIFIED** |
+| Windows 11 desktop, standard-integrity target | UI, HK, REC, STT, OUT, DL, SET, RECOV | **NOT VERIFIED** — no Windows GUI/microphone/runtime run through Phase 5. | **NOT VERIFIED** |
 | Windows elevated target (if supported) | OUT-01, OUT-05, OUT-06 | **NOT VERIFIED** — SendInput integrity boundary not exercised. | **NOT VERIFIED** |
 | Ubuntu/Debian X11 | UI, HK-02, REC, STT, OUT-02, DL, SET | **NOT VERIFIED** — no Linux desktop/audio run in Phase 0. | **NOT VERIFIED** |
 | Linux Wayland | UI, HK-02, REC, STT, OUT-03, RECOV | **NOT VERIFIED** — clipboard/paste and global-hotkey portal behavior not exercised. | **NOT VERIFIED** |
