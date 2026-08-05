@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 10 matrix (2026-08-04). No manual desktop, microphone,
+**Status:** living Phase 11 matrix (2026-08-04). No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-10 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-11 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -142,7 +142,7 @@ closed in the current implementation.
 | --- | --- | --- |
 | Format/check/lint/build | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict Clippy; `cargo build --all-features` | PASS |
 | Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 358 discovered, 353 passed, 0 failed, 5 environment-required tests ignored |
-| Native capture/DSP | SPSC FIFO/wrap/concurrency/overflow; conversion/downmix/resample/normalization; 25 Hz RMS/peak; adaptive VAD, timing, pre/post-roll, no-speech, and disabled-VAD tests | PASS automated paths; physical microphones and driver timing remain NOT VERIFIED |
+| Native capture/DSP | SPSC FIFO/wrap/concurrency/overflow; conversion/downmix/resample/normalization; 30 ms RMS/peak publication; adaptive VAD, timing, pre/post-roll, no-speech, and disabled-VAD tests | PASS automated paths; physical microphones and driver timing remain NOT VERIFIED |
 | Stop/error recovery | Explicit-over-endpoint/max priority; structured overflow/stream/format faults; two-attempt restart bound; no-speech no-output; in-memory audio ownership | PASS deterministic injection; live unplug/restart remains NOT VERIFIED |
 | Settings | Defaults, ordered range normalization, field salvage, and future Recording-field round trip | PASS |
 | Accessibility semantics | AccessKit relationships for maximum-duration and all five VAD timing spin buttons | PASS automated semantics; physical screen-reader behavior remains NOT VERIFIED |
@@ -235,11 +235,11 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | UI-04 | Win/Linux/macOS | P1 | If tray is supported, hide window, open tray menu, Show, Hide, Start/Stop Recording, Copy Last Transcript, Quit. | Tray commands affect the app exactly once; Quit exits; no duplicate recording. Capture tray menu and status. | **NOT VERIFIED** |
 | UI-05 | Linux (X11/Wayland) | P1, P6 | Run once with tray/hotkey defaults and once with explicit `SCRIBE_ENABLE_GLOBAL_HOTKEY=1`; try `SCRIBE_DISABLE_TRAY=1`. | Unsupported session paths fail visibly and main window remains usable; no silent process exit. | **NOT VERIFIED** |
 | UI-06 | Windows | P1, P5 | Start dictation with the target on each monitor and with mixed display scaling; repeat near each work-area edge. | The pre-created overlay appears in the selected top/bottom position within the captured target monitor's work area, uses appropriate physical sizing, and never steals target focus. | **NOT VERIFIED** |
-| UI-07 | Win/Linux/macOS | P1, P3 | Open Models and inspect every visible card, search, device choice, and runtime-maintenance row. | Exactly the four normalized primary entries are visible; each has an Experimental text cue/reason, CPU-only capability, no backend/family filter or badge, and no curated role. Existing legacy paths/files remain untouched. | **NOT VERIFIED** |
+| UI-07 | Win/Linux/macOS | P1, P3 | Open Models with and without network access. Search trusted catalog and imported models by name/language/filename; toggle installed, recommended, multilingual, and size-tier filters; select every sort order; clear the search/filters and restart. Inspect an installed revision and a newer revision of the same source when available. | The page keeps installed/imported cards usable offline. Trusted cards remain Experimental and source-pinned. Search/filter result counts and status changes are announced accessibly; non-default sorts apply across the complete matching result set; “Installed only” matches the exact pinned revision/variant; empty state identifies search or filters; browse controls reset after restart. Install actions explain insufficient disk space without starting a download or unloading the active runtime. Existing legacy paths/files remain untouched. | **NOT VERIFIED** |
 | UI-08 | Windows | P1, P2, P4 | With overlay Live, begin dictation from another app; verify taskbar, Alt+Tab, mouse interaction through the overlay, and original target focus. Repeat in Minimal and Off. | The overlay has no taskbar/Alt+Tab entry, is always on top without activation, is mouse-pass-through, and does not redirect keyboard input. Live shows real phase/level/text, Minimal is compact, and Off stays hidden. | **NOT VERIFIED** |
 | UI-09 | Linux/macOS | P1, P2 | Select Live or Minimal and begin dictation. | Until a native no-focus adapter exists, the effective overlay remains Off and the UI explains the conservative limitation; no focus-stealing window appears. | **NOT VERIFIED** |
 | UI-10 | Windows | P1, P2, P6 | Navigate all main pages and controls by keyboard, inspect visible focus, run a screen reader while overlay state changes, and enable the OS reduced-motion setting. | All controls are reachable and labeled, focus is visible, state is not conveyed by color alone, primary app controls are at least 44 px, overlay announcements are polite, and no disallowed motion occurs. | **NOT VERIFIED** |
-| UI-11 | Windows | P1, P2 | Start capture and speak softly/loudly, then stay silent; compare overlay meter with input. | The meter reflects distinct native RMS and peak values at the 25 Hz worker cadence, clamps safely, and displays no fabricated activity. Record first-meter latency. | **NOT VERIFIED** |
+| UI-11 | Windows | P1, P2 | Start capture and speak softly/loudly, then stay silent; compare overlay meter with input. | The meter reflects distinct native RMS and peak values at the approximately 33 Hz worker cadence, clamps safely, and displays no fabricated activity. Record first-meter latency. | **NOT VERIFIED** |
 
 ## Hotkeys and recording lifecycle
 
@@ -256,6 +256,7 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | REC-03 | Win/Linux/macOS | P1, P2 | Let recording run to configured maximum duration. | Recording stops deterministically and finalization follows the same safe path as explicit stop. | **NOT VERIFIED** |
 | REC-04 | Win/Linux/macOS | P1, P2 | Cancel/stop during capture before speech and during finalization; immediately start another normal or Playground session; repeat once through tray Quit. | Cancel never pastes; in-memory PCM is released; stale completion cannot overwrite the next session; explicit stop wins if inferred endpoint/max occurs at the same boundary. Coordinator/ownership paths are automated, but the live race still requires this check. | **NOT VERIFIED** |
 | REC-05 | Win/Linux/macOS | P1, P2 | In Toggle mode with defaults, begin in silence, speak after at least 250 ms, pause for 450 ms and resume, then finish with at least 900 ms silence. Repeat in Hold-to-talk, with VAD disabled, and with an immediate shortcut stop. | First syllable is retained by pre-roll; 450 ms pause does not finalize; 900 ms silence endpoints only in Toggle mode; Hold-to-talk waits for release; VAD disabled never endpoints; explicit stop retains about 200 ms post-roll and outranks inferred silence. Record actual timings and audio evidence only with consent. | **NOT VERIFIED** |
+| REC-06 | Win/Linux/macOS | P1, P2, P7 | Hardware-mute the selected microphone or turn its physical gain to minimum, record once through normal dictation and once through Playground, then export redacted diagnostics. Restore gain and make a short audible non-voice burst that reaches the meter but does not satisfy speech confirmation. | Both low-input captures paste nothing and use the shared silent/too-low guidance; a selected FIFINE names its top mute control and physical gain knob. Diagnostics contain only maximum input RMS/peak scalars, never PCM. The audible short burst retains generic no-speech feedback. | **NOT VERIFIED** |
 
 ## Runtime, model, and transcription flows
 
@@ -266,7 +267,7 @@ new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
 | STT-03 | Win/Linux/macOS | P1, P2, P3 | Run a second transcription immediately, then after the model has been idle for more than five minutes. | Windows primary runtime reports immediate warm reuse; the dedicated worker unloads after the five-minute idle timeout and the next request reloads. Other platforms preserve the compatibility path. Record load/decode metrics. | **NOT VERIFIED** |
 | STT-04 | Win/Linux/macOS | P1, P2, P3 | Attempt transcription with a missing runtime, missing model file, and incomplete model directory. | No child process is started; actionable status identifies what to install/repair; no paste occurs. | **NOT VERIFIED** |
 | STT-05 | Win/Linux/macOS | P1, P2, P3 | Kill the short-lived runtime process or force a non-zero exit during transcription. | Failure is surfaced, app returns to Idle/Error, and retry is safe; no stale result is applied. | **NOT VERIFIED** |
-| STT-06 | Win/Linux/macOS | P1, P2 | Speak silence/noise only until endpoint or stop. | Empty/no-speech result is handled without empty paste; status explains the outcome. | **NOT VERIFIED** |
+| STT-06 | Win/Linux/macOS | P1, P2 | Remain silent, then repeat with audible non-speech/noise until endpoint or stop. | Empty/no-speech results never paste. Input that reached the activation floor but did not confirm speech keeps generic no-speech feedback; only a capture whose maximum RMS remained below that floor receives silent/too-low hardware guidance. | **NOT VERIFIED** |
 | STT-07 | Win/Linux/macOS | P1, P2, P3 | In Advanced, run Auto, Rolling preview, and Final text only against the same utterance; repeat once in Playground. Capture the committed/tentative overlay states and first-partial latency. | Auto and Rolling use bounded batch preview only for the primary native model; Final text only and Playground emit no partials. Tentative text stays in the overlay, corrections do not backspace another app, and the final result replaces the preview once. No model advertises native streaming. | **NOT VERIFIED** |
 | STT-08 | Win/Linux/macOS | P1, P2, P3 | Change Auto/GPU/CPU-only acceleration preference where supported; run fixture on each available mode. | Auto resolves to a health-validated device, explicit CPU is honored, and unavailable GPU fails clearly without silent fallback. Record resolved backend/device and errors. | **NOT VERIFIED** |
 | STT-09 | Windows | P1, P3 | Record the exact sherpa-onnx v1.13.4 and streaming Zipformer prerequisites; attempt the evidence harness only after a native package, pinned model, shared corpus, and Phase 7 comparator exist. | Any missing measurement remains NO-GO. A second logical handler appears only if every first-partial, 30% improvement, RTF, cancellation, WER, lifecycle, crash, memory, and platform threshold passes. | **NOT VERIFIED / CURRENT NO-GO** |
@@ -332,3 +333,109 @@ requires a dated PASS/FAIL/BLOCKED result with evidence in the owning test
 report. Do not change a manual row to PASS based solely on compilation or a unit
 test. Rows that cannot be run on a platform remain **NOT VERIFIED** and are
 listed as release risks until an explicit support decision is made.
+
+## Automated Phase 11 checkpoint
+
+Recorded 2026-08-04 on Windows x64. Automated evidence does not change any
+manual row above to PASS.
+
+| Area | Evidence | Status |
+| --- | --- | --- |
+| Repository gates | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; strict all-target/all-feature Clippy; full tests; debug/release builds | **PASS** - 535 tests discovered, 529 passed, 0 failed, 6 ignored because they require explicit local runtime/fixture environments |
+| Handler boundary | Rust architecture guard plus WSL Python source scanner | **PASS** - exactly one `TranscribeCppRuntime`; no `OnnxSpeechRuntime`; router-private selection; neutral app/UI; native PCM; final-only output |
+| Diagnostics privacy | Five focused diagnostics tests plus source review | **PASS** - bounded replace, allowlisted context/metrics, null absent values, no private marker, export failure preserves in-memory data |
+| Benchmark privacy | Fifteen focused benchmark tests plus one release CLI report | **PASS** - service-boundary execution, sanitized errors, create-new output, no transcript/audio/path/stdout/stderr/raw errors in report |
+| Accessibility | Exhaustive heatmap contrast test and focused diagnostics/target semantics; specialist re-review | **PASS / GO** - minimum contrast 13.18:1 light and 8.77:1 dark; visible disabled reason; semantic headings/descriptions; 44 px action |
+| Native shutdown | Active-decoder ownership, bounded stuck-command recovery, panic/disconnect, and 20x concurrent last-clone tests | **PASS** - cooperative cancellation and one shared two-second exit budget; no same-process detach; hard abort prevents DLL teardown after timeout |
+| Runtime/package | Pinned Windows runtime bundler and base.en service fixtures | **PASS** - v1.9.1 CPU exact package; service first load/decode 299/857 ms; warm 0/826 ms; cancellation acknowledgement 840 ms |
+| Comparable final latency | 5 cold + 20 warm release runs, same 11 s JFK/base.en/CPU fixture | **PASS as measurement only** - cold 1,182/1,197 ms; warm 846/926 ms median/p95; cold RTF 0.107/0.109; warm RTF 0.077/0.084 |
+| Rolling batch preview | Exact post-fix 5 cold + 20 warm run | **PASS as Experimental evidence** - cold 2,042/2,077 ms; warm 1,783/1,849 ms median/p95; warm p95 remains above the 1,200 ms target |
+| Security review | Specialist review plus low-finding remediation | **PASS** - no Critical, High, or Medium finding; report path errors sanitized and private/create-new output applied |
+
+Two release-test access-violation dialogs were observed before the bounded
+shutdown fix. One pre-fix rolling run timed out. The same 25-run rolling fixture
+passed afterward, but this does not substitute for a WER-monitored physical
+desktop close/restart soak. That soak remains **NOT VERIFIED**.
+
+Final handler and compatibility state:
+
+- Logical runtime handlers: **1** (`TranscribeCppRuntime`).
+- Supported models: **0**.
+- Experimental models: `whisper_cpp_tiny_en`, `whisper_cpp_base_en`,
+  `whisper_cpp_small_en`, and `whisper_cpp_medium_en`.
+- Native streaming models: **0**. The shared preview is bounded rolling batch
+  decoding, not native streaming.
+- `OnnxSpeechRuntime`: omitted; the exact v1.13.4 Zipformer evidence gate is
+  **NO-GO**.
+
+The release remains **NO-GO**. Required missing evidence includes the dated
+Windows rows above, desktop median/p95 phase metrics, memory/idle CPU, physical
+shutdown soak, complete Supported-model compatibility suites, native-streaming
+Definition of Done, and macOS/Linux fallback exercises.
+
+## Tray wakeup regression checkpoint
+
+Recorded 2026-08-05 on Windows x64. The initial repaint-callback fix failed its
+physical retest. A live native probe proved the tray Show command was queued and
+that one asynchronous `WM_PAINT` to the hidden root HWND immediately executed
+it. Pinned eframe/winit request a redraw from the invisible window, which cannot
+receive the `WM_PAINT` required to run `App::update`.
+
+The corrected implementation captures the root HWND, posts an asynchronous
+paint wake for each tray action, and uses a one-shot 40/100/500 ms Win32 timer
+while hidden so capture and transcription continue to be polled. Saturation
+evicts the oldest queued action and preserves the newest intent. Four focused
+tray tests, formatting, all-target/all-feature checking, strict Clippy, the full
+suite (533 passed, 6 environment-gated ignored), and debug plus isolated release
+builds pass. Actual tray-popup clicks against the corrected release verified
+Show changed the root HWND hidden -> visible and Hide changed it visible ->
+hidden. Start did not retain a Stop label after 2.2 seconds and may have failed
+immediately; it is not counted as verified.
+
+UI-04 intentionally remains **NOT VERIFIED**: the operator must still hide the
+window and exercise Show, Hide, Start/Stop Recording, Copy Last Transcript, and
+Quit from the real Windows notification area. Record whether each command acts
+exactly once, whether Show restores and focuses the primary window, whether a
+hidden recording reaches a terminal state, and the hidden idle CPU percentage.
+
+## Low-input diagnostic regression checkpoint
+
+Recorded 2026-08-05 on Windows x64. No-save CPAL probes of the selected FIFINE
+A8 proved healthy 48 kHz stereo callbacks but near-silent samples: maximum 10 ms
+mono RMS 0.001559 and 0/1,498 windows at the unchanged 0.012 activation floor.
+Windows privacy was Allow and endpoint software gain was 100%/+7 dB. Automated
+coverage now verifies capture-wide 10 ms VAD-frame RMS and 30 ms meter peak
+scalars, final partial windows, shared FIFINE/general low-input guidance, generic feedback at the
+activation floor, redacted diagnostic serialization, and no output for every
+no-speech completion. The full suite passed 548 tests with 9 environment-gated
+tests ignored; formatting, strict Clippy, debug/release builds, and the packaged
+runtime fixture also passed.
+
+REC-06 and STT-06 remain **NOT VERIFIED** until an operator corrects the
+physical mute/gain state and executes both the low-input and restored-speech
+rows through the real GUI/hotkey/target/output path.
+
+## Input-sensitivity rows
+
+| ID | Platform | Steps | Expected result | Status |
+| --- | --- | --- | --- | --- |
+| MIC-01 | Win/Linux/macOS | Open General > Audio with a working selected microphone, speak softly/loudly, then stay silent. | One `Input sensitivity` slider is present. Its in-track fill attacks quickly, releases smoothly, and settles to minimum without any test button, idle numeric meter, separate meter, or speech/clipping label. No audio or transcript artifact is retained. | **NOT VERIFIED** - automated UI and no-retention paths pass; physical input still requires an operator. |
+| MIC-02 | Win/Linux/macOS | Click/drag the threshold thumb, adjust it with Left/Right arrows, and dictate at levels just below/above it; observe the value bubble and then restart Scribe. | Pointer and keyboard adjustment work; the bubble shows the current whole-dB threshold during interaction; the next VAD frames use the changed threshold; hysteresis/hangover and pre/post-roll avoid flicker or clipped phrases; the selected threshold survives restart. | **NOT VERIFIED** - mapping, interaction, atomic threshold, VAD, and persistence tests pass; audible boundary behavior still requires an operator. |
+| MIC-03 | Win/Linux/macOS | With General open, begin dictation; stop, switch the selected input, start retained-audio playback, leave General, and return. | Idle monitoring yields before dictation/playback with no duplicate input stream. Active dictation supplies the slider level and is not stopped by navigation. Idle monitoring follows the new device and stops outside General. | **NOT VERIFIED** - ownership/deferred-start tests pass; device/driver timing still requires an operator. |
+| MIC-04 | Win/Linux/macOS | Navigate to the slider using keyboard and a screen reader in light and dark themes. | The control is named `Input sensitivity`, has one Slider role and normalized value actions, a 44 px target and neutral thumb-only focus treatment, and exposes no dBFS/RMS or live speech-state announcements. The threshold/remainder regions use distinct fills, and the live fill keeps one thickness as it passes the thumb. | **PARTIAL** - automated AccessKit, interaction, and visual-shape assertions pass; screen-reader and visual theme checks still require an operator. |
+
+### Input-sensitivity implementation evidence
+
+The current automated suite covers normalized mapping and silence, attack and
+release smoothing, stale reset, click/drag/arrow interaction, the single-slider
+AccessKit contract, immediate atomic threshold updates, meter revisions,
+no-retention meter capture, VAD timing/pre-roll regressions, settings
+round-tripping, and monitor ownership handoff. The earlier
+`qa/microphone-test-final-*.png` screenshots show the superseded UI and must not
+be used as current visual evidence. A fresh physical-microphone screenshot and
+the manual rows above remain required.
+
+Final repository gate on 2026-08-05: `cargo test --all-targets --all-features`
+discovered 623 tests and passed 614 with 0 failures and 9 environment-gated
+tests ignored. Formatting, strict Clippy, debug build, release build, source
+boundary scanning, and diff hygiene also passed on the same source state.

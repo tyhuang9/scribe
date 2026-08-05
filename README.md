@@ -4,6 +4,13 @@ Scribe is a lightweight local-first desktop speech-to-text app built with Rust
 and egui/eframe. It does not use Tauri, Electron, React, cloud STT, an account
 or sync service, a Python server, or a plugin system.
 
+The runtime-consolidated implementation has one logical handler, zero Supported
+models, and four Experimental whisper.cpp artifacts. Its final automated Phase
+11 gate discovered 623 tests: 614 passed, 0 failed, and 9 explicit
+runtime/fixture tests remained ignored. The release is still NO-GO pending the
+documented manual and compatibility evidence; see
+`docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md`.
+
 The app shell stays small and only invokes an STT runtime when the user records audio and starts transcription.
 
 ## Current Features
@@ -135,9 +142,13 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install, select, repair, update, or remove one of the four
-normalized Experimental models. The UI receives only runtime-neutral
-descriptors and capabilities. A model is not labelled Supported until its full
+Open `Models` to import a local GGUF or install, select, update, and remove
+trusted Experimental models. The catalog can search model/language/filename,
+filter its trusted results by installed/recommended/multilingual/size metadata,
+and sort them; unavailable metadata such as download counts and native
+streaming is not presented as a control. Install is disabled with a clear
+message when the destination volume cannot satisfy the download plus Scribe's
+1 GiB safety reserve. A model is not labelled Supported until its full
 compatibility matrix passes; currently none has.
 
 Managed model files live under the app-data `models` directory and managed
@@ -162,149 +173,40 @@ Runtime selection is private to `RuntimeRouter`. There is one logical handler,
 `TranscribeCppRuntime`; `OnnxSpeechRuntime` is absent because the named
 Zipformer candidate has not passed the complete evidence gate.
 
-### Transitional development tooling
+### Runtime packaging and legacy development tools
 
-The source checkout still contains legacy bundle scripts and environment
-fallbacks for compatibility investigation. They are not normalized catalog
-support, do not create additional application-level runtime handlers, and are
-not compatibility evidence. Release behavior must use an exact pinned manifest
-and the transactional smoke/activation path above.
-
-Builds can stage the supported whisper.cpp runtime next to the executable:
-
-```bash
-scripts/bundle-whisper-runtime.sh
-```
-
-By default this copies the CPU-capable whisper.cpp sidecar into
-`target/debug/runtimes/whisper_cpp`. For a release build, run:
+Release bundles contain only the pinned primary whisper.cpp package and the
+application. Build one with:
 
 ```bash
 scripts/build-release-bundle.sh
 ```
 
-The release bundle places whisper.cpp files under
-`target/release/runtimes/whisper_cpp` and stages Python sidecars under
-`target/release/runtimes/faster_whisper`, `target/release/runtimes/vosk`,
-`target/release/runtimes/sherpa_onnx`, `target/release/runtimes/moonshine`,
-and `target/release/runtimes/parakeet`. These are the same locations the app
-checks before falling back to user-managed runtime paths. Set
-`SCRIBE_SKIP_FASTER_WHISPER=1`, `SCRIBE_SKIP_VOSK=1`,
-`SCRIBE_SKIP_SHERPA_ONNX=1`, `SCRIBE_SKIP_MOONSHINE=1`, or
-`SCRIBE_SKIP_PARAKEET=1` to omit a generated Python sidecar from a release
-bundle.
+The bundler stages the primary package under
+`target/release/runtimes/whisper_cpp`. The app validates the exact package
+manifest before use; packaging variants do not create additional logical
+runtime kinds.
 
-To stage only the faster-whisper runtime during development:
+The repository retains separate faster-whisper, Vosk, sherpa-onnx, Moonshine,
+Parakeet, and CUDA scripts solely for bounded development investigation and
+migration compatibility. The release bundler does not invoke them. Their
+presence is neither application-level support nor compatibility evidence, and
+the normalized UI cannot select those legacy adapters.
 
-```bash
-scripts/bundle-faster-whisper-runtime.sh
-```
+Acceleration is runtime-neutral in settings. The shipped Windows package
+currently resolves `Auto` and `CPU` to its health-tested CPU backend; explicit
+`GPU` reports that no verified accelerator package is installed.
 
-The faster-whisper runtime is a generated Python virtual environment with a
-small Scribe runner. Python package versions are pinned by
-`scripts/runtime-dependencies.env`; release builds can override those pins with
-the matching `SCRIBE_*_VERSION` environment variables. The runner downloads
-CTranslate2 faster-whisper model directories through faster-whisper's Hugging
-Face integration when a model is installed from the app.
-
-To check whether pinned runtime dependencies have newer PyPI releases:
+For a local benchmark that uses the same `TranscriptionService` boundary as the
+desktop application:
 
 ```bash
-scripts/check-runtime-dependency-updates.py
+cargo run --release -- --benchmark path/to/fixture.wav --model whisper_cpp_base_en --output benchmark.json
 ```
 
-The app itself does not install arbitrary latest PyPI packages on user machines.
-It asks users to update managed runtimes when installed runtime metadata is older
-than the version recorded in Scribe's runtime catalog.
-
-To stage only the Vosk runtime during development:
-
-```bash
-scripts/bundle-vosk-runtime.sh
-```
-
-The Vosk runtime is a generated Python virtual environment pinned to
-`vosk==0.3.45` with a small Scribe runner. The runner downloads and extracts
-`vosk-model-small-en-us-0.15.zip` from the official Vosk model catalog when
-the Vosk small English model is installed from the app. The Vosk catalog lists
-that model as 40M and Apache 2.0. The upstream model catalog does not publish a
-checksum alongside the ZIP; release packaging should record a SHA256 in the
-runtime manifest before distributing a fixed bundle.
-
-To stage only one of the sherpa-onnx-family runtimes during development:
-
-```bash
-scripts/bundle-sherpa-onnx-runtime.sh
-scripts/bundle-moonshine-runtime.sh
-scripts/bundle-parakeet-runtime.sh
-```
-
-These runtimes are generated Python virtual environments with pinned
-`sherpa-onnx`, `sherpa-onnx-bin`, and `numpy` dependencies plus a small Scribe
-runner. Each backend gets a separate managed runtime directory and wrapper, but
-they share the same runner. The runner downloads official sherpa-onnx model
-archives for:
-
-- `sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2`
-- `sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2`
-- `sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2`
-
-The model archives are validated by required ONNX/ORT and `tokens.txt` files
-before Scribe marks them installed. Release packaging should record SHA256
-checksums for these archives before distributing fixed bundles.
-
-GPU-capable bundles are intentionally opt-in because the CUDA runtime payload is
-large. On a machine with Ollama's CUDA libraries available, run:
-
-```bash
-SCRIBE_BUNDLE_CUDA=1 scripts/build-release-bundle.sh
-```
-
-This copies `libggml-cuda.so` plus its required CUDA shared libraries into the
-bundled runtime. The app prefers those bundled CUDA libraries over host-specific
-CUDA config when they are present. When both Ollama CUDA v12 and v13 runtimes
-exist, the bundler prefers v12 for wider driver compatibility. Set
-`CUDA_RUNTIME_DIR=/path/to/cuda_v13` or another CUDA runtime directory to
-override that choice.
-
-`Settings` exposes one performance control shared by supported local runtimes:
-
-- `Auto`: let the runtime choose the device.
-- `Prefer GPU`: pass the selected GPU device to the runtime.
-- `CPU only`: force CPU mode.
-
-For CUDA development without installing the full CUDA Toolkit, Scribe can use a dynamic-backend whisper.cpp build with Ollama's local CUDA runtime:
-
-```bash
-scripts/build-whisper-ollama-cuda-backend.sh
-```
-
-Then launch with the runtime path in the environment, for example:
-
-```bash
-SCRIBE_WHISPER_CPP_CLI=/home/tyhuang/Projects/whisper.cpp/build-dl-ollama/bin/whisper-cli cargo run
-```
-
-For a native CUDA Toolkit build, install a toolkit that provides `nvcc`, then
-build the adjacent whisper.cpp checkout with GGML_CUDA enabled:
-
-```bash
-sudo apt-get install -y nvidia-cuda-toolkit
-scripts/build-whisper-cuda.sh
-```
-
-The backend calls whisper.cpp like this:
-
-```bash
-whisper-cli -m /path/to/model.bin -f /path/to/audio.wav -nt -dev 0
-```
-
-`Auto` omits explicit whisper.cpp device flags and lets faster-whisper fall back
-to CPU when CUDA is unavailable. `Prefer GPU` appends `-dev <device>` for
-whisper.cpp and asks faster-whisper for CUDA. `CPU only` appends `-ng` for
-whisper.cpp and asks faster-whisper for CPU/int8 mode. Vosk, sherpa-onnx,
-Moonshine, and Parakeet are CPU-oriented in this build and ignore the GPU
-preference.
+The report contains allowlisted machine, model, backend, capability, and timing
+metadata only. It omits transcript text, audio, source paths, runtime output,
+and raw error chains, and refuses to overwrite an existing report.
 
 ## Config
 
@@ -332,14 +234,14 @@ The config stores:
 - paste automation delay
 
 Normal microphone and Debug comparison capture remains canonical PCM in native
-memory and creates no routine WAV file. The private legacy compatibility bridge
-may create a short-lived canonical WAV only while transitional adapters remain;
-it deletes the file when the request completes. The latest transcription
-latency breakdown is diagnostic-only and is not persisted.
+memory and creates no routine WAV file. Diagnostics retain at most 50
+allowlisted, transcript-free session records in memory. An explicit export
+writes only those redacted records and timing/backend metadata.
 
 ## Notes
 
-- sherpa-onnx, Moonshine, and Parakeet use experimental, managed sherpa-onnx Python sidecars in this build. The sidecars are short-lived local processes and currently run batch transcription only; true streaming partial transcription still needs a `SttBackend` streaming API.
+- No model advertises native streaming. Experimental primary models use the
+  shared bounded rolling batch preview and keep tentative text in Scribe only.
 - Scribe has no cleanup/reasoning pipeline today. If one is added later, it must be local, optional, and off by default, and it must never send audio or text to a cloud service.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
@@ -356,14 +258,17 @@ cargo check
 The main modules are:
 
 - `src/app.rs`: egui UI, app state, event polling, and background job dispatch.
-- `src/audio.rs`: microphone capture and temporary WAV writing.
+- `src/audio.rs`: microphone capture into the fixed-capacity native ring.
+- `src/audio/pipeline.rs`: native preparation, metering, VAD, and endpointing.
+- `src/benchmark.rs`: privacy-bounded command-line benchmark/reporting path.
 - `src/config.rs`: local JSON config loading/saving.
-- `src/core.rs`: testable recording/transcription workflow reducer.
+- `src/coordinator.rs`: authoritative one-active-session state machine.
+- `src/diagnostics.rs`: bounded allowlisted session metrics and redacted export.
+- `src/history.rs`: SQLite history lifecycle, retention, retry, and reconciliation.
 - `src/hotkey.rs`: global hotkey parsing and registration.
-- `src/models.rs`: shared STT model/result/status structs.
-- `src/stt/mod.rs`: backend trait and dispatch.
-- `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
-- `src/stt/faster_whisper.rs`: faster-whisper child-process integration.
-- `src/stt/sherpa_onnx.rs`: sherpa-onnx-family child-process integration for sherpa-onnx, Moonshine, and Parakeet.
+- `src/models.rs`: normalized runtime-neutral model descriptors and catalog.
+- `src/runtime_router.rs`: the only application-level concrete runtime selector.
+- `src/transcription.rs`: neutral `TranscriptionService` and worker lifecycle.
+- `src/streaming.rs`: bounded rolling preview and transcript stabilization.
 - `src/text_output.rs`: transactional Windows target insertion and conservative cross-platform clipboard output.
 - `src/tray.rs`: tray icon, tray menu, and tray command mapping.

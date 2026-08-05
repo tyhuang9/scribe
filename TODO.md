@@ -1,5 +1,10 @@
 # TODO
 
+Phase 11 implementation gates discovered 623 tests: 614 passed, 0 failed, and 9
+explicit local-runtime/fixture tests were ignored. The remaining items below are
+release evidence or follow-up improvements; see
+`docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md` for the final NO-GO rationale.
+
 ## Release Evidence
 
 - Complete the dated Windows 11 manual matrix for hotkey, microphone, overlay,
@@ -13,9 +18,10 @@
 ## MVP Hardening
 
 - Expand first-run setup with richer validation and recovery guidance.
-- Complete the redacted diagnostics export and structured per-session metrics.
 - Add visual regression notes/screenshots for the Stitch-aligned egui pages.
 - Split the remaining egui rendering out of `src/app.rs` into smaller page/component modules.
+- Run an extended Windows shutdown/restart soak after the native worker join fix;
+  retain Windows Error Reporting evidence if any access violation recurs.
 
 ## Compatibility
 
@@ -24,10 +30,10 @@
 - Evaluate the exact sherpa-onnx v1.13.4 Zipformer candidate only with the named
   native package, shared corpus, WER, memory, cancellation, lifecycle, and
   Windows first-partial thresholds. Keep `OnnxSpeechRuntime` absent on NO-GO.
-- Retire transitional faster-whisper, Vosk, sherpa/Moonshine/Parakeet adapters
-  only after intended roles have verified replacements; preserve config aliases
-  and user artifacts. Remove the unreachable legacy downloader helpers and
-  their dead-code allowances with that Phase 11 retirement.
+- Remove the preserved private faster-whisper, Vosk, and
+  sherpa/Moonshine/Parakeet compatibility adapters only after intended roles
+  have verified replacements. Keep release packaging and normalized UI isolated
+  from them; preserve config aliases and user artifacts.
 
 ## Streaming And Voice UX
 
@@ -43,12 +49,6 @@
 - Add local model inventory scanning for safely adopting exact verified files.
 - Add disk usage reporting.
 - Add per-model benchmark history for latency and accuracy notes.
-
-## History And Retention
-
-- Add bundled SQLite Pending/Completed/Failed entries, transcript-only default
-  retention, optional separate audio, search/pagination, pin/delete, retry, and
-  startup reconciliation.
 
 ## Desktop Integration
 
