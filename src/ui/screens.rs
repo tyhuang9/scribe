@@ -797,6 +797,13 @@ fn models(
                 RichText::new("Manage the speech models available on this device.")
                     .color(colors.muted_text),
             );
+            if let Some(notice) = management.removal_notice.as_deref() {
+                let response = ui.label(RichText::new(notice).color(colors.muted_text));
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
+            }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let add_models = button(
@@ -897,6 +904,10 @@ fn models(
                     };
                 }
                 let details = button(ui, "Details", ButtonTone::Text);
+                ui.ctx().accesskit_node_builder(details.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(format!("Details for {}", model.display_name));
+                });
                 if management.restore_details_focus.as_deref() == Some(model.id.as_str()) {
                     details.request_focus();
                 }
@@ -913,10 +924,18 @@ fn models(
                     None
                 };
                 let remove = ui.add_enabled(remove_reason.is_none(), egui::Button::new("Remove"));
+                ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(format!("Remove {}", model.display_name));
+                });
                 if management.restore_remove_focus.as_deref() == Some(model.id.as_str()) {
                     remove.request_focus();
                 }
                 if let Some(reason) = remove_reason {
+                    ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                        builder.set_description(reason);
+                    });
+                    ui.label(RichText::new(reason).small().color(colors.muted_text));
                     remove.clone().on_hover_text(reason);
                 }
                 if remove.clicked() {
@@ -969,6 +988,7 @@ fn models(
                 ui.ctx().accesskit_node_builder(toggle.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Button);
                     builder.set_name(toggle_name);
+                    builder.set_expanded(comparison.expanded);
                 });
                 focus_tooltip(ui, &toggle, toggle_name);
                 let toggle = toggle.on_hover_text(toggle_name);
@@ -1124,6 +1144,9 @@ fn models(
             );
         });
     }
+    if management.dialog.is_some() {
+        model_dialog_interaction_shield(ui.ctx());
+    }
     if management.dialog.is_some() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         return ScreenAction::CloseModelDialog;
     }
@@ -1170,14 +1193,17 @@ fn models(
                                     install.clone().on_hover_text(reason);
                                 }
                                 if model.download_state == ModelDownloadState::Downloading {
-                                    let progress = model.total_bytes.filter(|total| *total > 0).map_or(0.0, |total| {
+                                    let progress_value = model.total_bytes.filter(|total| *total > 0).map_or(0.0, |total| {
                                         (model.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
                                     });
-                                    let progress = ui.add(egui::ProgressBar::new(progress).text(model_download_label(model)));
+                                    let progress = ui.add(egui::ProgressBar::new(progress_value).text(model_download_label(model)));
                                     ui.ctx().accesskit_node_builder(progress.id, |builder| {
                                         builder.set_role(egui::accesskit::Role::ProgressIndicator);
                                         builder.set_name(format!("{} installation progress", model.display_name));
                                         builder.set_description(model_download_label(model));
+                                        builder.set_numeric_value(f64::from(progress_value * 100.0));
+                                        builder.set_min_numeric_value(0.0);
+                                        builder.set_max_numeric_value(100.0);
                                     });
                                 }
                                 if install.clicked() {
@@ -1243,39 +1269,48 @@ fn models(
                             );
                         }
                         ui.add_space(8.0);
-                        egui::CollapsingHeader::new("Runtime maintenance")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.label(format!("Status: {}", model.runtime_status_label));
-                                if let Some(version) = &model.runtime_version_label {
-                                    ui.label(version);
-                                }
-                                if let Some(storage) = &model.runtime_storage_label {
-                                    ui.label(storage);
-                                }
-                                if let Some(detail) = &model.runtime_detail {
-                                    ui.label(RichText::new(detail).color(colors.muted_text));
-                                }
-                                if let Some(label) = &model.runtime_action_label {
-                                    let runtime_action = ui
-                                        .add_enabled_ui(model.runtime_action_enabled, |ui| {
-                                            button(ui, label, ButtonTone::Secondary)
-                                        })
-                                        .inner;
-                                    if let Some(reason) = &model.runtime_action_disabled_reason {
-                                        ui.ctx()
-                                            .accesskit_node_builder(runtime_action.id, |builder| {
-                                                builder.set_description(reason.as_str())
-                                            });
-                                        focus_tooltip(ui, &runtime_action, reason);
-                                        runtime_action.clone().on_hover_text(reason);
+                        let runtime_maintenance =
+                            egui::CollapsingHeader::new("Runtime maintenance")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label(format!("Status: {}", model.runtime_status_label));
+                                    if let Some(version) = &model.runtime_version_label {
+                                        ui.label(version);
                                     }
-                                    if runtime_action.clicked() {
-                                        action =
-                                            ScreenAction::MaintainModelRuntime(model.id.clone());
+                                    if let Some(storage) = &model.runtime_storage_label {
+                                        ui.label(storage);
                                     }
-                                }
-                            });
+                                    if let Some(detail) = &model.runtime_detail {
+                                        ui.label(RichText::new(detail).color(colors.muted_text));
+                                    }
+                                    if let Some(label) = &model.runtime_action_label {
+                                        let runtime_action = ui
+                                            .add_enabled_ui(model.runtime_action_enabled, |ui| {
+                                                button(ui, label, ButtonTone::Secondary)
+                                            })
+                                            .inner;
+                                        if let Some(reason) = &model.runtime_action_disabled_reason
+                                        {
+                                            ui.ctx().accesskit_node_builder(
+                                                runtime_action.id,
+                                                |builder| builder.set_description(reason.as_str()),
+                                            );
+                                            focus_tooltip(ui, &runtime_action, reason);
+                                            runtime_action.clone().on_hover_text(reason);
+                                        }
+                                        if runtime_action.clicked() {
+                                            action = ScreenAction::MaintainModelRuntime(
+                                                model.id.clone(),
+                                            );
+                                        }
+                                    }
+                                });
+                        ui.ctx().accesskit_node_builder(
+                            runtime_maintenance.header_response.id,
+                            |builder| {
+                                builder.set_expanded(runtime_maintenance.body_response.is_some());
+                            },
+                        );
                         ui.add_space(8.0);
                         let close = button(ui, "Close", ButtonTone::Secondary);
                         if management.focus_dialog_initial {
@@ -1354,6 +1389,26 @@ fn model_download_label(model: &ModelViewModel) -> String {
         ModelDownloadState::Cancelled => "Cancelled; partial download can be resumed.".to_owned(),
         ModelDownloadState::NotInstalled => "Not installed".to_owned(),
     }
+}
+
+/// egui 0.27 has no modal-window focus trap. This mirrors the established
+/// Playground selector shield: it sits below the middle-layer window while
+/// consuming pointer input intended for the background Models page.
+fn model_dialog_interaction_shield(ctx: &egui::Context) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("models-dialog-interaction-shield"))
+        .order(egui::Order::Background)
+        .fixed_pos(screen_rect.min)
+        .movable(false)
+        .show(ctx, |ui| {
+            let shield_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+            ui.allocate_rect(shield_rect, egui::Sense::click_and_drag());
+            ui.painter().rect_filled(
+                shield_rect,
+                Rounding::ZERO,
+                egui::Color32::from_black_alpha(72),
+            );
+        });
 }
 
 fn render_comparison_results(
@@ -1449,10 +1504,6 @@ fn render_comparison_results(
                             let response = column.label(cell);
                             column.ctx().accesskit_node_builder(response.id, |builder| {
                                 builder.set_role(egui::accesskit::Role::Cell);
-                                if let Some(rtf) = result.and_then(|result| result.realtime_factor)
-                                {
-                                    builder.set_description(format!("Real-time factor: {rtf:.2}x"));
-                                }
                             });
                         }
                     });
@@ -1461,6 +1512,9 @@ fn render_comparison_results(
             ui.ctx().accesskit_node_builder(row.response.id, |builder| {
                 builder.set_role(egui::accesskit::Role::Row);
                 builder.set_name(format!("Comparison result for {}", model.display_name));
+                if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
+                    builder.set_description(format!("Real-time factor: {rtf:.2}x"));
+                }
             });
         }
     });
@@ -2818,6 +2872,134 @@ mod tests {
                         && node.name() == Some(label))
             );
         }
+    }
+
+    #[test]
+    fn model_dialogs_expose_progress_values_and_disclosure_state() {
+        let downloading = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "whisper.cpp base.en".into(),
+            install_supported: true,
+            install_action_enabled: false,
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 50,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[downloading],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Add),
+                            ..Default::default()
+                        },
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Dialog && node.name() == Some("Add models")
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ProgressIndicator
+                && node.name() == Some("whisper.cpp base.en installation progress")
+                && node.numeric_value() == Some(50.0)
+                && node.min_numeric_value() == Some(0.0)
+                && node.max_numeric_value() == Some(100.0)
+        }));
+
+        let details = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "whisper.cpp base.en".into(),
+            ..Default::default()
+        };
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[details],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Details("base.en".into())),
+                            ..Default::default()
+                        },
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some("Runtime maintenance") && node.is_expanded() == Some(false)
+                })
+        );
+    }
+
+    #[test]
+    fn model_row_actions_are_contextual_and_disabled_remove_is_explained() {
+        let model = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "whisper.cpp base.en".into(),
+            active: true,
+            ..Default::default()
+        };
+        let comparison = ModelComparisonState {
+            expanded: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[model],
+                        model_catalog: &[],
+                        comparison: &comparison,
+                        model_management: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Details for whisper.cpp base.en")
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Remove whisper.cpp base.en")
+                && node.description()
+                    == Some("Select another ready model before removing the active model.")
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Collapse comparison") && node.is_expanded() == Some(true)
+        }));
     }
 
     #[test]

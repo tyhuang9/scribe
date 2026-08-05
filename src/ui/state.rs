@@ -322,6 +322,8 @@ pub(crate) struct ModelManagementState {
     pub restore_add_focus: bool,
     pub restore_details_focus: Option<String>,
     pub restore_remove_focus: Option<String>,
+    /// One-frame polite confirmation after a synchronous model removal attempt.
+    pub removal_notice: Option<String>,
     pub mutation_block_reason: Option<String>,
 }
 
