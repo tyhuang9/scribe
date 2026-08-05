@@ -5,7 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,11 @@ use crate::config::{
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::installations::{
+    ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
+    InstallError, InstallProgress, InstallStage, ManagedRemoval, reconcile_activation_journal,
+    reconcile_managed_removal,
+};
 use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
@@ -43,9 +48,10 @@ use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewEvent;
 use crate::text_output;
 use crate::transcription::{
-    AccelerationPreference, CompatibilityStatus, ModelDescriptor, ModelId, RequestId,
-    RollingPreviewHandle, SessionId, TranscriptionOptions, TranscriptionOutcome,
-    TranscriptionRequest, TranscriptionService,
+    AccelerationPreference, CompatibilityStatus, InstallSmoke, InstallationCandidate,
+    ModelDescriptor, ModelId, RequestId, RollingPreviewHandle, SessionId, TranscriptionOptions,
+    TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
+    VerifiedInstallationCapability, verified_installation_capability,
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
@@ -59,6 +65,7 @@ const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
+static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
     CaptureOptions {
@@ -423,18 +430,20 @@ enum AppEvent {
         latency: Option<LatencyTrace>,
     },
     ModelDownloadProgress {
+        job_id: u64,
         model_id: String,
-        downloaded_bytes: u64,
-        total_bytes: Option<u64>,
-        bytes_per_second: Option<u64>,
+        progress: InstallProgress,
     },
-    ModelDownloadDone {
+    VerifiedInstallDone {
+        job_id: u64,
         model_id: String,
-        path: PathBuf,
+        result: Box<VerifiedInstallResult>,
     },
-    ModelDownloadFailed {
+    VerifiedInstallFailed {
+        job_id: u64,
         model_id: String,
         message: String,
+        recovery_required: bool,
     },
     RuntimeInstallDone {
         runtime_id: String,
@@ -448,31 +457,329 @@ enum AppEvent {
     },
 }
 
-fn send_model_download_progress(
+#[derive(Debug)]
+struct VerifiedInstallResult {
+    model: FileReplacement,
+    runtime: Option<DirectoryReplacement>,
+    runtime_id: String,
+    runtime_entrypoint: Option<PathBuf>,
+    runtime_version: Option<String>,
+    runtime_package_id: Option<String>,
+    runtime_archive_sha256: Option<String>,
+    retain_runtime_as_previous: bool,
+    model_sha256: String,
+    smoke: InstallSmoke,
+    journal: ActivationJournal,
+}
+
+#[derive(Debug)]
+struct InstallJobFailure {
+    message: String,
+    recovery_required: bool,
+}
+
+impl InstallJobFailure {
+    fn normal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recovery_required: false,
+        }
+    }
+
+    fn recovery_required(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recovery_required: true,
+        }
+    }
+}
+
+impl From<String> for InstallJobFailure {
+    fn from(message: String) -> Self {
+        Self::normal(message)
+    }
+}
+
+impl From<InstallError> for InstallJobFailure {
+    fn from(error: InstallError) -> Self {
+        if error.requires_recovery() {
+            Self::recovery_required(error.to_string())
+        } else {
+            Self::normal(error.to_string())
+        }
+    }
+}
+
+fn send_install_progress(
     tx: &Sender<AppEvent>,
-    progress: managed_downloads::ModelDownloadProgress,
+    job_id: u64,
+    model_id: &str,
+    progress: InstallProgress,
 ) {
     let _ = tx.send(AppEvent::ModelDownloadProgress {
-        model_id: progress.model_id,
-        downloaded_bytes: progress.downloaded_bytes,
-        total_bytes: progress.total_bytes,
-        bytes_per_second: progress.bytes_per_second,
+        job_id,
+        model_id: model_id.to_owned(),
+        progress,
     });
 }
 
-fn send_model_download_result(
+fn send_verified_install_result(
     tx: &Sender<AppEvent>,
+    job_id: u64,
     model_id: String,
-    result: Result<PathBuf, String>,
+    result: Result<VerifiedInstallResult, InstallJobFailure>,
 ) {
     match result {
-        Ok(path) => {
-            let _ = tx.send(AppEvent::ModelDownloadDone { model_id, path });
+        Ok(result) => {
+            let _ = tx.send(AppEvent::VerifiedInstallDone {
+                job_id,
+                model_id,
+                result: Box::new(result),
+            });
         }
-        Err(message) => {
-            let _ = tx.send(AppEvent::ModelDownloadFailed { model_id, message });
+        Err(failure) => {
+            let _ = tx.send(AppEvent::VerifiedInstallFailed {
+                job_id,
+                model_id,
+                message: failure.message,
+                recovery_required: failure.recovery_required,
+            });
         }
     }
+}
+
+fn activation_journal_path() -> PathBuf {
+    config::runtime_storage_dir().join("activation-journal.json")
+}
+
+fn failure_after_safe_rollback(
+    journal: ActivationJournal,
+    message: impl Into<String>,
+) -> InstallJobFailure {
+    let message = message.into();
+    match journal.clear() {
+        Ok(()) => InstallJobFailure::normal(message),
+        Err(clear_error) => InstallJobFailure::recovery_required(format!(
+            "{message}. Rollback completed, but the activation journal could not be cleared: {clear_error}"
+        )),
+    }
+}
+
+struct VerifiedInstallRequest {
+    config: AppConfig,
+    service: TranscriptionService,
+    runtime_id: String,
+    model_id: ModelId,
+    existing_runtime_root: Option<PathBuf>,
+    force_runtime_package: bool,
+    cancellation: InstallCancellation,
+}
+
+fn run_verified_install(
+    request: VerifiedInstallRequest,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<VerifiedInstallResult, InstallJobFailure> {
+    let VerifiedInstallRequest {
+        config,
+        service,
+        runtime_id,
+        model_id,
+        existing_runtime_root,
+        force_runtime_package,
+        cancellation,
+    } = request;
+    let model = managed_downloads::prepare_model(&config, &model_id, &cancellation, progress)
+        .map_err(InstallJobFailure::from)?;
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled. The verified partial was retained for Resume.",
+        ));
+    }
+
+    let target_root = config::runtime_storage_dir().join(&runtime_id);
+    let mut staged_runtime = None;
+    let mut runtime_entrypoint = None;
+    let mut runtime_version = None;
+    let mut runtime_package_id = None;
+    let mut runtime_archive_sha256 = None;
+    let mut candidate_root = existing_runtime_root;
+
+    let smoke_current = candidate_root.as_ref().and_then(|root| {
+        progress(InstallProgress {
+            stage: InstallStage::HealthChecking,
+            completed_bytes: model.size_bytes,
+            total_bytes: model.size_bytes,
+            bytes_per_second: None,
+        });
+        service
+            .verify_installation_candidate(
+                InstallationCandidate {
+                    model_id: model_id.clone(),
+                    model_path: model.path.clone(),
+                    runtime_package_root: root.clone(),
+                },
+                &cancellation,
+            )
+            .ok()
+    });
+    let current_runtime_known_good = smoke_current.is_some()
+        && candidate_root
+            .as_ref()
+            .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
+
+    let smoke = if !force_runtime_package && let Some(smoke) = smoke_current {
+        smoke
+    } else {
+        let prepared =
+            managed_downloads::prepare_primary_runtime(&target_root, &cancellation, progress)
+                .map_err(InstallJobFailure::from)?;
+        candidate_root = Some(prepared.staged.root.clone());
+        runtime_entrypoint = Some(prepared.installed_entrypoint.clone());
+        runtime_version = Some(prepared.version.clone());
+        runtime_package_id = Some(prepared.package_id.clone());
+        runtime_archive_sha256 = Some(prepared.archive_sha256.clone());
+        progress(InstallProgress {
+            stage: InstallStage::HealthChecking,
+            completed_bytes: model.size_bytes,
+            total_bytes: model.size_bytes,
+            bytes_per_second: None,
+        });
+        let smoke = service
+            .verify_installation_candidate(
+                InstallationCandidate {
+                    model_id: model_id.clone(),
+                    model_path: model.path.clone(),
+                    runtime_package_root: candidate_root
+                        .clone()
+                        .ok_or_else(|| "staged runtime root was lost".to_owned())?,
+                },
+                &cancellation,
+            )
+            .map_err(|error| error.to_string())?;
+        staged_runtime = Some(prepared.staged);
+        smoke
+    };
+
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled after smoke testing; no artifacts were activated.",
+        ));
+    }
+    progress(InstallProgress {
+        stage: InstallStage::Activating,
+        completed_bytes: model.size_bytes,
+        total_bytes: model.size_bytes,
+        bytes_per_second: None,
+    });
+
+    let runtime_target = staged_runtime.as_ref().map(|_| target_root.clone());
+    let prior_config_fingerprint = config::settings::artifact_config_fingerprint(&config)
+        .map_err(|error| format!("could not fingerprint pre-install artifact settings: {error}"))?;
+    let mut journal = ActivationJournal::begin(
+        activation_journal_path(),
+        model.destination.clone(),
+        runtime_target,
+        current_runtime_known_good,
+        prior_config_fingerprint,
+    )
+    .map_err(|error| {
+        if error.requires_recovery() {
+            InstallJobFailure::recovery_required(error.to_string())
+        } else {
+            InstallJobFailure::normal(error.to_string())
+        }
+    })?;
+
+    let runtime = if let Some(staged) = staged_runtime {
+        let replacement = match staged.activate() {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                if !error.requires_recovery() {
+                    return Err(failure_after_safe_rollback(journal, error.to_string()));
+                }
+                return Err(InstallJobFailure::recovery_required(error.to_string()));
+            }
+        };
+        if let Err(error) = journal.mark(ActivationPhase::RuntimeActivated) {
+            let rollback = replacement.rollback().err();
+            if rollback.is_none() && !error.requires_recovery() {
+                return Err(failure_after_safe_rollback(journal, error.to_string()));
+            }
+            return Err(rollback.map_or_else(
+                || InstallJobFailure::normal(error.to_string()),
+                |rollback| {
+                    InstallJobFailure::recovery_required(format!(
+                        "{error}. Runtime rollback also failed: {rollback}"
+                    ))
+                },
+            ));
+        }
+        Some(replacement)
+    } else {
+        None
+    };
+
+    let model_sha256 = model.sha256.clone();
+    let model = match model.activate() {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            let rollback = runtime.and_then(|replacement| replacement.rollback().err());
+            if rollback.is_none() && !error.requires_recovery() {
+                return Err(failure_after_safe_rollback(journal, error.to_string()));
+            }
+            return Err(rollback.map_or_else(
+                || {
+                    if error.requires_recovery() {
+                        InstallJobFailure::recovery_required(error.to_string())
+                    } else {
+                        InstallJobFailure::normal(error.to_string())
+                    }
+                },
+                |rollback| {
+                    InstallJobFailure::recovery_required(format!(
+                        "{error}. Runtime rollback also failed: {rollback}"
+                    ))
+                },
+            ));
+        }
+    };
+    if let Err(error) = journal.mark(ActivationPhase::ModelActivated) {
+        let model_rollback = model.rollback().err();
+        let runtime_rollback = runtime.and_then(|replacement| replacement.rollback().err());
+        if model_rollback.is_none() && runtime_rollback.is_none() {
+            return Err(failure_after_safe_rollback(journal, error.to_string()));
+        }
+        let message = format!(
+            "{error}{}{}",
+            model_rollback
+                .as_ref()
+                .map(|error| format!(". Model rollback also failed: {error}"))
+                .unwrap_or_default(),
+            runtime_rollback
+                .as_ref()
+                .map(|error| format!(". Runtime rollback also failed: {error}"))
+                .unwrap_or_default()
+        );
+        return Err(if model_rollback.is_some() || runtime_rollback.is_some() {
+            InstallJobFailure::recovery_required(message)
+        } else {
+            InstallJobFailure::normal(message)
+        });
+    }
+
+    Ok(VerifiedInstallResult {
+        model,
+        runtime,
+        runtime_id,
+        runtime_entrypoint,
+        runtime_version,
+        runtime_package_id,
+        runtime_archive_sha256,
+        retain_runtime_as_previous: current_runtime_known_good,
+        model_sha256,
+        smoke,
+        journal,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,10 +831,20 @@ fn model_primary_action_label(
 ) -> String {
     match action {
         ModelPrimaryAction::Repair => "Repair runtime".to_owned(),
+        ModelPrimaryAction::Retry
+            if matches!(
+                install_status,
+                ModelInstallStatus::Error(message)
+                    if message.contains("resumable partial retained")
+                        || message.contains("Installation cancelled")
+            ) =>
+        {
+            "Resume".to_owned()
+        }
         ModelPrimaryAction::Installing
             if matches!(install_status, ModelInstallStatus::InstallingRuntime) =>
         {
-            "Preparing runtime".to_owned()
+            "Installing".to_owned()
         }
         _ => action.label().to_owned(),
     }
@@ -862,6 +1179,7 @@ fn model_download_uses_runtime(
     })
 }
 
+#[cfg(test)]
 fn apply_runtime_uninstall_result(
     config: &mut AppConfig,
     runtime_id: &str,
@@ -888,6 +1206,47 @@ fn runtime_action_state_inner(config: &AppConfig, model: &SttModelInfo) -> Runti
             disabled_tooltip: Some(
                 "The managed local runtime installer is not bundled in this build.".to_owned(),
             ),
+        };
+    }
+
+    if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
+        let package_version = match capability {
+            VerifiedInstallationCapability::Available { package_version } => package_version,
+            VerifiedInstallationCapability::Unavailable { reason } => {
+                return RuntimeActionState {
+                    kind: RuntimeActionKind::Install,
+                    enabled: false,
+                    disabled_tooltip: Some(reason),
+                };
+            }
+        };
+        let source_available = model.local_path.as_ref().is_some_and(|path| path.is_file());
+        if has_managed_runtime_install(config, provider) {
+            let installed = config
+                .general
+                .managed_runtimes
+                .get(provider.id())
+                .and_then(|install| install.version.as_deref());
+            if installed != Some(package_version.as_str()) && source_available {
+                return RuntimeActionState {
+                    kind: RuntimeActionKind::Update,
+                    enabled: true,
+                    disabled_tooltip: None,
+                };
+            }
+            return RuntimeActionState {
+                kind: RuntimeActionKind::Uninstall,
+                enabled: true,
+                disabled_tooltip: None,
+            };
+        }
+        return RuntimeActionState {
+            kind: RuntimeActionKind::Install,
+            enabled: source_available,
+            disabled_tooltip: (!source_available).then(|| {
+                "Install a pinned model before installing or updating its native runtime."
+                    .to_owned()
+            }),
         };
     }
 
@@ -937,6 +1296,12 @@ fn runtime_action_state_for_source(
 }
 
 fn supports_managed_install(model: &SttModelInfo) -> bool {
+    if model.download_model.is_none() {
+        return false;
+    }
+    if let Some(capability) = verified_installation_capability(&ModelId::new(&model.id)) {
+        return matches!(capability, VerifiedInstallationCapability::Available { .. });
+    }
     compatibility_bridge::provider_for_model(model)
         .is_some_and(|provider| provider.can_install_model(model))
 }
@@ -1135,6 +1500,8 @@ pub struct LocalTranscriberApp {
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
+    artifact_installations: HashMap<String, (u64, InstallCancellation)>,
+    artifact_recovery_error: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
     pending_output: Option<PendingOutput>,
@@ -1195,6 +1562,8 @@ impl LocalTranscriberApp {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
+            artifact_installations: HashMap::new(),
+            artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -1233,7 +1602,105 @@ impl LocalTranscriberApp {
             quit_requested: false,
         };
 
-        if let Err(err) = audio::cleanup_abandoned_recordings() {
+        let allowed_model_targets = config::configured_models(&app.config)
+            .into_iter()
+            .filter(|model| {
+                app.transcription_service
+                    .model_descriptor(&ModelId::new(&model.id))
+                    .is_ok()
+            })
+            .filter_map(|model| config::downloaded_model_path(&app.config, &model))
+            .collect::<Vec<_>>();
+        let allowed_runtime_bindings = app
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .filter_map(|descriptor| {
+                app.transcription_service
+                    .recovery_installation_binding(&descriptor.id)
+                    .ok()
+                    .map(|binding| {
+                        let target =
+                            config::runtime_storage_dir().join(&binding.managed_runtime_id);
+                        (binding.managed_runtime_id, target)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let allowed_runtime_targets = allowed_runtime_bindings
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>();
+        let durable_artifact_fingerprint =
+            config::settings::artifact_config_fingerprint(&app.config).map_err(|error| {
+                crate::installations::InstallError::RecoveryRequired(format!(
+                    "could not fingerprint durable settings before artifact recovery: {error}"
+                ))
+            });
+        let removal_recovery = durable_artifact_fingerprint
+            .as_ref()
+            .map_err(|error| {
+                crate::installations::InstallError::RecoveryRequired(error.to_string())
+            })
+            .and_then(|fingerprint| {
+                allowed_model_targets
+                    .iter()
+                    .try_for_each(|target| {
+                        reconcile_managed_removal(target, &allowed_model_targets, fingerprint)
+                            .map(|_| ())
+                    })
+                    .and_then(|_| {
+                        allowed_runtime_bindings.iter().try_for_each(|(_, target)| {
+                            reconcile_managed_removal(target, &allowed_runtime_targets, fingerprint)
+                                .map(|_| ())
+                        })
+                    })
+                    .and_then(|_| {
+                        allowed_runtime_bindings
+                            .iter()
+                            .try_for_each(|(runtime_id, target)| {
+                                crate::installations::reconcile_orphaned_previous_runtime(
+                                    target,
+                                    app.config.general.managed_runtimes.contains_key(runtime_id),
+                                )
+                                .map(|_| ())
+                            })
+                    })
+            });
+        if let Err(error) = removal_recovery {
+            let message = format!("Could not reconcile an interrupted artifact removal: {error}");
+            app.status = TranscriptionStatus::Error;
+            app.status_message = message.clone();
+            app.artifact_recovery_error = Some(message);
+        }
+        let activation_recovery = durable_artifact_fingerprint.and_then(|fingerprint| {
+            reconcile_activation_journal(
+                &activation_journal_path(),
+                &allowed_model_targets,
+                &allowed_runtime_targets,
+                Some(&fingerprint),
+            )
+        });
+        match activation_recovery {
+            Ok(true) => {
+                app.status_message =
+                    "Recovered an interrupted model/runtime activation transaction.".to_owned();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let message =
+                    format!("Could not reconcile an interrupted artifact activation: {error}");
+                app.status = TranscriptionStatus::Error;
+                app.status_message = message.clone();
+                app.artifact_recovery_error = Some(message);
+            }
+        }
+        if app.artifact_recovery_error.is_none() {
+            app.validate_startup_runtime_or_recover();
+        }
+
+        if let Err(err) = audio::cleanup_abandoned_recordings()
+            && app.artifact_recovery_error.is_none()
+        {
             app.status_message = format!("Recording cleanup warning: {err}");
         }
 
@@ -1250,11 +1717,15 @@ impl LocalTranscriberApp {
                 app.last_tray_state = Some(initial_tray_state);
             }
             Err(err) => {
-                app.status_message = format!("Tray unavailable: {err}");
+                if app.artifact_recovery_error.is_none() {
+                    app.status_message = format!("Tray unavailable: {err}");
+                }
             }
         }
 
-        if let Some(err) = &app.hotkey_service.last_error {
+        if let Some(err) = &app.hotkey_service.last_error
+            && app.artifact_recovery_error.is_none()
+        {
             app.status_message = format!("Hotkey unavailable: {err}");
         }
 
@@ -1263,6 +1734,189 @@ impl LocalTranscriberApp {
 
     fn selected_model(&self) -> Option<SttModelInfo> {
         config::selected_model(&self.config)
+    }
+
+    fn validate_startup_runtime_or_recover(&mut self) {
+        let Some(model) = self.selected_model() else {
+            return;
+        };
+        let model_id = ModelId::new(&model.id);
+        if self
+            .transcription_service
+            .model_descriptor(&model_id)
+            .is_err()
+        {
+            return;
+        }
+        let binding = match self.transcription_service.installation_binding(&model_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let message = format!(
+                    "The managed runtime settings record is unsafe or unavailable; repair or remove it before transcription: {error}"
+                );
+                self.artifact_recovery_error = Some(message.clone());
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+        };
+        if !self
+            .config
+            .general
+            .managed_runtimes
+            .contains_key(&binding.managed_runtime_id)
+        {
+            return;
+        }
+        if model.local_path.as_ref().is_none_or(|path| !path.is_file()) {
+            return;
+        }
+        if let Err(error) = self
+            .transcription_service
+            .verify_model_artifact_for_installation(&model_id, model.local_path.clone())
+        {
+            let message = format!(
+                "The selected model failed integrity verification; repair the model without replacing the runtime: {error}"
+            );
+            self.model_downloads
+                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
+        let current = self
+            .transcription_service
+            .startup_runtime_health_and_load(&model_id, model.local_path.clone());
+        if current.is_ok() {
+            return;
+        }
+        let current_error = current.unwrap_err();
+        let _ = self.transcription_service.unload_runtime();
+        let recovery = match self
+            .transcription_service
+            .rollback_to_previous_runtime(&model_id)
+        {
+            Ok(Some(recovery)) => recovery,
+            Ok(None) => {
+                match self.restore_bundled_runtime_fallback(
+                    &model,
+                    &binding.managed_runtime_id,
+                    "Managed runtime failed; restored and verified the immutable bundled runtime.",
+                ) {
+                    Ok(()) => return,
+                    Err(fallback_error) => {
+                        let message = format!(
+                            "Installed speech runtime failed startup health/load checks and no previous or bundled known-good package is available: {current_error}. {fallback_error}"
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                match self.restore_bundled_runtime_fallback(
+                    &model,
+                    &binding.managed_runtime_id,
+                    "Managed runtime and its previous package failed verification; restored and verified the immutable bundled runtime.",
+                ) {
+                    Ok(()) => return,
+                    Err(fallback_error) => {
+                        let message = format!(
+                            "Installed speech runtime failed and neither previous nor bundled recovery succeeded: {current_error}. Previous runtime: {error}. Bundled fallback: {fallback_error}"
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                        return;
+                    }
+                }
+            }
+        };
+        let mut install = config::ManagedRuntimeInstall::app_managed(
+            recovery.entrypoint,
+            "startup-previous-known-good-rollback",
+        );
+        install.version = Some(recovery.version);
+        install.sha256 = Some(recovery.archive_sha256);
+        self.config
+            .general
+            .managed_runtimes
+            .insert(recovery.managed_runtime_id, install);
+        if let Err(error) = config::save_config(&self.config) {
+            let message = format!(
+                "Previous runtime was restored, but its settings record could not be persisted: {error}"
+            );
+            self.artifact_recovery_error = Some(message.clone());
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        let recovered = self
+            .transcription_service
+            .startup_runtime_health_and_load(&model_id, model.local_path.clone());
+        match recovered {
+            Ok(()) => {
+                self.status = TranscriptionStatus::Idle;
+                self.status_message =
+                    "Restored and verified the previous known-good speech runtime.".to_owned();
+            }
+            Err(error) => {
+                match self.restore_bundled_runtime_fallback(
+                    &model,
+                    &binding.managed_runtime_id,
+                    "The previous runtime failed verification; restored and verified the immutable bundled runtime.",
+                ) {
+                    Ok(()) => {}
+                    Err(fallback_error) => {
+                        let message = format!(
+                            "The previous runtime was restored but failed native smoke verification, and bundled fallback also failed: {error}. Bundled fallback: {fallback_error}"
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_bundled_runtime_fallback(
+        &mut self,
+        model: &SttModelInfo,
+        managed_runtime_id: &str,
+        success_message: &str,
+    ) -> Result<(), String> {
+        let mut fallback_config = self.config.clone();
+        if fallback_config
+            .general
+            .managed_runtimes
+            .remove(managed_runtime_id)
+            .is_none()
+        {
+            return Err("managed runtime settings record was already absent".to_owned());
+        }
+        let fallback_service = self
+            .transcription_service
+            .with_config(fallback_config.clone());
+        fallback_service
+            .startup_bundled_runtime_health_and_load(
+                &ModelId::new(&model.id),
+                model.local_path.clone(),
+            )
+            .map_err(|error| format!("bundled runtime health/load failed: {error}"))?;
+        config::save_config(&fallback_config)
+            .map_err(|error| format!("bundled fallback settings could not be saved: {error}"))?;
+        self.config = fallback_config;
+        self.transcription_service = fallback_service;
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = success_message.to_owned();
+        Ok(())
     }
 
     fn playground_selected_models(&self) -> Vec<SttModelInfo> {
@@ -1736,6 +2390,18 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
+        if let Some(message) = self.artifact_recovery_error.as_ref() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message.clone();
+            return;
+        }
+        if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                "Wait for the active model/runtime installation to finish or cancel it before transcribing."
+                    .to_owned();
+            return;
+        }
         if self.capture_is_active() {
             return;
         }
@@ -2840,21 +3506,74 @@ impl LocalTranscriberApp {
                     self.cleanup_after_job(source, session_id, request_id);
                 }
                 AppEvent::ModelDownloadProgress {
+                    job_id,
                     model_id,
-                    downloaded_bytes,
-                    total_bytes,
-                    bytes_per_second,
+                    progress,
                 } => {
+                    if self
+                        .artifact_installations
+                        .get(&model_id)
+                        .is_none_or(|(active_job, _)| *active_job != job_id)
+                    {
+                        continue;
+                    }
+                    let stage_label = match progress.stage {
+                        InstallStage::Downloading => "Downloading",
+                        InstallStage::Verifying => "Verifying checksum",
+                        InstallStage::Extracting => "Extracting verified runtime files",
+                        InstallStage::HealthChecking => {
+                            "Running native health/load/transcribe smoke test"
+                        }
+                        InstallStage::Activating => "Activating verified artifacts",
+                    };
                     self.model_downloads.insert(
-                        model_id,
-                        ModelInstallStatus::Downloading {
-                            downloaded_bytes,
-                            total_bytes,
-                            bytes_per_second,
+                        model_id.clone(),
+                        if progress.stage == InstallStage::Downloading {
+                            ModelInstallStatus::Downloading {
+                                downloaded_bytes: progress.completed_bytes,
+                                total_bytes: Some(progress.total_bytes),
+                                bytes_per_second: progress.bytes_per_second,
+                            }
+                        } else {
+                            ModelInstallStatus::InstallingRuntime
                         },
                     );
+                    self.status_message = format!("{stage_label} for {model_id}...");
                 }
-                AppEvent::ModelDownloadDone { model_id, path } => {
+                AppEvent::VerifiedInstallDone {
+                    job_id,
+                    model_id,
+                    result,
+                } => {
+                    let mut result = *result;
+                    if self
+                        .artifact_installations
+                        .get(&model_id)
+                        .is_none_or(|(active_job, _)| *active_job != job_id)
+                    {
+                        let model_rollback = result.model.rollback().err();
+                        let runtime_rollback =
+                            result.runtime.and_then(|runtime| runtime.rollback().err());
+                        let journal_clear =
+                            if model_rollback.is_none() && runtime_rollback.is_none() {
+                                result.journal.clear().err()
+                            } else {
+                                None
+                            };
+                        if model_rollback.is_some()
+                            || runtime_rollback.is_some()
+                            || journal_clear.is_some()
+                        {
+                            let message = "A stale installation result could not be rolled back; startup recovery is required."
+                                .to_owned();
+                            self.artifact_recovery_error = Some(message.clone());
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = message;
+                        }
+                        continue;
+                    }
+                    self.artifact_installations.remove(&model_id);
+                    let previous_config = self.config.clone();
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
                     if let Some(model) = config::configured_models(&self.config)
@@ -2866,10 +3585,17 @@ impl LocalTranscriberApp {
                                 runtime_status_for_model(&self.config, &active)
                                     == ModelRuntimeStatus::Ready
                             });
-                        self.config.general.managed_models.insert(
-                            model_id.clone(),
-                            config::ManagedModelInstall::app_managed(path, "managed-download"),
-                        );
+                        self.config
+                            .general
+                            .managed_models
+                            .insert(model_id.clone(), {
+                                let mut install = config::ManagedModelInstall::app_managed(
+                                    result.model.destination().to_path_buf(),
+                                    "verified-manifest-download",
+                                );
+                                install.sha256 = Some(result.model_sha256.clone());
+                                install
+                            });
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.general.selected_default_model = model_id.clone();
@@ -2879,25 +3605,164 @@ impl LocalTranscriberApp {
                             );
                         }
                     }
-                    self.save_config();
-                    self.status = TranscriptionStatus::Idle;
-                    self.status_message = match config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id)
-                        .map(|model| runtime_status_for_model(&self.config, &model))
-                    {
-                        Some(ModelRuntimeStatus::Ready) => "Model installed and ready.".to_owned(),
-                        _ => {
-                            "Model installed. Install its managed runtime from Models before transcribing."
-                                .to_owned()
+                    if let Some(entrypoint) = result.runtime_entrypoint.as_ref() {
+                        let mut install = config::ManagedRuntimeInstall::app_managed(
+                            entrypoint.clone(),
+                            "verified-pinned-runtime-package",
+                        );
+                        install.version = result.runtime_version.clone();
+                        install.sha256 = result.runtime_archive_sha256.clone();
+                        if let Some(package_id) = result.runtime_package_id.as_ref() {
+                            install.unknown.insert(
+                                "package_id".to_owned(),
+                                serde_json::Value::String(package_id.clone()),
+                            );
                         }
+                        self.config
+                            .general
+                            .managed_runtimes
+                            .insert(result.runtime_id.clone(), install);
+                    }
+                    config::normalize_config(&mut self.config);
+                    let journal_preparation =
+                        config::settings::artifact_config_fingerprint(&self.config)
+                            .map_err(|error| error.to_string())
+                            .and_then(|fingerprint| {
+                                result
+                                    .journal
+                                    .prepare_config_commit(fingerprint)
+                                    .map_err(|error| error.to_string())
+                            });
+                    if let Err(error) = journal_preparation {
+                        self.config = previous_config;
+                        let model_rollback = result.model.rollback().err();
+                        let runtime_rollback =
+                            result.runtime.and_then(|runtime| runtime.rollback().err());
+                        let recovery_required =
+                            model_rollback.is_some() || runtime_rollback.is_some();
+                        let journal_clear = if recovery_required {
+                            None
+                        } else {
+                            result.journal.clear().err()
+                        };
+                        let recovery_required = recovery_required || journal_clear.is_some();
+                        let message = format!(
+                            "Could not prepare the durable settings commit: {error}{}{}",
+                            model_rollback
+                                .as_ref()
+                                .map(|error| format!(". Model rollback failed: {error}"))
+                                .unwrap_or_default(),
+                            runtime_rollback
+                                .as_ref()
+                                .map(|error| format!(". Runtime rollback failed: {error}"))
+                                .unwrap_or_default(),
+                        ) + &journal_clear
+                            .as_ref()
+                            .map(|error| format!(". Activation journal cleanup failed: {error}"))
+                            .unwrap_or_default();
+                        if recovery_required {
+                            self.artifact_recovery_error = Some(message.clone());
+                        }
+                        self.model_downloads
+                            .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                        continue;
+                    }
+                    let persistence =
+                        config::save_config(&self.config).map_err(|error| error.to_string());
+                    if let Err(message) = persistence {
+                        let message = format!(
+                            "Could not confirm the verified installation settings commit: {message}. Artifacts and the activation journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.model_downloads
+                            .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                        continue;
+                    }
+                    if let Err(error) = result.journal.mark(ActivationPhase::ConfigPersisted) {
+                        let message = format!(
+                            "Could not advance the installation journal after settings persistence: {error}. Artifacts and the journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.model_downloads
+                            .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                        continue;
+                    }
+                    let model_cleanup = result.model.commit().err();
+                    let runtime_cleanup = result.runtime.and_then(|runtime| {
+                        runtime
+                            .commit_with_previous_policy(result.retain_runtime_as_previous)
+                            .err()
+                    });
+                    let journal_cleanup = if model_cleanup.is_none() && runtime_cleanup.is_none() {
+                        result.journal.clear().err()
+                    } else {
+                        None
                     };
+                    let cleanup_requires_recovery = model_cleanup.is_some()
+                        || runtime_cleanup.is_some()
+                        || journal_cleanup.is_some();
+                    if let Some(store) = self.settings_store.as_mut() {
+                        store.mark_current_persisted();
+                    }
+                    self.transcription_service =
+                        self.transcription_service.with_config(self.config.clone());
+                    self.refresh_playground_cards_from_config();
+                    let message = format!(
+                        "Model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, {}).{}{}{}",
+                        result.smoke.health_duration_ms,
+                        result.smoke.load_duration_ms,
+                        result.smoke.decode_duration_ms,
+                        result.smoke.reload_duration_ms,
+                        result.smoke.resolved_acceleration.resolved.label(),
+                        model_cleanup
+                            .map(|error| format!(" Model cleanup warning: {error}."))
+                            .unwrap_or_default(),
+                        runtime_cleanup
+                            .map(|error| format!(" Runtime backup warning: {error}."))
+                            .unwrap_or_default(),
+                        journal_cleanup
+                            .map(|error| format!(" Journal cleanup warning: {error}."))
+                            .unwrap_or_default(),
+                    );
+                    if cleanup_requires_recovery {
+                        let message = format!(
+                            "{message} Artifact cleanup is incomplete; restart Scribe to reconcile the retained transaction before another install, update, repair, removal, or runtime switch."
+                        );
+                        self.artifact_recovery_error = Some(message.clone());
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = message;
+                    } else {
+                        self.status = TranscriptionStatus::Idle;
+                        self.status_message = message;
+                    }
                 }
-                AppEvent::ModelDownloadFailed { model_id, message } => {
+                AppEvent::VerifiedInstallFailed {
+                    job_id,
+                    model_id,
+                    message,
+                    recovery_required,
+                } => {
+                    if self
+                        .artifact_installations
+                        .get(&model_id)
+                        .is_none_or(|(active_job, _)| *active_job != job_id)
+                    {
+                        continue;
+                    }
+                    self.artifact_installations.remove(&model_id);
+                    if recovery_required {
+                        self.artifact_recovery_error = Some(message.clone());
+                    }
                     self.model_downloads
                         .insert(model_id, ModelInstallStatus::Error(message.clone()));
                     self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Download failed: {message}");
+                    self.status_message = format!("Installation failed: {message}");
                 }
                 AppEvent::RuntimeInstallDone {
                     runtime_id,
@@ -3430,6 +4295,16 @@ impl LocalTranscriberApp {
     }
 
     fn select_model_as_default(&mut self, model: &SttModelInfo) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                format!("Could not unload the warm model before switching: {error}");
+            return;
+        }
         self.config.general.selected_default_model = model.id.clone();
         compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
@@ -3456,6 +4331,14 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download(&mut self, model: &SttModelInfo) {
+        if self
+            .transcription_service
+            .installation_binding(&ModelId::new(&model.id))
+            .is_ok()
+        {
+            self.start_model_download_only(model);
+            return;
+        }
         let Some(provider) = compatibility_bridge::provider_for_model(model) else {
             self.fail_model_install(&model.id, "Model provider is not available.".to_owned());
             return;
@@ -3470,6 +4353,18 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download_only(&mut self, model: &SttModelInfo) {
+        self.start_model_download_with_runtime_policy(model, false);
+    }
+
+    fn start_model_download_with_runtime_policy(
+        &mut self,
+        model: &SttModelInfo,
+        force_runtime_package: bool,
+    ) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.fail_model_install(&model.id, reason);
+            return;
+        }
         if model.download_model.is_none() {
             self.status = TranscriptionStatus::Error;
             self.status_message = format!("{} does not have a supported download.", model.name);
@@ -3491,6 +4386,24 @@ impl LocalTranscriberApp {
             return;
         }
 
+        let model_id = ModelId::new(&model.id);
+        let binding = match self.transcription_service.installation_binding(&model_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.fail_model_install(
+                    &model.id,
+                    format!("This model is not eligible for verified installation: {error}"),
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.fail_model_install(
+                &model.id,
+                format!("Could not release the active speech artifact before install: {error}"),
+            );
+            return;
+        }
         let expected_total_bytes = model_download_total_bytes(model);
         self.model_downloads.insert(
             model.id.clone(),
@@ -3504,18 +4417,81 @@ impl LocalTranscriberApp {
         self.status_message = format!("Downloading {}...", model.name);
 
         let tx = self.tx.clone();
-        let model_id = model.id.clone();
-        let download_id = crate::transcription::ModelId::new(&model_id);
+        let model_name = model.id.clone();
         let config = self.config.clone();
+        let service = self.transcription_service.with_config(config.clone());
+        let cancellation = InstallCancellation::default();
+        let thread_cancellation = cancellation.clone();
+        let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.artifact_installations
+            .insert(model.id.clone(), (job_id, cancellation));
         thread::spawn(move || {
-            let progress = |progress| send_model_download_progress(&tx, progress);
-            let result = managed_downloads::download_model(&config, &download_id, &progress);
-            send_model_download_result(&tx, model_id, result);
+            let progress = |progress| send_install_progress(&tx, job_id, &model_name, progress);
+            let result = run_verified_install(
+                VerifiedInstallRequest {
+                    config,
+                    service,
+                    runtime_id: binding.managed_runtime_id,
+                    model_id,
+                    existing_runtime_root: binding.installed_package_root,
+                    force_runtime_package,
+                    cancellation: thread_cancellation,
+                },
+                &progress,
+            );
+            send_verified_install_result(&tx, job_id, model_name, result);
         });
     }
 
     fn uninstall_model(&mut self, model: &SttModelInfo) {
-        let removal = uninstall_model_files(&self.config, model);
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status_message = format!("Could not unload the selected model: {error}");
+            return;
+        }
+        let managed_target = self
+            .config
+            .general
+            .managed_models
+            .get(&model.id)
+            .map(|install| install.path.clone())
+            .filter(|path| {
+                config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
+            })
+            .filter(|path| is_app_managed_model_path(&self.config, path));
+        let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    format!("Could not prepare model removal settings witness: {error}");
+                return;
+            }
+        };
+        let mut staged_removal = match managed_target.as_ref() {
+            Some(target) => {
+                match ManagedRemoval::stage(target, std::slice::from_ref(target), prior_fingerprint)
+                {
+                    Ok(removal) => Some(removal),
+                    Err(error) => {
+                        if error.requires_recovery() {
+                            self.artifact_recovery_error = Some(error.to_string());
+                        }
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Could not stage model removal: {error}");
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        let removed_files = staged_removal
+            .as_ref()
+            .is_some_and(ManagedRemoval::removed_files);
+        let previous_config = self.config.clone();
         self.model_downloads.remove(&model.id);
         self.config.general.managed_models.remove(&model.id);
         self.config.general.model_paths.remove(&model.id);
@@ -3524,17 +4500,95 @@ impl LocalTranscriberApp {
         if self.config.general.selected_default_model == model.id {
             select_first_installed_model(&mut self.config);
         }
-
-        self.save_config();
+        config::normalize_config(&mut self.config);
+        let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
+            .map_err(|error| error.to_string())
+            .and_then(|fingerprint| {
+                staged_removal.as_mut().map_or(Ok(()), |removal| {
+                    removal
+                        .prepare_config_commit(fingerprint)
+                        .map_err(|error| error.to_string())
+                })
+            });
+        if let Err(error) = removal_preparation {
+            self.config = previous_config;
+            let rollback = staged_removal.and_then(|removal| removal.rollback().err());
+            let message = format!(
+                "Could not prepare model removal transaction: {error}{}",
+                rollback
+                    .as_ref()
+                    .map(|error| format!(". Restoring the model also failed: {error}"))
+                    .unwrap_or_default()
+            );
+            if rollback.is_some() {
+                self.artifact_recovery_error = Some(message.clone());
+            }
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
+        if let Err(error) = config::save_config(&self.config) {
+            self.config = previous_config;
+            let message = format!(
+                "Could not confirm model removal settings persistence: {error}. The artifact tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
+            );
+            if staged_removal.is_some() {
+                self.artifact_recovery_error = Some(message.clone());
+            }
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
+        let cleanup = staged_removal.and_then(|removal| removal.commit().err());
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.refresh_playground_cards_from_config();
+        if let Some(error) = cleanup {
+            let message = format!(
+                "{} was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}",
+                model.name
+            );
+            self.artifact_recovery_error = Some(message.clone());
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
         self.status = TranscriptionStatus::Idle;
-        self.status_message = match removal {
-            Ok(true) => format!("Uninstalled {}.", model.name),
-            Ok(false) => format!("Removed {} from Scribe.", model.name),
-            Err(message) => format!("Removed {} from Scribe. {message}", model.name),
+        self.status_message = match removed_files {
+            true => format!("Uninstalled {}.", model.name),
+            false => format!("Removed {} from Scribe.", model.name),
         };
     }
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        if self
+            .transcription_service
+            .installation_binding(&ModelId::new(&model.id))
+            .is_ok()
+        {
+            match intent {
+                RuntimeJobIntent::DownloadModel(_) => self.start_model_download_only(model),
+                RuntimeJobIntent::RepairModel(_) | RuntimeJobIntent::Maintenance
+                    if model.local_path.as_ref().is_some_and(|path| path.is_file()) =>
+                {
+                    self.start_model_download_with_runtime_policy(model, true);
+                }
+                RuntimeJobIntent::RepairModel(_) | RuntimeJobIntent::Maintenance => {
+                    self.fail_model_install(
+                        &model.id,
+                        "Install this model to verify a runtime update against an exact pinned artifact before activation."
+                            .to_owned(),
+                    );
+                }
+            }
+            return;
+        }
         let Some(provider) = compatibility_bridge::provider_for_model(model) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "Model provider is not available.".to_owned();
@@ -3663,34 +4717,181 @@ impl LocalTranscriberApp {
     }
 
     fn uninstall_runtime(&mut self, model: &SttModelInfo) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status_message = format!("Could not unload the local runtime: {error}");
+            return;
+        }
+        if let Ok(binding) = self
+            .transcription_service
+            .installation_binding(&ModelId::new(&model.id))
+        {
+            let target = config::runtime_storage_dir().join(&binding.managed_runtime_id);
+            let owns_target = self
+                .config
+                .general
+                .managed_runtimes
+                .get(&binding.managed_runtime_id)
+                .and_then(|install| {
+                    runtime_uninstall_target(
+                        &config::runtime_storage_dir(),
+                        &binding.managed_runtime_id,
+                        &install.path,
+                    )
+                })
+                .is_some_and(|candidate| candidate == target);
+            let prior_fingerprint =
+                match config::settings::artifact_config_fingerprint(&self.config) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message =
+                            format!("Could not prepare runtime removal settings witness: {error}");
+                        return;
+                    }
+                };
+            let mut staged_removal = if owns_target {
+                match ManagedRemoval::stage(
+                    &target,
+                    std::slice::from_ref(&target),
+                    prior_fingerprint,
+                ) {
+                    Ok(removal) => Some(removal),
+                    Err(error) => {
+                        if error.requires_recovery() {
+                            self.artifact_recovery_error = Some(error.to_string());
+                        }
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Could not stage runtime removal: {error}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let removed_files = staged_removal
+                .as_ref()
+                .is_some_and(ManagedRemoval::removed_files);
+            let previous_config = self.config.clone();
+            self.config
+                .general
+                .managed_runtimes
+                .remove(&binding.managed_runtime_id);
+            config::normalize_config(&mut self.config);
+            let removal_preparation = config::settings::artifact_config_fingerprint(&self.config)
+                .map_err(|error| error.to_string())
+                .and_then(|fingerprint| {
+                    staged_removal.as_mut().map_or(Ok(()), |removal| {
+                        removal
+                            .prepare_config_commit(fingerprint)
+                            .map_err(|error| error.to_string())
+                    })
+                });
+            if let Err(error) = removal_preparation {
+                self.config = previous_config;
+                let rollback = staged_removal.and_then(|removal| removal.rollback().err());
+                let message = format!(
+                    "Could not prepare runtime removal transaction: {error}{}",
+                    rollback
+                        .as_ref()
+                        .map(|error| format!(". Restoring the runtime also failed: {error}"))
+                        .unwrap_or_default()
+                );
+                if rollback.is_some() {
+                    self.artifact_recovery_error = Some(message.clone());
+                }
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+            if let Err(error) = config::save_config(&self.config) {
+                self.config = previous_config;
+                let message = format!(
+                    "Could not confirm runtime removal settings persistence: {error}. The runtime tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
+                );
+                if staged_removal.is_some() {
+                    self.artifact_recovery_error = Some(message.clone());
+                }
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+            let cleanup = staged_removal
+                .and_then(|removal| removal.commit().err())
+                .or_else(|| crate::installations::remove_previous_runtime_if_exists(&target).err());
+            if let Some(store) = self.settings_store.as_mut() {
+                store.mark_current_persisted();
+            }
+            self.transcription_service =
+                self.transcription_service.with_config(self.config.clone());
+            self.refresh_playground_runtime_statuses();
+            if let Some(error) = cleanup {
+                let message = format!(
+                    "Runtime was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}"
+                );
+                self.artifact_recovery_error = Some(message.clone());
+                self.status = TranscriptionStatus::Error;
+                self.status_message = message;
+                return;
+            }
+            self.status = TranscriptionStatus::Idle;
+            self.status_message = if removed_files {
+                "Uninstalled verified local speech runtime.".to_owned()
+            } else {
+                "Removed verified local speech runtime from Scribe.".to_owned()
+            };
+            return;
+        }
         let Some(provider) = compatibility_bridge::provider_for_model(model) else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "Model provider is not available.".to_owned();
             return;
         };
 
-        let removal = uninstall_runtime_files(&self.config, provider.id());
-        let removed_files =
-            match apply_runtime_uninstall_result(&mut self.config, provider.id(), removal) {
-                Ok(removed_files) => removed_files,
-                Err(message) => {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not uninstall runtime. {message}");
-                    return;
-                }
-            };
-        self.save_config();
+        let previous_config = self.config.clone();
+        self.config.general.managed_runtimes.remove(provider.id());
+        config::normalize_config(&mut self.config);
+        if let Err(error) = config::save_config(&self.config) {
+            self.config = previous_config;
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "Could not persist legacy runtime settings removal: {error}. Unmanaged files were left untouched."
+            );
+            return;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_runtime_statuses();
         self.status = TranscriptionStatus::Idle;
-        self.status_message = match removed_files {
-            true => "Uninstalled local speech runtime.".to_owned(),
-            false => "Removed local speech runtime from Scribe.".to_owned(),
-        };
+        self.status_message = "Removed the legacy runtime from Scribe settings. Its files were preserved because they are not governed by the normalized manifest transaction.".to_owned();
     }
 
     fn refresh_playground_runtime_statuses(&mut self) {
         for card in &mut self.playground_cards {
             card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
+        }
+    }
+
+    fn artifact_mutation_block_reason(&self) -> Option<String> {
+        if let Some(error) = self.artifact_recovery_error.as_ref() {
+            Some(error.clone())
+        } else if self.capture_is_active() || self.pending_recording.is_some() {
+            Some("Stop the active recording before changing speech artifacts.".to_owned())
+        } else if self.effective_status() == TranscriptionStatus::Transcribing
+            || self.pending_output.is_some()
+        {
+            Some("Wait for final transcription and output to finish before changing speech artifacts.".to_owned())
+        } else if self.playground_pending > 0 {
+            Some("Wait for Playground jobs to finish before changing speech artifacts.".to_owned())
+        } else if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
+            Some("Wait for the active installation to finish or cancel it first.".to_owned())
+        } else {
+            None
         }
     }
 }
@@ -3760,6 +4961,9 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for (_, cancellation) in self.artifact_installations.values() {
+            cancellation.cancel();
+        }
         self.stop_and_discard_active_recording();
         self.shutdown_rolling_preview();
         if !self
@@ -4028,6 +5232,22 @@ impl LocalTranscriberApp {
                             .copied()
                             .expect("filtered download row must have a neutral descriptor");
                         download_summary_row(ui, descriptor, install_status);
+                        if let Some((_, cancellation)) = self.artifact_installations.get(&model.id)
+                        {
+                            let cancellation = cancellation.clone();
+                            let response = ui
+                                .add(small_button(ui, "Cancel installation"))
+                                .on_hover_text(
+                                    "Stop after the current native chunk and retain resumable download bytes.",
+                                );
+                            if response.clicked() {
+                                cancellation.cancel();
+                                self.status_message = format!(
+                                    "Cancelling {}. Downloaded partials will be kept for Resume.",
+                                    descriptor.display_name
+                                );
+                            }
+                        }
                         if index + 1 < download_rows.len() {
                             ui.add_space(8.0);
                         }
@@ -5560,7 +6780,7 @@ fn download_progress_bar_text(install_status: &ModelInstallStatus) -> String {
             format!("{percent:.0}% Completed")
         }
         ModelInstallStatus::Downloading { .. } => "Downloading".to_owned(),
-        ModelInstallStatus::InstallingRuntime => "Preparing runtime".to_owned(),
+        ModelInstallStatus::InstallingRuntime => "Verifying and installing".to_owned(),
         ModelInstallStatus::Installed => "100% Completed".to_owned(),
         ModelInstallStatus::Error(_) => "Failed".to_owned(),
         ModelInstallStatus::RuntimeError(_) => "Runtime repair failed".to_owned(),
@@ -6585,45 +7805,6 @@ fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<St
     }
 }
 
-fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<bool, String> {
-    let mut removed_any = false;
-    for path in uninstall_candidate_paths(config, model) {
-        if !path.exists() || !is_app_managed_model_path(config, &path) {
-            continue;
-        }
-        let result = if path.is_dir() {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
-        result.map_err(|err| format!("Could not delete {}: {err}", path.display()))?;
-        removed_any = true;
-    }
-    Ok(removed_any)
-}
-
-fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool, String> {
-    let Some(install) = config.general.managed_runtimes.get(runtime_id) else {
-        return Ok(false);
-    };
-    let Some(target) =
-        runtime_uninstall_target(&config::runtime_storage_dir(), runtime_id, &install.path)
-    else {
-        return Ok(false);
-    };
-    if !target.exists() {
-        return Ok(false);
-    }
-
-    let result = if target.is_dir() {
-        fs::remove_dir_all(&target)
-    } else {
-        fs::remove_file(&target)
-    };
-    result.map_err(|err| format!("Could not delete {}: {err}", target.display()))?;
-    Ok(true)
-}
-
 fn build_development_runtime_package(
     runtime_id: &str,
     runtime_label: &str,
@@ -7010,12 +8191,33 @@ fn runtime_uninstall_target(
     runtime_id: &str,
     installed_path: &Path,
 ) -> Option<PathBuf> {
-    if runtime_id.is_empty() || installed_path.as_os_str().is_empty() {
+    let mut runtime_components = Path::new(runtime_id).components();
+    if installed_path.as_os_str().is_empty()
+        || installed_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !matches!(
+            runtime_components.next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || runtime_components.next().is_some()
+    {
         return None;
     }
 
     let runtime_dir = storage_dir.join(runtime_id);
-    if installed_path.starts_with(&runtime_dir) {
+    let storage_canonical = storage_dir.canonicalize().ok()?;
+    let installed_canonical = installed_path.canonicalize().ok()?;
+    if !installed_canonical.starts_with(&storage_canonical)
+        || path_has_link_below(storage_dir, installed_path)
+    {
+        return None;
+    }
+    if let Ok(runtime_canonical) = runtime_dir.canonicalize()
+        && installed_canonical.starts_with(&runtime_canonical)
+        && runtime_canonical.starts_with(&storage_canonical)
+        && !path_has_link_below(storage_dir, &runtime_dir)
+    {
         Some(runtime_dir)
     } else if installed_path.starts_with(storage_dir) {
         Some(installed_path.to_path_buf())
@@ -7024,33 +8226,39 @@ fn runtime_uninstall_target(
     }
 }
 
-fn uninstall_candidate_paths(config: &AppConfig, model: &SttModelInfo) -> Vec<PathBuf> {
-    let mut paths = [
-        config::managed_model_path(config, model),
-        config::downloaded_model_path(config, model),
-        model.local_path.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    dedup_paths(&mut paths);
-    paths
+fn path_has_link_below(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return true;
+        }
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            return true;
+        };
+        if runtime_entry_is_link(&metadata) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
-    path.starts_with(config::model_storage_dir(config))
-}
-
-fn dedup_paths(paths: &mut Vec<PathBuf>) {
-    let mut seen = Vec::new();
-    paths.retain(|path| {
-        if seen.iter().any(|seen_path| seen_path == path) {
-            false
-        } else {
-            seen.push(path.clone());
-            true
-        }
-    });
+    let storage = config::model_storage_dir(config);
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !path.starts_with(&storage)
+    {
+        return false;
+    }
+    path.canonicalize()
+        .ok()
+        .zip(storage.canonicalize().ok())
+        .is_some_and(|(path, storage)| path.starts_with(storage))
 }
 
 fn select_first_installed_model(config: &mut AppConfig) {
@@ -7281,6 +8489,8 @@ mod layout_tests {
     use crate::audio::CaptureMetrics;
     use crate::streaming::StreamIdentity;
     use crate::transcription::StreamUpdate;
+
+    static NEXT_TEST_SESSION: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn start_tab_env_parser_accepts_known_tabs() {
@@ -9488,6 +10698,8 @@ mod layout_tests {
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
+            artifact_installations: HashMap::new(),
+            artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
             playground_selector_return_focus: None,
@@ -9752,6 +10964,7 @@ mod layout_tests {
         );
 
         let mut unavailable = whisper;
+        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
         unavailable.backend = "sherpa-onnx".to_owned();
         unavailable.download_model = None;
         assert_eq!(
@@ -9762,6 +10975,17 @@ mod layout_tests {
                 show_uninstall: false,
             }
         );
+    }
+
+    #[test]
+    fn installation_failures_preserve_recovery_required_classification() {
+        let normal = InstallJobFailure::from(InstallError::Failed("retryable".to_owned()));
+        assert!(!normal.recovery_required);
+        let recovery = InstallJobFailure::from(InstallError::RecoveryRequired(
+            "filesystem state is ambiguous".to_owned(),
+        ));
+        assert!(recovery.recovery_required);
+        assert!(recovery.message.contains("recovery required"));
     }
 
     #[test]
@@ -10613,6 +11837,16 @@ mod layout_tests {
             ),
             "Repair runtime"
         );
+        assert_eq!(
+            model_primary_action_label(
+                ModelPrimaryAction::Retry,
+                &model,
+                &ModelInstallStatus::Error(
+                    "Installation cancelled; resumable partial retained".to_owned(),
+                ),
+            ),
+            "Resume"
+        );
     }
 
     #[test]
@@ -10737,6 +11971,7 @@ mod layout_tests {
         );
 
         let mut unavailable = whisper;
+        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
         unavailable.backend = "sherpa-onnx".to_owned();
         unavailable.download_model = None;
         let unavailable_state =
@@ -11202,6 +12437,7 @@ mod layout_tests {
         );
 
         let mut faster_whisper = whisper;
+        faster_whisper.id = "faster_whisper_tiny_en".to_owned();
         faster_whisper.backend = "faster-whisper".to_owned();
         faster_whisper.download_model = Some("tiny.en".to_owned());
         let action = runtime_action_state(&AppConfig::default(), &faster_whisper);
@@ -11242,26 +12478,30 @@ mod layout_tests {
 
         let managed_models = [
             (
+                "sherpa_onnx_zipformer_small",
                 "sherpa-onnx",
                 "sherpa_onnx",
                 "scribe-sherpa-onnx",
                 "sherpa-onnx-zipformer-small-en-2023-06-26",
             ),
             (
+                "moonshine",
                 "Moonshine",
                 "moonshine",
                 "scribe-moonshine",
                 "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27",
             ),
             (
+                "parakeet_0_6b",
                 "Parakeet",
                 "parakeet",
                 "scribe-parakeet",
                 "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
             ),
         ];
-        for (backend, runtime_id, wrapper, download_model) in managed_models {
+        for (model_id, backend, runtime_id, wrapper, download_model) in managed_models {
             let mut model = test_model();
+            model.id = model_id.to_owned();
             model.backend = backend.to_owned();
             model.download_model = Some(download_model.to_owned());
 
@@ -11324,6 +12564,7 @@ mod layout_tests {
             )),
         );
         let mut model = test_model();
+        model.id = "faster_whisper_tiny_en".to_owned();
         model.backend = "faster-whisper".to_owned();
         model.download_model = Some("tiny.en".to_owned());
 
@@ -11341,6 +12582,7 @@ mod layout_tests {
             )),
         );
         model.backend = "Vosk".to_owned();
+        model.id = "vosk_small_en".to_owned();
         model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
 
         let action = runtime_action_state(&config, &model);
@@ -11570,15 +12812,25 @@ mod layout_tests {
 
     #[test]
     fn runtime_uninstall_target_only_allows_app_runtime_storage() {
-        let storage_dir = PathBuf::from("/tmp/scribe-runtimes");
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-uninstall-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage_dir = root.join("runtimes");
         let runtime_dir = storage_dir.join("whisper_cpp");
         let runtime_executable = runtime_dir.join("bin").join("whisper-cli");
         let sibling_runtime_file = storage_dir.join("legacy-whisper-cli");
-        let external_runtime = PathBuf::from("/opt/whisper.cpp/bin/whisper-cli");
+        let external_runtime = root.join("external").join("whisper-cli");
+        fs::create_dir_all(runtime_executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(external_runtime.parent().unwrap()).unwrap();
+        fs::write(&runtime_executable, b"runtime").unwrap();
+        fs::write(&sibling_runtime_file, b"legacy").unwrap();
+        fs::write(&external_runtime, b"external").unwrap();
 
         assert_eq!(
             runtime_uninstall_target(&storage_dir, "whisper_cpp", &runtime_executable),
-            Some(runtime_dir)
+            Some(runtime_dir.clone())
         );
         assert_eq!(
             runtime_uninstall_target(&storage_dir, "whisper_cpp", &sibling_runtime_file),
@@ -11588,6 +12840,48 @@ mod layout_tests {
             runtime_uninstall_target(&storage_dir, "whisper_cpp", &external_runtime),
             None
         );
+        assert_eq!(
+            runtime_uninstall_target(
+                &storage_dir,
+                "whisper_cpp",
+                &runtime_dir.join("bin").join("..").join("whisper-cli")
+            ),
+            None
+        );
+        assert_eq!(
+            runtime_uninstall_target(&storage_dir, "../external", &runtime_executable),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_uninstall_target_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-runtime-uninstall-link-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage_dir = root.join("runtimes");
+        let external = root.join("external");
+        fs::create_dir_all(&storage_dir).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("whisper-cli"), b"external").unwrap();
+        let linked_runtime = storage_dir.join("whisper_cpp");
+        symlink(&external, &linked_runtime).unwrap();
+
+        assert_eq!(
+            runtime_uninstall_target(
+                &storage_dir,
+                "whisper_cpp",
+                &linked_runtime.join("whisper-cli")
+            ),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11614,12 +12908,11 @@ mod layout_tests {
             config::ManagedModelInstall::new(small_path.clone()),
         );
 
-        let base_model = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .unwrap();
-
-        assert!(uninstall_model_files(&config, &base_model).unwrap());
+        let removal =
+            ManagedRemoval::stage(&base_path, std::slice::from_ref(&base_path), "0".repeat(64))
+                .unwrap();
+        assert!(removal.removed_files());
+        removal.commit().unwrap();
         assert!(!base_path.exists());
         config.general.managed_models.remove("whisper_cpp_base_en");
         select_first_installed_model(&mut config);
@@ -11663,12 +12956,7 @@ mod layout_tests {
         let mut config = AppConfig::default();
         config.general.model_storage_dir = app_storage;
         config.general.model_paths = model_paths;
-        let model = config::configured_models(&config)
-            .into_iter()
-            .find(|model| model.id == "whisper_cpp_base_en")
-            .unwrap();
-
-        assert!(!uninstall_model_files(&config, &model).unwrap());
+        assert!(!is_app_managed_model_path(&config, &external_path));
         assert!(external_path.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);

@@ -1,39 +1,25 @@
 # Scribe
 
-Scribe is a lightweight local-first desktop speech-to-text app built with Rust and egui/eframe. It does not use Tauri, Electron, React, cloud STT, an account or sync service, a Python server, any always-running model process, or a plugin system.
+Scribe is a lightweight local-first desktop speech-to-text app built with Rust
+and egui/eframe. It does not use Tauri, Electron, React, cloud STT, an account
+or sync service, a Python server, or a plugin system.
 
 The app shell stays small and only invokes an STT runtime when the user records audio and starts transcription.
 
 ## Current Features
 
-- Native egui desktop UI with Transcribe, Models, Playground, and Settings pages aligned to `DESIGN.md`.
-- Local JSON config for hotkey, active model, Playground ordering, managed model/runtime metadata, performance mode, theme mode, audio input device, and max recording duration.
+- Native egui desktop UI with General, Models, History, Advanced, About, and opt-in Debug navigation aligned to the checked-in Scribe design tokens.
+- Versioned local JSON settings with field-level salvage, unknown-field preservation, debounced atomic replacement, and legacy migration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
-- Local microphone recording through `cpal`, optional microphone device selection, and temporary WAV output through `hound`.
-- Six runnable local STT backends: `whisper.cpp`, `faster-whisper`, Vosk, sherpa-onnx, Moonshine, and Parakeet. They use bundled/managed runtime discovery, managed downloaded models, and simple `Auto` / `Prefer GPU` / `CPU only` performance modes where the runtime supports them.
-- Experimental sherpa-onnx-family support (sherpa-onnx, Moonshine, and Parakeet) runs through managed, short-lived Python sidecars and currently provides batch transcription only; streaming needs a future backend API.
-- Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper, Vosk, sherpa-onnx, Moonshine, and Parakeet model directories.
-- Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
+- Native microphone capture through `cpal`; callback samples enter a fixed-capacity SPSC ring and native workers perform downmixing, 16 kHz resampling, normalization, metering, VAD, endpointing, and post-roll without sending PCM through the UI.
+- One application-level logical runtime handler, `TranscribeCppRuntime`, selected only by the private `RuntimeRouter`. The normalized catalog currently exposes four Experimental whisper.cpp artifacts and zero Supported models.
+- Manifest-driven, resumable, exact-hash model/runtime installation with staged native smoke tests, atomic activation, one previous-known-good runtime, and crash recovery.
+- Non-blocking native workers for capture, model preload, rolling batch preview, final transcription, and diagnostic latency breakdowns.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
 - Optional Windows insertion of the completed transcript into the captured app; other platforms use an explicit clipboard-only fallback.
-- Model metadata for:
-  - whisper.cpp tiny.en
-  - whisper.cpp base.en
-  - whisper.cpp small.en
-  - whisper.cpp medium.en
-  - Vosk small English
-  - faster-whisper tiny.en
-  - faster-whisper base.en
-  - faster-whisper small.en
-  - faster-whisper medium.en
-  - faster-whisper large-v3
-  - faster-whisper turbo
-  - faster-whisper distil-large-v3
-  - sherpa-onnx Zipformer Small
-  - Moonshine tiny English
-  - Parakeet Unified 0.6B int8
-- Playground model selection is explicit: choose installed models to test, keep their drag order, and send the same WAV file through every selected ready model. Models with a missing runtime stay visible with repair guidance and block partial runs.
+- Runtime-neutral model metadata for whisper.cpp tiny.en, base.en, small.en, and medium.en. Family/backend distinctions remain private manifest/adapter data.
+- Debug comparison selection is explicit: choose installed models, retain drag order, and decode the same native prepared audio through the shared `TranscriptionService`.
 - Transcript copy and clear actions.
 
 ## Requirements
@@ -149,22 +135,40 @@ cargo check
 
 ## Models and Runtime
 
-Open `Models` to install a local whisper.cpp, faster-whisper, Vosk, sherpa-onnx, Moonshine, or Parakeet model, select the active model, or uninstall models to free storage. One click prepares a missing shared backend runtime from the packaged/staged runtime included with the build, persists it, then downloads the requested model. Scribe stores managed models under the app data directory and does not expose model path settings in the normal UI. Use the default-collapsed `Runtime maintenance` section only for explicit updates or removal.
+Open `Models` to install, select, repair, update, or remove one of the four
+normalized Experimental models. The UI receives only runtime-neutral
+descriptors and capabilities. A model is not labelled Supported until its full
+compatibility matrix passes; currently none has.
 
-Managed model files live under the app data `models` directory. Managed runtime copies live under the app data `runtimes` directory. Legacy external model paths can still be read when valid, but they are not treated as app-managed installs and are not deleted by uninstall.
+Managed model files live under the app-data `models` directory and managed
+runtime packages under `runtimes`. Legacy external paths remain readable where
+the private compatibility bridge still needs them, but they are not treated as
+managed installs and uninstall never deletes them.
 
-Runtime discovery is internal. Scribe checks for bundled runtime sidecars next to the executable, then managed runtime copies under the app data directory. Development builds can still use `SCRIBE_WHISPER_CPP_CLI`, `SCRIBE_WHISPER_CUDA_CLI`, `SCRIBE_FASTER_WHISPER_CLI`, `SCRIBE_VOSK_CLI`, `SCRIBE_SHERPA_ONNX_CLI`, `SCRIBE_MOONSHINE_CLI`, or `SCRIBE_PARAKEET_CLI` as fallback runtime paths.
+On Windows x64, the primary package is pinned to whisper.cpp v1.9.1 commit
+`f049fff95a089aa9969deb009cdd4892b3e74916`. Installation validates the release
+archive size and SHA-256, extracts only the 13 allowlisted files, runs native
+health/load/transcription/unload/reload smoke behavior in an isolated child,
+and atomically activates the result. Valid partials support HTTP Range resume.
+Settings fingerprints and recovery journals make activation/removal
+restart-safe; exactly one previous known-good runtime is retained for rollback.
 
-When running a debug build from a source checkout on Unix, the Models page can
-also use the checked-in `scripts/bundle-*-runtime.sh` helpers as a development
-fallback. If a packaged sidecar is not already staged, clicking `Install
-runtime` builds the runtime directly into Scribe's managed app-data runtime
-directory. This source-checkout bundle-script fallback is Unix-only: Windows
-development builds need packaged sidecars staged next to the executable, or explicit
-development runtime paths through the corresponding `SCRIBE_*_CLI` environment
-variables. Release builds do not use source-checkout scripts unless
-`SCRIBE_ALLOW_DEV_RUNTIME_INSTALL=1` is set for explicit Unix development or
-smoke testing.
+The pinned package is CPU-only. `Auto` resolves to the health-tested CPU
+backend, `CPU` requests it explicitly, and `GPU` fails clearly because no
+verified accelerator package ships. Normalized managed runtime installation
+fails closed on platforms without a pinned, measured package.
+
+Runtime selection is private to `RuntimeRouter`. There is one logical handler,
+`TranscribeCppRuntime`; `OnnxSpeechRuntime` is absent because the named
+Zipformer candidate has not passed the complete evidence gate.
+
+### Transitional development tooling
+
+The source checkout still contains legacy bundle scripts and environment
+fallbacks for compatibility investigation. They are not normalized catalog
+support, do not create additional application-level runtime handlers, and are
+not compatibility evidence. Release behavior must use an exact pinned manifest
+and the transactional smoke/activation path above.
 
 Builds can stage the supported whisper.cpp runtime next to the executable:
 
@@ -327,7 +331,11 @@ The config stores:
 - clipboard restore after insertion
 - paste automation delay
 
-Temporary WAV files are deleted after transcription in normal operation. The latest transcription latency breakdown is diagnostic-only and is not persisted.
+Normal microphone and Debug comparison capture remains canonical PCM in native
+memory and creates no routine WAV file. The private legacy compatibility bridge
+may create a short-lived canonical WAV only while transitional adapters remain;
+it deletes the file when the request completes. The latest transcription
+latency breakdown is diagnostic-only and is not persisted.
 
 ## Notes
 

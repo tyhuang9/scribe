@@ -1559,3 +1559,106 @@ The release remains **NO-GO** until the Windows manual matrix, native-streaming
 Definition of Done, Supported-model evidence, and complete comparable latency
 report pass. Phase 9 may now replace installation with manifest-driven
 transactions without changing the safe output boundary.
+
+## Phase 9 - Verified model and runtime installation
+
+Phase 9 replaces direct artifact mutation with one manifest-driven transaction
+system shared by model and runtime installation. It does not add an audio,
+model-management, or runtime-selection subsystem. The logical handler count
+remains **one** (`TranscribeCppRuntime`); `OnnxSpeechRuntime` is still omitted,
+all four normalized Whisper artifacts remain **Experimental**, and the number
+of Supported models remains **0**.
+
+### Installation and recovery decisions
+
+- The primary Windows x64 runtime is pinned to whisper.cpp v1.9.1 commit
+  `f049fff95a089aa9969deb009cdd4892b3e74916`. Its release archive is exactly
+  7,982,101 bytes with SHA-256
+  `7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539`.
+  Activation accepts only the 13 manifest files: `whisper.dll`,
+  `whisper-cli.exe`, `ggml.dll`, `ggml-base.dll`, and the nine pinned CPU
+  backend DLLs. Missing, extra, wrong-sized, wrong-hash, linked, or reparse
+  entries fail closed. The broad upstream Release directory is not itself a
+  valid installed package because it contains unallowlisted executables and
+  libraries.
+- Downloads use bounded blocking workers, HTTP identity encoding, validated
+  Range/Content-Range resume, durable partial files, cancellation that retains
+  valid partials, and exact final size/SHA-256 checks. Invalid or oversized
+  partials are quarantined before a clean retry. ZIP extraction uses the
+  manifest as an exact allowlist, extracts only allowlisted entries, and
+  rejects traversal, links/reparse points, duplicates, and missing entries.
+  The pinned outer archive hash rejects modified archives, while exact-tree
+  validation rejects extras in a staged or installed tree.
+- Model and runtime activation use same-volume staging, durable renames, and a
+  journal containing the prior and expected settings fingerprints. Startup
+  promotes or rolls back only when the durable fingerprint proves which side
+  committed; an ambiguous mismatch preserves both artifacts and gates further
+  mutation for operator recovery. Removal uses the same fingerprinted journal
+  protocol instead of deleting files before settings persistence.
+- Exactly one previous known-good primary runtime is retained at `.previous`.
+  Startup tries current, then previous, then an explicitly located immutable
+  bundled package. A bundled candidate must pass the same exact-tree and smoke
+  checks; development PATH/CLI discovery is never treated as a packaged
+  fallback. Orphaned `.previous` state is reconciled after durable settings and
+  removal journals are resolved.
+- Runtime smoke tests execute in a child process controlled by a parent with a
+  120-second deadline and 25 ms cancellation polling. On Windows the child
+  suppresses operating-system fault dialogs so a malformed native package
+  cannot strand the installer. Install, update, removal, and runtime switching
+  are disabled while a session owns the artifact. Legacy unmanaged paths are
+  preserved and removal changes settings only; user artifacts are not silently
+  deleted.
+- Normalized managed runtime installation currently fails closed outside
+  Windows x64 because no pinned package manifest and native smoke evidence has
+  been established for those platforms. This preserves buildability without
+  claiming cross-platform installation support.
+
+### Verification and measured evidence
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/check/lint | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings` | **PASS** |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 474 discovered, 468 passed, 0 failed, 6 environment-gated tests ignored |
+| Debug/release builds | `cargo build --all-features`; `cargo build --release --all-features` | **PASS** |
+| Architecture boundary | Exact `runtime_router::tests::concrete_runtime_boundary_is_confined_to_the_router` plus the full source-boundary suite | **PASS** - exactly one logical handler; concrete runtime selection remains router-private |
+| Download/install failure injection | In-process HTTP, archive, activation, removal, and recovery tests | **PASS** - resume, ignored/invalid Range, cancellation, size/hash failure, traversal/extra/missing entries, smoke failure, activation/rollback, unchanged-model commit/rollback, config-fingerprint mismatch, and interrupted removal covered |
+| Exact pinned runtime smoke | `local-transcriber.exe --scribe-install-smoke-parent ... cpu` against a temporary exact 13-file package | **PASS** - health 4,098 ms; load 4,341 ms; decode 732 ms; unload/reload 4,051 ms; exit 0 |
+| Pinned model/service fixture | Exact ignored `transcription_service_jfk_smoke_uses_the_whisper_cpp_facade` with v1.9.1/base.en/JFK/CPU | **PASS** - first load 4,501 ms; first decode 840 ms; warm load 0 ms; warm decode 806 ms |
+
+An earlier direct blocking helper invocation used the broad upstream Release
+directory and ended with a Windows access violation dialog. That run bypassed
+the bounded parent and is recorded as **failed evidence**. No process remained
+after termination. The final smoke used the exact manifest tree through the
+bounded parent, completed without a dialog, and passed. This verifies the
+package/install boundary; it does not promote a model to Supported or replace
+the complete compatibility suite.
+
+Phase 9 changes installation and recovery rather than normal inference. The
+saved Phase 7 comparable release measurements therefore remain the current
+before/after latency evidence; the installer smoke timings above are neither
+desktop end-to-end latency nor an improvement claim. PCM remains entirely in
+native Rust workers, tentative text remains overlay-only, and history/audio
+privacy behavior is unchanged pending Phase 10.
+
+### Risks and Phase 10 entry
+
+- **High - live installation evidence:** a real GitHub interruption/resume,
+  power-loss recovery, live Models UI transaction, and physical Windows
+  activation/rollback have not been executed. The deterministic protocol and
+  failure-injection suite pass, but the manual DL rows remain NOT VERIFIED.
+- **Medium - native package behavior:** the isolated exact package passed on
+  this Windows machine, while the broad direct invocation crashed. Only the
+  exact pinned tree is eligible; future package revisions require new hashes,
+  smoke evidence, and review.
+- **Medium - cross-platform availability:** normalized managed runtime install
+  is intentionally unavailable without a pinned platform package. Existing
+  compatibility paths remain conservative; no macOS/Linux installation claim
+  is made.
+- **Low - recovery operator path:** fingerprint ambiguity fails closed and
+  preserves state, but the UI currently reports recovery-required rather than
+  offering an automated destructive resolution.
+
+The release remains **NO-GO** until the Windows manual matrix,
+native-streaming Definition of Done, Supported-model evidence, and complete
+comparable desktop latency report pass. Phase 10 may now add durable history
+on top of the transactional artifact and settings boundary.

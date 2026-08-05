@@ -225,6 +225,12 @@ impl RuntimeRouter {
         runtime_kind_for_model(model_id).is_some()
     }
 
+    pub(crate) fn managed_runtime_id(&self, model_id: &ModelId) -> Option<&'static str> {
+        runtime_kind_for_model(model_id).map(|kind| match kind {
+            RuntimeKind::TranscribeCpp => "whisper_cpp",
+        })
+    }
+
     pub(crate) fn capabilities(&self, model_id: &ModelId) -> Option<RuntimeCapabilities> {
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),

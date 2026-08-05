@@ -145,16 +145,26 @@ impl SttBackend for WhisperCppBackend {
 
 pub fn resolve_whisper_cpp_executable(config: &AppConfig) -> Option<PathBuf> {
     resolve_whisper_cpp_executable_from_candidates(
-        bundled_runtime_root(),
+        bundled_runtime_package_root(),
         managed_runtime_roots(config),
         dev_runtime_paths(config),
     )
 }
 
-fn bundled_runtime_root() -> Option<PathBuf> {
-    env::current_exe()
+pub(crate) fn bundled_runtime_package_root() -> Option<PathBuf> {
+    let executable_dir = env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|path| path.parent().map(Path::to_path_buf))?;
+    [
+        executable_dir.join("runtimes").join("whisper.cpp"),
+        executable_dir.join("runtimes").join("whisper_cpp"),
+    ]
+    .into_iter()
+    .find(|root| {
+        whisper_cli_binary_names()
+            .iter()
+            .any(|name| root.join("bin").join(name).is_file())
+    })
 }
 
 fn managed_runtime_roots(config: &AppConfig) -> Vec<PathBuf> {
@@ -181,11 +191,11 @@ pub(crate) fn resolve_whisper_cpp_executable_from_candidates(
     dev_paths: impl IntoIterator<Item = PathBuf>,
 ) -> Option<PathBuf> {
     first_existing_path(
-        bundled_roots
+        managed_roots
             .into_iter()
             .flat_map(|root| whisper_runtime_candidates(&root))
             .chain(
-                managed_roots
+                bundled_roots
                     .into_iter()
                     .flat_map(|root| whisper_runtime_candidates(&root)),
             )
@@ -587,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_prefers_bundled_before_managed_and_dev_paths() {
+    fn resolver_prefers_explicit_managed_before_bundled_and_dev_paths() {
         let root = test_runtime_root("prefers-bundled");
         let bundled_root = root.join("bundled");
         let managed_root = root.join("managed");
@@ -608,7 +618,7 @@ mod tests {
             [dev_runtime],
         );
 
-        assert_eq!(resolved, Some(bundled_runtime));
+        assert_eq!(resolved, Some(managed_runtime));
         let _ = fs::remove_dir_all(root);
     }
 

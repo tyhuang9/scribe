@@ -3,6 +3,7 @@
   "logical_runtime": "transcribe-cpp",
   "package_id": "whisper-cpp-v1.9.1-windows-x64-cpu",
   "platform_triple": "x86_64-pc-windows-msvc",
+  "archive_prefix": "Release",
   "upstream": {
     "repository": "https://github.com/ggml-org/whisper.cpp",
     "tag": "v1.9.1",
