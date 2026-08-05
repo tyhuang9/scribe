@@ -2422,6 +2422,13 @@ mod tests {
                         && node.live() == Some(egui::accesskit::Live::Polite)
                         && node.is_live_atomic()
                 }));
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.description()
+                            == Some(
+                                "Unavailable while a retained-audio retry owns its history row.",
+                            )
+                }));
             }
         }
     }

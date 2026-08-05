@@ -17005,6 +17005,23 @@ mod layout_tests {
     }
 
     #[test]
+    fn shared_settings_actions_cancel_capture_and_exit_disabled_debug() {
+        let mut app = test_app();
+        app.apply_settings_screen_action(ScreenAction::ChangeShortcut);
+        assert!(app.capturing_hotkey);
+        app.apply_settings_screen_action(ScreenAction::ChangeShortcut);
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.status_message, "Hotkey capture cancelled.");
+
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::Debug;
+        app.apply_settings_screen_action(ScreenAction::SetDebugMode(false));
+        assert!(!app.config.developer.debug_mode);
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+    }
+
+    #[test]
     fn preview_service_snapshot_uses_current_acceleration_settings() {
         let mut app = test_app();
         app.config.performance.acceleration_preference = AccelerationPreference::Cpu;
