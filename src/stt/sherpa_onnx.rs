@@ -511,11 +511,8 @@ mod tests {
     fn resolver_skips_broken_packaged_runtime_before_dev_runtime() {
         let root = temp_root("resolver-broken");
         let managed_root = root.join("managed");
-        let broken_runtime = managed_root.join("bin").join(
-            runtime_spec_for_runtime_id("moonshine")
-                .unwrap()
-                .wrapper_name,
-        );
+        let spec = runtime_spec_for_runtime_id("moonshine").unwrap();
+        let broken_runtime = managed_root.join("bin").join(&wrapper_names(spec)[0]);
         let dev_runtime = root.join("dev").join("scribe-moonshine-dev");
         fs::create_dir_all(broken_runtime.parent().unwrap()).unwrap();
         fs::create_dir_all(dev_runtime.parent().unwrap()).unwrap();
@@ -581,7 +578,11 @@ mod tests {
         manifest_contents: &str,
     ) -> PathBuf {
         let spec = runtime_spec_for_runtime_id(runtime_id).unwrap();
-        let executable = root.join("bin").join(spec.wrapper_name);
+        let executable = root.join("bin").join(if cfg!(windows) {
+            format!("{}.bat", spec.wrapper_name)
+        } else {
+            spec.wrapper_name.to_owned()
+        });
         let runner = root.join("bin").join("sherpa_onnx_runner.py");
         let manifest = root.join("runtime-manifest.json");
         let python = root.join(venv_python_relative_path());
