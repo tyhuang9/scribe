@@ -26,6 +26,9 @@ pub(crate) struct RecordingSettingsView {
     pub device_label: String,
     pub input_level: f32,
     pub auto_insert_transcript: bool,
+    pub output_label: String,
+    pub show_restore_clipboard: bool,
+    pub output_notice: Option<String>,
     pub restore_clipboard_after_insert: bool,
     pub paste_delay_ms: u64,
     pub active_model_label: String,
@@ -54,6 +57,9 @@ impl Default for RecordingSettingsView {
             device_label: "OS default".into(),
             input_level: 0.0,
             auto_insert_transcript: false,
+            output_label: "Automatically insert final transcript".into(),
+            show_restore_clipboard: cfg!(target_os = "windows"),
+            output_notice: None,
             restore_clipboard_after_insert: true,
             paste_delay_ms: 60,
             active_model_label: "No model selected".into(),
@@ -1399,30 +1405,34 @@ fn output_settings_panel(
         ui.add_space(8.0);
         let mut auto_insert = settings.auto_insert_transcript;
         if ui
-            .checkbox(&mut auto_insert, "Automatically insert final transcript")
+            .checkbox(&mut auto_insert, &settings.output_label)
             .changed()
         {
             *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
         }
         ui.add_enabled_ui(auto_insert, |ui| {
-            let mut restore = settings.restore_clipboard_after_insert;
-            if ui
-                .checkbox(&mut restore, "Restore clipboard after insert")
-                .changed()
-            {
-                *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
-            }
-            ui.horizontal(|ui| {
-                let label = ui.label("Paste delay (ms)");
-                let mut delay = settings.paste_delay_ms as i64;
+            if settings.show_restore_clipboard {
+                let mut restore = settings.restore_clipboard_after_insert;
                 if ui
-                    .add(egui::DragValue::new(&mut delay).clamp_range(1..=1_000))
-                    .labelled_by(label.id)
+                    .checkbox(&mut restore, "Restore clipboard after insert")
                     .changed()
                 {
-                    *action = ScreenAction::SetPasteDelayMs(delay as u64);
+                    *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
                 }
-            });
+                ui.horizontal(|ui| {
+                    let label = ui.label("Paste delay ms");
+                    let mut delay = settings.paste_delay_ms as i64;
+                    if ui
+                        .add(egui::DragValue::new(&mut delay).clamp_range(1..=1_000))
+                        .labelled_by(label.id)
+                        .changed()
+                    {
+                        *action = ScreenAction::SetPasteDelayMs(delay as u64);
+                    }
+                });
+            } else if let Some(notice) = &settings.output_notice {
+                ui.label(RichText::new(notice).color(ui_palette(ui).muted_text));
+            }
         });
     });
 }
@@ -1850,6 +1860,40 @@ mod tests {
                     node.name() == Some("Finish recording before changing recording settings.")
                 })
         );
+    }
+
+    #[test]
+    fn output_controls_use_platform_contract_and_bounded_delay() {
+        let mut settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            output_label: "Copy final transcript to clipboard automatically".into(),
+            show_restore_clipboard: false,
+            output_notice: Some("Clipboard-only fallback".into()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(
+                    ui,
+                    SettingsTab::Output,
+                    &TranscriptionState::default(),
+                    &settings_view,
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(
+            |(_, node)| node.name() == Some("Copy final transcript to clipboard automatically")
+        ));
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Clipboard-only fallback"))
+        );
+        settings_view.paste_delay_ms = 1_000;
+        assert_eq!(settings_view.paste_delay_ms, 1_000);
     }
 
     #[test]

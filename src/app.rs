@@ -9691,6 +9691,19 @@ impl LocalTranscriberApp {
                 .then(|| self.current_audio_level())
                 .unwrap_or_default(),
             auto_insert_transcript: self.config.output.auto_insert_transcript,
+            output_label: if cfg!(target_os = "windows") {
+                "Insert final transcript into captured app".to_owned()
+            } else {
+                "Copy final transcript to clipboard automatically".to_owned()
+            },
+            show_restore_clipboard: cfg!(target_os = "windows"),
+            output_notice: self
+                .config
+                .output
+                .auto_insert_transcript
+                .then(text_output::paste_automation_notice)
+                .flatten()
+                .map(str::to_owned),
             restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
             paste_delay_ms: self.config.output.paste_delay_ms,
             active_model_label: self
