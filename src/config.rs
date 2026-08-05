@@ -19,12 +19,14 @@ pub mod settings;
 
 #[allow(unused_imports)]
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
-    OutputSettings, OverlayMode, OverlayPosition, OverlaySettings, PerformanceSettings,
-    RecordingSettings, SettingsStore, StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistoryMode,
+    HistorySettings, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
+    PerformanceSettings, RecordingSettings, SettingsStore, StreamingMode, StreamingSettings,
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;
+pub const MAX_HISTORY_ENTRIES: u32 = 1_000;
+pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3_650;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManagedModelInstall {
@@ -364,6 +366,10 @@ pub fn runtime_storage_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("runtimes"))
 }
 
+pub fn history_storage_dir() -> Result<PathBuf> {
+    Ok(scribe_project_dirs()?.data_dir().join("history"))
+}
+
 pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<PathBuf> {
     config
         .general
@@ -565,6 +571,20 @@ pub fn normalize_config(config: &mut AppConfig) {
         .clamp(config.recording.internal_pause_ms.max(300), 5_000);
     config.recording.pre_roll_ms = config.recording.pre_roll_ms.min(2_000);
     config.recording.post_roll_ms = config.recording.post_roll_ms.min(2_000);
+    config.history.max_unpinned_entries = config
+        .history
+        .max_unpinned_entries
+        .clamp(1, MAX_HISTORY_ENTRIES);
+    config.history.transcript_retention_days = config
+        .history
+        .transcript_retention_days
+        .filter(|days| *days > 0)
+        .map(|days| days.min(MAX_HISTORY_RETENTION_DAYS));
+    config.history.audio_retention_days = config
+        .history
+        .audio_retention_days
+        .filter(|days| *days > 0)
+        .map(|days| days.min(MAX_HISTORY_RETENTION_DAYS));
     if config.output.paste_delay_ms == 0 {
         config.output.paste_delay_ms = default_paste_delay_ms();
     }
@@ -847,6 +867,10 @@ mod tests {
         assert_eq!(config.recording.pre_roll_ms, 250);
         assert_eq!(config.recording.post_roll_ms, 200);
         assert_eq!(config.streaming.mode, StreamingMode::Auto);
+        assert_eq!(config.history.mode, HistoryMode::TranscriptOnly);
+        assert_eq!(config.history.max_unpinned_entries, 20);
+        assert!(!config.history.mode.stores_audio());
+        assert!(config.history.mode.stores_transcripts());
     }
 
     #[test]
@@ -878,6 +902,27 @@ mod tests {
             config.recording.max_recording_seconds,
             MAX_RECORDING_SECONDS
         );
+    }
+
+    #[test]
+    fn history_retention_values_are_bounded_for_hand_edited_settings() {
+        let mut config = AppConfig::default();
+        config.history.max_unpinned_entries = 0;
+        config.history.transcript_retention_days = Some(0);
+        config.history.audio_retention_days = Some(u32::MAX);
+
+        normalize_config(&mut config);
+
+        assert_eq!(config.history.max_unpinned_entries, 1);
+        assert_eq!(config.history.transcript_retention_days, None);
+        assert_eq!(
+            config.history.audio_retention_days,
+            Some(MAX_HISTORY_RETENTION_DAYS)
+        );
+
+        config.history.max_unpinned_entries = u32::MAX;
+        normalize_config(&mut config);
+        assert_eq!(config.history.max_unpinned_entries, MAX_HISTORY_ENTRIES);
     }
 
     #[test]

@@ -156,11 +156,58 @@ pub struct OverlaySettings {
     pub unknown: UnknownFields,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    Off,
+    #[default]
+    TranscriptOnly,
+    TranscriptAndAudio,
+}
+
+impl HistoryMode {
+    pub const ALL: [Self; 3] = [Self::Off, Self::TranscriptOnly, Self::TranscriptAndAudio];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::TranscriptOnly => "Transcript only",
+            Self::TranscriptAndAudio => "Transcript and audio",
+        }
+    }
+
+    pub fn stores_transcripts(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn stores_audio(self) -> bool {
+        matches!(self, Self::TranscriptAndAudio)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistorySettings {
+    pub mode: HistoryMode,
+    pub max_unpinned_entries: u32,
+    pub transcript_retention_days: Option<u32>,
+    pub audio_retention_days: Option<u32>,
+    pub store_application_identity: bool,
     #[serde(flatten)]
     pub unknown: UnknownFields,
+}
+
+impl Default for HistorySettings {
+    fn default() -> Self {
+        Self {
+            mode: HistoryMode::TranscriptOnly,
+            max_unpinned_entries: 20,
+            transcript_retention_days: None,
+            audio_retention_days: None,
+            store_application_identity: false,
+            unknown: UnknownFields::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

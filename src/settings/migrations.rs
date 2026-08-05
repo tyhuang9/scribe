@@ -90,7 +90,10 @@ fn parse_sectioned(mut root: Map<String, Value>, diagnostics: &mut ParseDiagnost
         take_section(&mut root, "overlay", &[], diagnostics),
         diagnostics,
     );
-    let history = parse_history(take_section(&mut root, "history", &[], diagnostics));
+    let history = parse_history(
+        take_section(&mut root, "history", &[], diagnostics),
+        diagnostics,
+    );
     let performance = parse_performance(
         take_section(&mut root, "performance", &[], diagnostics),
         diagnostics,
@@ -551,8 +554,41 @@ fn parse_overlay(
     }
 }
 
-fn parse_history(section: Map<String, Value>) -> HistorySettings {
+fn parse_history(
+    mut section: Map<String, Value>,
+    diagnostics: &mut ParseDiagnostics,
+) -> HistorySettings {
+    let defaults = HistorySettings::default();
     HistorySettings {
+        mode: take(&mut section, "mode", &[], defaults.mode, diagnostics),
+        max_unpinned_entries: take(
+            &mut section,
+            "max_unpinned_entries",
+            &[],
+            defaults.max_unpinned_entries,
+            diagnostics,
+        ),
+        transcript_retention_days: take(
+            &mut section,
+            "transcript_retention_days",
+            &[],
+            defaults.transcript_retention_days,
+            diagnostics,
+        ),
+        audio_retention_days: take(
+            &mut section,
+            "audio_retention_days",
+            &[],
+            defaults.audio_retention_days,
+            diagnostics,
+        ),
+        store_application_identity: take(
+            &mut section,
+            "store_application_identity",
+            &[],
+            defaults.store_application_identity,
+            diagnostics,
+        ),
         unknown: into_unknown(section),
     }
 }
@@ -734,7 +770,7 @@ fn into_unknown(values: Map<String, Value>) -> UnknownFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HotkeyMode, OverlayMode, OverlayPosition, StreamingMode};
+    use crate::config::{HistoryMode, HotkeyMode, OverlayMode, OverlayPosition, StreamingMode};
     use serde_json::json;
 
     #[test]
@@ -793,10 +829,67 @@ mod tests {
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.overlay.mode, OverlayMode::Live);
         assert_eq!(config.overlay.position, OverlayPosition::Bottom);
+        assert_eq!(config.history.mode, HistoryMode::TranscriptOnly);
+        assert_eq!(config.history.max_unpinned_entries, 20);
+        assert_eq!(config.history.transcript_retention_days, None);
+        assert_eq!(config.history.audio_retention_days, None);
+        assert!(!config.history.store_application_identity);
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
         );
+    }
+
+    #[test]
+    fn history_settings_salvage_invalid_fields_and_preserve_future_values() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "history": {
+                "mode": "not-a-mode",
+                "max_unpinned_entries": "many",
+                "transcript_retention_days": 30,
+                "audio_retention_days": null,
+                "store_application_identity": true,
+                "future_history": {"encryption": "kept"}
+            }
+        }));
+
+        assert_eq!(config.history.mode, HistoryMode::TranscriptOnly);
+        assert_eq!(config.history.max_unpinned_entries, 20);
+        assert_eq!(config.history.transcript_retention_days, Some(30));
+        assert_eq!(config.history.audio_retention_days, None);
+        assert!(config.history.store_application_identity);
+        assert_eq!(
+            config.history.unknown["future_history"],
+            json!({"encryption": "kept"})
+        );
+        assert!(diagnostics.invalid_values_salvaged);
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["history"]["future_history"],
+            json!({"encryption": "kept"})
+        );
+    }
+
+    #[test]
+    fn every_history_mode_round_trips() {
+        for (stored, expected) in [
+            ("off", HistoryMode::Off),
+            ("transcript_only", HistoryMode::TranscriptOnly),
+            ("transcript_and_audio", HistoryMode::TranscriptAndAudio),
+        ] {
+            let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "history": {"mode": stored}
+            }));
+            assert_eq!(config.history.mode, expected);
+            assert!(!diagnostics.invalid_values_salvaged);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["history"]["mode"],
+                stored
+            );
+        }
     }
 
     #[test]

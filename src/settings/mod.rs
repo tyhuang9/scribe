@@ -4,9 +4,9 @@ mod schema;
 
 pub use repository::SettingsStore;
 pub use schema::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistorySettings,
-    OutputSettings, OverlayMode, OverlayPosition, OverlaySettings, PerformanceSettings,
-    RecordingSettings, StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistoryMode,
+    HistorySettings, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
+    PerformanceSettings, RecordingSettings, StreamingMode, StreamingSettings,
 };
 
 pub(crate) use migrations::parse_settings_value_with_diagnostics;
