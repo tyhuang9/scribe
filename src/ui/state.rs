@@ -194,6 +194,7 @@ pub(crate) enum ModelDownloadState {
     Extracting,
     Installed,
     Failed,
+    Cancelled,
 }
 
 impl ModelDownloadState {
@@ -256,8 +257,13 @@ pub(crate) struct ModelViewModel {
     pub architecture: Option<String>,
     pub installed: bool,
     pub active: bool,
+    pub ready: bool,
     pub recommended: bool,
     pub custom: bool,
+    pub install_supported: bool,
+    pub install_action_enabled: bool,
+    pub cancel_supported: bool,
+    pub removal_supported: bool,
     pub download_state: ModelDownloadState,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
@@ -283,6 +289,20 @@ impl ModelViewModel {
         }
         self
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ModelDialog {
+    Add,
+    Details(String),
+    Remove(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelManagementState {
+    pub dialog: Option<ModelDialog>,
+    pub restore_add_focus: bool,
+    pub mutation_block_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

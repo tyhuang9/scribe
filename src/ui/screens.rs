@@ -1,7 +1,7 @@
 //! Shared, backend-neutral egui screen renderers.
 
 use eframe::egui::{
-    self, Align, ComboBox, Frame, Grid, Layout, Margin, RichText, Rounding, Stroke, Vec2,
+    self, Align, Align2, ComboBox, Frame, Grid, Layout, Margin, RichText, Rounding, Stroke, Vec2,
 };
 
 use super::{
@@ -9,8 +9,9 @@ use super::{
         ButtonTone, Icon, badge, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
-        ModelComparisonState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-        SettingsSaveState, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ModelComparisonState, ModelDialog, ModelDownloadState, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, RecordingMode, SettingsSaveState, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -110,7 +111,9 @@ pub(crate) struct ScreenView<'a> {
     pub route: UiRoute,
     pub transcription: &'a TranscriptionState,
     pub models: &'a [ModelViewModel],
+    pub model_catalog: &'a [ModelViewModel],
     pub comparison: &'a ModelComparisonState,
+    pub model_management: &'a ModelManagementState,
     pub recording_settings: &'a RecordingSettingsView,
 }
 
@@ -128,6 +131,13 @@ pub(crate) enum ScreenAction {
     ToggleComparison,
     ToggleComparisonModel(String),
     StartComparison,
+    SelectModel(String),
+    InstallModel(String),
+    CancelModelInstall(String),
+    ShowModelDetails(String),
+    RequestModelRemoval(String),
+    ConfirmModelRemoval(String),
+    CloseModelDialog,
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
     OpenModelSettings,
@@ -165,7 +175,13 @@ pub(crate) enum ScreenAction {
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
     match view.route {
         UiRoute::Transcribe => transcribe(ui, view.transcription, view.models),
-        UiRoute::Models => models(ui, view.models, view.comparison),
+        UiRoute::Models => models(
+            ui,
+            view.models,
+            view.model_catalog,
+            view.comparison,
+            view.model_management,
+        ),
         UiRoute::Settings(tab) => settings(ui, tab, view.transcription, view.recording_settings),
         UiRoute::History => placeholder(
             ui,
@@ -758,7 +774,9 @@ fn models_footer_spacer(
 fn models(
     ui: &mut egui::Ui,
     models: &[ModelViewModel],
+    model_catalog: &[ModelViewModel],
     comparison: &ModelComparisonState,
+    management: &ModelManagementState,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
@@ -783,7 +801,15 @@ fn models(
             {
                 action = ScreenAction::AddModel;
             }
-            let compare_disabled_reason = (models.len() < 2)
+            let eligible_models = models
+                .iter()
+                .filter(|model| {
+                    model.installed
+                        && model.ready
+                        && model.compatibility != super::state::ModelCompatibility::Incompatible
+                })
+                .count();
+            let compare_disabled_reason = (eligible_models < 2)
                 .then_some("Install at least two compatible models to compare them.");
             let compare = ui
                 .add_enabled_ui(compare_disabled_reason.is_none(), |ui| {
@@ -803,6 +829,16 @@ fn models(
         });
     });
     ui.add_space(24.0);
+    if models.is_empty() {
+        card(ui, |ui| {
+            ui.label(RichText::new("No installed models").strong());
+            ui.label(
+                RichText::new("Add a curated model to begin local transcription.")
+                    .color(colors.muted_text),
+            );
+        });
+        ui.add_space(8.0);
+    }
     for model in models {
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -829,6 +865,39 @@ fn models(
                 metadata(ui, Icon::Globe, &model.language_summary);
                 metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
                 metadata(ui, Icon::Folder, size_label(model.size_tier));
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let use_reason = (!model.ready).then_some("This installed model is not ready yet.");
+                let use_model = ui.add_enabled(
+                    !model.active && model.ready,
+                    egui::Button::new(if model.active { "Active" } else { "Use" }),
+                );
+                if let Some(reason) = use_reason {
+                    use_model.clone().on_hover_text(reason);
+                }
+                if use_model.clicked() {
+                    action = ScreenAction::SelectModel(model.id.clone());
+                }
+                if button(ui, "Details", ButtonTone::Text).clicked() {
+                    action = ScreenAction::ShowModelDetails(model.id.clone());
+                }
+                let remove_reason = if model.active {
+                    Some("Select another ready model before removing the active model.")
+                } else if model.custom {
+                    Some("Custom model files are not managed by Scribe and will not be deleted.")
+                } else if !model.removal_supported {
+                    Some("This model is not an app-managed download and cannot be removed here.")
+                } else {
+                    None
+                };
+                let remove = ui.add_enabled(remove_reason.is_none(), egui::Button::new("Remove"));
+                if let Some(reason) = remove_reason {
+                    remove.clone().on_hover_text(reason);
+                }
+                if remove.clicked() {
+                    action = ScreenAction::RequestModelRemoval(model.id.clone());
+                }
             });
         });
         ui.add_space(8.0);
@@ -886,7 +955,11 @@ fn models(
             if comparison.expanded {
                 ui.add_space(12.0);
                 ui.horizontal_wrapped(|ui| {
-                    for model in models {
+                    for model in models.iter().filter(|model| {
+                        model.installed
+                            && model.ready
+                            && model.compatibility != super::state::ModelCompatibility::Incompatible
+                    }) {
                         let mut checked = comparison.selected_model_ids.contains(&model.id);
                         let response = ui.checkbox(&mut checked, &model.display_name);
                         ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -991,7 +1064,132 @@ fn models(
             );
         });
     }
+    match &management.dialog {
+        Some(ModelDialog::Add) => {
+            egui::Window::new("Add models")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    if let Some(reason) = &management.mutation_block_reason {
+                        ui.label(RichText::new(reason).color(colors.warning));
+                        ui.add_space(8.0);
+                    }
+                    for model in model_catalog {
+                        card(ui, |ui| {
+                            ui.label(RichText::new(&model.display_name).strong());
+                            ui.label(RichText::new(&model.variant_label).small().color(colors.muted_text));
+                            if let Some(description) = &model.description {
+                                ui.label(description);
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(model_download_label(model)).color(colors.muted_text));
+                                if let Some(total) = model.total_bytes {
+                                    ui.label(RichText::new(format_bytes(total)).small().color(colors.muted_text));
+                                }
+                                let can_cancel = model.cancel_supported;
+                                let install = ui.add_enabled(
+                                    model.install_action_enabled,
+                                    egui::Button::new(if model.download_state == ModelDownloadState::Failed { "Retry" } else { "Install" }),
+                                );
+                                if !model.install_supported {
+                                    install.clone().on_hover_text("This model has no supported managed download in this build.");
+                                } else if let Some(reason) = &management.mutation_block_reason {
+                                    install.clone().on_hover_text(reason);
+                                }
+                                if install.clicked() {
+                                    action = ScreenAction::InstallModel(model.id.clone());
+                                }
+                                if ui.add_enabled(can_cancel, egui::Button::new("Cancel")).clicked() {
+                                    action = ScreenAction::CancelModelInstall(model.id.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if button(ui, "Close", ButtonTone::Secondary).clicked() {
+                        action = ScreenAction::CloseModelDialog;
+                    }
+                });
+        }
+        Some(ModelDialog::Details(id)) => {
+            if let Some(model) = model_catalog
+                .iter()
+                .chain(models.iter())
+                .find(|model| &model.id == id)
+            {
+                egui::Window::new("Model details")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(RichText::new(&model.display_name).strong());
+                        if let Some(description) = &model.description {
+                            ui.label(description);
+                        }
+                        ui.label(format!("Status: {}", model_download_label(model)));
+                        ui.label(format!("Languages: {}", model.language_summary));
+                        if let Some(size) = model.total_bytes {
+                            ui.label(format!("Download: {}", format_bytes(size)));
+                        }
+                        if let Some(size) = model.disk_bytes {
+                            ui.label(format!("On disk: {}", format_bytes(size)));
+                        }
+                        if model.custom {
+                            ui.label(
+                                RichText::new(
+                                    "This is a custom model. Scribe will not delete its files.",
+                                )
+                                .color(colors.muted_text),
+                            );
+                        }
+                        if button(ui, "Close", ButtonTone::Secondary).clicked() {
+                            action = ScreenAction::CloseModelDialog;
+                        }
+                    });
+            }
+        }
+        Some(ModelDialog::Remove(id)) => {
+            if let Some(model) = models.iter().find(|model| &model.id == id) {
+                egui::Window::new("Remove model?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!("Remove {} from Scribe?", model.display_name));
+                        ui.label(RichText::new("Only Scribe-managed artifact files are removed. This cannot be undone.").color(colors.warning));
+                        ui.horizontal(|ui| {
+                            if button(ui, "Cancel", ButtonTone::Secondary).clicked() { action = ScreenAction::CloseModelDialog; }
+                            if button(ui, "Remove", ButtonTone::Danger).clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
+                        });
+                    });
+            }
+        }
+        None => {}
+    }
     action
+}
+
+fn model_download_label(model: &ModelViewModel) -> String {
+    match model.download_state {
+        ModelDownloadState::Downloading => match model.total_bytes.filter(|total| *total > 0) {
+            Some(total) => format!(
+                "Downloading {:.0}%",
+                model.downloaded_bytes as f64 / total as f64 * 100.0
+            ),
+            None => format!("Downloading {}", format_bytes(model.downloaded_bytes)),
+        },
+        ModelDownloadState::Queued => "Queued".to_owned(),
+        ModelDownloadState::Verifying => "Verifying".to_owned(),
+        ModelDownloadState::Extracting => "Extracting".to_owned(),
+        ModelDownloadState::Installed => "Installed".to_owned(),
+        ModelDownloadState::Failed => model
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Install failed".to_owned()),
+        ModelDownloadState::Cancelled => "Cancelled; partial download can be resumed.".to_owned(),
+        ModelDownloadState::NotInstalled => "Not installed".to_owned(),
+    }
 }
 
 fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option<&'static str> {
@@ -1877,7 +2075,9 @@ mod tests {
                         route,
                         transcription: &state,
                         models: &[],
+                        model_catalog: &[],
                         comparison: &comparison,
+                        model_management: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -1901,7 +2101,9 @@ mod tests {
                         route: UiRoute::Transcribe,
                         transcription: state,
                         models,
+                        model_catalog: &[],
                         comparison: &comparison,
+                        model_management: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -2101,7 +2303,9 @@ mod tests {
                         route: UiRoute::Transcribe,
                         transcription: &state,
                         models: &[],
+                        model_catalog: &[],
                         comparison: &comparison,
+                        model_management: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -2162,7 +2366,9 @@ mod tests {
                         route: UiRoute::Models,
                         transcription: &state,
                         models: &[],
+                        model_catalog: &[],
                         comparison: &comparison,
+                        model_management: &Default::default(),
                         recording_settings: &settings,
                     },
                 )

@@ -70,8 +70,9 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCompatibility,
-    ModelDownloadState, ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+    AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCapabilities,
+    ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
+    ModelManagementState, ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel,
     RecordingMode, RecordingSettingsView, ScreenAction, ScreenView, SettingsTab, ThemePalette,
     UiRoute, about_page, configure_accessible_style, history_page, minimum_primary_target_height,
     recording_mode, render_screen, settings_save_state, show_navigation, theme_palette,
@@ -2675,6 +2676,8 @@ pub struct LocalTranscriberApp {
     current_tab: Tab,
     settings_tab: SettingsTab,
     models_show_comparison: bool,
+    model_comparison: ModelComparisonState,
+    model_management: ModelManagementState,
     status: TranscriptionStatus,
     transcript: String,
     raw_transcript: String,
@@ -2839,6 +2842,8 @@ impl LocalTranscriberApp {
             current_tab: initial_tab(),
             settings_tab: SettingsTab::General,
             models_show_comparison: false,
+            model_comparison: ModelComparisonState::default(),
+            model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -7189,6 +7194,16 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download(&mut self, model: &SttModelInfo) {
+        if self.artifact_installations.contains_key(&model.id)
+            || self.runtime_jobs.values().any(|job| {
+                job.download_model_ids
+                    .iter()
+                    .any(|queued_model_id| queued_model_id == &model.id)
+            })
+        {
+            self.status_message = format!("{} is already being installed.", model.name);
+            return;
+        }
         if self
             .transcription_service
             .installation_binding(&ModelId::new(&model.id))
@@ -8053,7 +8068,6 @@ impl eframe::App for LocalTranscriberApp {
             .show(ctx, |ui| match self.current_tab {
                 Tab::Transcribe => self.ui_transcribe(ui),
                 Tab::General => self.ui_general_settings(ui),
-                Tab::Models if self.models_show_comparison => self.ui_playground(ui),
                 Tab::Models => self.ui_models(ui),
                 Tab::History => self.ui_history(ui),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
@@ -8161,7 +8175,9 @@ impl LocalTranscriberApp {
                 route: UiRoute::Transcribe,
                 transcription: &state,
                 models: &models,
+                model_catalog: &[],
                 comparison: &Default::default(),
+                model_management: &Default::default(),
                 recording_settings: &settings,
             },
         );
@@ -8270,6 +8286,13 @@ impl LocalTranscriberApp {
             ScreenAction::ClearTranscript => self.clear_transcript_history(),
             ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
             ScreenAction::None
+            | ScreenAction::SelectModel(_)
+            | ScreenAction::InstallModel(_)
+            | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::RequestModelRemoval(_)
+            | ScreenAction::ConfirmModelRemoval(_)
+            | ScreenAction::CloseModelDialog
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
@@ -8562,6 +8585,232 @@ impl LocalTranscriberApp {
         if !cfg!(test) && !self.remote_catalog.attempted {
             self.request_remote_catalog(false);
         }
+        self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        let catalog = self.model_management_catalog();
+        let installed = catalog
+            .iter()
+            .filter(|model| model.installed)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.model_comparison.selected_model_ids.retain(|id| {
+            installed.iter().any(|model| {
+                &model.id == id
+                    && model.ready
+                    && model.compatibility != ModelCompatibility::Incompatible
+            })
+        });
+        let action = render_screen(
+            ui,
+            &ScreenView {
+                route: UiRoute::Models,
+                transcription: &Default::default(),
+                models: &installed,
+                model_catalog: &catalog,
+                comparison: &self.model_comparison,
+                model_management: &self.model_management,
+                recording_settings: &Default::default(),
+            },
+        );
+        self.apply_model_management_action(action);
+    }
+
+    fn model_management_catalog(&self) -> Vec<ModelViewModel> {
+        let descriptors = self
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
+            .collect::<HashMap<_, _>>();
+        config::configured_models(&self.config)
+            .into_iter()
+            .filter_map(|model| {
+                descriptors
+                    .get(&model.id)
+                    .map(|descriptor| self.model_management_view_model(&model, descriptor))
+            })
+            .collect()
+    }
+
+    fn model_management_view_model(
+        &self,
+        model: &SttModelInfo,
+        descriptor: &ModelDescriptor,
+    ) -> ModelViewModel {
+        let install_status = self.effective_install_status(model);
+        let runtime_ready =
+            runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
+        let installed = install_status.is_runnable();
+        let custom = model.local_path.is_some()
+            && !self.config.general.managed_models.contains_key(&model.id);
+        let download_state = match &install_status {
+            ModelInstallStatus::Installed => ModelDownloadState::Installed,
+            ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
+            ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
+            ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message)
+                if message.contains("cancelled") || message.contains("Cancelled") =>
+            {
+                ModelDownloadState::Cancelled
+            }
+            ModelInstallStatus::Error(_)
+            | ModelInstallStatus::RuntimeError(_)
+            | ModelInstallStatus::Missing => ModelDownloadState::Failed,
+            ModelInstallStatus::NotInstalled => ModelDownloadState::NotInstalled,
+        };
+        let (downloaded_bytes, total_bytes) = match &install_status {
+            ModelInstallStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => (*downloaded_bytes, *total_bytes),
+            _ => (0, Some(descriptor.artifact_size_bytes)),
+        };
+        let mutation_blocked = self.artifact_mutation_block_reason().is_some();
+        ModelViewModel {
+            id: model.id.clone(),
+            display_name: descriptor.display_name.to_owned(),
+            variant_label: descriptor.speed_guidance.to_owned(),
+            description: Some(descriptor.description.to_owned()),
+            runtime_group: "Local speech runtime".to_owned(),
+            installed,
+            active: installed
+                && runtime_ready
+                && self.config.general.selected_default_model == model.id,
+            ready: installed && runtime_ready,
+            recommended: model.id == "whisper_cpp_base_en",
+            custom,
+            install_supported: supports_managed_install(model),
+            install_action_enabled: !mutation_blocked
+                && !installed
+                && !matches!(
+                    install_status,
+                    ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
+                )
+                && supports_managed_install(model),
+            cancel_supported: self.artifact_installations.contains_key(&model.id),
+            removal_supported: !custom && supports_managed_uninstall(model, &install_status),
+            download_state,
+            downloaded_bytes,
+            total_bytes,
+            disk_bytes: installed
+                .then(|| {
+                    model
+                        .local_path
+                        .as_ref()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .map(|metadata| metadata.len())
+                })
+                .flatten(),
+            estimated_ram_bytes: descriptor
+                .expected_ram
+                .trim_end_matches(" GB")
+                .parse::<u64>()
+                .ok()
+                .map(|gigabytes| gigabytes * 1_000_000_000),
+            languages: descriptor
+                .languages
+                .iter()
+                .map(|language| (*language).to_owned())
+                .collect(),
+            language_summary: descriptor.languages.join(", "),
+            speed_tier: match descriptor.speed_guidance {
+                "Fastest" => ModelSpeedTier::VeryFast,
+                "Fast" => ModelSpeedTier::Fast,
+                "Medium" => ModelSpeedTier::Balanced,
+                "Slower" => ModelSpeedTier::AccurateSlow,
+                _ => ModelSpeedTier::Unknown,
+            },
+            size_tier: match descriptor.artifact_size_bytes {
+                0..=100_000_000 => ModelSizeTier::Tiny,
+                100_000_001..=200_000_000 => ModelSizeTier::Base,
+                200_000_001..=600_000_000 => ModelSizeTier::Small,
+                600_000_001..=1_000_000_000 => ModelSizeTier::Medium,
+                _ => ModelSizeTier::Large,
+            },
+            capabilities: ModelCapabilities {
+                streaming_preview: descriptor.capabilities.native_streaming,
+                translation: descriptor.capabilities.translation,
+                timestamps: descriptor.capabilities.timestamps,
+                language_detection: descriptor.capabilities.language_detection,
+            },
+            compatibility: match descriptor.compatibility {
+                CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
+                CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
+            },
+            error_message: match install_status {
+                ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message) => {
+                    Some(message)
+                }
+                _ => None,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn apply_model_management_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::AddModel => {
+                self.model_management.dialog = Some(ModelDialog::Add);
+                self.model_management.restore_add_focus = true;
+            }
+            ScreenAction::ShowModelDetails(id) => {
+                self.model_management.dialog = Some(ModelDialog::Details(id))
+            }
+            ScreenAction::RequestModelRemoval(id) => {
+                self.model_management.dialog = Some(ModelDialog::Remove(id))
+            }
+            ScreenAction::CloseModelDialog => self.model_management.dialog = None,
+            ScreenAction::ToggleComparison => {
+                self.model_comparison.expanded = !self.model_comparison.expanded
+            }
+            ScreenAction::ToggleComparisonModel(id) => {
+                if !self.model_comparison.selected_model_ids.insert(id.clone()) {
+                    self.model_comparison.selected_model_ids.remove(&id);
+                }
+            }
+            ScreenAction::StartComparison => {
+                self.status_message =
+                    "Model comparison is not scheduled from this screen yet.".to_owned();
+            }
+            ScreenAction::InstallModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    self.start_model_download(&model);
+                }
+            }
+            ScreenAction::CancelModelInstall(id) => {
+                if let Some((_, cancellation)) = self.artifact_installations.get(&id) {
+                    cancellation.cancel();
+                    self.status_message =
+                        format!("Cancelling {id}. Downloaded partials will be kept for Resume.");
+                }
+            }
+            ScreenAction::SelectModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    self.select_model_as_default(&model);
+                }
+            }
+            ScreenAction::ConfirmModelRemoval(id) => {
+                self.model_management.dialog = None;
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    self.uninstall_model(&model);
+                }
+            }
+            ScreenAction::None => {}
+            other => self.apply_transcribe_screen_action(other),
+        }
+        self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+    }
+
+    fn ui_models_legacy(&mut self, ui: &mut Ui) {
         let descriptors = self.transcription_service.model_descriptors();
         let descriptors_by_id = descriptors
             .iter()
@@ -9779,7 +10028,9 @@ impl LocalTranscriberApp {
                 route: UiRoute::Settings(self.settings_tab),
                 transcription: &state,
                 models: &[],
+                model_catalog: &[],
                 comparison: &comparison,
+                model_management: &Default::default(),
                 recording_settings: &settings,
             },
         );
@@ -9975,6 +10226,13 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::None
+            | ScreenAction::SelectModel(_)
+            | ScreenAction::InstallModel(_)
+            | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::RequestModelRemoval(_)
+            | ScreenAction::ConfirmModelRemoval(_)
+            | ScreenAction::CloseModelDialog
             | ScreenAction::AddModel
             | ScreenAction::ChangeModel
             | ScreenAction::StartRecording
@@ -16748,6 +17006,8 @@ mod layout_tests {
             current_tab: Tab::Models,
             settings_tab: SettingsTab::General,
             models_show_comparison: false,
+            model_comparison: ModelComparisonState::default(),
+            model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),

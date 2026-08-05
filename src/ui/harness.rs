@@ -7,8 +7,9 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ModelComparisonState, ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ModelComparisonState, ModelDownloadState, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase, TranscriptionState,
+        UiRoute,
     },
     theme_palette,
 };
@@ -114,6 +115,7 @@ impl Fixture {
             transcription,
             models,
             comparison,
+            model_management: ModelManagementState::default(),
             settings,
         }
     }
@@ -157,6 +159,7 @@ struct FixtureData {
     transcription: TranscriptionState,
     models: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
+    model_management: ModelManagementState,
     settings: RecordingSettingsView,
 }
 pub(crate) fn fixture_from_env() -> Option<Fixture> {
@@ -205,7 +208,9 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
         route: harness_route(*page, data.route),
         transcription: &data.transcription,
         models: &data.models,
+        model_catalog: &data.models,
         comparison: &data.comparison,
+        model_management: &data.model_management,
         recording_settings: &data.settings,
     };
     CentralPanel::default()
@@ -225,7 +230,14 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
 
 fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
     match action {
-        ScreenAction::None => {}
+        ScreenAction::None
+        | ScreenAction::SelectModel(_)
+        | ScreenAction::InstallModel(_)
+        | ScreenAction::CancelModelInstall(_)
+        | ScreenAction::ShowModelDetails(_)
+        | ScreenAction::RequestModelRemoval(_)
+        | ScreenAction::ConfirmModelRemoval(_)
+        | ScreenAction::CloseModelDialog => {}
         ScreenAction::AddModel | ScreenAction::ChangeModel => {
             data.transcription.selected_model_id = Some("base.en".into());
             data.transcription.phase = TranscriptionPhase::Ready;
