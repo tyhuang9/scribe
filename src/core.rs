@@ -26,7 +26,6 @@ pub enum DictationPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum StopReason {
-    #[allow(dead_code)] // Native endpointing begins emitting this in Phase 6.
     Endpoint,
     MaximumDuration,
     Explicit,
@@ -57,8 +56,6 @@ pub enum ModelLoadState {
 #[derive(Clone, Debug)]
 struct RequestState {
     model_id: ModelId,
-    #[allow(dead_code)] // Consumed by incremental StreamUpdate events in Phase 7.
-    last_sequence: Option<u64>,
     completed: bool,
     failed: bool,
 }
@@ -142,7 +139,6 @@ pub enum CoordinatorError {
         actual: ModelId,
     },
     #[error("update sequence {actual} is not newer than {previous}")]
-    #[allow(dead_code)] // Produced by the Phase 7 incremental update entrypoint.
     StaleSequence { previous: u64, actual: u64 },
     #[error("model-load event expected {expected}, got {actual}")]
     WrongPreloadModel { expected: ModelId, actual: ModelId },
@@ -197,7 +193,6 @@ impl SessionCoordinator {
                     request_id,
                     RequestState {
                         model_id,
-                        last_sequence: None,
                         completed: false,
                         failed: false,
                     },
@@ -388,7 +383,6 @@ impl SessionCoordinator {
             request_id,
             RequestState {
                 model_id,
-                last_sequence: None,
                 completed: false,
                 failed: false,
             },
@@ -510,30 +504,6 @@ impl SessionCoordinator {
                     preview.request_id == request_id && &preview.model_id == model_id
                 })
         })
-    }
-
-    #[allow(dead_code)] // Phase 7 calls this for committed/tentative updates.
-    pub fn accept_update(
-        &mut self,
-        session_id: SessionId,
-        request_id: RequestId,
-        model_id: &ModelId,
-        sequence: u64,
-    ) -> Result<(), CoordinatorError> {
-        let request = self.request_mut(session_id, request_id, model_id)?;
-        if request.completed {
-            return Err(CoordinatorError::DuplicateCompletion(request_id));
-        }
-        if let Some(previous) = request.last_sequence
-            && sequence <= previous
-        {
-            return Err(CoordinatorError::StaleSequence {
-                previous,
-                actual: sequence,
-            });
-        }
-        request.last_sequence = Some(sequence);
-        Ok(())
     }
 
     pub fn complete_request(
@@ -775,9 +745,6 @@ mod tests {
         let mut coordinator = SessionCoordinator::default();
         let (session_id, request_id) =
             transcribing(&mut coordinator, SessionPurpose::Dictation, "balanced");
-        coordinator
-            .accept_update(session_id, request_id, &model("balanced"), 1)
-            .unwrap();
         assert!(
             coordinator
                 .complete_request(session_id, request_id, &model("balanced"))
@@ -975,20 +942,10 @@ mod tests {
     }
 
     #[test]
-    fn sequence_and_completion_are_monotonic_and_exactly_once() {
+    fn completion_is_exactly_once() {
         let mut coordinator = SessionCoordinator::default();
         let (session_id, request_id) =
             transcribing(&mut coordinator, SessionPurpose::Dictation, "balanced");
-        coordinator
-            .accept_update(session_id, request_id, &model("balanced"), 7)
-            .unwrap();
-        assert_eq!(
-            coordinator.accept_update(session_id, request_id, &model("balanced"), 7),
-            Err(CoordinatorError::StaleSequence {
-                previous: 7,
-                actual: 7
-            })
-        );
         coordinator
             .complete_request(session_id, request_id, &model("balanced"))
             .unwrap();

@@ -8,6 +8,7 @@ use directories::ProjectDirs;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
@@ -60,6 +61,79 @@ pub struct ManagedRuntimeInstall {
     pub installed_at_unix_seconds: Option<u64>,
     #[serde(flatten)]
     pub unknown: BTreeMap<String, Value>,
+}
+
+/// A Scribe-managed GGUF selected from the trusted Hugging Face catalog.
+///
+/// This is intentionally separate from `ManagedModelInstall`: that map is a
+/// compatibility record for the static catalog and normalizes unknown IDs
+/// away. Remote artifacts retain the exact immutable Hub source that was
+/// verified before activation, so they can be loaded without treating a
+/// user-supplied path or URL as a model definition.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedRemoteModelInstall {
+    pub repository: String,
+    pub revision: String,
+    pub filename: String,
+    pub expected_size_bytes: u64,
+    pub expected_sha256: String,
+    pub path: PathBuf,
+    pub display_name: String,
+    pub description: String,
+    pub languages: Vec<String>,
+    pub recommended: bool,
+    pub installed_at_unix_seconds: Option<u64>,
+}
+
+/// A user-selected local GGUF that Scribe has hashed and smoke-validated in
+/// place. It deliberately has no Hub source, is never treated as app-owned,
+/// and must therefore never be removed from disk by Scribe.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportedGgufModelInstall {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub display_name: String,
+    pub imported_at_unix_seconds: Option<u64>,
+}
+
+impl ImportedGgufModelInstall {
+    pub fn validated(path: PathBuf, size_bytes: u64, sha256: String, display_name: String) -> Self {
+        Self {
+            path,
+            size_bytes,
+            sha256: sha256.to_ascii_lowercase(),
+            display_name,
+            imported_at_unix_seconds: current_unix_seconds(),
+        }
+    }
+}
+
+impl ManagedRemoteModelInstall {
+    pub fn trusted(
+        artifact: RemoteGgufArtifact,
+        path: PathBuf,
+        display_name: String,
+        description: String,
+        languages: Vec<String>,
+        recommended: bool,
+    ) -> Self {
+        Self {
+            repository: artifact.repository,
+            revision: artifact.revision,
+            filename: artifact.filename,
+            expected_size_bytes: artifact.expected_size_bytes,
+            expected_sha256: artifact.expected_sha256.to_ascii_lowercase(),
+            path,
+            display_name,
+            description,
+            languages,
+            recommended,
+            installed_at_unix_seconds: current_unix_seconds(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -292,7 +366,7 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
 }
 
 pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    default_model_catalog()
+    let mut models = default_model_catalog()
         .into_iter()
         .map(|mut model| {
             let configured_path = config.general.model_paths.get(&model.id).cloned();
@@ -321,7 +395,142 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             };
             model
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut managed_remote_models = config
+        .general
+        .managed_remote_models
+        .iter()
+        .filter(|(id, install)| valid_managed_remote_model(config, id, install))
+        .map(|(id, install)| remote_model_info(id, install))
+        .collect::<Vec<_>>();
+    managed_remote_models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.extend(managed_remote_models);
+
+    let mut imported_gguf_models = config
+        .general
+        .imported_gguf_models
+        .iter()
+        .filter(|(id, install)| valid_imported_gguf_model(id, install))
+        .map(|(id, install)| imported_gguf_model_info(id, install))
+        .collect::<Vec<_>>();
+    imported_gguf_models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.extend(imported_gguf_models);
+    models
+}
+
+/// Stable opaque IDs ensure a catalog display name or filename cannot be used
+/// to overwrite a different remote artifact. The full immutable source is
+/// still persisted and revalidated before every use.
+pub fn managed_remote_model_id(repository: &str, revision: &str, filename: &str) -> Option<String> {
+    if !valid_remote_artifact_metadata(
+        repository,
+        revision,
+        filename,
+        1,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ) {
+        return None;
+    }
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{repository}\n{revision}\n{filename}").as_bytes())
+    );
+    Some(format!("hf-{}", &digest[..24]))
+}
+
+/// Content-addressed IDs prevent a path or display-name change from replacing
+/// a different imported artifact. The local file remains external to Scribe's
+/// managed storage and is reverified by the embedded runtime before use.
+pub fn imported_gguf_model_id(sha256: &str) -> Option<String> {
+    let sha256 = sha256.trim();
+    (sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("local-{}", sha256.to_ascii_lowercase()))
+}
+
+/// The exact source and integrity facts used by the common runtime. This is
+/// not a download request and never carries a remote URL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteGgufArtifact {
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) filename: String,
+    pub(crate) expected_size_bytes: u64,
+    pub(crate) expected_sha256: String,
+}
+
+/// The locally observed facts for an imported GGUF. These are not a trusted
+/// remote checksum claim; they are rechecked as the runtime's expected bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImportedGgufArtifact {
+    pub(crate) expected_size_bytes: u64,
+    pub(crate) expected_sha256: String,
+}
+
+pub(crate) fn remote_gguf_artifact(
+    config: &AppConfig,
+    model_id: &str,
+) -> Option<RemoteGgufArtifact> {
+    let install = config.general.managed_remote_models.get(model_id)?;
+    valid_managed_remote_model(config, model_id, install).then(|| RemoteGgufArtifact {
+        repository: install.repository.clone(),
+        revision: install.revision.clone(),
+        filename: install.filename.clone(),
+        expected_size_bytes: install.expected_size_bytes,
+        expected_sha256: install.expected_sha256.clone(),
+    })
+}
+
+pub(crate) fn managed_remote_model_path(config: &AppConfig, model_id: &str) -> Option<PathBuf> {
+    let install = config.general.managed_remote_models.get(model_id)?;
+    valid_managed_remote_model(config, model_id, install).then(|| install.path.clone())
+}
+
+pub(crate) fn imported_gguf_artifact(
+    config: &AppConfig,
+    model_id: &str,
+) -> Option<ImportedGgufArtifact> {
+    let install = config.general.imported_gguf_models.get(model_id)?;
+    valid_imported_gguf_model(model_id, install).then(|| ImportedGgufArtifact {
+        expected_size_bytes: install.size_bytes,
+        expected_sha256: install.sha256.clone(),
+    })
+}
+
+fn remote_model_info(id: &str, install: &ManagedRemoteModelInstall) -> SttModelInfo {
+    let file_matches = install.path.metadata().ok().is_some_and(|metadata| {
+        metadata.is_file() && metadata.len() == install.expected_size_bytes
+    });
+    SttModelInfo {
+        id: id.to_owned(),
+        name: install.display_name.clone(),
+        backend: "transcribe-cpp".to_owned(),
+        description: install.description.clone(),
+        expected_ram: "Not measured".to_owned(),
+        accuracy_tier: "Runtime-validated".to_owned(),
+        speed_tier: "Not measured".to_owned(),
+        local_path: Some(install.path.clone()),
+        install_status: if file_matches {
+            ModelInstallStatus::Installed
+        } else {
+            ModelInstallStatus::Missing
+        },
+        download_model: None,
+    }
+}
+
+fn imported_gguf_model_info(id: &str, install: &ImportedGgufModelInstall) -> SttModelInfo {
+    SttModelInfo {
+        id: id.to_owned(),
+        name: install.display_name.clone(),
+        backend: "transcribe-cpp".to_owned(),
+        description: "Local GGUF imported after Scribe hash and runtime validation.".to_owned(),
+        expected_ram: "Not measured".to_owned(),
+        accuracy_tier: "Runtime-validated local import".to_owned(),
+        speed_tier: "Not measured".to_owned(),
+        local_path: Some(install.path.clone()),
+        install_status: ModelInstallStatus::Installed,
+        download_model: None,
+    }
 }
 
 pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
@@ -381,7 +590,7 @@ pub fn managed_model_path(config: &AppConfig, model: &SttModelInfo) -> Option<Pa
 
 pub fn is_valid_model_install_path(model: &SttModelInfo, path: &Path) -> bool {
     match model.backend.as_str() {
-        "whisper.cpp" => path.is_file(),
+        "whisper.cpp" | "transcribe-cpp" => path.is_file(),
         "faster-whisper" => is_faster_whisper_model_dir(path),
         "Vosk" => is_vosk_model_dir(path),
         "sherpa-onnx" => is_sherpa_onnx_model_dir(path),
@@ -485,9 +694,12 @@ pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option
         .download_model
         .as_ref()
         .map(|download_model| match model.backend.as_str() {
+            "whisper.cpp" if download_model.ends_with(".gguf") => {
+                model_storage_dir(config).join("gguf").join(download_model)
+            }
             "whisper.cpp" => model_storage_dir(config)
                 .join("whisper.cpp")
-                .join(format!("ggml-{download_model}.bin")),
+                .join(download_model),
             "faster-whisper" => model_storage_dir(config)
                 .join("faster-whisper")
                 .join(&model.id),
@@ -511,17 +723,18 @@ pub fn runtime_id_for_backend(backend: &str) -> String {
 }
 
 pub fn normalize_config(config: &mut AppConfig) {
-    let catalog = default_model_catalog();
-    let catalog_ids = catalog
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
-
     migrate_legacy_model_ids(config);
     if config.general.model_storage_dir.as_os_str().is_empty() {
         config.general.model_storage_dir = default_model_storage_dir();
     }
     apply_managed_model_metadata(config);
+    normalize_managed_remote_models(config);
+    normalize_imported_gguf_models(config);
+    let catalog = configured_models(config);
+    let catalog_ids = catalog
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
     if let Some(device_name) = &config.recording.audio_input_device_name
         && device_name.trim().is_empty()
     {
@@ -561,6 +774,13 @@ pub fn normalize_config(config: &mut AppConfig) {
         .min(MAX_RECORDING_SECONDS);
     config.recording.speech_confirmation_ms =
         config.recording.speech_confirmation_ms.clamp(50, 1_000);
+    if !config.recording.manual_activation_rms.is_finite() {
+        config.recording.manual_activation_rms = settings::DEFAULT_MANUAL_ACTIVATION_RMS;
+    }
+    config.recording.manual_activation_rms = config.recording.manual_activation_rms.clamp(
+        settings::MIN_MANUAL_ACTIVATION_RMS,
+        settings::MAX_MANUAL_ACTIVATION_RMS,
+    );
     config.recording.internal_pause_ms = config
         .recording
         .internal_pause_ms
@@ -662,6 +882,142 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
             install.path = PathBuf::new();
         }
     }
+}
+
+fn normalize_managed_remote_models(config: &mut AppConfig) {
+    let storage_dir = model_storage_dir(config);
+    config
+        .general
+        .managed_remote_models
+        .retain(|id, install| valid_managed_remote_model_in_storage(&storage_dir, id, install));
+}
+
+fn normalize_imported_gguf_models(config: &mut AppConfig) {
+    config
+        .general
+        .imported_gguf_models
+        .retain(|id, install| valid_imported_gguf_model(id, install));
+}
+
+fn valid_imported_gguf_model(id: &str, install: &ImportedGgufModelInstall) -> bool {
+    imported_gguf_model_id(&install.sha256).as_deref() == Some(id)
+        && install.size_bytes > 0
+        && !install.display_name.trim().is_empty()
+        && install
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        && regular_imported_gguf_file(&install.path, install.size_bytes)
+}
+
+fn regular_imported_gguf_file(path: &Path, expected_size_bytes: u64) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        if metadata.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    metadata.len() == expected_size_bytes
+}
+
+fn valid_managed_remote_model(
+    config: &AppConfig,
+    id: &str,
+    install: &ManagedRemoteModelInstall,
+) -> bool {
+    valid_managed_remote_model_in_storage(&model_storage_dir(config), id, install)
+}
+
+fn valid_managed_remote_model_in_storage(
+    storage_dir: &Path,
+    id: &str,
+    install: &ManagedRemoteModelInstall,
+) -> bool {
+    managed_remote_model_id(&install.repository, &install.revision, &install.filename).as_deref()
+        == Some(id)
+        && valid_remote_artifact_metadata(
+            &install.repository,
+            &install.revision,
+            &install.filename,
+            install.expected_size_bytes,
+            &install.expected_sha256,
+        )
+        && remote_managed_model_path_in_storage(storage_dir, install) == Some(install.path.clone())
+        && safe_managed_model_path(storage_dir, &install.path)
+}
+
+fn valid_remote_artifact_metadata(
+    repository: &str,
+    revision: &str,
+    filename: &str,
+    expected_size_bytes: u64,
+    expected_sha256: &str,
+) -> bool {
+    let Some((organization, repository_name)) = repository.split_once('/') else {
+        return false;
+    };
+    organization == "handy-computer"
+        && safe_hub_identifier(repository_name)
+        && revision.len() == 40
+        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && expected_size_bytes > 0
+        && expected_sha256.len() == 64
+        && expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && safe_hub_gguf_filename(filename)
+}
+
+fn remote_managed_model_path_in_storage(
+    storage_dir: &Path,
+    install: &ManagedRemoteModelInstall,
+) -> Option<PathBuf> {
+    let (organization, repository) = install.repository.split_once('/')?;
+    Some(
+        storage_dir
+            .join("huggingface")
+            .join(organization)
+            .join(repository)
+            .join(&install.revision)
+            .join(managed_remote_model_id(
+                &install.repository,
+                &install.revision,
+                &install.filename,
+            )?)
+            .join(&install.filename),
+    )
+}
+
+fn safe_hub_identifier(value: &str) -> bool {
+    value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn safe_hub_gguf_filename(value: &str) -> bool {
+    let path = Path::new(value);
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::Normal(_))
+                && component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(safe_hub_identifier)
+        })
 }
 
 fn safe_managed_model_path(storage_dir: &Path, path: &Path) -> bool {
@@ -892,6 +1248,24 @@ mod tests {
     }
 
     #[test]
+    fn manual_voice_activation_threshold_normalizes_to_the_supported_range() {
+        let mut config = AppConfig::default();
+        config.recording.manual_activation_rms = f32::INFINITY;
+        normalize_config(&mut config);
+        assert_eq!(
+            config.recording.manual_activation_rms,
+            settings::DEFAULT_MANUAL_ACTIVATION_RMS
+        );
+
+        config.recording.manual_activation_rms = 10.0;
+        normalize_config(&mut config);
+        assert_eq!(
+            config.recording.manual_activation_rms,
+            settings::MAX_MANUAL_ACTIVATION_RMS
+        );
+    }
+
+    #[test]
     fn recording_duration_is_bounded_for_hand_edited_settings() {
         let mut config = AppConfig::default();
         config.recording.max_recording_seconds = u32::MAX;
@@ -1072,7 +1446,9 @@ mod tests {
         let model_dir = root.join("whisper.cpp");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
+        let tiny_path = root.join("gguf").join("whisper-tiny.en-Q4_K_M.gguf");
+        fs::create_dir_all(tiny_path.parent().unwrap()).unwrap();
+        fs::write(tiny_path, b"tiny").unwrap();
         fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
         fs::write(model_dir.join("ggml-small.en.bin"), b"small").unwrap();
 
@@ -1309,6 +1685,208 @@ mod tests {
         );
         assert!(model.installed_at_unix_seconds.is_some());
         assert!(runtime.installed_at_unix_seconds.is_some());
+    }
+
+    #[test]
+    fn trusted_remote_gguf_survives_normalization_only_at_its_pinned_path() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-remote-model-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repository = "handy-computer/example-asr-gguf";
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let filename = "example-Q4_K_M.gguf";
+        let id = managed_remote_model_id(repository, revision, filename).unwrap();
+        let path = root
+            .join("huggingface")
+            .join("handy-computer")
+            .join("example-asr-gguf")
+            .join(revision)
+            .join(&id)
+            .join(filename);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"fixture").unwrap();
+
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.clone();
+        config.general.selected_default_model = id.clone();
+        config.general.managed_remote_models.insert(
+            id.clone(),
+            ManagedRemoteModelInstall::trusted(
+                RemoteGgufArtifact {
+                    repository: repository.to_owned(),
+                    revision: revision.to_owned(),
+                    filename: filename.to_owned(),
+                    expected_size_bytes: 7,
+                    expected_sha256: "a".repeat(64),
+                },
+                path.clone(),
+                "Example ASR".to_owned(),
+                "Trusted test model".to_owned(),
+                vec!["en".to_owned()],
+                false,
+            ),
+        );
+
+        normalize_config(&mut config);
+
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == id)
+            .unwrap();
+        assert_eq!(model.local_path.as_deref(), Some(path.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
+        assert!(remote_gguf_artifact(&config, &model.id).is_some());
+        assert_eq!(config.general.selected_default_model, model.id);
+
+        config
+            .general
+            .managed_remote_models
+            .get_mut(&model.id)
+            .unwrap()
+            .path = root.join("outside.gguf");
+        normalize_config(&mut config);
+        assert!(config.general.managed_remote_models.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_remote_model_id_rejects_dot_path_repository_components() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let filename = "example-Q4_K_M.gguf";
+
+        for repository in ["handy-computer/.", "handy-computer/.."] {
+            assert!(managed_remote_model_id(repository, revision, filename).is_none());
+        }
+    }
+
+    #[test]
+    fn imported_gguf_stays_external_and_is_never_classified_as_remote_or_managed() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-imported-gguf-config-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let storage = root.join("scribe-models");
+        let external = root.join("external").join("imported.gguf");
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, b"imported fixture").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"imported fixture"));
+        let id = imported_gguf_model_id(&sha256).unwrap();
+        let canonical = fs::canonicalize(&external).unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage;
+        config.general.imported_gguf_models.insert(
+            id.clone(),
+            ImportedGgufModelInstall::validated(
+                canonical.clone(),
+                b"imported fixture".len() as u64,
+                sha256,
+                "Imported fixture".to_owned(),
+            ),
+        );
+
+        normalize_config(&mut config);
+
+        let model = configured_models(&config)
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("imported model remains configured");
+        assert_eq!(model.local_path.as_deref(), Some(canonical.as_path()));
+        assert_eq!(model.install_status, ModelInstallStatus::Installed);
+        assert!(imported_gguf_artifact(&config, &model.id).is_some());
+        assert!(remote_gguf_artifact(&config, &model.id).is_none());
+        assert!(!config.general.managed_models.contains_key(&model.id));
+        assert!(!config.general.managed_remote_models.contains_key(&model.id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_models_sorts_managed_and_imported_gguf_models_by_id() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-configured-model-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("models");
+
+        let mut managed_ids = Vec::new();
+        for (repository, filename) in [
+            ("handy-computer/zeta", "zeta.gguf"),
+            ("handy-computer/alpha", "alpha.gguf"),
+        ] {
+            let id = managed_remote_model_id(repository, revision, filename).unwrap();
+            let path = config
+                .general
+                .model_storage_dir
+                .join("huggingface")
+                .join(repository)
+                .join(revision)
+                .join(&id)
+                .join(filename);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"fixture").unwrap();
+            config.general.managed_remote_models.insert(
+                id.clone(),
+                ManagedRemoteModelInstall::trusted(
+                    RemoteGgufArtifact {
+                        repository: repository.to_owned(),
+                        revision: revision.to_owned(),
+                        filename: filename.to_owned(),
+                        expected_size_bytes: 7,
+                        expected_sha256: "a".repeat(64),
+                    },
+                    path,
+                    id.clone(),
+                    "Trusted test model".to_owned(),
+                    vec!["en".to_owned()],
+                    false,
+                ),
+            );
+            managed_ids.push(id);
+        }
+
+        let mut imported_ids = Vec::new();
+        for (filename, bytes) in [
+            ("zeta.gguf", b"zeta".as_slice()),
+            ("alpha.gguf", b"alpha".as_slice()),
+        ] {
+            let path = root.join("external").join(filename);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            let sha256 = format!("{:x}", Sha256::digest(bytes));
+            let id = imported_gguf_model_id(&sha256).unwrap();
+            config.general.imported_gguf_models.insert(
+                id.clone(),
+                ImportedGgufModelInstall::validated(
+                    fs::canonicalize(path).unwrap(),
+                    bytes.len() as u64,
+                    sha256,
+                    id.clone(),
+                ),
+            );
+            imported_ids.push(id);
+        }
+
+        managed_ids.sort();
+        imported_ids.sort();
+        let models = configured_models(&config);
+        let actual_managed_ids = models
+            .iter()
+            .filter(|model| managed_ids.contains(&model.id))
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let actual_imported_ids = models
+            .iter()
+            .filter(|model| imported_ids.contains(&model.id))
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_managed_ids, managed_ids);
+        assert_eq!(actual_imported_ids, imported_ids);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

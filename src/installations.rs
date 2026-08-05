@@ -14,9 +14,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use url::Url;
+
+use crate::disk_space::{self, DiskSpacePreflight};
 
 const BUFFER_BYTES: usize = 64 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
+const MAX_REMOVAL_DISCOVERY_DEPTH: usize = 12;
+const MAX_REMOVAL_DISCOVERY_ENTRIES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstallStage {
@@ -38,6 +44,16 @@ pub(crate) struct InstallProgress {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InstallCancellation {
     cancelled: Arc<AtomicBool>,
+}
+
+/// Immutable facts observed while hashing a user-selected local artifact.
+/// The canonical path is retained so callers can reject a source that changes
+/// identity before it becomes an imported model record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileFingerprint {
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
 }
 
 impl InstallCancellation {
@@ -123,6 +139,10 @@ struct ActivationJournalDocument {
     phase: ActivationPhase,
     model_target: PathBuf,
     model_had_previous: bool,
+    #[serde(default)]
+    manifest_target: Option<PathBuf>,
+    #[serde(default)]
+    manifest_had_previous: bool,
     runtime_target: Option<PathBuf>,
     runtime_had_previous: bool,
     #[serde(default)]
@@ -160,6 +180,8 @@ impl ActivationJournal {
                 schema_version: 2,
                 phase: ActivationPhase::Prepared,
                 model_had_previous: model_target.exists(),
+                manifest_target: None,
+                manifest_had_previous: false,
                 runtime_had_previous: runtime_target.as_ref().is_some_and(|path| path.exists()),
                 model_target,
                 runtime_target,
@@ -217,6 +239,25 @@ impl ActivationJournal {
         self.persist()
     }
 
+    /// Associates an auxiliary, model-scoped file replacement with this
+    /// transaction before it is activated. The journal can then either commit
+    /// or restore it after an interrupted settings write.
+    pub(crate) fn record_manifest_target(&mut self, target: PathBuf) -> Result<(), InstallError> {
+        if self.document.phase != ActivationPhase::ModelActivated {
+            return Err(failed(
+                "an installed-model manifest can be recorded only after model activation",
+            ));
+        }
+        if self.document.manifest_target.is_some() {
+            return Err(failed(
+                "an installed-model manifest is already associated with this activation journal",
+            ));
+        }
+        self.document.manifest_had_previous = target.exists();
+        self.document.manifest_target = Some(target);
+        self.persist()
+    }
+
     pub(crate) fn clear(self) -> Result<(), InstallError> {
         remove_path_if_exists(&self.path)
     }
@@ -232,6 +273,7 @@ impl ActivationJournal {
 pub(crate) fn reconcile_activation_journal(
     path: &Path,
     allowed_model_targets: &[PathBuf],
+    allowed_manifest_targets: &[PathBuf],
     allowed_runtime_targets: &[PathBuf],
     durable_config_fingerprint: Option<&str>,
 ) -> Result<bool, InstallError> {
@@ -256,6 +298,13 @@ pub(crate) fn reconcile_activation_journal(
         validate_sha256(fingerprint)?;
     }
     validate_reconciliation_target(&document.model_target, allowed_model_targets, "model")?;
+    if let Some(manifest_target) = document.manifest_target.as_ref() {
+        validate_reconciliation_target(
+            manifest_target,
+            allowed_manifest_targets,
+            "installed-model manifest",
+        )?;
+    }
     if let Some(runtime_target) = document.runtime_target.as_ref() {
         validate_reconciliation_target(runtime_target, allowed_runtime_targets, "runtime")?;
     }
@@ -271,10 +320,16 @@ pub(crate) fn reconcile_activation_journal(
         .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual));
     if new_config_is_durable {
         finalize_file_replacement(&document.model_target)?;
+        if let Some(manifest) = document.manifest_target.as_ref() {
+            finalize_file_replacement(manifest)?;
+        }
         if let Some(runtime) = document.runtime_target.as_ref() {
             finalize_directory_replacement(runtime, document.retain_runtime_as_previous)?;
         }
     } else if prior_config_is_durable {
+        if let Some(manifest) = document.manifest_target.as_ref() {
+            restore_file_replacement(manifest, document.manifest_had_previous)?;
+        }
         restore_file_replacement(&document.model_target, document.model_had_previous)?;
         if let Some(runtime) = document.runtime_target.as_ref() {
             restore_directory_replacement(runtime, document.runtime_had_previous)?;
@@ -640,6 +695,137 @@ pub(crate) fn reconcile_managed_removal(
     Ok(true)
 }
 
+/// Finds durable removal journals below Scribe-owned storage roots so a
+/// transaction remains recoverable after its model/runtime record has already
+/// been removed from the persisted settings. Traversal is bounded and never
+/// follows symbolic links or Windows reparse points.
+pub(crate) fn discover_managed_removal_targets(
+    roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, InstallError> {
+    let mut discovered = Vec::new();
+    let mut inspected_entries = 0_usize;
+
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        let root_metadata = fs::symlink_metadata(root).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "could not inspect managed removal root {}: {error}",
+                root.display()
+            ))
+        })?;
+        if !root_metadata.is_dir() || runtime_metadata_is_link_or_reparse(&root_metadata) {
+            return Err(InstallError::RecoveryRequired(format!(
+                "managed removal root is not a regular directory or is a symbolic link/reparse point: {}",
+                root.display()
+            )));
+        }
+        let canonical_root = fs::canonicalize(root).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "could not canonicalize managed removal root {}: {error}",
+                root.display()
+            ))
+        })?;
+        let mut pending = vec![(canonical_root.clone(), 0_usize)];
+
+        while let Some((directory, depth)) = pending.pop() {
+            let entries = fs::read_dir(&directory).map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "could not enumerate managed removal directory {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    InstallError::RecoveryRequired(format!(
+                        "could not enumerate a managed removal entry below {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+                inspected_entries = inspected_entries.saturating_add(1);
+                if inspected_entries > MAX_REMOVAL_DISCOVERY_ENTRIES {
+                    return Err(InstallError::RecoveryRequired(format!(
+                        "managed removal discovery exceeded {MAX_REMOVAL_DISCOVERY_ENTRIES} entries"
+                    )));
+                }
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    InstallError::RecoveryRequired(format!(
+                        "could not inspect managed removal entry {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if runtime_metadata_is_link_or_reparse(&metadata) {
+                    return Err(InstallError::RecoveryRequired(format!(
+                        "managed removal discovery encountered a symbolic link/reparse point: {}",
+                        path.display()
+                    )));
+                }
+                if metadata.is_dir() {
+                    if depth >= MAX_REMOVAL_DISCOVERY_DEPTH {
+                        return Err(InstallError::RecoveryRequired(format!(
+                            "managed removal discovery exceeded depth {MAX_REMOVAL_DISCOVERY_DEPTH} at {}",
+                            path.display()
+                        )));
+                    }
+                    pending.push((path, depth + 1));
+                    continue;
+                }
+                if !metadata.is_file()
+                    || !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".removal-journal.json"))
+                {
+                    continue;
+                }
+
+                let bytes = fs::read(&path).map_err(|error| {
+                    InstallError::RecoveryRequired(format!(
+                        "could not read managed removal journal {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let journal: RemovalJournalDocument =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        InstallError::RecoveryRequired(format!(
+                            "invalid managed removal journal {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                if journal.schema_version != 1 {
+                    return Err(InstallError::RecoveryRequired(format!(
+                        "unsupported managed removal journal schema at {}",
+                        path.display()
+                    )));
+                }
+                let target = canonicalize_missing(&journal.target)?;
+                if !target.starts_with(&canonical_root) || target == canonical_root {
+                    return Err(InstallError::RecoveryRequired(format!(
+                        "managed removal journal {} references a target outside its storage root",
+                        path.display()
+                    )));
+                }
+                let expected_journal =
+                    canonicalize_missing(&removal_journal_path(&journal.target)?)?;
+                let actual_journal = canonicalize_missing(&path)?;
+                if expected_journal != actual_journal {
+                    return Err(InstallError::RecoveryRequired(format!(
+                        "managed removal journal path does not match its target: {}",
+                        path.display()
+                    )));
+                }
+                discovered.push(target);
+            }
+        }
+    }
+
+    discovered.sort();
+    discovered.dedup();
+    Ok(discovered)
+}
+
 fn persist_removal_journal(
     path: &Path,
     journal: &RemovalJournalDocument,
@@ -715,6 +901,53 @@ pub(crate) fn download_pinned_artifact(
     download_pinned_artifact_with(&UreqHttpSource, artifact, cancellation, progress)
 }
 
+/// Reports the conservative free-space budget for a managed artifact without
+/// creating directories, touching partials, or contacting the network.
+pub(crate) fn pinned_artifact_disk_space_preflight(
+    artifact: &PinnedArtifact,
+) -> Result<DiskSpacePreflight, InstallError> {
+    validate_artifact_spec(artifact)?;
+    let partial = partial_path(&artifact.destination)?;
+    let partial_bytes = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    let additional_bytes = additional_download_bytes(artifact.size_bytes, partial_bytes)?;
+    disk_space::preflight_download_destination(&artifact.destination, additional_bytes)
+        .map_err(InstallError::Failed)
+}
+
+fn additional_download_bytes(
+    artifact_size_bytes: u64,
+    partial_bytes: u64,
+) -> Result<u64, InstallError> {
+    // An oversized partial will be quarantined before a later retry. Reserve
+    // a complete replacement artifact rather than reporting a misleading
+    // zero-byte need in the browse UI.
+    if partial_bytes > artifact_size_bytes {
+        Ok(artifact_size_bytes)
+    } else {
+        Ok(artifact_size_bytes - partial_bytes)
+    }
+}
+
+fn require_pinned_artifact_disk_space(
+    artifact: &PinnedArtifact,
+    partial_bytes: u64,
+) -> Result<(), InstallError> {
+    let additional_bytes = additional_download_bytes(artifact.size_bytes, partial_bytes)?;
+    let preflight =
+        disk_space::preflight_download_destination(&artifact.destination, additional_bytes)
+            .map_err(InstallError::Failed)?;
+    if preflight.has_sufficient_space() {
+        return Ok(());
+    }
+    Err(failed(format!(
+        "insufficient free space on {}: {} bytes are available but {} bytes are required, including Scribe's {}-byte safety headroom",
+        preflight.volume,
+        preflight.available_bytes,
+        preflight.required_bytes,
+        disk_space::SAFETY_HEADROOM_BYTES,
+    )))
+}
+
 fn download_pinned_artifact_with(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
@@ -782,6 +1015,8 @@ fn download_pinned_artifact_with(
             }
         }
     }
+
+    require_pinned_artifact_disk_space(artifact, offset)?;
 
     let mut response = source.get(&artifact.url, (offset > 0).then_some(offset))?;
     let disposition = validate_download_response(&response, offset, artifact.size_bytes)?;
@@ -1373,6 +1608,103 @@ pub(crate) fn verify_file(
     )
 }
 
+/// Streams a regular, non-link file through SHA-256 without buffering its
+/// contents. This is intentionally separate from `verify_file`: local import
+/// has no upstream expected digest, so its result is an observed fingerprint,
+/// never a trusted checksum claim.
+pub(crate) fn fingerprint_file_cancellable(
+    path: &Path,
+    cancellation: &InstallCancellation,
+) -> Result<FileFingerprint, InstallError> {
+    let source_metadata = fs::symlink_metadata(path)
+        .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
+    if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
+        return Err(failed(format!(
+            "local import must be a regular file, not a link or directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    if has_reparse_point(&source_metadata) {
+        return Err(failed(format!(
+            "local import cannot use a Windows reparse-point file: {}",
+            path.display()
+        )));
+    }
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        failed(format!(
+            "failed to canonicalize local import {}: {error}",
+            path.display()
+        ))
+    })?;
+    let size_bytes = source_metadata.len();
+    if size_bytes == 0 {
+        return Err(failed(format!(
+            "local import is empty: {}",
+            canonical_path.display()
+        )));
+    }
+    let mut file = File::open(&canonical_path).map_err(|error| {
+        failed(format!(
+            "failed to open local import {}: {error}",
+            canonical_path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(InstallError::Cancelled {
+                partial_path: canonical_path,
+                downloaded_bytes: size_bytes,
+            });
+        }
+        let count = file.read(&mut buffer).map_err(|error| {
+            failed(format!(
+                "failed to hash local import {}: {error}",
+                canonical_path.display()
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let final_path = fs::canonicalize(path).map_err(|error| {
+        failed(format!(
+            "local import changed while hashing {}: {error}",
+            path.display()
+        ))
+    })?;
+    let final_metadata = fs::metadata(&final_path).map_err(|error| {
+        failed(format!(
+            "failed to inspect local import after hashing {}: {error}",
+            final_path.display()
+        ))
+    })?;
+    if final_path != canonical_path
+        || !final_metadata.is_file()
+        || final_metadata.len() != size_bytes
+    {
+        return Err(failed(format!(
+            "local import changed while hashing: {}",
+            path.display()
+        )));
+    }
+    Ok(FileFingerprint {
+        canonical_path,
+        size_bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+#[cfg(windows)]
+fn has_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
 pub(crate) fn verify_file_cancellable(
     path: &Path,
     expected_size: u64,
@@ -1949,44 +2281,158 @@ struct UreqHttpSource;
 
 impl HttpSource for UreqHttpSource {
     fn get(&self, url: &str, range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
+        let policy = redirect_policy_for_initial_url(url)?;
+        self.get_with_redirect_policy(url, range_start, policy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedirectPolicy {
+    Standard,
+    HuggingFace,
+}
+
+impl UreqHttpSource {
+    fn get_with_redirect_policy(
+        &self,
+        url: &str,
+        range_start: Option<u64>,
+        policy: RedirectPolicy,
+    ) -> Result<HttpResponse, InstallError> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_millis(750))
+            .redirects(0)
+            .https_only(!cfg!(test))
             .build();
-        let mut request = agent.get(url);
-        request = request.set("Accept-Encoding", "identity");
-        if let Some(start) = range_start {
-            request = request.set("Range", &format!("bytes={start}-"));
+        let mut current = Url::parse(url)
+            .map_err(|error| failed(format!("invalid pinned download URL: {error}")))?;
+        for redirects in 0..=MAX_DOWNLOAD_REDIRECTS {
+            let mut request = agent.get(current.as_str());
+            request = request.set("Accept-Encoding", "identity");
+            if let Some(start) = range_start {
+                request = request.set("Range", &format!("bytes={start}-"));
+            }
+            let response = match request.call() {
+                Ok(response) => response,
+                Err(ureq::Error::Status(_, response)) => response,
+                Err(error) => {
+                    return Err(failed(format!(
+                        "request failed for {}: {error}",
+                        current.as_str()
+                    )));
+                }
+            };
+            let status = response.status();
+            if is_redirect_status(status) {
+                if redirects == MAX_DOWNLOAD_REDIRECTS {
+                    return Err(failed(format!(
+                        "download exceeded {MAX_DOWNLOAD_REDIRECTS} validated redirects"
+                    )));
+                }
+                let location = strict_ureq_header(&response, "Location")?;
+                let location = location
+                    .ok_or_else(|| failed("download redirect response has no Location header"))?;
+                current = validated_redirect_url(&current, location, policy)?;
+                continue;
+            }
+            let content_lengths = response
+                .all("Content-Length")
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let content_ranges = response
+                .all("Content-Range")
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let content_encodings = response
+                .all("Content-Encoding")
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            return Ok(HttpResponse {
+                status,
+                content_lengths,
+                content_ranges,
+                content_encodings,
+                reader: response.into_reader(),
+            });
         }
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::Status(_, response)) => response,
-            Err(error) => return Err(failed(format!("request failed for {url}: {error}"))),
-        };
-        let status = response.status();
-        let content_lengths = response
-            .all("Content-Length")
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        let content_ranges = response
-            .all("Content-Range")
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        let content_encodings = response
-            .all("Content-Encoding")
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        Ok(HttpResponse {
-            status,
-            content_lengths,
-            content_ranges,
-            content_encodings,
-            reader: response.into_reader(),
-        })
+        Err(failed("download redirect handling ended unexpectedly"))
     }
+}
+
+fn redirect_policy_for_initial_url(url: &str) -> Result<RedirectPolicy, InstallError> {
+    let url =
+        Url::parse(url).map_err(|error| failed(format!("invalid pinned download URL: {error}")))?;
+    Ok(if is_hugging_face_host(url.host_str()) {
+        validate_hugging_face_download_url(&url)?;
+        RedirectPolicy::HuggingFace
+    } else {
+        RedirectPolicy::Standard
+    })
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn strict_ureq_header<'a>(
+    response: &'a ureq::Response,
+    name: &str,
+) -> Result<Option<&'a str>, InstallError> {
+    let values = response.all(name);
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.first().copied()),
+        _ => Err(failed(format!(
+            "download response has duplicate {name} headers"
+        ))),
+    }
+}
+
+fn validated_redirect_url(
+    current: &Url,
+    location: &str,
+    policy: RedirectPolicy,
+) -> Result<Url, InstallError> {
+    let next = current
+        .join(location)
+        .map_err(|error| failed(format!("download redirect Location is invalid: {error}")))?;
+    if next.scheme() != "https" || !next.username().is_empty() || next.password().is_some() {
+        return Err(failed(
+            "download redirect must use a credential-free HTTPS URL",
+        ));
+    }
+    if policy == RedirectPolicy::HuggingFace {
+        validate_hugging_face_download_url(&next)?;
+    }
+    Ok(next)
+}
+
+fn validate_hugging_face_download_url(url: &Url) -> Result<(), InstallError> {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || !is_hugging_face_host(url.host_str())
+    {
+        return Err(failed(
+            "trusted Hugging Face downloads may redirect only to approved HTTPS hosts",
+        ));
+    }
+    Ok(())
+}
+
+fn is_hugging_face_host(host: Option<&str>) -> bool {
+    host.is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "huggingface.co"
+            || host.ends_with(".huggingface.co")
+            || host == "hf.co"
+            || host.ends_with(".hf.co")
+    })
 }
 
 fn failed(message: impl Into<String>) -> InstallError {
@@ -2037,6 +2483,14 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn disk_space_preflight_accounts_for_resumable_partial_bytes() {
+        assert_eq!(additional_download_bytes(100, 0).unwrap(), 100);
+        assert_eq!(additional_download_bytes(100, 40).unwrap(), 60);
+        assert_eq!(additional_download_bytes(100, 100).unwrap(), 0);
+        assert_eq!(additional_download_bytes(100, 101).unwrap(), 100);
+    }
+
     fn artifact(root: &Path, bytes: &[u8]) -> PinnedArtifact {
         PinnedArtifact {
             id: "fixture".to_owned(),
@@ -2085,6 +2539,68 @@ mod tests {
         let mut bytes = response.into_bytes();
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    #[test]
+    fn trusted_huggingface_redirect_rejects_a_disallowed_host_from_a_local_server() {
+        let response = http_response(
+            "302 Found",
+            &[("Location", "https://example.invalid/model.gguf".to_owned())],
+            &[],
+        );
+        let (url, request, server) = serve_once(response);
+
+        let error = match UreqHttpSource.get_with_redirect_policy(
+            &url,
+            None,
+            RedirectPolicy::HuggingFace,
+        ) {
+            Ok(_) => panic!("disallowed redirect must not return a download response"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("approved HTTPS hosts"));
+        assert!(request.recv_timeout(Duration::from_secs(2)).is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn trusted_huggingface_redirect_accepts_documented_hub_host_suffixes() {
+        let current = Url::parse(
+            "https://huggingface.co/handy-computer/example/resolve/0123456789abcdef0123456789abcdef01234567/model.gguf",
+        )
+        .unwrap();
+        for location in [
+            "https://cdn-lfs-us-1.hf.co/model.gguf",
+            "https://cas-server.xethub-eu.hf.co/reconstruction",
+            "https://us.aws.cdn.hf.co/model.gguf",
+        ] {
+            assert_eq!(
+                validated_redirect_url(&current, location, RedirectPolicy::HuggingFace)
+                    .unwrap()
+                    .host_str(),
+                Url::parse(location).unwrap().host_str()
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_huggingface_redirect_rejects_insecure_or_credentialed_targets() {
+        let current = Url::parse(
+            "https://huggingface.co/handy-computer/example/resolve/0123456789abcdef0123456789abcdef01234567/model.gguf",
+        )
+        .unwrap();
+        for location in [
+            "http://cdn-lfs-us-1.hf.co/model.gguf",
+            "https://user@cdn-lfs-us-1.hf.co/model.gguf",
+            "https://cdn-lfs-us-1.hf.co:444/model.gguf",
+            "https://hf.co.example.invalid/model.gguf",
+        ] {
+            assert!(
+                validated_redirect_url(&current, location, RedirectPolicy::HuggingFace).is_err(),
+                "redirect should be rejected: {location}"
+            );
+        }
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
@@ -2633,6 +3149,8 @@ mod tests {
             phase: ActivationPhase::Prepared,
             model_target: outside.clone(),
             model_had_previous: false,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: None,
             runtime_had_previous: false,
             retain_runtime_as_previous: false,
@@ -2644,6 +3162,7 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             &[root.join("allowed-model.bin")],
+            &[],
             &[],
             None,
         )
@@ -2680,6 +3199,8 @@ mod tests {
             phase: ActivationPhase::ConfigPersisted,
             model_target: model.clone(),
             model_had_previous: false,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: Some(runtime.clone()),
             runtime_had_previous: true,
             retain_runtime_as_previous: false,
@@ -2692,6 +3213,7 @@ mod tests {
             reconcile_activation_journal(
                 &journal_path,
                 std::slice::from_ref(&model),
+                &[],
                 std::slice::from_ref(&runtime),
                 Some(&durable_new),
             )
@@ -2725,6 +3247,8 @@ mod tests {
             phase: ActivationPhase::ConfigPersisted,
             model_target: model.clone(),
             model_had_previous: false,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: Some(runtime.clone()),
             runtime_had_previous: true,
             retain_runtime_as_previous: true,
@@ -2736,6 +3260,7 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
+            &[],
             std::slice::from_ref(&runtime),
             Some(&durable_new),
         )
@@ -2782,6 +3307,8 @@ mod tests {
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: None,
             runtime_had_previous: false,
             retain_runtime_as_previous: false,
@@ -2794,11 +3321,56 @@ mod tests {
             &journal_path,
             std::slice::from_ref(&model),
             &[],
+            &[],
             Some(&durable_old),
         )
         .unwrap();
 
         assert_eq!(fs::read(model).unwrap(), b"old-model");
+        assert!(!journal_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_activation_recovery_rolls_back_its_installed_manifest() {
+        let root = unique_root("journal-manifest-old-config");
+        fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join("activation-journal.json");
+        let model = root.join("model.gguf");
+        let manifest = root.join("model.gguf.install-manifest.json");
+        let model_rollback = file_rollback_path(&model).unwrap();
+        let manifest_rollback = file_rollback_path(&manifest).unwrap();
+        fs::write(&model, b"new-model").unwrap();
+        fs::write(&model_rollback, b"old-model").unwrap();
+        fs::write(&manifest, b"new-manifest").unwrap();
+        fs::write(&manifest_rollback, b"old-manifest").unwrap();
+        let durable_old = format!("{:x}", Sha256::digest(b"old-config"));
+        let document = ActivationJournalDocument {
+            schema_version: 2,
+            phase: ActivationPhase::ModelActivated,
+            model_target: model.clone(),
+            model_had_previous: true,
+            manifest_target: Some(manifest.clone()),
+            manifest_had_previous: true,
+            runtime_target: None,
+            runtime_had_previous: false,
+            retain_runtime_as_previous: false,
+            prior_config_fingerprint: Some(durable_old.clone()),
+            expected_config_fingerprint: Some(format!("{:x}", Sha256::digest(b"new-config"))),
+        };
+        fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        reconcile_activation_journal(
+            &journal_path,
+            std::slice::from_ref(&model),
+            std::slice::from_ref(&manifest),
+            &[],
+            Some(&durable_old),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&model).unwrap(), b"old-model");
+        assert_eq!(fs::read(&manifest).unwrap(), b"old-manifest");
         assert!(!journal_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2818,6 +3390,8 @@ mod tests {
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: None,
             runtime_had_previous: false,
             retain_runtime_as_previous: false,
@@ -2829,6 +3403,7 @@ mod tests {
         reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
+            &[],
             &[],
             Some(&durable_new),
         )
@@ -2854,6 +3429,8 @@ mod tests {
             phase: ActivationPhase::ModelActivated,
             model_target: model.clone(),
             model_had_previous: true,
+            manifest_target: None,
+            manifest_had_previous: false,
             runtime_target: None,
             runtime_had_previous: false,
             retain_runtime_as_previous: false,
@@ -2866,6 +3443,7 @@ mod tests {
         let error = reconcile_activation_journal(
             &journal_path,
             std::slice::from_ref(&model),
+            &[],
             &[],
             Some(&unrelated),
         )
@@ -2952,6 +3530,57 @@ mod tests {
     }
 
     #[test]
+    fn removal_discovery_recovers_a_target_absent_from_post_commit_settings() {
+        let root = unique_root("removal-discovery-post-commit");
+        let target = root
+            .join("huggingface")
+            .join("handy-computer")
+            .join("fixture")
+            .join("revision")
+            .join("artifact");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("model.gguf"), b"model").unwrap();
+        let prior = format!("{:x}", Sha256::digest(b"prior-config"));
+        let expected = format!("{:x}", Sha256::digest(b"expected-config"));
+        let mut removal =
+            ManagedRemoval::stage(&target, std::slice::from_ref(&target), prior).unwrap();
+        removal.prepare_config_commit(expected.clone()).unwrap();
+        std::mem::forget(removal);
+
+        let discovered = discover_managed_removal_targets(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(discovered, vec![canonicalize_missing(&target).unwrap()]);
+        assert!(
+            reconcile_managed_removal(&target, &discovered, &expected).unwrap(),
+            "the durable post-removal fingerprint should finish cleanup"
+        );
+        assert!(!target.exists());
+        assert!(!removal_tombstone_path(&target).unwrap().exists());
+        assert!(!removal_journal_path(&target).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_discovery_rejects_a_journal_target_outside_managed_storage() {
+        let root = unique_root("removal-discovery-escape");
+        let outside = unique_root("removal-discovery-outside").join("model.gguf");
+        fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join("model.gguf.removal-journal.json");
+        let journal = RemovalJournalDocument {
+            schema_version: 1,
+            target: outside,
+            prior_config_fingerprint: format!("{:x}", Sha256::digest(b"prior-config")),
+            expected_config_fingerprint: None,
+        };
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+        let error = discover_managed_removal_targets(std::slice::from_ref(&root)).unwrap_err();
+        assert!(error.requires_recovery());
+        assert!(error.to_string().contains("outside its storage root"));
+        assert!(journal_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn removal_recovery_mismatch_preserves_tombstone_and_journal() {
         let root = unique_root("removal-reconcile-mismatch");
         fs::create_dir_all(&root).unwrap();
@@ -3020,6 +3649,28 @@ mod tests {
         assert!(error.to_string().contains("unsafe runtime ZIP path"));
         assert!(!root.join("escape.dll").exists());
         assert!(!stage.join("bin/allowed.dll").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_file_fingerprint_is_canonical_and_exact() {
+        let root = unique_root("local-fingerprint");
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("imported.gguf");
+        fs::write(&model, b"local fixture").unwrap();
+
+        let fingerprint =
+            fingerprint_file_cancellable(&model, &InstallCancellation::default()).unwrap();
+
+        assert_eq!(
+            fingerprint.canonical_path,
+            fs::canonicalize(&model).unwrap()
+        );
+        assert_eq!(fingerprint.size_bytes, b"local fixture".len() as u64);
+        assert_eq!(
+            fingerprint.sha256,
+            format!("{:x}", Sha256::digest(b"local fixture"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::transcription::ModelId;
 
 const WHISPER_CPP_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+const HANDY_COMPUTER_TINY_EN_REVISION: &str = "becb8bcb804405dc97b380a523d9975888820986";
 const COMPATIBILITY_EVIDENCE_DOCUMENT: &str = "docs/SCRIBE_REVAMP.md";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -23,6 +24,7 @@ enum ModelArchitecture {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelFormat {
     Ggml,
+    Gguf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -264,21 +266,7 @@ const PHASE_TWO_BASE_SMOKE: CompatibilityEvidence = CompatibilityEvidence {
 };
 
 const MODELS: &[ModelManifest] = &[
-    whisper_manifest(
-        "whisper_cpp_tiny_en",
-        "English Tiny",
-        ModelGuidance {
-            description: "Small local English model for low-resource machines.",
-            storage: "~75 MB",
-            expected_ram: "1 GB",
-            speed: "Fastest",
-            accuracy: "Basic",
-        },
-        "ggml-tiny.en.bin",
-        77_704_715,
-        "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
-        PHASE_ZERO_SMOKE,
-    ),
+    handy_computer_tiny_en_manifest(),
     whisper_manifest(
         "whisper_cpp_base_en",
         "English Base",
@@ -326,6 +314,37 @@ const MODELS: &[ModelManifest] = &[
     ),
 ];
 
+const fn handy_computer_tiny_en_manifest() -> ModelManifest {
+    ModelManifest {
+        id: "whisper_cpp_tiny_en",
+        display_name: "English Tiny",
+        description: "Small English GGUF model for low-resource local dictation.",
+        storage_guidance: "~42 MB",
+        expected_ram: "1 GB",
+        speed_guidance: "Fastest",
+        accuracy_guidance: "Basic",
+        runtime: RuntimeRequirement::PrimaryNative,
+        architecture: ModelArchitecture::EncoderDecoder,
+        format: ModelFormat::Gguf,
+        minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
+        artifact: ArtifactManifest {
+            repository: "handy-computer/whisper-tiny.en-gguf",
+            revision: HANDY_COMPUTER_TINY_EN_REVISION,
+            filename: "whisper-tiny.en-Q4_K_M.gguf",
+            size_bytes: 43_545_248,
+            sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b",
+        },
+        languages: &["en"],
+        capabilities: BATCH_ENGLISH_CAPABILITIES,
+        roles: NO_ROLES,
+        compatibility: CompatibilityStatus::Experimental {
+            evidence: PHASE_ZERO_SMOKE.link(),
+            reason: "The complete compatibility suite has not passed.",
+        },
+        evidence: PHASE_ZERO_SMOKE,
+    }
+}
+
 const fn whisper_manifest(
     id: &'static str,
     display_name: &'static str,
@@ -370,6 +389,19 @@ pub fn model_descriptors() -> Vec<ModelDescriptor> {
     MODELS.iter().map(ModelManifest::descriptor).collect()
 }
 
+/// Models available in Scribe's normal user-facing flow. GGML artifacts are
+/// deliberately excluded because they require the retained compatibility
+/// native package; their descriptors remain available to migrate existing
+/// configurations without advertising a second installation architecture.
+pub fn normal_model_descriptors() -> Vec<ModelDescriptor> {
+    assert_catalog_valid();
+    MODELS
+        .iter()
+        .filter(|manifest| manifest.format == ModelFormat::Gguf)
+        .map(ModelManifest::descriptor)
+        .collect()
+}
+
 pub fn model_descriptor(id: &ModelId) -> Option<ModelDescriptor> {
     assert_catalog_valid();
     MODELS
@@ -394,6 +426,35 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
             artifact_storage_estimate: manifest.storage_guidance,
             artifact_sha256: manifest.artifact.sha256,
         })
+}
+
+/// Keeps the file-format-to-runtime routing decision inside catalog
+/// validation, rather than leaking it into application or installer code.
+pub(crate) fn model_uses_embedded_runtime(id: &ModelId) -> bool {
+    assert_catalog_valid();
+    MODELS
+        .iter()
+        .find(|manifest| manifest.id == id.as_str())
+        .is_some_and(|manifest| manifest.format == ModelFormat::Gguf)
+}
+
+/// Resolves a remote artifact to an existing normalized catalog entry only
+/// when every trust-relevant source fact is identical. Callers must not infer
+/// that another variant from the same repository is managed by Scribe.
+pub(crate) fn normalized_model_id_for_pinned_artifact(
+    repository: &str,
+    revision: &str,
+    filename: &str,
+) -> Option<ModelId> {
+    assert_catalog_valid();
+    MODELS
+        .iter()
+        .find(|manifest| {
+            manifest.artifact.repository == repository
+                && manifest.artifact.revision == revision
+                && manifest.artifact.filename == filename
+        })
+        .map(|manifest| ModelId::new(manifest.id))
 }
 
 pub(crate) fn runtime_model_download_url(id: &ModelId) -> Option<String> {
@@ -705,6 +766,35 @@ mod tests {
     fn production_catalog_is_valid_and_has_unique_ids() {
         assert_eq!(validate_catalog(), Ok(()));
         assert_eq!(model_descriptors().len(), 4);
+        assert_eq!(normal_model_descriptors().len(), 1);
+        assert_eq!(
+            normal_model_descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>(),
+            vec![ModelId::new("whisper_cpp_tiny_en")]
+        );
+    }
+
+    #[test]
+    fn remote_artifact_must_match_every_pinned_source_fact_to_use_local_installation() {
+        let artifact = MODELS[0].artifact;
+        assert_eq!(
+            normalized_model_id_for_pinned_artifact(
+                artifact.repository,
+                artifact.revision,
+                artifact.filename,
+            ),
+            Some(ModelId::new("whisper_cpp_tiny_en"))
+        );
+        assert!(
+            normalized_model_id_for_pinned_artifact(
+                artifact.repository,
+                artifact.revision,
+                "another-quantization.gguf",
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -771,6 +861,8 @@ mod tests {
     fn supported_status_requires_a_matching_machine_readable_receipt() {
         const RECEIPT: &str = r#"{"schema_version":1,"model_id":"whisper_cpp_tiny_en","evidence_id":"phase-0-whisper-jfk-process-smoke","runtime_version":"1.9.1","model_artifact_sha256":"921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f","runtime_package_sha256":"6510693d373c9ed4adbb708015135ea9ec885c8e4312d543ca7d1c2f3dbbd7dc","fixture_corpus_sha256":"9799f3da4289f4db1586d89570026fc0d2ba4f5cec8c64daaebedf8e0643cccf","results_sha256":"a341e990e02ed8589238eb1e8c152a855ec2fbbcd2519d069f5378c098bb28fa","platform":"windows-x86_64","load":true,"known_fixture":true,"cancellation":true,"unload_reload":true,"acceleration":true,"platform_tests":true}"#;
         let mut manifest = MODELS[0];
+        manifest.artifact.sha256 =
+            "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
         manifest.evidence = CompatibilityEvidence {
             load: true,
             known_fixture: true,

@@ -75,26 +75,6 @@ impl fmt::Display for ModelInstallStatus {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecordingStatus {
-    Idle,
-    Recording,
-    Finalizing,
-    Error,
-}
-
-impl fmt::Display for RecordingStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Idle => write!(f, "Idle"),
-            Self::Recording => write!(f, "Recording"),
-            Self::Finalizing => write!(f, "Finalizing"),
-            Self::Error => write!(f, "Error"),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TranscriptSegment {
     pub start_ms: Option<u64>,
@@ -207,41 +187,13 @@ pub fn backend_capabilities(backend: &str) -> BackendCapabilities {
     }
 }
 
-pub fn vosk_model_download_url(model_name: &str) -> Option<&'static str> {
-    match model_name {
-        "vosk-model-small-en-us-0.15" => {
-            Some("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
-        }
-        _ => None,
-    }
-}
-
-pub fn sherpa_model_download_url(model_name: &str) -> Option<&'static str> {
-    match model_name {
-        "sherpa-onnx-zipformer-small-en-2023-06-26" => Some(
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2",
-        ),
-        "sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27" => Some(
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",
-        ),
-        "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming" => Some(
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2",
-        ),
-        _ => None,
-    }
-}
-
 pub fn default_model_catalog() -> Vec<SttModelInfo> {
     let mut models = crate::model_catalog::model_descriptors()
         .into_iter()
         .map(|descriptor| {
             let runtime = crate::model_catalog::runtime_model_manifest(&descriptor.id)
                 .expect("every normalized descriptor must have a runtime manifest");
-            let download_model = runtime
-                .artifact_filename
-                .strip_prefix("ggml-")
-                .and_then(|name| name.strip_suffix(".bin"))
-                .map(str::to_owned);
+            let download_model = Some(runtime.artifact_filename.to_owned());
             SttModelInfo {
                 id: descriptor.id.into_inner(),
                 name: descriptor.display_name.to_owned(),
@@ -416,38 +368,6 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn vosk_download_url_uses_official_model_catalog_entry() {
-        assert_eq!(
-            vosk_model_download_url("vosk-model-small-en-us-0.15"),
-            Some("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
-        );
-    }
-
-    #[test]
-    fn sherpa_family_download_urls_use_supported_model_archives() {
-        assert_eq!(
-            sherpa_model_download_url("sherpa-onnx-zipformer-small-en-2023-06-26"),
-            Some(
-                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-small-en-2023-06-26.tar.bz2"
-            )
-        );
-        assert_eq!(
-            sherpa_model_download_url("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"),
-            Some(
-                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2"
-            )
-        );
-        assert_eq!(
-            sherpa_model_download_url(
-                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
-            ),
-            Some(
-                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2"
-            )
-        );
-    }
 
     #[test]
     fn install_status_labels_progress() {

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "models": {
+    "handy-computer/whisper-tiny.en-gguf": {
+      "display_name": "English Tiny",
+      "description": "Small English GGUF model for low-resource local dictation.",
+      "languages": ["en"],
+      "recommended": true
+    }
+  }
+}

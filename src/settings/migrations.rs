@@ -155,6 +155,22 @@ fn migrate_legacy_flat(
         diagnostics,
         Some(managed_install_value_is_valid),
     );
+    config.general.managed_remote_models = take_map(
+        &mut root,
+        "managed_remote_models",
+        &[],
+        config.general.managed_remote_models,
+        diagnostics,
+        None,
+    );
+    config.general.imported_gguf_models = take_map(
+        &mut root,
+        "imported_gguf_models",
+        &[],
+        config.general.imported_gguf_models,
+        diagnostics,
+        None,
+    );
     config.general.managed_runtimes = take_map(
         &mut root,
         "managed_runtimes",
@@ -232,6 +248,13 @@ fn migrate_legacy_flat(
         "vad_enabled",
         &[],
         config.recording.vad_enabled,
+        diagnostics,
+    );
+    config.recording.manual_activation_rms = take(
+        &mut root,
+        "manual_activation_rms",
+        &[],
+        config.recording.manual_activation_rms,
         diagnostics,
     );
     config.recording.speech_confirmation_ms = take(
@@ -372,6 +395,22 @@ fn parse_general(
             diagnostics,
             Some(managed_install_value_is_valid),
         ),
+        managed_remote_models: take_map(
+            &mut section,
+            "managed_remote_models",
+            &[],
+            defaults.managed_remote_models,
+            diagnostics,
+            None,
+        ),
+        imported_gguf_models: take_map(
+            &mut section,
+            "imported_gguf_models",
+            &[],
+            defaults.imported_gguf_models,
+            diagnostics,
+            None,
+        ),
         managed_runtimes: take_map(
             &mut section,
             "managed_runtimes",
@@ -453,6 +492,13 @@ fn parse_recording(
             "vad_enabled",
             &[],
             defaults.vad_enabled,
+            diagnostics,
+        ),
+        manual_activation_rms: take(
+            &mut section,
+            "manual_activation_rms",
+            &[],
+            defaults.manual_activation_rms,
             diagnostics,
         ),
         speech_confirmation_ms: take(
@@ -826,6 +872,10 @@ mod tests {
         assert_eq!(config.recording.endpoint_silence_ms, 900);
         assert_eq!(config.recording.pre_roll_ms, 250);
         assert_eq!(config.recording.post_roll_ms, 200);
+        assert_eq!(
+            config.recording.manual_activation_rms,
+            RecordingSettings::default().manual_activation_rms
+        );
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.overlay.mode, OverlayMode::Live);
         assert_eq!(config.overlay.position, OverlayPosition::Bottom);
@@ -837,6 +887,36 @@ mod tests {
         assert_eq!(
             config.performance.acceleration_preference,
             AccelerationPreference::Auto
+        );
+    }
+
+    #[test]
+    fn manual_sensitivity_salvages_invalid_values_and_preserves_legacy_fields() {
+        let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "recording": {
+                "sensitivity_mode": "not-a-mode",
+                "manual_activation_rms": "not-a-number",
+                "future_microphone_option": {"kept": true}
+            }
+        }));
+
+        assert_eq!(
+            config.recording.manual_activation_rms,
+            RecordingSettings::default().manual_activation_rms
+        );
+        assert_eq!(
+            config.recording.unknown["future_microphone_option"],
+            json!({"kept": true})
+        );
+        assert_eq!(
+            config.recording.unknown["sensitivity_mode"],
+            json!("not-a-mode")
+        );
+        assert!(diagnostics.invalid_values_salvaged);
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["recording"]["future_microphone_option"],
+            json!({"kept": true})
         );
     }
 
@@ -1002,6 +1082,8 @@ mod tests {
             "schema_version": CURRENT_SCHEMA_VERSION,
             "recording": {
                 "vad_enabled": false,
+                "sensitivity_mode": "manual",
+                "manual_activation_rms": 0.02,
                 "speech_confirmation_ms": 200,
                 "internal_pause_ms": 500,
                 "endpoint_silence_ms": 1000,
@@ -1012,6 +1094,7 @@ mod tests {
         }));
 
         assert!(!config.recording.vad_enabled);
+        assert_eq!(config.recording.manual_activation_rms, 0.02);
         assert_eq!(config.recording.speech_confirmation_ms, 200);
         assert_eq!(config.recording.internal_pause_ms, 500);
         assert_eq!(config.recording.endpoint_silence_ms, 1000);
@@ -1021,6 +1104,15 @@ mod tests {
         assert_eq!(
             serialized["recording"]["future_endpointing"],
             json!({"mode": "adaptive"})
+        );
+        assert_eq!(serialized["recording"]["sensitivity_mode"], json!("manual"));
+        assert!(
+            (serialized["recording"]["manual_activation_rms"]
+                .as_f64()
+                .unwrap()
+                - 0.02)
+                .abs()
+                < 1e-8
         );
     }
 

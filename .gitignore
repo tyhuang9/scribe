@@ -1,4 +1,7 @@
 /target
+/target-*/
+/NUL
+/.stitch/
 
 # Graphify generated output/state should stay local.
 /.graphifyignore

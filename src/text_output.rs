@@ -111,13 +111,6 @@ impl From<TextOutputResult> for TextOutputOutcome {
     }
 }
 
-#[allow(dead_code)] // Compatibility API; target-aware application code uses write_to_captured_target.
-pub fn write_to_focused_app(text: &str, config: &AppConfig) -> TextOutputResult {
-    // Compatibility entry point: without a target captured when dictation
-    // started, copying is safe but synthesizing a paste is not.
-    write_to_captured_target(text, config, None).result
-}
-
 pub fn write_to_captured_target(
     text: &str,
     config: &AppConfig,

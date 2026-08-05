@@ -2,17 +2,20 @@ mod pipeline;
 mod ring_buffer;
 
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
 use thiserror::Error;
 
 use crate::config;
+use crate::config::settings::{
+    DEFAULT_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS, MIN_MANUAL_ACTIVATION_RMS,
+};
 use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewAudioPublisher;
 
@@ -30,9 +33,13 @@ const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000 * (config::MAX_RECORDING_SECON
 pub(super) const MIN_INPUT_SAMPLE_RATE: u32 = 8_000;
 pub(super) const MAX_INPUT_SAMPLE_RATE: u32 = 384_000;
 pub(super) const MAX_INPUT_CHANNELS: u16 = 32;
+pub(crate) const MIN_SPEECH_ACTIVATION_RMS: f32 = 0.012;
 const FAULT_NONE: u8 = 0;
 const FAULT_OVERFLOW: u8 = 1;
 const FAULT_STREAM: u8 = 2;
+const STARTUP_PENDING: u8 = 0;
+const STARTUP_PLAY_COMMITTED: u8 = 1;
+const STARTUP_CANCELLED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VadOptions {
@@ -107,6 +114,32 @@ pub struct CaptureOptions {
     pub vad_enabled: bool,
     pub endpointing_enabled: bool,
     pub vad: VadOptions,
+    pub sensitivity: Sensitivity,
+    pub intent: CaptureIntent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureIntent {
+    Dictation,
+    MeterOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sensitivity {
+    Automatic,
+    Manual { activation_rms: f32 },
+}
+
+impl Sensitivity {
+    fn validate(self) -> Result<(), CaptureError> {
+        if matches!(self, Self::Manual { activation_rms } if !activation_rms.is_finite() || !(MIN_MANUAL_ACTIVATION_RMS..=MAX_MANUAL_ACTIVATION_RMS).contains(&activation_rms))
+        {
+            return Err(CaptureError::InvalidOptions(
+                "manual voice activation threshold must be between 0.000251 and 1.0 RMS",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CaptureOptions {
@@ -115,6 +148,8 @@ impl CaptureOptions {
             vad_enabled: true,
             endpointing_enabled: true,
             vad,
+            sensitivity: Sensitivity::Automatic,
+            intent: CaptureIntent::Dictation,
         }
     }
 }
@@ -132,6 +167,55 @@ pub enum CaptureStopReason {
     MaximumDuration,
 }
 
+#[derive(Clone, Default)]
+pub struct CaptureCancellation {
+    stop_requested: Arc<AtomicBool>,
+    startup_state: Arc<AtomicU8>,
+}
+
+impl CaptureCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.startup_state.compare_exchange(
+            STARTUP_PENDING,
+            STARTUP_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
+
+    fn ensure_startup_active(&self) -> Result<(), CaptureError> {
+        if self.is_cancelled() || self.startup_state.load(Ordering::Acquire) == STARTUP_CANCELLED {
+            Err(CaptureError::StartupCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_play(&self) -> Result<(), CaptureError> {
+        if self.is_cancelled() {
+            return Err(CaptureError::StartupCancelled);
+        }
+        self.startup_state
+            .compare_exchange(
+                STARTUP_PENDING,
+                STARTUP_PLAY_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| CaptureError::StartupCancelled)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LevelSnapshot {
     pub rms: f32,
@@ -147,6 +231,10 @@ pub struct CaptureMetrics {
     pub source_channels: u16,
     pub source_frames: usize,
     pub prepared_frames: usize,
+    /// Maximum native RMS observed across 10 ms VAD signal frames.
+    pub maximum_input_rms: f32,
+    /// Maximum native sample peak observed by the 30 ms meter windows.
+    pub maximum_input_peak: f32,
     pub dropped_samples: usize,
     pub stream_restarts: u32,
 }
@@ -188,6 +276,8 @@ pub enum CaptureError {
     PreparedAudioLimit { maximum_frames: usize },
     #[error("audio recorder did not start within {0:?}")]
     StartTimeout(Duration),
+    #[error("microphone startup was cancelled")]
+    StartupCancelled,
     #[error("audio recorder did not stop within {0:?}")]
     StopTimeout(Duration),
     #[error("audio recorder worker disconnected unexpectedly")]
@@ -202,6 +292,8 @@ pub struct RecordingSession {
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
+    level_revision: Arc<AtomicU64>,
+    manual_activation_threshold_bits: Arc<AtomicU32>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -231,6 +323,29 @@ impl RecordingSession {
 
     pub fn has_level_update(&self) -> bool {
         self.level_observed.load(Ordering::Acquire)
+    }
+
+    pub fn latest_level_revision(&self) -> u64 {
+        self.level_revision.load(Ordering::Acquire)
+    }
+
+    pub fn set_manual_activation_threshold(&self, activation_rms: f32) {
+        if activation_rms.is_finite() {
+            self.manual_activation_threshold_bits.store(
+                activation_rms
+                    .clamp(MIN_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS)
+                    .to_bits(),
+                Ordering::Release,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_activation_threshold(&self) -> f32 {
+        f32::from_bits(
+            self.manual_activation_threshold_bits
+                .load(Ordering::Acquire),
+        )
     }
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<(), CaptureError> {
@@ -272,6 +387,15 @@ impl RecordingSession {
         audio: Option<Arc<PreparedAudio>>,
         stop_reason: CaptureStopReason,
     ) -> Self {
+        Self::simulated_with_stop_delay(audio, stop_reason, Duration::ZERO)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_with_stop_delay(
+        audio: Option<Arc<PreparedAudio>>,
+        stop_reason: CaptureStopReason,
+        stop_delay: Duration,
+    ) -> Self {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop_requested);
         let (finished_tx, finished_rx) = bounded(1);
@@ -280,6 +404,9 @@ impl RecordingSession {
             while !worker_stop.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(2)
             {
                 thread::sleep(Duration::from_millis(1));
+            }
+            if worker_stop.load(Ordering::Acquire) {
+                thread::sleep(stop_delay);
             }
             let prepared_frames = audio.as_ref().map_or(0, |prepared| prepared.samples.len());
             let source_sample_rate = audio
@@ -303,6 +430,8 @@ impl RecordingSession {
                     source_channels,
                     source_frames,
                     prepared_frames,
+                    maximum_input_rms: 0.0,
+                    maximum_input_peak: 0.0,
                     dropped_samples: 0,
                     stream_restarts: 0,
                 },
@@ -314,8 +443,21 @@ impl RecordingSession {
             rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             level_observed: Arc::new(AtomicBool::new(false)),
+            level_revision: Arc::new(AtomicU64::new(0)),
+            manual_activation_threshold_bits: Arc::new(AtomicU32::new(
+                DEFAULT_MANUAL_ACTIVATION_RMS.to_bits(),
+            )),
             worker: Mutex::new(Some(worker)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_simulated_telemetry(&self, levels: LevelSnapshot) {
+        self.rms_bits.store(levels.rms.to_bits(), Ordering::Relaxed);
+        self.peak_bits
+            .store(levels.peak.to_bits(), Ordering::Relaxed);
+        self.level_observed.store(true, Ordering::Release);
+        self.level_revision.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -339,12 +481,24 @@ pub fn start_recording(
     input_device_name: Option<String>,
     options: CaptureOptions,
     preview_publisher: Option<PreviewAudioPublisher>,
+    cancellation: CaptureCancellation,
 ) -> Result<RecordingSession, CaptureError> {
     options.vad.validate()?;
-    let stop_requested = Arc::new(AtomicBool::new(false));
+    options.sensitivity.validate()?;
+    let stop_requested = Arc::clone(&cancellation.stop_requested);
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let level_observed = Arc::new(AtomicBool::new(false));
+    let level_revision = Arc::new(AtomicU64::new(0));
+    let vad_threshold_bits = Arc::new(AtomicU32::new(MIN_SPEECH_ACTIVATION_RMS.to_bits()));
+    let manual_activation_threshold_bits = Arc::new(AtomicU32::new(
+        match options.sensitivity {
+            Sensitivity::Automatic => DEFAULT_MANUAL_ACTIVATION_RMS,
+            Sensitivity::Manual { activation_rms } => activation_rms,
+        }
+        .to_bits(),
+    ));
+    let speech_detected = Arc::new(AtomicBool::new(false));
     let (started_tx, started_rx) = bounded(1);
     let (finished_tx, finished_rx) = bounded(1);
 
@@ -352,6 +506,11 @@ pub fn start_recording(
     let worker_rms = Arc::clone(&rms_bits);
     let worker_peak = Arc::clone(&peak_bits);
     let worker_observed = Arc::clone(&level_observed);
+    let worker_level_revision = Arc::clone(&level_revision);
+    let worker_vad_threshold = Arc::clone(&vad_threshold_bits);
+    let worker_manual_activation_threshold = Arc::clone(&manual_activation_threshold_bits);
+    let worker_speech_detected = Arc::clone(&speech_detected);
+    let worker_cancellation = cancellation.clone();
     let worker = thread::Builder::new()
         .name("scribe-audio-capture".to_owned())
         .spawn(move || {
@@ -364,6 +523,11 @@ pub fn start_recording(
                 worker_rms,
                 worker_peak,
                 worker_observed,
+                worker_level_revision,
+                worker_vad_threshold,
+                worker_manual_activation_threshold,
+                worker_speech_detected,
+                worker_cancellation,
                 &started_tx,
             );
             if let Err(error) = &result {
@@ -373,23 +537,42 @@ pub fn start_recording(
         })
         .map_err(|error| CaptureError::WorkerSpawn(error.to_string()))?;
 
-    match started_rx.recv_timeout(START_TIMEOUT) {
-        Ok(Ok(())) => Ok(RecordingSession {
+    match await_capture_start(&started_rx, &cancellation, worker, START_TIMEOUT) {
+        Ok(worker) => Ok(RecordingSession {
             stop_requested,
             finished_rx,
             rms_bits,
             peak_bits,
             level_observed,
+            level_revision,
+            manual_activation_threshold_bits,
             worker: Mutex::new(Some(worker)),
         }),
+        Err(error) => Err(error),
+    }
+}
+
+fn await_capture_start(
+    started_rx: &Receiver<Result<(), CaptureError>>,
+    cancellation: &CaptureCancellation,
+    worker: thread::JoinHandle<()>,
+    timeout: Duration,
+) -> Result<thread::JoinHandle<()>, CaptureError> {
+    match started_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(worker),
         Ok(Err(error)) => {
             let _ = worker.join();
             Err(error)
         }
-        Err(_) => {
-            stop_requested.store(true, Ordering::Release);
+        Err(RecvTimeoutError::Timeout) => {
+            cancellation.cancel();
             spawn_worker_reaper(worker);
-            Err(CaptureError::StartTimeout(START_TIMEOUT))
+            Err(CaptureError::StartTimeout(timeout))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            cancellation.cancel();
+            spawn_worker_reaper(worker);
+            Err(CaptureError::WorkerDisconnected)
         }
     }
 }
@@ -404,13 +587,22 @@ fn capture_worker(
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
+    level_revision: Arc<AtomicU64>,
+    vad_threshold_bits: Arc<AtomicU32>,
+    manual_activation_threshold_bits: Arc<AtomicU32>,
+    speech_detected: Arc<AtomicBool>,
+    cancellation: CaptureCancellation,
     started_tx: &Sender<Result<(), CaptureError>>,
 ) -> Result<CaptureCompletion, CaptureError> {
+    cancellation.ensure_startup_active()?;
     let host = cpal::default_host();
+    cancellation.ensure_startup_active()?;
     let device = select_input_device(&host, input_device_name.as_deref())?;
+    cancellation.ensure_startup_active()?;
     let supported = device
         .default_input_config()
         .map_err(|error| CaptureError::InputConfiguration(error.to_string()))?;
+    cancellation.ensure_startup_active()?;
     let format = InputFormat::from_supported(&supported)?;
     let config: cpal::StreamConfig = supported.into();
     if !input_format_is_credible(format.sample_rate, format.channels) {
@@ -428,6 +620,7 @@ fn capture_worker(
     let (producer, mut consumer) = ring_buffer(ring_capacity);
     let fault = Arc::new(AtomicU8::new(FAULT_NONE));
     let dropped_samples = Arc::new(AtomicUsize::new(0));
+    cancellation.ensure_startup_active()?;
     let mut stream = Some(build_stream(
         &device,
         &config,
@@ -436,6 +629,8 @@ fn capture_worker(
         Arc::clone(&fault),
         Arc::clone(&dropped_samples),
     )?);
+    cancellation.ensure_startup_active()?;
+    cancellation.commit_play()?;
     stream
         .as_ref()
         .expect("stream was just built")
@@ -450,7 +645,13 @@ fn capture_worker(
         rms_bits,
         peak_bits,
         level_observed,
+        level_revision,
     )?
+    .with_vad_telemetry(
+        vad_threshold_bits,
+        manual_activation_threshold_bits,
+        speech_detected,
+    )
     .with_preview_publisher(preview_publisher);
     let capture_started = Instant::now();
     let maximum_duration = Duration::from_secs(
@@ -547,6 +748,7 @@ fn capture_worker(
     let source_frames = pipeline.source_frames();
     let speech_trigger_elapsed = pipeline.speech_trigger_elapsed();
     let audio = pipeline.finish(stop_reason)?.map(Arc::new);
+    let maximum_levels = pipeline.maximum_levels();
     let prepared_frames = audio.as_ref().map_or(0, |audio| audio.samples.len());
     Ok(CaptureCompletion {
         audio,
@@ -559,6 +761,8 @@ fn capture_worker(
             source_channels: format.channels,
             source_frames,
             prepared_frames,
+            maximum_input_rms: maximum_levels.rms,
+            maximum_input_peak: maximum_levels.peak,
             dropped_samples: dropped_samples.load(Ordering::Relaxed),
             stream_restarts: restart_policy.attempts,
         },
@@ -1026,5 +1230,95 @@ mod tests {
         }
 
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn simulated_telemetry_advances_the_latest_meter_revision() {
+        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
+        assert_eq!(session.latest_level_revision(), 0);
+
+        session.set_simulated_telemetry(LevelSnapshot {
+            rms: 0.02,
+            peak: 0.04,
+        });
+        assert_eq!(session.latest_level_revision(), 1);
+        assert_eq!(session.latest_levels().peak, 0.04);
+
+        session.set_simulated_telemetry(LevelSnapshot::default());
+        assert_eq!(session.latest_level_revision(), 2);
+        session.stop_and_discard(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn session_manual_threshold_updates_are_bounded_and_ignore_non_finite_values() {
+        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
+        session.set_manual_activation_threshold(f32::INFINITY);
+        assert_eq!(
+            f32::from_bits(
+                session
+                    .manual_activation_threshold_bits
+                    .load(Ordering::Acquire)
+            ),
+            DEFAULT_MANUAL_ACTIVATION_RMS
+        );
+
+        session.set_manual_activation_threshold(MAX_MANUAL_ACTIVATION_RMS * 2.0);
+        assert_eq!(
+            f32::from_bits(
+                session
+                    .manual_activation_threshold_bits
+                    .load(Ordering::Acquire)
+            ),
+            MAX_MANUAL_ACTIVATION_RMS
+        );
+        session.stop_and_discard(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn startup_timeout_returns_before_blocked_worker_is_reaped() {
+        let cancellation = CaptureCancellation::new();
+        let awaiting_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = bounded(1);
+        let (worker_blocked_tx, worker_blocked_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let (worker_done_tx, worker_done_rx) = bounded(1);
+        let worker = thread::spawn(move || {
+            let _started_tx = started_tx;
+            worker_blocked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            worker_done_tx.send(()).unwrap();
+        });
+        worker_blocked_rx.recv().unwrap();
+
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = thread::spawn(move || {
+            result_tx
+                .send(await_capture_start(
+                    &started_rx,
+                    &awaiting_cancellation,
+                    worker,
+                    Duration::from_millis(5),
+                ))
+                .unwrap();
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup timeout must not wait for the blocked worker");
+
+        assert!(matches!(
+            result,
+            Err(CaptureError::StartTimeout(timeout)) if timeout == Duration::from_millis(5)
+        ));
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            worker_done_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released worker should finish for reaping");
+        waiter.join().unwrap();
     }
 }

@@ -1,17 +1,21 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW_MS};
 
 use super::{
-    CaptureError, CaptureOptions, CaptureStopReason, LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES,
-    VadOptions, input_format_is_credible,
+    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LevelSnapshot,
+    MAX_CAPTURE_PREPARED_FRAMES, MIN_SPEECH_ACTIVATION_RMS, Sensitivity, VadOptions,
+    input_format_is_credible,
+};
+use crate::config::settings::{
+    DEFAULT_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS, MIN_MANUAL_ACTIVATION_RMS,
 };
 
 const VAD_FRAME_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
-const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 25;
+const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) * 30 / 1_000;
 const TARGET_RMS: f32 = 0.1;
 const TARGET_PEAK_CEILING: f32 = 0.95;
 const MAX_NORMALIZATION_GAIN: f32 = 8.0;
@@ -29,6 +33,7 @@ pub(super) struct Pipeline {
     channel_sum: f64,
     resampler: StreamingLinearResampler,
     prepared: Vec<f32>,
+    retain_audio: bool,
     limit_exceeded: bool,
     levels: LevelTracker,
     vad_enabled: bool,
@@ -45,6 +50,7 @@ impl Pipeline {
         level_bits: Arc<AtomicU32>,
         peak_bits: Arc<AtomicU32>,
         level_observed: Arc<AtomicBool>,
+        level_revision: Arc<AtomicU64>,
     ) -> Result<Self, CaptureError> {
         if !input_format_is_credible(source_sample_rate, source_channels) {
             return Err(CaptureError::InvalidInputFormat {
@@ -61,10 +67,15 @@ impl Pipeline {
             channel_sum: 0.0,
             resampler: StreamingLinearResampler::new(source_sample_rate, PREPARED_SAMPLE_RATE),
             prepared: Vec::new(),
+            retain_audio: options.intent == CaptureIntent::Dictation,
             limit_exceeded: false,
-            levels: LevelTracker::new(level_bits, peak_bits, level_observed),
+            levels: LevelTracker::new(level_bits, peak_bits, level_observed, level_revision),
             vad_enabled: options.vad_enabled,
-            vad: VadTracker::new(options.vad, options.endpointing_enabled),
+            vad: VadTracker::new(
+                options.vad,
+                options.endpointing_enabled,
+                options.sensitivity,
+            ),
             preview_publisher: None,
             next_preview_frame: PREVIEW_INTERVAL_FRAMES,
         })
@@ -75,6 +86,20 @@ impl Pipeline {
         publisher: Option<PreviewAudioPublisher>,
     ) -> Self {
         self.preview_publisher = publisher;
+        self
+    }
+
+    pub(super) fn with_vad_telemetry(
+        mut self,
+        activation_threshold_bits: Arc<AtomicU32>,
+        manual_activation_threshold_bits: Arc<AtomicU32>,
+        speech_detected: Arc<AtomicBool>,
+    ) -> Self {
+        self.vad.set_telemetry(
+            activation_threshold_bits,
+            manual_activation_threshold_bits,
+            speech_detected,
+        );
         self
     }
 
@@ -95,13 +120,16 @@ impl Pipeline {
         let levels = &mut self.levels;
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
+        let retain_audio = self.retain_audio;
         self.resampler.push(mono, |output| {
-            push_bounded(
-                prepared,
-                limit_exceeded,
-                output,
-                MAX_CAPTURE_PREPARED_FRAMES,
-            );
+            if retain_audio {
+                push_bounded(
+                    prepared,
+                    limit_exceeded,
+                    output,
+                    MAX_CAPTURE_PREPARED_FRAMES,
+                );
+            }
             levels.push(output);
             if vad_enabled {
                 vad.push(output);
@@ -156,7 +184,7 @@ impl Pipeline {
     }
 
     pub(super) fn finish(
-        mut self,
+        &mut self,
         stop_reason: CaptureStopReason,
     ) -> Result<Option<PreparedAudio>, CaptureError> {
         let prepared = &mut self.prepared;
@@ -164,23 +192,31 @@ impl Pipeline {
         let levels = &mut self.levels;
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
+        let retain_audio = self.retain_audio;
         self.resampler.finish(|output| {
-            push_bounded(
-                prepared,
-                limit_exceeded,
-                output,
-                MAX_CAPTURE_PREPARED_FRAMES,
-            );
+            if retain_audio {
+                push_bounded(
+                    prepared,
+                    limit_exceeded,
+                    output,
+                    MAX_CAPTURE_PREPARED_FRAMES,
+                );
+            }
             levels.push(output);
             if vad_enabled {
                 vad.push(output);
             }
         });
+        self.levels.finish_windows();
 
         if self.limit_exceeded {
             return Err(CaptureError::PreparedAudioLimit {
                 maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
             });
+        }
+
+        if !self.retain_audio {
+            return Ok(None);
         }
 
         if !self.vad_enabled {
@@ -189,7 +225,7 @@ impl Pipeline {
             }
             normalize_loudness(&mut self.prepared);
             return PreparedAudio::from_captured_mono(
-                self.prepared,
+                std::mem::take(&mut self.prepared),
                 self.source_sample_rate,
                 self.source_channels,
                 self.source_frames,
@@ -214,7 +250,7 @@ impl Pipeline {
         if start >= end {
             return Ok(None);
         }
-        let mut samples = self.prepared;
+        let mut samples = std::mem::take(&mut self.prepared);
         samples.truncate(end);
         if start > 0 {
             samples.drain(..start);
@@ -229,6 +265,10 @@ impl Pipeline {
         )
         .map(Some)
         .map_err(|error| CaptureError::Preparation(error.to_string()))
+    }
+
+    pub(super) fn maximum_levels(&self) -> LevelSnapshot {
+        self.levels.maximum()
     }
 }
 
@@ -359,20 +399,35 @@ struct LevelTracker {
     sum_squares: f64,
     peak: f32,
     count: usize,
+    signal_sum_squares: f64,
+    signal_count: usize,
+    maximum_rms: f32,
+    maximum_peak: f32,
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     observed: Arc<AtomicBool>,
+    revision: Arc<AtomicU64>,
 }
 
 impl LevelTracker {
-    fn new(rms_bits: Arc<AtomicU32>, peak_bits: Arc<AtomicU32>, observed: Arc<AtomicBool>) -> Self {
+    fn new(
+        rms_bits: Arc<AtomicU32>,
+        peak_bits: Arc<AtomicU32>,
+        observed: Arc<AtomicBool>,
+        revision: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             sum_squares: 0.0,
             peak: 0.0,
             count: 0,
+            signal_sum_squares: 0.0,
+            signal_count: 0,
+            maximum_rms: 0.0,
+            maximum_peak: 0.0,
             rms_bits,
             peak_bits,
             observed,
+            revision,
         }
     }
 
@@ -381,22 +436,56 @@ impl LevelTracker {
         self.sum_squares += f64::from(sample) * f64::from(sample);
         self.peak = self.peak.max(sample.abs());
         self.count += 1;
-        if self.count != LEVEL_WINDOW_SAMPLES {
+        self.signal_sum_squares += f64::from(sample) * f64::from(sample);
+        self.signal_count += 1;
+        if self.signal_count == VAD_FRAME_SAMPLES {
+            self.finish_signal_window();
+        }
+        if self.count == LEVEL_WINDOW_SAMPLES {
+            self.publish_meter_window();
+        }
+    }
+
+    fn finish_windows(&mut self) {
+        self.finish_signal_window();
+        self.publish_meter_window();
+    }
+
+    fn finish_signal_window(&mut self) {
+        if self.signal_count == 0 {
             return;
         }
+        let rms = (self.signal_sum_squares / self.signal_count as f64).sqrt() as f32;
+        self.maximum_rms = self.maximum_rms.max(rms);
+        self.signal_sum_squares = 0.0;
+        self.signal_count = 0;
+    }
 
+    fn publish_meter_window(&mut self) {
+        if self.count == 0 {
+            return;
+        }
         let snapshot = LevelSnapshot {
             rms: (self.sum_squares / self.count as f64).sqrt() as f32,
             peak: self.peak,
         };
+        self.maximum_peak = self.maximum_peak.max(snapshot.peak);
         self.rms_bits
             .store(snapshot.rms.to_bits(), Ordering::Relaxed);
         self.peak_bits
             .store(snapshot.peak.to_bits(), Ordering::Relaxed);
+        self.revision.fetch_add(1, Ordering::Release);
         self.observed.store(true, Ordering::Release);
         self.sum_squares = 0.0;
         self.peak = 0.0;
         self.count = 0;
+    }
+
+    fn maximum(&self) -> LevelSnapshot {
+        LevelSnapshot {
+            rms: self.maximum_rms,
+            peak: self.maximum_peak,
+        }
     }
 }
 
@@ -421,10 +510,18 @@ struct VadTracker {
     speech_trigger_frame: Option<usize>,
     last_voice_frame: usize,
     endpoint_frame: Option<usize>,
+    sensitivity: Sensitivity,
+    activation_threshold_bits: Arc<AtomicU32>,
+    manual_activation_threshold_bits: Arc<AtomicU32>,
+    speech_detected: Arc<AtomicBool>,
 }
 
 impl VadTracker {
-    fn new(options: VadOptions, endpointing_enabled: bool) -> Self {
+    fn new(options: VadOptions, endpointing_enabled: bool, sensitivity: Sensitivity) -> Self {
+        let threshold = match sensitivity {
+            Sensitivity::Automatic => MIN_SPEECH_ACTIVATION_RMS,
+            Sensitivity::Manual { activation_rms } => activation_rms,
+        };
         Self {
             options,
             endpointing_enabled,
@@ -439,7 +536,28 @@ impl VadTracker {
             speech_trigger_frame: None,
             last_voice_frame: 0,
             endpoint_frame: None,
+            sensitivity,
+            activation_threshold_bits: Arc::new(AtomicU32::new(threshold.to_bits())),
+            manual_activation_threshold_bits: Arc::new(AtomicU32::new(threshold.to_bits())),
+            speech_detected: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn set_telemetry(
+        &mut self,
+        activation_threshold_bits: Arc<AtomicU32>,
+        manual_activation_threshold_bits: Arc<AtomicU32>,
+        speech_detected: Arc<AtomicBool>,
+    ) {
+        activation_threshold_bits.store(
+            self.activation_threshold_bits.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.activation_threshold_bits = activation_threshold_bits;
+        if matches!(self.sensitivity, Sensitivity::Manual { .. }) {
+            self.manual_activation_threshold_bits = manual_activation_threshold_bits;
+        }
+        self.speech_detected = speech_detected;
     }
 
     fn push(&mut self, sample: f32) {
@@ -460,9 +578,30 @@ impl VadTracker {
             return;
         }
         let frame_end = self.processed_samples;
-        let frame_start = frame_end - VAD_FRAME_SAMPLES;
-        let activation_threshold = (self.noise_floor * 3.0).max(0.012);
-        let release_threshold = (self.noise_floor * 1.8).max(0.008);
+        // Production pushes reach this method only after a full VAD frame,
+        // but saturating here also keeps direct/unit-test frame processing
+        // fail-safe at the beginning of a capture.
+        let frame_start = frame_end.saturating_sub(VAD_FRAME_SAMPLES);
+        let (activation_threshold, release_threshold) = match self.sensitivity {
+            Sensitivity::Automatic => (
+                (self.noise_floor * 3.0).max(MIN_SPEECH_ACTIVATION_RMS),
+                (self.noise_floor * 1.8).max(0.008),
+            ),
+            Sensitivity::Manual { .. } => {
+                let activation_rms = f32::from_bits(
+                    self.manual_activation_threshold_bits
+                        .load(Ordering::Acquire),
+                );
+                let activation_rms = if activation_rms.is_finite() {
+                    activation_rms.clamp(MIN_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS)
+                } else {
+                    DEFAULT_MANUAL_ACTIVATION_RMS
+                };
+                (activation_rms, activation_rms * 0.67)
+            }
+        };
+        self.activation_threshold_bits
+            .store(activation_threshold.to_bits(), Ordering::Relaxed);
 
         match self.state {
             VadState::Waiting => {
@@ -476,6 +615,7 @@ impl VadTracker {
                         self.speech_start_frame = self.candidate_start_frame;
                         self.speech_trigger_frame = Some(frame_end);
                         self.last_voice_frame = frame_end;
+                        self.speech_detected.store(true, Ordering::Release);
                     }
                 } else {
                     self.update_noise_floor(rms);
@@ -522,16 +662,22 @@ mod tests {
     use crate::streaming::RollingPreviewSession;
     use crate::transcription::{ModelId, RequestId, SessionId, StreamUpdate};
 
-    fn level_state() -> (Arc<AtomicU32>, Arc<AtomicU32>, Arc<AtomicBool>) {
+    fn level_state() -> (
+        Arc<AtomicU32>,
+        Arc<AtomicU32>,
+        Arc<AtomicBool>,
+        Arc<AtomicU64>,
+    ) {
         (
             Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
     fn pipeline(source_rate: u32, channels: u16) -> Pipeline {
-        let (rms, peak, observed) = level_state();
+        let (rms, peak, observed, revision) = level_state();
         Pipeline::new(
             source_rate,
             channels,
@@ -539,6 +685,7 @@ mod tests {
             rms,
             peak,
             observed,
+            revision,
         )
         .unwrap()
     }
@@ -660,7 +807,7 @@ mod tests {
             endpointing_enabled: false,
             ..CaptureOptions::default()
         };
-        let (preview_rms, preview_peak, preview_observed) = level_state();
+        let (preview_rms, preview_peak, preview_observed, preview_revision) = level_state();
         let mut with_preview = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -668,10 +815,11 @@ mod tests {
             preview_rms,
             preview_peak,
             preview_observed,
+            preview_revision,
         )
         .unwrap()
         .with_preview_publisher(Some(publisher));
-        let (final_rms, final_peak, final_observed) = level_state();
+        let (final_rms, final_peak, final_observed, final_revision) = level_state();
         let mut final_only = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -679,6 +827,7 @@ mod tests {
             final_rms,
             final_peak,
             final_observed,
+            final_revision,
         )
         .unwrap();
 
@@ -733,7 +882,7 @@ mod tests {
             RequestId(5),
             ModelId::new("preview-model"),
         );
-        let (rms, peak, observed) = level_state();
+        let (rms, peak, observed, revision) = level_state();
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -745,6 +894,7 @@ mod tests {
             rms,
             peak,
             observed,
+            revision,
         )
         .unwrap()
         .with_preview_publisher(Some(publisher));
@@ -776,8 +926,8 @@ mod tests {
     }
 
     #[test]
-    fn levels_publish_only_on_the_25hz_boundary() {
-        let (rms, peak, observed) = level_state();
+    fn levels_publish_only_on_the_30ms_boundary() {
+        let (rms, peak, observed, revision) = level_state();
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -785,6 +935,7 @@ mod tests {
             Arc::clone(&rms),
             Arc::clone(&peak),
             Arc::clone(&observed),
+            Arc::clone(&revision),
         )
         .unwrap();
         for _ in 0..LEVEL_WINDOW_SAMPLES - 1 {
@@ -794,12 +945,182 @@ mod tests {
         pipeline.push_interleaved(1.0);
 
         assert!(observed.load(Ordering::Acquire));
+        assert_eq!(revision.load(Ordering::Acquire), 1);
         assert_eq!(f32::from_bits(peak.load(Ordering::Relaxed)), 1.0);
         let actual_rms = f32::from_bits(rms.load(Ordering::Relaxed));
         let expected_rms = (((LEVEL_WINDOW_SAMPLES - 1) as f64 * 0.25 + 1.0)
             / LEVEL_WINDOW_SAMPLES as f64)
             .sqrt() as f32;
         assert!((actual_rms - expected_rms).abs() < 1e-6);
+
+        for _ in 0..LEVEL_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.25);
+        }
+        assert_eq!(revision.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn capture_maximum_levels_include_full_and_partial_signal_and_meter_windows() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        for _ in 0..LEVEL_WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.2);
+        }
+        for _ in 0..LEVEL_WINDOW_SAMPLES / 2 {
+            pipeline.push_interleaved(0.6);
+        }
+
+        let _ = pipeline.finish(CaptureStopReason::Explicit).unwrap();
+
+        assert!((pipeline.maximum_levels().rms - 0.6).abs() < 1e-6);
+        assert!((pipeline.maximum_levels().peak - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn diagnostic_rms_uses_ten_millisecond_frames_while_live_rms_uses_thirty() {
+        let (rms_bits, peak_bits, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Arc::clone(&rms_bits),
+            peak_bits,
+            observed,
+            revision,
+        )
+        .unwrap();
+        push_mono_ms(&mut pipeline, 20, 0.01);
+        push_mono_ms(&mut pipeline, 10, 0.05);
+
+        let live_rms = f32::from_bits(rms_bits.load(Ordering::Relaxed));
+        let diagnostic_rms = pipeline.maximum_levels().rms;
+
+        assert!((diagnostic_rms - 0.05).abs() < 1e-6);
+        assert!(live_rms < diagnostic_rms);
+        assert!(live_rms > 0.01);
+    }
+
+    #[test]
+    fn one_meter_window_non_speech_burst_reaches_the_diagnostic_activation_floor() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        push_mono_ms(&mut pipeline, 30, MIN_SPEECH_ACTIVATION_RMS);
+        push_mono_ms(&mut pipeline, 100, 0.0);
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pipeline.maximum_levels().rms >= MIN_SPEECH_ACTIVATION_RMS);
+    }
+
+    #[test]
+    fn automatic_activation_threshold_preserves_the_existing_noise_floor_rule() {
+        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
+        pipeline.vad.noise_floor = 0.01;
+        pipeline.vad.process_frame(0.0);
+
+        assert!(
+            (f32::from_bits(
+                pipeline
+                    .vad
+                    .activation_threshold_bits
+                    .load(Ordering::Relaxed)
+            ) - 0.03)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn manual_activation_threshold_changes_apply_to_subsequent_vad_frames() {
+        let (rms, peak, observed, revision) = level_state();
+        let reported_threshold = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let manual_threshold = Arc::new(AtomicU32::new(0.03_f32.to_bits()));
+        let speech_detected = Arc::new(AtomicBool::new(false));
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                sensitivity: Sensitivity::Manual {
+                    activation_rms: 0.03,
+                },
+                ..CaptureOptions::default()
+            },
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_vad_telemetry(
+            Arc::clone(&reported_threshold),
+            Arc::clone(&manual_threshold),
+            Arc::clone(&speech_detected),
+        );
+
+        push_mono_ms(&mut pipeline, 10, 0.02);
+        assert_eq!(pipeline.vad.state, VadState::Waiting);
+        manual_threshold.store(0.01_f32.to_bits(), Ordering::Release);
+        push_mono_ms(&mut pipeline, 150, 0.02);
+
+        assert!(speech_detected.load(Ordering::Acquire));
+        assert_eq!(
+            f32::from_bits(reported_threshold.load(Ordering::Relaxed)),
+            0.01
+        );
+    }
+
+    #[test]
+    fn manual_meter_only_capture_detects_voice_without_retaining_audio() {
+        let (rms_bits, peak_bits, observed, revision) = level_state();
+        let threshold_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let speech_detected = Arc::new(AtomicBool::new(false));
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                sensitivity: Sensitivity::Manual {
+                    activation_rms: 0.02,
+                },
+                intent: CaptureIntent::MeterOnly,
+                ..CaptureOptions::default()
+            },
+            Arc::clone(&rms_bits),
+            Arc::clone(&peak_bits),
+            Arc::clone(&observed),
+            Arc::clone(&revision),
+        )
+        .unwrap()
+        .with_vad_telemetry(
+            Arc::clone(&threshold_bits),
+            Arc::new(AtomicU32::new(0.02_f32.to_bits())),
+            Arc::clone(&speech_detected),
+        );
+        push_mono_ms(&mut pipeline, 150, 0.03);
+
+        assert!(speech_detected.load(Ordering::Acquire));
+        assert_eq!(f32::from_bits(threshold_bits.load(Ordering::Relaxed)), 0.02);
+        assert!(observed.load(Ordering::Acquire));
+        assert!(revision.load(Ordering::Acquire) > 0);
+        assert!(f32::from_bits(rms_bits.load(Ordering::Relaxed)) > 0.0);
+        assert!(f32::from_bits(peak_bits.load(Ordering::Relaxed)) > 0.0);
+        assert!(pipeline.prepared.is_empty());
+        assert_eq!(
+            pipeline.prepared.len(),
+            0,
+            "prepared_frames must remain zero"
+        );
+        assert!(
+            pipeline.preview_publisher.is_none(),
+            "meter-only never publishes preview audio"
+        );
+        let audio = pipeline.finish(CaptureStopReason::Explicit).unwrap();
+        assert!(
+            audio.is_none(),
+            "meter-only completion has no PreparedAudio"
+        );
+        assert!(pipeline.prepared.is_empty());
     }
 
     #[test]
@@ -825,7 +1146,7 @@ mod tests {
 
     #[test]
     fn hold_to_talk_vad_keeps_tracking_speech_after_endpoint_length_silence() {
-        let (rms, peak, observed) = level_state();
+        let (rms, peak, observed, revision) = level_state();
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -836,6 +1157,7 @@ mod tests {
             rms,
             peak,
             observed,
+            revision,
         )
         .unwrap();
         push_mono_ms(&mut pipeline, 150, 0.2);
@@ -944,7 +1266,7 @@ mod tests {
 
     #[test]
     fn disabled_vad_returns_silence_without_endpointing_or_trimming() {
-        let (rms, peak, observed) = level_state();
+        let (rms, peak, observed, revision) = level_state();
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
@@ -956,6 +1278,7 @@ mod tests {
             rms,
             peak,
             observed,
+            revision,
         )
         .unwrap();
         push_mono_ms(&mut pipeline, 1_000, 0.0);

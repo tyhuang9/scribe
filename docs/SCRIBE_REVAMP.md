@@ -1153,7 +1153,7 @@ error rather than silently transcribing corrupt audio.
 
 The consumer worker owns channel downmixing, streaming linear resampling to
 16 kHz, finite/range normalization, deterministic bounded RMS normalization,
-25 Hz RMS/peak publication, adaptive noise-floor VAD, trimming, post-roll, and
+30 ms RMS/peak publication, adaptive noise-floor VAD, trimming, post-roll, and
 construction of `PreparedAudio`. Loudness normalization occurs only after VAD
 classification, targets 0.1 RMS, caps peaks at 0.95, and limits gain to 8x so
 the detector and meter always observe the unamplified signal. The legacy WAV
@@ -1253,7 +1253,7 @@ stop-to-final, final-to-paste, total duration, memory, and idle CPU remain
 
 Automated coverage added in this phase includes sample-format conversion,
 downmix, 48 kHz and 44.1 kHz resampling, finite/range and bounded loudness
-normalization, ring wrap/overflow/concurrency, exact 25 Hz meter publication,
+normalization, ring wrap/overflow/concurrency, exact 30 ms meter publication,
 restart token handoff, bounded worker drain, adaptive noise floor, speech
 confirmation, pause/endpoint timing, pre/post-roll, no-speech, VAD-disabled
 capture, Toggle-only silence endpointing, Hold-to-talk release ownership,
@@ -1782,3 +1782,368 @@ measurements on the same machine/corpus/backend.
 The release remains **NO-GO** until Phase 11 diagnostics/hardening, the complete
 Windows manual matrix, Supported-model compatibility evidence, native-streaming
 Definition of Done, and comparable before/after desktop latency report pass.
+
+## Phase 11 - Diagnostics, compatibility, hardening, and retirement
+
+### 1. Summary
+
+Phase 11 implements runtime-neutral session diagnostics and redacted export, a
+local benchmark command/view, expanded architecture boundaries, normalized
+one-handler release packaging, legacy dead-path retirement, accessibility
+hardening, and bounded process-safe native shutdown. The implementation phases
+are complete. The release remains **NO-GO** because the dated Windows desktop
+matrix, physical crash soak, complete Supported-model evidence, native-streaming
+Definition of Done, and desktop latency/memory/idle-CPU evidence are not complete.
+
+### 2. Files changed
+
+- **Created `src/diagnostics.rs`:** allowlisted, runtime-neutral session
+  diagnostics; 50-record in-memory bound; replace-by-session behavior; redacted
+  create-new export with synchronized writes and Unix owner-only permissions.
+- **Created `src/architecture_guard.rs`:** cargo-test source guards for exact
+  handler count, router-private runtime selection, neutral application/UI
+  boundaries, family-logic confinement, native-only PCM, and final-only output.
+- **Modified `src/app.rs`:** session metric capture and failure attribution;
+  diagnostics export; semantic/accessibility improvements to diagnostics and
+  benchmark views; bounded process-exit coordination across preview,
+  compatibility cancellation, and native runtime shutdown. No-speech feedback
+  now distinguishes a capture whose maximum input RMS never reached the
+  existing speech-activation floor and gives hardware mute/gain guidance.
+- **Modified `src/audio.rs` and `src/audio/pipeline.rs`:** capture-wide maximum
+  10 ms VAD-frame RMS and 30 ms meter-window peak scalars are retained with
+  completion metrics, including a final partial meter window. No PCM is
+  persisted for this diagnostic and the VAD threshold is unchanged.
+- **Modified `src/benchmark.rs` and `src/main.rs`:** privacy-bounded
+  `--benchmark` CLI using `TranscriptionService`, allowlisted JSON reporting,
+  create-new output, sanitized errors, and pre-UI command dispatch.
+- **Modified `src/transcription.rs`:** runtime-neutral resolved-backend accessor;
+  explicit bounded native-worker shutdown; cooperative cancellation;
+  deadline-bounded command/ack/join; panic/disconnect and concurrent-drop tests.
+- **Modified `src/streaming.rs`:** bounded rolling-preview shutdown with no
+  same-process detach; process-safe hard-abort fallback after the deadline; new
+  active-decoder ownership regression.
+- **Modified `src/managed_downloads.rs` and `src/models.rs`:** removed
+  unreachable runner-specific model download implementations, output parsers,
+  family URL branches, tests, and dead allowances. Phase 9 pinned transactional
+  preparation remains authoritative.
+- **Modified `src/runtime_router.rs`, `src/core.rs`, and
+  `src/text_output.rs`:** removed stale dead code and a duplicate output entry
+  point while preserving the one router and exactly-once final-output boundary.
+- **Modified `scripts/check-catalog-boundaries.py`:** expanded the independent
+  source scanner to enforce one handler, private manifest routing, neutral UI,
+  native PCM, final-only output, and confined legacy selection.
+- **Modified `scripts/build-release-bundle.sh`:** release output now invokes only
+  the primary whisper.cpp bundler. Legacy development scripts are retained but
+  are not release inputs.
+- **Modified `README.md` and `TODO.md`:** corrected stale runtime/package/audio
+  claims and removed completed Phase 10/11 work.
+- **Created `docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md`; modified this record
+  and `docs/MANUAL_TEST_MATRIX.md`:** final architecture, compatibility,
+  privacy, latency, crash, verification, and remaining-gate evidence.
+
+The untracked consolidated specification files and `.stitch` tree remain
+unchanged.
+
+### 3. Architecture and design decisions
+
+- The final logical handler count is **one**: `TranscribeCppRuntime`.
+  `OnnxSpeechRuntime` remains absent because the exact sherpa-onnx v1.13.4
+  Zipformer evidence gate has no qualifying native package/corpus results.
+- `RuntimeRouter` remains the only application-level runtime selector.
+  Benchmark and diagnostics obtain resolved backend information from a neutral
+  outcome accessor and never import concrete handlers.
+- Diagnostics are ephemeral by default and structurally privacy-bounded instead
+  of redacting arbitrary debug objects after collection. Missing measurements
+  serialize as null rather than being invented.
+- Low-input diagnosis uses the same downmixed, resampled native signal as the
+  meter and VAD. A no-speech capture is classified as silent/too-low only when
+  its maximum window RMS never reaches the unchanged 0.012 minimum activation
+  floor; louder short bursts and non-voice input retain the generic no-speech
+  result. Only maximum RMS/peak scalars enter the allowlisted diagnostics.
+- The benchmark reuses the application service boundary. It reports only
+  allowlisted metadata/timings and does not become a second transcription path.
+- Legacy adapters, aliases, scripts, and user artifacts are retained privately
+  because removing user-owned data or migration compatibility would be unsafe.
+  Unreachable family-specific downloader and release-selection paths were
+  removed now because normalized manifests replaced their roles.
+- Native shutdown has one two-second process-exit budget. Cooperative cancel is
+  attempted first; command admission, acknowledgement, and thread completion
+  are deadline bounded. A completed or panicked worker is joined. If native code
+  remains live at the deadline, Scribe hard-aborts without running Rust/DLL
+  teardown. It never detaches a native worker in the same process and never
+  waits indefinitely. A helper-process runtime was rejected for this phase
+  because it would replace the verified retained native C-API vertical slice;
+  the explicit hard-abort policy is smaller and safe for exit-only failure.
+- The benchmark heatmap uses theme-specific dark fills and explicit high-
+  contrast text. Missing diagnostics capability has a visible explanation,
+  not a hover-only affordance.
+
+### 4. Risks and assumptions
+
+- **High - Windows desktop evidence:** shortcut, microphone, overlay focus,
+  clipboard, target identity, history, install recovery, device restart,
+  multi-monitor/DPI, and standard/elevated targets remain manually unverified.
+  Mitigation: execute every dated Windows matrix row and attach evidence.
+- **High - native shutdown soak:** two release-test access violations were
+  observed before shutdown hardening. Deterministic ownership/deadline tests and
+  the exact 25-run rolling fixture pass afterward, but a prolonged physical app
+  close/restart soak is absent. Mitigation: run a Windows WER-monitored soak;
+  retain dumps/events for any recurrence.
+- **High - compatibility claims:** no model has the complete required matrix.
+  Mitigation: keep all four artifacts Experimental and promote only after the
+  full gate passes.
+- **Medium - hard-abort fallback:** a genuinely wedged native runtime terminates
+  Scribe without normal settings/history flush after the shared two-second exit
+  budget. This is intentionally preferable to an unload access violation or
+  infinite hang; in-flight text is never pasted. Mitigation: keep writes
+  transactional, diagnose the native hang from the prior allowlisted metrics,
+  and consider a supervised runtime process only if real hangs recur.
+- **Medium - preview latency:** warm rolling p95 is 1,849 ms, above the 1,200 ms
+  product target and native-streaming definition. Mitigation: retain the batch
+  preview exception as Experimental and continue representative-corpus tuning;
+  do not describe it as native streaming.
+- **Medium - cross-platform evidence:** conservative code paths compile where
+  available but macOS/Linux desktop behavior is not exercised here. Mitigation:
+  run their build/manual fallback matrices before a platform support claim.
+- **Low - export ACL variance:** Unix owner-only mode is explicit; Windows uses
+  the selected directory's ACL. The UI default is Scribe's private config
+  directory. Mitigation: document exports as user-controlled files and verify
+  Windows ACL inheritance in the manual matrix.
+
+### 5. Testing and measured evidence
+
+| Check | Command/evidence | Result |
+| --- | --- | --- |
+| Format/check/lint | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings` | **PASS** |
+| Full automated suite | `cargo test --all-targets --all-features` | **PASS** - 623 discovered, 614 passed, 0 failed, 9 environment-gated tests ignored |
+| Builds | `cargo build --all-features`; `cargo build --release --all-features` | **PASS** |
+| Architecture boundaries | Rust `architecture_guard` suite and WSL `scripts/check-catalog-boundaries.py` | **PASS** - exactly one handler, router-private selection, neutral UI, native PCM, final-only output |
+| Diagnostics | Focused `diagnostics::tests` | **PASS** - allowlist, null metrics, bounded replace, private-marker absence, export I/O preservation |
+| Low-input diagnosis | Focused audio-pipeline and app no-speech tests | **PASS** - full/partial-window maximum levels; low-input/FIFINE guidance; threshold-level non-speech remains generic |
+| Live FIFINE probe | Two no-save CPAL probes on Windows against the configured 48 kHz F32 stereo input | **DIAGNOSED** - callbacks and both channels were healthy with no phase cancellation, but the strongest observed 10 ms mono RMS was 0.001559 (0/1,498 windows at 0.012); Windows privacy was Allow and endpoint gain was 100%/+7 dB, isolating hardware mute/physical gain or acoustic input rather than runtime/model failure |
+| Benchmark | Focused `benchmark::tests` and release CLI report | **PASS** - 15 tests; one fixture report recorded 1/403/838/1,243 ms prepare/load/backend/total and no private payload |
+| Native shutdown | Focused streaming/transcription tests | **PASS** - active preview is never detached; stuck command returns at deadline and recovers; panic/disconnect joins; 20x concurrent last-clone stress completes |
+| Accessibility | Exhaustive score/theme contrast plus focused diagnostics/target tests | **PASS / reviewer GO** - minimum 13.18:1 light and 8.77:1 dark; semantic headings/descriptions and 44 px primary action |
+| Security review | Specialist privacy/security audit and post-fix review | **PASS** - no Critical, High, or Medium finding; sanitized benchmark errors and private export mode addressed Low findings |
+| Runtime package | Pinned PowerShell bundler to disposable output | **PASS** - Windows x64 CPU v1.9.1; 13 manifest files plus manifest |
+| Service fixture | Release JFK service smoke | **PASS** - first load/decode 299/857 ms; warm load/decode 0/826 ms |
+| Cancellation | Release primary cancellation fixture | **PASS** - 840 ms acknowledgement; the absent ONNX-handler 250 ms gate does not apply |
+| Rolling release fixture | Exact 5 cold + 20 warm run after shutdown fix | **PASS** - cold 2,042/2,077 ms; warm 1,783/1,849 ms median/p95 |
+| Diff hygiene | `git diff --check` and explicit status review | **PASS** |
+
+One rolling release attempt before the shutdown fix timed out, and Windows
+showed an access-violation dialog for the release test executable. It is retained
+as failure evidence rather than hidden by the successful post-fix rerun.
+
+Comparable 11-second base.en CPU latency:
+
+| Measurement | Phase 0 before median/p95 | Phase 11 after median/p95 | Change |
+| --- | ---: | ---: | ---: |
+| Cold process/load/transcribe | 1,282.8/1,333.1 ms | 1,182/1,197 ms | -7.9%/-10.2% |
+| Repeated process vs retained warm | 1,279.5/1,452.8 ms | 846/926 ms | -33.9%/-36.3% |
+| Cold load | not separated | 308/330 ms | no comparison claim |
+| Warm load | process included load | 0/0 ms | retained-model observation |
+| Cold RTF | not separated | 0.107/0.109 | no comparison claim |
+| Warm RTF | not separated | 0.077/0.084 | no comparison claim |
+
+The warm delta includes process elimination and retained model state. It is not
+an end-to-end desktop, accuracy, memory, or Supported-model claim.
+
+### 6. What could not be verified
+
+- A real Windows FIFINE input was probed without saving audio and confirmed the
+  silent/too-low failure signature. A successful spoken GUI/hotkey/overlay/
+  target/paste/history run after correcting hardware mute/gain remains absent.
+- Hotkey-to-overlay, hotkey-to-capture, first meter, first partial,
+  stop-to-final, final-to-paste, total duration, memory, and idle CPU lack saved
+  desktop median/p95 results. Instrumentation is present; values are not.
+- No physical shutdown/restart soak or Windows crash dump analysis followed the
+  access-violation fix.
+- The four Experimental models lack the complete platform, acceleration,
+  cancel, unload/reload, crash recovery, accuracy, and memory suite.
+- The named Zipformer native streaming candidate was not available as a fully
+  pinned, qualified package and therefore did not enter the application.
+- macOS/Linux UI, microphone, hotkey, and clipboard-only behavior was not run.
+- CodeRabbit reviewed earlier stacked snapshots and its findings were
+  addressed. Its CLI was unavailable for a dedicated final-snapshot rerun;
+  compiler/tests plus local security, accessibility, performance, and
+  integration reviews cover the final tree.
+
+### 7. Next steps
+
+1. Execute the dated Windows 11 manual matrix and shutdown/restart soak.
+2. Save same-machine desktop latency, RTF, memory, and idle-CPU observations.
+3. Complete the full compatibility suite before promoting any model.
+4. Tune rolling preview against a representative corpus while retaining its
+   bounded work and tentative-overlay-only guarantees.
+5. Exercise conservative macOS/Linux builds and copy-only output.
+6. Publish the pinned Windows archive and exercise real network interruption,
+   resume, recovery, and rollback.
+
+These are evidence/release tasks and should be independently reviewable rather
+than folded into an unrelated implementation branch.
+
+### 8. Self review
+
+- The added diagnostics and benchmark types are intentionally allowlisted; no
+  generic error/debug serialization path remains.
+- Shutdown handling is more complex than a simple join because it must avoid
+  both the observed DLL-unload race and an infinite UI hang. Deadline ownership
+  and hard-abort behavior are documented and fault-injected.
+- `app.rs` remains large. Phase 5 split composition/pages/platform adapters, but
+  further page extraction is a maintainability improvement, not a reason to
+  duplicate state systems.
+- Private legacy adapters remain technical debt, but are excluded from runtime
+  routing, the normalized UI, and release packaging. Removing them before
+  verified replacement roles would violate artifact/config preservation.
+- No placeholder control, fake progress, second runtime, tentative output path,
+  or duplicate settings/history/download/transcription system was introduced.
+- The final report deliberately does not turn compilation or smoke timing into
+  compatibility, native-streaming, desktop-latency, or release claims.
+
+### 9. Confidence assessment
+
+- **Overall: Medium.** The implementation and automated boundaries are strong;
+  release evidence is intentionally incomplete.
+- **Correctness: Medium-High.** The automated suite and targeted fault injection
+  cover the implemented contracts; physical desktop/native shutdown behavior
+  still needs soak evidence.
+- **Maintainability: Medium-High.** Runtime selection and contracts are sharply
+  bounded, though the remaining `app.rs` size and private legacy adapters carry
+  debt.
+- **Test coverage: High for deterministic/native-neutral contracts; Low for
+  physical desktop coverage.** Confidence rises after the dated manual matrix.
+- **Security/privacy: High for the inspected implementation.** PCM, tentative
+  text, exports, output target validation, and persistence defaults are bounded;
+  Windows export ACL/manual clipboard races still need observation.
+- **Production readiness: Low.** Release remains NO-GO until the explicit manual,
+  compatibility, streaming, soak, and measurement gates pass.
+
+## Post-Phase 11 tray wakeup regression checkpoint
+
+Recorded 2026-08-05 on Windows x64 after a report that tray commands stopped
+responding once the primary viewport was hidden.
+
+- Corrected root cause: native tray events were delivered and queued, but
+  eframe 0.27.2 converts `Context::request_repaint` into winit
+  `window.request_redraw()`. Pinned winit 0.29.15 implements that with
+  `RedrawWindow(..., RDW_INTERNALPAINT)` and explicitly documents that an
+  invisible Windows window does not receive the `WM_PAINT` used for
+  `RedrawRequested`. The first callback-only fix therefore woke the event loop
+  but still could not run `App::update` for the hidden root viewport.
+- Live failure evidence: against the exact isolated release process, selecting
+  Show queued the command but left the root HWND hidden. Posting one asynchronous
+  `WM_PAINT` to that HWND immediately drained the queued command and restored
+  the window. This ruled out stale binaries, menu IDs, handler registration, and
+  command mapping.
+- Corrected fix: the root HWND is captured from `CreationContext`. Every tray
+  callback still publishes to the bounded runtime-neutral channel and now posts
+  an asynchronous native paint wake. While closed to tray, a one-shot native
+  timer rearms from the existing 40/100/500 ms repaint policy so capture,
+  transcription, history, and menu-state completion continue after the initial
+  action. Show, Quit, and service teardown cancel the timer. The handler is
+  registered before icon construction to remove its one-shot initialization
+  race. No audio, transcription, runtime, output, history, or settings system
+  was duplicated.
+- Automated evidence: four focused tray tests pass, including wake delivery,
+  newest-intent bounded-queue behavior, Win32 timer bounds, and menu-command
+  mapping. Formatting, all-target/all-feature checking, strict Clippy, the full
+  suite (533 passed, 6 environment-gated ignored), and debug plus isolated
+  release builds pass. The corrected release is at
+  `C:\tmp\scribe-tray-wake-v2-target\release\local-transcriber.exe`.
+- Corrected live evidence: actual Windows tray-popup clicks against the v2
+  release changed the root HWND from hidden to visible for Show and visible to
+  hidden for Hide while the process remained responsive. A Start click did not
+  retain a Stop label after 2.2 seconds and may have failed immediately because
+  of application/model state; Start/Stop, Copy, and Quit remain unverified.
+- Remaining evidence: manual matrix row UI-04 remains **NOT VERIFIED** until a
+  human exercises Show, Hide, Start/Stop Recording, Copy Last Transcript, and
+  Quit from the Windows notification area with the main window hidden.
+
+Risk is **Low** for the bounded command bridge and **Medium** for the pinned
+eframe Win32 scheduling workaround until UI-04 and hidden idle-CPU sampling are
+completed. The `tray-icon` handlers remain process-lifetime callbacks, while the
+active publisher and native timer are explicitly replaced/cancelled with the
+single tray-service lifecycle.
+
+## Post-Phase 11 low-input diagnostic checkpoint
+
+Recorded 2026-08-05 on Windows x64 after the configured FIFINE A8 repeatedly
+ended as no-speech. Two no-save CPAL probes verified F32, 48 kHz, stereo input,
+matching channels, and complete callback delivery. The independent probe's
+maximum 10 ms mono RMS was 0.001559 and none of 1,498 windows reached the
+unchanged 0.012 VAD activation floor. Windows microphone privacy was Allow and
+the endpoint was unmuted at 100% with +7 dB gain. The evidence isolates a
+silent/too-low acoustic or hardware mute/gain path rather than runtime, device
+selection, sample conversion, or channel cancellation.
+
+The native pipeline now retains only capture-wide maximum 10 ms VAD-frame RMS
+and 30 ms meter-window peak scalars. Those values flow through capture metrics into the
+allowlisted redacted diagnostics; no PCM is persisted or sent through UI/IPC.
+A shared application classifier gives actionable mute/gain guidance below the
+minimum activation floor and preserves generic no-speech feedback for louder
+short or non-voice input. The VAD, runtime selection, and transcription path are
+unchanged.
+
+Formatting, strict all-target/all-feature Clippy, the full suite (557
+discovered; 548 passed, 9 environment-gated ignored), debug/release builds, and
+diff hygiene passed. The rebuilt packaged v1.9.1/base.en/CPU fixture reported
+1/313/839/1,154 ms prepare/load/backend/total. The updated desktop process was
+launched successfully. A spoken GUI/hotkey/paste run after physically
+correcting the A8 top mute or bottom gain remains **NOT VERIFIED** and no manual
+matrix row is promoted by this checkpoint.
+
+## Input sensitivity slider
+
+General > Audio exposes one model-independent `Input sensitivity` slider. Its
+track combines the latest microphone RMS with the persisted activation
+threshold; while dragging or keyboard-adjusting, a compact bubble shows the
+current whole-dB threshold. There is no test button, Automatic/Manual selector,
+idle numeric meter, second meter, waveform, calibration action, or
+speech/clipping label.
+The threshold thumb remains usable when input is unavailable.
+
+When General is visible and dictation is idle, the existing native
+CPAL/ring/pipeline service owns a `MeterOnly` session. That intent retains no
+prepared audio and creates no preview, transcript, output, history, overlay, or
+audio file. During active dictation, the slider reads the existing recording
+session's atomic level telemetry instead of opening another stream. Monitor
+teardown is acknowledged before deferred dictation or retained-audio playback
+starts, so the owners never overlap. Deferred recording and playback are
+mutually exclusive; recording takes priority and playback is rejected while a
+capture is queued or active. Leaving General stops only the idle monitor,
+clears its envelope/repaint state, and never stops active dictation.
+
+The capture worker continues to publish normalized mono RMS every 30 ms through
+latest-value atomics. Each publication increments a revision counter. The UI
+uses a 30 ms attack, 240 ms release, and a 160 ms stale-sample deadline; stale
+or absent input decays to the track minimum instead of freezing. Repaint remains
+at the approximately 33 Hz meter cadence only while capture, monitoring, or
+release animation is active.
+
+The internal slider range is -72 to 0 dBFS, with a default threshold near
+-42 dBFS. Values remain internal: the accessible slider exposes only a
+normalized range and adjustment actions. The base track is split at the thumb
+into distinct threshold and remainder fills. The live fill keeps one thickness;
+crossing remains spatially visible because the fill extends beyond the thumb,
+and its high-contrast color changes from the below-threshold tone to success. Keyboard focus
+uses a neutral heavier thumb outline and center dot rather than an accent halo.
+The custom control has a 44 px interaction target, click/drag, focus, Left/Right
+arrows, and AccessKit increment/decrement/set-value actions.
+
+The persisted `manual_activation_rms` field is the only runtime sensitivity
+setting. An obsolete `sensitivity_mode` property is preserved as unknown
+compatibility data when encountered, but cannot select a second behavior.
+Pointer and keyboard changes update the in-memory value immediately,
+use the existing 300 ms debounced settings store, and write a shared atomic read
+by the VAD on the next 10 ms frame. Existing confirmation, 3 dB-class release
+hysteresis, pause/hangover, endpointing, pre-roll, and post-roll behavior is
+unchanged. The advanced endpointing option controls only automatic stop in
+Toggle mode; it cannot bypass sensitivity gating. Per-device thresholds remain
+deferred because the current device selection exposes only a display name
+rather than a stable identifier.
+
+The earlier `qa/microphone-test-final-*.png` captures document the superseded
+button-and-diagnostics UI and are not evidence of the current slider design.
+Physical microphone, device-disconnect, and permission-failure verification of
+the redesigned lifecycle remains **NOT VERIFIED**.

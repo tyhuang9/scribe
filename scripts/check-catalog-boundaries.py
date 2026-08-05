@@ -22,7 +22,7 @@ def main() -> None:
     router = sources[SRC / "runtime_router.rs"]
 
     for path, source in sources.items():
-        if path.name == "runtime_router.rs":
+        if path.name in {"runtime_router.rs", "architecture_guard.rs"}:
             continue
         for concrete in ("RuntimeKind", "TranscribeCppRuntime", "OnnxSpeechRuntime"):
             if concrete in source:
@@ -63,7 +63,6 @@ def main() -> None:
         "runtime_catalog::",
         "provider_for_backend",
         ".backend",
-        "backend_label",
         "RuntimeRouter",
         "transcribe_with_config",
         "whisper_cpp_",
@@ -75,6 +74,8 @@ def main() -> None:
         scanned_source = source
         if path.name == "app.rs":
             scanned_source = app_production
+        if path.name == "architecture_guard.rs":
+            continue
         if "provider_for_backend" not in scanned_source:
             continue
         relative = path.relative_to(SRC).as_posix()
@@ -91,6 +92,7 @@ def main() -> None:
         relative = path.relative_to(SRC).as_posix()
         scanned_source = app_production if path.name == "app.rs" else source
         if relative.startswith("stt/") or relative in {
+            "architecture_guard.rs",
             "runtime_router.rs",
             "compatibility_bridge.rs",
         }:
@@ -101,6 +103,77 @@ def main() -> None:
                     f"concrete compatibility adapter {concrete_path} escaped "
                     f"its private bridge into src/{relative}"
                 )
+
+    # Family-specific compatibility and packaging knowledge is intentionally
+    # confined to private adapters, the service/router, or artifact/catalog
+    # validation. This fail-closed allowlist prevents a future application or
+    # UI branch from selecting a model family directly.
+    family_validation_allowlist = {
+        "compatibility_bridge.rs",
+        "config.rs",
+        "managed_downloads.rs",
+        "model_catalog.rs",
+        "models.rs",
+        "runtime_catalog.rs",
+        "runtime_router.rs",
+        "settings/schema.rs",
+        "transcription.rs",
+    }
+    expanded_family_terms = family_terms + (
+        "whisper-cpp",
+        "qwen",
+        "voxtral",
+        "nemotron",
+        "sensevoice",
+        "canary",
+    )
+    for path, source in sources.items():
+        relative = path.relative_to(SRC).as_posix()
+        if (
+            relative == "architecture_guard.rs"
+            or relative.startswith("stt/")
+            or relative in family_validation_allowlist
+        ):
+            continue
+        production = source.split("\n#[cfg(test)]", maxsplit=1)[0].lower()
+        for term in expanded_family_terms:
+            if term in production:
+                fail(
+                    f"model-family term {term!r} escaped private adapters/catalog "
+                    f"validation into src/{relative}"
+                )
+
+    downloads = sources[SRC / "managed_downloads.rs"]
+    for retired_helper in (
+        "download_faster_whisper_model",
+        "download_vosk_model",
+        "download_sherpa_model",
+        "download_runner_model",
+    ):
+        if retired_helper in downloads:
+            fail(f"unreachable legacy download helper {retired_helper!r} was restored")
+
+    for path, source in sources.items():
+        if path.name == "architecture_guard.rs":
+            continue
+        production = source.split("\n#[cfg(test)]", maxsplit=1)[0].lower()
+        for web_transport in ("tauri::", "webview", "ipc::", "javascript"):
+            if web_transport in production:
+                fail(
+                    f"forbidden web/UI transport {web_transport!r} exists in "
+                    f"{path.relative_to(ROOT)}"
+                )
+        if path.relative_to(SRC).as_posix().startswith("ui/"):
+            for pcm_shape in ("Vec<f32>", "&[f32]", "PreparedAudio"):
+                if pcm_shape in source.split("\n#[cfg(test)]", maxsplit=1)[0]:
+                    fail(
+                        f"native PCM shape {pcm_shape!r} escaped into "
+                        f"{path.relative_to(ROOT)}"
+                    )
+
+    text_output = sources[SRC / "text_output.rs"]
+    if "tentative" in text_output.split("\n#[cfg(test)]", maxsplit=1)[0].lower():
+        fail("tentative transcript text has a path into the output module")
 
     catalog = sources[SRC / "model_catalog.rs"]
     descriptor = re.search(
@@ -123,7 +196,7 @@ def main() -> None:
 
     print(
         "catalog boundary PASS: one handler, manifest routing, neutral UI, "
-        "legacy provider selection confined to its private bridge"
+        "native-only PCM, final-only output, and legacy selection confined"
     )
 
 

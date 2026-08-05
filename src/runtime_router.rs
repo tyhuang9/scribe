@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use transcribe_cpp::CancelToken;
 
+use crate::embedded_runtime::{EmbeddedRuntime, TRANSCRIBE_CPP_VERSION};
 use crate::model_catalog::{RuntimeRequirement, RuntimeVersion, runtime_model_manifest};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
@@ -81,9 +83,11 @@ const COMMON_GGML_DEPENDENCIES: [(&str, &str); 11] = [
 pub(crate) struct RuntimeModel {
     pub id: ModelId,
     pub path: PathBuf,
-    pub package_root: PathBuf,
+    /// Legacy GGML uses a hash-verified package; the safe GGUF route is
+    /// statically linked and deliberately has no downloaded runtime package.
+    pub package_root: Option<PathBuf>,
     pub expected_size_bytes: u64,
-    pub expected_sha256: &'static str,
+    pub expected_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +108,11 @@ pub(crate) struct RuntimeExecution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeLoadExecution {
     pub diagnostics: NativeRuntimeDiagnostics,
+    /// Identity reported by the loaded model itself. It is intentionally
+    /// carried alongside load diagnostics so install validation can persist
+    /// observed facts without rebuilding a catalog assumption.
+    pub detected_architecture: String,
+    pub capabilities: RuntimeCapabilities,
 }
 
 #[derive(Debug, Error)]
@@ -190,9 +199,6 @@ const TRANSCRIBE_CPP_RUNTIME_VERSION: RuntimeVersion = RuntimeVersion {
 };
 
 fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
-    if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        return None;
-    }
     let manifest = runtime_model_manifest(model_id)?;
     match manifest.runtime {
         RuntimeRequirement::PrimaryNative
@@ -204,6 +210,31 @@ fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
     }
 }
 
+fn is_gguf_model(model: &RuntimeModel) -> bool {
+    model
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+/// A remote GGUF is admitted only after `TranscriptionService` has resolved
+/// its persisted trusted source and supplied an immutable size/digest. The
+/// router deliberately keys the safe embedded route on the concrete GGUF
+/// artifact rather than on a display/catalog ID, so dynamic catalog entries
+/// use the same in-process engine as the bundled default.
+fn runtime_kind_for_runtime_model(model: &RuntimeModel) -> Option<RuntimeKind> {
+    is_gguf_model(model)
+        .then_some(RuntimeKind::TranscribeCpp)
+        .or_else(|| runtime_kind_for_model(&model.id))
+}
+
+fn embedded_runtime_location() -> PathBuf {
+    PathBuf::from(format!(
+        "<statically linked transcribe-cpp {TRANSCRIBE_CPP_VERSION}>"
+    ))
+}
+
 /// The sole application-level runtime router. Clones share one serialized
 /// engine state, which both retains a warm model and enforces the upstream
 /// same-context non-concurrency rule.
@@ -211,6 +242,13 @@ fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
 pub(crate) struct RuntimeRouter {
     inner: Arc<Mutex<RouterState>>,
     cancel_generation: Arc<AtomicU64>,
+    embedded_cancellation: Arc<Mutex<Option<CancelToken>>>,
+}
+
+struct EmbeddedCancellationContext {
+    token: Arc<Mutex<Option<CancelToken>>>,
+    generation: Arc<AtomicU64>,
+    snapshot: u64,
 }
 
 impl RuntimeRouter {
@@ -218,6 +256,7 @@ impl RuntimeRouter {
         Self {
             inner: Arc::new(Mutex::new(RouterState::default())),
             cancel_generation: Arc::new(AtomicU64::new(0)),
+            embedded_cancellation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -226,6 +265,11 @@ impl RuntimeRouter {
     }
 
     pub(crate) fn managed_runtime_id(&self, model_id: &ModelId) -> Option<&'static str> {
+        if runtime_model_manifest(model_id)
+            .is_some_and(|manifest| manifest.artifact_filename.ends_with(".gguf"))
+        {
+            return None;
+        }
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => "whisper_cpp",
         })
@@ -235,6 +279,10 @@ impl RuntimeRouter {
         runtime_kind_for_model(model_id).map(|kind| match kind {
             RuntimeKind::TranscribeCpp => TranscribeCppRuntime::runtime_capabilities(),
         })
+    }
+
+    pub(crate) fn embedded_capabilities(&self) -> RuntimeCapabilities {
+        TranscribeCppRuntime::runtime_capabilities()
     }
 
     pub(crate) fn transcribe(
@@ -258,10 +306,21 @@ impl RuntimeRouter {
             });
         }
 
-        let kind = runtime_kind_for_model(&model.id)
+        let kind = runtime_kind_for_runtime_model(&model)
             .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         match kind {
+            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => state.transcribe_embedded(
+                model,
+                preference,
+                audio,
+                options,
+                EmbeddedCancellationContext {
+                    token: Arc::clone(&self.embedded_cancellation),
+                    generation: Arc::clone(&self.cancel_generation),
+                    snapshot: cancellation_snapshot,
+                },
+            ),
             RuntimeKind::TranscribeCpp => state.transcribe_cpp(
                 model,
                 preference,
@@ -278,10 +337,13 @@ impl RuntimeRouter {
         model: RuntimeModel,
         preference: AccelerationPreference,
     ) -> Result<RuntimeLoadExecution, RuntimeError> {
-        let kind = runtime_kind_for_model(&model.id)
+        let kind = runtime_kind_for_runtime_model(&model)
             .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         match kind {
+            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => {
+                state.load_embedded(model, preference, Arc::clone(&self.embedded_cancellation))
+            }
             RuntimeKind::TranscribeCpp => {
                 state.load_transcribe_cpp(model, preference, Arc::clone(&self.cancel_generation))
             }
@@ -293,10 +355,15 @@ impl RuntimeRouter {
         model: RuntimeModel,
         preference: AccelerationPreference,
     ) -> Result<(), RuntimeError> {
-        let kind = runtime_kind_for_model(&model.id)
+        let kind = runtime_kind_for_runtime_model(&model)
             .ok_or_else(|| RuntimeError::UnsupportedModel(model.id.clone()))?;
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         match kind {
+            RuntimeKind::TranscribeCpp if is_gguf_model(&model) => state.health_check_embedded(
+                model,
+                preference,
+                Arc::clone(&self.embedded_cancellation),
+            ),
             RuntimeKind::TranscribeCpp => {
                 let runtime = state.transcribe_cpp_runtime(
                     model,
@@ -309,10 +376,16 @@ impl RuntimeRouter {
         }
     }
 
-    /// Cancellation is lock-free so it can interrupt inference while the
-    /// dedicated native worker owns the serialized engine lock.
+    /// Cancellation never waits for the native worker lock. The legacy path
+    /// observes its generation atomically; the safe adapter receives an owned
+    /// `CancelToken` that it polls in the native decode callback.
     pub(crate) fn cancel_active(&self) {
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(active) = self.embedded_cancellation.lock()
+            && let Some(token) = active.as_ref()
+        {
+            token.cancel();
+        }
     }
 
     pub(crate) fn cancellation_snapshot(&self) -> u64 {
@@ -326,6 +399,16 @@ impl RuntimeRouter {
                 .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
         }
         state.transcribe_cpp = None;
+        if let Some(runtime) = state.embedded.as_mut() {
+            SpeechEngine::unload(runtime)
+                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        }
+        state.embedded = None;
+        state.embedded_model = None;
+        *self
+            .embedded_cancellation
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)? = None;
         Ok(())
     }
 }
@@ -341,9 +424,172 @@ impl std::fmt::Debug for RuntimeRouter {
 #[derive(Default)]
 struct RouterState {
     transcribe_cpp: Option<TranscribeCppRuntime>,
+    embedded: Option<EmbeddedRuntime>,
+    embedded_model: Option<RuntimeModel>,
+}
+
+fn embedded_request_is_warm(
+    current_model: Option<&RuntimeModel>,
+    current_runtime: Option<(&Path, AccelerationPreference, bool)>,
+    requested_model: &RuntimeModel,
+    requested_preference: AccelerationPreference,
+) -> bool {
+    current_model == Some(requested_model)
+        && current_runtime.is_some_and(|(path, preference, loaded)| {
+            path == requested_model.path && preference == requested_preference && loaded
+        })
 }
 
 impl RouterState {
+    fn embedded_is_warm(&self, model: &RuntimeModel, preference: AccelerationPreference) -> bool {
+        embedded_request_is_warm(
+            self.embedded_model.as_ref(),
+            self.embedded.as_ref().map(|runtime| {
+                (
+                    runtime.model_path(),
+                    runtime.preference(),
+                    runtime.is_loaded(),
+                )
+            }),
+            model,
+            preference,
+        )
+    }
+
+    fn embedded_runtime(
+        &mut self,
+        model: &RuntimeModel,
+        preference: AccelerationPreference,
+        cancellation: Arc<Mutex<Option<CancelToken>>>,
+    ) -> Result<&mut EmbeddedRuntime, RuntimeError> {
+        let reusable = self.embedded_model.as_ref() == Some(model)
+            && self.embedded.as_ref().is_some_and(|runtime| {
+                runtime.model_path() == model.path && runtime.preference() == preference
+            });
+        if !reusable {
+            self.embedded = Some(EmbeddedRuntime::new(model.path.clone(), preference));
+            self.embedded_model = Some(model.clone());
+            let token = self
+                .embedded
+                .as_ref()
+                .expect("the embedded runtime was initialized")
+                .cancellation_handle();
+            *cancellation.lock().map_err(|_| RuntimeError::Poisoned)? = Some(token);
+        }
+        Ok(self
+            .embedded
+            .as_mut()
+            .expect("the embedded runtime was initialized"))
+    }
+
+    fn load_embedded(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        cancellation: Arc<Mutex<Option<CancelToken>>>,
+    ) -> Result<RuntimeLoadExecution, RuntimeError> {
+        let warm_reused = self.embedded_is_warm(&model, preference);
+        verify_embedded_runtime_model(&model, warm_reused)?;
+        let runtime = self.embedded_runtime(&model, preference, cancellation)?;
+        let load_started = Instant::now();
+        SpeechEngine::load(runtime).map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+        let resolved_acceleration = runtime
+            .resolved_acceleration()
+            .cloned()
+            .expect("a successfully loaded embedded runtime resolves acceleration");
+        Ok(RuntimeLoadExecution {
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration,
+                native_library_path: embedded_runtime_location(),
+                warm_reused,
+                model_load_duration_ms: if warm_reused {
+                    0
+                } else {
+                    load_started.elapsed().as_millis()
+                },
+            },
+            detected_architecture: runtime
+                .detected_architecture()
+                .expect("a successfully loaded embedded runtime reports its architecture"),
+            capabilities: SpeechEngine::capabilities(runtime),
+        })
+    }
+
+    fn health_check_embedded(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        cancellation: Arc<Mutex<Option<CancelToken>>>,
+    ) -> Result<(), RuntimeError> {
+        self.load_embedded(model, preference, cancellation)
+            .map(|_| ())
+    }
+
+    fn transcribe_embedded(
+        &mut self,
+        model: RuntimeModel,
+        preference: AccelerationPreference,
+        audio: &PreparedAudio,
+        options: &TranscriptionOptions,
+        cancellation: EmbeddedCancellationContext,
+    ) -> Result<RuntimeExecution, RuntimeError> {
+        let warm_reused = self.embedded_is_warm(&model, preference);
+        verify_embedded_runtime_model(&model, warm_reused)?;
+        let (result, diagnostics) = {
+            let runtime = self.embedded_runtime(&model, preference, cancellation.token)?;
+            let load_started = Instant::now();
+            SpeechEngine::load(runtime)
+                .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
+            let model_load_duration_ms = if warm_reused {
+                0
+            } else {
+                load_started.elapsed().as_millis()
+            };
+            let processing_started = Instant::now();
+            let result = runtime.transcribe_with_cancellation(
+                audio,
+                options,
+                &cancellation.generation,
+                cancellation.snapshot,
+            );
+            let resolved_acceleration = runtime.resolved_acceleration().cloned();
+            let processing_duration_ms = processing_started.elapsed().as_millis();
+            (
+                result,
+                (
+                    resolved_acceleration,
+                    warm_reused,
+                    model_load_duration_ms,
+                    processing_duration_ms,
+                ),
+            )
+        };
+        let transcript = match result {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                // A native decode error or cancellation must not leave a
+                // partial session active. The next request starts from a known
+                // model/session state rather than pretending it was warm.
+                self.embedded = None;
+                self.embedded_model = None;
+                return Err(RuntimeError::Engine(format!("{error:#}")));
+            }
+        };
+        let (resolved_acceleration, warm_reused, model_load_duration_ms, processing_duration_ms) =
+            diagnostics;
+        Ok(RuntimeExecution {
+            transcript,
+            diagnostics: NativeRuntimeDiagnostics {
+                resolved_acceleration: resolved_acceleration
+                    .expect("a successful embedded decode resolves acceleration"),
+                native_library_path: embedded_runtime_location(),
+                warm_reused,
+                model_load_duration_ms,
+            },
+            processing_duration_ms,
+        })
+    }
+
     fn transcribe_cpp_runtime(
         &mut self,
         model: RuntimeModel,
@@ -393,6 +639,12 @@ impl RouterState {
                 warm_reused,
                 model_load_duration_ms,
             },
+            // GGML compatibility installs do not expose architecture through
+            // the retained shim. They are outside the normal installer path;
+            // keep their known adapter identity explicit rather than claiming
+            // filename-derived evidence.
+            detected_architecture: "whisper".to_owned(),
+            capabilities: SpeechEngine::capabilities(runtime),
         })
     }
 
@@ -459,7 +711,12 @@ impl TranscribeCppRuntime {
         acceleration: ResolvedAcceleration,
         cancel_generation: Arc<AtomicU64>,
     ) -> Self {
-        let package = NativePackage::from_root(model.package_root.clone());
+        let package = NativePackage::from_root(
+            model
+                .package_root
+                .clone()
+                .expect("legacy transcribe-cpp runtime requires a package root"),
+        );
         Self {
             model,
             package,
@@ -707,6 +964,9 @@ fn verify_sha256(path: &Path, expected: &'static str) -> Result<(), NativeBootst
 }
 
 fn verify_runtime_model(model: &RuntimeModel) -> Result<(), NativeBootstrapFailure> {
+    #[cfg(test)]
+    RUNTIME_MODEL_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+
     let metadata =
         std::fs::metadata(&model.path).map_err(|error| NativeBootstrapFailure::ModelIntegrity {
             path: model.path.clone(),
@@ -727,13 +987,29 @@ fn verify_runtime_model(model: &RuntimeModel) -> Result<(), NativeBootstrapFailu
             path: model.path.clone(),
             message: error.to_string(),
         })?;
-    if !actual.eq_ignore_ascii_case(model.expected_sha256) {
+    if !actual.eq_ignore_ascii_case(&model.expected_sha256) {
         return Err(NativeBootstrapFailure::ModelIntegrity {
             path: model.path.clone(),
             message: format!("expected SHA-256 {}, got {actual}", model.expected_sha256),
         });
     }
     Ok(())
+}
+
+fn verify_embedded_runtime_model(
+    model: &RuntimeModel,
+    warm_reused: bool,
+) -> Result<(), NativeBootstrapFailure> {
+    if warm_reused {
+        Ok(())
+    } else {
+        verify_runtime_model(model)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_MODEL_VERIFICATION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -1076,6 +1352,84 @@ mod tests {
     }
 
     #[test]
+    fn safe_gguf_catalog_artifacts_do_not_require_a_managed_runtime_package() {
+        let router = RuntimeRouter::new();
+
+        assert_eq!(
+            router.managed_runtime_id(&ModelId::new("whisper_cpp_tiny_en")),
+            None
+        );
+        assert_eq!(
+            router.managed_runtime_id(&ModelId::new("whisper_cpp_base_en")),
+            Some("whisper_cpp")
+        );
+    }
+
+    #[test]
+    fn embedded_model_verification_runs_for_cold_or_changed_paths_but_not_warm_reuse() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first_path = std::env::temp_dir().join(format!(
+            "scribe-embedded-verification-{}-{suffix}-first.gguf",
+            std::process::id()
+        ));
+        let second_path = std::env::temp_dir().join(format!(
+            "scribe-embedded-verification-{}-{suffix}-second.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&first_path, b"first verified model").unwrap();
+        std::fs::write(&second_path, b"second verified model").unwrap();
+        let first = RuntimeModel {
+            id: ModelId::new("first"),
+            path: first_path.clone(),
+            package_root: None,
+            expected_size_bytes: std::fs::metadata(&first_path).unwrap().len(),
+            expected_sha256: sha256_file(&first_path).unwrap(),
+        };
+        let second = RuntimeModel {
+            id: ModelId::new("second"),
+            path: second_path.clone(),
+            package_root: None,
+            expected_size_bytes: std::fs::metadata(&second_path).unwrap().len(),
+            expected_sha256: sha256_file(&second_path).unwrap(),
+        };
+        RUNTIME_MODEL_VERIFICATION_COUNT.with(|count| count.set(0));
+
+        let cold = embedded_request_is_warm(
+            Some(&first),
+            Some((first.path.as_path(), AccelerationPreference::Auto, false)),
+            &first,
+            AccelerationPreference::Auto,
+        );
+        assert!(!cold);
+        verify_embedded_runtime_model(&first, cold).unwrap();
+
+        let warm = embedded_request_is_warm(
+            Some(&first),
+            Some((first.path.as_path(), AccelerationPreference::Auto, true)),
+            &first,
+            AccelerationPreference::Auto,
+        );
+        assert!(warm);
+        verify_embedded_runtime_model(&first, warm).unwrap();
+
+        let changed_path = embedded_request_is_warm(
+            Some(&first),
+            Some((first.path.as_path(), AccelerationPreference::Auto, true)),
+            &second,
+            AccelerationPreference::Auto,
+        );
+        assert!(!changed_path);
+        verify_embedded_runtime_model(&second, changed_path).unwrap();
+
+        RUNTIME_MODEL_VERIFICATION_COUNT.with(|count| assert_eq!(count.get(), 2));
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
     fn runtime_version_must_meet_the_model_minimum() {
         assert!(
             TRANSCRIBE_CPP_RUNTIME_VERSION
@@ -1248,7 +1602,7 @@ mod tests {
         for (path, source) in &sources {
             if path
                 .file_name()
-                .is_some_and(|name| name == "runtime_router.rs")
+                .is_some_and(|name| name == "runtime_router.rs" || name == "architecture_guard.rs")
             {
                 continue;
             }
@@ -1283,7 +1637,6 @@ mod tests {
             "runtime_catalog::",
             "provider_for_backend",
             ".backend",
-            "backend_label",
             "RuntimeRouter",
             "transcribe_with_config",
             "whisper_cpp_",
@@ -1295,6 +1648,12 @@ mod tests {
         }
 
         for (path, source) in &sources {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "architecture_guard.rs")
+            {
+                continue;
+            }
             let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
                 source
                     .split("\n#[cfg(test)]\nmod layout_tests")
@@ -1317,6 +1676,12 @@ mod tests {
         }
 
         for (path, source) in &sources {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "architecture_guard.rs")
+            {
+                continue;
+            }
             let production_source = if path.file_name().is_some_and(|name| name == "app.rs") {
                 source
                     .split("\n#[cfg(test)]\nmod layout_tests")

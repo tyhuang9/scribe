@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::sync::{Arc, Mutex, Once};
+use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -7,6 +10,39 @@ const MENU_HIDE: &str = "scribe-hide";
 const MENU_TOGGLE_RECORDING: &str = "scribe-toggle-recording";
 const MENU_COPY_LAST: &str = "scribe-copy-last";
 const MENU_QUIT: &str = "scribe-quit";
+const COMMAND_QUEUE_CAPACITY: usize = 32;
+#[cfg(target_os = "windows")]
+const HIDDEN_REPAINT_TIMER_ID: usize = 0x5343_5242;
+
+type WakeEventLoop = Arc<dyn Fn() + Send + Sync + 'static>;
+
+static EVENT_HANDLERS: Once = Once::new();
+static EVENT_TARGET: Mutex<Option<Arc<TrayCommandPublisher>>> = Mutex::new(None);
+
+struct TrayCommandPublisher {
+    sender: Sender<TrayCommand>,
+    discard_receiver: Receiver<TrayCommand>,
+    publish_lock: Mutex<()>,
+    wake_event_loop: WakeEventLoop,
+    main_window_handle: Option<isize>,
+}
+
+impl TrayCommandPublisher {
+    fn publish(&self, command: TrayCommand) {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(TrySendError::Full(command)) = self.sender.try_send(command) {
+            // Human-generated tray input should never saturate this queue. If it does,
+            // retain the newest intent instead of leaving the app stuck on an old one.
+            let _ = self.discard_receiver.try_recv();
+            let _ = self.sender.try_send(command);
+        }
+        (self.wake_event_loop)();
+        wake_hidden_main_window(self.main_window_handle);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayCommand {
@@ -19,6 +55,9 @@ pub enum TrayCommand {
 
 pub struct TrayService {
     _tray_icon: TrayIcon,
+    command_receiver: Receiver<TrayCommand>,
+    command_publisher: Option<Arc<TrayCommandPublisher>>,
+    main_window_handle: Option<isize>,
     toggle_recording_item: MenuItem,
     copy_last_item: MenuItem,
     _show_item: MenuItem,
@@ -28,7 +67,12 @@ pub struct TrayService {
 }
 
 impl TrayService {
-    pub fn new(is_recording: bool, has_transcript: bool) -> Result<Self> {
+    pub fn new(
+        is_recording: bool,
+        has_transcript: bool,
+        main_window_handle: Option<isize>,
+        wake_event_loop: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
         if std::env::var_os("SCRIBE_DISABLE_TRAY").is_some() {
             return Err(anyhow!("system tray disabled by SCRIBE_DISABLE_TRAY"));
         }
@@ -38,10 +82,29 @@ impl TrayService {
             ));
         }
         ensure_tray_runtime_available()?;
-        catch_tray_init_panic(|| Self::build(is_recording, has_transcript))?
+        install_event_handlers();
+        let (mut service, command_sender) = catch_tray_init_panic(|| {
+            Self::build(is_recording, has_transcript, main_window_handle)
+        })??;
+        let command_publisher = Arc::new(TrayCommandPublisher {
+            sender: command_sender,
+            discard_receiver: service.command_receiver.clone(),
+            publish_lock: Mutex::new(()),
+            wake_event_loop: Arc::new(wake_event_loop),
+            main_window_handle: service.main_window_handle,
+        });
+        service.command_publisher = Some(Arc::clone(&command_publisher));
+        *EVENT_TARGET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command_publisher);
+        Ok(service)
     }
 
-    fn build(is_recording: bool, has_transcript: bool) -> Result<Self> {
+    fn build(
+        is_recording: bool,
+        has_transcript: bool,
+        main_window_handle: Option<isize>,
+    ) -> Result<(Self, Sender<TrayCommand>)> {
         let show_item = MenuItem::with_id(MENU_SHOW, "Show Scribe", true, None);
         let hide_item = MenuItem::with_id(MENU_HIDE, "Hide Window", true, None);
         let toggle_recording_item = MenuItem::with_id(
@@ -73,15 +136,23 @@ impl TrayService {
             .build()
             .context("failed to create tray icon")?;
 
-        Ok(Self {
-            _tray_icon: tray_icon,
-            toggle_recording_item,
-            copy_last_item,
-            _show_item: show_item,
-            _hide_item: hide_item,
-            _quit_item: quit_item,
-            _separator: separator,
-        })
+        let (command_sender, command_receiver) = bounded(COMMAND_QUEUE_CAPACITY);
+
+        Ok((
+            Self {
+                _tray_icon: tray_icon,
+                command_receiver,
+                command_publisher: None,
+                main_window_handle: valid_main_window_handle(main_window_handle),
+                toggle_recording_item,
+                copy_last_item,
+                _show_item: show_item,
+                _hide_item: hide_item,
+                _quit_item: quit_item,
+                _separator: separator,
+            },
+            command_sender,
+        ))
     }
 
     pub fn set_recording(&self, is_recording: bool) {
@@ -94,23 +165,164 @@ impl TrayService {
     }
 
     pub fn poll_command(&self) -> Option<TrayCommand> {
-        let mut command = None;
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(menu_command) = command_from_menu_id(event.id().as_ref()) {
-                command = Some(menu_command);
-            }
-        }
-        if command.is_some() {
-            while TrayIconEvent::receiver().try_recv().is_ok() {}
-            return command;
-        }
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if tray_event_should_show(&event) {
-                command = Some(TrayCommand::Show);
-            }
-        }
-        command
+        self.command_receiver.try_recv().ok()
     }
+
+    pub fn schedule_hidden_repaint(&self, delay: Duration) -> Result<bool> {
+        #[cfg(target_os = "windows")]
+        {
+            schedule_hidden_main_window_repaint(self.main_window_handle, delay)?;
+            Ok(true)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(false)
+        }
+    }
+
+    pub fn cancel_hidden_repaint(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            cancel_hidden_main_window_repaint(self.main_window_handle);
+        }
+    }
+}
+
+impl Drop for TrayService {
+    fn drop(&mut self) {
+        self.cancel_hidden_repaint();
+        let mut target = EVENT_TARGET
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.command_publisher.as_ref().is_some_and(|owned| {
+            target
+                .as_ref()
+                .is_some_and(|publisher| Arc::ptr_eq(publisher, owned))
+        }) {
+            *target = None;
+        }
+    }
+}
+
+fn install_event_handlers() {
+    EVENT_HANDLERS.call_once(|| {
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some(command) = command_from_menu_id(event.id().as_ref()) {
+                publish_event(command);
+            }
+        }));
+
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if tray_event_should_show(&event) {
+                publish_event(TrayCommand::Show);
+            }
+        }));
+    });
+}
+
+fn publish_event(command: TrayCommand) {
+    let publisher = EVENT_TARGET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(publisher) = publisher {
+        publisher.publish(command);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn valid_main_window_handle(handle: Option<isize>) -> Option<isize> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    let handle = handle.filter(|handle| *handle != 0)?;
+    let window = handle as windows_sys::Win32::Foundation::HWND;
+    (unsafe { IsWindow(window) } != 0).then_some(handle)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn valid_main_window_handle(_handle: Option<isize>) -> Option<isize> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn wake_hidden_main_window(handle: Option<isize>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_PAINT};
+
+    let Some(handle) = handle else {
+        return;
+    };
+    unsafe {
+        PostMessageW(
+            handle as windows_sys::Win32::Foundation::HWND,
+            WM_PAINT,
+            0,
+            0,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wake_hidden_main_window(_handle: Option<isize>) {}
+
+#[cfg(target_os = "windows")]
+fn schedule_hidden_main_window_repaint(handle: Option<isize>, delay: Duration) -> Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, SetTimer};
+
+    let handle = handle.ok_or_else(|| anyhow!("the native Scribe window handle is unavailable"))?;
+    let window = handle as windows_sys::Win32::Foundation::HWND;
+    if unsafe { IsWindow(window) } == 0 {
+        return Err(anyhow!("the native Scribe window no longer exists"));
+    }
+    let timer = unsafe {
+        SetTimer(
+            window,
+            HIDDEN_REPAINT_TIMER_ID,
+            hidden_repaint_delay_millis(delay),
+            Some(hidden_repaint_timer),
+        )
+    };
+    if timer == 0 {
+        return Err(anyhow!(
+            "Windows could not schedule hidden tray processing: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_hidden_main_window_repaint(handle: Option<isize>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+
+    if let Some(handle) = handle {
+        unsafe {
+            KillTimer(
+                handle as windows_sys::Win32::Foundation::HWND,
+                HIDDEN_REPAINT_TIMER_ID,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn hidden_repaint_timer(
+    window: windows_sys::Win32::Foundation::HWND,
+    _message: u32,
+    timer_id: usize,
+    _elapsed: u32,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, WM_PAINT};
+
+    unsafe {
+        KillTimer(window, timer_id);
+        PostMessageW(window, WM_PAINT, 0, 0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hidden_repaint_delay_millis(delay: Duration) -> u32 {
+    delay.as_millis().clamp(10, u32::MAX as u128) as u32
 }
 
 #[cfg(target_os = "linux")]
@@ -233,4 +445,77 @@ fn scribe_icon() -> Result<Icon> {
     }
 
     Icon::from_rgba(rgba, SIZE, SIZE).context("failed to create tray icon bitmap")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn publisher(
+        capacity: usize,
+        wake_count: Arc<AtomicUsize>,
+    ) -> (TrayCommandPublisher, Receiver<TrayCommand>) {
+        let (sender, receiver) = bounded(capacity);
+        let discard_receiver = receiver.clone();
+        (
+            TrayCommandPublisher {
+                sender,
+                discard_receiver,
+                publish_lock: Mutex::new(()),
+                wake_event_loop: Arc::new(move || {
+                    wake_count.fetch_add(1, Ordering::Relaxed);
+                }),
+                main_window_handle: None,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn enqueued_command_wakes_event_loop_and_is_received() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let (publisher, receiver) = publisher(1, Arc::clone(&wake_count));
+
+        publisher.publish(TrayCommand::Show);
+
+        assert_eq!(receiver.try_recv(), Ok(TrayCommand::Show));
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn full_command_queue_keeps_newest_intent_and_wakes_event_loop() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let (publisher, receiver) = publisher(1, Arc::clone(&wake_count));
+        publisher.publish(TrayCommand::Hide);
+        publisher.publish(TrayCommand::Quit);
+
+        assert_eq!(receiver.try_recv(), Ok(TrayCommand::Quit));
+        assert_eq!(wake_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_repaint_timer_delay_is_bounded_for_win32() {
+        assert_eq!(hidden_repaint_delay_millis(Duration::ZERO), 10);
+        assert_eq!(hidden_repaint_delay_millis(Duration::from_millis(40)), 40);
+        assert_eq!(hidden_repaint_delay_millis(Duration::from_millis(500)), 500);
+        assert_eq!(hidden_repaint_delay_millis(Duration::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn menu_ids_map_to_runtime_neutral_commands() {
+        assert_eq!(command_from_menu_id(MENU_SHOW), Some(TrayCommand::Show));
+        assert_eq!(command_from_menu_id(MENU_HIDE), Some(TrayCommand::Hide));
+        assert_eq!(
+            command_from_menu_id(MENU_TOGGLE_RECORDING),
+            Some(TrayCommand::ToggleRecording)
+        );
+        assert_eq!(
+            command_from_menu_id(MENU_COPY_LAST),
+            Some(TrayCommand::CopyLastTranscript)
+        );
+        assert_eq!(command_from_menu_id(MENU_QUIT), Some(TrayCommand::Quit));
+        assert_eq!(command_from_menu_id("unknown"), None);
+    }
 }
