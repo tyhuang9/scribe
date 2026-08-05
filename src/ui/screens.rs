@@ -5,7 +5,9 @@ use eframe::egui::{
 };
 
 use super::{
-    controls::{ButtonTone, Icon, badge, button, card, icon_glyph, keycap, paint_focus_ring},
+    controls::{
+        ButtonTone, Icon, badge, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
+    },
     state::{
         ModelComparisonState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
         SettingsSaveState, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
@@ -268,8 +270,15 @@ fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
     let colors = ui_palette(ui);
     let width = ui.available_width();
     let mut action = ScreenAction::None;
-    let mut action_ids = Vec::new();
-    let alert =
+    let alert_id = ui.make_persistent_id("microphone-error-alert");
+    let ctx = ui.ctx().clone();
+    ctx.accesskit_node_builder(alert_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Alert);
+        builder.set_name("Microphone access error");
+        builder.set_live(egui::accesskit::Live::Assertive);
+        builder.set_live_atomic();
+    });
+    ctx.with_accessibility_parent(alert_id, || {
         ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
             Frame::none()
                 .fill(colors.error_pale)
@@ -288,31 +297,17 @@ fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let open_settings = button(ui, "Open audio settings", ButtonTone::Text);
-                        action_ids.push(open_settings.id);
                         if open_settings.clicked() {
                             action = ScreenAction::OpenAudioSettings;
                         }
                         let retry = button(ui, "Try again", ButtonTone::Secondary);
-                        action_ids.push(retry.id);
                         if retry.clicked() {
                             action = ScreenAction::RetryMicrophone;
                         }
                     });
                 });
         });
-    alert.response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, "Microphone access error")
     });
-    ui.ctx()
-        .accesskit_node_builder(alert.response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Alert);
-            builder.set_name("Microphone access error");
-            builder.set_live(egui::accesskit::Live::Assertive);
-            builder.set_live_atomic();
-            for id in &action_ids {
-                builder.push_controlled(id.value().into());
-            }
-        });
     action
 }
 
@@ -434,6 +429,11 @@ fn models(
                             .color(colors.muted_text),
                     );
                 });
+                let toggle_name = if comparison.expanded {
+                    "Collapse comparison"
+                } else {
+                    "Expand comparison"
+                };
                 let toggle = button(
                     ui,
                     icon_glyph(if comparison.expanded {
@@ -442,12 +442,13 @@ fn models(
                         Icon::ChevronDown
                     }),
                     ButtonTone::Text,
-                )
-                .on_hover_text(if comparison.expanded {
-                    "Collapse comparison"
-                } else {
-                    "Expand comparison"
+                );
+                ui.ctx().accesskit_node_builder(toggle.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name(toggle_name);
                 });
+                focus_tooltip(ui, &toggle, toggle_name);
+                let toggle = toggle.on_hover_text(toggle_name);
                 if toggle.clicked() {
                     action = ScreenAction::ToggleComparison;
                 }
@@ -466,8 +467,9 @@ fn models(
                             action = ScreenAction::ToggleComparisonModel(model.id.clone());
                         }
                     }
+                    let disabled_reason = comparison_start_disabled_reason(comparison);
                     let start = ui.add_enabled(
-                        comparison.can_start(),
+                        disabled_reason.is_none(),
                         egui::Button::new(
                             RichText::new(format!(
                                 "{}  Start test recording",
@@ -482,20 +484,12 @@ fn models(
                         builder.set_role(egui::accesskit::Role::Button);
                         builder.set_name("Start test recording");
                     });
-                    if !comparison.can_start() {
+                    if let Some(reason) = disabled_reason {
                         ui.ctx().accesskit_node_builder(start.id, |builder| {
-                            builder.set_description(
-                                "Select at least two installed models before starting a comparison.",
-                            );
+                            builder.set_description(reason);
                         });
-                        start.clone().on_hover_text(
-                            "Select at least two models before starting a comparison.",
-                        );
-                        ui.label(
-                            RichText::new("Select at least two models to start.")
-                                .small()
-                                .color(colors.muted_text),
-                        );
+                        start.clone().on_hover_text(reason);
+                        ui.label(RichText::new(reason).small().color(colors.muted_text));
                     }
                     if start.clicked() {
                         action = ScreenAction::StartComparison;
@@ -574,6 +568,19 @@ fn models(
         });
     }
     action
+}
+
+fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option<&'static str> {
+    if matches!(
+        comparison.phase,
+        super::state::ComparisonPhase::Recording | super::state::ComparisonPhase::Processing
+    ) {
+        Some("Wait for the current comparison to finish before starting another.")
+    } else if comparison.selected_model_ids.len() < 2 {
+        Some("Select at least two installed models before starting a comparison.")
+    } else {
+        None
+    }
 }
 
 fn settings(
@@ -1078,10 +1085,7 @@ mod tests {
                     node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
                 })
                 .unwrap();
-            assert!(
-                accesskit_descends_from(nodes, alert.0, button.0)
-                    || alert.1.controls().contains(&button.0)
-            );
+            assert!(accesskit_descends_from(nodes, alert.0, button.0));
         }
     }
 
@@ -1127,17 +1131,33 @@ mod tests {
                 )
             });
         });
-        assert!(output
-            .platform_output
-            .accesskit_update
-            .unwrap()
-            .nodes
-            .iter()
-            .any(|(_, node)| {
-                node.name() == Some("Start test recording")
-                    && node.description()
-                        == Some("Select at least two installed models before starting a comparison.")
-            }));
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some("Start test recording")
+                && node.description()
+                    == Some("Select at least two installed models before starting a comparison.")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Collapse comparison")
+        }));
+    }
+
+    #[test]
+    fn comparison_start_reason_distinguishes_busy_from_insufficient_selection() {
+        let mut comparison = ModelComparisonState::default();
+        assert_eq!(
+            comparison_start_disabled_reason(&comparison),
+            Some("Select at least two installed models before starting a comparison.")
+        );
+
+        comparison.selected_model_ids.insert("base.en".into());
+        comparison.selected_model_ids.insert("tiny.en".into());
+        comparison.phase = super::super::state::ComparisonPhase::Processing;
+        assert_eq!(
+            comparison_start_disabled_reason(&comparison),
+            Some("Wait for the current comparison to finish before starting another.")
+        );
     }
 
     #[test]
