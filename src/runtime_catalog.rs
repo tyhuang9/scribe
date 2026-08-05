@@ -6,19 +6,6 @@ pub enum DeviceSupport {
     CpuAndGpu,
 }
 
-impl DeviceSupport {
-    pub fn supports_gpu(self) -> bool {
-        matches!(self, Self::CpuAndGpu)
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CpuOnly => "CPU",
-            Self::CpuAndGpu => "CPU/GPU",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevelopmentRuntimeSpec {
     pub script_name: &'static str,
@@ -159,34 +146,6 @@ const BACKENDS: &[BackendSpec] = &[
 ];
 
 const MODEL_ARTIFACTS: &[ModelArtifactSpec] = &[
-    pinned_model_artifact(
-        "whisper_cpp_tiny_en",
-        "~75 MB",
-        77_704_715,
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
-    ),
-    pinned_model_artifact(
-        "whisper_cpp_base_en",
-        "~150 MB",
-        147_964_211,
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-    ),
-    pinned_model_artifact(
-        "whisper_cpp_small_en",
-        "~470 MB",
-        487_614_201,
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
-    ),
-    pinned_model_artifact(
-        "whisper_cpp_medium_en",
-        "~1.5 GB",
-        1_533_774_781,
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
-    ),
     model_artifact("faster_whisper_tiny_en", "~75 MB", Some(75 * MIB)),
     model_artifact("faster_whisper_base_en", "~150 MB", Some(150 * MIB)),
     model_artifact("faster_whisper_small_en_gpu", "~470 MB", Some(470 * MIB)),
@@ -203,22 +162,6 @@ const MODEL_ARTIFACTS: &[ModelArtifactSpec] = &[
     model_artifact("moonshine", "~35 MB", Some(35 * MIB)),
     model_artifact("parakeet_0_6b", "~640 MB", Some(650 * MIB)),
 ];
-
-const fn pinned_model_artifact(
-    model_id: &'static str,
-    storage_estimate: &'static str,
-    download_bytes: u64,
-    version: &'static str,
-    sha256: &'static str,
-) -> ModelArtifactSpec {
-    ModelArtifactSpec {
-        model_id,
-        storage_estimate,
-        download_bytes: Some(download_bytes),
-        version: Some(version),
-        sha256: Some(sha256),
-    }
-}
 
 const fn model_artifact(
     model_id: &'static str,
@@ -297,16 +240,8 @@ pub fn resolve_runtime_entrypoint(
     None
 }
 
-fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
-    match runtime_id {
-        "whisper_cpp" => path.is_file(),
-        "faster_whisper" => crate::stt::faster_whisper::is_faster_whisper_runtime_usable(path),
-        "vosk" => crate::stt::vosk::is_vosk_runtime_usable(path),
-        "sherpa_onnx" | "moonshine" | "parakeet" => {
-            crate::stt::sherpa_onnx::is_sherpa_family_runtime_usable(runtime_id, path)
-        }
-        _ => false,
-    }
+pub(crate) fn runtime_entrypoint_is_usable(runtime_id: &str, path: &Path) -> bool {
+    crate::stt::runtime_entrypoint_is_usable(runtime_id, path)
 }
 
 fn platform_executable_path(relative: &str) -> PathBuf {
@@ -317,12 +252,24 @@ fn platform_executable_path(relative: &str) -> PathBuf {
     path
 }
 
-pub fn model_artifact_spec(model_id: &str) -> Option<&'static ModelArtifactSpec> {
+pub fn model_artifact_spec(model_id: &str) -> Option<ModelArtifactSpec> {
+    let normalized_id = crate::transcription::ModelId::new(model_id);
+    if let Some(manifest) = crate::model_catalog::runtime_model_manifest(&normalized_id) {
+        return Some(ModelArtifactSpec {
+            model_id: manifest.id,
+            storage_estimate: manifest.artifact_storage_estimate,
+            download_bytes: Some(manifest.artifact_size_bytes),
+            version: Some(manifest.artifact_revision),
+            sha256: Some(manifest.artifact_sha256),
+        });
+    }
     MODEL_ARTIFACTS
         .iter()
         .find(|artifact| artifact.model_id == model_id)
+        .copied()
 }
 
+#[cfg(test)]
 pub fn model_storage_estimate(model_id: &str) -> &'static str {
     model_artifact_spec(model_id)
         .map(|artifact| artifact.storage_estimate)

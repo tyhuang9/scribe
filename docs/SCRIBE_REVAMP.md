@@ -1,6 +1,6 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 2 implemented on its stacked branch (2026-08-03). This document
+**Status:** Phase 3 implemented on its stacked branch (2026-08-03). This document
 preserves the Phase 0 audit and records each implemented phase against the
 consolidated revamp plan. It does not claim that uncompleted later phases are
 implemented.
@@ -719,3 +719,126 @@ model compatibility remains NO-GO for Supported status and native streaming
 remains NO-GO. The named Zipformer evaluation may add the sole optional second
 handler only if every quantitative gate passes; otherwise the final handler
 count remains one.
+
+## Phase 3 checkpoint - normalized catalog and compatibility gate
+
+Phase 3 keeps exactly **one logical runtime handler**:
+`TranscribeCppRuntime`. `OnnxSpeechRuntime` was not added. Runtime selection no
+longer depends on the `whisper_cpp_` model-ID prefix: `RuntimeRouter` resolves a
+closed manifest requirement and remains the only component that maps it to a
+concrete handler.
+
+### Normalized catalog decision
+
+`src/model_catalog.rs` is now the authoritative source for the four primary
+artifacts. Each immutable manifest records its minimum runtime version,
+architecture, actual GGML format, immutable repository revision, filename,
+exact byte size and SHA-256, languages, capabilities, roles, compatibility
+status, and linked evidence. Runtime-package metadata remains separate from
+model-artifact metadata.
+
+The application-facing `ModelDescriptor` deliberately omits runtime kind,
+backend/family, architecture, format, repository revision, filename, and hash.
+The Models, Transcribe, and Playground views receive descriptors from
+`TranscriptionService`, show explicit compatibility status, and no longer
+expose backend filters, badges, family-coded quick actions, or legacy model
+records. Opaque compatibility-provider lookup and primary CLI discovery are
+confined to `compatibility_bridge.rs`; concrete legacy validation is confined
+to `stt`. New managed downloads accept a neutral `ModelId` and resolve URL,
+destination, exact size, and SHA-256 from the normalized manifest. A Rust test
+and source gate reject model-family terms/IDs, backend field access, provider
+lookup, runtime catalog calls, or concrete adapter imports in production
+`app.rs`; they also reject concrete handler symbols outside the router and
+concrete adapter paths outside the private compatibility bridge.
+
+| Normalized model ID | Exact artifact | Evidence | Status | Roles | Streaming |
+| --- | --- | --- | --- | --- | --- |
+| `whisper_cpp_tiny_en` | `ggml-tiny.en.bin`, 77,704,715 bytes, SHA-256 `921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f` | Historical process fixture only | **Experimental** | None | Final-only batch |
+| `whisper_cpp_base_en` | `ggml-base.en.bin`, 147,964,211 bytes, SHA-256 `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002` | Windows x64 CPU native load/JFK/cancel/unload-reload/Auto-to-CPU partial evidence | **Experimental** | None | Final-only batch |
+| `whisper_cpp_small_en` | `ggml-small.en.bin`, 487,614,201 bytes, SHA-256 `c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d` | Historical process fixture only | **Experimental** | None | Final-only batch |
+| `whisper_cpp_medium_en` | `ggml-medium.en.bin`, 1,533,774,781 bytes, SHA-256 `cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356` | Historical process fixture only | **Experimental** | None | Final-only batch |
+
+All use immutable Hugging Face revision
+`5359861c739e955e79d9a303bcbc70fb988958b1` and require the pinned primary
+runtime at or above 1.9.1; the router now enforces that minimum rather than
+recording it passively. The validation rules reject duplicate IDs, unsafe or
+malformed artifact metadata, status/evidence mismatches, `Supported` without
+every required gate and a hashed machine-readable receipt, receipt claims not
+bound to embedded runtime-package/corpus/results artifacts, duplicate roles,
+and roles on a non-Supported model. Production descriptor and runtime-manifest
+lookups enforce catalog validation. No model is Supported and no Fast English,
+Balanced multilingual, High accuracy, or Low memory role is curated in this
+phase.
+
+The eleven older faster-whisper, Vosk, offline sherpa, Moonshine, and Parakeet
+records remain only as private compatibility/migration records so existing
+configuration, installed paths, and user artifacts are not silently deleted.
+They are absent from the normalized Models catalog and contribute no evidence
+to a shipped runtime handler. Their transitional execution source remains for
+the Phase 11 evidence-based retirement decision.
+
+### Named Zipformer evidence gate: NO-GO
+
+The exact candidate is
+`sherpa-onnx-streaming-zipformer-en-2023-06-26` with sherpa-onnx v1.13.4 at
+commit `142807252687d81b40d6315f23470a1512a00de3`. Upstream documents it as an
+English online Zipformer model and documents a native streaming C API. The
+checked-out application, however, has only a distinct offline Zipformer entry
+and a sherpa-onnx 1.13.3 Python batch runner. That runner is not candidate
+evidence and was not silently substituted.
+
+| Required gate | Result | Evidence / blocker |
+| --- | --- | --- |
+| Native v1.13.4 package and exact model pins | **UNVERIFIED / FAIL CLOSED** | No local v1.13.4 native package; no exact candidate revision, complete file list, byte sizes, or SHA-256 record. |
+| Warm first-partial p95 <= 800 ms | **UNVERIFIED** | No native candidate handler or first-partial stream exists. |
+| At least 30% below primary rolling-preview p95 | **UNVERIFIED** | Primary rolling preview is a Phase 7 deliverable, so the required same-machine comparator does not exist. Phase 2 warm final p95 796 ms is not reused as first-partial evidence. |
+| RTF < 1 | **UNVERIFIED** | No pinned candidate measurement on the shared corpus. |
+| Cancellation acknowledgement <= 250 ms | **UNVERIFIED** | No native candidate cancellation protocol or samples. The primary handler's 781 ms cleanup completion is unrelated evidence. |
+| WER regression <= 3 absolute percentage points | **UNVERIFIED** | No versioned same-corpus references, normalization policy, or candidate results. A single editable Playground reference is not a compatibility corpus. |
+| Common contract and unload/reload | **UNVERIFIED** | Candidate is not implemented behind `SpeechEngine`. |
+| Crash recovery and memory | **UNVERIFIED** | No crash harness, working-set sampler, ceiling, or soak results. |
+| Windows/platform matrix and native in-memory PCM topology | **UNVERIFIED** | No candidate platform package was installed or exercised; the old Python/WAV bridge is explicitly excluded from evidence. |
+
+Because every quantitative/contract gate must pass and missing evidence is a
+failure, the decision is **NO-GO**. The catalog contains a machine-checked gate
+record, but there is no ONNX dependency, runtime variant, adapter, package,
+selectable catalog entry, or simulated progress/control.
+
+Primary sources consulted for this decision:
+
+- sherpa-onnx v1.13.4 release:
+  <https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.4>
+- native streaming C API:
+  <https://k2-fsa.github.io/sherpa/onnx/c-api/html/online_asr.html>
+- exact online Zipformer model documentation:
+  <https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html>
+
+### Commands, measured results, and remaining risk
+
+Phase 3 final verification on 2026-08-03:
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format | `cargo fmt --all -- --check` | PASS |
+| Strict lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
+| Tests | `cargo test --all-targets --all-features` | PASS: 252 discovered, 247 passed, 0 failed, 5 environment-required ignored |
+| Debug build | `cargo build --all-features` | PASS |
+| Release build | `cargo build --release --all-features` | PASS |
+| Boundary | `wsl.exe python3 scripts/check-catalog-boundaries.py` plus Rust source-boundary test | PASS: one handler, manifest routing, neutral UI, family-coded IDs rejected, legacy provider/adapter selection confined to its private bridge |
+| Runtime package | `bundle-whisper-runtime.ps1 -Profile release` | PASS after explicitly archiving the previous Phase 2 evidence package; fresh files revalidated and staged |
+| Release fixture | ignored exact service JFK smoke with the pinned release package/base.en/JFK paths | PASS: cold load 290 ms, first decode 791 ms, retained decode 780 ms, explicit unload/reload passed |
+
+Phase 3 intentionally makes no new latency-improvement claim: the inference
+path is unchanged from Phase 2 and the smoke values are a single confirmation,
+not the required 5-cold/20-warm measurement. The saved Phase 0-versus-Phase 2
+results remain the current comparable latency evidence.
+
+Known risks remain: the normalized UI and router boundary are enforced, but
+flat configuration and private legacy provider records still contain
+compatibility aliases until the Phase 4 schema migration and Phase 11
+retirement; legacy managed-download helpers remain dormant but preserved for
+the Phase 9 transaction rewrite; primary
+native crash isolation is incomplete; only base.en on Windows CPU has current
+native fixture evidence; no desktop/microphone/target/paste row was executed;
+and the optional native-streaming requirement remains a concrete NO-GO until
+the Phase 7 comparator and complete candidate evidence harness exist.
