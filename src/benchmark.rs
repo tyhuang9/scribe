@@ -1,4 +1,241 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
+
+use crate::config;
+use crate::prepared_audio::PreparedAudio;
+use crate::transcription::{
+    ModelId, RequestId, SessionId, TranscriptionRequest, TranscriptionService,
+    VerifiedInstallationCapability, verified_installation_capability,
+};
+
+#[derive(Serialize)]
+struct LocalBenchmarkReport {
+    schema_version: u8,
+    recorded_at_unix_seconds: u64,
+    hardware: HardwareReport,
+    model: BenchmarkModelReport,
+    runtime: RuntimeReport,
+    streaming_mode: String,
+    phase_timings_ms: PhaseTimings,
+}
+
+#[derive(Serialize)]
+struct HardwareReport {
+    operating_system: &'static str,
+    architecture: &'static str,
+    cpu: Option<String>,
+    logical_cores: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct BenchmarkModelReport {
+    id: String,
+    display_name: String,
+    audio_duration_ms: u128,
+}
+
+#[derive(Serialize)]
+struct RuntimeReport {
+    runtime_package_version: String,
+    resolved_backend: String,
+    resolved_acceleration: String,
+    native_streaming_supported: bool,
+}
+
+#[derive(Serialize)]
+struct PhaseTimings {
+    fixture_prepare: u128,
+    total: u128,
+    model_load: Option<u128>,
+    backend_processing: Option<u128>,
+}
+
+/// Runs `--benchmark <fixture.wav>` without starting the native UI.
+///
+/// The report deliberately excludes audio, transcript text, stderr, stdout,
+/// and configuration paths. `--output` writes the same metadata-only JSON.
+pub fn maybe_run_local_command() -> Option<i32> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if !args.iter().any(|arg| arg == "--benchmark") {
+        return None;
+    }
+
+    match run_local_command(args) {
+        Ok(report) => {
+            match serde_json::to_string_pretty(&report) {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("benchmark failed to serialize its metadata report: {error}");
+                    return Some(1);
+                }
+            }
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("benchmark failed: {error:#}");
+            Some(1)
+        }
+    }
+}
+
+fn run_local_command(args: Vec<std::ffi::OsString>) -> Result<LocalBenchmarkReport> {
+    let options = parse_local_command(&args)?;
+    let fixture_started = Instant::now();
+    let audio = PreparedAudio::from_wav_path(&options.fixture)
+        .context("benchmark fixture is unavailable or invalid; expected a non-empty WAV")?;
+    let fixture_prepare = fixture_started.elapsed().as_millis();
+
+    let (config, _) = config::load_config()
+        .map_err(|_| anyhow!("failed to load local benchmark configuration"))?;
+    let model_id = options
+        .model_id
+        .unwrap_or_else(|| config.general.selected_default_model.clone());
+    if model_id.trim().is_empty() {
+        bail!("benchmark model is not configured; pass --model <model-id>");
+    }
+
+    let service = TranscriptionService::new(config.clone());
+    let model_id = ModelId::new(model_id);
+    let descriptor = service
+        .model_descriptor(&model_id)
+        .with_context(|| format!("benchmark model is unavailable: {model_id}"))?;
+    let package_version = match verified_installation_capability(&model_id) {
+        Some(VerifiedInstallationCapability::Available { package_version }) => package_version,
+        Some(VerifiedInstallationCapability::Unavailable { reason }) => {
+            bail!("benchmark requires the pinned local runtime package: {reason}")
+        }
+        None => bail!("benchmark model has no verified local runtime package: {model_id}"),
+    };
+    let capabilities = service.capabilities_for(&model_id).with_context(|| {
+        format!("benchmark could not resolve runtime capabilities for {model_id}")
+    })?;
+
+    let started = Instant::now();
+    let request = TranscriptionRequest::new(
+        SessionId(1),
+        RequestId(1),
+        Arc::new(audio.clone()),
+        model_id.clone(),
+    );
+    let outcome = service
+        .transcribe(request)
+        .map_err(|_| anyhow!("benchmark runtime or model is unavailable for {model_id}"))?;
+    let total = started.elapsed().as_millis();
+
+    let report = LocalBenchmarkReport {
+        schema_version: 1,
+        recorded_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        hardware: current_hardware(),
+        model: BenchmarkModelReport {
+            id: model_id.into_inner(),
+            display_name: descriptor.display_name.to_owned(),
+            audio_duration_ms: audio.duration_ms(),
+        },
+        runtime: RuntimeReport {
+            runtime_package_version: package_version,
+            resolved_backend: outcome.resolved_backend_label().to_owned(),
+            resolved_acceleration: outcome
+                .resolved_acceleration
+                .as_ref()
+                .map(|value| value.resolved.label().to_owned())
+                .unwrap_or_else(|| "not reported".to_owned()),
+            native_streaming_supported: capabilities.streaming,
+        },
+        streaming_mode: config.streaming.mode.label().to_owned(),
+        phase_timings_ms: PhaseTimings {
+            fixture_prepare,
+            total,
+            model_load: outcome.model_load_duration_ms,
+            backend_processing: outcome.processing_duration_ms,
+        },
+    };
+    if let Some(output) = options.output {
+        write_benchmark_report(&output, &report)?;
+    }
+    Ok(report)
+}
+
+fn write_benchmark_report(path: &Path, report: &LocalBenchmarkReport) -> Result<()> {
+    let json =
+        serde_json::to_string_pretty(report).context("failed to serialize benchmark output")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .context("refusing to overwrite benchmark output or create it safely")?;
+    file.write_all(json.as_bytes())
+        .context("failed to write benchmark output")?;
+    file.write_all(b"\n")
+        .context("failed to finish benchmark output")?;
+    file.sync_all().context("failed to sync benchmark output")?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LocalBenchmarkOptions {
+    fixture: PathBuf,
+    model_id: Option<String>,
+    output: Option<PathBuf>,
+}
+
+fn parse_local_command(args: &[std::ffi::OsString]) -> Result<LocalBenchmarkOptions> {
+    let mut fixture = None;
+    let mut model_id = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_string_lossy().as_ref() {
+            "--benchmark" => fixture = Some(next_option(args, &mut index, "--benchmark")?),
+            "--model" => model_id = Some(next_option(args, &mut index, "--model")?),
+            "--output" => output = Some(PathBuf::from(next_option(args, &mut index, "--output")?)),
+            value => bail!(
+                "unknown benchmark argument: {value}; use --benchmark <fixture.wav> [--model <model-id>] [--output <report.json>]"
+            ),
+        }
+        index += 1;
+    }
+    Ok(LocalBenchmarkOptions {
+        fixture: PathBuf::from(
+            fixture.ok_or_else(|| anyhow!("--benchmark requires a WAV fixture path"))?,
+        ),
+        model_id,
+        output,
+    })
+}
+
+fn next_option(args: &[std::ffi::OsString], index: &mut usize, flag: &str) -> Result<String> {
+    *index += 1;
+    args.get(*index)
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.starts_with("--"))
+        .ok_or_else(|| anyhow!("{flag} requires a value"))
+}
+
+fn current_hardware() -> HardwareReport {
+    HardwareReport {
+        operating_system: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        cpu: std::env::var("PROCESSOR_IDENTIFIER")
+            .ok()
+            .or_else(|| std::env::var("HOSTTYPE").ok()),
+        logical_cores: std::thread::available_parallelism().ok().map(usize::from),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TextNormalizationOptions {
@@ -647,6 +884,7 @@ fn format_memory_mb(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn normalization_lowercases_trims_collapses_whitespace_and_removes_punctuation() {
@@ -740,5 +978,108 @@ mod tests {
         let overall = calculate_overall_score(&scores, RankingMode::Accuracy).unwrap();
 
         assert!((overall - (0.60 / 0.70)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn benchmark_command_requires_a_fixture() {
+        let error = parse_local_command(&["--benchmark".into()]).unwrap_err();
+
+        assert!(error.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn benchmark_command_parses_only_explicit_metadata_options() {
+        let options = parse_local_command(&[
+            "--benchmark".into(),
+            "fixture.wav".into(),
+            "--model".into(),
+            "whisper_cpp_tiny_en".into(),
+            "--output".into(),
+            "report.json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.fixture, PathBuf::from("fixture.wav"));
+        assert_eq!(options.model_id.as_deref(), Some("whisper_cpp_tiny_en"));
+        assert_eq!(options.output, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn benchmark_report_omits_transcript_and_audio_content() {
+        let report = LocalBenchmarkReport {
+            schema_version: 1,
+            recorded_at_unix_seconds: 1,
+            hardware: current_hardware(),
+            model: BenchmarkModelReport {
+                id: "model".to_owned(),
+                display_name: "Model".to_owned(),
+                audio_duration_ms: 10,
+            },
+            runtime: RuntimeReport {
+                runtime_package_version: "version".to_owned(),
+                resolved_backend: "backend".to_owned(),
+                resolved_acceleration: "CPU".to_owned(),
+                native_streaming_supported: false,
+            },
+            streaming_mode: "Auto".to_owned(),
+            phase_timings_ms: PhaseTimings {
+                fixture_prepare: 1,
+                total: 2,
+                model_load: Some(3),
+                backend_processing: Some(4),
+            },
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains("transcript"));
+        assert!(!json.contains("samples"));
+        assert!(!json.contains("stderr"));
+    }
+
+    #[test]
+    fn benchmark_output_refuses_to_overwrite_an_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "scribe-benchmark-output-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"existing report").unwrap();
+
+        let error = write_benchmark_report(
+            &path,
+            &LocalBenchmarkReport {
+                schema_version: 1,
+                recorded_at_unix_seconds: 1,
+                hardware: current_hardware(),
+                model: BenchmarkModelReport {
+                    id: "model".to_owned(),
+                    display_name: "Model".to_owned(),
+                    audio_duration_ms: 10,
+                },
+                runtime: RuntimeReport {
+                    runtime_package_version: "version".to_owned(),
+                    resolved_backend: "backend".to_owned(),
+                    resolved_acceleration: "CPU".to_owned(),
+                    native_streaming_supported: false,
+                },
+                streaming_mode: "Auto".to_owned(),
+                phase_timings_ms: PhaseTimings {
+                    fixture_prepare: 1,
+                    total: 2,
+                    model_load: Some(3),
+                    backend_processing: Some(4),
+                },
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(!error.to_string().contains(path.to_string_lossy().as_ref()));
+        assert_eq!(fs::read(&path).unwrap(), b"existing report");
+        fs::remove_file(path).unwrap();
     }
 }

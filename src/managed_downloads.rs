@@ -1,23 +1,22 @@
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+//! Manifest-driven download preparation for the normalized model catalog.
+//!
+//! Pre-revamp runner-specific download helpers were unreachable after Phase 9
+//! switched the Models flow to pinned transactional artifacts. They were
+//! removed in Phase 11; legacy configuration aliases and existing unmanaged
+//! artifacts remain untouched.
 
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::config::AppConfig;
+use crate::disk_space::DiskSpacePreflight;
+use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
-    StagedRuntime, download_pinned_artifact, stage_runtime_archive,
+    StagedRuntime, download_pinned_artifact, pinned_artifact_disk_space_preflight,
+    stage_runtime_archive,
 };
-use crate::models::{SttModelInfo, sherpa_model_download_url, vosk_model_download_url};
 use crate::transcription::ModelId;
-
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) fn prepare_model(
     config: &AppConfig,
@@ -25,6 +24,24 @@ pub(crate) fn prepare_model(
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
+    let artifact = normalized_model_download_spec(config, model_id)?;
+    download_pinned_artifact(&artifact, cancellation, progress)
+}
+
+/// Reads the conservative free-space requirement for a normalized catalog
+/// model without starting a download or changing any model state.
+pub(crate) fn normalized_model_download_space_preflight(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<DiskSpacePreflight, InstallError> {
+    let artifact = normalized_model_download_spec(config, model_id)?;
+    pinned_artifact_disk_space_preflight(&artifact)
+}
+
+fn normalized_model_download_spec(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<PinnedArtifact, InstallError> {
     let model = config::configured_models(config)
         .into_iter()
         .find(|model| model.id == model_id.as_str())
@@ -37,17 +54,127 @@ pub(crate) fn prepare_model(
     })?;
     let url = crate::model_catalog::runtime_model_download_url(model_id)
         .ok_or_else(|| InstallError::Failed("The model has no pinned download URL.".to_owned()))?;
-    download_pinned_artifact(
-        &PinnedArtifact {
-            id: model_id.as_str().to_owned(),
-            url,
-            size_bytes: artifact.artifact_size_bytes,
-            sha256: artifact.artifact_sha256.to_owned(),
-            destination,
-        },
-        cancellation,
-        progress,
-    )
+    Ok(PinnedArtifact {
+        id: model_id.as_str().to_owned(),
+        url,
+        size_bytes: artifact.artifact_size_bytes,
+        sha256: artifact.artifact_sha256.to_owned(),
+        destination,
+    })
+}
+
+/// Resolves a selected trusted GGUF artifact into the existing transactional
+/// downloader. Callers receive no arbitrary URL input: the repository,
+/// full revision, filename, size, and digest were accepted by the backend
+/// catalog service before this function is reached.
+pub(crate) fn prepare_trusted_gguf_model(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<DownloadedArtifact, InstallError> {
+    let pinned = trusted_gguf_download_spec(config, artifact)?;
+    download_pinned_artifact(&pinned, cancellation, progress)
+}
+
+/// Reads the conservative free-space requirement for a backend-validated
+/// trusted GGUF artifact without starting a download or changing model state.
+pub(crate) fn trusted_gguf_download_space_preflight(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Result<DiskSpacePreflight, InstallError> {
+    let pinned = trusted_gguf_download_spec(config, artifact)?;
+    pinned_artifact_disk_space_preflight(&pinned)
+}
+
+fn trusted_gguf_download_spec(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Result<PinnedArtifact, InstallError> {
+    let (organization, repository) = artifact
+        .model_id
+        .split_once('/')
+        .filter(|(organization, repository)| {
+            *organization == "handy-computer"
+                && is_safe_identifier(repository)
+                && !repository.is_empty()
+        })
+        .ok_or_else(|| {
+            InstallError::Failed("untrusted Hugging Face model identifier".to_owned())
+        })?;
+    if !is_full_revision(&artifact.revision)
+        || !is_safe_relative_gguf(&artifact.filename)
+        || artifact.size_bytes == 0
+        || !is_sha256(&artifact.expected_sha256)
+    {
+        return Err(InstallError::Failed(
+            "trusted Hugging Face artifact metadata failed validation".to_owned(),
+        ));
+    }
+    let destination = config::model_storage_dir(config)
+        .join("huggingface")
+        .join(organization)
+        .join(repository)
+        .join(&artifact.revision)
+        .join(
+            config::managed_remote_model_id(
+                &artifact.model_id,
+                &artifact.revision,
+                &artifact.filename,
+            )
+            .ok_or_else(|| {
+                InstallError::Failed("trusted Hugging Face artifact identity is invalid".to_owned())
+            })?,
+        )
+        .join(&artifact.filename);
+    Ok(PinnedArtifact {
+        id: format!(
+            "hf:{}@{}:{}",
+            artifact.model_id, artifact.revision, artifact.filename
+        ),
+        url: format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            artifact.model_id, artifact.revision, artifact.filename
+        ),
+        size_bytes: artifact.size_bytes,
+        sha256: artifact.expected_sha256.to_ascii_lowercase(),
+        destination,
+    })
+}
+
+fn is_safe_identifier(value: &str) -> bool {
+    value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_full_revision(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_safe_relative_gguf(value: &str) -> bool {
+    let path = Path::new(value);
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::Normal(_))
+                && component.as_os_str() != "."
+                && component.as_os_str() != ".."
+                && component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(is_safe_identifier)
+        })
 }
 
 #[derive(Debug)]
@@ -84,605 +211,86 @@ pub(crate) fn prepare_primary_runtime(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ModelDownloadProgress {
-    pub(crate) model_id: String,
-    pub(crate) downloaded_bytes: u64,
-    pub(crate) total_bytes: Option<u64>,
-    pub(crate) bytes_per_second: Option<u64>,
-}
-
-// Phase 9 normalized installs use `prepare_model` and the transactional
-// installer above. These unused helpers remain temporarily for private legacy
-// adapter/config compatibility and are scheduled for Phase 11 retirement; they
-// are not reachable from the normalized Models flow or runtime router.
-#[allow(dead_code)]
-fn download_whisper_cpp_model(
-    url: &str,
-    destination: &Path,
-    model_id: &str,
-    expected_total_bytes: u64,
-    expected_sha256: &str,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
-    download_model_file(
-        url,
-        destination,
-        model_id,
-        Some(expected_total_bytes),
-        Some(expected_sha256),
-        progress,
-    )
-}
-
-#[allow(dead_code)]
-fn download_faster_whisper_model(
-    runner: &Path,
-    model_name: &str,
-    destination: &Path,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
-    download_runner_model(RunnerModelDownload {
-        runner,
-        model_name,
-        destination,
-        model_id,
-        expected_total_bytes,
-        backend_label: "faster-whisper",
-        stdout_label: "faster-whisper stdout",
-        valid_install: &config::is_faster_whisper_model_dir,
-        parse_path: parse_faster_whisper_download_path,
-        progress,
-    })
-}
-
-#[allow(dead_code)]
-fn download_vosk_model(
-    runner: &Path,
-    model_name: &str,
-    destination: &Path,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
-    if vosk_model_download_url(model_name).is_none() {
-        return Err(format!("unsupported Vosk model download: {model_name}"));
-    }
-
-    download_runner_model(RunnerModelDownload {
-        runner,
-        model_name,
-        destination,
-        model_id,
-        expected_total_bytes,
-        backend_label: "Vosk",
-        stdout_label: "Vosk stdout",
-        valid_install: &config::is_vosk_model_dir,
-        parse_path: parse_vosk_download_path,
-        progress,
-    })
-}
-
-#[allow(dead_code)]
-fn download_sherpa_model(
-    runner: &Path,
-    model: &SttModelInfo,
-    model_name: &str,
-    destination: &Path,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
-    if sherpa_model_download_url(model_name).is_none() {
-        return Err(format!(
-            "unsupported {} model download: {model_name}",
-            model.backend
-        ));
-    }
-
-    let backend = model.backend.as_str();
-    download_runner_model(RunnerModelDownload {
-        runner,
-        model_name,
-        destination,
-        model_id,
-        expected_total_bytes,
-        backend_label: backend,
-        stdout_label: "sherpa-onnx stdout",
-        valid_install: &|path| config::is_valid_model_install_path(model, path),
-        parse_path: parse_sherpa_download_path,
-        progress,
-    })
-}
-
-#[allow(dead_code)]
-fn download_model_file(
-    url: &str,
-    destination: &Path,
-    model_id: &str,
-    expected_total_bytes: Option<u64>,
-    expected_sha256: Option<&str>,
-    progress: &dyn Fn(ModelDownloadProgress),
-) -> Result<PathBuf, String> {
-    if destination.exists() {
-        verify_downloaded_file(destination, expected_total_bytes, expected_sha256)?;
-        return Ok(destination.to_path_buf());
-    }
-
-    let partial_path = destination.with_extension("bin.partial");
-    let result = (|| {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-        }
-
-        let response = ureq::get(url)
-            .call()
-            .map_err(|err| format!("request failed for {url}: {err}"))?;
-        let total_bytes = response
-            .header("content-length")
-            .and_then(|value| value.parse::<u64>().ok())
-            .or(expected_total_bytes);
-        let mut reader = response.into_reader();
-        let mut file = fs::File::create(&partial_path)
-            .map_err(|err| format!("failed to create {}: {err}", partial_path.display()))?;
-        let mut downloaded_bytes = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        let started_at = Instant::now();
-        let mut last_progress_at = started_at;
-
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|err| format!("download read failed: {err}"))?;
-            if read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..read])
-                .map_err(|err| format!("failed to write {}: {err}", partial_path.display()))?;
-            downloaded_bytes += read as u64;
-            let now = Instant::now();
-            if now.duration_since(last_progress_at) >= PROGRESS_INTERVAL {
-                last_progress_at = now;
-                emit_progress(
-                    progress,
-                    model_id,
-                    downloaded_bytes,
-                    total_bytes,
-                    started_at,
-                    now,
-                );
-            }
-        }
-
-        let finished_at = Instant::now();
-        emit_progress(
-            progress,
-            model_id,
-            downloaded_bytes,
-            total_bytes,
-            started_at,
-            finished_at,
-        );
-        file.sync_all()
-            .map_err(|err| format!("failed to finish {}: {err}", partial_path.display()))?;
-        drop(file);
-        verify_downloaded_file(&partial_path, expected_total_bytes, expected_sha256)?;
-        fs::rename(&partial_path, destination).map_err(|err| {
-            format!(
-                "failed to move {} to {}: {err}",
-                partial_path.display(),
-                destination.display()
-            )
-        })?;
-        Ok(destination.to_path_buf())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&partial_path);
-    }
-
-    result
-}
-
-fn verify_downloaded_file(
-    path: &Path,
-    expected_size: Option<u64>,
-    expected_sha256: Option<&str>,
-) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        format!(
-            "failed to inspect downloaded model {}: {error}",
-            path.display()
-        )
-    })?;
-    if let Some(expected_size) = expected_size
-        && metadata.len() != expected_size
-    {
-        return Err(format!(
-            "downloaded model size mismatch for {}: expected {expected_size} bytes, got {}",
-            path.display(),
-            metadata.len()
-        ));
-    }
-    if let Some(expected_sha256) = expected_sha256 {
-        let mut file = fs::File::open(path).map_err(|error| {
-            format!(
-                "failed to open downloaded model {} for verification: {error}",
-                path.display()
-            )
-        })?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer).map_err(|error| {
-                format!(
-                    "failed to verify downloaded model {}: {error}",
-                    path.display()
-                )
-            })?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-        }
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected_sha256) {
-            return Err(format!(
-                "downloaded model checksum mismatch for {}: expected {expected_sha256}, got {actual}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-struct RunnerModelDownload<'a> {
-    runner: &'a Path,
-    model_name: &'a str,
-    destination: &'a Path,
-    model_id: &'a str,
-    expected_total_bytes: Option<u64>,
-    backend_label: &'a str,
-    stdout_label: &'a str,
-    valid_install: &'a dyn Fn(&Path) -> bool,
-    parse_path: fn(&str) -> Option<PathBuf>,
-    progress: &'a dyn Fn(ModelDownloadProgress),
-}
-
-fn download_runner_model(spec: RunnerModelDownload<'_>) -> Result<PathBuf, String> {
-    if prepare_install_destination(spec.destination, spec.backend_label, spec.valid_install)? {
-        return Ok(spec.destination.to_path_buf());
-    }
-
-    let started_at = Instant::now();
-    let mut child = Command::new(spec.runner)
-        .args(["download-model", "--model", spec.model_name, "--output"])
-        .arg(spec.destination)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {}: {err}", spec.runner.display()))?;
-    let stdout = child.stdout.take().map(read_stream_to_string);
-    let stderr = child.stderr.take().map(read_stream_to_string);
-    let mut last_progress_at = started_at;
-    let mut last_downloaded_bytes = 0_u64;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("failed to poll {}: {err}", spec.runner.display()))?
-        {
-            Some(status) => break status,
-            None => {
-                let now = Instant::now();
-                if now.duration_since(last_progress_at) >= PROGRESS_INTERVAL {
-                    last_progress_at = now;
-                    last_downloaded_bytes =
-                        installed_path_size(spec.destination).unwrap_or(last_downloaded_bytes);
-                    emit_progress(
-                        spec.progress,
-                        spec.model_id,
-                        last_downloaded_bytes,
-                        spec.expected_total_bytes,
-                        started_at,
-                        now,
-                    );
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-
-    let finished_at = Instant::now();
-    let downloaded_bytes = installed_path_size(spec.destination).unwrap_or(last_downloaded_bytes);
-    emit_progress(
-        spec.progress,
-        spec.model_id,
-        downloaded_bytes,
-        spec.expected_total_bytes,
-        started_at,
-        finished_at,
-    );
-    let stdout = join_stream_reader(stdout, spec.stdout_label)?;
-    let stderr = join_stream_reader(stderr, &format!("{} stderr", spec.backend_label))?;
-
-    if !status.success() {
-        let _ = remove_incomplete_destination(spec.destination);
-        return Err(format!(
-            "{} model download failed with status {}: {}",
-            spec.backend_label,
-            status,
-            stderr.trim()
-        ));
-    }
-
-    let runner_path = (spec.parse_path)(&stdout).unwrap_or_else(|| spec.destination.to_path_buf());
-    if (spec.valid_install)(&runner_path)
-        && (runner_path == spec.destination || runner_path.starts_with(spec.destination))
-    {
-        Ok(runner_path)
-    } else if (spec.valid_install)(spec.destination) {
-        Ok(spec.destination.to_path_buf())
-    } else {
-        Err(format!(
-            "{} runner finished but did not create a complete model at {}",
-            spec.backend_label,
-            spec.destination.display()
-        ))
-    }
-}
-
-fn prepare_install_destination(
-    destination: &Path,
-    backend_label: &str,
-    valid_install: &dyn Fn(&Path) -> bool,
-) -> Result<bool, String> {
-    if destination.exists() {
-        if valid_install(destination) {
-            return Ok(true);
-        }
-        remove_incomplete_destination(destination).map_err(|err| {
-            format!(
-                "failed to replace incomplete {} model at {}: {err}",
-                backend_label,
-                destination.display()
-            )
-        })?;
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-    }
-    Ok(false)
-}
-
-fn remove_incomplete_destination(destination: &Path) -> std::io::Result<()> {
-    if destination.is_dir() {
-        fs::remove_dir_all(destination)
-    } else {
-        fs::remove_file(destination)
-    }
-}
-
-fn emit_progress(
-    progress: &dyn Fn(ModelDownloadProgress),
-    model_id: &str,
-    downloaded_bytes: u64,
-    total_bytes: Option<u64>,
-    started_at: Instant,
-    measured_at: Instant,
-) {
-    progress(ModelDownloadProgress {
-        model_id: model_id.to_owned(),
-        downloaded_bytes,
-        total_bytes,
-        bytes_per_second: download_speed(downloaded_bytes, started_at, measured_at),
-    });
-}
-
-fn read_stream_to_string<R>(mut reader: R) -> JoinHandle<Result<String, String>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut output = String::new();
-        reader
-            .read_to_string(&mut output)
-            .map_err(|err| format!("failed to read child process output: {err}"))?;
-        Ok(output)
-    })
-}
-
-fn join_stream_reader(
-    handle: Option<JoinHandle<Result<String, String>>>,
-    label: &str,
-) -> Result<String, String> {
-    match handle {
-        Some(handle) => handle
-            .join()
-            .map_err(|_| format!("{label} reader panicked"))?,
-        None => Ok(String::new()),
-    }
-}
-
-fn download_speed(downloaded_bytes: u64, started_at: Instant, measured_at: Instant) -> Option<u64> {
-    let elapsed = measured_at.duration_since(started_at).as_secs_f64();
-    if downloaded_bytes == 0 || elapsed <= 0.0 {
-        None
-    } else {
-        Some((downloaded_bytes as f64 / elapsed).round() as u64)
-    }
-}
-
-fn installed_path_size(path: &Path) -> Result<u64, String> {
-    if !path.exists() {
-        return Ok(0);
-    }
-
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("failed to inspect {}: {err}", path.display()))?;
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-
-    let mut total = 0_u64;
-    let entries =
-        fs::read_dir(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| format!("failed to read entry in {}: {err}", path.display()))?;
-        total = total.saturating_add(installed_path_size(&entry.path())?);
-    }
-    Ok(total)
-}
-
-#[derive(Debug, Deserialize)]
-struct FasterWhisperDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_faster_whisper_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<FasterWhisperDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
-#[derive(Debug, Deserialize)]
-struct VoskDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_vosk_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<VoskDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
-#[derive(Debug, Deserialize)]
-struct SherpaDownloadOutput {
-    path: PathBuf,
-}
-
-fn parse_sherpa_download_path(stdout: &str) -> Option<PathBuf> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<SherpaDownloadOutput>(line.trim()).ok())
-        .map(|output| output.path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "scribe-managed-downloads-{name}-{}-{nanos}",
-            std::process::id()
-        ))
+    fn trusted_artifact() -> TrustedArtifact {
+        TrustedArtifact {
+            model_id: "handy-computer/whisper-tiny.en-gguf".to_owned(),
+            revision: "becb8bcb804405dc97b380a523d9975888820986".to_owned(),
+            filename: "whisper-tiny.en-Q4_K_M.gguf".to_owned(),
+            size_bytes: 43_545_248,
+            expected_sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b"
+                .to_owned(),
+        }
     }
 
     #[test]
-    fn parses_faster_whisper_download_path_from_runner_json() {
-        let path = parse_faster_whisper_download_path(
-            r#"{"model":"small.en","path":"/tmp/scribe-models/faster-whisper/small"}"#,
-        )
-        .unwrap();
+    fn trusted_gguf_download_uses_only_a_pinned_huggingface_resolution_url() {
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = PathBuf::from("C:/scribe-models");
+
+        let spec = trusted_gguf_download_spec(&config, &trusted_artifact()).unwrap();
 
         assert_eq!(
-            path,
-            PathBuf::from("/tmp/scribe-models/faster-whisper/small")
+            spec.url,
+            "https://huggingface.co/handy-computer/whisper-tiny.en-gguf/resolve/becb8bcb804405dc97b380a523d9975888820986/whisper-tiny.en-Q4_K_M.gguf"
         );
-    }
-
-    #[test]
-    fn parses_vosk_download_path_from_runner_json() {
-        let path = parse_vosk_download_path(
-            r#"{"model":"vosk-model-small-en-us-0.15","path":"/tmp/scribe-models/vosk/vosk_small_en"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(path, PathBuf::from("/tmp/scribe-models/vosk/vosk_small_en"));
-    }
-
-    #[test]
-    fn parses_sherpa_download_path_from_runner_json() {
-        let path = parse_sherpa_download_path(
-            r#"{"model":"sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27","path":"/tmp/scribe-models/moonshine/moonshine"}"#,
-        )
-        .unwrap();
-
         assert_eq!(
-            path,
-            PathBuf::from("/tmp/scribe-models/moonshine/moonshine")
+            spec.destination,
+            PathBuf::from("C:/scribe-models")
+                .join("huggingface")
+                .join("handy-computer")
+                .join("whisper-tiny.en-gguf")
+                .join("becb8bcb804405dc97b380a523d9975888820986")
+                .join(
+                    config::managed_remote_model_id(
+                        "handy-computer/whisper-tiny.en-gguf",
+                        "becb8bcb804405dc97b380a523d9975888820986",
+                        "whisper-tiny.en-Q4_K_M.gguf",
+                    )
+                    .unwrap()
+                )
+                .join("whisper-tiny.en-Q4_K_M.gguf")
         );
     }
 
     #[test]
-    fn prepare_install_destination_returns_existing_valid_install() {
-        let destination = unique_temp_path("valid-existing");
-        fs::create_dir_all(&destination).unwrap();
-
-        let result = prepare_install_destination(&destination, "test", &|path| path.is_dir());
-
-        assert_eq!(result, Ok(true));
-        assert!(destination.exists());
-
-        fs::remove_dir_all(destination).unwrap();
-    }
-
-    #[test]
-    fn prepare_install_destination_removes_incomplete_path() {
-        let parent = unique_temp_path("incomplete-parent");
-        let destination = parent.join("model");
-        fs::create_dir_all(&parent).unwrap();
-        fs::write(&destination, b"incomplete").unwrap();
-
-        let result = prepare_install_destination(&destination, "test", &|_| false);
-
-        assert_eq!(result, Ok(false));
-        assert!(parent.exists());
-        assert!(!destination.exists());
-
-        fs::remove_dir_all(parent).unwrap();
-    }
-
-    #[test]
-    fn downloaded_model_requires_exact_size_and_sha256() {
-        let path = unique_temp_path("integrity");
-        let bytes = b"pinned model bytes";
-        fs::write(&path, bytes).unwrap();
-        let expected = format!("{:x}", Sha256::digest(bytes));
-
-        assert_eq!(
-            verify_downloaded_file(&path, Some(bytes.len() as u64), Some(&expected)),
-            Ok(())
-        );
-        assert!(
-            verify_downloaded_file(&path, Some(bytes.len() as u64 + 1), Some(&expected))
-                .unwrap_err()
-                .contains("size mismatch")
-        );
-        assert!(
-            verify_downloaded_file(&path, Some(bytes.len() as u64), Some(&"0".repeat(64)))
-                .unwrap_err()
-                .contains("checksum mismatch")
-        );
-
-        fs::remove_file(path).unwrap();
+    fn trusted_gguf_download_rejects_untrusted_or_unsafe_artifact_metadata() {
+        for (model_id, revision, filename) in [
+            (
+                "other-org/model",
+                "becb8bcb804405dc97b380a523d9975888820986",
+                "model.gguf",
+            ),
+            ("handy-computer/model", "main", "model.gguf"),
+            (
+                "handy-computer/model",
+                "becb8bcb804405dc97b380a523d9975888820986",
+                "../model.gguf",
+            ),
+            (
+                "handy-computer/model",
+                "becb8bcb804405dc97b380a523d9975888820986",
+                "model.bin",
+            ),
+            (
+                "handy-computer/.",
+                "becb8bcb804405dc97b380a523d9975888820986",
+                "model.gguf",
+            ),
+            (
+                "handy-computer/..",
+                "becb8bcb804405dc97b380a523d9975888820986",
+                "model.gguf",
+            ),
+        ] {
+            let mut artifact = trusted_artifact();
+            artifact.model_id = model_id.to_owned();
+            artifact.revision = revision.to_owned();
+            artifact.filename = filename.to_owned();
+            assert!(trusted_gguf_download_spec(&AppConfig::default(), &artifact).is_err());
+        }
     }
 }

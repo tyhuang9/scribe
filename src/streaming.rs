@@ -23,6 +23,7 @@ const FRAMES_PER_MILLISECOND: u64 = PREPARED_SAMPLE_RATE as u64 / 1_000;
 const MAX_WINDOW_FRAMES: u64 = ROLLING_WINDOW_MS * FRAMES_PER_MILLISECOND;
 const OVERLAP_FRAMES: u64 = BOUNDARY_OVERLAP_MS * FRAMES_PER_MILLISECOND;
 const HORIZON_FRAMES: u64 = STABILITY_HORIZON_MS * FRAMES_PER_MILLISECOND;
+const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Correlation data carried by every preview request and response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,12 +359,22 @@ pub struct RollingPreviewSession<E> {
     mailbox: ReplaceLatestMailbox<PreviewSnapshot>,
     updates: ReplaceLatestMailbox<PreviewEvent<E>>,
     worker: Option<JoinHandle<()>>,
+    cancel_active: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl<E: Send + 'static> RollingPreviewSession<E> {
-    pub fn new<F>(mut decode: F) -> std::io::Result<Self>
+    #[cfg(test)]
+    pub fn new<F>(decode: F) -> std::io::Result<Self>
     where
         F: FnMut(PreviewSnapshot) -> Result<StreamUpdate, E> + Send + 'static,
+    {
+        Self::new_with_cancel(decode, || {})
+    }
+
+    pub(crate) fn new_with_cancel<F, C>(mut decode: F, cancel_active: C) -> std::io::Result<Self>
+    where
+        F: FnMut(PreviewSnapshot) -> Result<StreamUpdate, E> + Send + 'static,
+        C: FnOnce() + Send + 'static,
     {
         let mailbox: ReplaceLatestMailbox<PreviewSnapshot> = ReplaceLatestMailbox::new();
         let worker_mailbox = mailbox.clone();
@@ -388,6 +399,7 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
             mailbox,
             updates,
             worker: Some(worker),
+            cancel_active: Some(Box::new(cancel_active)),
         })
     }
 
@@ -431,8 +443,9 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
     }
 
     /// Stops future work and waits no longer than `timeout`. A `false` result
-    /// means the synchronous decode was still running and must be cancelled by
-    /// its owner before calling this again.
+    /// means native work still owns the decoder. A process-exit caller must use
+    /// the hard-abort policy before allowing DLL teardown; normal callers may
+    /// cancel the owner and call this again while retaining the handle.
     pub fn stop_and_join(&mut self, timeout: Duration) -> bool {
         self.mailbox.close();
         let Some(worker) = self.worker.as_ref() else {
@@ -455,9 +468,38 @@ impl<E: Send + 'static> RollingPreviewSession<E> {
 
 impl<E> Drop for RollingPreviewSession<E> {
     fn drop(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            && let Some(cancel_active) = self.cancel_active.take()
+        {
+            cancel_active();
+        }
         self.mailbox.close();
-        // Do not block destruction on an external synchronous decoder. A
-        // caller needing a deterministic shutdown uses stop_and_join.
+        let deadline = Instant::now() + DROP_SHUTDOWN_TIMEOUT;
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            if Instant::now() >= deadline {
+                // Detaching permits DLL teardown to race a live native
+                // decoder; joining forever can hang the desktop on exit.
+                // Aborting is the only process-safe fallback once the bounded
+                // cooperative path is exhausted: it skips Rust/DLL teardown
+                // and cannot paste stale text. App-owned shutdown normally
+                // consumes this handle first.
+                eprintln!(
+                    "native rolling-preview worker exceeded the shutdown deadline; aborting safely"
+                );
+                std::process::abort();
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -1040,6 +1082,52 @@ mod tests {
                 .recv_timeout(Duration::from_millis(20))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dropping_preview_session_cancels_and_joins_an_active_decoder() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let cancel_release = Arc::clone(&release);
+        let cancel_count = Arc::new(AtomicU64::new(0));
+        let observed_cancel_count = Arc::clone(&cancel_count);
+        let session = RollingPreviewSession::<()>::new_with_cancel(
+            move |snapshot| {
+                started_sender.send(snapshot.identity.sequence).unwrap();
+                let (lock, wake) = &*worker_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                Ok(StreamUpdate::default())
+            },
+            move || {
+                observed_cancel_count.fetch_add(1, Ordering::AcqRel);
+                let (lock, wake) = &*cancel_release;
+                *lock.lock().unwrap() = true;
+                wake.notify_one();
+            },
+        )
+        .unwrap();
+
+        assert!(session.try_update(snapshot(1)));
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            1
+        );
+        let (dropped_sender, dropped_receiver) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(session);
+            dropped_sender.send(()).unwrap();
+        });
+        dropped_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+        assert_eq!(cancel_count.load(Ordering::Acquire), 1);
     }
 
     #[test]

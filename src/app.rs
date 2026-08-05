@@ -15,11 +15,13 @@ use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
     ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
 };
+#[cfg(target_os = "windows")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::Deserialize;
 
 use crate::audio::{
-    self, CaptureCompletion, CaptureError, CaptureOptions, CaptureStopReason, LevelSnapshot,
-    RecordingSession, VadOptions,
+    self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
+    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, Sensitivity, VadOptions,
 };
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
@@ -30,17 +32,25 @@ use crate::config::{
     StreamingMode, ThemeMode,
 };
 use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
+use crate::diagnostics::{
+    self, DiagnosticsStore, FailureStage as DiagnosticFailureStage, SessionDiagnostic,
+    SessionMetrics as DiagnosticSessionMetrics, SessionOutcome as DiagnosticSessionOutcome,
+};
 use crate::history::{
     CompletedHistoryEntry, HistoryCursor, HistoryError, HistoryMetrics, HistoryPage, HistoryQuery,
     HistoryRecord, HistoryRetentionPolicy, HistoryStatus, HistoryStore, NewHistoryEntry,
 };
 use crate::history_playback::{PlaybackEvent, PlaybackService};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
+use crate::huggingface_catalog::{
+    CatalogSnapshot, HuggingFaceCatalogService, RemoteModel, TrustedArtifact,
+};
 use crate::installations::{
     ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
-    InstallError, InstallProgress, InstallStage, ManagedRemoval, reconcile_activation_journal,
-    reconcile_managed_removal,
+    InstallError, InstallProgress, InstallStage, ManagedRemoval, discover_managed_removal_targets,
+    fingerprint_file_cancellable, reconcile_activation_journal, reconcile_managed_removal,
 };
+use crate::installed_manifest;
 use crate::managed_downloads;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
@@ -68,15 +78,40 @@ use crate::ui::{
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
+const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
+const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
+const INPUT_LEVEL_KEYBOARD_STEP_DB: f32 = 1.0;
+const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
+const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
+const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
+const INPUT_SENSITIVITY_TRACK_HEIGHT: f32 = 10.0;
+const INPUT_SENSITIVITY_LIVE_FILL_HEIGHT: f32 = 8.0;
+const MICROPHONE_MONITOR_RETRY_DELAY: Duration = Duration::from_secs(2);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
 static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(target_os = "windows")]
+fn native_main_window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    let window = cc.window_handle().ok()?;
+    match window.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_main_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    None
+}
+
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
     CaptureOptions {
-        vad_enabled: config.recording.vad_enabled,
+        // Input sensitivity always gates accepted speech. The legacy VAD setting controls
+        // only whether Toggle mode stops automatically after the configured silence.
+        vad_enabled: true,
         endpointing_enabled: config.recording.vad_enabled
             && config.recording.hotkey_mode == HotkeyMode::Toggle,
         vad: VadOptions::new(
@@ -86,7 +121,364 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
             Duration::from_millis(config.recording.pre_roll_ms.into()),
             Duration::from_millis(config.recording.post_roll_ms.into()),
         ),
+        sensitivity: Sensitivity::Manual {
+            activation_rms: config.recording.manual_activation_rms,
+        },
+        intent: CaptureIntent::Dictation,
     }
+}
+
+fn rms_to_dbfs(rms: f32) -> f32 {
+    if !rms.is_finite() || rms <= 0.0 {
+        return INPUT_LEVEL_MIN_DBFS;
+    }
+    (20.0 * rms.log10()).clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
+}
+
+fn dbfs_to_rms(dbfs: f32) -> f32 {
+    let dbfs = if dbfs.is_finite() {
+        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
+    } else {
+        INPUT_LEVEL_MIN_DBFS
+    };
+    10.0_f32.powf(dbfs / 20.0).clamp(
+        config::settings::MIN_MANUAL_ACTIVATION_RMS,
+        config::settings::MAX_MANUAL_ACTIVATION_RMS,
+    )
+}
+
+fn dbfs_to_slider_position(dbfs: f32) -> f32 {
+    ((dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS) - INPUT_LEVEL_MIN_DBFS)
+        / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS))
+        .clamp(0.0, 1.0)
+}
+
+fn slider_position_to_dbfs(position: f32) -> f32 {
+    INPUT_LEVEL_MIN_DBFS + position.clamp(0.0, 1.0) * (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS)
+}
+
+fn input_sensitivity_db_label(dbfs: f32) -> String {
+    format!(
+        "{:.0} dB",
+        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
+    )
+}
+
+fn rms_to_slider_position(rms: f32) -> f32 {
+    dbfs_to_slider_position(rms_to_dbfs(rms))
+}
+
+#[derive(Clone, Debug)]
+struct MicrophoneLevelEnvelope {
+    position: f32,
+    last_step_at: Option<Instant>,
+    last_fresh_sample_at: Option<Instant>,
+    last_revision: Option<u64>,
+}
+
+impl Default for MicrophoneLevelEnvelope {
+    fn default() -> Self {
+        Self {
+            position: 0.0,
+            last_step_at: None,
+            last_fresh_sample_at: None,
+            last_revision: None,
+        }
+    }
+}
+
+impl MicrophoneLevelEnvelope {
+    fn reset_source(&mut self) {
+        self.last_fresh_sample_at = None;
+        self.last_revision = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn update(
+        &mut self,
+        rms: f32,
+        revision: Option<u64>,
+        source_active: bool,
+        now: Instant,
+    ) -> f32 {
+        if source_active && revision != self.last_revision {
+            self.last_revision = revision;
+            self.last_fresh_sample_at = Some(now);
+        }
+        let fresh = source_active
+            && self.last_fresh_sample_at.is_some_and(|observed| {
+                now.saturating_duration_since(observed) <= INPUT_LEVEL_STALE_AFTER
+            });
+        let target = if fresh {
+            rms_to_slider_position(rms)
+        } else {
+            0.0
+        };
+        let elapsed = self.last_step_at.map_or(METER_REPAINT_DELAY, |previous| {
+            now.saturating_duration_since(previous)
+        });
+        self.last_step_at = Some(now);
+        let time_constant = if target > self.position {
+            INPUT_LEVEL_ATTACK
+        } else {
+            INPUT_LEVEL_RELEASE
+        };
+        let alpha = 1.0 - (-elapsed.as_secs_f32() / time_constant.as_secs_f32()).exp();
+        self.position += (target - self.position) * alpha.clamp(0.0, 1.0);
+        if target == 0.0 && self.position < 0.001 {
+            self.position = 0.0;
+        }
+        self.position
+    }
+
+    fn is_animating(&self) -> bool {
+        self.position > 0.0
+    }
+}
+
+fn microphone_sensitivity_slider(
+    ui: &mut Ui,
+    live_level_position: f32,
+    threshold_rms: &mut f32,
+) -> egui::Response {
+    use egui::accesskit::{Action, ActionData};
+
+    let desired = Vec2::new(usable_width(ui), minimum_primary_target_height());
+    let (rect, mut response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+    let previous = *threshold_rms;
+    let mut threshold_dbfs = rms_to_dbfs(*threshold_rms);
+
+    if response.clicked() {
+        response.request_focus();
+    }
+    if (response.clicked() || response.dragged())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let position = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        threshold_dbfs = slider_position_to_dbfs(position);
+    }
+
+    let mut decrement = 0usize;
+    let mut increment = 0usize;
+    if response.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+        ui.input(|input| {
+            decrement += input.num_presses(egui::Key::ArrowLeft);
+            increment += input.num_presses(egui::Key::ArrowRight);
+        });
+    }
+    ui.input(|input| {
+        decrement += input.num_accesskit_action_requests(response.id, Action::Decrement);
+        increment += input.num_accesskit_action_requests(response.id, Action::Increment);
+        for request in input.accesskit_action_requests(response.id, Action::SetValue) {
+            if let Some(ActionData::NumericValue(value)) = request.data {
+                threshold_dbfs = slider_position_to_dbfs((value as f32 / 100.0).clamp(0.0, 1.0));
+            }
+        }
+    });
+    threshold_dbfs += (increment as f32 - decrement as f32) * INPUT_LEVEL_KEYBOARD_STEP_DB;
+    *threshold_rms = dbfs_to_rms(threshold_dbfs);
+    if *threshold_rms != previous {
+        response.mark_changed();
+    }
+
+    let threshold_position = rms_to_slider_position(*threshold_rms);
+    response.widget_info(|| {
+        egui::WidgetInfo::slider(f64::from(threshold_position * 100.0), "Input sensitivity")
+    });
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_description(format!(
+            "Minimum microphone level treated as speech. Current threshold {}. Use Left and Right arrow keys to adjust.",
+            input_sensitivity_db_label(threshold_dbfs)
+        ));
+        builder.set_min_numeric_value(0.0);
+        builder.set_max_numeric_value(100.0);
+        builder.set_numeric_value_step(f64::from(
+            100.0 * INPUT_LEVEL_KEYBOARD_STEP_DB / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS),
+        ));
+        builder.add_action(Action::SetValue);
+        if threshold_position < 1.0 {
+            builder.add_action(Action::Increment);
+        }
+        if threshold_position > 0.0 {
+            builder.add_action(Action::Decrement);
+        }
+    });
+
+    let colors = ui_palette(ui);
+    let track = egui::Rect::from_center_size(
+        rect.center(),
+        Vec2::new(rect.width(), INPUT_SENSITIVITY_TRACK_HEIGHT),
+    );
+    let rounding = Rounding::same(5.0);
+    ui.painter()
+        .rect_filled(track, rounding, colors.slider_remainder_fill);
+    let threshold_x = track.left() + track.width() * threshold_position;
+    let threshold_region = egui::Rect::from_min_max(
+        track.min,
+        egui::pos2(
+            threshold_x.clamp(track.left(), track.right()),
+            track.bottom(),
+        ),
+    );
+    if threshold_region.width() > 0.0 {
+        ui.painter()
+            .rect_filled(threshold_region, rounding, colors.slider_threshold_fill);
+    }
+    ui.painter().rect_stroke(
+        track,
+        rounding,
+        Stroke::new(1.0, colors.slider_track_border),
+    );
+    let crossed = live_level_position >= threshold_position && live_level_position > 0.0;
+    let fill_width = track.width() * live_level_position.clamp(0.0, 1.0);
+    if fill_width > 0.0 {
+        let fill = egui::Rect::from_min_size(
+            egui::pos2(
+                track.left(),
+                track.center().y - INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0,
+            ),
+            Vec2::new(fill_width, INPUT_SENSITIVITY_LIVE_FILL_HEIGHT),
+        );
+        let fill_color = if crossed {
+            colors.success
+        } else {
+            colors.slider_live_below
+        };
+        ui.painter().rect_filled(
+            fill,
+            Rounding::same(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0),
+            fill_color,
+        );
+    }
+
+    let thumb_center = egui::pos2(
+        track.left() + track.width() * threshold_position,
+        track.center().y,
+    );
+    let thumb_radius = if response.dragged() { 9.0 } else { 8.0 };
+    ui.painter()
+        .circle_filled(thumb_center, thumb_radius, colors.card_bg);
+    let thumb_stroke_width = if response.has_focus() { 3.0 } else { 2.0 };
+    ui.painter().circle_stroke(
+        thumb_center,
+        thumb_radius,
+        Stroke::new(thumb_stroke_width, colors.primary),
+    );
+    if response.has_focus() {
+        ui.painter()
+            .circle_filled(thumb_center, 2.0, colors.primary);
+    } else if response.hovered() {
+        ui.painter().circle_stroke(
+            thumb_center,
+            thumb_radius + 2.0,
+            Stroke::new(1.0, colors.border_strong),
+        );
+    }
+    if response.dragged() || response.has_focus() {
+        let label = input_sensitivity_db_label(threshold_dbfs);
+        let font = FontId::proportional(13.0);
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), font.clone(), colors.text)
+            .size()
+            .x;
+        let bubble_size = Vec2::new(text_width + 18.0, 28.0);
+        let bubble_center_x = thumb_center.x.clamp(
+            rect.left() + bubble_size.x / 2.0,
+            rect.right() - bubble_size.x / 2.0,
+        );
+        let bubble_rect = egui::Rect::from_center_size(
+            egui::pos2(bubble_center_x, track.top() - bubble_size.y / 2.0 - 6.0),
+            bubble_size,
+        );
+        ui.painter()
+            .rect_filled(bubble_rect, Rounding::same(8.0), colors.card_bg);
+        ui.painter().rect_stroke(
+            bubble_rect,
+            Rounding::same(8.0),
+            Stroke::new(1.0, colors.border_strong),
+        );
+        ui.painter().text(
+            bubble_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font,
+            colors.text,
+        );
+    }
+    response
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NoSpeechFeedback {
+    status_message: String,
+    overlay_message: &'static str,
+}
+
+fn no_speech_feedback(
+    maximum_input_rms: Option<f32>,
+    input_device_name: Option<&str>,
+    activation_floor: f32,
+) -> NoSpeechFeedback {
+    let input_was_too_low = maximum_input_rms
+        .filter(|rms| rms.is_finite())
+        .is_some_and(|rms| rms < activation_floor);
+    if !input_was_too_low {
+        return NoSpeechFeedback {
+            status_message: "No speech detected; nothing was pasted.".to_owned(),
+            overlay_message: "No speech detected",
+        };
+    }
+
+    let is_fifine = input_device_name.is_some_and(|name| {
+        name.to_ascii_lowercase()
+            .split_whitespace()
+            .any(|part| part.contains("fifine"))
+    });
+    let status_message = if is_fifine {
+        "FIFINE microphone signal was silent or too low. Tap its top mute control, turn up the physical gain knob, move closer, and try again."
+    } else {
+        "Microphone signal was silent or too low. Check its hardware mute and gain, move closer, verify the selected input, and try again."
+    };
+    NoSpeechFeedback {
+        status_message: status_message.to_owned(),
+        overlay_message: "Microphone signal too low — check mute and gain",
+    }
+}
+
+fn no_speech_feedback_for_capture(
+    maximum_input_rms: Option<f32>,
+    diagnostics: &CaptureDiagnosticContext,
+) -> NoSpeechFeedback {
+    no_speech_feedback(
+        maximum_input_rms,
+        diagnostics.input_device_name.as_deref(),
+        diagnostics.activation_floor,
+    )
+}
+
+fn diagnostic_activation_floor(config: &AppConfig) -> f32 {
+    config.recording.manual_activation_rms
+}
+
+fn discard_recording_async(session: RecordingSession) {
+    let _ = thread::Builder::new()
+        .name("scribe-stale-audio-cleanup".to_owned())
+        .spawn(move || {
+            let _ = session.stop_and_discard(Duration::from_secs(2));
+        });
 }
 
 fn history_retention_policy(config: &AppConfig) -> HistoryRetentionPolicy {
@@ -240,6 +632,13 @@ enum TriggerObservation {
     HotkeyPoll,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeferredRecordingStart {
+    source: RecordingSource,
+    activation_at: Instant,
+    trigger_observation: TriggerObservation,
+}
+
 struct ActiveRecording {
     session_id: SessionId,
     session: RecordingSession,
@@ -248,6 +647,7 @@ struct ActiveRecording {
     started_at: Instant,
     max_duration_seconds: u32,
     latency: LatencyTrace,
+    capture_diagnostics: CaptureDiagnosticContext,
 }
 
 struct PendingRecording {
@@ -256,7 +656,58 @@ struct PendingRecording {
     stop_requested: bool,
     max_duration_seconds: u32,
     latency: LatencyTrace,
+    capture_diagnostics: CaptureDiagnosticContext,
     abandon: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CaptureDiagnosticContext {
+    activation_floor: f32,
+    input_device_name: Option<String>,
+}
+
+impl CaptureDiagnosticContext {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            activation_floor: diagnostic_activation_floor(config),
+            input_device_name: config.recording.audio_input_device_name.clone(),
+        }
+    }
+}
+
+impl Default for CaptureDiagnosticContext {
+    fn default() -> Self {
+        Self {
+            activation_floor: audio::MIN_SPEECH_ACTIVATION_RMS,
+            input_device_name: None,
+        }
+    }
+}
+
+#[derive(Default)]
+enum MicrophoneTest {
+    #[default]
+    Idle,
+    Starting {
+        request_id: u64,
+        stop_requested: bool,
+        cancellation: CaptureCancellation,
+    },
+    Active {
+        session: RecordingSession,
+    },
+    Stopping {
+        session: RecordingSession,
+    },
+}
+
+impl MicrophoneTest {
+    fn session(&self) -> Option<&RecordingSession> {
+        match self {
+            Self::Active { session } | Self::Stopping { session } => Some(session),
+            Self::Idle | Self::Starting { .. } => None,
+        }
+    }
 }
 
 struct PendingOutput {
@@ -327,6 +778,7 @@ struct FinishedCapture {
     stop_requested: bool,
     started_at: Instant,
     latency: LatencyTrace,
+    capture_diagnostics: CaptureDiagnosticContext,
 }
 
 enum PreviewDrainAction {
@@ -381,6 +833,17 @@ struct LatencyTrace {
     target_activated_at: Option<Instant>,
     paste_completed_at: Option<Instant>,
     output_completed_at: Option<Instant>,
+    model_id: Option<String>,
+    resolved_backend: Option<String>,
+    compute_backend: Option<String>,
+    streaming_mode: Option<String>,
+    cold_or_warm: Option<String>,
+    reported_model_load_ms: Option<u64>,
+    audio_duration_ms: Option<u64>,
+    processing_duration_ms: Option<u64>,
+    maximum_input_rms: Option<f32>,
+    maximum_input_peak: Option<f32>,
+    capture_diagnostics: Option<CaptureDiagnosticContext>,
 }
 
 impl LatencyTrace {
@@ -404,6 +867,141 @@ impl LatencyTrace {
             target_activated_at: None,
             paste_completed_at: None,
             output_completed_at: None,
+            model_id: None,
+            resolved_backend: None,
+            compute_backend: None,
+            streaming_mode: None,
+            cold_or_warm: None,
+            reported_model_load_ms: None,
+            audio_duration_ms: None,
+            processing_duration_ms: None,
+            maximum_input_rms: None,
+            maximum_input_peak: None,
+            capture_diagnostics: None,
+        }
+    }
+
+    fn observe_session_context(&mut self, model_id: Option<String>, streaming_mode: StreamingMode) {
+        self.model_id = model_id;
+        self.streaming_mode = Some(
+            match streaming_mode {
+                StreamingMode::Auto => "auto",
+                StreamingMode::Rolling => "rolling",
+                StreamingMode::FinalOnly => "final_only",
+            }
+            .to_owned(),
+        );
+    }
+
+    fn observe_transcription_outcome(&mut self, outcome: &TranscriptionOutcome) {
+        self.model_id = Some(outcome.model_id.as_str().to_owned());
+        self.resolved_backend = Some(outcome.resolved_backend_label().to_owned());
+        self.compute_backend = outcome
+            .resolved_acceleration
+            .as_ref()
+            .map(|acceleration| acceleration.resolved.label().to_owned());
+        self.cold_or_warm = Some(
+            if outcome.warm_model_reused {
+                "warm"
+            } else {
+                "cold"
+            }
+            .to_owned(),
+        );
+        self.reported_model_load_ms = outcome
+            .model_load_duration_ms
+            .and_then(|value| u64::try_from(value).ok());
+        self.audio_duration_ms = outcome
+            .transcript
+            .duration_ms
+            .and_then(|value| u64::try_from(value).ok());
+        self.processing_duration_ms = outcome
+            .processing_duration_ms
+            .and_then(|value| u64::try_from(value).ok());
+    }
+
+    fn observe_capture_metrics(&mut self, metrics: &CaptureMetrics) {
+        self.maximum_input_rms = Some(metrics.maximum_input_rms);
+        self.maximum_input_peak = Some(metrics.maximum_input_peak);
+    }
+
+    fn diagnostic_snapshot(
+        &self,
+        session_id: SessionId,
+        outcome: DiagnosticSessionOutcome,
+        failure_stage: Option<DiagnosticFailureStage>,
+    ) -> SessionDiagnostic {
+        let millis = |start: Option<Instant>, end: Option<Instant>| {
+            end?.checked_duration_since(start?)?
+                .as_millis()
+                .try_into()
+                .ok()
+        };
+        let realtime_factor = self
+            .processing_duration_ms
+            .zip(self.audio_duration_ms)
+            .filter(|(_, audio)| *audio > 0)
+            .map(|(processing, audio)| processing as f64 / audio as f64);
+        SessionDiagnostic {
+            session_id: session_id.0,
+            outcome,
+            failure_stage,
+            trigger: match self.trigger_observation {
+                TriggerObservation::AppAction => "app_action",
+                TriggerObservation::HotkeyPoll => "hotkey_poll",
+            },
+            model_id: self.model_id.clone(),
+            // Architecture and package version are intentionally absent until
+            // the application-facing service exposes verified neutral values.
+            model_architecture: None,
+            resolved_backend: self.resolved_backend.clone(),
+            runtime_package_version: None,
+            compute_backend: self.compute_backend.clone(),
+            streaming_mode: self.streaming_mode.clone(),
+            cold_or_warm: self.cold_or_warm.clone(),
+            metrics: DiagnosticSessionMetrics {
+                hotkey_to_overlay_visible_ms: millis(
+                    Some(self.activation_at),
+                    self.overlay_visible_at,
+                ),
+                hotkey_to_capture_started_ms: millis(
+                    Some(self.activation_at),
+                    self.recorder_started_at,
+                ),
+                hotkey_to_first_meter_update_ms: millis(
+                    Some(self.activation_at),
+                    self.first_meter_update_at,
+                ),
+                maximum_input_rms: self.maximum_input_rms,
+                maximum_input_peak: self.maximum_input_peak,
+                // The existing recorder reports meter cadence, not a verified
+                // speech-onset timestamp. Preserve that distinction as null.
+                speech_start_detected_ms: None,
+                model_load_ms: millis(self.model_load_started_at, self.model_loaded_at)
+                    .or(self.reported_model_load_ms),
+                first_partial_ms: millis(Some(self.activation_at), self.first_partial_at),
+                recording_duration_ms: millis(self.recorder_started_at, self.stop_requested_at),
+                stop_to_capture_finalized_ms: millis(
+                    self.stop_requested_at,
+                    self.capture_finalized_at,
+                ),
+                recording_end_to_final_text_ms: millis(
+                    self.stop_requested_at,
+                    self.final_text_ready_at,
+                ),
+                // No separately measured post-processing phase exists yet.
+                post_processing_ms: None,
+                final_text_to_paste_ms: millis(self.final_text_ready_at, self.paste_completed_at),
+                final_text_to_output_completed_ms: millis(
+                    self.final_text_ready_at,
+                    self.output_completed_at,
+                ),
+                total_end_to_end_ms: millis(
+                    Some(self.activation_at),
+                    self.final_observed_instant(),
+                ),
+                realtime_factor,
+            },
         }
     }
 
@@ -537,6 +1135,83 @@ struct PlaygroundCardState {
     peak_vram_mb: Option<f64>,
 }
 
+#[derive(Default)]
+struct RemoteCatalogState {
+    snapshot: Option<CatalogSnapshot>,
+    loading: bool,
+    attempted: bool,
+    error: Option<String>,
+}
+
+/// Ephemeral Models-page controls. They deliberately are not persisted: they
+/// change what the user is browsing, not the installed-model configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RemoteCatalogFilters {
+    installed_only: bool,
+    recommended_only: bool,
+    multilingual_only: bool,
+    size_tier: RemoteCatalogSizeTier,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RemoteCatalogSizeTier {
+    #[default]
+    Any,
+    Compact,
+    Standard,
+    Large,
+}
+
+impl RemoteCatalogSizeTier {
+    const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any size",
+            Self::Compact => "Compact (up to 512 MiB)",
+            Self::Standard => "Standard (512 MiB to 1 GiB)",
+            Self::Large => "Large (over 1 GiB)",
+        }
+    }
+
+    fn matches(self, size_bytes: Option<u64>) -> bool {
+        const MIB: u64 = 1024 * 1024;
+        const COMPACT_MAX: u64 = 512 * MIB;
+        const STANDARD_MAX: u64 = 1024 * MIB;
+
+        match self {
+            Self::Any => true,
+            Self::Compact => size_bytes.is_some_and(|size| size <= COMPACT_MAX),
+            Self::Standard => {
+                size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
+            }
+            Self::Large => size_bytes.is_some_and(|size| size > STANDARD_MAX),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RemoteCatalogSort {
+    #[default]
+    Recommended,
+    Smallest,
+    Largest,
+    Name,
+}
+
+impl RemoteCatalogSort {
+    const ALL: [Self; 4] = [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Recommended first",
+            Self::Smallest => "Smallest first",
+            Self::Largest => "Largest first",
+            Self::Name => "Name",
+        }
+    }
+}
+
 enum PlaygroundAction {
     Clear(String),
     MoveBy {
@@ -552,6 +1227,10 @@ enum PlaygroundAction {
 enum AppEvent {
     CaptureReady {
         session_id: SessionId,
+        result: Result<RecordingSession, audio::CaptureError>,
+    },
+    MicrophoneTestReady {
+        request_id: u64,
         result: Result<RecordingSession, audio::CaptureError>,
     },
     ModelPreloadFinished {
@@ -614,6 +1293,9 @@ enum AppEvent {
         retry_lease_released: bool,
         result: Result<(), String>,
     },
+    RemoteCatalogLoaded {
+        result: Result<CatalogSnapshot, String>,
+    },
     ModelDownloadProgress {
         job_id: u64,
         model_id: String,
@@ -630,6 +1312,9 @@ enum AppEvent {
         message: String,
         recovery_required: bool,
     },
+    LocalGgufImportFinished {
+        result: Result<Box<ValidatedLocalGgufImport>, String>,
+    },
     RuntimeInstallDone {
         runtime_id: String,
         runtime_label: String,
@@ -645,6 +1330,7 @@ enum AppEvent {
 #[derive(Debug)]
 struct VerifiedInstallResult {
     model: FileReplacement,
+    manifest: FileReplacement,
     runtime: Option<DirectoryReplacement>,
     runtime_id: String,
     runtime_entrypoint: Option<PathBuf>,
@@ -655,6 +1341,17 @@ struct VerifiedInstallResult {
     model_sha256: String,
     smoke: InstallSmoke,
     journal: ActivationJournal,
+    remote_install: Option<config::ManagedRemoteModelInstall>,
+}
+
+/// A local source has been fully re-hashed and exercised by the isolated
+/// embedded runtime. The UI thread owns the final receipt/config transaction.
+#[derive(Debug)]
+struct ValidatedLocalGgufImport {
+    model_id: ModelId,
+    install: config::ImportedGgufModelInstall,
+    manifest: installed_manifest::InstalledModelManifest,
+    smoke: InstallSmoke,
 }
 
 #[derive(Debug)]
@@ -750,6 +1447,37 @@ fn failure_after_safe_rollback(
     }
 }
 
+fn failure_after_activated_artifact_rollback(
+    journal: ActivationJournal,
+    model: FileReplacement,
+    manifest: Option<FileReplacement>,
+    runtime: Option<DirectoryReplacement>,
+    message: impl Into<String>,
+) -> InstallJobFailure {
+    let manifest_rollback = manifest.and_then(|replacement| replacement.rollback().err());
+    let model_rollback = model.rollback().err();
+    let runtime_rollback = runtime.and_then(|replacement| replacement.rollback().err());
+    if manifest_rollback.is_none() && model_rollback.is_none() && runtime_rollback.is_none() {
+        return failure_after_safe_rollback(journal, message);
+    }
+    let message = message.into();
+    InstallJobFailure::recovery_required(format!(
+        "{message}{}{}{}",
+        manifest_rollback
+            .as_ref()
+            .map(|error| format!(". Installed-model manifest rollback also failed: {error}"))
+            .unwrap_or_default(),
+        model_rollback
+            .as_ref()
+            .map(|error| format!(". Model rollback also failed: {error}"))
+            .unwrap_or_default(),
+        runtime_rollback
+            .as_ref()
+            .map(|error| format!(". Runtime rollback also failed: {error}"))
+            .unwrap_or_default(),
+    ))
+}
+
 struct VerifiedInstallRequest {
     config: AppConfig,
     service: TranscriptionService,
@@ -758,6 +1486,33 @@ struct VerifiedInstallRequest {
     existing_runtime_root: Option<PathBuf>,
     force_runtime_package: bool,
     cancellation: InstallCancellation,
+    source: VerifiedInstallSource,
+}
+
+/// The UI can only construct this request from a typed backend catalog card.
+/// It carries source facts, never an arbitrary URL or filesystem path.
+#[derive(Clone, Debug)]
+struct TrustedRemoteInstallRequest {
+    artifact: TrustedArtifact,
+    display_name: String,
+    description: String,
+    languages: Vec<String>,
+    recommended: bool,
+}
+
+#[derive(Clone, Debug)]
+enum VerifiedInstallSource {
+    NormalizedCatalog,
+    TrustedRemote(TrustedRemoteInstallRequest),
+}
+
+#[derive(Clone, Debug)]
+enum RemoteModelCardAction {
+    InstallNormalized(ModelId),
+    InstallTrusted(TrustedRemoteInstallRequest),
+    CancelInstall(ModelId),
+    SelectInstalled(ModelId),
+    RemoveInstalled(ModelId),
 }
 
 fn run_verified_install(
@@ -772,9 +1527,41 @@ fn run_verified_install(
         existing_runtime_root,
         force_runtime_package,
         cancellation,
+        source,
     } = request;
-    let model = managed_downloads::prepare_model(&config, &model_id, &cancellation, progress)
-        .map_err(InstallJobFailure::from)?;
+    let (model, model_uses_embedded_runtime, manifest_source, remote_install_request) = match source
+    {
+        VerifiedInstallSource::NormalizedCatalog => {
+            let model =
+                managed_downloads::prepare_model(&config, &model_id, &cancellation, progress)
+                    .map_err(InstallJobFailure::from)?;
+            let source = installed_manifest::ArtifactSource::normalized(&model_id)
+                .map_err(|error| error.to_string())?;
+            (
+                model,
+                crate::model_catalog::model_uses_embedded_runtime(&model_id),
+                source,
+                None,
+            )
+        }
+        VerifiedInstallSource::TrustedRemote(request) => {
+            let model = managed_downloads::prepare_trusted_gguf_model(
+                &config,
+                &request.artifact,
+                &cancellation,
+                progress,
+            )
+            .map_err(InstallJobFailure::from)?;
+            let source = installed_manifest::ArtifactSource::trusted_gguf(
+                request.artifact.model_id.clone(),
+                request.artifact.revision.clone(),
+                request.artifact.filename.clone(),
+                request.artifact.size_bytes,
+                request.artifact.expected_sha256.clone(),
+            );
+            (model, true, source, Some(request))
+        }
+    };
     if cancellation.is_cancelled() {
         return Err(InstallJobFailure::normal(
             "Installation cancelled. The verified partial was retained for Resume.",
@@ -787,9 +1574,38 @@ fn run_verified_install(
     let mut runtime_version = None;
     let mut runtime_package_id = None;
     let mut runtime_archive_sha256 = None;
-    let mut candidate_root = existing_runtime_root;
+    let mut candidate_root = (!model_uses_embedded_runtime)
+        .then_some(existing_runtime_root)
+        .flatten();
 
-    let smoke_current = candidate_root.as_ref().and_then(|root| {
+    let smoke_current = (!model_uses_embedded_runtime)
+        .then_some(candidate_root.as_ref())
+        .flatten()
+        .and_then(|root| {
+            progress(InstallProgress {
+                stage: InstallStage::HealthChecking,
+                completed_bytes: model.size_bytes,
+                total_bytes: model.size_bytes,
+                bytes_per_second: None,
+            });
+            service
+                .verify_installation_candidate(
+                    InstallationCandidate::normalized(
+                        model_id.clone(),
+                        model.path.clone(),
+                        Some(root.clone()),
+                    )
+                    .ok()?,
+                    &cancellation,
+                )
+                .ok()
+        });
+    let current_runtime_known_good = smoke_current.is_some()
+        && candidate_root
+            .as_ref()
+            .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
+
+    let smoke = if model_uses_embedded_runtime {
         progress(InstallProgress {
             stage: InstallStage::HealthChecking,
             completed_bytes: model.size_bytes,
@@ -798,21 +1614,17 @@ fn run_verified_install(
         });
         service
             .verify_installation_candidate(
-                InstallationCandidate {
-                    model_id: model_id.clone(),
-                    model_path: model.path.clone(),
-                    runtime_package_root: root.clone(),
-                },
+                InstallationCandidate::pinned(
+                    model_id.clone(),
+                    model.path.clone(),
+                    None,
+                    manifest_source.expected_size_bytes,
+                    manifest_source.expected_sha256.clone(),
+                ),
                 &cancellation,
             )
-            .ok()
-    });
-    let current_runtime_known_good = smoke_current.is_some()
-        && candidate_root
-            .as_ref()
-            .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
-
-    let smoke = if !force_runtime_package && let Some(smoke) = smoke_current {
+            .map_err(|error| error.to_string())?
+    } else if !force_runtime_package && let Some(smoke) = smoke_current {
         smoke
     } else {
         let prepared =
@@ -831,13 +1643,16 @@ fn run_verified_install(
         });
         let smoke = service
             .verify_installation_candidate(
-                InstallationCandidate {
-                    model_id: model_id.clone(),
-                    model_path: model.path.clone(),
-                    runtime_package_root: candidate_root
-                        .clone()
-                        .ok_or_else(|| "staged runtime root was lost".to_owned())?,
-                },
+                InstallationCandidate::normalized(
+                    model_id.clone(),
+                    model.path.clone(),
+                    Some(
+                        candidate_root
+                            .clone()
+                            .ok_or_else(|| "staged runtime root was lost".to_owned())?,
+                    ),
+                )
+                .map_err(|error| error.to_string())?,
                 &cancellation,
             )
             .map_err(|error| error.to_string())?;
@@ -929,31 +1744,81 @@ fn run_verified_install(
         }
     };
     if let Err(error) = journal.mark(ActivationPhase::ModelActivated) {
-        let model_rollback = model.rollback().err();
-        let runtime_rollback = runtime.and_then(|replacement| replacement.rollback().err());
-        if model_rollback.is_none() && runtime_rollback.is_none() {
-            return Err(failure_after_safe_rollback(journal, error.to_string()));
-        }
-        let message = format!(
-            "{error}{}{}",
-            model_rollback
-                .as_ref()
-                .map(|error| format!(". Model rollback also failed: {error}"))
-                .unwrap_or_default(),
-            runtime_rollback
-                .as_ref()
-                .map(|error| format!(". Runtime rollback also failed: {error}"))
-                .unwrap_or_default()
-        );
-        return Err(if model_rollback.is_some() || runtime_rollback.is_some() {
-            InstallJobFailure::recovery_required(message)
-        } else {
-            InstallJobFailure::normal(message)
-        });
+        return Err(failure_after_activated_artifact_rollback(
+            journal,
+            model,
+            None,
+            runtime,
+            error.to_string(),
+        ));
     }
+
+    let manifest_document = match installed_manifest::build_manifest(
+        &model_id,
+        manifest_source,
+        model_uses_embedded_runtime,
+        model.destination(),
+        &model_sha256,
+        &smoke,
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(failure_after_activated_artifact_rollback(
+                journal,
+                model,
+                None,
+                runtime,
+                error.to_string(),
+            ));
+        }
+    };
+    if let Err(error) =
+        journal.record_manifest_target(installed_manifest::manifest_path_for(model.destination()))
+    {
+        return Err(failure_after_activated_artifact_rollback(
+            journal,
+            model,
+            None,
+            runtime,
+            error.to_string(),
+        ));
+    }
+    let manifest = match installed_manifest::stage_manifest(&manifest_document) {
+        Ok(replacement) => replacement,
+        Err(error) if error.requires_recovery() => {
+            return Err(InstallJobFailure::recovery_required(error.to_string()));
+        }
+        Err(error) => {
+            return Err(failure_after_activated_artifact_rollback(
+                journal,
+                model,
+                None,
+                runtime,
+                error.to_string(),
+            ));
+        }
+    };
+
+    let remote_install = remote_install_request.map(|request| {
+        config::ManagedRemoteModelInstall::trusted(
+            config::RemoteGgufArtifact {
+                repository: request.artifact.model_id,
+                revision: request.artifact.revision,
+                filename: request.artifact.filename,
+                expected_size_bytes: request.artifact.size_bytes,
+                expected_sha256: request.artifact.expected_sha256,
+            },
+            model.destination().to_path_buf(),
+            request.display_name,
+            request.description,
+            request.languages,
+            request.recommended,
+        )
+    });
 
     Ok(VerifiedInstallResult {
         model,
+        manifest,
         runtime,
         runtime_id,
         runtime_entrypoint,
@@ -964,7 +1829,138 @@ fn run_verified_install(
         model_sha256,
         smoke,
         journal,
+        remote_install,
     })
+}
+
+fn validate_local_gguf_import(
+    source_path: PathBuf,
+    model_storage_dir: PathBuf,
+    service: TranscriptionService,
+    cancellation: InstallCancellation,
+) -> Result<ValidatedLocalGgufImport, String> {
+    if !source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err("Choose a local .gguf file to import.".to_owned());
+    }
+    let fingerprint = fingerprint_file_cancellable(&source_path, &cancellation)
+        .map_err(local_gguf_import_install_error)?;
+    reject_import_source_in_model_storage(&fingerprint.canonical_path, &model_storage_dir)?;
+    let model_id = config::imported_gguf_model_id(&fingerprint.sha256)
+        .map(ModelId::new)
+        .ok_or_else(|| "The local GGUF hash was invalid.".to_owned())?;
+    let filename = fingerprint
+        .canonical_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "The local GGUF file has no usable filename.".to_owned())?;
+    let display_name = fingerprint
+        .canonical_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Imported local GGUF".to_owned());
+    let smoke = service
+        .verify_installation_candidate(
+            InstallationCandidate::pinned(
+                model_id.clone(),
+                fingerprint.canonical_path.clone(),
+                None,
+                fingerprint.size_bytes,
+                fingerprint.sha256.clone(),
+            ),
+            &cancellation,
+        )
+        .map_err(local_gguf_import_error)?;
+    let after_smoke = fingerprint_file_cancellable(&fingerprint.canonical_path, &cancellation)
+        .map_err(local_gguf_import_install_error)?;
+    if after_smoke != fingerprint {
+        return Err(
+            "The local GGUF changed during validation. It was not imported; choose it again to revalidate its current bytes."
+                .to_owned(),
+        );
+    }
+    let install = config::ImportedGgufModelInstall::validated(
+        fingerprint.canonical_path.clone(),
+        fingerprint.size_bytes,
+        fingerprint.sha256.clone(),
+        display_name,
+    );
+    let manifest = installed_manifest::build_manifest(
+        &model_id,
+        installed_manifest::ArtifactSource::local_import(
+            filename,
+            fingerprint.size_bytes,
+            fingerprint.sha256,
+        ),
+        true,
+        &fingerprint.canonical_path,
+        &after_smoke.sha256,
+        &smoke,
+    )
+    .map_err(|error| format!("Could not prepare local import receipt: {error}"))?;
+    Ok(ValidatedLocalGgufImport {
+        model_id,
+        install,
+        manifest,
+        smoke,
+    })
+}
+
+fn reject_import_source_in_model_storage(
+    canonical_source_path: &Path,
+    model_storage_dir: &Path,
+) -> Result<(), String> {
+    let canonical_storage_dir = match fs::canonicalize(model_storage_dir) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect Scribe model storage {}: {error}",
+                model_storage_dir.display()
+            ));
+        }
+    };
+    if canonical_source_path.starts_with(&canonical_storage_dir) {
+        return Err(
+            "Choose a GGUF outside Scribe's managed model storage. Local imports must remain external to Scribe."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn local_gguf_import_fingerprint_matches(
+    install: &config::ImportedGgufModelInstall,
+    fingerprint: &crate::installations::FileFingerprint,
+) -> bool {
+    fingerprint.canonical_path == install.path
+        && fingerprint.size_bytes == install.size_bytes
+        && fingerprint.sha256 == install.sha256
+}
+
+fn local_gguf_import_install_error(error: InstallError) -> String {
+    match error {
+        InstallError::Cancelled { .. } => {
+            "Local GGUF import was cancelled. The source file was left unchanged.".to_owned()
+        }
+        error => format!("Local GGUF could not be loaded by the embedded runtime: {error}"),
+    }
+}
+
+fn local_gguf_import_error(error: anyhow::Error) -> String {
+    if matches!(
+        error.downcast_ref::<InstallError>(),
+        Some(InstallError::Cancelled { .. })
+    ) {
+        "Local GGUF import was cancelled. The source file was left unchanged.".to_owned()
+    } else {
+        format!("Local GGUF could not be loaded by the embedded runtime: {error}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1146,11 +2142,11 @@ fn persist_runtime_install(
 }
 
 fn runtime_metadata_matches(
-    config: &AppConfig,
+    app_config: &AppConfig,
     runtime_id: &str,
     install: &config::ManagedRuntimeInstall,
 ) -> bool {
-    config.general.managed_runtimes.get(runtime_id) == Some(install)
+    app_config.general.managed_runtimes.get(runtime_id) == Some(install)
 }
 
 fn missing_runtime_source_message() -> String {
@@ -1681,11 +2677,23 @@ pub struct LocalTranscriberApp {
     status_message: String,
     hotkey_input: String,
     model_search: String,
+    remote_catalog_filters: RemoteCatalogFilters,
+    remote_catalog_sort: RemoteCatalogSort,
+    model_import_path: String,
+    remote_catalog: RemoteCatalogState,
     audio_devices: Vec<String>,
+    microphone_test: MicrophoneTest,
+    microphone_test_sequence: u64,
+    microphone_test_error: Option<String>,
+    microphone_monitor_retry_at: Option<Instant>,
+    microphone_level_envelope: MicrophoneLevelEnvelope,
+    deferred_recording_start: Option<DeferredRecordingStart>,
+    deferred_history_playback: Option<i64>,
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: HashMap<String, (u64, InstallCancellation)>,
+    local_gguf_import: Option<InstallCancellation>,
     artifact_recovery_error: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
@@ -1729,12 +2737,16 @@ pub struct LocalTranscriberApp {
     session_coordinator: SessionCoordinator,
     playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
+    diagnostics: DiagnosticsStore,
+    #[cfg(test)]
+    test_gguf_fixture: Option<PathBuf>,
     captured_targets: HashMap<SessionId, CapturedTarget>,
     overlay_controller: OverlayController,
     overlay_hide_at: Option<Instant>,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
     last_tray_state: Option<TrayUiState>,
+    window_hidden_to_tray: bool,
     quit_requested: bool,
 }
 
@@ -1790,11 +2802,23 @@ impl LocalTranscriberApp {
         let mut app = Self {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            remote_catalog_filters: RemoteCatalogFilters::default(),
+            remote_catalog_sort: RemoteCatalogSort::default(),
+            model_import_path: String::new(),
+            remote_catalog: RemoteCatalogState::default(),
             audio_devices: Vec::new(),
+            microphone_test: MicrophoneTest::Idle,
+            microphone_test_sequence: 0,
+            microphone_test_error: None,
+            microphone_monitor_retry_at: None,
+            microphone_level_envelope: MicrophoneLevelEnvelope::default(),
+            deferred_recording_start: None,
+            deferred_history_playback: None,
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
+            local_gguf_import: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -1848,22 +2872,55 @@ impl LocalTranscriberApp {
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
+            diagnostics: DiagnosticsStore::default(),
+            #[cfg(test)]
+            test_gguf_fixture: None,
             captured_targets: HashMap::new(),
             overlay_controller: OverlayController::new(overlay::reduced_motion_preferred()),
             overlay_hide_at: None,
             tray_service: None,
             last_tray_state: None,
+            window_hidden_to_tray: false,
             quit_requested: false,
         };
 
         let allowed_model_targets = config::configured_models(&app.config)
             .into_iter()
             .filter(|model| {
-                app.transcription_service
-                    .model_descriptor(&ModelId::new(&model.id))
-                    .is_ok()
+                config::remote_gguf_artifact(&app.config, &model.id).is_some()
+                    || app
+                        .transcription_service
+                        .model_descriptor(&ModelId::new(&model.id))
+                        .is_ok()
             })
-            .filter_map(|model| config::downloaded_model_path(&app.config, &model))
+            .filter_map(|model| {
+                config::managed_remote_model_path(&app.config, &model.id)
+                    .or_else(|| config::downloaded_model_path(&app.config, &model))
+            })
+            .collect::<Vec<_>>();
+        let allowed_removal_targets = config::configured_models(&app.config)
+            .into_iter()
+            .filter_map(|model| {
+                config::managed_remote_model_path(&app.config, &model.id)
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .or_else(|| config::downloaded_model_path(&app.config, &model))
+            })
+            .chain(app.config.general.imported_gguf_models.keys().map(|id| {
+                installed_manifest::imported_manifest_path_for(
+                    &config::model_storage_dir(&app.config),
+                    &ModelId::new(id),
+                )
+            }))
+            .collect::<Vec<_>>();
+        let allowed_manifest_targets = allowed_model_targets
+            .iter()
+            .map(|model_path| installed_manifest::manifest_path_for(model_path))
+            .chain(app.config.general.imported_gguf_models.keys().map(|id| {
+                installed_manifest::imported_manifest_path_for(
+                    &config::model_storage_dir(&app.config),
+                    &ModelId::new(id),
+                )
+            }))
             .collect::<Vec<_>>();
         let allowed_runtime_bindings = app
             .transcription_service
@@ -1896,15 +2953,19 @@ impl LocalTranscriberApp {
                 crate::installations::InstallError::RecoveryRequired(error.to_string())
             })
             .and_then(|fingerprint| {
-                allowed_model_targets
-                    .iter()
-                    .try_for_each(|target| {
-                        reconcile_managed_removal(target, &allowed_model_targets, fingerprint)
-                            .map(|_| ())
-                    })
-                    .and_then(|_| {
-                        allowed_runtime_bindings.iter().try_for_each(|(_, target)| {
-                            reconcile_managed_removal(target, &allowed_runtime_targets, fingerprint)
+                let removal_roots = vec![
+                    config::model_storage_dir(&app.config),
+                    config::runtime_storage_dir(),
+                ];
+                discover_managed_removal_targets(&removal_roots)
+                    .and_then(|discovered| {
+                        let mut allowed_targets = allowed_removal_targets.clone();
+                        allowed_targets.extend(allowed_runtime_targets.iter().cloned());
+                        allowed_targets.extend(discovered);
+                        allowed_targets.sort();
+                        allowed_targets.dedup();
+                        allowed_targets.iter().try_for_each(|target| {
+                            reconcile_managed_removal(target, &allowed_targets, fingerprint)
                                 .map(|_| ())
                         })
                     })
@@ -1930,6 +2991,7 @@ impl LocalTranscriberApp {
             reconcile_activation_journal(
                 &activation_journal_path(),
                 &allowed_model_targets,
+                &allowed_manifest_targets,
                 &allowed_runtime_targets,
                 Some(&fingerprint),
             )
@@ -1962,9 +3024,12 @@ impl LocalTranscriberApp {
             is_recording: false,
             has_transcript: false,
         };
+        let tray_context = cc.egui_ctx.clone();
         match TrayService::new(
             initial_tray_state.is_recording,
             initial_tray_state.has_transcript,
+            native_main_window_handle(cc),
+            move || tray_context.request_repaint(),
         ) {
             Ok(tray_service) => {
                 app.tray_service = Some(tray_service);
@@ -1997,10 +3062,13 @@ impl LocalTranscriberApp {
             return;
         };
         let model_id = ModelId::new(&model.id);
-        if self
-            .transcription_service
-            .model_descriptor(&model_id)
-            .is_err()
+        let embedded_gguf = config::remote_gguf_artifact(&self.config, &model.id).is_some()
+            || config::imported_gguf_artifact(&self.config, &model.id).is_some();
+        if !embedded_gguf
+            && self
+                .transcription_service
+                .model_descriptor(&model_id)
+                .is_err()
         {
             return;
         }
@@ -2016,11 +3084,12 @@ impl LocalTranscriberApp {
                 return;
             }
         };
-        if !self
-            .config
-            .general
-            .managed_runtimes
-            .contains_key(&binding.managed_runtime_id)
+        if !embedded_gguf
+            && !self
+                .config
+                .general
+                .managed_runtimes
+                .contains_key(&binding.managed_runtime_id)
         {
             return;
         }
@@ -2048,6 +3117,16 @@ impl LocalTranscriberApp {
         }
         let current_error = current.unwrap_err();
         let _ = self.transcription_service.unload_runtime();
+        if embedded_gguf {
+            let message = format!(
+                "The selected GGUF could not be loaded by the embedded runtime: {current_error}"
+            );
+            self.model_downloads
+                .insert(model.id.clone(), ModelInstallStatus::Error(message.clone()));
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
         let recovery = match self
             .transcription_service
             .rollback_to_previous_runtime(&model_id)
@@ -2297,9 +3376,24 @@ impl LocalTranscriberApp {
     }
 
     fn stop_and_discard_active_recording(&mut self) {
-        self.pending_output = None;
+        if let Some(pending) = self.pending_output.take()
+            && let Some(latency) = pending.latency.as_ref()
+        {
+            self.record_session_diagnostic(
+                pending.session_id,
+                latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
+        }
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
+            self.record_session_diagnostic(
+                pending.session_id,
+                &pending.latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
             let _ = self.session_coordinator.cancel_active();
             self.retire_captured_target(pending.session_id);
             let _ = self.overlay_controller.hide(pending.session_id);
@@ -2307,6 +3401,12 @@ impl LocalTranscriberApp {
         let Some(active) = self.active_recording.take() else {
             return;
         };
+        self.record_session_diagnostic(
+            active.session_id,
+            &active.latency,
+            DiagnosticSessionOutcome::Cancelled,
+            None,
+        );
         self.retire_captured_target(active.session_id);
         let _ = self.overlay_controller.hide(active.session_id);
         if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
@@ -2339,18 +3439,25 @@ impl LocalTranscriberApp {
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.capture_is_active() {
+        if self.capture_is_active()
+            || self.microphone_test_is_active()
+            || self.microphone_level_envelope.is_animating()
+        {
             METER_REPAINT_DELAY
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
-            // Hotkey and tray events are integrated from update(), so idle still polls slowly.
+            // Hotkey events are integrated from update(), so idle still polls slowly. Tray
+            // handlers wake the event loop directly and do not depend on this polling clock.
             IDLE_REPAINT_DELAY
         }
     }
 
     fn has_active_work(&self) -> bool {
         self.capture_is_active()
+            || self.microphone_test_is_active()
+            || self.deferred_recording_start.is_some()
+            || self.deferred_history_playback.is_some()
             || self.session_coordinator.phase() != DictationPhase::Idle
             || self.playground_pending > 0
             || self.history_loading
@@ -2393,10 +3500,7 @@ impl LocalTranscriberApp {
                         _ => None,
                     })
             })
-    }
-
-    fn current_audio_level(&self) -> f32 {
-        self.current_audio_levels().peak
+            .or_else(|| self.deferred_recording_start.map(|pending| pending.source))
     }
 
     fn current_audio_levels(&self) -> LevelSnapshot {
@@ -2405,6 +3509,152 @@ impl LocalTranscriberApp {
             .map_or_else(LevelSnapshot::default, |active| {
                 active.session.latest_levels()
             })
+    }
+
+    fn apply_input_sensitivity_threshold(&mut self) {
+        let threshold = self.config.recording.manual_activation_rms;
+        if let Some(active) = self.active_recording.as_mut() {
+            active.session.set_manual_activation_threshold(threshold);
+            active.capture_diagnostics.activation_floor = threshold;
+        }
+        if let Some(pending) = self.pending_recording.as_mut() {
+            pending.capture_diagnostics.activation_floor = threshold;
+        }
+        if let Some(session) = self.microphone_test.session() {
+            session.set_manual_activation_threshold(threshold);
+        }
+    }
+
+    fn microphone_test_is_active(&self) -> bool {
+        !matches!(self.microphone_test, MicrophoneTest::Idle)
+    }
+
+    fn current_sensitivity_level_sample(&self) -> (LevelSnapshot, Option<u64>, bool) {
+        if let Some(active) = self.active_recording.as_ref() {
+            return (
+                active.session.latest_levels(),
+                Some(active.session.latest_level_revision()),
+                true,
+            );
+        }
+        if let MicrophoneTest::Active { session } = &self.microphone_test {
+            return (
+                session.latest_levels(),
+                Some(session.latest_level_revision()),
+                true,
+            );
+        }
+        (LevelSnapshot::default(), None, false)
+    }
+
+    fn ensure_microphone_monitor(&mut self) {
+        if self.capture_is_active()
+            || self.deferred_recording_start.is_some()
+            || self.deferred_history_playback.is_some()
+            || self.playing_history_id.is_some()
+            || self.microphone_test_is_active()
+            || self
+                .microphone_monitor_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return;
+        }
+        self.start_microphone_test();
+    }
+
+    fn start_microphone_test(&mut self) {
+        if self.microphone_test_is_active() {
+            return;
+        }
+        if self.capture_is_active() || self.playing_history_id.is_some() {
+            return;
+        }
+
+        let mut options = capture_options_from_config(&self.config);
+        options.intent = CaptureIntent::MeterOnly;
+        options.vad_enabled = true;
+        options.endpointing_enabled = false;
+        let input_device_name = self.config.recording.audio_input_device_name.clone();
+        let max_duration_seconds = config::MAX_RECORDING_SECONDS;
+        self.microphone_test_sequence = self.microphone_test_sequence.wrapping_add(1);
+        let request_id = self.microphone_test_sequence;
+        let cancellation = CaptureCancellation::new();
+        self.microphone_test = MicrophoneTest::Starting {
+            request_id,
+            stop_requested: false,
+            cancellation: cancellation.clone(),
+        };
+        self.microphone_test_error = None;
+        self.microphone_monitor_retry_at = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = audio::start_recording(
+                max_duration_seconds,
+                input_device_name,
+                options,
+                None,
+                cancellation,
+            );
+            let _ = tx.send(AppEvent::MicrophoneTestReady { request_id, result });
+        });
+    }
+
+    fn stop_microphone_test(&mut self) {
+        self.microphone_test = match std::mem::take(&mut self.microphone_test) {
+            MicrophoneTest::Starting {
+                request_id,
+                cancellation,
+                ..
+            } => {
+                cancellation.cancel();
+                MicrophoneTest::Starting {
+                    request_id,
+                    stop_requested: true,
+                    cancellation,
+                }
+            }
+            MicrophoneTest::Active { session } => {
+                session.stop();
+                MicrophoneTest::Stopping { session }
+            }
+            state @ (MicrophoneTest::Idle | MicrophoneTest::Stopping { .. }) => state,
+        };
+    }
+
+    fn suspend_microphone_monitor(&mut self) {
+        self.stop_microphone_test();
+        self.microphone_level_envelope.clear();
+    }
+
+    fn poll_microphone_test(&mut self) {
+        let completion = self
+            .microphone_test
+            .session()
+            .and_then(RecordingSession::try_finish);
+        if let Some(result) = completion {
+            self.microphone_test = MicrophoneTest::Idle;
+            self.microphone_level_envelope.reset_source();
+            self.microphone_test_error = result.err().map(|error| error.to_string());
+            if let Some(error) = self.microphone_test_error.as_ref() {
+                self.microphone_monitor_retry_at =
+                    Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
+                self.status_message = format!("Microphone monitoring unavailable: {error}");
+            }
+        }
+        if matches!(self.microphone_test, MicrophoneTest::Idle)
+            && let Some(pending) = self.deferred_recording_start.take()
+        {
+            self.deferred_history_playback = None;
+            self.start_recording_at(
+                pending.source,
+                pending.activation_at,
+                pending.trigger_observation,
+            );
+        } else if matches!(self.microphone_test, MicrophoneTest::Idle)
+            && let Some(history_id) = self.deferred_history_playback.take()
+        {
+            self.apply_history_action(HistoryPageAction::Play(history_id));
+        }
     }
 
     fn sync_overlay_state(&mut self) {
@@ -2553,10 +3803,30 @@ impl LocalTranscriberApp {
         }
         let message = message.into();
         let _ = self.session_coordinator.fail(session_id);
-        self.pending_output = None;
+        if let Some(pending) = self.pending_output.take()
+            && let Some(latency) = pending.latency.as_ref()
+        {
+            self.record_session_diagnostic(
+                pending.session_id,
+                latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
+        }
         self.status = TranscriptionStatus::Error;
         self.status_message = message.clone();
         self.finish_overlay_error(session_id, &message);
+    }
+
+    fn record_session_diagnostic(
+        &mut self,
+        session_id: SessionId,
+        latency: &LatencyTrace,
+        outcome: DiagnosticSessionOutcome,
+        failure_stage: Option<DiagnosticFailureStage>,
+    ) {
+        self.diagnostics
+            .record(latency.diagnostic_snapshot(session_id, outcome, failure_stage));
     }
 
     fn poll_pending_output(&mut self) {
@@ -2598,6 +3868,18 @@ impl LocalTranscriberApp {
         let output_message = result.status_message();
         if let Some(history_id) = pending.history_id {
             self.record_history_output_outcome(history_id, &result);
+        }
+        if let Some(latency) = pending.latency.as_ref() {
+            let (outcome, failure_stage) =
+                if matches!(result, text_output::TextOutputResult::Failed(_)) {
+                    (
+                        DiagnosticSessionOutcome::Failed,
+                        Some(DiagnosticFailureStage::Output),
+                    )
+                } else {
+                    (DiagnosticSessionOutcome::Completed, None)
+                };
+            self.record_session_diagnostic(pending.session_id, latency, outcome, failure_stage);
         }
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = pending.latency;
@@ -2652,6 +3934,14 @@ impl LocalTranscriberApp {
                 } else {
                     self.status = TranscriptionStatus::Idle;
                     self.status_message = pending.completion_message;
+                    if let Some(latency) = pending.latency.as_ref() {
+                        self.record_session_diagnostic(
+                            pending.session_id,
+                            latency,
+                            DiagnosticSessionOutcome::Completed,
+                            None,
+                        );
+                    }
                     self.latest_latency = pending.latency;
                     let _ = self.session_coordinator.complete(pending.session_id);
                     self.finish_overlay_success(pending.session_id);
@@ -2664,6 +3954,14 @@ impl LocalTranscriberApp {
                     "{}. History retry completed; nothing was pasted.",
                     pending.completion_message
                 );
+                if let Some(latency) = pending.latency.as_ref() {
+                    self.record_session_diagnostic(
+                        pending.session_id,
+                        latency,
+                        DiagnosticSessionOutcome::Completed,
+                        None,
+                    );
+                }
                 self.latest_latency = pending.latency;
                 let _ = self.session_coordinator.complete(pending.session_id);
             }
@@ -2714,10 +4012,10 @@ impl LocalTranscriberApp {
         });
     }
 
-    fn finish_no_speech_history_context(&self, context: HistoryRequestContext) {
+    fn finish_no_speech_history_context(&self, context: HistoryRequestContext, message: &str) {
         match context.kind {
             HistoryRequestKind::Dictation => self.discard_history_entry(context.id),
-            HistoryRequestKind::Retry => self.fail_history_retry(context.id, "No speech detected"),
+            HistoryRequestKind::Retry => self.fail_history_retry(context.id, message),
         }
     }
 
@@ -2837,6 +4135,21 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
+        // A recording request has priority over retained-audio playback that was waiting
+        // for the same monitor teardown. Never allow the two deferred audio owners to coexist.
+        self.deferred_history_playback = None;
+        if self.microphone_test_is_active() {
+            if self.deferred_recording_start.is_none() {
+                self.deferred_recording_start = Some(DeferredRecordingStart {
+                    source,
+                    activation_at,
+                    trigger_observation,
+                });
+                self.stop_microphone_test();
+                self.status_message = "Preparing microphone".to_owned();
+            }
+            return;
+        }
         if self.playing_history_id.is_some() {
             self.status_message =
                 "Stop retained-audio playback before starting dictation".to_owned();
@@ -2865,6 +4178,7 @@ impl LocalTranscriberApp {
             return;
         }
         let mut latency = LatencyTrace::started_at(activation_at, trigger_observation);
+        latency.capture_diagnostics = Some(CaptureDiagnosticContext::from_config(&self.config));
 
         let preload_model = if source == RecordingSource::Transcribe {
             let Some(model) = self.selected_model() else {
@@ -2907,6 +4221,10 @@ impl LocalTranscriberApp {
                 return;
             }
         };
+        latency.observe_session_context(
+            preload_model.as_ref().map(|model| model.id.clone()),
+            self.config.streaming.mode,
+        );
         let overlay_mode = if source == RecordingSource::Transcribe {
             effective_native_overlay_mode(self.config.overlay.mode)
         } else {
@@ -2957,12 +4275,18 @@ impl LocalTranscriberApp {
             }
         }
         let abandon = Arc::new(AtomicBool::new(false));
+        let capture_diagnostics = latency
+            .capture_diagnostics
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
         self.pending_recording = Some(PendingRecording {
             session_id,
             source,
             stop_requested: false,
             max_duration_seconds,
             latency,
+            capture_diagnostics,
             abandon: abandon.clone(),
         });
         self.status = TranscriptionStatus::Listening;
@@ -2980,6 +4304,7 @@ impl LocalTranscriberApp {
                 input_device_name,
                 capture_options,
                 preview_publisher,
+                CaptureCancellation::new(),
             );
             if abandon.load(Ordering::Acquire) {
                 if let Ok(session) = result {
@@ -3055,8 +4380,23 @@ impl LocalTranscriberApp {
         }
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
+            self.record_session_diagnostic(
+                pending.session_id,
+                &pending.latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
         }
-        self.pending_output = None;
+        if let Some(pending) = self.pending_output.take()
+            && let Some(latency) = pending.latency.as_ref()
+        {
+            self.record_session_diagnostic(
+                pending.session_id,
+                latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
+        }
         if self.begin_preview_drain(
             previous_session,
             PreviewDrainAction::Cancel {
@@ -3200,7 +4540,7 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn shutdown_rolling_preview(&mut self) {
+    fn shutdown_rolling_preview(&mut self, deadline: Instant) {
         let preview = self
             .pending_preview_drain
             .take()
@@ -3211,11 +4551,34 @@ impl LocalTranscriberApp {
         };
         preview.close();
         self.transcription_service.cancel_active();
-        if !preview.stop_and_join(Duration::from_secs(2)) {
+        if !preview.stop_and_join(deadline.saturating_duration_since(Instant::now())) {
             eprintln!(
-                "rolling preview did not stop before process exit for session {}",
+                "rolling preview did not stop before the process-exit deadline for session {}",
                 preview.identity().session_id.0
             );
+            // The handle still owns a live native decoder. Returning would
+            // eventually unload its DLL; dropping would have to wait forever.
+            // Abort skips teardown and prevents either unsafe outcome.
+            std::mem::forget(preview);
+            std::process::abort();
+        }
+    }
+
+    fn shutdown_transcription_for_exit(&mut self) {
+        self.stop_and_discard_active_recording();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        self.shutdown_rolling_preview(deadline);
+        self.transcription_service.cancel_active();
+        let compatibility_stopped = self
+            .transcription_service
+            .cancel_active_and_wait(deadline.saturating_duration_since(Instant::now()));
+        let runtime_stopped = compatibility_stopped
+            && self
+                .transcription_service
+                .shutdown_runtime_and_wait(deadline.saturating_duration_since(Instant::now()));
+        if !runtime_stopped {
+            eprintln!("native transcription shutdown exceeded the process-exit deadline");
+            std::process::abort();
         }
     }
 
@@ -3287,6 +4650,11 @@ impl LocalTranscriberApp {
     }
 
     fn stop_recording(&mut self) {
+        if self.deferred_recording_start.take().is_some() {
+            self.status = TranscriptionStatus::Idle;
+            self.status_message = "Recording cancelled".to_owned();
+            return;
+        }
         if let Some(pending) = self.pending_recording.as_mut()
             && !pending.stop_requested
         {
@@ -3320,7 +4688,7 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
-        if self.capture_is_active() {
+        if self.capture_is_active() || self.deferred_recording_start.is_some() {
             self.stop_recording();
         } else {
             self.start_recording_at(
@@ -3351,6 +4719,7 @@ impl LocalTranscriberApp {
                 stop_requested: active.stop_requested,
                 started_at: active.started_at,
                 latency: active.latency,
+                capture_diagnostics: active.capture_diagnostics,
             };
             if self.has_preview_for_session(session_id) {
                 let scheduled = self.begin_preview_drain(
@@ -3369,6 +4738,7 @@ impl LocalTranscriberApp {
         let session_id = capture.session_id;
         match capture.result {
             Ok(completion) => {
+                capture.latency.observe_capture_metrics(&completion.metrics);
                 if !capture.stop_requested {
                     let reason = match completion.stop_reason {
                         CaptureStopReason::Explicit => StopReason::Explicit,
@@ -3399,11 +4769,21 @@ impl LocalTranscriberApp {
                     return;
                 }
                 let Some(audio) = completion.audio else {
+                    let feedback = no_speech_feedback_for_capture(
+                        capture.latency.maximum_input_rms,
+                        &capture.capture_diagnostics,
+                    );
                     let _ = self.session_coordinator.cancel_active();
                     self.status = TranscriptionStatus::Idle;
-                    self.status_message = "No speech detected; nothing was pasted.".to_owned();
+                    self.status_message = feedback.status_message;
+                    self.record_session_diagnostic(
+                        session_id,
+                        &capture.latency,
+                        DiagnosticSessionOutcome::Cancelled,
+                        Some(DiagnosticFailureStage::NoSpeech),
+                    );
                     self.latest_latency = Some(capture.latency);
-                    self.finish_overlay_error(session_id, "No speech detected");
+                    self.finish_overlay_error(session_id, feedback.overlay_message);
                     return;
                 };
                 self.status = TranscriptionStatus::Transcribing;
@@ -3422,6 +4802,12 @@ impl LocalTranscriberApp {
             }
             Err(error) => {
                 capture.latency.capture_finalized_at = Some(Instant::now());
+                self.record_session_diagnostic(
+                    session_id,
+                    &capture.latency,
+                    DiagnosticSessionOutcome::Failed,
+                    Some(DiagnosticFailureStage::Capture),
+                );
                 self.latest_latency = Some(capture.latency);
                 self.fail_dictation_session_now(session_id, format!("Recording failed: {error}"));
             }
@@ -3455,11 +4841,15 @@ impl LocalTranscriberApp {
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
-        let Some(tray_service) = &self.tray_service else {
-            return;
-        };
-        if let Some(command) = tray_service.poll_command() {
+        while let Some(command) = self
+            .tray_service
+            .as_ref()
+            .and_then(TrayService::poll_command)
+        {
             self.apply_tray_command(command, ctx);
+            if command == TrayCommand::Quit {
+                break;
+            }
         }
     }
 
@@ -3486,14 +4876,11 @@ impl LocalTranscriberApp {
             TrayCommand::ToggleRecording => self.toggle_recording(),
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
-                self.stop_and_discard_active_recording();
-                self.shutdown_rolling_preview();
-                if !self
-                    .transcription_service
-                    .cancel_active_and_wait(Duration::from_secs(2))
-                {
-                    eprintln!("transcription workers did not stop before the quit timeout");
+                self.window_hidden_to_tray = false;
+                if let Some(tray_service) = &self.tray_service {
+                    tray_service.cancel_hidden_repaint();
                 }
+                self.shutdown_transcription_for_exit();
                 let _ = self.session_coordinator.cancel_active();
                 self.flush_settings();
                 self.quit_requested = true;
@@ -3515,11 +4902,24 @@ impl LocalTranscriberApp {
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
+        if let Some(tray_service) = &self.tray_service
+            && let Err(error) = tray_service.schedule_hidden_repaint(self.next_repaint_delay())
+        {
+            self.status_message = format!(
+                "Could not keep Scribe responsive in the tray; the window remains open: {error}"
+            );
+            return;
+        }
+        self.window_hidden_to_tray = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.status_message = "Scribe is running in the tray".to_owned();
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_hidden_to_tray = false;
+        if let Some(tray_service) = &self.tray_service {
+            tray_service.cancel_hidden_repaint();
+        }
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.status_message = "Scribe window restored".to_owned();
@@ -3536,6 +4936,14 @@ impl LocalTranscriberApp {
         if let Some(pending) = self.pending_output.take() {
             if let Some(history_id) = pending.history_id {
                 self.record_history_output_label(history_id, "cancelled_by_user");
+            }
+            if let Some(latency) = pending.latency.as_ref() {
+                self.record_session_diagnostic(
+                    pending.session_id,
+                    latency,
+                    DiagnosticSessionOutcome::Cancelled,
+                    None,
+                );
             }
             let _ = self.session_coordinator.cancel_active();
             self.retire_captured_target(pending.session_id);
@@ -3638,6 +5046,16 @@ impl LocalTranscriberApp {
                 );
             }
             HistoryPageAction::Play(history_id) => {
+                if self.capture_is_active() || self.deferred_recording_start.is_some() {
+                    self.status_message = "Stop recording before playing retained audio".to_owned();
+                    return;
+                }
+                if self.microphone_test_is_active() {
+                    self.deferred_history_playback = Some(history_id);
+                    self.stop_microphone_test();
+                    self.status_message = "Preparing audio playback".to_owned();
+                    return;
+                }
                 let Some(store) = self.history_store.clone() else {
                     return;
                 };
@@ -4087,6 +5505,48 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                AppEvent::MicrophoneTestReady { request_id, result } => {
+                    let state = std::mem::take(&mut self.microphone_test);
+                    match state {
+                        MicrophoneTest::Starting {
+                            request_id: expected,
+                            stop_requested,
+                            cancellation: _,
+                        } if expected == request_id => match result {
+                            Ok(session)
+                                if stop_requested
+                                    || self.capture_is_active()
+                                    || self.playing_history_id.is_some() =>
+                            {
+                                session.stop();
+                                self.microphone_test = MicrophoneTest::Stopping { session };
+                            }
+                            Ok(session) => {
+                                session.set_manual_activation_threshold(
+                                    self.config.recording.manual_activation_rms,
+                                );
+                                self.microphone_level_envelope.reset_source();
+                                self.microphone_test = MicrophoneTest::Active { session };
+                            }
+                            Err(error) => {
+                                self.microphone_level_envelope.reset_source();
+                                if !stop_requested {
+                                    self.microphone_test_error = Some(error.to_string());
+                                    self.microphone_monitor_retry_at =
+                                        Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
+                                    self.status_message =
+                                        format!("Microphone monitoring unavailable: {error}");
+                                }
+                            }
+                        },
+                        current => {
+                            self.microphone_test = current;
+                            if let Ok(session) = result {
+                                discard_recording_async(session);
+                            }
+                        }
+                    }
+                }
                 AppEvent::CaptureReady { session_id, result } => {
                     let Some(mut pending) = self.pending_recording.take() else {
                         if let Ok(session) = result {
@@ -4105,6 +5565,9 @@ impl LocalTranscriberApp {
                     }
                     match result {
                         Ok(session) => {
+                            let threshold = self.config.recording.manual_activation_rms;
+                            session.set_manual_activation_threshold(threshold);
+                            pending.capture_diagnostics.activation_floor = threshold;
                             if let Err(err) = self.session_coordinator.capture_started(session_id) {
                                 let _ = session.stop_and_discard(Duration::from_secs(2));
                                 self.fail_dictation_session(
@@ -4127,6 +5590,7 @@ impl LocalTranscriberApp {
                                 started_at: Instant::now(),
                                 max_duration_seconds: pending.max_duration_seconds,
                                 latency: pending.latency,
+                                capture_diagnostics: pending.capture_diagnostics,
                             });
                             if stop_requested {
                                 if let Some(active) = self.active_recording.as_ref() {
@@ -4394,6 +5858,21 @@ impl LocalTranscriberApp {
                         }
                     }
                 }
+                AppEvent::RemoteCatalogLoaded { result } => {
+                    self.remote_catalog.loading = false;
+                    match result {
+                        Ok(snapshot) => {
+                            self.remote_catalog.snapshot = Some(snapshot);
+                            self.remote_catalog.error = None;
+                        }
+                        Err(error) => {
+                            self.remote_catalog.error = Some(error);
+                        }
+                    }
+                }
+                AppEvent::LocalGgufImportFinished { result } => {
+                    self.finish_local_gguf_import(result);
+                }
                 AppEvent::TranscriptionDone {
                     source,
                     session_id,
@@ -4467,6 +5946,7 @@ impl LocalTranscriberApp {
 
                     let mut latency = latency.map(|mut latency| {
                         latency.ui_result_at = Some(Instant::now());
+                        latency.observe_transcription_outcome(&result);
                         latency
                     });
                     match source {
@@ -4476,8 +5956,20 @@ impl LocalTranscriberApp {
                             let Some(finalized_text) =
                                 FinalizedText::without_cleanup(result.transcript.text.clone())
                             else {
+                                let diagnostics = latency
+                                    .as_ref()
+                                    .and_then(|trace| trace.capture_diagnostics.as_ref())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let feedback = no_speech_feedback_for_capture(
+                                    latency.as_ref().and_then(|trace| trace.maximum_input_rms),
+                                    &diagnostics,
+                                );
                                 if let Some(context) = history_context {
-                                    self.finish_no_speech_history_context(context);
+                                    self.finish_no_speech_history_context(
+                                        context,
+                                        feedback.overlay_message,
+                                    );
                                 }
                                 if let Some(latency) = latency.as_mut() {
                                     latency.final_text_ready_at = None;
@@ -4488,10 +5980,17 @@ impl LocalTranscriberApp {
                                 }
                                 let _ = self.session_coordinator.cancel_active();
                                 self.status = TranscriptionStatus::Idle;
-                                self.status_message =
-                                    "No speech detected; nothing was pasted.".to_owned();
+                                self.status_message = feedback.status_message;
+                                if let Some(latency) = latency.as_ref() {
+                                    self.record_session_diagnostic(
+                                        session_id,
+                                        latency,
+                                        DiagnosticSessionOutcome::Cancelled,
+                                        Some(DiagnosticFailureStage::NoSpeech),
+                                    );
+                                }
                                 self.latest_latency = latency;
-                                self.finish_overlay_error(session_id, "No speech detected");
+                                self.finish_overlay_error(session_id, feedback.overlay_message);
                                 self.cleanup_after_job(source, session_id, request_id);
                                 continue;
                             };
@@ -4655,6 +6154,14 @@ impl LocalTranscriberApp {
                             } else {
                                 self.status = TranscriptionStatus::Idle;
                                 self.status_message = completion_message;
+                                if let Some(latency) = latency.as_ref() {
+                                    self.record_session_diagnostic(
+                                        session_id,
+                                        latency,
+                                        DiagnosticSessionOutcome::Completed,
+                                        None,
+                                    );
+                                }
                                 self.latest_latency = latency;
                                 let _ = self.session_coordinator.complete(session_id);
                                 self.finish_overlay_success(session_id);
@@ -4729,6 +6236,12 @@ impl LocalTranscriberApp {
                     };
                     if let Some(mut latency) = latency {
                         latency.ui_result_at = Some(Instant::now());
+                        self.record_session_diagnostic(
+                            session_id,
+                            &latency,
+                            DiagnosticSessionOutcome::Failed,
+                            Some(DiagnosticFailureStage::Transcription),
+                        );
                         self.latest_latency = Some(latency);
                     }
                     match source {
@@ -4805,16 +6318,20 @@ impl LocalTranscriberApp {
                         .get(&model_id)
                         .is_none_or(|(active_job, _)| *active_job != job_id)
                     {
+                        let manifest_rollback = result.manifest.rollback().err();
                         let model_rollback = result.model.rollback().err();
                         let runtime_rollback =
                             result.runtime.and_then(|runtime| runtime.rollback().err());
-                        let journal_clear =
-                            if model_rollback.is_none() && runtime_rollback.is_none() {
-                                result.journal.clear().err()
-                            } else {
-                                None
-                            };
-                        if model_rollback.is_some()
+                        let journal_clear = if manifest_rollback.is_none()
+                            && model_rollback.is_none()
+                            && runtime_rollback.is_none()
+                        {
+                            result.journal.clear().err()
+                        } else {
+                            None
+                        };
+                        if manifest_rollback.is_some()
+                            || model_rollback.is_some()
                             || runtime_rollback.is_some()
                             || journal_clear.is_some()
                         {
@@ -4830,6 +6347,13 @@ impl LocalTranscriberApp {
                     let previous_config = self.config.clone();
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Installed);
+                    let remote_install = result.remote_install.take();
+                    if let Some(remote_install) = remote_install.as_ref() {
+                        self.config
+                            .general
+                            .managed_remote_models
+                            .insert(model_id.clone(), remote_install.clone());
+                    }
                     if let Some(model) = config::configured_models(&self.config)
                         .into_iter()
                         .find(|model| model.id == model_id)
@@ -4839,17 +6363,19 @@ impl LocalTranscriberApp {
                                 runtime_status_for_model(&self.config, &active)
                                     == ModelRuntimeStatus::Ready
                             });
-                        self.config
-                            .general
-                            .managed_models
-                            .insert(model_id.clone(), {
-                                let mut install = config::ManagedModelInstall::app_managed(
-                                    result.model.destination().to_path_buf(),
-                                    "verified-manifest-download",
-                                );
-                                install.sha256 = Some(result.model_sha256.clone());
-                                install
-                            });
+                        if remote_install.is_none() {
+                            self.config
+                                .general
+                                .managed_models
+                                .insert(model_id.clone(), {
+                                    let mut install = config::ManagedModelInstall::app_managed(
+                                        result.model.destination().to_path_buf(),
+                                        "verified-manifest-download",
+                                    );
+                                    install.sha256 = Some(result.model_sha256.clone());
+                                    install
+                                });
+                        }
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.general.selected_default_model = model_id.clone();
@@ -4889,11 +6415,13 @@ impl LocalTranscriberApp {
                             });
                     if let Err(error) = journal_preparation {
                         self.config = previous_config;
+                        let manifest_rollback = result.manifest.rollback().err();
                         let model_rollback = result.model.rollback().err();
                         let runtime_rollback =
                             result.runtime.and_then(|runtime| runtime.rollback().err());
-                        let recovery_required =
-                            model_rollback.is_some() || runtime_rollback.is_some();
+                        let recovery_required = manifest_rollback.is_some()
+                            || model_rollback.is_some()
+                            || runtime_rollback.is_some();
                         let journal_clear = if recovery_required {
                             None
                         } else {
@@ -4901,7 +6429,13 @@ impl LocalTranscriberApp {
                         };
                         let recovery_required = recovery_required || journal_clear.is_some();
                         let message = format!(
-                            "Could not prepare the durable settings commit: {error}{}{}",
+                            "Could not prepare the durable settings commit: {error}{}{}{}",
+                            manifest_rollback
+                                .as_ref()
+                                .map(|error| format!(
+                                    ". Installed-model manifest rollback failed: {error}"
+                                ))
+                                .unwrap_or_default(),
                             model_rollback
                                 .as_ref()
                                 .map(|error| format!(". Model rollback failed: {error}"))
@@ -4948,17 +6482,22 @@ impl LocalTranscriberApp {
                         continue;
                     }
                     let model_cleanup = result.model.commit().err();
+                    let manifest_cleanup = result.manifest.commit().err();
                     let runtime_cleanup = result.runtime.and_then(|runtime| {
                         runtime
                             .commit_with_previous_policy(result.retain_runtime_as_previous)
                             .err()
                     });
-                    let journal_cleanup = if model_cleanup.is_none() && runtime_cleanup.is_none() {
+                    let journal_cleanup = if model_cleanup.is_none()
+                        && manifest_cleanup.is_none()
+                        && runtime_cleanup.is_none()
+                    {
                         result.journal.clear().err()
                     } else {
                         None
                     };
                     let cleanup_requires_recovery = model_cleanup.is_some()
+                        || manifest_cleanup.is_some()
                         || runtime_cleanup.is_some()
                         || journal_cleanup.is_some();
                     if let Some(store) = self.settings_store.as_mut() {
@@ -4968,7 +6507,7 @@ impl LocalTranscriberApp {
                         self.transcription_service.with_config(self.config.clone());
                     self.refresh_playground_cards_from_config();
                     let message = format!(
-                        "Model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, {}).{}{}{}",
+                        "Model installed and smoke-tested (health {} ms, load {} ms, decode {} ms, reload {} ms, {}).{}{}{}{}",
                         result.smoke.health_duration_ms,
                         result.smoke.load_duration_ms,
                         result.smoke.decode_duration_ms,
@@ -4976,6 +6515,11 @@ impl LocalTranscriberApp {
                         result.smoke.resolved_acceleration.resolved.label(),
                         model_cleanup
                             .map(|error| format!(" Model cleanup warning: {error}."))
+                            .unwrap_or_default(),
+                        manifest_cleanup
+                            .map(|error| format!(
+                                " Installed-model manifest cleanup warning: {error}."
+                            ))
                             .unwrap_or_default(),
                         runtime_cleanup
                             .map(|error| format!(" Runtime backup warning: {error}."))
@@ -5696,6 +7240,10 @@ impl LocalTranscriberApp {
         }
 
         let model_id = ModelId::new(&model.id);
+        if let Some(reason) = normalized_model_install_space_error(&self.config, &model_id) {
+            self.fail_model_install(&model.id, reason);
+            return;
+        }
         let binding = match self.transcription_service.installation_binding(&model_id) {
             Ok(binding) => binding,
             Err(error) => {
@@ -5745,11 +7293,217 @@ impl LocalTranscriberApp {
                     existing_runtime_root: binding.installed_package_root,
                     force_runtime_package,
                     cancellation: thread_cancellation,
+                    source: VerifiedInstallSource::NormalizedCatalog,
                 },
                 &progress,
             );
             send_verified_install_result(&tx, job_id, model_name, result);
         });
+    }
+
+    /// Starts a catalog-owned GGUF installation. Unlike the static catalog
+    /// path above, its identity is derived from the full pinned Hub source;
+    /// the source is only persisted after smoke validation and activation.
+    fn start_trusted_remote_model_download(&mut self, request: TrustedRemoteInstallRequest) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = reason;
+            return;
+        }
+        let Some(model_id) = config::managed_remote_model_id(
+            &request.artifact.model_id,
+            &request.artifact.revision,
+            &request.artifact.filename,
+        ) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "The selected Hugging Face artifact failed Scribe's source validation. Refresh the catalog and try again.".to_owned();
+            return;
+        };
+        if self.artifact_installations.contains_key(&model_id) {
+            self.status_message =
+                "That verified model variant is already being installed.".to_owned();
+            return;
+        }
+        if let Some(reason) = trusted_model_install_space_error(&self.config, &request.artifact) {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = reason;
+            return;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                format!("Could not release the active speech artifact before install: {error}");
+            return;
+        }
+
+        self.model_downloads.insert(
+            model_id.clone(),
+            ModelInstallStatus::Downloading {
+                downloaded_bytes: 0,
+                total_bytes: Some(request.artifact.size_bytes),
+                bytes_per_second: None,
+            },
+        );
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = format!("Downloading {}...", request.display_name);
+
+        let tx = self.tx.clone();
+        let config = self.config.clone();
+        let service = self.transcription_service.with_config(config.clone());
+        let cancellation = InstallCancellation::default();
+        let thread_cancellation = cancellation.clone();
+        let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.artifact_installations
+            .insert(model_id.clone(), (job_id, cancellation));
+        thread::spawn(move || {
+            let progress = |progress| send_install_progress(&tx, job_id, &model_id, progress);
+            let result = run_verified_install(
+                VerifiedInstallRequest {
+                    config,
+                    service,
+                    runtime_id: "embedded-transcribe-cpp".to_owned(),
+                    model_id: ModelId::new(model_id.clone()),
+                    existing_runtime_root: None,
+                    force_runtime_package: false,
+                    cancellation: thread_cancellation,
+                    source: VerifiedInstallSource::TrustedRemote(request),
+                },
+                &progress,
+            );
+            send_verified_install_result(&tx, job_id, model_id, result);
+        });
+    }
+
+    /// Validates a user-chosen GGUF in place. This is deliberately separate
+    /// from the downloader: no remote source, app-managed path, or model
+    /// replacement is created for an imported file.
+    fn start_local_gguf_import(&mut self) {
+        if self.local_gguf_import.is_some() {
+            self.status_message = "A local GGUF import is already being validated.".to_owned();
+            return;
+        }
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = reason;
+            return;
+        }
+        let source = self.model_import_path.trim();
+        if source.is_empty() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "Enter the path to a local .gguf file to import.".to_owned();
+            return;
+        }
+        let source_path = PathBuf::from(source);
+        let cancellation = InstallCancellation::default();
+        let thread_cancellation = cancellation.clone();
+        self.local_gguf_import = Some(cancellation);
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = "Hashing and validating the local GGUF...".to_owned();
+        let tx = self.tx.clone();
+        let service = self.transcription_service.with_config(self.config.clone());
+        let model_storage_dir = config::model_storage_dir(&self.config);
+        thread::spawn(move || {
+            let result = validate_local_gguf_import(
+                source_path,
+                model_storage_dir,
+                service,
+                thread_cancellation,
+            )
+            .map(Box::new);
+            let _ = tx.send(AppEvent::LocalGgufImportFinished { result });
+        });
+    }
+
+    fn finish_local_gguf_import(&mut self, result: Result<Box<ValidatedLocalGgufImport>, String>) {
+        self.local_gguf_import = None;
+        let imported = match result {
+            Ok(imported) => *imported,
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Local GGUF import failed: {error}");
+                return;
+            }
+        };
+        let current_fingerprint = match fingerprint_file_cancellable(
+            &imported.install.path,
+            &InstallCancellation::default(),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!(
+                    "Could not recheck local GGUF before persistence: {}",
+                    local_gguf_import_install_error(error)
+                );
+                return;
+            }
+        };
+        if !local_gguf_import_fingerprint_matches(&imported.install, &current_fingerprint) {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "The local GGUF changed after validation and was not imported. Choose it again to validate its current bytes."
+                .to_owned();
+            return;
+        }
+        let previous_config = self.config.clone();
+        self.config.general.imported_gguf_models.insert(
+            imported.model_id.as_str().to_owned(),
+            imported.install.clone(),
+        );
+        config::normalize_config(&mut self.config);
+        if !self
+            .config
+            .general
+            .imported_gguf_models
+            .contains_key(imported.model_id.as_str())
+        {
+            self.config = previous_config;
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "The local GGUF changed before Scribe could persist its import receipt. Revalidate it before importing."
+                .to_owned();
+            return;
+        }
+        let receipt_path = installed_manifest::imported_manifest_path_for(
+            &config::model_storage_dir(&self.config),
+            &imported.model_id,
+        );
+        if let Err(error) = config::save_config(&self.config) {
+            self.config = previous_config;
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("Could not save the local import record: {error}.");
+            return;
+        }
+        if let Err(error) =
+            installed_manifest::persist_manifest_at(&imported.manifest, &receipt_path)
+        {
+            self.config = previous_config;
+            let config_rollback = config::save_config(&self.config).err();
+            let message = format!(
+                "Could not persist the local import receipt after saving settings: {error}.{}",
+                config_rollback
+                    .as_ref()
+                    .map(|error| format!(" Restoring the previous settings also failed: {error}"))
+                    .unwrap_or_default()
+            );
+            if config_rollback.is_some() {
+                self.artifact_recovery_error = Some(message.clone());
+            }
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.refresh_playground_cards_from_config();
+        let model_name = imported.install.display_name;
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = format!(
+            "Imported and smoke-tested {model_name} in place (health {} ms, load {} ms, decode {} ms).",
+            imported.smoke.health_duration_ms,
+            imported.smoke.load_duration_ms,
+            imported.smoke.decode_duration_ms,
+        );
     }
 
     fn uninstall_model(&mut self, model: &SttModelInfo) {
@@ -5761,7 +7515,7 @@ impl LocalTranscriberApp {
             self.status_message = format!("Could not unload the selected model: {error}");
             return;
         }
-        let managed_target = self
+        let static_managed_target = self
             .config
             .general
             .managed_models
@@ -5771,6 +7525,29 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        // Each trusted remote artifact owns an opaque leaf directory. Staging
+        // that directory removes the generated provenance manifest together
+        // with the model, without affecting another variant in the same Hub
+        // revision.
+        let remote_managed_target = config::managed_remote_model_path(&self.config, &model.id)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .filter(|path| is_app_managed_model_path(&self.config, path));
+        let imported_receipt_target = self
+            .config
+            .general
+            .imported_gguf_models
+            .contains_key(&model.id)
+            .then(|| {
+                installed_manifest::imported_manifest_path_for(
+                    &config::model_storage_dir(&self.config),
+                    &ModelId::new(&model.id),
+                )
+            })
+            .filter(|path| is_app_managed_model_path(&self.config, path));
+        let imported_local = imported_receipt_target.is_some();
+        let managed_target = static_managed_target
+            .or(remote_managed_target)
+            .or(imported_receipt_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -5803,6 +7580,8 @@ impl LocalTranscriberApp {
         let previous_config = self.config.clone();
         self.model_downloads.remove(&model.id);
         self.config.general.managed_models.remove(&model.id);
+        self.config.general.managed_remote_models.remove(&model.id);
+        self.config.general.imported_gguf_models.remove(&model.id);
         self.config.general.model_paths.remove(&model.id);
         set_model_selected(&mut self.config, &model.id, false);
 
@@ -5865,9 +7644,16 @@ impl LocalTranscriberApp {
             return;
         }
         self.status = TranscriptionStatus::Idle;
-        self.status_message = match removed_files {
-            true => format!("Uninstalled {}.", model.name),
-            false => format!("Removed {} from Scribe.", model.name),
+        self.status_message = if imported_local {
+            format!(
+                "Removed {} from Scribe. The local GGUF file was kept.",
+                model.name
+            )
+        } else {
+            match removed_files {
+                true => format!("Uninstalled {}.", model.name),
+                false => format!("Removed {} from Scribe.", model.name),
+            }
         };
     }
 
@@ -6207,6 +7993,10 @@ impl LocalTranscriberApp {
 
 impl Drop for LocalTranscriberApp {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(fixture) = self.test_gguf_fixture.take() {
+            let _ = fs::remove_file(fixture);
+        }
         for (_, target) in self.captured_targets.drain() {
             crate::overlay::platform::release_captured_target(&target);
         }
@@ -6232,6 +8022,7 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_rolling_preview();
         self.poll_preview_drain();
         self.poll_recording();
+        self.poll_microphone_test();
         self.poll_preview_drain();
         // Pending output was created in the prior frame, allowing the overlay
         // to present the correlated Output/Pasting phase before any blocking
@@ -6244,6 +8035,9 @@ impl eframe::App for LocalTranscriberApp {
         self.sync_tray_state();
 
         show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        if self.current_tab != Tab::General {
+            self.suspend_microphone_monitor();
+        }
 
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
@@ -6258,6 +8052,10 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Debug => self.ui_playground(ui),
             });
 
+        if self.current_tab != Tab::General {
+            self.suspend_microphone_monitor();
+        }
+
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
         let target = overlay_session_id.and_then(|id| self.captured_targets.get(&id));
@@ -6268,21 +8066,28 @@ impl eframe::App for LocalTranscriberApp {
             native_overlay_position(self.config.overlay.position),
         );
 
-        ctx.request_repaint_after(self.next_repaint_delay());
+        let repaint_delay = self.next_repaint_delay();
+        if self.window_hidden_to_tray
+            && let Some(error) = self
+                .tray_service
+                .as_ref()
+                .and_then(|tray_service| tray_service.schedule_hidden_repaint(repaint_delay).err())
+        {
+            self.window_hidden_to_tray = false;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            self.status_message = format!(
+                "Scribe restored its window because hidden tray processing failed: {error}"
+            );
+        }
+        ctx.request_repaint_after(repaint_delay);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_microphone_test();
         for (_, cancellation) in self.artifact_installations.values() {
             cancellation.cancel();
         }
-        self.stop_and_discard_active_recording();
-        self.shutdown_rolling_preview();
-        if !self
-            .transcription_service
-            .cancel_active_and_wait(Duration::from_secs(2))
-        {
-            eprintln!("transcription workers did not stop before the exit timeout");
-        }
+        self.shutdown_transcription_for_exit();
         let _ = self.session_coordinator.cancel_active();
         self.flush_settings();
     }
@@ -6299,6 +8104,11 @@ impl LocalTranscriberApp {
                 .map(|model| runtime_status_for_model(&self.config, model));
             let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
             let selected_model_summary = selected_model.as_ref().and_then(|model| {
+                let remote = self
+                    .config
+                    .general
+                    .managed_remote_models
+                    .contains_key(&model.id);
                 self.transcription_service
                     .model_descriptor(&crate::transcription::ModelId::new(&model.id))
                     .ok()
@@ -6308,6 +8118,15 @@ impl LocalTranscriberApp {
                             descriptor.compatibility.label(),
                             self.effective_install_status(model),
                         )
+                    })
+                    .or_else(|| {
+                        remote.then(|| {
+                            (
+                                model.name.as_str(),
+                                "Experimental",
+                                self.effective_install_status(model),
+                            )
+                        })
                     })
             });
             let hotkey = self.config.recording.hotkey.clone();
@@ -6419,12 +8238,6 @@ impl LocalTranscriberApp {
                                 .desired_width(220.0)
                                 .text(recording_timer_text(active)),
                         );
-                        let level = self.current_audio_level();
-                        ui.add(
-                            egui::ProgressBar::new(level)
-                                .desired_width(220.0)
-                                .text(format!("Input level {:.0}%", level * 100.0)),
-                        );
                     } else if self.pending_recording.is_some() {
                         ui.label(RichText::new("Preparing microphone").small().weak());
                     } else if ready {
@@ -6492,12 +8305,61 @@ impl LocalTranscriberApp {
         });
     }
 
+    fn request_remote_catalog(&mut self, force: bool) {
+        if self.remote_catalog.loading {
+            return;
+        }
+        let cache_path = match config::cache_dir() {
+            Ok(path) => path.join("huggingface-model-catalog-v1.json"),
+            Err(error) => {
+                self.remote_catalog.attempted = true;
+                self.remote_catalog.error = Some(format!(
+                    "Could not determine the local Hugging Face catalog cache path: {error}"
+                ));
+                return;
+            }
+        };
+        self.remote_catalog.loading = true;
+        self.remote_catalog.attempted = true;
+        self.remote_catalog.error = None;
+        let tx = self.tx.clone();
+        let spawn = thread::Builder::new()
+            .name("scribe-huggingface-catalog".to_owned())
+            .spawn(move || {
+                let service = HuggingFaceCatalogService::for_cache_path(cache_path);
+                let result = if force {
+                    service.refresh()
+                } else {
+                    service.list()
+                }
+                .map_err(|error| error.to_string());
+                let _ = tx.send(AppEvent::RemoteCatalogLoaded { result });
+            });
+        if let Err(error) = spawn {
+            self.remote_catalog.loading = false;
+            self.remote_catalog.error = Some(format!(
+                "Could not start trusted catalog discovery: {error}"
+            ));
+        }
+    }
+
     fn ui_models(&mut self, ui: &mut Ui) {
+        if !cfg!(test) && !self.remote_catalog.attempted {
+            self.request_remote_catalog(false);
+        }
         let descriptors = self.transcription_service.model_descriptors();
         let descriptors_by_id = descriptors
             .iter()
             .map(|descriptor| (descriptor.id.as_str(), descriptor))
             .collect::<HashMap<_, _>>();
+        let remote_catalog = self.remote_catalog.snapshot.clone();
+        let remote_catalog_loading = self.remote_catalog.loading;
+        let remote_catalog_error = self.remote_catalog.error.clone();
+        let mut refresh_remote_catalog = false;
+        let mut remote_model_action = None;
+        let mut start_local_import = false;
+        let local_import_in_progress = self.local_gguf_import.is_some();
+        let local_import_cancellation = self.local_gguf_import.clone();
 
         let status = self.effective_status();
         let status_message = self.status_message.clone();
@@ -6523,10 +8385,337 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             panel(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    model_search_filter_control(ui, &mut self.model_search);
-                });
+                remote_catalog_filter_controls(
+                    ui,
+                    &mut self.model_search,
+                    &mut self.remote_catalog_filters,
+                    &mut self.remote_catalog_sort,
+                );
+                ui.add_space(6.0);
+                wrapped_label(
+                    ui,
+                    mut_text(
+                        "Size uses each model's smallest available GGUF variant. The trusted catalog does not currently publish download counts, update timestamps, or native-streaming capability.",
+                    ),
+                );
             });
+
+            let remote_search = self.model_search.trim().to_ascii_lowercase();
+            if let Some(snapshot) = remote_catalog.as_ref() {
+                let matching_count = filtered_remote_models(
+                    &snapshot.models,
+                    &self.config,
+                    &remote_search,
+                    self.remote_catalog_filters,
+                    self.remote_catalog_sort,
+                )
+                .len();
+                catalog_status_label(
+                    ui,
+                    format!(
+                        "Showing {matching_count} of {} trusted catalog models",
+                        snapshot.models.len()
+                    ),
+                );
+            }
+
+            ui.add_space(12.0);
+            panel(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(section_heading("Discover compatible models"));
+                        ui.label(mut_text(
+                            "Catalog metadata is retrieved by Scribe from a trusted public publisher; model data never passes through the UI.",
+                        ));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let refresh = ui
+                            .add_enabled(
+                                !remote_catalog_loading,
+                                small_button(ui, "Refresh catalog"),
+                            )
+                            .on_hover_text(
+                                "Re-query the trusted Hugging Face catalog and replace the cache only after validation.",
+                            );
+                        if refresh.clicked() {
+                            refresh_remote_catalog = true;
+                        }
+                        if remote_catalog_loading {
+                            badge(ui, "Loading", ChipTone::Neutral);
+                        }
+                    });
+                });
+                if let Some(snapshot) = remote_catalog.as_ref() {
+                    ui.add_space(8.0);
+                    catalog_status_label(
+                        ui,
+                        format!(
+                            "{} · {} compatible candidate(s)",
+                            snapshot.source.label(),
+                            snapshot.models.len(),
+                        ),
+                    );
+                } else if let Some(error) = remote_catalog_error.as_deref() {
+                    ui.add_space(8.0);
+                    catalog_status_label(ui, format!("Catalog unavailable: {error}"));
+                } else {
+                    ui.add_space(8.0);
+                    catalog_status_label(
+                        ui,
+                        "Catalog discovery has not completed yet. Refresh to retry.",
+                    );
+                }
+            });
+
+            ui.add_space(12.0);
+            panel(ui, |ui| {
+                ui.label(section_heading("Import local GGUF"));
+                wrapped_label(
+                    ui,
+                    mut_text(
+                        "Validate an existing .gguf file in place. Scribe hashes and smoke-tests it through the embedded runtime, but never copies, uploads, or deletes the source file.",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label(label_caps("GGUF file path"));
+                    let path_input = ui.add_sized(
+                        [usable_width(ui).min(460.0), 28.0],
+                        TextEdit::singleline(&mut self.model_import_path)
+                            .hint_text("C:\\Models\\model.gguf"),
+                    );
+                    path_input.labelled_by(label.id);
+                });
+                ui.add_space(6.0);
+                if local_import_in_progress {
+                    ui.horizontal_wrapped(|ui| {
+                        badge(ui, "Validating local file", ChipTone::Neutral);
+                        if ui.add(small_button(ui, "Cancel import")).clicked()
+                            && let Some(cancellation) = local_import_cancellation.as_ref()
+                        {
+                            cancellation.cancel();
+                            self.status_message =
+                                "Cancelling local GGUF validation; source bytes are unchanged."
+                                    .to_owned();
+                        }
+                    });
+                } else if ui
+                    .add(primary_small_button(ui, "Validate and import"))
+                    .on_hover_text(
+                        "Hash and smoke-test this local GGUF before adding it to Scribe.",
+                    )
+                    .clicked()
+                {
+                    start_local_import = true;
+                }
+                wrapped_label(
+                    ui,
+                    mut_text(
+                        "A local SHA-256 is an observed fingerprint, not an upstream checksum. Remove from Scribe only forgets its record and receipt.",
+                    ),
+                );
+            });
+
+            let imported_local_models = config::configured_models(&self.config)
+                .into_iter()
+                .filter_map(|model| {
+                    self.config
+                        .general
+                        .imported_gguf_models
+                        .get(&model.id)
+                        .cloned()
+                        .map(|install| (model, install))
+                })
+                .filter(|(model, install)| {
+                    remote_search.is_empty()
+                        || model.name.to_ascii_lowercase().contains(&remote_search)
+                        || install
+                            .path
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains(&remote_search)
+                })
+                .collect::<Vec<_>>();
+            if !imported_local_models.is_empty() {
+                ui.add_space(12.0);
+                panel(ui, |ui| {
+                    ui.label(section_heading("Imported local models"));
+                    ui.add_space(8.0);
+                    for (index, (model, install)) in imported_local_models.iter().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(body_strong(&model.name));
+                            badge(ui, "Imported in place", ChipTone::Neutral);
+                            badge(ui, "Embedded runtime", ChipTone::Neutral);
+                            if ui.add(small_button(ui, "Use")).clicked() {
+                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
+                                    ModelId::new(model.id.clone()),
+                                ));
+                            }
+                            if ui.add(small_button(ui, "Remove from Scribe")).clicked() {
+                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
+                                    ModelId::new(model.id.clone()),
+                                ));
+                            }
+                        });
+                        wrapped_label(
+                            ui,
+                            mut_text(format!(
+                                "{} · observed SHA-256 {}",
+                                install.path.display(),
+                                install.sha256
+                            )),
+                        );
+                        if index + 1 < imported_local_models.len() {
+                            ui.add_space(8.0);
+                        }
+                    }
+                });
+            }
+
+            let installed_remote_models = config::configured_models(&self.config)
+                .into_iter()
+                .filter_map(|model| {
+                    self.config
+                        .general
+                        .managed_remote_models
+                        .get(&model.id)
+                        .cloned()
+                        .map(|install| (model, install))
+                })
+                .filter(|(model, install)| {
+                    remote_search.is_empty()
+                        || model.name.to_ascii_lowercase().contains(&remote_search)
+                        || install
+                            .repository
+                            .to_ascii_lowercase()
+                            .contains(&remote_search)
+                        || install
+                            .languages
+                            .iter()
+                            .any(|language| language.to_ascii_lowercase().contains(&remote_search))
+                })
+                .collect::<Vec<_>>();
+            if !installed_remote_models.is_empty() {
+                ui.add_space(12.0);
+                panel(ui, |ui| {
+                    ui.label(section_heading("Installed Hugging Face models"));
+                    ui.add_space(8.0);
+                    for (index, (model, install)) in installed_remote_models.iter().enumerate() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(body_strong(&model.name));
+                            badge(
+                                ui,
+                                &model.install_status.label(),
+                                if model.install_status.is_runnable() {
+                                    ChipTone::Success
+                                } else {
+                                    ChipTone::Error
+                                },
+                            );
+                            badge(ui, "Embedded runtime", ChipTone::Neutral);
+                            if ui.add(small_button(ui, "Use")).clicked() {
+                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
+                                    ModelId::new(model.id.clone()),
+                                ));
+                            }
+                            if ui.add(small_button(ui, "Remove")).clicked() {
+                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
+                                    ModelId::new(model.id.clone()),
+                                ));
+                            }
+                        });
+                        wrapped_label(
+                            ui,
+                            mut_text(format!(
+                                "{} @ {} · {}",
+                                install.repository, install.revision, install.filename
+                            )),
+                        );
+                        if index + 1 < installed_remote_models.len() {
+                            ui.add_space(8.0);
+                        }
+                    }
+                });
+            }
+
+            if let Some(snapshot) = remote_catalog.as_ref() {
+                let remote_models = filtered_remote_models(
+                    &snapshot.models,
+                    &self.config,
+                    &remote_search,
+                    self.remote_catalog_filters,
+                    self.remote_catalog_sort,
+                );
+                if remote_models.is_empty() {
+                    ui.add_space(8.0);
+                    wrapped_label(
+                        ui,
+                        mut_text("No trusted catalog models match the current search or filters."),
+                    );
+                } else if self.remote_catalog_sort == RemoteCatalogSort::Recommended {
+                    let recommended_models = remote_models
+                        .iter()
+                        .copied()
+                        .filter(|model| model.recommended)
+                        .collect::<Vec<_>>();
+                    if !recommended_models.is_empty() {
+                        ui.add_space(12.0);
+                        ui.label(section_heading("Recommended"));
+                        for model in recommended_models {
+                            if let Some(action) =
+                                remote_model_card(ui, model, &self.config, &self.model_downloads)
+                            {
+                                remote_model_action = Some(action);
+                            }
+                            ui.add_space(8.0);
+                        }
+                    }
+                    let experimental_models = remote_models
+                        .iter()
+                        .copied()
+                        .filter(|model| !model.recommended)
+                        .collect::<Vec<_>>();
+                    if !experimental_models.is_empty() {
+                        ui.add_space(8.0);
+                        let experimental =
+                            egui::CollapsingHeader::new("Browse compatible models (Experimental)")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for model in experimental_models {
+                                        if let Some(action) = remote_model_card(
+                                            ui,
+                                            model,
+                                            &self.config,
+                                            &self.model_downloads,
+                                        ) {
+                                            remote_model_action = Some(action);
+                                        }
+                                        ui.add_space(8.0);
+                                    }
+                                });
+                        set_collapsing_header_accessibility(ui.ctx(), &experimental);
+                    } else {
+                        ui.add_space(8.0);
+                        wrapped_label(
+                            ui,
+                            mut_text(
+                                "All matching candidates are shown above. Additional trusted candidates will appear here after refresh.",
+                            ),
+                        );
+                    }
+                } else {
+                    ui.add_space(12.0);
+                    ui.label(section_heading("Matching trusted catalog models"));
+                    for model in remote_models {
+                        if let Some(action) =
+                            remote_model_card(ui, model, &self.config, &self.model_downloads)
+                        {
+                            remote_model_action = Some(action);
+                        }
+                        ui.add_space(8.0);
+                    }
+                }
+            }
 
             ui.add_space(12.0);
             let download_rows = current_download_rows(&self.config, &self.model_downloads)
@@ -6567,8 +8756,19 @@ impl LocalTranscriberApp {
                 ui.add_space(12.0);
             }
 
-            let mut runtime_action = None;
-            let runtime_maintenance = egui::CollapsingHeader::new("Runtime maintenance")
+            // Runtime packages are a compatibility-only path. None of the
+            // normal embedded GGUF descriptors may expose their install or
+            // maintenance controls in the Models experience.
+            let runtime_models = runtime_representative_models(&self.config)
+                .into_iter()
+                .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
+                .filter(|model| {
+                    !crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+                })
+                .collect::<Vec<_>>();
+            if !runtime_models.is_empty() {
+                let mut runtime_action = None;
+                let runtime_maintenance = egui::CollapsingHeader::new("Runtime maintenance")
                 .default_open(false)
                 .show(ui, |ui| panel(ui, |ui| {
                 ui.label(mut_text(
@@ -6583,10 +8783,7 @@ impl LocalTranscriberApp {
                     )),
                 );
                 ui.add_space(8.0);
-                for model in runtime_representative_models(&self.config)
-                    .into_iter()
-                    .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
-                {
+                for model in runtime_models {
                     let provider = compatibility_bridge::provider_for_model(&model);
                     let runtime_busy = provider.is_some_and(|provider| {
                         self.runtime_jobs.contains_key(provider.id())
@@ -6658,14 +8855,15 @@ impl LocalTranscriberApp {
                     ui.add_space(6.0);
                 }
             }));
-            set_collapsing_header_accessibility(ui.ctx(), &runtime_maintenance);
+                set_collapsing_header_accessibility(ui.ctx(), &runtime_maintenance);
 
-            if let Some((model, kind)) = runtime_action {
-                match kind {
-                    RuntimeActionKind::Install | RuntimeActionKind::Update => {
-                        self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
+                if let Some((model, kind)) = runtime_action {
+                    match kind {
+                        RuntimeActionKind::Install | RuntimeActionKind::Update => {
+                            self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
+                        }
+                        RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
                     }
-                    RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
                 }
             }
 
@@ -6701,9 +8899,7 @@ impl LocalTranscriberApp {
                 let selected = self.config.general.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
                 let runtime_ready =
-                    compatibility_bridge::provider_for_model(&model).is_some_and(|provider| {
-                        provider.runtime_status(&self.config) == ModelRuntimeStatus::Ready
-                    });
+                    runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready;
                 let action_state = model_action_state_with_runtime(
                     &model,
                     &install_status,
@@ -6776,6 +8972,61 @@ impl LocalTranscriberApp {
                 ui.add_space(8.0);
             }
         });
+        if start_local_import {
+            self.start_local_gguf_import();
+        }
+        if let Some(action) = remote_model_action {
+            match action {
+                RemoteModelCardAction::InstallNormalized(model_id) => {
+                    if self.artifact_installations.contains_key(model_id.as_str()) {
+                        self.status_message =
+                            "That verified model variant is already being installed.".to_owned();
+                    } else if let Some(model) = config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == model_id.as_str())
+                    {
+                        self.start_model_download(&model);
+                    } else {
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message =
+                            "The selected catalog variant is no longer available in Scribe's verified local catalog. Refresh and try again."
+                                .to_owned();
+                    }
+                }
+                RemoteModelCardAction::InstallTrusted(request) => {
+                    self.start_trusted_remote_model_download(request);
+                }
+                RemoteModelCardAction::CancelInstall(model_id) => {
+                    if let Some((_, cancellation)) =
+                        self.artifact_installations.get(model_id.as_str())
+                    {
+                        cancellation.cancel();
+                        self.status_message =
+                            "Cancelling verified model installation. Downloaded partial bytes will be retained for Resume."
+                                .to_owned();
+                    }
+                }
+                RemoteModelCardAction::SelectInstalled(model_id) => {
+                    if let Some(model) = config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == model_id.as_str())
+                    {
+                        self.select_model_as_default(&model);
+                    }
+                }
+                RemoteModelCardAction::RemoveInstalled(model_id) => {
+                    if let Some(model) = config::configured_models(&self.config)
+                        .into_iter()
+                        .find(|model| model.id == model_id.as_str())
+                    {
+                        self.uninstall_model(&model);
+                    }
+                }
+            }
+        }
+        if refresh_remote_catalog && !cfg!(test) {
+            self.request_remote_catalog(true);
+        }
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
@@ -7210,12 +9461,11 @@ impl LocalTranscriberApp {
             card(ui, |ui| {
                 ui.label(section_heading("Active model"));
                 let model_name = self
-                    .transcription_service
-                    .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
-                    .map(|descriptor| descriptor.display_name)
-                    .unwrap_or("No model selected");
+                    .selected_model()
+                    .map(|model| model.name)
+                    .unwrap_or_else(|| "No model selected".to_owned());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(body_strong(model_name));
+                    ui.label(body_strong(&model_name));
                     if ui.add(small_button(ui, "Manage models")).clicked() {
                         self.current_tab = Tab::Models;
                     }
@@ -7270,13 +9520,14 @@ impl LocalTranscriberApp {
                 });
             });
 
+            ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Audio"));
+                semantic_heading(ui, section_heading("Audio"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.recording.audio_input_device_name.clone();
-                    ui.label("Microphone");
-                    ComboBox::from_id_source("audio-input-device")
+                    let label = ui.label("Microphone");
+                    let combo = ComboBox::from_id_source("audio-input-device")
                         .selected_text(
                             self.config
                                 .recording
@@ -7298,13 +9549,37 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
+                    combo.response.labelled_by(label.id);
                     if before != self.config.recording.audio_input_device_name {
+                        self.stop_microphone_test();
+                        self.microphone_monitor_retry_at = None;
+                        self.microphone_level_envelope.reset_source();
                         self.save_config();
                     }
                     if ui.add(small_button(ui, "Refresh")).clicked() {
                         self.refresh_audio_devices();
                     }
                 });
+                self.ensure_microphone_monitor();
+                ui.add_space(10.0);
+                let (levels, revision, source_active) = self.current_sensitivity_level_sample();
+                let live_level_position = self.microphone_level_envelope.update(
+                    levels.rms,
+                    revision,
+                    source_active,
+                    Instant::now(),
+                );
+                let label = ui.label("Input sensitivity");
+                let response = microphone_sensitivity_slider(
+                    ui,
+                    live_level_position,
+                    &mut self.config.recording.manual_activation_rms,
+                )
+                .labelled_by(label.id);
+                if response.changed() {
+                    self.apply_input_sensitivity_threshold();
+                    self.save_config();
+                }
             });
 
             ui.add_space(12.0);
@@ -7400,9 +9675,48 @@ impl LocalTranscriberApp {
         let status_message = self.status_message.clone();
         let model_dir = config::model_storage_dir(&self.config);
         let config_path = self.config_path.clone();
+        let export_dir = config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|parent| parent.join("diagnostics"));
+        let session_count = self.diagnostics.len();
+        let mut export_requested = false;
         page(ui, "About", status, &status_message, |ui| {
             about_page(ui, &model_dir, config_path.as_deref());
+            ui.add_space(12.0);
+            ui.group(|ui| {
+                semantic_heading(ui, section_heading("Redacted diagnostics"));
+                ui.label(format!(
+                    "{session_count} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors."
+                ));
+                let unavailable_reason = export_dir.is_none().then_some(
+                    "The platform settings directory is unavailable, so Scribe cannot choose a private export location.",
+                );
+                let button = ui.add_enabled(
+                    export_dir.is_some(),
+                    Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
+                );
+                if let Some(reason) = unavailable_reason {
+                    ui.ctx().accesskit_node_builder(button.id, |builder| {
+                        builder.set_description(reason);
+                    });
+                    ui.label(mut_text(reason));
+                }
+                export_requested = button.clicked();
+            });
         });
+        if export_requested && let Some(directory) = export_dir {
+            match diagnostics::export_redacted(&directory, &self.diagnostics) {
+                Ok(path) => {
+                    self.status_message =
+                        format!("Redacted diagnostics exported to {}", path.display());
+                }
+                Err(error) => {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not export redacted diagnostics: {error}");
+                }
+            }
+        }
     }
 
     fn ui_advanced_settings(&mut self, ui: &mut Ui) {
@@ -7476,55 +9790,51 @@ impl LocalTranscriberApp {
                 if ui
                     .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
                     .on_hover_text(
-                        "Uses local adaptive voice detection. An explicit shortcut release or Stop action always takes priority.",
+                        "Stops after the configured silence interval. Input sensitivity still controls speech detection when this option is off, and an explicit shortcut release or Stop action always takes priority.",
                     )
                     .changed()
                 {
                     self.config.recording.vad_enabled = vad_enabled;
                     self.save_config();
                 }
+                let mut speech_confirmation = self.config.recording.speech_confirmation_ms as i32;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Speech confirmation ms");
+                    if ui
+                        .add(egui::DragValue::new(&mut speech_confirmation).clamp_range(50..=1000))
+                        .labelled_by(label.id)
+                        .changed()
+                    {
+                        self.config.recording.speech_confirmation_ms =
+                            speech_confirmation.max(50) as u32;
+                        self.config.recording.internal_pause_ms = self
+                            .config
+                            .recording
+                            .internal_pause_ms
+                            .max(self.config.recording.speech_confirmation_ms);
+                        self.save_config();
+                    }
+                });
+                let mut internal_pause = self.config.recording.internal_pause_ms as i32;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Internal pause ms");
+                    if ui
+                        .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
+                        .labelled_by(label.id)
+                        .changed()
+                    {
+                        self.config.recording.internal_pause_ms = internal_pause
+                            .max(self.config.recording.speech_confirmation_ms as i32)
+                            as u32;
+                        self.config.recording.endpoint_silence_ms = self
+                            .config
+                            .recording
+                            .endpoint_silence_ms
+                            .max(self.config.recording.internal_pause_ms);
+                        self.save_config();
+                    }
+                });
                 ui.add_enabled_ui(self.config.recording.vad_enabled, |ui| {
-                    let mut speech_confirmation =
-                        self.config.recording.speech_confirmation_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Speech confirmation ms");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut speech_confirmation)
-                                    .clamp_range(50..=1000),
-                            )
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.speech_confirmation_ms =
-                                speech_confirmation.max(50) as u32;
-                            self.config.recording.internal_pause_ms = self
-                                .config
-                                .recording
-                                .internal_pause_ms
-                                .max(self.config.recording.speech_confirmation_ms);
-                            self.save_config();
-                        }
-                    });
-                    let mut internal_pause = self.config.recording.internal_pause_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Internal pause ms");
-                        if ui
-                            .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.internal_pause_ms = internal_pause
-                                .max(self.config.recording.speech_confirmation_ms as i32)
-                                as u32;
-                            self.config.recording.endpoint_silence_ms = self
-                                .config
-                                .recording
-                                .endpoint_silence_ms
-                                .max(self.config.recording.internal_pause_ms);
-                            self.save_config();
-                        }
-                    });
                     let mut endpoint_silence = self.config.recording.endpoint_silence_ms as i32;
                     ui.horizontal_wrapped(|ui| {
                         let label = ui.label("End after silence ms");
@@ -7543,30 +9853,30 @@ impl LocalTranscriberApp {
                             self.save_config();
                         }
                     });
-                    let mut pre_roll = self.config.recording.pre_roll_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Pre-roll ms");
-                        if ui
-                            .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
-                            self.save_config();
-                        }
-                    });
-                    let mut post_roll = self.config.recording.post_roll_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Post-roll ms");
-                        if ui
-                            .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.post_roll_ms = post_roll.max(0) as u32;
-                            self.save_config();
-                        }
-                    });
+                });
+                let mut pre_roll = self.config.recording.pre_roll_ms as i32;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Pre-roll ms");
+                    if ui
+                        .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
+                        .labelled_by(label.id)
+                        .changed()
+                    {
+                        self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
+                        self.save_config();
+                    }
+                });
+                let mut post_roll = self.config.recording.post_roll_ms as i32;
+                ui.horizontal_wrapped(|ui| {
+                    let label = ui.label("Post-roll ms");
+                    if ui
+                        .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
+                        .labelled_by(label.id)
+                        .changed()
+                    {
+                        self.config.recording.post_roll_ms = post_roll.max(0) as u32;
+                        self.save_config();
+                    }
                 });
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.overlay.position;
@@ -8004,11 +10314,78 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
 
 fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
     ui.vertical(|ui| {
-        ui.label(label_caps("Search"));
-        ui.add_sized(
+        let label = ui.label(label_caps("Search imports and trusted catalog"));
+        let input = ui.add_sized(
             [190.0, 28.0],
-            TextEdit::singleline(search).hint_text("Search models..."),
+            TextEdit::singleline(search).hint_text("Name, language, or filename"),
         );
+        input.labelled_by(label.id);
+    });
+}
+
+fn remote_catalog_filter_controls(
+    ui: &mut Ui,
+    search: &mut String,
+    filters: &mut RemoteCatalogFilters,
+    sort: &mut RemoteCatalogSort,
+) {
+    model_search_filter_control(ui, search);
+    ui.add_space(6.0);
+    ui.label(label_caps("Trusted catalog filters"));
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(
+            &mut filters.installed_only,
+            "Installed trusted catalog models only",
+        );
+        ui.checkbox(
+            &mut filters.recommended_only,
+            "Recommended trusted catalog models only",
+        );
+        ui.checkbox(
+            &mut filters.multilingual_only,
+            "Multilingual trusted catalog models only",
+        );
+    });
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
+            let label = ui.label(label_caps("Trusted catalog size tier"));
+            let combo = ComboBox::from_id_source("remote-catalog-size-tier")
+                .selected_text(filters.size_tier.label())
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for tier in RemoteCatalogSizeTier::ALL {
+                        ui.selectable_value(&mut filters.size_tier, tier, tier.label());
+                    }
+            });
+            combo.response.clone().labelled_by(label.id);
+            ui.ctx().accesskit_node_builder(combo.response.id, |builder| {
+                builder.set_description(
+                    "Filters by the smallest available GGUF variant for each trusted catalog model.",
+                );
+            });
+        });
+        ui.vertical(|ui| {
+            let label = ui.label(label_caps("Sort trusted catalog results"));
+            let combo = ComboBox::from_id_source("remote-catalog-sort")
+                .selected_text(sort.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for order in RemoteCatalogSort::ALL {
+                        ui.selectable_value(sort, order, order.label());
+                    }
+                });
+            combo.response.labelled_by(label.id);
+        });
+    });
+}
+
+fn catalog_status_label(ui: &mut Ui, text: impl Into<String>) {
+    let response = ui.add(egui::Label::new(mut_text(text)).wrap(true));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Status);
+        builder.set_live(egui::accesskit::Live::Polite);
+        builder.set_live_atomic();
     });
 }
 
@@ -8048,6 +10425,355 @@ fn summary_card(
             ui.with_layout(Layout::right_to_left(Align::TOP), actions);
         });
     });
+}
+
+fn remote_model_matches_search(model: &RemoteModel, search: &str) -> bool {
+    search.is_empty()
+        || model.display_name.to_ascii_lowercase().contains(search)
+        || model.description.to_ascii_lowercase().contains(search)
+        || model.id.to_ascii_lowercase().contains(search)
+        || model
+            .languages
+            .iter()
+            .any(|language| language.to_ascii_lowercase().contains(search))
+        || model
+            .variants
+            .iter()
+            .any(|variant| variant.filename.to_ascii_lowercase().contains(search))
+}
+
+fn remote_model_smallest_variant_size(model: &RemoteModel) -> Option<u64> {
+    model
+        .variants
+        .iter()
+        .map(|variant| variant.size_bytes)
+        .min()
+}
+
+fn remote_model_is_installed(model: &RemoteModel, app_config: &AppConfig) -> bool {
+    model.variants.iter().any(|variant| {
+        config::managed_remote_model_id(&model.id, &model.revision, &variant.filename).is_some_and(
+            |model_id| {
+                app_config
+                    .general
+                    .managed_remote_models
+                    .contains_key(&model_id)
+            },
+        )
+    })
+}
+
+fn remote_model_is_multilingual(model: &RemoteModel) -> bool {
+    let unique_languages = model
+        .languages
+        .iter()
+        .map(|language| language.trim().to_ascii_lowercase())
+        .filter(|language| !language.is_empty())
+        .collect::<HashSet<_>>();
+    unique_languages.len() > 1
+        || unique_languages
+            .iter()
+            .any(|language| language == "multilingual")
+}
+
+fn remote_model_matches_catalog_filters(
+    model: &RemoteModel,
+    app_config: &AppConfig,
+    filters: RemoteCatalogFilters,
+) -> bool {
+    (!filters.installed_only || remote_model_is_installed(model, app_config))
+        && (!filters.recommended_only || model.recommended)
+        && (!filters.multilingual_only || remote_model_is_multilingual(model))
+        && filters
+            .size_tier
+            .matches(remote_model_smallest_variant_size(model))
+}
+
+fn filtered_remote_models<'model>(
+    models: &'model [RemoteModel],
+    app_config: &AppConfig,
+    search: &str,
+    filters: RemoteCatalogFilters,
+    sort: RemoteCatalogSort,
+) -> Vec<&'model RemoteModel> {
+    let mut matching = models
+        .iter()
+        .filter(|model| remote_model_matches_search(model, search))
+        .filter(|model| remote_model_matches_catalog_filters(model, app_config, filters))
+        .collect::<Vec<_>>();
+
+    matching.sort_by(|left, right| match sort {
+        RemoteCatalogSort::Recommended => right
+            .recommended
+            .cmp(&left.recommended)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.id.cmp(&right.id)),
+        RemoteCatalogSort::Smallest => remote_model_smallest_variant_size(left)
+            .unwrap_or(u64::MAX)
+            .cmp(&remote_model_smallest_variant_size(right).unwrap_or(u64::MAX))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.id.cmp(&right.id)),
+        RemoteCatalogSort::Largest => remote_model_smallest_variant_size(right)
+            .unwrap_or(0)
+            .cmp(&remote_model_smallest_variant_size(left).unwrap_or(0))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.id.cmp(&right.id)),
+        RemoteCatalogSort::Name => left
+            .display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.id.cmp(&right.id)),
+    });
+    matching
+}
+
+fn disk_space_preflight_error(
+    preflight: Result<crate::disk_space::DiskSpacePreflight, InstallError>,
+) -> Option<String> {
+    match preflight {
+        Ok(preflight) if preflight.has_sufficient_space() => None,
+        Ok(preflight) => Some(format!(
+            "Install disabled: {} free is required on {} (including Scribe's {} safety headroom); only {} is available.",
+            format_bytes(preflight.required_bytes),
+            preflight.volume,
+            format_bytes(crate::disk_space::SAFETY_HEADROOM_BYTES),
+            format_bytes(preflight.available_bytes),
+        )),
+        Err(error) => Some(format!(
+            "Install disabled because Scribe could not safely verify available disk space: {error}"
+        )),
+    }
+}
+
+fn normalized_model_install_space_error(config: &AppConfig, model_id: &ModelId) -> Option<String> {
+    disk_space_preflight_error(
+        managed_downloads::normalized_model_download_space_preflight(config, model_id),
+    )
+}
+
+fn trusted_model_install_space_error(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Option<String> {
+    disk_space_preflight_error(managed_downloads::trusted_gguf_download_space_preflight(
+        config, artifact,
+    ))
+}
+
+fn install_button(
+    ui: &mut Ui,
+    label: &str,
+    default_tooltip: &str,
+    disk_space_error: Option<&str>,
+) -> egui::Response {
+    match disk_space_error {
+        Some(reason) => ui
+            .add_enabled(false, small_button(ui, label))
+            .on_hover_text(reason),
+        None => ui
+            .add(small_button(ui, label))
+            .on_hover_text(default_tooltip),
+    }
+}
+
+fn remote_model_card(
+    ui: &mut Ui,
+    model: &RemoteModel,
+    app_config: &AppConfig,
+    downloads: &HashMap<String, ModelInstallStatus>,
+) -> Option<RemoteModelCardAction> {
+    let mut action = None;
+    panel(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(section_heading(&model.display_name));
+            if model.recommended {
+                badge(ui, "Recommended", ChipTone::Success);
+            }
+            badge(ui, model.trust.label(), ChipTone::Neutral);
+            badge(ui, "Experimental", ChipTone::Warning);
+        });
+        ui.add_space(4.0);
+        wrapped_label(ui, mut_text(&model.description));
+        if !model.languages.is_empty() {
+            ui.add_space(4.0);
+            wrapped_label(
+                ui,
+                mut_text(format!("Languages: {}", model.languages.join(", "))),
+            );
+        }
+        ui.add_space(4.0);
+        wrapped_label(ui, mut_text(model.compatibility.detail()));
+        ui.add_space(8.0);
+        ui.label(body_strong("Variants"));
+        for variant in &model.variants {
+            let artifact = model.artifact_for(&variant.id);
+            let normalized_model_id = artifact.as_ref().and_then(|artifact| {
+                crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                    &artifact.model_id,
+                    &artifact.revision,
+                    &artifact.filename,
+                )
+            });
+            let is_available_in_local_catalog = normalized_model_id.is_some();
+            let disk_space_error = artifact
+                .as_ref()
+                .and_then(|artifact| match normalized_model_id.as_ref() {
+                    Some(model_id) => normalized_model_install_space_error(app_config, model_id),
+                    None => trusted_model_install_space_error(app_config, artifact),
+                });
+            let remote_id = artifact.as_ref().and_then(|artifact| {
+                config::managed_remote_model_id(
+                    &artifact.model_id,
+                    &artifact.revision,
+                    &artifact.filename,
+                )
+            });
+            let installed = remote_id.as_ref().and_then(|id| {
+                app_config
+                    .general
+                    .managed_remote_models
+                    .get_key_value(id)
+                    .map(|(id, _)| ModelId::new(id.clone()))
+            });
+            let previous_revision = artifact.as_ref().and_then(|artifact| {
+                app_config
+                    .general
+                    .managed_remote_models
+                    .iter()
+                    .find(|(_, install)| {
+                        install.repository == artifact.model_id
+                            && install.filename == artifact.filename
+                            && install.revision != artifact.revision
+                    })
+                    .map(|(id, _)| ModelId::new(id.clone()))
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(mut_text(&variant.filename));
+                badge(ui, &format_bytes(variant.size_bytes), ChipTone::Neutral);
+                if let Some(remote_id) = remote_id.as_ref()
+                    && let Some(status) = downloads.get(remote_id)
+                {
+                    badge(ui, &status.label(), ChipTone::Neutral);
+                    if matches!(
+                        status,
+                        ModelInstallStatus::Downloading { .. }
+                            | ModelInstallStatus::InstallingRuntime
+                    ) {
+                        if ui.add(small_button(ui, "Cancel")).clicked() {
+                            action = Some(RemoteModelCardAction::CancelInstall(ModelId::new(
+                                remote_id.clone(),
+                            )));
+                        }
+                    } else if matches!(status, ModelInstallStatus::Error(_))
+                        && install_button(
+                            ui,
+                            "Resume",
+                            "Resume this verified download from its retained partial bytes.",
+                            disk_space_error.as_deref(),
+                        )
+                        .clicked()
+                    {
+                        action = artifact.as_ref().map(|artifact| {
+                            RemoteModelCardAction::InstallTrusted(
+                                trusted_remote_install_request(model, artifact),
+                            )
+                        });
+                    }
+                } else if let Some(installed_id) = installed {
+                    badge(ui, "Installed and verified", ChipTone::Success);
+                    if ui.add(small_button(ui, "Use")).clicked() {
+                        action = Some(RemoteModelCardAction::SelectInstalled(installed_id.clone()));
+                    }
+                    if ui.add(small_button(ui, "Remove")).clicked() {
+                        action = Some(RemoteModelCardAction::RemoveInstalled(installed_id));
+                    }
+                } else if let Some(previous_id) = previous_revision {
+                    badge(ui, "Update available", ChipTone::Warning);
+                    if install_button(
+                        ui,
+                        "Install update",
+                        "Download and validate this new pinned revision before switching models.",
+                        disk_space_error.as_deref(),
+                    )
+                        .clicked()
+                    {
+                        action = artifact.as_ref().map(|artifact| {
+                            RemoteModelCardAction::InstallTrusted(
+                                trusted_remote_install_request(model, artifact),
+                            )
+                        });
+                    }
+                    let _ = previous_id;
+                } else if is_available_in_local_catalog {
+                    badge(ui, "Available in local catalog", ChipTone::Success);
+                    if install_button(
+                        ui,
+                        "Install verified variant",
+                            "Download this exact revision and checksum through Scribe's verified local installer.",
+                        disk_space_error.as_deref(),
+                    )
+                        .clicked()
+                    {
+                        action = normalized_model_id
+                            .clone()
+                            .map(RemoteModelCardAction::InstallNormalized);
+                    }
+                } else {
+                    badge(ui, "Pinned GGUF", ChipTone::Neutral);
+                    if install_button(
+                        ui,
+                        "Install",
+                        "Download this exact verified revision through Scribe's transactional installer.",
+                        disk_space_error.as_deref(),
+                    )
+                        .clicked()
+                    {
+                        action = artifact.as_ref().map(|artifact| {
+                            RemoteModelCardAction::InstallTrusted(
+                                trusted_remote_install_request(model, artifact),
+                            )
+                        });
+                    }
+                }
+            });
+        }
+        ui.add_space(4.0);
+        let details = egui::CollapsingHeader::new("Source and verification details")
+            .default_open(false)
+            .show(ui, |ui| {
+                wrapped_label(ui, mut_text(format!("Repository: {}", model.id)));
+                wrapped_label(ui, mut_text(format!("Pinned revision: {}", model.revision)));
+                for variant in &model.variants {
+                    wrapped_label(
+                        ui,
+                        mut_text(format!(
+                            "{} · SHA-256 {}",
+                            variant.filename, variant.expected_sha256
+                        )),
+                    );
+                }
+                wrapped_label(
+                    ui,
+                    mut_text(
+                        "Scribe pins the full repository revision, expected size, and SHA-256 before download. The model is selectable only after isolated runtime smoke validation and transactional activation.",
+                    ),
+                );
+            });
+        set_collapsing_header_accessibility(ui.ctx(), &details);
+    });
+    action
+}
+
+fn trusted_remote_install_request(
+    model: &RemoteModel,
+    artifact: &TrustedArtifact,
+) -> TrustedRemoteInstallRequest {
+    TrustedRemoteInstallRequest {
+        artifact: artifact.clone(),
+        display_name: model.display_name.clone(),
+        description: model.description.clone(),
+        languages: model.languages.clone(),
+        recommended: model.recommended,
+    }
 }
 
 fn model_catalog_row(
@@ -8604,7 +11330,7 @@ fn benchmark_grid_ui(
     panel(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
-                ui.label(section_heading("Benchmark Scores"));
+                semantic_heading(ui, section_heading("Benchmark Scores"));
                 ui.label(mut_text(
                     "Raw metric values are colored by relative score in this run.",
                 ));
@@ -8624,12 +11350,22 @@ fn benchmark_grid_ui(
                     .spacing(Vec2::new(8.0, 6.0))
                     .show(ui, |ui| {
                         ui.label(label_caps("Model"));
-                        ui.label(label_caps("Overall")).on_hover_text(
+                        let overall_header = ui.label(label_caps("Overall")).on_hover_text(
                             "Weighted normalized score for the selected ranking mode.",
                         );
+                        ui.ctx()
+                            .accesskit_node_builder(overall_header.id, |builder| {
+                                builder.set_description(
+                                    "Weighted normalized score for the selected ranking mode.",
+                                );
+                            });
                         for metric in &metrics {
-                            ui.label(label_caps(metric.header()))
+                            let header = ui
+                                .label(label_caps(metric.header()))
                                 .on_hover_text(metric.tooltip());
+                            ui.ctx().accesskit_node_builder(header.id, |builder| {
+                                builder.set_description(metric.tooltip());
+                            });
                         }
                         ui.end_row();
 
@@ -8643,6 +11379,11 @@ fn benchmark_grid_ui(
                                 ui,
                                 benchmark::format_overall_score(overall),
                                 overall,
+                                &format!(
+                                    "{}, overall {} score",
+                                    result.model_name,
+                                    ranking_mode.label()
+                                ),
                             );
                             for metric in &metrics {
                                 let value = result.raw_metrics.value(*metric);
@@ -8651,6 +11392,12 @@ fn benchmark_grid_ui(
                                     ui,
                                     benchmark::format_metric_value(*metric, value),
                                     score,
+                                    &format!(
+                                        "{}, {}. {}",
+                                        result.model_name,
+                                        metric.header(),
+                                        metric.tooltip()
+                                    ),
                                 );
                             }
                             ui.end_row();
@@ -8706,7 +11453,12 @@ fn benchmark_model_cell(
     });
 }
 
-fn benchmark_score_cell(ui: &mut Ui, label: String, score: Option<f64>) {
+fn benchmark_score_cell(
+    ui: &mut Ui,
+    label: String,
+    score: Option<f64>,
+    accessible_description: &str,
+) {
     let colors = ui_palette(ui);
     Frame::none()
         .fill(benchmark_heatmap_fill(ui, score))
@@ -8715,7 +11467,10 @@ fn benchmark_score_cell(ui: &mut Ui, label: String, score: Option<f64>) {
         .inner_margin(Margin::symmetric(8.0, 5.0))
         .show(ui, |ui| {
             ui.set_min_width(68.0);
-            ui.label(RichText::new(label).strong());
+            let value = ui.label(RichText::new(label).strong().color(colors.text));
+            ui.ctx().accesskit_node_builder(value.id, |builder| {
+                builder.set_description(accessible_description);
+            });
         });
 }
 
@@ -8723,21 +11478,30 @@ fn benchmark_heatmap_fill(ui: &Ui, score: Option<f64>) -> Color32 {
     let Some(score) = score else {
         return ui_palette(ui).panel_bg;
     };
+    benchmark_heatmap_fill_for_mode(ui.visuals().dark_mode, score)
+}
+
+fn benchmark_heatmap_fill_for_mode(dark_mode: bool, score: f64) -> Color32 {
     let score = score.clamp(0.0, 1.0);
-    if score < 0.5 {
-        let t = score / 0.5;
-        lerp_color(
-            Color32::from_rgb(254, 226, 226),
-            Color32::from_rgb(254, 249, 195),
-            t,
+    let (low, middle, high) = if dark_mode {
+        (
+            Color32::from_rgb(78, 32, 40),
+            Color32::from_rgb(80, 65, 22),
+            Color32::from_rgb(25, 72, 48),
         )
     } else {
-        let t = (score - 0.5) / 0.5;
-        lerp_color(
+        (
+            Color32::from_rgb(254, 226, 226),
             Color32::from_rgb(254, 249, 195),
             Color32::from_rgb(220, 252, 231),
-            t,
         )
+    };
+    if score < 0.5 {
+        let t = score / 0.5;
+        lerp_color(low, middle, t)
+    } else {
+        let t = (score - 0.5) / 0.5;
+        lerp_color(middle, high, t)
     }
 }
 
@@ -9857,6 +12621,23 @@ fn cards_from_config(
 }
 
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
+    if config::remote_gguf_artifact(config, &model.id).is_some()
+        || config::imported_gguf_artifact(config, &model.id).is_some()
+        || crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+    {
+        return match model.install_status {
+            ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
+            ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
+                ModelRuntimeStatus::Downloading
+            }
+            ModelInstallStatus::NotInstalled => ModelRuntimeStatus::NotInstalled,
+            ModelInstallStatus::Missing => ModelRuntimeStatus::MissingConfiguration,
+            ModelInstallStatus::Error(ref message)
+            | ModelInstallStatus::RuntimeError(ref message) => {
+                ModelRuntimeStatus::Error(message.clone())
+            }
+        };
+    }
     let Some(provider) = compatibility_bridge::provider_for_model(model) else {
         return ModelRuntimeStatus::Error("Model provider is not available.".to_owned());
     };
@@ -10026,6 +12807,88 @@ mod layout_tests {
     }
 
     #[test]
+    fn normal_models_page_does_not_expose_runtime_package_maintenance() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.remote_catalog.snapshot = Some(CatalogSnapshot {
+            source: crate::huggingface_catalog::CatalogSource::BundledFallback,
+            fetched_at_unix_seconds: 0,
+            models: vec![remote_catalog_model(
+                "handy-computer/catalog-fixture",
+                "Catalog fixture",
+                &["en", "es"],
+                true,
+                320 * 1024 * 1024,
+            )],
+        });
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_models(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Runtime maintenance"))
+        );
+        for (label_name, role) in [
+            (
+                "Search imports and trusted catalog",
+                egui::accesskit::Role::TextInput,
+            ),
+            ("Trusted catalog size tier", egui::accesskit::Role::ComboBox),
+            (
+                "Sort trusted catalog results",
+                egui::accesskit::Role::ComboBox,
+            ),
+        ] {
+            let label_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing Models-page label {label_name:?}"));
+            assert!(
+                update.nodes.iter().any(|(_, node)| {
+                    node.role() == role && node.labelled_by().contains(&label_id)
+                }),
+                "no {role:?} is programmatically labelled by {label_name:?}"
+            );
+        }
+        for filter_name in [
+            "Installed trusted catalog models only",
+            "Recommended trusted catalog models only",
+            "Multilingual trusted catalog models only",
+        ] {
+            assert!(update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::CheckBox && node.name() == Some(filter_name)
+            }));
+        }
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.name() == Some("Showing 1 of 1 trusted catalog models")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
+    }
+
+    #[test]
     fn app_shell_pages_paint_within_viewport_at_minimum_and_wide_widths() {
         for tab in [
             Tab::Transcribe,
@@ -10115,6 +12978,93 @@ mod layout_tests {
         for (text, fill) in combinations {
             let ratio = contrast_ratio(text, fill);
             assert!(ratio >= 4.5, "contrast ratio was {ratio:.2}");
+        }
+    }
+
+    #[test]
+    fn input_sensitivity_track_boundary_meets_non_text_contrast() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            for adjacent in [palette.panel_bg, palette.card_bg] {
+                let ratio = contrast_ratio(palette.slider_track_border, adjacent);
+                assert!(
+                    ratio >= 3.0,
+                    "input-sensitivity track contrast was {ratio:.2}"
+                );
+            }
+            let live_ratio =
+                contrast_ratio(palette.slider_live_below, palette.slider_threshold_fill);
+            assert!(
+                live_ratio >= 3.0,
+                "below-threshold live-fill contrast was {live_ratio:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_sensitivity_track_has_split_fills_and_constant_live_height() {
+        let palette = ThemePalette::light();
+        assert_ne!(palette.slider_threshold_fill, palette.slider_remainder_fill);
+        let threshold_position = 0.5;
+
+        for (live_position, expected_live_color) in
+            [(0.25, palette.slider_live_below), (0.75, palette.success)]
+        {
+            let ctx = egui::Context::default();
+            configure_stitch_style(&ctx);
+            ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+            let mut threshold = dbfs_to_rms(slider_position_to_dbfs(threshold_position));
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        microphone_sensitivity_slider(ui, live_position, &mut threshold);
+                    });
+                },
+            );
+
+            let rects = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) => Some(rect),
+                _ => None,
+            });
+            let mut saw_threshold_fill = false;
+            let mut saw_remainder_fill = false;
+            let mut live_height = None;
+            for rect in rects {
+                saw_threshold_fill |= rect.fill == palette.slider_threshold_fill;
+                saw_remainder_fill |= rect.fill == palette.slider_remainder_fill;
+                if rect.fill == expected_live_color {
+                    live_height = Some(rect.rect.height());
+                }
+            }
+
+            assert!(saw_threshold_fill);
+            assert!(saw_remainder_fill);
+            assert_eq!(live_height, Some(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT));
+        }
+    }
+
+    #[test]
+    fn benchmark_heatmap_text_meets_aa_in_light_and_dark_themes() {
+        for (dark_mode, palette) in [(false, ThemePalette::light()), (true, ThemePalette::dark())] {
+            for score in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let fill = benchmark_heatmap_fill_for_mode(dark_mode, score);
+                let ratio = contrast_ratio(palette.text, fill);
+                assert!(
+                    ratio >= 4.5,
+                    "benchmark score {score} contrast was {ratio:.2} in dark_mode={dark_mode}"
+                );
+            }
+            let ratio = contrast_ratio(palette.text, palette.panel_bg);
+            assert!(
+                ratio >= 4.5,
+                "unavailable benchmark contrast was {ratio:.2} in dark_mode={dark_mode}"
+            );
         }
     }
 
@@ -10260,6 +13210,7 @@ mod layout_tests {
             stop_requested: false,
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
         });
 
@@ -10288,6 +13239,7 @@ mod layout_tests {
             stop_requested: false,
             max_duration_seconds: 30,
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
         });
 
@@ -10343,6 +13295,7 @@ mod layout_tests {
                 stop_requested: false,
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+                capture_diagnostics: CaptureDiagnosticContext::default(),
                 abandon: Arc::new(AtomicBool::new(false)),
             });
             app.tx
@@ -10370,7 +13323,7 @@ mod layout_tests {
             assert_eq!(app.status, TranscriptionStatus::Idle);
             assert_eq!(
                 app.status_message,
-                "No speech detected; nothing was pasted."
+                "Microphone signal was silent or too low. Check its hardware mute and gain, move closer, verify the selected input, and try again."
             );
             assert_eq!(app.transcript, "keep prior transcript");
             assert!(app.pending_output.is_none());
@@ -10389,7 +13342,227 @@ mod layout_tests {
     }
 
     #[test]
-    fn typed_recording_settings_drive_native_capture_options() {
+    fn no_speech_feedback_distinguishes_low_input_from_short_non_speech_audio() {
+        let low = no_speech_feedback(
+            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 10.0),
+            Some("Microphone (fifine  Microphone)"),
+            audio::MIN_SPEECH_ACTIVATION_RMS,
+        );
+        assert_eq!(
+            low.status_message,
+            "FIFINE microphone signal was silent or too low. Tap its top mute control, turn up the physical gain knob, move closer, and try again."
+        );
+        assert_eq!(
+            low.overlay_message,
+            "Microphone signal too low — check mute and gain"
+        );
+
+        let non_silent = no_speech_feedback(
+            Some(audio::MIN_SPEECH_ACTIVATION_RMS),
+            Some("Microphone Array"),
+            audio::MIN_SPEECH_ACTIVATION_RMS,
+        );
+        assert_eq!(
+            non_silent.status_message,
+            "No speech detected; nothing was pasted."
+        );
+        assert_eq!(non_silent.overlay_message, "No speech detected");
+    }
+
+    #[test]
+    fn input_sensitivity_uses_its_threshold_for_low_input_feedback() {
+        let mut config = AppConfig::default();
+        config.recording.manual_activation_rms = 0.03;
+
+        let feedback = no_speech_feedback(
+            Some(0.02),
+            Some("Microphone Array"),
+            diagnostic_activation_floor(&config),
+        );
+
+        assert!(feedback.status_message.contains("silent or too low"));
+    }
+
+    #[test]
+    fn input_sensitivity_db_label_rounds_to_a_compact_whole_db_value() {
+        assert_eq!(input_sensitivity_db_label(-54.4), "-54 dB");
+        assert_eq!(input_sensitivity_db_label(-53.6), "-54 dB");
+        assert_eq!(input_sensitivity_db_label(4.0), "0 dB");
+        assert_eq!(input_sensitivity_db_label(-80.0), "-72 dB");
+    }
+
+    #[test]
+    fn sensitivity_slider_endpoints_remain_valid_capture_thresholds() {
+        assert!(
+            (dbfs_to_rms(INPUT_LEVEL_MIN_DBFS) - config::settings::MIN_MANUAL_ACTIVATION_RMS).abs()
+                < 1e-9
+        );
+        assert_eq!(
+            dbfs_to_rms(INPUT_LEVEL_MAX_DBFS),
+            config::settings::MAX_MANUAL_ACTIVATION_RMS
+        );
+    }
+
+    #[test]
+    fn input_level_mapping_handles_silence_and_round_trips_positions() {
+        assert_eq!(rms_to_dbfs(0.0), INPUT_LEVEL_MIN_DBFS);
+        assert_eq!(rms_to_dbfs(f32::NAN), INPUT_LEVEL_MIN_DBFS);
+        assert!(rms_to_dbfs(0.0).is_finite());
+        assert_eq!(dbfs_to_slider_position(INPUT_LEVEL_MIN_DBFS), 0.0);
+        assert_eq!(dbfs_to_slider_position(INPUT_LEVEL_MAX_DBFS), 1.0);
+
+        for position in [0.0_f32, 0.2, 0.5, 0.8, 1.0] {
+            let round_trip = dbfs_to_slider_position(slider_position_to_dbfs(position));
+            assert!((round_trip - position).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn microphone_level_envelope_attacks_fast_releases_slowly_and_resets_stale_input() {
+        let base = Instant::now();
+        let mut envelope = MicrophoneLevelEnvelope::default();
+        let attack = envelope.update(1.0, Some(1), true, base);
+        assert!(
+            attack > 0.5,
+            "attack should move most of the way in one meter frame"
+        );
+
+        let release = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
+        assert!(
+            release > 0.4,
+            "release should settle more slowly than attack"
+        );
+        assert!(release < attack);
+
+        let stale = envelope.update(
+            1.0,
+            Some(2),
+            true,
+            base + INPUT_LEVEL_STALE_AFTER + Duration::from_millis(81),
+        );
+        assert!(stale < release, "a stale unchanged sample must decay");
+        let settled = envelope.update(
+            1.0,
+            Some(2),
+            true,
+            base + INPUT_LEVEL_STALE_AFTER + Duration::from_secs(3),
+        );
+        assert_eq!(settled, 0.0);
+    }
+
+    #[test]
+    fn leaving_general_clears_sensitivity_animation_and_fast_repaint() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.microphone_level_envelope
+            .update(0.1, Some(1), true, now);
+        assert!(app.microphone_level_envelope.is_animating());
+        assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
+
+        app.current_tab = Tab::Transcribe;
+        app.suspend_microphone_monitor();
+
+        assert!(!app.microphone_level_envelope.is_animating());
+        assert_ne!(app.next_repaint_delay(), METER_REPAINT_DELAY);
+    }
+
+    #[test]
+    fn no_speech_feedback_uses_capture_start_device_and_threshold_after_settings_drift() {
+        let mut config = AppConfig::default();
+        config.recording.manual_activation_rms = 0.03;
+        config.recording.audio_input_device_name = Some("FIFINE A8".to_owned());
+        let diagnostics = CaptureDiagnosticContext::from_config(&config);
+
+        config.recording.manual_activation_rms = 0.001;
+        config.recording.audio_input_device_name = Some("Different microphone".to_owned());
+        let feedback = no_speech_feedback_for_capture(Some(0.02), &diagnostics);
+
+        assert_eq!(diagnostics.activation_floor, 0.03);
+        assert_eq!(diagnostics.input_device_name.as_deref(), Some("FIFINE A8"));
+        assert!(feedback.status_message.starts_with("FIFINE microphone"));
+    }
+
+    #[test]
+    fn live_input_sensitivity_updates_capture_diagnostics() {
+        let mut app = test_app();
+        app.active_recording = Some(ActiveRecording {
+            session_id: SessionId(901),
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
+        });
+        app.pending_recording = Some(PendingRecording {
+            session_id: SessionId(902),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+
+        app.config.recording.manual_activation_rms = 0.025;
+        app.apply_input_sensitivity_threshold();
+
+        assert_eq!(
+            app.active_recording
+                .as_ref()
+                .unwrap()
+                .capture_diagnostics
+                .activation_floor,
+            0.025
+        );
+        assert_eq!(
+            app.pending_recording
+                .as_ref()
+                .unwrap()
+                .capture_diagnostics
+                .activation_floor,
+            0.025
+        );
+    }
+
+    #[test]
+    fn capture_ready_adopts_the_latest_input_sensitivity() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        app.config.recording.manual_activation_rms = 0.025;
+        app.tx
+            .send(AppEvent::CaptureReady {
+                session_id,
+                result: Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                )),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        let active = app.active_recording.as_ref().unwrap();
+        assert_eq!(active.session.manual_activation_threshold(), 0.025);
+        assert_eq!(active.capture_diagnostics.activation_floor, 0.025);
+        app.stop_and_discard_active_recording();
+    }
+
+    #[test]
+    fn typed_recording_settings_keep_sensitivity_gating_when_endpointing_is_off() {
         let mut config = AppConfig::default();
         config.recording.vad_enabled = false;
         config.recording.speech_confirmation_ms = 175;
@@ -10400,13 +13573,227 @@ mod layout_tests {
 
         let options = capture_options_from_config(&config);
 
-        assert!(!options.vad_enabled);
+        assert!(
+            options.vad_enabled,
+            "input sensitivity must continue to gate accepted speech"
+        );
         assert!(!options.endpointing_enabled);
         assert_eq!(options.vad.speech_confirmation, Duration::from_millis(175));
         assert_eq!(options.vad.pause, Duration::from_millis(525));
         assert_eq!(options.vad.endpoint, Duration::from_millis(975));
         assert_eq!(options.vad.pre_roll, Duration::from_millis(300));
         assert_eq!(options.vad.post_roll, Duration::from_millis(225));
+        assert_eq!(options.intent, CaptureIntent::Dictation);
+
+        config.recording.manual_activation_rms = 0.025;
+        let manual = capture_options_from_config(&config);
+        assert_eq!(
+            manual.sensitivity,
+            Sensitivity::Manual {
+                activation_rms: 0.025
+            }
+        );
+    }
+
+    #[test]
+    fn stale_microphone_test_ready_is_discarded_without_replacing_the_current_request() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 2,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 1,
+                result: Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                )),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 2,
+                stop_requested: false,
+                ..
+            }
+        ));
+        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
+    }
+
+    #[test]
+    fn microphone_test_ready_keeps_capture_outside_dictation_lifecycle() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 1,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 1,
+                result: Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                )),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Active { .. }));
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
+        app.stop_microphone_test();
+    }
+
+    #[test]
+    fn microphone_monitor_defers_retained_audio_playback_until_teardown() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+        };
+
+        app.apply_history_action(HistoryPageAction::Play(7));
+
+        assert!(app.playing_history_id.is_none());
+        assert_eq!(app.deferred_history_playback, Some(7));
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+        assert_eq!(app.status_message, "Preparing audio playback");
+    }
+
+    #[test]
+    fn stopping_microphone_test_keeps_all_audio_owners_excluded_until_completion() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated_with_stop_delay(
+                None,
+                CaptureStopReason::Explicit,
+                Duration::from_millis(80),
+            ),
+        };
+
+        app.stop_microphone_test();
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+
+        let sequence = app.microphone_test_sequence;
+        app.start_microphone_test();
+        assert_eq!(app.microphone_test_sequence, sequence);
+        app.start_recording(RecordingSource::Transcribe);
+        assert!(app.deferred_recording_start.is_some());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+
+        app.poll_microphone_test();
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+        app.stop_recording();
+        assert!(app.deferred_recording_start.is_none());
+        thread::sleep(Duration::from_millis(100));
+        app.poll_microphone_test();
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+    }
+
+    #[test]
+    fn stopping_during_microphone_startup_adopts_ready_session_until_teardown() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 9,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.stop_microphone_test();
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 9,
+                result: Ok(RecordingSession::simulated_with_stop_delay(
+                    None,
+                    CaptureStopReason::Explicit,
+                    Duration::from_millis(50),
+                )),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+        assert!(app.microphone_test_is_active());
+        thread::sleep(Duration::from_millis(70));
+        app.poll_microphone_test();
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+    }
+
+    #[test]
+    fn cancelled_microphone_startup_keeps_audio_excluded_until_worker_confirmation() {
+        let mut app = test_app();
+        let cancellation = CaptureCancellation::new();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 12,
+            stop_requested: false,
+            cancellation: cancellation.clone(),
+        };
+
+        app.stop_microphone_test();
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 12,
+                stop_requested: true,
+                ..
+            }
+        ));
+        let sequence = app.microphone_test_sequence;
+        app.start_microphone_test();
+        assert_eq!(app.microphone_test_sequence, sequence);
+        app.apply_history_action(HistoryPageAction::Play(7));
+        assert_eq!(app.deferred_history_playback, Some(7));
+        app.start_recording(RecordingSource::Transcribe);
+        assert!(app.deferred_recording_start.is_some());
+        assert!(app.deferred_history_playback.is_none());
+        assert_eq!(app.status_message, "Preparing microphone");
+        app.apply_history_action(HistoryPageAction::Play(8));
+        assert!(app.playing_history_id.is_none());
+        assert!(app.deferred_history_playback.is_none());
+        assert_eq!(
+            app.status_message,
+            "Stop recording before playing retained audio"
+        );
+        assert!(app.microphone_test_is_active());
+
+        app.stop_recording();
+
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 12,
+                result: Err(CaptureError::StartupCancelled),
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+        assert!(app.microphone_test_error.is_none());
     }
 
     #[test]
@@ -10446,6 +13833,7 @@ mod layout_tests {
                 stop_requested: false,
                 max_duration_seconds: 30,
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+                capture_diagnostics: CaptureDiagnosticContext::default(),
                 abandon: Arc::new(AtomicBool::new(false)),
             });
             let preload_event = AppEvent::ModelPreloadFinished {
@@ -10502,6 +13890,17 @@ mod layout_tests {
             target_activated_at: None,
             paste_completed_at: Some(base + Duration::from_millis(735)),
             output_completed_at: Some(base + Duration::from_millis(735)),
+            model_id: Some("whisper_cpp_base_en".into()),
+            resolved_backend: Some("transcribe-cpp".into()),
+            compute_backend: Some("CPU".into()),
+            streaming_mode: Some("rolling".into()),
+            cold_or_warm: Some("cold".into()),
+            reported_model_load_ms: Some(50),
+            audio_duration_ms: Some(500),
+            processing_duration_ms: Some(500),
+            maximum_input_rms: Some(0.25),
+            maximum_input_peak: Some(0.75),
+            capture_diagnostics: None,
         };
 
         assert_eq!(
@@ -10519,6 +13918,62 @@ mod layout_tests {
                 "Total observed: 735 ms",
             ]
         );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_attributes_only_observed_session_phases() {
+        let base = Instant::now();
+        let mut trace = LatencyTrace::started_at(base, TriggerObservation::HotkeyPoll);
+        trace.observe_session_context(Some("whisper_cpp_base_en".into()), StreamingMode::Rolling);
+        trace.overlay_visible_at = Some(base + Duration::from_millis(5));
+        trace.recorder_started_at = Some(base + Duration::from_millis(10));
+        trace.first_meter_update_at = Some(base + Duration::from_millis(25));
+        trace.stop_requested_at = Some(base + Duration::from_millis(510));
+        trace.capture_finalized_at = Some(base + Duration::from_millis(530));
+        trace.final_text_ready_at = Some(base + Duration::from_millis(710));
+        trace.paste_completed_at = Some(base + Duration::from_millis(760));
+        trace.output_completed_at = Some(base + Duration::from_millis(770));
+        trace.observe_capture_metrics(&CaptureMetrics {
+            duration: Duration::from_millis(520),
+            stop_trigger_elapsed: Duration::from_millis(500),
+            speech_trigger_elapsed: Some(Duration::from_millis(150)),
+            source_sample_rate: 48_000,
+            source_channels: 2,
+            source_frames: 24_960,
+            prepared_frames: 8_320,
+            maximum_input_rms: 0.2,
+            maximum_input_peak: 0.8,
+            dropped_samples: 0,
+            stream_restarts: 0,
+        });
+
+        let snapshot =
+            trace.diagnostic_snapshot(SessionId(41), DiagnosticSessionOutcome::Completed, None);
+
+        assert_eq!(snapshot.session_id, 41);
+        assert_eq!(snapshot.trigger, "hotkey_poll");
+        assert_eq!(snapshot.streaming_mode.as_deref(), Some("rolling"));
+        assert_eq!(snapshot.metrics.hotkey_to_overlay_visible_ms, Some(5));
+        assert_eq!(snapshot.metrics.hotkey_to_capture_started_ms, Some(10));
+        assert_eq!(snapshot.metrics.hotkey_to_first_meter_update_ms, Some(25));
+        assert_eq!(snapshot.metrics.maximum_input_rms, Some(0.2));
+        assert_eq!(snapshot.metrics.maximum_input_peak, Some(0.8));
+        assert_eq!(snapshot.metrics.recording_duration_ms, Some(500));
+        assert_eq!(snapshot.metrics.stop_to_capture_finalized_ms, Some(20));
+        assert_eq!(snapshot.metrics.recording_end_to_final_text_ms, Some(200));
+        assert_eq!(snapshot.metrics.final_text_to_paste_ms, Some(50));
+        assert_eq!(snapshot.metrics.final_text_to_output_completed_ms, Some(60));
+        assert_eq!(snapshot.metrics.total_end_to_end_ms, Some(770));
+        assert_eq!(snapshot.metrics.speech_start_detected_ms, None);
+        assert_eq!(snapshot.metrics.post_processing_ms, None);
+
+        let failed = trace.diagnostic_snapshot(
+            SessionId(41),
+            DiagnosticSessionOutcome::Failed,
+            Some(DiagnosticFailureStage::Output),
+        );
+        assert_eq!(failed.outcome, DiagnosticSessionOutcome::Failed);
+        assert_eq!(failed.failure_stage, Some(DiagnosticFailureStage::Output));
     }
 
     #[test]
@@ -10543,6 +13998,17 @@ mod layout_tests {
             target_activated_at: None,
             paste_completed_at: None,
             output_completed_at: None,
+            model_id: Some("whisper_cpp_base_en".into()),
+            resolved_backend: Some("transcribe-cpp".into()),
+            compute_backend: Some("CPU".into()),
+            streaming_mode: Some("final_only".into()),
+            cold_or_warm: None,
+            reported_model_load_ms: None,
+            audio_duration_ms: Some(500),
+            processing_duration_ms: None,
+            maximum_input_rms: Some(0.2),
+            maximum_input_peak: Some(0.8),
+            capture_diagnostics: None,
         };
 
         let summary = trace.summary_lines();
@@ -11448,6 +14914,50 @@ mod layout_tests {
     }
 
     #[test]
+    fn discarded_pending_output_records_a_cancelled_diagnostic() {
+        let mut app = test_app();
+        let session_id = SessionId(14);
+        let request_id = RequestId(15);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            history_id: None,
+            transcript: "discarded".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: Some(LatencyTrace::started_at(
+                Instant::now(),
+                TriggerObservation::AppAction,
+            )),
+        });
+
+        app.stop_and_discard_active_recording();
+
+        let diagnostics_root = std::env::temp_dir().join(format!(
+            "scribe-discarded-output-diagnostics-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&diagnostics_root);
+        let report = diagnostics::export_redacted(&diagnostics_root, &app.diagnostics).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(report["sessions"][0]["outcome"], "cancelled");
+        assert!(report["sessions"][0]["failure_stage"].is_null());
+        let _ = fs::remove_dir_all(diagnostics_root);
+    }
+
+    #[test]
     fn successful_paste_with_restore_failure_keeps_timing_and_never_offers_retry() {
         let mut app = test_app();
         let session_id = SessionId(14);
@@ -11570,6 +15080,8 @@ mod layout_tests {
                     source_channels: 1,
                     source_frames: 1_600,
                     prepared_frames: 1_600,
+                    maximum_input_rms: 0.2,
+                    maximum_input_peak: 0.4,
                     dropped_samples: 0,
                     stream_restarts: 0,
                 },
@@ -11577,6 +15089,7 @@ mod layout_tests {
             stop_requested: true,
             started_at,
             latency: LatencyTrace::started_at(started_at, TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
         };
         assert!(app.begin_preview_drain(
             session_id,
@@ -12625,6 +16138,20 @@ mod layout_tests {
 
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
+        // Keep Playground event tests independent from whichever legacy model
+        // happens to be installed on the developer machine. The default
+        // catalog artifact is now GGUF, so a tiny local test file is enough
+        // to exercise card/session state without invoking native loading.
+        let fixture = std::env::temp_dir().join(format!(
+            "scribe-app-default-tiny-{}-{}.gguf",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&fixture, b"test-only placeholder").unwrap();
+        config
+            .general
+            .model_paths
+            .insert("whisper_cpp_tiny_en".to_owned(), fixture.clone());
         config::normalize_config(&mut config);
         let (tx, rx) = unbounded();
 
@@ -12633,11 +16160,23 @@ mod layout_tests {
         LocalTranscriberApp {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            remote_catalog_filters: RemoteCatalogFilters::default(),
+            remote_catalog_sort: RemoteCatalogSort::default(),
+            model_import_path: String::new(),
+            remote_catalog: RemoteCatalogState::default(),
             audio_devices: Vec::new(),
+            microphone_test: MicrophoneTest::Idle,
+            microphone_test_sequence: 0,
+            microphone_test_error: None,
+            microphone_monitor_retry_at: None,
+            microphone_level_envelope: MicrophoneLevelEnvelope::default(),
+            deferred_recording_start: None,
+            deferred_history_playback: None,
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
+            local_gguf_import: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -12691,13 +16230,193 @@ mod layout_tests {
             session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
+            diagnostics: DiagnosticsStore::default(),
+            test_gguf_fixture: Some(fixture),
             captured_targets: HashMap::new(),
             overlay_controller: OverlayController::new(false),
             overlay_hide_at: None,
             tray_service: None,
             last_tray_state: None,
+            window_hidden_to_tray: false,
             quit_requested: false,
         }
+    }
+
+    #[test]
+    fn trusted_catalog_event_updates_only_backend_owned_catalog_state() {
+        let mut app = test_app();
+        app.remote_catalog.loading = true;
+        let snapshot = CatalogSnapshot {
+            source: crate::huggingface_catalog::CatalogSource::BundledFallback,
+            fetched_at_unix_seconds: 0,
+            models: Vec::new(),
+        };
+        app.tx
+            .send(AppEvent::RemoteCatalogLoaded {
+                result: Ok(snapshot),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(!app.remote_catalog.loading);
+        assert!(app.remote_catalog.error.is_none());
+        assert_eq!(
+            app.remote_catalog
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.source),
+            Some(crate::huggingface_catalog::CatalogSource::BundledFallback)
+        );
+    }
+
+    fn remote_catalog_model(
+        id: &str,
+        display_name: &str,
+        languages: &[&str],
+        recommended: bool,
+        variant_size_bytes: u64,
+    ) -> RemoteModel {
+        RemoteModel {
+            id: id.to_owned(),
+            revision: "a".repeat(40),
+            display_name: display_name.to_owned(),
+            description: format!("{display_name} description"),
+            languages: languages
+                .iter()
+                .map(|language| (*language).to_owned())
+                .collect(),
+            recommended,
+            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
+            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
+                "Fixture only".to_owned(),
+            ),
+            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
+                id: "q4".to_owned(),
+                filename: "fixture.gguf".to_owned(),
+                size_bytes: variant_size_bytes,
+                expected_sha256: "b".repeat(64),
+            }],
+        }
+    }
+
+    #[test]
+    fn remote_catalog_browse_filters_and_sorts_only_from_available_metadata() {
+        const MIB: u64 = 1024 * 1024;
+        let models = vec![
+            remote_catalog_model(
+                "handy-computer/compact",
+                "Compact",
+                &["en"],
+                false,
+                320 * MIB,
+            ),
+            remote_catalog_model(
+                "handy-computer/multilingual",
+                "Multilingual",
+                &["en", "es"],
+                true,
+                800 * MIB,
+            ),
+            remote_catalog_model(
+                "handy-computer/large",
+                "Large",
+                &["multilingual"],
+                true,
+                2 * 1024 * MIB,
+            ),
+        ];
+        let mut config = AppConfig::default();
+        let installed = config::ManagedRemoteModelInstall {
+            repository: "handy-computer/compact".to_owned(),
+            revision: "a".repeat(40),
+            filename: "fixture.gguf".to_owned(),
+            ..Default::default()
+        };
+        config.general.managed_remote_models.insert(
+            config::managed_remote_model_id(
+                &installed.repository,
+                &installed.revision,
+                &installed.filename,
+            )
+            .unwrap(),
+            installed,
+        );
+
+        let installed_only = filtered_remote_models(
+            &models,
+            &config,
+            "",
+            RemoteCatalogFilters {
+                installed_only: true,
+                ..Default::default()
+            },
+            RemoteCatalogSort::Name,
+        );
+        assert_eq!(
+            installed_only
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["handy-computer/compact"]
+        );
+
+        let multilingual_standard = filtered_remote_models(
+            &models,
+            &config,
+            "es",
+            RemoteCatalogFilters {
+                multilingual_only: true,
+                size_tier: RemoteCatalogSizeTier::Standard,
+                ..Default::default()
+            },
+            RemoteCatalogSort::Name,
+        );
+        assert_eq!(
+            multilingual_standard
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["handy-computer/multilingual"]
+        );
+
+        let recommended_first = filtered_remote_models(
+            &models,
+            &config,
+            "",
+            RemoteCatalogFilters::default(),
+            RemoteCatalogSort::Recommended,
+        );
+        assert_eq!(
+            recommended_first
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "handy-computer/large",
+                "handy-computer/multilingual",
+                "handy-computer/compact"
+            ]
+        );
+
+        let smallest_first = filtered_remote_models(
+            &models,
+            &config,
+            "",
+            RemoteCatalogFilters::default(),
+            RemoteCatalogSort::Smallest,
+        );
+        assert_eq!(
+            smallest_first
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "handy-computer/compact",
+                "handy-computer/multilingual",
+                "handy-computer/large"
+            ]
+        );
     }
 
     #[test]
@@ -13587,7 +17306,9 @@ mod layout_tests {
         let model_dir = root.join("whisper.cpp");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
+        let tiny_path = root.join("gguf").join("whisper-tiny.en-Q4_K_M.gguf");
+        fs::create_dir_all(tiny_path.parent().unwrap()).unwrap();
+        fs::write(&tiny_path, b"tiny").unwrap();
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -13670,38 +17391,38 @@ mod layout_tests {
     fn refreshing_playground_cards_retains_selected_results_and_drops_removed_cards() {
         let root =
             std::env::temp_dir().join(format!("scribe-playground-cards-{}", std::process::id()));
-        let model_dir = root.join("whisper.cpp");
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
-        fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
+        let tiny_path = root.join("gguf").join("whisper-tiny.en-Q4_K_M.gguf");
+        fs::create_dir_all(tiny_path.parent().unwrap()).unwrap();
+        fs::write(&tiny_path, b"tiny").unwrap();
 
         let mut app = test_app();
         app.config.general.model_storage_dir = root.clone();
-        app.config.general.playground_selected_models = vec![
-            "whisper_cpp_tiny_en".to_owned(),
-            "whisper_cpp_base_en".to_owned(),
-        ];
-        app.config.general.playground_model_order = vec![
-            "whisper_cpp_base_en".to_owned(),
-            "whisper_cpp_tiny_en".to_owned(),
-        ];
+        app.config
+            .general
+            .model_paths
+            .insert("whisper_cpp_tiny_en".to_owned(), tiny_path);
+        app.config.general.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
+        app.config.general.playground_model_order = vec!["whisper_cpp_tiny_en".to_owned()];
         config::normalize_config(&mut app.config);
         app.refresh_playground_cards_from_config();
         app.playground_cards[0].transcript = "retained".to_owned();
 
-        app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
         app.refresh_playground_cards_from_config();
         assert_eq!(app.playground_cards.len(), 1);
         assert_eq!(app.playground_cards[0].transcript, "retained");
+
+        app.config.general.playground_selected_models.clear();
+        app.refresh_playground_cards_from_config();
+        assert!(app.playground_cards.is_empty());
 
         app.config
             .general
             .playground_selected_models
             .push("whisper_cpp_tiny_en".to_owned());
         app.refresh_playground_cards_from_config();
-        assert_eq!(app.playground_cards.len(), 2);
-        assert!(app.playground_cards[1].transcript.is_empty());
+        assert_eq!(app.playground_cards.len(), 1);
+        assert!(app.playground_cards[0].transcript.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -14139,6 +17860,381 @@ mod layout_tests {
     }
 
     #[test]
+    fn input_sensitivity_is_the_only_accessible_microphone_testing_control() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::General;
+        app.playing_history_id = Some(1);
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_general_settings(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Audio")
+        }));
+
+        let microphone_label_id = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some("Microphone"))
+            .map(|(id, _)| *id)
+            .expect("missing Microphone label");
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ComboBox
+                && node.labelled_by().contains(&microphone_label_id)
+        }));
+
+        let sensitivity_label_id = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::StaticText
+                    && node.name() == Some("Input sensitivity")
+            })
+            .map(|(id, _)| *id)
+            .expect("missing Input sensitivity label");
+        let slider = update
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| {
+                node.role() == egui::accesskit::Role::Slider
+                    && node.name() == Some("Input sensitivity")
+            })
+            .expect("missing accessible input sensitivity slider");
+        assert!(slider.labelled_by().contains(&sensitivity_label_id));
+        assert_eq!(slider.min_numeric_value(), Some(0.0));
+        assert_eq!(slider.max_numeric_value(), Some(100.0));
+        assert!(slider.numeric_value().is_some());
+        assert!(
+            slider
+                .description()
+                .is_some_and(|description| description.contains("Left and Right arrow keys"))
+        );
+
+        for forbidden in [
+            "Test microphone",
+            "Voice activation",
+            "Microphone input level",
+            "Voice detected",
+            "Clipping",
+        ] {
+            assert!(
+                !update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(forbidden))
+            );
+        }
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.name()
+                .is_some_and(|name| name.contains("dBFS") || name.contains("RMS"))
+        }));
+    }
+
+    #[test]
+    fn input_sensitivity_slider_supports_click_drag_and_arrow_keys() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
+        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
+        let mut slider_rect = egui::Rect::NOTHING;
+        let render = |ctx: &egui::Context,
+                      raw_input: egui::RawInput,
+                      threshold: &mut f32,
+                      slider_rect: &mut egui::Rect| {
+            let _ = ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *slider_rect = microphone_sensitivity_slider(ui, 0.4, threshold).rect;
+                });
+            });
+        };
+
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        let click = egui::pos2(
+            slider_rect.left() + slider_rect.width() * 0.8,
+            slider_rect.center().y,
+        );
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        let clicked_position = rms_to_slider_position(threshold);
+        assert!((clicked_position - 0.8).abs() < 0.02);
+
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        assert!(rms_to_slider_position(threshold) < clicked_position);
+
+        let drag_start = egui::pos2(
+            slider_rect.left() + slider_rect.width() * rms_to_slider_position(threshold),
+            slider_rect.center().y,
+        );
+        let drag_target = egui::pos2(
+            slider_rect.left() + slider_rect.width() * 0.25,
+            slider_rect.center().y,
+        );
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(drag_start),
+                    egui::Event::PointerButton {
+                        pos: drag_start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(drag_target)],
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        render(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: drag_target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            &mut threshold,
+            &mut slider_rect,
+        );
+        assert!((rms_to_slider_position(threshold) - 0.25).abs() < 0.02);
+    }
+
+    #[test]
+    fn input_sensitivity_slider_accepts_tab_focus() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
+        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
+        let mut slider_id = egui::Id::NULL;
+        let mut render = |raw_input: egui::RawInput| {
+            let _ = ctx.run(raw_input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    slider_id = microphone_sensitivity_slider(ui, 0.0, &mut threshold).id;
+                });
+            });
+        };
+
+        render(egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        });
+        render(egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+
+        assert!(ctx.memory(|memory| memory.has_focus(slider_id)));
+    }
+
+    #[test]
+    fn input_sensitivity_avoids_live_meter_announcements_and_remains_usable() {
+        fn render(
+            ctx: &egui::Context,
+            app: &mut LocalTranscriberApp,
+        ) -> egui::accesskit::TreeUpdate {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_024.0, 1_600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| app.ui_general_settings(ui));
+                },
+            )
+            .platform_output
+            .accesskit_update
+            .unwrap()
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 1,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        let update = render(&ctx, &mut app);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+        }));
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.live().is_some()
+                && node.name().is_some_and(|name| {
+                    name.contains("microphone")
+                        || name.contains("Voice detected")
+                        || name.contains("Clipping")
+                        || name.contains("RMS")
+                })
+        }));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
+        session.set_simulated_telemetry(LevelSnapshot {
+            rms: 0.08,
+            peak: 0.15,
+        });
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active { session };
+        let update = render(&ctx, &mut app);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+        }));
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.name() == Some("Voice detected") || node.name() == Some("Clipping")
+        }));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.microphone_test_error = Some("Microphone permission denied".to_owned());
+        app.microphone_monitor_retry_at = Some(Instant::now() + Duration::from_secs(60));
+        let update = render(&ctx, &mut app);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+        }));
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Microphone permission denied"))
+        );
+    }
+
+    #[test]
+    fn transcribe_recording_does_not_render_a_second_microphone_meter() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.active_recording = Some(ActiveRecording {
+            session_id: SessionId(903),
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
+        });
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_transcribe(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.name().is_some_and(|name| {
+                name.contains("Input RMS") || name.contains("input level") || name.contains("peak")
+            })
+        }));
+    }
+
+    #[test]
     fn transcript_editor_and_queued_output_state_are_accessible() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -14379,7 +18475,7 @@ mod layout_tests {
         let root =
             std::env::temp_dir().join(format!("scribe-neutral-playground-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let primary = root.join("primary.bin");
+        let primary = root.join("primary.gguf");
         let legacy = root.join("legacy");
         fs::create_dir_all(legacy.join("am")).unwrap();
         fs::create_dir_all(legacy.join("conf")).unwrap();
@@ -14393,20 +18489,20 @@ mod layout_tests {
         config
             .general
             .model_paths
-            .insert("whisper_cpp_base_en".to_owned(), primary);
+            .insert("whisper_cpp_tiny_en".to_owned(), primary);
         config
             .general
             .model_paths
             .insert("vosk_small_en".to_owned(), legacy);
         config.general.playground_selected_models =
-            vec!["whisper_cpp_base_en".to_owned(), "vosk_small_en".to_owned()];
+            vec!["whisper_cpp_tiny_en".to_owned(), "vosk_small_en".to_owned()];
         let service = TranscriptionService::new(config.clone());
 
         let cards = cards_from_config(&config, &service);
 
         assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].descriptor.id.as_str(), "whisper_cpp_base_en");
-        assert_eq!(cards[0].descriptor.display_name, "English Base");
+        assert_eq!(cards[0].descriptor.id.as_str(), "whisper_cpp_tiny_en");
+        assert_eq!(cards[0].descriptor.display_name, "English Tiny");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -14850,6 +18946,20 @@ mod layout_tests {
     }
 
     #[test]
+    fn embedded_gguf_model_is_ready_without_a_runtime_package() {
+        let mut model = config::configured_models(&AppConfig::default())
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .unwrap();
+        model.install_status = ModelInstallStatus::Installed;
+
+        assert_eq!(
+            runtime_status_for_model(&AppConfig::default(), &model),
+            ModelRuntimeStatus::Ready
+        );
+    }
+
+    #[test]
     fn vosk_model_needs_runtime_instead_of_placeholder_backend_message() {
         let mut model = test_model();
         model.id = "vosk_small_en".to_owned();
@@ -15015,6 +19125,86 @@ mod layout_tests {
         assert!(external_path.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn removing_an_imported_model_only_removes_its_scribe_owned_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-imported-removal-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let storage = root.join("scribe-models");
+        let external = root.join("external").join("imported.gguf");
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, b"external").unwrap();
+        let model_id = ModelId::new("local-aaaaaaaaaaaaaaaaaaaaaaaa");
+        let receipt = installed_manifest::imported_manifest_path_for(&storage, &model_id);
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        fs::write(&receipt, b"scribe receipt").unwrap();
+
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = storage;
+        assert!(is_app_managed_model_path(&config, &receipt));
+        assert!(!is_app_managed_model_path(&config, &external));
+
+        let removal =
+            ManagedRemoval::stage(&receipt, std::slice::from_ref(&receipt), "0".repeat(64))
+                .unwrap();
+        removal.commit().unwrap();
+
+        assert!(!receipt.exists());
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_gguf_import_rejects_sources_inside_scribe_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-import-owned-source-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let storage = root.join("scribe-models");
+        let source = storage.join("owned.gguf");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(&source, b"not an importable runtime fixture").unwrap();
+
+        let fingerprint =
+            fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
+        let error = reject_import_source_in_model_storage(&fingerprint.canonical_path, &storage)
+            .unwrap_err();
+
+        assert!(error.contains("outside Scribe's managed model storage"));
+        assert!(!storage.join("imported-receipts").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_gguf_import_recheck_rejects_same_size_changed_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-import-fingerprint-recheck-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("external").join("imported.gguf");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"original").unwrap();
+        let before =
+            fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
+        let install = config::ImportedGgufModelInstall::validated(
+            before.canonical_path.clone(),
+            before.size_bytes,
+            before.sha256,
+            "Imported fixture".to_owned(),
+        );
+
+        fs::write(&source, b"changed!").unwrap();
+        let after = fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
+
+        assert_eq!(after.size_bytes, install.size_bytes);
+        assert!(!local_gguf_import_fingerprint_matches(&install, &after));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

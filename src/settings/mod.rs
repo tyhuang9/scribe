@@ -4,8 +4,9 @@ mod schema;
 
 pub use repository::SettingsStore;
 pub use schema::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistoryMode,
-    HistorySettings, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_MANUAL_ACTIVATION_RMS, DeveloperSettings,
+    GeneralSettings, HistoryMode, HistorySettings, MAX_MANUAL_ACTIVATION_RMS,
+    MIN_MANUAL_ACTIVATION_RMS, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
     PerformanceSettings, RecordingSettings, StreamingMode, StreamingSettings,
 };
 

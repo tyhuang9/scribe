@@ -104,6 +104,8 @@ pub(crate) fn artifact_config_fingerprint(config: &AppConfig) -> Result<String> 
     let normalized = normalized_config(config);
     let witness = serde_json::json!({
         "managed_models": normalized.general.managed_models,
+        "managed_remote_models": normalized.general.managed_remote_models,
+        "imported_gguf_models": normalized.general.imported_gguf_models,
         "managed_runtimes": normalized.general.managed_runtimes,
         "model_paths": normalized.general.model_paths,
     });
@@ -487,8 +489,10 @@ mod tests {
         let mut store = SettingsStore::new(path.clone(), Duration::from_secs(60));
         let mut first = AppConfig::default();
         first.recording.hotkey = "First".to_owned();
+        first.recording.manual_activation_rms = 0.01;
         let mut latest = first.clone();
         latest.recording.hotkey = "Latest".to_owned();
+        latest.recording.manual_activation_rms = 0.025;
 
         store.schedule(&first);
         store.schedule(&latest);
@@ -497,8 +501,9 @@ mod tests {
         assert!(store.flush().unwrap());
         assert!(!store.has_pending());
 
-        let persisted: AppConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let persisted = load_from_path(&path).unwrap();
         assert_eq!(persisted.recording.hotkey, "Latest");
+        assert!((persisted.recording.manual_activation_rms - 0.025).abs() < f32::EPSILON);
         assert!(!store.flush().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -551,7 +556,7 @@ mod tests {
         let restarted = load_from_path(&path).unwrap();
 
         assert_eq!(artifact_config_fingerprint(&restarted).unwrap(), expected);
-        let mut changed = restarted;
+        let mut changed = restarted.clone();
         changed.recording.hotkey = "Different".to_owned();
         assert_eq!(artifact_config_fingerprint(&changed).unwrap(), expected);
         changed.general.model_paths.insert(
@@ -559,6 +564,61 @@ mod tests {
             PathBuf::from("models/tiny.bin"),
         );
         assert_ne!(artifact_config_fingerprint(&changed).unwrap(), expected);
+
+        let mut remote_changed = restarted.clone();
+        let remote_storage = dir.join("remote-model-storage");
+        remote_changed.general.model_storage_dir = remote_storage.clone();
+        let repository = "handy-computer/model";
+        let revision = "a".repeat(40);
+        let filename = "model.gguf";
+        let remote_id = crate::config::managed_remote_model_id(repository, &revision, filename)
+            .expect("fixture remote ID");
+        let remote_path = remote_storage
+            .join("huggingface")
+            .join("handy-computer")
+            .join("model")
+            .join(&revision)
+            .join(&remote_id)
+            .join(filename);
+        fs::create_dir_all(remote_path.parent().unwrap()).unwrap();
+        fs::write(&remote_path, b"x").unwrap();
+        remote_changed.general.managed_remote_models.insert(
+            remote_id,
+            crate::config::ManagedRemoteModelInstall {
+                repository: repository.to_owned(),
+                revision,
+                filename: filename.to_owned(),
+                expected_size_bytes: 1,
+                expected_sha256: "b".repeat(64),
+                path: remote_path,
+                display_name: "Remote fixture".to_owned(),
+                description: String::new(),
+                languages: vec!["en".to_owned()],
+                recommended: false,
+                installed_at_unix_seconds: None,
+            },
+        );
+        assert_ne!(
+            artifact_config_fingerprint(&remote_changed).unwrap(),
+            expected
+        );
+
+        let mut imported_changed = restarted;
+        let imported_path = dir.join("external.gguf");
+        fs::write(&imported_path, b"x").unwrap();
+        imported_changed.general.imported_gguf_models.insert(
+            format!("local-{}", "c".repeat(64)),
+            crate::config::ImportedGgufModelInstall::validated(
+                imported_path,
+                1,
+                "c".repeat(64),
+                "Imported fixture".to_owned(),
+            ),
+        );
+        assert_ne!(
+            artifact_config_fingerprint(&imported_changed).unwrap(),
+            expected
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

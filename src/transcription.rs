@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -33,7 +33,7 @@ use crate::installations::{
 pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
-use crate::model_catalog::{model_descriptor, model_descriptors, runtime_model_manifest};
+use crate::model_catalog::{model_descriptor, normal_model_descriptors, runtime_model_manifest};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
@@ -45,11 +45,12 @@ use crate::streaming::{
     TranscriptHypothesis, TranscriptStabilizer,
 };
 
-const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_SMOKE_TIMEOUT: Duration = Duration::from_secs(120);
 const INSTALL_SMOKE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
 const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
+const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Identifies one user dictation session.
 ///
@@ -255,7 +256,7 @@ pub struct TranscriptionOptions {
 ///
 /// `timestamps` means final results may include timestamp metadata; it does
 /// not mean that the Phase 1 legacy bridge can enable timestamps on request.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
     pub streaming: bool,
     pub cancellation: bool,
@@ -276,12 +277,54 @@ pub struct RuntimeCapabilities {
 pub(crate) struct InstallationCandidate {
     pub(crate) model_id: ModelId,
     pub(crate) model_path: PathBuf,
-    pub(crate) runtime_package_root: PathBuf,
+    pub(crate) runtime_package_root: Option<PathBuf>,
+    pub(crate) expected_size_bytes: u64,
+    pub(crate) expected_sha256: String,
+}
+
+impl InstallationCandidate {
+    pub(crate) fn normalized(
+        model_id: ModelId,
+        model_path: PathBuf,
+        runtime_package_root: Option<PathBuf>,
+    ) -> Result<Self> {
+        let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
+            anyhow!("model {model_id} has no normalized pinned artifact manifest")
+        })?;
+        Ok(Self {
+            model_id,
+            model_path,
+            runtime_package_root,
+            expected_size_bytes: manifest.artifact_size_bytes,
+            expected_sha256: manifest.artifact_sha256.to_owned(),
+        })
+    }
+
+    pub(crate) fn pinned(
+        model_id: ModelId,
+        model_path: PathBuf,
+        runtime_package_root: Option<PathBuf>,
+        expected_size_bytes: u64,
+        expected_sha256: String,
+    ) -> Self {
+        Self {
+            model_id,
+            model_path,
+            runtime_package_root,
+            expected_size_bytes,
+            expected_sha256,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct InstallSmoke {
     pub(crate) resolved_acceleration: ResolvedAcceleration,
+    /// Read from the successfully loaded runtime model, never inferred from
+    /// the catalog filename or presentation metadata.
+    pub(crate) detected_architecture: String,
+    /// The runtime's observed capabilities for this installed artifact.
+    pub(crate) capabilities: RuntimeCapabilities,
     pub(crate) health_duration_ms: u128,
     pub(crate) load_duration_ms: u128,
     pub(crate) decode_duration_ms: u128,
@@ -440,6 +483,14 @@ pub struct TranscriptionOutcome {
     pub stderr: String,
 }
 
+impl TranscriptionOutcome {
+    /// Runtime-neutral technical label for diagnostics. Application code uses
+    /// this accessor instead of depending on the private handler selection.
+    pub fn resolved_backend_label(&self) -> &str {
+        &self.backend_label
+    }
+}
+
 /// Runtime-neutral diagnostics from an explicit model preload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelLoadOutcome {
@@ -536,20 +587,25 @@ struct RuntimeWorker {
 struct RuntimeWorkerInner {
     commands: SyncSender<RuntimeCommand>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_gate: Mutex<()>,
+    cancellation: RuntimeRouter,
 }
 
 impl RuntimeWorker {
     fn new(router: RuntimeRouter) -> Self {
         cleanup_stale_temporary_audio();
         let (commands, receiver) = sync_channel(1);
+        let worker_router = router.clone();
         let worker = std::thread::Builder::new()
             .name("scribe-native-runtime".to_owned())
-            .spawn(move || runtime_worker_loop(router, receiver))
+            .spawn(move || runtime_worker_loop(worker_router, receiver))
             .expect("Scribe could not create its native runtime worker");
         Self {
             inner: Arc::new(RuntimeWorkerInner {
                 commands,
                 worker: Mutex::new(Some(worker)),
+                shutdown_gate: Mutex::new(()),
+                cancellation: router,
             }),
         }
     }
@@ -627,31 +683,89 @@ impl RuntimeWorker {
             .recv()
             .map_err(|error| RuntimeError::WorkerUnavailable(error.to_string()))?
     }
+
+    fn shutdown_and_join(&self, timeout: Duration) -> bool {
+        self.inner.shutdown_and_join(timeout)
+    }
+}
+
+impl RuntimeWorkerInner {
+    fn shutdown_and_join(&self, timeout: Duration) -> bool {
+        self.cancellation.cancel_active();
+        let deadline = Instant::now() + timeout;
+        let _shutdown_guard = loop {
+            match self.shutdown_gate.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+                }
+            }
+        };
+
+        let mut worker_guard = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(worker) = worker_guard.as_ref() else {
+            return true;
+        };
+        if worker.is_finished() {
+            let worker = worker_guard.take().expect("worker checked above");
+            let _ = worker.join();
+            return true;
+        }
+
+        let (reply, response) = sync_channel(1);
+        let mut shutdown = RuntimeCommand::Shutdown { reply };
+        loop {
+            match self.commands.try_send(shutdown) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    shutdown = command;
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
+
+        if !worker.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match response.recv_timeout(remaining) {
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) if !worker.is_finished() => return false,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+        while !worker.is_finished() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+        }
+        let worker = worker_guard.take().expect("worker checked above");
+        // A panic/disconnect is an operational failure, but the native thread
+        // is gone and it is therefore safe to continue process teardown.
+        let _ = worker.join();
+        true
+    }
 }
 
 impl Drop for RuntimeWorkerInner {
     fn drop(&mut self) {
-        let (reply, response) = sync_channel(1);
-        let shutdown_completed = self
-            .commands
-            .try_send(RuntimeCommand::Shutdown { reply })
-            .is_ok()
-            && response.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).is_ok();
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if shutdown_completed && let Some(worker) = worker {
-            let _ = worker.join();
-        } else if let Some(worker) = worker {
-            if worker.is_finished() {
-                let _ = worker.join();
-            } else {
-                eprintln!(
-                    "Scribe runtime worker did not shut down within {RUNTIME_SHUTDOWN_TIMEOUT:?}; detaching it"
-                );
-            }
+        if !self.shutdown_and_join(DROP_SHUTDOWN_TIMEOUT) {
+            // Never detach a native worker in-process: that reintroduces the
+            // observed Windows access violation when the DLL unloads. Also do
+            // not hang forever. A hard abort skips destructors/DLL teardown and
+            // is the last-resort process-safe exit policy.
+            eprintln!("native runtime worker exceeded the shutdown deadline; aborting safely");
+            std::process::abort();
         }
     }
 }
@@ -749,11 +863,11 @@ impl TranscriptionService {
         self.config.performance.acceleration_preference
     }
 
-    /// Returns the normalized, runtime-neutral model catalog. Concrete
-    /// runtime requirements and artifact routing remain private below this
-    /// service boundary.
+    /// Returns normal user-facing, runtime-neutral descriptors. Retained
+    /// compatibility descriptors remain resolvable individually for existing
+    /// configurations, but are deliberately absent from the default flow.
     pub fn model_descriptors(&self) -> Vec<ModelDescriptor> {
-        model_descriptors()
+        normal_model_descriptors()
             .into_iter()
             .map(|descriptor| self.effective_descriptor(descriptor))
             .collect()
@@ -767,6 +881,18 @@ impl TranscriptionService {
     }
 
     pub(crate) fn installation_binding(&self, model_id: &ModelId) -> Result<InstallationBinding> {
+        if model_uses_embedded_gguf(model_id)
+            || config::remote_gguf_artifact(&self.config, model_id.as_str()).is_some()
+            || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
+        {
+            return Ok(InstallationBinding {
+                // This stable internal token lets the existing operation
+                // machinery correlate the request without representing a
+                // downloadable or executable runtime.
+                managed_runtime_id: "embedded-transcribe-cpp".to_owned(),
+                installed_package_root: None,
+            });
+        }
         let runtime_id = self
             .router
             .managed_runtime_id(model_id)
@@ -786,6 +912,11 @@ impl TranscriptionService {
         &self,
         model_id: &ModelId,
     ) -> Result<InstallationBinding> {
+        if model_uses_embedded_gguf(model_id) {
+            return Err(anyhow!(
+                "embedded GGUF models do not have a recoverable runtime package"
+            ));
+        }
         let runtime_id = self
             .router
             .managed_runtime_id(model_id)
@@ -830,10 +961,34 @@ impl TranscriptionService {
     /// Returns the conservative feature set for a configured model.
     pub fn capabilities_for(&self, model_id: &ModelId) -> Result<RuntimeCapabilities> {
         let model = self.resolve_model(model_id, None)?;
+        let persisted_capabilities = model
+            .local_path
+            .as_deref()
+            .and_then(|path| {
+                let validation =
+                    if config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some() {
+                        crate::installed_manifest::imported_runtime_validation_for(
+                            model_id,
+                            path,
+                            &config::model_storage_dir(&self.config),
+                        )
+                    } else {
+                        crate::installed_manifest::runtime_validation_for(model_id, path)
+                    };
+                validation.ok().flatten()
+            })
+            .filter(|validation| validation.package_free)
+            .map(|validation| validation.capabilities);
+        if config::remote_gguf_artifact(&self.config, model_id.as_str()).is_some()
+            || config::imported_gguf_artifact(&self.config, model_id.as_str()).is_some()
+        {
+            return Ok(
+                persisted_capabilities.unwrap_or_else(|| self.router.embedded_capabilities())
+            );
+        }
         if self.router.handles_model(model_id) {
-            let runtime_capabilities = self
-                .router
-                .capabilities(model_id)
+            let runtime_capabilities = persisted_capabilities
+                .or_else(|| self.router.capabilities(model_id))
                 .ok_or_else(|| anyhow!("runtime router rejected its own selected model"))?;
             let descriptor = model_descriptor(model_id)
                 .ok_or_else(|| anyhow!("unknown normalized transcription model: {model_id}"))?;
@@ -899,17 +1054,21 @@ impl TranscriptionService {
     ) -> Result<()> {
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
-        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        if let Some(package_root) = runtime_model.package_root.as_deref() {
+            verify_primary_runtime_package_tree(package_root)?;
+        }
         verify_runtime_model_artifact(&runtime_model)?;
         let mut smoke_config = self.config.clone();
         smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
         self.with_config(smoke_config)
             .verify_installation_candidate(
-                InstallationCandidate {
-                    model_id: runtime_model.id,
-                    model_path: runtime_model.path,
-                    runtime_package_root: runtime_model.package_root,
-                },
+                InstallationCandidate::pinned(
+                    runtime_model.id,
+                    runtime_model.path,
+                    runtime_model.package_root,
+                    runtime_model.expected_size_bytes,
+                    runtime_model.expected_sha256,
+                ),
                 &InstallCancellation::default(),
             )
             .map(|_| ())
@@ -938,21 +1097,25 @@ impl TranscriptionService {
         let runtime_model = RuntimeModel {
             id: model_id.clone(),
             path,
-            package_root,
+            package_root: Some(package_root),
             expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256,
+            expected_sha256: manifest.artifact_sha256.to_owned(),
         };
-        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        if let Some(package_root) = runtime_model.package_root.as_deref() {
+            verify_primary_runtime_package_tree(package_root)?;
+        }
         verify_runtime_model_artifact(&runtime_model)?;
         let mut smoke_config = self.config.clone();
         smoke_config.performance.acceleration_preference = AccelerationPreference::Cpu;
         self.with_config(smoke_config)
             .verify_installation_candidate(
-                InstallationCandidate {
-                    model_id: runtime_model.id,
-                    model_path: runtime_model.path,
-                    runtime_package_root: runtime_model.package_root,
-                },
+                InstallationCandidate::pinned(
+                    runtime_model.id,
+                    runtime_model.path,
+                    runtime_model.package_root,
+                    runtime_model.expected_size_bytes,
+                    runtime_model.expected_sha256,
+                ),
                 &InstallCancellation::default(),
             )
             .map(|_| ())
@@ -970,18 +1133,24 @@ impl TranscriptionService {
         let path = model
             .local_path
             .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
+        let imported_artifact = config::imported_gguf_artifact(&self.config, model_id.as_str());
         let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
             anyhow!(
                 "model {} has no pinned size and SHA-256 evidence for verification",
                 model.name
             )
-        })?;
-        crate::installations::verify_file(
-            &path,
-            manifest.artifact_size_bytes,
-            manifest.artifact_sha256,
-        )
-        .map_err(|error| anyhow!("model integrity verification failed: {error}"))
+        });
+        let (expected_size_bytes, expected_sha256) = if let Some(artifact) = imported_artifact {
+            (artifact.expected_size_bytes, artifact.expected_sha256)
+        } else {
+            let manifest = manifest?;
+            (
+                manifest.artifact_size_bytes,
+                manifest.artifact_sha256.to_owned(),
+            )
+        };
+        crate::installations::verify_file(&path, expected_size_bytes, &expected_sha256)
+            .map_err(|error| anyhow!("model integrity verification failed: {error}"))
     }
 
     /// Requests lock-free cancellation of native work submitted before this
@@ -996,6 +1165,13 @@ impl TranscriptionService {
     pub fn cancel_active_and_wait(&self, timeout: Duration) -> bool {
         self.router.cancel_active();
         crate::stt::cancel_active_processes_and_wait(timeout)
+    }
+
+    /// Stops the dedicated native runtime and joins it within the caller's
+    /// process-exit budget. A false result requires an immediate hard abort;
+    /// continuing normal teardown would permit a live worker to race DLL unload.
+    pub(crate) fn shutdown_runtime_and_wait(&self, timeout: Duration) -> bool {
+        self.worker.shutdown_and_join(timeout)
     }
 
     /// Captures cancellation state synchronously before a caller dispatches
@@ -1046,7 +1222,14 @@ impl TranscriptionService {
             .arg(INSTALL_SMOKE_HELPER_FLAG)
             .arg(candidate.model_id.as_str())
             .arg(&candidate.model_path)
-            .arg(&candidate.runtime_package_root)
+            .arg(
+                candidate
+                    .runtime_package_root
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("-")),
+            )
+            .arg(candidate.expected_size_bytes.to_string())
+            .arg(&candidate.expected_sha256)
             .arg(acceleration)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1104,20 +1287,16 @@ impl TranscriptionService {
         candidate: InstallationCandidate,
         cancellation: &InstallCancellation,
     ) -> Result<InstallSmoke> {
-        let manifest = runtime_model_manifest(&candidate.model_id).ok_or_else(|| {
-            anyhow!(
-                "model {} has no normalized pinned artifact manifest",
-                candidate.model_id
-            )
-        })?;
         let runtime_model = RuntimeModel {
             id: candidate.model_id,
             path: candidate.model_path,
             package_root: candidate.runtime_package_root,
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256,
+            expected_size_bytes: candidate.expected_size_bytes,
+            expected_sha256: candidate.expected_sha256,
         };
-        verify_primary_runtime_package_tree(&runtime_model.package_root)?;
+        if let Some(package_root) = runtime_model.package_root.as_deref() {
+            verify_primary_runtime_package_tree(package_root)?;
+        }
         let router = RuntimeRouter::new();
         let worker = RuntimeWorker::new(router.clone());
         let preference = self.config.performance.acceleration_preference;
@@ -1170,6 +1349,8 @@ impl TranscriptionService {
 
         Ok(InstallSmoke {
             resolved_acceleration: load.diagnostics.resolved_acceleration,
+            detected_architecture: load.detected_architecture,
+            capabilities: load.capabilities,
             health_duration_ms,
             load_duration_ms,
             decode_duration_ms,
@@ -1194,7 +1375,10 @@ impl TranscriptionService {
         model_id: ModelId,
         model_path: Option<PathBuf>,
     ) -> Result<(PreviewAudioPublisher, RollingPreviewHandle)> {
-        if !self.router.handles_model(&model_id) {
+        if !self.router.handles_model(&model_id)
+            && config::remote_gguf_artifact(&self.config, model_id.as_str()).is_none()
+            && config::imported_gguf_artifact(&self.config, model_id.as_str()).is_none()
+        {
             return Err(anyhow!(
                 "rolling preview is unavailable for this model's verified native runtime"
             ));
@@ -1210,35 +1394,39 @@ impl TranscriptionService {
             sequence: 0,
         };
         let service = self.clone();
+        let cancellation = service.clone();
         let mut stabilizer = TranscriptStabilizer::new(session_id, request_id, model_id.clone());
         let decode_model_id = model_id.clone();
-        let session = RollingPreviewSession::new(move |snapshot| {
-            let hypothesis_identity = snapshot.identity.clone();
-            let window_start_frame = snapshot.window_start_frame;
-            let window_end_frame = snapshot.window_end_frame;
-            let mut request = TranscriptionRequest::new(
-                session_id,
-                request_id,
-                Arc::clone(&snapshot.audio),
-                decode_model_id.clone(),
-            );
-            request.model_path = model_path.clone();
-            request.options = TranscriptionOptions::default();
-            let outcome = service.transcribe_preview(request)?;
-            let hypothesis = transcript_hypothesis(
-                hypothesis_identity,
-                window_start_frame,
-                window_end_frame,
-                &outcome.transcript,
-            );
-            let state = stabilizer
-                .push(hypothesis)
-                .map_err(|error| anyhow!(error))?;
-            Ok(StreamUpdate {
-                committed: state.committed,
-                tentative: state.tentative,
-            })
-        })
+        let session = RollingPreviewSession::new_with_cancel(
+            move |snapshot| {
+                let hypothesis_identity = snapshot.identity.clone();
+                let window_start_frame = snapshot.window_start_frame;
+                let window_end_frame = snapshot.window_end_frame;
+                let mut request = TranscriptionRequest::new(
+                    session_id,
+                    request_id,
+                    Arc::clone(&snapshot.audio),
+                    decode_model_id.clone(),
+                );
+                request.model_path = model_path.clone();
+                request.options = TranscriptionOptions::default();
+                let outcome = service.transcribe_preview(request)?;
+                let hypothesis = transcript_hypothesis(
+                    hypothesis_identity,
+                    window_start_frame,
+                    window_end_frame,
+                    &outcome.transcript,
+                );
+                let state = stabilizer
+                    .push(hypothesis)
+                    .map_err(|error| anyhow!(error))?;
+                Ok(StreamUpdate {
+                    committed: state.committed,
+                    tentative: state.tentative,
+                })
+            },
+            move || cancellation.cancel_active(),
+        )
         .map_err(|error| anyhow!("failed to start rolling preview worker: {error}"))?;
         let publisher = session.audio_publisher(session_id, request_id, model_id);
         Ok((publisher, RollingPreviewHandle { identity, session }))
@@ -1260,7 +1448,10 @@ impl TranscriptionService {
                 "rolling preview was cancelled before native dispatch"
             ));
         }
-        if !self.router.handles_model(&request.model_id) {
+        if !self.router.handles_model(&request.model_id)
+            && config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
+            && config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_none()
+        {
             return Err(anyhow!(
                 "rolling preview is unavailable for this model's verified native runtime"
             ));
@@ -1309,7 +1500,10 @@ impl TranscriptionService {
             ));
         }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
-        if self.router.handles_model(&request.model_id) {
+        if self.router.handles_model(&request.model_id)
+            || config::remote_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
+            || config::imported_gguf_artifact(&self.config, request.model_id.as_str()).is_some()
+        {
             return self.transcribe_primary(request, model, ticket);
         }
 
@@ -1415,28 +1609,54 @@ impl TranscriptionService {
             .clone()
             .ok_or_else(|| anyhow!("download {} before transcribing", model.name))?;
         let model_id = ModelId::new(model.id.clone());
-        let package_root = match self.router.managed_runtime_id(&model_id) {
-            Some(runtime_id) => configured_managed_runtime_root(&self.config, runtime_id)?,
-            None => None,
-        }
-            .or_else(|| primary_runtime_package_root(&self.config))
-            .ok_or_else(|| {
-            anyhow!(
-                "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
+        let remote_artifact = config::remote_gguf_artifact(&self.config, &model.id);
+        let imported_artifact = config::imported_gguf_artifact(&self.config, &model.id);
+        let is_gguf = remote_artifact.is_some()
+            || imported_artifact.is_some()
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+        let package_root = if is_gguf {
+            None
+        } else {
+            Some(
+                match self.router.managed_runtime_id(&model_id) {
+                    Some(runtime_id) => {
+                        configured_managed_runtime_root(&self.config, runtime_id)?
+                    }
+                    None => None,
+                }
+                .or_else(|| primary_runtime_package_root(&self.config))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "the verified native runtime package is not installed; install it from Models or configure the compatibility CLI"
+                    )
+                })?,
             )
-        })?;
-        let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
-            anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for in-process native loading",
-                model.name
+        };
+        let (expected_size_bytes, expected_sha256) = if let Some(artifact) = remote_artifact {
+            (artifact.expected_size_bytes, artifact.expected_sha256)
+        } else if let Some(artifact) = imported_artifact {
+            (artifact.expected_size_bytes, artifact.expected_sha256)
+        } else {
+            let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
+                anyhow!(
+                    "model {} has no pinned size and SHA-256 evidence for in-process native loading",
+                    model.name
+                )
+            })?;
+            (
+                manifest.artifact_size_bytes,
+                manifest.artifact_sha256.to_owned(),
             )
-        })?;
+        };
         Ok(RuntimeModel {
             id: model.id.into(),
             path,
             package_root,
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256,
+            expected_size_bytes,
+            expected_sha256,
         })
     }
 
@@ -1482,6 +1702,23 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
         let runtime_package_root = args
             .next()
             .ok_or_else(|| anyhow!("missing runtime package root"))?;
+        let expected_size_bytes = args
+            .next()
+            .ok_or_else(|| anyhow!("missing expected model size"))?
+            .into_string()
+            .map_err(|_| anyhow!("expected model size is not valid Unicode"))?
+            .parse::<u64>()
+            .map_err(|_| anyhow!("expected model size is invalid"))?;
+        let expected_sha256 = args
+            .next()
+            .ok_or_else(|| anyhow!("missing expected model SHA-256"))?
+            .into_string()
+            .map_err(|_| anyhow!("expected model SHA-256 is not valid Unicode"))?;
+        if expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!("expected model SHA-256 is invalid"));
+        }
         let acceleration = args
             .next()
             .ok_or_else(|| anyhow!("missing acceleration preference"))?
@@ -1499,11 +1736,13 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
         let mut config = AppConfig::default();
         config.performance.acceleration_preference = acceleration;
         let service = TranscriptionService::new(config);
-        let candidate = InstallationCandidate {
-            model_id: ModelId::new(model_id),
-            model_path: PathBuf::from(model_path),
-            runtime_package_root: PathBuf::from(runtime_package_root),
-        };
+        let candidate = InstallationCandidate::pinned(
+            ModelId::new(model_id),
+            PathBuf::from(model_path),
+            (runtime_package_root != "-").then(|| PathBuf::from(runtime_package_root)),
+            expected_size_bytes,
+            expected_sha256,
+        );
         if isolated_parent {
             service.verify_installation_candidate(candidate, &InstallCancellation::default())
         } else {
@@ -1544,7 +1783,7 @@ fn verify_runtime_model_artifact(runtime_model: &RuntimeModel) -> Result<()> {
     crate::installations::verify_file(
         &runtime_model.path,
         runtime_model.expected_size_bytes,
-        runtime_model.expected_sha256,
+        &runtime_model.expected_sha256,
     )
     .map_err(|error| anyhow!("model integrity verification failed: {error}"))
 }
@@ -1558,6 +1797,10 @@ fn verify_primary_runtime_package_tree(package_root: &Path) -> Result<()> {
     verify_runtime_tree(package_root, &spec.archive.files).map_err(|error| {
         anyhow!("runtime package tree failed exact manifest verification: {error}")
     })
+}
+
+fn model_uses_embedded_gguf(model_id: &ModelId) -> bool {
+    crate::model_catalog::model_uses_embedded_runtime(model_id)
 }
 
 fn ensure_install_not_cancelled(cancellation: &InstallCancellation) -> Result<()> {
@@ -2078,6 +2321,7 @@ fn intersect_capabilities(
 mod tests {
     use super::*;
     use crate::models::TranscriptSegment as LegacyTranscriptSegment;
+    use sha2::{Digest, Sha256};
 
     fn prepared_audio() -> Arc<PreparedAudio> {
         Arc::new(PreparedAudio {
@@ -2294,11 +2538,47 @@ mod tests {
     }
 
     #[test]
+    fn imported_gguf_uses_the_embedded_installation_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-imported-gguf-service-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let model_path = root.join("external").join("imported.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"fixture").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"fixture"));
+        let id = config::imported_gguf_model_id(&sha256).unwrap();
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.join("scribe-storage");
+        config.general.imported_gguf_models.insert(
+            id.clone(),
+            config::ImportedGgufModelInstall::validated(
+                std::fs::canonicalize(&model_path).unwrap(),
+                7,
+                sha256,
+                "Imported fixture".to_owned(),
+            ),
+        );
+        config::normalize_config(&mut config);
+        let service = TranscriptionService::new(config);
+
+        assert_eq!(
+            service
+                .installation_binding(&ModelId::new(id))
+                .unwrap()
+                .managed_runtime_id,
+            "embedded-transcribe-cpp"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn normalized_catalog_exposes_only_neutral_experimental_descriptors() {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors.len(), 1);
         for descriptor in descriptors {
             assert!(matches!(
                 descriptor.compatibility,
@@ -2359,18 +2639,18 @@ mod tests {
     }
 
     #[test]
-    fn singular_and_list_descriptor_capabilities_are_identical() {
+    fn compatibility_descriptor_is_resolvable_but_absent_from_the_normal_catalog() {
         let service = TranscriptionService::new(AppConfig::default());
-        let from_list = service
-            .model_descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor.id == ModelId::new("whisper_cpp_base_en"))
-            .unwrap();
         let singular = service
             .model_descriptor(&ModelId::new("whisper_cpp_base_en"))
             .unwrap();
 
-        assert_eq!(singular, from_list);
+        assert!(
+            !service
+                .model_descriptors()
+                .into_iter()
+                .any(|descriptor| descriptor.id == singular.id)
+        );
     }
 
     #[test]
@@ -2390,6 +2670,16 @@ mod tests {
                 .to_string()
                 .contains("unknown configured transcription model")
         );
+    }
+
+    #[test]
+    fn catalog_identifies_gguf_as_the_embedded_runtime_route() {
+        assert!(model_uses_embedded_gguf(&ModelId::new(
+            "whisper_cpp_tiny_en"
+        )));
+        assert!(!model_uses_embedded_gguf(&ModelId::new(
+            "whisper_cpp_base_en"
+        )));
     }
 
     #[test]
@@ -2583,6 +2873,95 @@ mod tests {
         drop(retained);
 
         assert!(weak.upgrade().is_none());
+    }
+
+    fn simulated_runtime_worker<F>(worker_loop: F) -> RuntimeWorker
+    where
+        F: FnOnce(Receiver<RuntimeCommand>) + Send + 'static,
+    {
+        let (commands, receiver) = sync_channel(1);
+        let worker = std::thread::spawn(move || worker_loop(receiver));
+        RuntimeWorker {
+            inner: Arc::new(RuntimeWorkerInner {
+                commands,
+                worker: Mutex::new(Some(worker)),
+                shutdown_gate: Mutex::new(()),
+                cancellation: RuntimeRouter::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn native_shutdown_deadline_is_bounded_while_a_command_is_stuck() {
+        let (started_sender, started_receiver) = sync_channel(1);
+        let release = Arc::new((std::sync::Condvar::new(), Mutex::new(false)));
+        let worker_release = Arc::clone(&release);
+        let worker = simulated_runtime_worker(move |receiver| {
+            if let RuntimeCommand::Unload { reply } = receiver.recv().unwrap() {
+                started_sender.send(()).unwrap();
+                let (wake, lock) = &*worker_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                let _ = reply.send(Ok(()));
+            }
+            if let Ok(RuntimeCommand::Shutdown { reply }) = receiver.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        let (reply, _response) = sync_channel(1);
+        worker
+            .inner
+            .commands
+            .send(RuntimeCommand::Unload { reply })
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let started = Instant::now();
+        assert!(!worker.shutdown_and_join(Duration::from_millis(20)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let (wake, lock) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+        assert!(worker.shutdown_and_join(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn disconnected_panicked_native_worker_is_joined_without_hanging() {
+        let worker = simulated_runtime_worker(|_receiver| panic!("injected worker panic"));
+        let started = Instant::now();
+
+        assert!(worker.shutdown_and_join(Duration::from_secs(1)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn concurrent_last_clone_drop_stress_leaves_no_native_worker_owner() {
+        for _ in 0..20 {
+            let worker = RuntimeWorker::new(RuntimeRouter::new());
+            let weak = Arc::downgrade(&worker.inner);
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let droppers = (0..8)
+                .map(|_| {
+                    let retained = worker.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        drop(retained);
+                    })
+                })
+                .collect::<Vec<_>>();
+            drop(worker);
+            barrier.wait();
+            for dropper in droppers {
+                dropper.join().unwrap();
+            }
+            assert!(weak.upgrade().is_none());
+        }
     }
 
     #[test]

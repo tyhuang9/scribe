@@ -4,10 +4,15 @@ mod benchmark;
 mod compatibility_bridge;
 mod config;
 mod core;
+mod diagnostics;
+mod disk_space;
+mod embedded_runtime;
 mod history;
 mod history_playback;
 mod hotkey;
+mod huggingface_catalog;
 mod installations;
+mod installed_manifest;
 mod managed_downloads;
 mod model_catalog;
 mod models;
@@ -22,6 +27,9 @@ mod transcription;
 mod tray;
 mod ui;
 
+#[cfg(test)]
+mod architecture_guard;
+
 use eframe::egui;
 
 #[cfg(any(target_os = "linux", test))]
@@ -34,6 +42,9 @@ enum LinuxDisplayBackend {
 
 fn main() -> eframe::Result<()> {
     if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = benchmark::maybe_run_local_command() {
         std::process::exit(exit_code);
     }
     configure_graphics_environment();
