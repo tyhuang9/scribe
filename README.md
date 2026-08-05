@@ -33,7 +33,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
   - sherpa-onnx Zipformer Small
   - Moonshine tiny English
   - Parakeet Unified 0.6B int8
-- Playground that shows the full catalog, keeps enable/disable controls for testing, supports persisted drag reordering, disabled-model grouping, and sends the same WAV file through enabled models.
+- Playground model selection is explicit: choose installed models to test, keep their drag order, and send the same WAV file through every selected ready model. Models with a missing runtime stay visible with repair guidance and block partial runs.
 - Transcript copy and clear actions.
 
 ## Requirements
@@ -311,7 +311,7 @@ Scribe stores new config under the Scribe application directory. On first launch
 The config stores:
 
 - selected default model
-- Playground-enabled models
+- Playground-selected models (the persisted `playground_selected_models` key; older `playground_enabled_models` and `enabled_models` keys migrate on load)
 - persisted model playground order
 - managed model install metadata
 - managed runtime install metadata

@@ -178,7 +178,10 @@ struct PlaygroundCardState {
 
 enum PlaygroundAction {
     Clear(String),
-    SetEnabled(String, bool),
+    MoveBy {
+        model_id: String,
+        offset: isize,
+    },
     MoveBefore {
         dragged_id: String,
         target_id: String,
@@ -948,6 +951,10 @@ pub struct LocalTranscriberApp {
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     playground_cards: Vec<PlaygroundCardState>,
+    playground_selector_draft: Option<Vec<String>>,
+    playground_selector_return_focus: Option<egui::Id>,
+    playground_selector_header_focus: Option<egui::Id>,
+    playground_selector_needs_initial_focus: bool,
     playground_reference_transcript: String,
     playground_reference_user_edited: bool,
     playground_ranking_mode: RankingMode,
@@ -988,6 +995,10 @@ impl LocalTranscriberApp {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             playground_cards: cards_from_config(&config),
+            playground_selector_draft: None,
+            playground_selector_return_focus: None,
+            playground_selector_header_focus: None,
+            playground_selector_needs_initial_focus: false,
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
@@ -1037,12 +1048,18 @@ impl LocalTranscriberApp {
         config::selected_model(&self.config)
     }
 
-    fn playground_enabled_models(&self) -> Vec<SttModelInfo> {
-        config::playground_enabled_models(&self.config)
+    fn playground_selected_models(&self) -> Vec<SttModelInfo> {
+        config::playground_selected_installed_models(&self.config)
     }
 
     fn save_config(&mut self) {
         config::normalize_config(&mut self.config);
+        #[cfg(test)]
+        if self.config_path.is_none() {
+            self.status_message = "Settings saved".to_owned();
+            self.refresh_playground_cards_from_config();
+            return;
+        }
         match config::save_config(&self.config) {
             Ok(()) => {
                 if self.config_path.is_none() {
@@ -1124,26 +1141,31 @@ impl LocalTranscriberApp {
                     self.playground_reference_transcript.clear();
                 }
             }
-            PlaygroundAction::SetEnabled(model_id, enabled) => {
-                let was_active_model = model_id == self.config.selected_default_model;
-                set_model_enabled(&mut self.config, &model_id, enabled);
-                if !enabled {
-                    if let Some(card) = self
+            PlaygroundAction::MoveBy { model_id, offset } => {
+                let selected_ids = self
+                    .playground_cards
+                    .iter()
+                    .map(|card| card.model.id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(position) = move_selected_model_by(
+                    &mut self.config.playground_model_order,
+                    &selected_ids,
+                    &model_id,
+                    offset,
+                ) {
+                    let model_name = self
                         .playground_cards
-                        .iter_mut()
+                        .iter()
                         .find(|card| card.model.id == model_id)
-                    {
-                        card.transcript.clear();
-                        card.latency_ms = None;
-                        card.audio_duration_ms = None;
-                        card.peak_ram_mb = None;
-                        card.peak_vram_mb = None;
-                    }
-                    if was_active_model && !self.playground_reference_user_edited {
-                        self.playground_reference_transcript.clear();
-                    }
+                        .map(|card| card.model.name.clone())
+                        .unwrap_or(model_id);
+                    self.save_config();
+                    self.status_message = format!(
+                        "Moved {model_name} to position {} of {}.",
+                        position + 1,
+                        selected_ids.len()
+                    );
                 }
-                self.save_config();
             }
             PlaygroundAction::MoveBefore {
                 dragged_id,
@@ -1156,6 +1178,17 @@ impl LocalTranscriberApp {
                         &target_id,
                     );
                     self.save_config();
+                    if let Some(position) = self
+                        .playground_cards
+                        .iter()
+                        .position(|card| card.model.id == dragged_id)
+                    {
+                        self.status_message = format!(
+                            "Moved model to position {} of {}.",
+                            position + 1,
+                            self.playground_cards.len()
+                        );
+                    }
                 }
             }
         }
@@ -1163,6 +1196,13 @@ impl LocalTranscriberApp {
 
     fn start_recording(&mut self, source: RecordingSource) {
         if self.active_recording.is_some() {
+            return;
+        }
+        if source == RecordingSource::Playground
+            && let Some(message) = self.playground_run_block_reason()
+        {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
             return;
         }
         let mut latency = LatencyTrace::started_now();
@@ -1484,7 +1524,7 @@ impl LocalTranscriberApp {
                             model_id.clone(),
                             config::ManagedModelInstall::app_managed(path, "managed-download"),
                         );
-                        set_model_enabled(&mut self.config, &model_id, true);
+                        set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
                             self.config.selected_default_model = model_id.clone();
                             self.config.last_used_backend = model.backend;
@@ -1648,14 +1688,10 @@ impl LocalTranscriberApp {
     }
 
     fn dispatch_playground_transcriptions(&mut self, audio_path: PathBuf) {
-        let models = config::configured_models_for_playground(&self.config)
-            .into_iter()
-            .filter(|model| model.enabled)
-            .collect::<Vec<_>>();
-        if models.is_empty() {
+        let models = self.playground_selected_models();
+        if let Some(message) = self.playground_run_block_reason() {
             self.status = TranscriptionStatus::Error;
-            self.status_message =
-                "Enable at least one model before running the playground".to_owned();
+            self.status_message = message;
             let _ = fs::remove_file(audio_path);
             return;
         }
@@ -1753,17 +1789,63 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn set_all_models_enabled(&mut self, enabled: bool) {
-        set_all_models_enabled(&mut self.config, enabled);
-        self.save_config();
-        if !enabled {
-            self.clear_playground_results(true);
+    fn playground_selector_busy(&self) -> bool {
+        self.active_recording.is_some() || self.playground_pending > 0
+    }
+
+    fn open_playground_selector(&mut self, opener_id: Option<egui::Id>) {
+        if !self.playground_selector_busy() {
+            self.playground_selector_draft = Some(self.config.playground_selected_models.clone());
+            self.playground_selector_return_focus = opener_id;
+            self.playground_selector_needs_initial_focus = true;
         }
-        self.status_message = if enabled {
-            "Enabled all models".to_owned()
-        } else {
-            "Disabled all models".to_owned()
-        };
+    }
+
+    fn close_playground_selector(&mut self, ctx: &egui::Context) {
+        self.playground_selector_draft = None;
+        self.playground_selector_needs_initial_focus = false;
+        if let Some(opener_id) = self.playground_selector_return_focus.take() {
+            ctx.memory_mut(|memory| memory.request_focus(opener_id));
+        }
+    }
+
+    fn apply_playground_selector(&mut self, ctx: &egui::Context) {
+        if self.playground_selector_busy() {
+            return;
+        }
+        if let Some(draft) = self.playground_selector_draft.take() {
+            apply_playground_selector_draft(&mut self.config, draft);
+            self.save_config();
+            self.status_message = "Playground models updated".to_owned();
+            self.playground_selector_needs_initial_focus = false;
+            let return_focus = self
+                .playground_selector_header_focus
+                .or_else(|| self.playground_selector_return_focus.take());
+            self.playground_selector_return_focus = None;
+            if let Some(return_focus) = return_focus {
+                ctx.memory_mut(|memory| memory.request_focus(return_focus));
+            }
+        }
+    }
+
+    fn playground_run_block_reason(&self) -> Option<String> {
+        if self.playground_cards.is_empty() {
+            return Some(if self.config.playground_selected_models.is_empty() {
+                "Choose models to test before starting a test recording.".to_owned()
+            } else {
+                "Install the selected Playground models before starting a test recording."
+                    .to_owned()
+            });
+        }
+        self.playground_cards
+            .iter()
+            .find(|card| card.status != ModelRuntimeStatus::Ready)
+            .map(|card| {
+                format!(
+                    "{} is not ready. Repair or install its runtime from Models before running the Playground.",
+                    card.model.name
+                )
+            })
     }
 
     fn active_playground_output(&self) -> Option<(String, String)> {
@@ -2034,7 +2116,7 @@ impl LocalTranscriberApp {
         self.model_downloads.remove(&model.id);
         self.config.managed_models.remove(&model.id);
         self.config.model_paths.remove(&model.id);
-        set_model_enabled(&mut self.config, &model.id, false);
+        set_model_selected(&mut self.config, &model.id, false);
 
         if self.config.selected_default_model == model.id {
             select_first_installed_model(&mut self.config);
@@ -2692,13 +2774,22 @@ impl LocalTranscriberApp {
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
             panel(ui, |ui| {
+                let run_blocked = self.playground_run_block_reason();
+                let selector_busy = self.playground_selector_busy();
                 ui.horizontal_wrapped(|ui| {
                     let text = if self.active_recording.is_some() {
                         "Stop Recording"
                     } else {
                         "Start Test Recording"
                     };
-                    if ui.add(primary_small_button(ui, text)).clicked() {
+                    let recording_button = add_enabled_button(
+                        ui,
+                        self.active_recording.is_some() || run_blocked.is_none(),
+                        primary_small_button(ui, text),
+                        run_blocked.as_deref(),
+                    )
+                    .on_hover_text("Record one audio sample and run every selected ready model.");
+                    if recording_button.clicked() {
                         if self.active_recording.is_some() {
                             self.stop_recording();
                         } else {
@@ -2708,16 +2799,27 @@ impl LocalTranscriberApp {
                     if ui.add(small_button(ui, "Clear Results")).clicked() {
                         self.clear_playground_results(true);
                     }
-                    if ui.add(small_button(ui, "Enable All")).clicked() {
-                        self.set_all_models_enabled(true);
-                    }
-                    if ui.add(small_button(ui, "Disable All")).clicked() {
-                        self.set_all_models_enabled(false);
+                    let selector_button = ui
+                        .push_id("playground-selector-header-control", |ui| {
+                            add_enabled_button(
+                                ui,
+                                !selector_busy,
+                                small_button(ui, "Choose models to test"),
+                                Some("Finish the current Playground recording or transcription before changing its model selection."),
+                            )
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Choose which installed models participate in Playground tests.",
+                        );
+                    self.playground_selector_header_focus = Some(selector_button.id);
+                    if selector_button.clicked() {
+                        self.open_playground_selector(Some(selector_button.id));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         badge(
                             ui,
-                            &format!("{} enabled", self.playground_enabled_models().len()),
+                            &format!("{} selected", self.config.playground_selected_models.len()),
                             ChipTone::Neutral,
                         );
                     });
@@ -2733,6 +2835,18 @@ impl LocalTranscriberApp {
                         .desired_width(260.0)
                         .text(recording_timer_text(active)),
                     );
+                }
+                if self.active_recording.is_none()
+                    && let Some(reason) = run_blocked
+                {
+                    ui.add_space(6.0);
+                    ui.label(mut_text(&reason));
+                }
+                if selector_busy {
+                    ui.add_space(4.0);
+                    ui.label(mut_text(
+                        "Finish the current Playground recording or transcription before changing models.",
+                    ));
                 }
             });
 
@@ -2814,7 +2928,7 @@ impl LocalTranscriberApp {
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(section_heading("Enabled Models"));
+                    ui.label(section_heading("Selected Models"));
                     ui.label(mut_text(
                         "Performance comparison based on current system hardware.",
                     ));
@@ -2824,10 +2938,25 @@ impl LocalTranscriberApp {
             let mut pending_actions = Vec::new();
             if self.playground_cards.is_empty() {
                 panel(ui, |ui| {
-                    ui.label(mut_text("No models are configured."));
+                    ui.label(mut_text(
+                        "No installed models are selected for Playground tests.",
+                    ));
+                    let selector_busy = self.playground_selector_busy();
+                    let choose_models = ui
+                        .add_enabled(!selector_busy, primary_small_button(ui, "Choose Models"))
+                        .on_hover_text("Select installed models to compare in the Playground.");
+                    if choose_models.clicked() {
+                        self.open_playground_selector(Some(choose_models.id));
+                    }
+                    if selector_busy {
+                        ui.label(mut_text(
+                            "Finish active Playground work before changing models.",
+                        ));
+                    }
                 });
             }
-            for card_state in &mut self.playground_cards {
+            let card_count = self.playground_cards.len();
+            for (card_index, card_state) in self.playground_cards.iter_mut().enumerate() {
                 let model_id = card_state.model.id.clone();
                 let is_active_model = model_id == self.config.selected_default_model;
                 let drag_id = ui.id().with(("playground-card", &model_id));
@@ -2850,6 +2979,8 @@ impl LocalTranscriberApp {
                                                 card_state,
                                                 is_active_model,
                                                 drag_id,
+                                                card_index > 0,
+                                                card_index + 1 < card_count,
                                             )
                                         },
                                     )
@@ -2868,7 +2999,7 @@ impl LocalTranscriberApp {
                         target_id: model_id,
                     });
                 }
-                ui.add_space(8.0);
+                ui.add_space(4.0);
             }
 
             if let Some(action) = pending_actions.into_iter().next() {
@@ -2887,6 +3018,144 @@ impl LocalTranscriberApp {
                 });
             });
         });
+        self.ui_playground_model_selector(ui.ctx());
+    }
+
+    fn ui_playground_model_selector(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.playground_selector_draft.take() else {
+            return;
+        };
+        let busy = self.playground_selector_busy();
+        let installed_models = config::configured_models(&self.config)
+            .into_iter()
+            .filter(|model| model.install_status.is_runnable())
+            .collect::<Vec<_>>();
+        let request_initial_focus =
+            std::mem::take(&mut self.playground_selector_needs_initial_focus);
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let screen_rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("playground-selector-shield"))
+            .order(egui::Order::Background)
+            .fixed_pos(screen_rect.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                let shield_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_rect.size());
+                ui.allocate_rect(shield_rect, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(
+                    shield_rect,
+                    Rounding::ZERO,
+                    Color32::from_black_alpha(72),
+                );
+            });
+        egui::Window::new("Choose models to test")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .min_width(432.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(mut_text(
+                    "Only installed models can be selected for Playground tests.",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let select_all =
+                        ui.add_enabled(
+                            !busy && !installed_models.is_empty(),
+                            small_button(ui, "Select all installed models"),
+                        );
+                    if request_initial_focus {
+                        select_all.request_focus();
+                    }
+                    if select_all.clicked() {
+                        draft = installed_models
+                            .iter()
+                            .map(|model| model.id.clone())
+                            .collect();
+                    }
+                    if ui
+                        .add_enabled(!busy, small_button(ui, "Clear selected models"))
+                        .clicked()
+                    {
+                        draft.clear();
+                    }
+                });
+                ui.add_space(8.0);
+                if installed_models.is_empty() {
+                    ui.label(mut_text(
+                        "No installed models yet. Install a model from Models, then return here to select it.",
+                    ));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for model in &installed_models {
+                                ui.horizontal_wrapped(|ui| {
+                                    let mut selected = draft.iter().any(|id| id == &model.id);
+                                    let readiness = runtime_status_for_model(&self.config, model);
+                                    let checkbox = ui.add_enabled(
+                                        !busy,
+                                        egui::Checkbox::new(&mut selected, &model.name),
+                                    );
+                                    checkbox.widget_info(|| {
+                                        let mut info = egui::WidgetInfo::selected(
+                                            egui::WidgetType::Checkbox,
+                                            selected,
+                                            format!(
+                                                "{}; backend {}; readiness {}",
+                                                model.name, model.backend, readiness
+                                            ),
+                                        );
+                                        info.enabled = !busy;
+                                        info
+                                    });
+                                    checkbox.on_hover_text(
+                                        "Include this model in the next Playground test.",
+                                    );
+                                    if selected {
+                                        if !draft.iter().any(|id| id == &model.id) {
+                                            draft.push(model.id.clone());
+                                        }
+                                    } else {
+                                        draft.retain(|id| id != &model.id);
+                                    }
+                                    badge(ui, &model.backend, ChipTone::Neutral);
+                                    badge(
+                                        ui,
+                                        &readiness.to_string(),
+                                        runtime_chip_tone(&readiness),
+                                    );
+                                });
+                            }
+                        });
+                }
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!busy, primary_small_button(ui, "Apply model selection"))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.add(small_button(ui, "Cancel model selection")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if apply {
+            self.playground_selector_draft = Some(draft);
+            self.apply_playground_selector(ctx);
+        } else if open && !cancel {
+            self.playground_selector_draft = Some(draft);
+        } else {
+            self.close_playground_selector(ctx);
+        }
     }
 
     fn ui_settings(&mut self, ui: &mut Ui) {
@@ -3793,13 +4062,15 @@ fn playground_card_ui(
     card_state: &mut PlaygroundCardState,
     is_active_model: bool,
     drag_id: egui::Id,
+    can_move_up: bool,
+    can_move_down: bool,
 ) -> Vec<PlaygroundAction> {
     let mut actions = Vec::new();
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let move_width = 28.0;
-        let actions_width = 132.0;
+        let actions_width = 92.0;
         let gap = 12.0;
         let detail_width = (ui.available_width() - move_width - actions_width - gap * 2.0).max(0.0);
         ui.horizontal_top(|ui| {
@@ -3852,21 +4123,38 @@ fn playground_card_ui(
                 Layout::top_down(Align::RIGHT),
                 |ui| {
                     set_exact_width(ui, actions_width);
+                    let move_up = ui.add_enabled(can_move_up, small_button(ui, "Move up"));
+                    move_up.widget_info(|| {
+                        let mut info = egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            format!("Move {} up", card_state.model.name),
+                        );
+                        info.enabled = can_move_up;
+                        info
+                    });
+                    if move_up.clicked() {
+                        actions.push(PlaygroundAction::MoveBy {
+                            model_id: card_state.model.id.clone(),
+                            offset: -1,
+                        });
+                    }
+                    let move_down = ui.add_enabled(can_move_down, small_button(ui, "Move down"));
+                    move_down.widget_info(|| {
+                        let mut info = egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            format!("Move {} down", card_state.model.name),
+                        );
+                        info.enabled = can_move_down;
+                        info
+                    });
+                    if move_down.clicked() {
+                        actions.push(PlaygroundAction::MoveBy {
+                            model_id: card_state.model.id.clone(),
+                            offset: 1,
+                        });
+                    }
                     if ui.add(small_button(ui, "Clear")).clicked() {
                         actions.push(PlaygroundAction::Clear(card_state.model.id.clone()));
-                    }
-                    let mut enabled = card_state.model.enabled;
-                    if ui
-                        .checkbox(&mut enabled, "Run")
-                        .on_hover_text(
-                            "Turn this off to keep the model here but skip it during playground runs.",
-                        )
-                        .changed()
-                    {
-                        actions.push(PlaygroundAction::SetEnabled(
-                            card_state.model.id.clone(),
-                            enabled,
-                        ));
                     }
                     badge(
                         ui,
@@ -4431,8 +4719,7 @@ fn runtime_chip_tone(status: &ModelRuntimeStatus) -> ChipTone {
     match status {
         ModelRuntimeStatus::Ready => ChipTone::Success,
         ModelRuntimeStatus::Running => ChipTone::Active,
-        ModelRuntimeStatus::Disabled
-        | ModelRuntimeStatus::NotImplemented
+        ModelRuntimeStatus::NotImplemented
         | ModelRuntimeStatus::NotInstalled
         | ModelRuntimeStatus::MissingConfiguration
         | ModelRuntimeStatus::Downloading => ChipTone::Warning,
@@ -4497,7 +4784,6 @@ fn setup_message_for_status(status: &ModelRuntimeStatus) -> String {
         }
         ModelRuntimeStatus::Downloading => "The selected model is still downloading.".to_owned(),
         ModelRuntimeStatus::Running => "A transcription is already running.".to_owned(),
-        ModelRuntimeStatus::Disabled => "Enable this model before transcribing.".to_owned(),
         ModelRuntimeStatus::NotImplemented => {
             "This backend runtime is not bundled yet; choose a whisper.cpp model.".to_owned()
         }
@@ -5196,29 +5482,32 @@ fn select_first_installed_model(config: &mut AppConfig) {
         .unwrap_or_default();
 }
 
-fn set_model_enabled(config: &mut AppConfig, model_id: &str, enabled: bool) {
-    if enabled {
+fn set_model_selected(config: &mut AppConfig, model_id: &str, selected: bool) {
+    if selected {
         if !config
-            .playground_enabled_models
+            .playground_selected_models
             .iter()
             .any(|id| id == model_id)
         {
-            config.playground_enabled_models.push(model_id.to_owned());
+            config.playground_selected_models.push(model_id.to_owned());
         }
     } else {
-        config.playground_enabled_models.retain(|id| id != model_id);
+        config
+            .playground_selected_models
+            .retain(|id| id != model_id);
     }
 }
 
-fn set_all_models_enabled(config: &mut AppConfig, enabled: bool) {
-    if enabled {
-        config.playground_enabled_models = config::configured_models(config)
-            .into_iter()
-            .map(|model| model.id)
-            .collect();
-    } else {
-        config.playground_enabled_models.clear();
-    }
+fn apply_playground_selector_draft(config: &mut AppConfig, draft: Vec<String>) {
+    let installed_ids = config::configured_models(config)
+        .into_iter()
+        .filter(|model| model.install_status.is_runnable())
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+    config.playground_selected_models = draft
+        .into_iter()
+        .filter(|id| installed_ids.iter().any(|installed| installed == id))
+        .collect();
 }
 
 fn move_model_before(order: &mut Vec<String>, dragged_id: &str, target_id: &str) {
@@ -5233,8 +5522,23 @@ fn move_model_before(order: &mut Vec<String>, dragged_id: &str, target_id: &str)
     order.insert(to_index, dragged);
 }
 
+fn move_selected_model_by(
+    order: &mut [String],
+    selected_ids: &[String],
+    model_id: &str,
+    offset: isize,
+) -> Option<usize> {
+    let from_selected = selected_ids.iter().position(|id| id == model_id)?;
+    let to_selected = from_selected.checked_add_signed(offset)?;
+    let target_id = selected_ids.get(to_selected)?;
+    let from_order = order.iter().position(|id| id == model_id)?;
+    let to_order = order.iter().position(|id| id == target_id)?;
+    order.swap(from_order, to_order);
+    Some(to_selected)
+}
+
 fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
-    config::configured_models_for_playground(config)
+    config::playground_selected_installed_models(config)
         .into_iter()
         .map(|model| {
             let status = runtime_status_for_model(config, &model);
@@ -5252,10 +5556,6 @@ fn cards_from_config(config: &AppConfig) -> Vec<PlaygroundCardState> {
 }
 
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
-    if !model.enabled {
-        return ModelRuntimeStatus::Disabled;
-    }
-
     let Some(provider) = stt::provider_for_backend(&model.backend) else {
         return ModelRuntimeStatus::Error(format!("unsupported STT backend: {}", model.backend));
     };
@@ -5545,17 +5845,17 @@ mod layout_tests {
     }
 
     #[test]
-    fn active_model_can_stay_pinned_when_disabled() {
+    fn active_model_can_stay_pinned_when_removed_from_playground_selection() {
         let mut config = AppConfig::default();
         let active_model = config.selected_default_model.clone();
 
-        set_model_enabled(&mut config, &active_model, false);
+        set_model_selected(&mut config, &active_model, false);
         config::normalize_config(&mut config);
 
         assert_eq!(config.selected_default_model, active_model);
         assert!(
             !config
-                .playground_enabled_models
+                .playground_selected_models
                 .iter()
                 .any(|id| id == &active_model)
         );
@@ -5748,29 +6048,6 @@ mod layout_tests {
             Some(with_transcript),
             tray_ui_state(false, "  hello  ")
         ));
-    }
-
-    #[test]
-    fn set_all_models_enabled_toggles_every_catalog_model() {
-        let mut config = AppConfig::default();
-
-        set_all_models_enabled(&mut config, false);
-        config::normalize_config(&mut config);
-        assert!(config.playground_enabled_models.is_empty());
-        assert!(
-            config::configured_models(&config)
-                .iter()
-                .all(|model| !model.enabled)
-        );
-
-        set_all_models_enabled(&mut config, true);
-        config::normalize_config(&mut config);
-        assert!(!config.playground_enabled_models.is_empty());
-        assert!(
-            config::configured_models(&config)
-                .iter()
-                .all(|model| model.enabled)
-        );
     }
 
     #[test]
@@ -5990,6 +6267,68 @@ mod layout_tests {
         })
     }
 
+    fn selector_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(840.0, 760.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn render_selector(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(selector_raw_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Playground behind selector");
+            });
+            app.ui_playground_model_selector(ctx);
+        })
+    }
+
+    fn render_playground(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(selector_raw_input(events), |ctx| {
+            egui::CentralPanel::default()
+                .frame(content_panel_frame(ctx))
+                .show(ctx, |ui| app.ui_playground(ui));
+        })
+    }
+
+    fn accesskit_control_id(output: &egui::FullOutput, name: &str) -> egui::accesskit::NodeId {
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some(name))
+            .map(|(id, _)| *id)
+            .unwrap()
+    }
+
+    fn accesskit_control_id_with_prefix(
+        output: &egui::FullOutput,
+        name_prefix: &str,
+    ) -> egui::accesskit::NodeId {
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.name()
+                    .is_some_and(|name| name.starts_with(name_prefix))
+            })
+            .map(|(id, _)| *id)
+            .unwrap()
+    }
+
     fn render_app_tab_repeatedly(tab: Tab, width: f32, frames: usize) -> Vec<f32> {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
@@ -6080,6 +6419,10 @@ mod layout_tests {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             playground_cards: cards_from_config(&config),
+            playground_selector_draft: None,
+            playground_selector_return_focus: None,
+            playground_selector_header_focus: None,
+            playground_selector_needs_initial_focus: false,
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
@@ -6118,7 +6461,6 @@ mod layout_tests {
             )),
             install_status: ModelInstallStatus::Installed,
             download_model: Some("base.en".to_owned()),
-            enabled: true,
         }
     }
 
@@ -6724,11 +7066,309 @@ mod layout_tests {
     #[test]
     fn playground_membership_adds_once_and_uninstall_cleanup_removes_model() {
         let mut config = AppConfig::default();
-        set_model_enabled(&mut config, "whisper_cpp_tiny_en", true);
-        set_model_enabled(&mut config, "whisper_cpp_tiny_en", true);
-        assert_eq!(config.playground_enabled_models, ["whisper_cpp_tiny_en"]);
-        set_model_enabled(&mut config, "whisper_cpp_tiny_en", false);
-        assert!(config.playground_enabled_models.is_empty());
+        set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
+        set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
+        assert_eq!(config.playground_selected_models, ["whisper_cpp_tiny_en"]);
+        set_model_selected(&mut config, "whisper_cpp_tiny_en", false);
+        assert!(config.playground_selected_models.is_empty());
+    }
+
+    #[test]
+    fn playground_selector_draft_opens_cancels_and_stays_closed_while_busy() {
+        let mut app = test_app();
+        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+            "scribe-selector-state-missing-models-{}",
+            std::process::id()
+        ));
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
+
+        app.open_playground_selector(None);
+        assert_eq!(
+            app.playground_selector_draft,
+            Some(vec!["whisper_cpp_tiny_en".to_owned()])
+        );
+        app.playground_selector_draft.as_mut().unwrap().clear();
+        app.close_playground_selector(&egui::Context::default());
+        assert!(app.playground_selector_draft.is_none());
+        assert_eq!(
+            app.config.playground_selected_models,
+            ["whisper_cpp_tiny_en"]
+        );
+
+        app.playground_pending = 1;
+        app.open_playground_selector(None);
+        assert!(app.playground_selector_draft.is_none());
+
+        let before_apply = app.config.playground_selected_models.clone();
+        app.playground_selector_draft = Some(vec!["whisper_cpp_base_en".to_owned()]);
+        app.apply_playground_selector(&egui::Context::default());
+        assert_eq!(app.config.playground_selected_models, before_apply);
+
+        apply_playground_selector_draft(&mut app.config, vec!["whisper_cpp_base_en".to_owned()]);
+        assert!(app.config.playground_selected_models.is_empty());
+    }
+
+    #[test]
+    fn selector_escape_dismisses_rendered_window_without_persisting_draft() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
+        let opener_id = egui::Id::new("selector-test-opener");
+        app.open_playground_selector(Some(opener_id));
+        app.playground_selector_draft.as_mut().unwrap().clear();
+
+        render_selector(&ctx, &mut app, Vec::new());
+        render_selector(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert!(app.playground_selector_draft.is_none());
+        assert_eq!(
+            app.config.playground_selected_models,
+            ["whisper_cpp_tiny_en"]
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(opener_id));
+    }
+
+    #[test]
+    fn selector_apply_button_prunes_uninstalled_draft_ids() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+            "scribe-missing-selector-models-{}",
+            std::process::id()
+        ));
+        app.config.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.open_playground_selector(None);
+
+        let output = render_selector(&ctx, &mut app, Vec::new());
+        let apply_id = accesskit_control_id(&output, "Apply model selection");
+        render_selector(
+            &ctx,
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: apply_id,
+                    data: None,
+                },
+            )],
+        );
+
+        assert!(app.playground_selector_draft.is_none());
+        assert!(app.config.playground_selected_models.is_empty());
+    }
+
+    #[test]
+    fn selector_empty_state_explains_how_to_install_models() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+            "scribe-selector-empty-state-{}",
+            std::process::id()
+        ));
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models.clear();
+        app.open_playground_selector(None);
+
+        let output = render_selector(&ctx, &mut app, Vec::new());
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some(
+                "No installed models yet. Install a model from Models, then return here to select it.",
+            )
+        }));
+    }
+
+    #[test]
+    fn selector_window_honors_minimum_content_width() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir =
+            std::env::temp_dir().join(format!("scribe-selector-min-width-{}", std::process::id()));
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models.clear();
+        app.open_playground_selector(None);
+
+        render_selector(&ctx, &mut app, Vec::new());
+
+        let selector_rect = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("Choose models to test")))
+            .expect("selector window should have an area rect after rendering");
+        assert!(
+            selector_rect.width() >= 432.0,
+            "selector width {} should honor the 432 px minimum",
+            selector_rect.width()
+        );
+    }
+
+    #[test]
+    fn empty_state_apply_restores_focus_to_persistent_header_control() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-selector-focus-models-{}",
+            std::process::id()
+        ));
+        let model_dir = root.join("whisper.cpp");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.model_storage_dir = root.clone();
+        app.config.managed_models.clear();
+        app.config.model_paths.clear();
+        app.config.playground_selected_models.clear();
+        config::normalize_config(&mut app.config);
+        app.refresh_playground_cards_from_config();
+
+        let output = render_playground(&ctx, &mut app, Vec::new());
+        let empty_opener = accesskit_control_id(&output, "Choose Models");
+        let output = render_playground(
+            &ctx,
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: empty_opener,
+                    data: None,
+                },
+            )],
+        );
+        let checkbox = accesskit_control_id_with_prefix(&output, "whisper.cpp tiny.en;");
+        let apply = accesskit_control_id(&output, "Apply model selection");
+        render_playground(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: checkbox,
+                    data: None,
+                }),
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: apply,
+                    data: None,
+                }),
+            ],
+        );
+        let output = render_playground(&ctx, &mut app, Vec::new());
+
+        let header_focus = app.playground_selector_header_focus.unwrap();
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(header_focus));
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Choose models to test"))
+        );
+        assert_eq!(
+            app.config.playground_selected_models,
+            ["whisper_cpp_tiny_en"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keyboard_reorder_swaps_selected_neighbors_and_respects_bounds() {
+        let mut order = vec!["a".to_owned(), "hidden".to_owned(), "b".to_owned()];
+        let selected = vec!["a".to_owned(), "b".to_owned()];
+
+        assert_eq!(
+            move_selected_model_by(&mut order, &selected, "b", -1),
+            Some(0)
+        );
+        assert_eq!(order, ["b", "hidden", "a"]);
+        assert_eq!(move_selected_model_by(&mut order, &selected, "a", -1), None);
+        assert_eq!(move_selected_model_by(&mut order, &selected, "b", 1), None);
+    }
+
+    #[test]
+    fn refreshing_playground_cards_retains_selected_results_and_drops_removed_cards() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-playground-cards-{}", std::process::id()));
+        let model_dir = root.join("whisper.cpp");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
+        fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
+
+        let mut app = test_app();
+        app.config.model_storage_dir = root.clone();
+        app.config.playground_selected_models = vec![
+            "whisper_cpp_tiny_en".to_owned(),
+            "whisper_cpp_base_en".to_owned(),
+        ];
+        app.config.playground_model_order = vec![
+            "whisper_cpp_base_en".to_owned(),
+            "whisper_cpp_tiny_en".to_owned(),
+        ];
+        config::normalize_config(&mut app.config);
+        app.refresh_playground_cards_from_config();
+        app.playground_cards[0].transcript = "retained".to_owned();
+
+        app.config.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.refresh_playground_cards_from_config();
+        assert_eq!(app.playground_cards.len(), 1);
+        assert_eq!(app.playground_cards[0].transcript, "retained");
+
+        app.config
+            .playground_selected_models
+            .push("whisper_cpp_tiny_en".to_owned());
+        app.refresh_playground_cards_from_config();
+        assert_eq!(app.playground_cards.len(), 2);
+        assert!(app.playground_cards[1].transcript.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn playground_run_requires_a_selection_and_ready_cards() {
+        let mut app = test_app();
+        app.config.playground_selected_models.clear();
+        app.playground_cards.clear();
+        assert!(
+            app.playground_run_block_reason()
+                .is_some_and(|message| message.contains("Choose models"))
+        );
+
+        app.playground_cards.push(PlaygroundCardState {
+            model: test_model(),
+            status: ModelRuntimeStatus::MissingConfiguration,
+            transcript: String::new(),
+            latency_ms: None,
+            audio_duration_ms: None,
+            peak_ram_mb: None,
+            peak_vram_mb: None,
+        });
+        assert!(
+            app.playground_run_block_reason()
+                .is_some_and(|message| message.contains("not ready"))
+        );
     }
 
     #[test]

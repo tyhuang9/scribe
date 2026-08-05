@@ -13,8 +13,8 @@ use crate::runtime_catalog;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub selected_default_model: String,
-    #[serde(default, alias = "enabled_models")]
-    pub playground_enabled_models: Vec<String>,
+    #[serde(default, alias = "playground_enabled_models", alias = "enabled_models")]
+    pub playground_selected_models: Vec<String>,
     #[serde(default)]
     pub playground_model_order: Vec<String>,
     #[serde(default)]
@@ -203,7 +203,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            playground_enabled_models: vec!["whisper_cpp_tiny_en".to_owned()],
+            playground_selected_models: vec!["whisper_cpp_tiny_en".to_owned()],
             playground_model_order: default_playground_model_order(),
             managed_models: HashMap::new(),
             managed_runtimes: HashMap::new(),
@@ -300,10 +300,6 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     default_model_catalog()
         .into_iter()
         .map(|mut model| {
-            model.enabled = config
-                .playground_enabled_models
-                .iter()
-                .any(|id| id == &model.id);
             let configured_path = config.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path = downloaded_model_path(config, &model);
@@ -333,37 +329,29 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
         .collect()
 }
 
-pub fn configured_models_for_playground(config: &AppConfig) -> Vec<SttModelInfo> {
-    let mut models = configured_models(config);
-    let order = &config.playground_model_order;
-
-    models.sort_by_key(|model| {
-        let active_group = if model.id == config.selected_default_model {
-            0
-        } else {
-            1
-        };
-        let enabled_group = if model.enabled { 0 } else { 1 };
-        let order_index = order
-            .iter()
-            .position(|id| id == &model.id)
-            .unwrap_or(usize::MAX);
-        (active_group, enabled_group, order_index)
-    });
-
-    models
-}
-
 pub fn selected_model(config: &AppConfig) -> Option<SttModelInfo> {
     configured_models(config)
         .into_iter()
         .find(|model| model.id == config.selected_default_model)
 }
 
-pub fn playground_enabled_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    configured_models(config)
+pub fn playground_selected_installed_models(config: &AppConfig) -> Vec<SttModelInfo> {
+    let mut models = configured_models(config)
         .into_iter()
-        .filter(|model| model.enabled)
+        .filter(|model| model.install_status.is_runnable())
+        .map(|model| (model.id.clone(), model))
+        .collect::<HashMap<_, _>>();
+
+    config
+        .playground_model_order
+        .iter()
+        .filter(|id| {
+            config
+                .playground_selected_models
+                .iter()
+                .any(|selected| selected == *id)
+        })
+        .filter_map(|id| models.remove(id))
         .collect()
 }
 
@@ -553,9 +541,9 @@ pub fn normalize_config(config: &mut AppConfig) {
     }
 
     config
-        .playground_enabled_models
+        .playground_selected_models
         .retain(|id| catalog_ids.iter().any(|catalog_id| catalog_id == id));
-    dedup_preserving_order(&mut config.playground_enabled_models);
+    dedup_preserving_order(&mut config.playground_selected_models);
 
     normalize_playground_order(config, &catalog_ids);
 
@@ -653,7 +641,7 @@ fn migrate_legacy_model_ids(config: &mut AppConfig) {
         if config.selected_default_model == old_id {
             config.selected_default_model = new_id.to_owned();
         }
-        for id in &mut config.playground_enabled_models {
+        for id in &mut config.playground_selected_models {
             if id == old_id {
                 *id = new_id.to_owned();
             }
@@ -780,7 +768,7 @@ mod tests {
         assert_eq!(config.theme_mode, ThemeMode::Light);
         assert_eq!(config.whisper_compute_mode, WhisperComputeMode::Cpu);
         assert_eq!(
-            config.playground_enabled_models,
+            config.playground_selected_models,
             vec!["whisper_cpp_tiny_en".to_owned()]
         );
         assert_eq!(config.whisper_gpu_device, 0);
@@ -852,48 +840,93 @@ mod tests {
     }
 
     #[test]
-    fn empty_enabled_models_remain_empty_after_normalize() {
+    fn empty_playground_selection_remains_empty_after_normalize() {
         let mut config = AppConfig {
-            playground_enabled_models: Vec::new(),
+            playground_selected_models: Vec::new(),
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
 
-        assert!(config.playground_enabled_models.is_empty());
+        assert!(config.playground_selected_models.is_empty());
         assert_eq!(config.selected_default_model, "whisper_cpp_tiny_en");
     }
 
     #[test]
-    fn playground_models_pin_active_model_then_sort_enabled_by_manual_order() {
+    fn playground_selection_normalizes_invalid_and_duplicate_ids() {
         let mut config = AppConfig {
-            selected_default_model: "whisper_cpp_tiny_en".to_owned(),
-            playground_enabled_models: vec![
+            playground_selected_models: vec![
                 "faster_whisper_medium_en_gpu".to_owned(),
-                "whisper_cpp_tiny_en".to_owned(),
-            ],
-            playground_model_order: vec![
+                "invalid".to_owned(),
                 "faster_whisper_medium_en_gpu".to_owned(),
-                "vosk_small_en".to_owned(),
-                "whisper_cpp_tiny_en".to_owned(),
             ],
             ..AppConfig::default()
         };
 
         normalize_config(&mut config);
-        let ids = configured_models_for_playground(&config)
+        assert_eq!(
+            config.playground_selected_models,
+            ["faster_whisper_medium_en_gpu"]
+        );
+    }
+
+    #[test]
+    fn legacy_playground_selection_keys_deserialize_and_new_key_serializes() {
+        for key in ["playground_enabled_models", "enabled_models"] {
+            let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("playground_selected_models");
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), serde_json::json!(["whisper_cpp_base_en"]));
+            let config: AppConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config.playground_selected_models, ["whisper_cpp_base_en"]);
+        }
+
+        let serialized = serde_json::to_string(&AppConfig::default()).unwrap();
+        assert!(serialized.contains("playground_selected_models"));
+        assert!(!serialized.contains("playground_enabled_models"));
+    }
+
+    #[test]
+    fn selected_installed_playground_models_follow_persisted_drag_order() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-playground-selection-{}",
+            std::process::id()
+        ));
+        let model_dir = root.join("whisper.cpp");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("ggml-tiny.en.bin"), b"tiny").unwrap();
+        fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
+        fs::write(model_dir.join("ggml-small.en.bin"), b"small").unwrap();
+
+        let mut config = AppConfig {
+            model_storage_dir: root.clone(),
+            playground_selected_models: vec![
+                "whisper_cpp_tiny_en".to_owned(),
+                "whisper_cpp_base_en".to_owned(),
+                "whisper_cpp_medium_en".to_owned(),
+            ],
+            playground_model_order: vec![
+                "whisper_cpp_small_en".to_owned(),
+                "whisper_cpp_medium_en".to_owned(),
+                "whisper_cpp_base_en".to_owned(),
+                "whisper_cpp_tiny_en".to_owned(),
+            ],
+            ..AppConfig::default()
+        };
+        normalize_config(&mut config);
+
+        let ids = playground_selected_installed_models(&config)
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
-
-        assert_eq!(ids[0], "whisper_cpp_tiny_en");
-        assert_eq!(ids[1], "faster_whisper_medium_en_gpu");
-        assert!(
-            ids.iter()
-                .position(|id| id == "vosk_small_en")
-                .expect("vosk model should be present")
-                > 1
-        );
+        assert_eq!(ids, ["whisper_cpp_base_en", "whisper_cpp_tiny_en"]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

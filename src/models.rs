@@ -15,7 +15,6 @@ pub struct SttModelInfo {
     pub local_path: Option<PathBuf>,
     pub install_status: ModelInstallStatus,
     pub download_model: Option<String>,
-    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,7 +140,6 @@ pub enum ModelRuntimeStatus {
     NotInstalled,
     Downloading,
     Running,
-    Disabled,
     NotImplemented,
     Error(String),
 }
@@ -154,7 +152,6 @@ impl fmt::Display for ModelRuntimeStatus {
             Self::NotInstalled => write!(f, "Not installed"),
             Self::Downloading => write!(f, "Downloading"),
             Self::Running => write!(f, "Running"),
-            Self::Disabled => write!(f, "Skipped"),
             Self::NotImplemented => write!(f, "Runtime unavailable"),
             Self::Error(message) => write!(f, "Error: {message}"),
         }
@@ -249,7 +246,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Basic",
             "Fastest",
             Some("tiny.en"),
-            true,
         ),
         model(
             "whisper_cpp_base_en",
@@ -260,7 +256,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Good",
             "Fast",
             Some("base.en"),
-            false,
         ),
         model(
             "whisper_cpp_small_en",
@@ -271,7 +266,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Better",
             "Medium",
             Some("small.en"),
-            false,
         ),
         model(
             "whisper_cpp_medium_en",
@@ -282,7 +276,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "High",
             "Slower",
             Some("medium.en"),
-            false,
         ),
         model(
             "vosk_small_en",
@@ -293,7 +286,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Basic",
             "Fast",
             Some("vosk-model-small-en-us-0.15"),
-            false,
         ),
         model(
             "faster_whisper_tiny_en",
@@ -304,7 +296,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Basic",
             "Fastest",
             Some("tiny.en"),
-            false,
         ),
         model(
             "faster_whisper_base_en",
@@ -315,7 +306,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Good",
             "Fast",
             Some("base.en"),
-            false,
         ),
         model(
             "faster_whisper_small_en_gpu",
@@ -326,7 +316,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Good",
             "Fast",
             Some("small.en"),
-            false,
         ),
         model(
             "faster_whisper_medium_en_gpu",
@@ -337,7 +326,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "High",
             "Medium",
             Some("medium.en"),
-            false,
         ),
         model(
             "faster_whisper_large_v3",
@@ -348,7 +336,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Highest",
             "Slow",
             Some("large-v3"),
-            false,
         ),
         model(
             "faster_whisper_turbo",
@@ -359,7 +346,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "High",
             "Fast",
             Some("turbo"),
-            false,
         ),
         model(
             "faster_whisper_distil_large_v3",
@@ -370,7 +356,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "High",
             "Fast",
             Some("distil-large-v3"),
-            false,
         ),
         model(
             "sherpa_onnx_zipformer_small",
@@ -381,7 +366,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Good",
             "Fast",
             Some("sherpa-onnx-zipformer-small-en-2023-06-26"),
-            false,
         ),
         model(
             "moonshine",
@@ -392,7 +376,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "Good",
             "Fast",
             Some("sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27"),
-            false,
         ),
         model(
             "parakeet_0_6b",
@@ -403,7 +386,6 @@ pub fn default_model_catalog() -> Vec<SttModelInfo> {
             "High",
             "Medium",
             Some("sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"),
-            false,
         ),
     ]
 }
@@ -418,7 +400,6 @@ fn model(
     accuracy_tier: &str,
     speed_tier: &str,
     download_model: Option<&str>,
-    enabled: bool,
 ) -> SttModelInfo {
     SttModelInfo {
         id: id.to_owned(),
@@ -431,7 +412,6 @@ fn model(
         local_path: None,
         install_status: ModelInstallStatus::NotInstalled,
         download_model: download_model.map(str::to_owned),
-        enabled,
     }
 }
 
@@ -518,11 +498,6 @@ mod tests {
         };
 
         assert_eq!(status.label(), "Downloading 1 MB · 2 MB/s");
-    }
-
-    #[test]
-    fn disabled_runtime_status_is_labeled_as_skipped() {
-        assert_eq!(ModelRuntimeStatus::Disabled.to_string(), "Skipped");
     }
 
     #[test]
