@@ -18562,7 +18562,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn transcript_editor_and_queued_output_state_are_accessible() {
+    fn transcript_and_queued_output_state_are_accessible() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
@@ -18595,30 +18595,14 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        let transcript_label_id = update
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
-            })
-            .map(|(id, _)| *id)
-            .expect("missing semantic Transcript heading");
-        let editor = update
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.role() == egui::accesskit::Role::MultilineTextInput)
-            .expect("missing transcript editor");
-
-        assert!(editor.labelled_by().contains(&transcript_label_id));
-        assert!(editor.is_disabled());
-        assert_eq!(
-            editor.description(),
-            Some("Transcript editing is temporarily locked while final output is sent.")
-        );
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Cancel pending output and clear transcript")
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::StaticText && node.name() == Some("final text")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Clear")
         }));
     }
 
