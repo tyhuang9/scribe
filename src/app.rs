@@ -70,9 +70,11 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, HistoryPageAction, HistoryPageState, ThemePalette, about_page,
-    configure_accessible_style, history_page, minimum_primary_target_height, show_navigation,
-    theme_palette, ui_palette,
+    AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCompatibility,
+    ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingSettingsView,
+    ScreenAction, ScreenView, ThemePalette, UiRoute, about_page, configure_accessible_style,
+    history_page, minimum_primary_target_height, recording_mode, render_screen,
+    settings_save_state, show_navigation, theme_palette, transcription_state, ui_palette,
 };
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
@@ -8095,6 +8097,168 @@ impl eframe::App for LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
+        let models = self.transcribe_screen_models();
+        let selected_model_id = self.selected_ready_model_id();
+        let microphone_permission = self.microphone_permission();
+        let provisional_transcript = self.capture_is_active().then(|| {
+            let preview = &self.overlay_controller.state().transcript;
+            [preview.committed.as_str(), preview.tentative.as_str()]
+                .into_iter()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let state = transcription_state(
+            self.effective_status(),
+            selected_model_id,
+            self.pending_recording.is_some(),
+            self.status_message == "No speech detected; nothing was pasted.",
+            self.active_recording
+                .as_ref()
+                .map(|recording| recording.started_at.elapsed().as_millis() as u64)
+                .unwrap_or_default(),
+            self.transcript.clone(),
+            provisional_transcript.unwrap_or_default(),
+            (!self.status_message.is_empty()).then(|| self.status_message.clone()),
+            self.config.recording.hotkey.clone(),
+            recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
+            microphone_permission,
+        );
+        let settings = RecordingSettingsView {
+            duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
+            provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
+            device_label: self
+                .config
+                .recording
+                .audio_input_device_name
+                .clone()
+                .unwrap_or_else(|| "OS default".to_owned()),
+            input_level: self
+                .capture_is_active()
+                .then(|| self.current_audio_level())
+                .unwrap_or_default(),
+            save_state: settings_save_state(
+                self.settings_store
+                    .as_ref()
+                    .is_some_and(SettingsStore::has_pending),
+                self.effective_status() == TranscriptionStatus::Error
+                    && self.status_message.starts_with("Failed to save settings:"),
+            ),
+        };
+        let action = render_screen(
+            ui,
+            &ScreenView {
+                route: UiRoute::Transcribe,
+                transcription: &state,
+                models: &models,
+                comparison: &Default::default(),
+                recording_settings: &settings,
+            },
+        );
+        self.apply_transcribe_screen_action(action);
+    }
+
+    fn selected_ready_model_id(&self) -> Option<String> {
+        let model = self.selected_model()?;
+        (runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready)
+            .then_some(model.id)
+    }
+
+    fn microphone_permission(&self) -> MicrophonePermission {
+        if self.effective_status() == TranscriptionStatus::Listening {
+            MicrophonePermission::Granted
+        } else if self.effective_status() == TranscriptionStatus::Error
+            && self.status_message.starts_with("Microphone failed:")
+        {
+            MicrophonePermission::Denied
+        } else {
+            MicrophonePermission::Unknown
+        }
+    }
+
+    fn transcribe_screen_models(&self) -> Vec<ModelViewModel> {
+        let Some(model) = self.selected_model() else {
+            return Vec::new();
+        };
+        let Ok(descriptor) = self
+            .transcription_service
+            .model_descriptor(&ModelId::new(&model.id))
+        else {
+            return Vec::new();
+        };
+        let install_status = self.effective_install_status(&model);
+        vec![ModelViewModel {
+            id: model.id.clone(),
+            display_name: descriptor.display_name.to_owned(),
+            variant_label: descriptor.speed_guidance.to_owned(),
+            description: Some(descriptor.description.to_owned()),
+            runtime_group: model.backend.clone(),
+            installed: install_status.is_runnable(),
+            active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
+            download_state: match install_status {
+                ModelInstallStatus::Installed => ModelDownloadState::Installed,
+                ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
+                ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
+                ModelInstallStatus::Error(_) | ModelInstallStatus::RuntimeError(_) => {
+                    ModelDownloadState::Failed
+                }
+                _ => ModelDownloadState::NotInstalled,
+            },
+            total_bytes: Some(descriptor.artifact_size_bytes),
+            disk_bytes: model
+                .local_path
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len()),
+            estimated_ram_bytes: descriptor
+                .expected_ram
+                .trim_end_matches("MB")
+                .parse::<u64>()
+                .ok()
+                .map(|megabytes| megabytes * 1_000_000),
+            languages: descriptor
+                .languages
+                .iter()
+                .map(|language| (*language).to_owned())
+                .collect(),
+            language_summary: descriptor.languages.join(", "),
+            speed_tier: ModelSpeedTier::Unknown,
+            size_tier: ModelSizeTier::Unknown,
+            compatibility: match descriptor.compatibility {
+                CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
+                CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
+            },
+            ..Default::default()
+        }]
+        .into_iter()
+        .collect()
+    }
+
+    fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
+            ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
+                self.start_recording(RecordingSource::Transcribe)
+            }
+            ScreenAction::StopRecording => self.stop_recording(),
+            ScreenAction::OpenAudioSettings => self.current_tab = Tab::General,
+            ScreenAction::ClearTranscript => self.clear_transcript_history(),
+            ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
+            ScreenAction::None
+            | ScreenAction::ToggleComparison
+            | ScreenAction::ToggleComparisonModel(_)
+            | ScreenAction::StartComparison
+            | ScreenAction::SetSettingsTab(_)
+            | ScreenAction::SetRecordingMode(_)
+            | ScreenAction::ToggleProvisionalFeedback
+            | ScreenAction::RefreshDevices
+            | ScreenAction::ChangeShortcut => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn ui_transcribe_legacy(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Transcribe", status, &status_message, |ui| {
