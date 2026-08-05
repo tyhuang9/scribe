@@ -21,7 +21,8 @@ use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
 };
 use crate::compatibility_bridge::{self, ProviderHandle};
-use crate::config::{self, AppConfig, HotkeyMode, ThemeMode};
+use crate::config::{self, AppConfig, HotkeyMode, SettingsStore, ThemeMode};
+use crate::core::{DictationPhase, SessionCoordinator, SessionPurpose, StopReason};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::managed_downloads;
 use crate::models::{
@@ -30,13 +31,14 @@ use crate::models::{
 use crate::prepared_audio::PreparedAudio;
 use crate::text_output;
 use crate::transcription::{
-    AccelerationPreference, CompatibilityStatus, ModelDescriptor, RequestId, SessionId,
+    AccelerationPreference, CompatibilityStatus, ModelDescriptor, ModelId, RequestId, SessionId,
     TranscriptionOptions, TranscriptionOutcome, TranscriptionRequest, TranscriptionService,
 };
 use crate::tray::{TrayCommand, TrayService};
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
+const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -78,6 +80,15 @@ fn tab_from_env_value(value: &str) -> Option<Tab> {
 enum RecordingSource {
     Transcribe,
     Playground,
+}
+
+impl RecordingSource {
+    fn purpose(self) -> SessionPurpose {
+        match self {
+            Self::Transcribe => SessionPurpose::Dictation,
+            Self::Playground => SessionPurpose::Comparison,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,6 +265,16 @@ enum PlaygroundAction {
 }
 
 enum AppEvent {
+    ModelPreloadFinished {
+        session_id: SessionId,
+        model_id: ModelId,
+        load_duration_ms: u128,
+    },
+    ModelPreloadFailed {
+        session_id: SessionId,
+        model_id: ModelId,
+        message: String,
+    },
     TranscriptionDone {
         source: RecordingSource,
         session_id: SessionId,
@@ -446,6 +467,7 @@ fn apply_runtime_record(
     install: config::ManagedRuntimeInstall,
 ) -> Option<config::ManagedRuntimeInstall> {
     config
+        .general
         .managed_runtimes
         .insert(runtime_id.to_owned(), install)
 }
@@ -458,11 +480,12 @@ fn rollback_runtime_record(
     match previous {
         Some(install) => {
             config
+                .general
                 .managed_runtimes
                 .insert(runtime_id.to_owned(), install);
         }
         None => {
-            config.managed_runtimes.remove(runtime_id);
+            config.general.managed_runtimes.remove(runtime_id);
         }
     }
 }
@@ -493,7 +516,7 @@ fn runtime_metadata_matches(
     runtime_id: &str,
     install: &config::ManagedRuntimeInstall,
 ) -> bool {
-    config.managed_runtimes.get(runtime_id) == Some(install)
+    config.general.managed_runtimes.get(runtime_id) == Some(install)
 }
 
 fn missing_runtime_source_message() -> String {
@@ -713,7 +736,7 @@ fn apply_runtime_uninstall_result(
     removal: Result<bool, String>,
 ) -> Result<bool, String> {
     let removed_files = removal?;
-    config.managed_runtimes.remove(runtime_id);
+    config.general.managed_runtimes.remove(runtime_id);
     Ok(removed_files)
 }
 
@@ -809,7 +832,7 @@ fn runtime_version_state(config: &AppConfig, provider: ProviderHandle) -> Runtim
     let Some(available) = provider.available_version() else {
         return RuntimeVersionState::NotTracked;
     };
-    let Some(install) = config.managed_runtimes.get(provider.id()) else {
+    let Some(install) = config.general.managed_runtimes.get(provider.id()) else {
         return RuntimeVersionState::NotTracked;
     };
     let installed = install
@@ -883,7 +906,7 @@ fn runtime_source_is_staged(config: &AppConfig, model: &SttModelInfo, path: &Pat
     let Some(provider) = compatibility_bridge::provider_for_model(model) else {
         return false;
     };
-    let Some(current) = config.managed_runtimes.get(provider.id()) else {
+    let Some(current) = config.general.managed_runtimes.get(provider.id()) else {
         return true;
     };
 
@@ -967,6 +990,7 @@ fn env_flag_value_enabled(value: &str) -> bool {
 pub struct LocalTranscriberApp {
     config: AppConfig,
     config_path: Option<PathBuf>,
+    settings_store: Option<SettingsStore>,
     current_tab: Tab,
     status: TranscriptionStatus,
     transcript: String,
@@ -991,11 +1015,7 @@ pub struct LocalTranscriberApp {
     playground_ranking_mode: RankingMode,
     playground_pending: usize,
     playground_audio_path: Option<PathBuf>,
-    next_session_id: u64,
-    next_request_id: u64,
-    active_transcription_session: Option<SessionId>,
-    active_transcription_request: Option<RequestId>,
-    active_playground_session: Option<SessionId>,
+    session_coordinator: SessionCoordinator,
     playground_runs: HashMap<SessionId, PlaygroundRunState>,
     latest_latency: Option<LatencyTrace>,
     hotkey_service: HotkeyService,
@@ -1018,15 +1038,18 @@ impl LocalTranscriberApp {
         };
         config::normalize_config(&mut config);
         cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode(
-            config.theme_mode,
+            config.general.theme_mode,
             cc.integration_info.system_theme,
         )));
 
         let (tx, rx) = unbounded();
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
+        let settings_store = config_path
+            .clone()
+            .map(|path| SettingsStore::new(path, SETTINGS_SAVE_DEBOUNCE));
         let mut app = Self {
-            hotkey_input: config.hotkey.clone(),
+            hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
             audio_devices: Vec::new(),
             capturing_hotkey: false,
@@ -1040,9 +1063,10 @@ impl LocalTranscriberApp {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey),
             config,
             config_path,
+            settings_store,
             current_tab: initial_tab(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -1053,17 +1077,17 @@ impl LocalTranscriberApp {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
-            next_session_id: 1,
-            next_request_id: 1,
-            active_transcription_session: None,
-            active_transcription_request: None,
-            active_playground_session: None,
+            session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
             quit_requested: false,
         };
+
+        if let Err(err) = audio::cleanup_abandoned_recordings() {
+            app.status_message = format!("Recording cleanup warning: {err}");
+        }
 
         let initial_tray_state = TrayUiState {
             is_recording: false,
@@ -1105,19 +1129,52 @@ impl LocalTranscriberApp {
             self.refresh_playground_cards_from_config();
             return;
         }
-        match config::save_config(&self.config) {
-            Ok(()) => {
-                if self.config_path.is_none() {
-                    self.config_path = config::config_file_path().ok();
-                }
-                self.status_message = "Settings saved".to_owned();
-            }
-            Err(err) => {
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Failed to save settings: {err}");
-            }
+        if self.settings_store.is_none()
+            && let Ok(path) = config::config_file_path()
+        {
+            self.config_path = Some(path.clone());
+            self.settings_store = Some(SettingsStore::new(path, SETTINGS_SAVE_DEBOUNCE));
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.schedule(&self.config);
+            self.status_message = "Settings updated".to_owned();
+        } else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "Failed to resolve the settings file path".to_owned();
         }
         self.refresh_playground_cards_from_config();
+    }
+
+    fn poll_settings_save(&mut self) {
+        let Some(store) = self.settings_store.as_mut() else {
+            return;
+        };
+        if let Err(err) = store.flush_if_due() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("Failed to save settings: {err}");
+        }
+    }
+
+    fn flush_settings(&mut self) {
+        let Some(store) = self.settings_store.as_mut() else {
+            return;
+        };
+        if !store.has_pending() {
+            return;
+        }
+        if let Err(err) = store.flush() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!("Failed to save settings: {err}");
+        }
+    }
+
+    fn stop_and_discard_active_recording(&mut self) {
+        let Some(active) = self.active_recording.take() else {
+            return;
+        };
+        if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
+            eprintln!("failed to stop and discard active recording: {err:#}");
+        }
     }
 
     fn refresh_playground_cards_from_config(&mut self) {
@@ -1155,6 +1212,7 @@ impl LocalTranscriberApp {
 
     fn has_active_work(&self) -> bool {
         self.active_recording.is_some()
+            || self.session_coordinator.phase() != DictationPhase::Idle
             || self.playground_pending > 0
             || matches!(
                 self.status,
@@ -1169,10 +1227,25 @@ impl LocalTranscriberApp {
             || !self.runtime_jobs.is_empty()
     }
 
+    fn effective_status(&self) -> TranscriptionStatus {
+        if self.status == TranscriptionStatus::Error {
+            return TranscriptionStatus::Error;
+        }
+        match self.session_coordinator.phase() {
+            DictationPhase::StartingCapture | DictationPhase::Capturing => {
+                TranscriptionStatus::Listening
+            }
+            DictationPhase::FinalizingCapture
+            | DictationPhase::Transcribing
+            | DictationPhase::Output => TranscriptionStatus::Transcribing,
+            DictationPhase::Idle => self.status,
+        }
+    }
+
     fn apply_playground_action(&mut self, action: PlaygroundAction) {
         match action {
             PlaygroundAction::Clear(model_id) => {
-                let clearing_active_model = model_id == self.config.selected_default_model;
+                let clearing_active_model = model_id == self.config.general.selected_default_model;
                 if let Some(card) = self
                     .playground_cards
                     .iter_mut()
@@ -1195,7 +1268,7 @@ impl LocalTranscriberApp {
                     .map(|card| card.descriptor.id.as_str().to_owned())
                     .collect::<Vec<_>>();
                 if let Some(position) = move_selected_model_by(
-                    &mut self.config.playground_model_order,
+                    &mut self.config.general.playground_model_order,
                     &selected_ids,
                     &model_id,
                     offset,
@@ -1220,7 +1293,7 @@ impl LocalTranscriberApp {
             } => {
                 if dragged_id != target_id {
                     move_model_before(
-                        &mut self.config.playground_model_order,
+                        &mut self.config.general.playground_model_order,
                         &dragged_id,
                         &target_id,
                     );
@@ -1245,24 +1318,6 @@ impl LocalTranscriberApp {
         self.start_recording_at(source, Instant::now(), TriggerObservation::AppAction);
     }
 
-    fn allocate_session_id(&mut self) -> SessionId {
-        let session_id = SessionId(self.next_session_id);
-        self.next_session_id = self
-            .next_session_id
-            .checked_add(1)
-            .expect("session identifier space exhausted");
-        session_id
-    }
-
-    fn allocate_request_id(&mut self) -> RequestId {
-        let request_id = RequestId(self.next_request_id);
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .expect("request identifier space exhausted");
-        request_id
-    }
-
     fn start_recording_at(
         &mut self,
         source: RecordingSource,
@@ -1281,7 +1336,7 @@ impl LocalTranscriberApp {
         }
         let mut latency = LatencyTrace::started_at(activation_at, trigger_observation);
 
-        if source == RecordingSource::Transcribe {
+        let preload_model = if source == RecordingSource::Transcribe {
             let Some(model) = self.selected_model() else {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
@@ -1294,33 +1349,42 @@ impl LocalTranscriberApp {
                 self.status_message = setup_message_for_status(&runtime_status);
                 return;
             }
-        }
+            Some(model)
+        } else {
+            None
+        };
 
         if source == RecordingSource::Playground {
             self.reset_playground_for_run();
         }
 
-        let session_id = self.allocate_session_id();
+        self.supersede_active_session();
+
+        let session_id = match self.session_coordinator.begin(source.purpose()) {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not start dictation: {err}");
+                return;
+            }
+        };
 
         match audio::start_recording(
-            self.config.max_recording_seconds,
-            self.config.audio_input_device_name.clone(),
+            self.config.recording.max_recording_seconds,
+            self.config.recording.audio_input_device_name.clone(),
         ) {
             Ok(session) => {
-                match source {
-                    RecordingSource::Transcribe => {
-                        self.active_playground_session = None;
-                        self.playground_pending = 0;
-                        self.playground_audio_path = None;
-                        self.refresh_playground_runtime_statuses();
-                        self.active_transcription_session = Some(session_id);
-                        self.active_transcription_request = None;
-                    }
-                    RecordingSource::Playground => {
-                        self.active_transcription_session = None;
-                        self.active_transcription_request = None;
-                        self.active_playground_session = Some(session_id);
-                    }
+                if let Err(err) = self.session_coordinator.capture_started(session_id) {
+                    session.stop();
+                    let _ = self.session_coordinator.fail(session_id);
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not enter capture state: {err}");
+                    return;
+                }
+                if source == RecordingSource::Transcribe {
+                    self.playground_pending = 0;
+                    self.playground_audio_path = None;
+                    self.refresh_playground_runtime_statuses();
                 }
                 latency.recorder_started_at = Some(Instant::now());
                 let path = session.audio_path.display().to_string();
@@ -1330,23 +1394,80 @@ impl LocalTranscriberApp {
                     source,
                     stop_requested: false,
                     started_at: Instant::now(),
-                    max_duration_seconds: self.config.max_recording_seconds,
+                    max_duration_seconds: self.config.recording.max_recording_seconds,
                     latency,
                 });
+                if let Some(model) = preload_model {
+                    self.start_model_preload(session_id, model);
+                }
                 self.status = TranscriptionStatus::Listening;
                 self.status_message = format!("Listening. Temporary WAV: {path}");
             }
             Err(err) => {
+                let _ = self.session_coordinator.fail(session_id);
                 self.status = TranscriptionStatus::Error;
                 self.status_message = format!("Microphone failed: {err}");
             }
         }
     }
 
+    fn start_model_preload(&mut self, session_id: SessionId, model: SttModelInfo) {
+        let model_id = ModelId::new(model.id.clone());
+        if self
+            .session_coordinator
+            .model_load_started(session_id, model_id.clone())
+            .is_err()
+        {
+            return;
+        }
+        if let Some(active) = self.active_recording.as_mut()
+            && active.session_id == session_id
+        {
+            active.latency.model_load_started_at = Some(Instant::now());
+        }
+        let service = self.transcription_service.with_config(self.config.clone());
+        let tx = self.tx.clone();
+        thread::spawn(
+            move || match service.preload_model(&model_id, model.local_path) {
+                Ok(outcome) => {
+                    let _ = tx.send(AppEvent::ModelPreloadFinished {
+                        session_id,
+                        model_id,
+                        load_duration_ms: outcome.model_load_duration_ms,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(AppEvent::ModelPreloadFailed {
+                        session_id,
+                        model_id,
+                        message: err.to_string(),
+                    });
+                }
+            },
+        );
+    }
+
+    fn supersede_active_session(&mut self) {
+        let Some(previous_session) = self.session_coordinator.active_session_id() else {
+            return;
+        };
+        self.transcription_service.cancel_active();
+        let _ = self.session_coordinator.cancel_active();
+        if let Some(run) = self.playground_runs.remove(&previous_session) {
+            let _ = fs::remove_file(run.audio_path);
+        }
+        self.playground_pending = 0;
+        self.playground_audio_path = None;
+        self.refresh_playground_runtime_statuses();
+    }
+
     fn stop_recording(&mut self) {
         if let Some(active) = self.active_recording.as_mut()
             && !active.stop_requested
         {
+            let _ = self
+                .session_coordinator
+                .request_stop(active.session_id, StopReason::Explicit);
             active.session.stop();
             active.stop_requested = true;
             active.latency.stop_requested_at = Some(Instant::now());
@@ -1387,9 +1508,21 @@ impl LocalTranscriberApp {
                 .active_recording
                 .take()
                 .expect("finished recording should still be active");
+            if !active.stop_requested {
+                let _ = self
+                    .session_coordinator
+                    .request_stop(session_id, StopReason::MaximumDuration);
+            }
+            debug_assert!(self.session_coordinator.stop_reason().is_some());
             active.latency.wav_finalized_at = Some(Instant::now());
             match result {
                 Ok(audio_path) => {
+                    if let Err(err) = self.session_coordinator.capture_finalized(session_id) {
+                        let _ = fs::remove_file(audio_path);
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Rejected stale capture result: {err}");
+                        return;
+                    }
                     self.status = TranscriptionStatus::Transcribing;
                     self.status_message = format!("Transcribing {}", audio_path.display());
                     match source {
@@ -1404,19 +1537,7 @@ impl LocalTranscriberApp {
                     }
                 }
                 Err(message) => {
-                    match source {
-                        RecordingSource::Transcribe => {
-                            if self.active_transcription_session == Some(session_id) {
-                                self.active_transcription_session = None;
-                                self.active_transcription_request = None;
-                            }
-                        }
-                        RecordingSource::Playground => {
-                            if self.active_playground_session == Some(session_id) {
-                                self.active_playground_session = None;
-                            }
-                        }
-                    }
+                    let _ = self.session_coordinator.fail(session_id);
                     self.status = TranscriptionStatus::Error;
                     self.status_message = format!("Recording failed: {message}");
                 }
@@ -1427,7 +1548,7 @@ impl LocalTranscriberApp {
     fn poll_hotkey(&mut self) {
         for observed in self.hotkey_service.poll_events() {
             match hotkey_recording_action(
-                self.config.hotkey_mode,
+                self.config.recording.hotkey_mode,
                 observed.event,
                 self.active_recording.as_ref().map(|active| active.source),
             ) {
@@ -1477,6 +1598,15 @@ impl LocalTranscriberApp {
             TrayCommand::ToggleRecording => self.toggle_recording(),
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
+                self.stop_and_discard_active_recording();
+                if !self
+                    .transcription_service
+                    .cancel_active_and_wait(Duration::from_secs(2))
+                {
+                    eprintln!("transcription workers did not stop before the quit timeout");
+                }
+                let _ = self.session_coordinator.cancel_active();
+                self.flush_settings();
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
@@ -1486,7 +1616,7 @@ impl LocalTranscriberApp {
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested
-            && self.config.close_to_tray
+            && self.config.general.close_to_tray
             && self.tray_service.is_some()
             && !self.quit_requested
         {
@@ -1527,21 +1657,8 @@ impl LocalTranscriberApp {
         session_id: SessionId,
         request_id: RequestId,
     ) -> bool {
-        match source {
-            RecordingSource::Transcribe => {
-                self.active_playground_session.is_none()
-                    && self.active_transcription_session == Some(session_id)
-                    && self.active_transcription_request == Some(request_id)
-            }
-            RecordingSource::Playground => {
-                self.active_transcription_session.is_none()
-                    && self.active_playground_session == Some(session_id)
-                    && self
-                        .playground_runs
-                        .get(&session_id)
-                        .is_some_and(|run| run.pending_requests.contains_key(&request_id))
-            }
-        }
+        self.session_coordinator
+            .is_current_request(source.purpose(), session_id, request_id)
     }
 
     fn expected_playground_model_id(
@@ -1549,11 +1666,9 @@ impl LocalTranscriberApp {
         session_id: SessionId,
         request_id: RequestId,
     ) -> Option<&str> {
-        self.playground_runs
-            .get(&session_id)?
-            .pending_requests
-            .get(&request_id)
-            .map(String::as_str)
+        self.session_coordinator
+            .request_model(session_id, request_id)
+            .map(ModelId::as_str)
     }
 
     fn reject_transcription_correlation(
@@ -1585,6 +1700,51 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                AppEvent::ModelPreloadFinished {
+                    session_id,
+                    model_id,
+                    load_duration_ms,
+                } => {
+                    if self
+                        .session_coordinator
+                        .model_load_finished(session_id, &model_id, true)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if let Some(active) = self.active_recording.as_mut()
+                        && active.session_id == session_id
+                    {
+                        active.latency.model_loaded_at = Some(Instant::now());
+                        self.status_message = if load_duration_ms == 0 {
+                            "Listening. Model is warm.".to_owned()
+                        } else {
+                            format!("Listening. Model loaded in {load_duration_ms} ms.")
+                        };
+                    }
+                }
+                AppEvent::ModelPreloadFailed {
+                    session_id,
+                    model_id,
+                    message,
+                } => {
+                    if self
+                        .session_coordinator
+                        .model_load_finished(session_id, &model_id, false)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if self
+                        .active_recording
+                        .as_ref()
+                        .is_some_and(|active| active.session_id == session_id)
+                    {
+                        self.status_message = format!(
+                            "Listening. Model warm-up was unavailable; final transcription will retry safely: {message}"
+                        );
+                    }
+                }
                 AppEvent::TranscriptionDone {
                     source,
                     session_id,
@@ -1602,6 +1762,7 @@ impl LocalTranscriberApp {
                                 request_id,
                                 "Transcription service returned mismatched correlation IDs",
                             );
+                            let _ = self.session_coordinator.fail(session_id);
                         }
                         self.cleanup_after_job(source, session_id, request_id);
                         continue;
@@ -1620,9 +1781,30 @@ impl LocalTranscriberApp {
                             request_id,
                             "Transcription service returned the wrong model for a Playground request",
                         );
+                        let _ = self.session_coordinator.fail(session_id);
                         self.cleanup_after_job(source, session_id, request_id);
                         continue;
                     }
+
+                    let result_model_id = ModelId::new(result.model_id.as_str());
+                    let all_requests_completed = match self.session_coordinator.complete_request(
+                        session_id,
+                        request_id,
+                        &result_model_id,
+                    ) {
+                        Ok(all_completed) => all_completed,
+                        Err(err) => {
+                            self.reject_transcription_correlation(
+                                source,
+                                session_id,
+                                request_id,
+                                &format!("Rejected transcription completion: {err}"),
+                            );
+                            let _ = self.session_coordinator.fail(session_id);
+                            self.cleanup_after_job(source, session_id, request_id);
+                            continue;
+                        }
+                    };
 
                     let mut latency = latency.map(|mut latency| {
                         latency.ui_result_at = Some(Instant::now());
@@ -1630,6 +1812,10 @@ impl LocalTranscriberApp {
                     });
                     match source {
                         RecordingSource::Transcribe => {
+                            if self.session_coordinator.begin_output(session_id).is_err() {
+                                self.cleanup_after_job(source, session_id, request_id);
+                                continue;
+                            }
                             let segment_count = result.transcript.segments.len();
                             let timed_segments = result
                                 .transcript
@@ -1659,7 +1845,7 @@ impl LocalTranscriberApp {
                                 stdout_bytes,
                                 stderr_bytes
                             );
-                            if self.config.auto_insert_transcript {
+                            if self.config.output.auto_insert_transcript {
                                 if let Some(latency) = latency.as_mut() {
                                     latency.output_started_at = Some(Instant::now());
                                 }
@@ -1682,9 +1868,21 @@ impl LocalTranscriberApp {
                                 self.status_message = completion_message;
                             }
                             self.latest_latency = latency;
+                            let _ = self.session_coordinator.complete(session_id);
                         }
                         RecordingSource::Playground => {
                             self.apply_playground_result(*result);
+                            if all_requests_completed {
+                                if self
+                                    .session_coordinator
+                                    .has_failed_requests(session_id)
+                                    .unwrap_or(false)
+                                {
+                                    let _ = self.session_coordinator.fail(session_id);
+                                } else {
+                                    let _ = self.session_coordinator.complete(session_id);
+                                }
+                            }
                         }
                     }
                     self.cleanup_after_job(source, session_id, request_id);
@@ -1711,9 +1909,29 @@ impl LocalTranscriberApp {
                             request_id,
                             "Transcription service returned the wrong model for a Playground request",
                         );
+                        let _ = self.session_coordinator.fail(session_id);
                         self.cleanup_after_job(source, session_id, request_id);
                         continue;
                     }
+                    let failed_model_id = ModelId::new(model_id.as_str());
+                    let all_requests_completed = match self.session_coordinator.fail_request(
+                        session_id,
+                        request_id,
+                        &failed_model_id,
+                    ) {
+                        Ok(all_completed) => all_completed,
+                        Err(err) => {
+                            self.reject_transcription_correlation(
+                                source,
+                                session_id,
+                                request_id,
+                                &format!("Rejected transcription failure: {err}"),
+                            );
+                            let _ = self.session_coordinator.fail(session_id);
+                            self.cleanup_after_job(source, session_id, request_id);
+                            continue;
+                        }
+                    };
                     if let Some(mut latency) = latency {
                         latency.ui_result_at = Some(Instant::now());
                         self.latest_latency = Some(latency);
@@ -1722,6 +1940,7 @@ impl LocalTranscriberApp {
                         RecordingSource::Transcribe => {
                             self.status = TranscriptionStatus::Error;
                             self.status_message = message;
+                            let _ = self.session_coordinator.fail(session_id);
                         }
                         RecordingSource::Playground => {
                             self.status = TranscriptionStatus::Error;
@@ -1735,6 +1954,9 @@ impl LocalTranscriberApp {
                                 card.latency_ms = None;
                             }
                             self.status_message = message;
+                            if all_requests_completed {
+                                let _ = self.session_coordinator.fail(session_id);
+                            }
                         }
                     }
                     self.cleanup_after_job(source, session_id, request_id);
@@ -1766,13 +1988,13 @@ impl LocalTranscriberApp {
                                 runtime_status_for_model(&self.config, &active)
                                     == ModelRuntimeStatus::Ready
                             });
-                        self.config.managed_models.insert(
+                        self.config.general.managed_models.insert(
                             model_id.clone(),
                             config::ManagedModelInstall::app_managed(path, "managed-download"),
                         );
                         set_model_selected(&mut self.config, &model_id, true);
                         if should_activate_installed_model(active_model_is_runnable) {
-                            self.config.selected_default_model = model_id.clone();
+                            self.config.general.selected_default_model = model_id.clone();
                             compatibility_bridge::record_selected_provider(
                                 &mut self.config,
                                 &model,
@@ -1838,6 +2060,9 @@ impl LocalTranscriberApp {
                             continue;
                         }
                     };
+                    if let Some(store) = self.settings_store.as_mut() {
+                        store.mark_current_persisted();
+                    }
                     let cleanup_warning = replacement.commit().err();
                     if self.config_path.is_none() {
                         self.config_path = config::config_file_path().ok();
@@ -1885,14 +2110,11 @@ impl LocalTranscriberApp {
     ) {
         match source {
             RecordingSource::Transcribe => {
-                if self.active_transcription_session != Some(session_id)
-                    || self.active_transcription_request != Some(request_id)
-                {
-                    return;
-                }
-                self.active_transcription_session = None;
-                self.active_transcription_request = None;
-                if self.active_playground_session.is_some() {
+                let owns_terminal = self
+                    .session_coordinator
+                    .last_terminal()
+                    .is_some_and(|terminal| terminal.session_id == session_id);
+                if self.session_coordinator.active_session_id().is_some() || !owns_terminal {
                     return;
                 }
                 self.status = if self.status == TranscriptionStatus::Error {
@@ -1917,16 +2139,19 @@ impl LocalTranscriberApp {
                     self.playground_runs.remove(&session_id);
                 }
 
-                if self.active_playground_session == Some(session_id)
+                let owns_active = self.session_coordinator.active_session_id() == Some(session_id);
+                let owns_terminal = self
+                    .session_coordinator
+                    .last_terminal()
+                    .is_some_and(|terminal| terminal.session_id == session_id);
+
+                if (owns_active || owns_terminal)
                     && let Some(remaining) = remaining
                 {
                     self.playground_pending = remaining;
                 }
 
-                if self.active_playground_session == Some(session_id)
-                    && completed_audio_path.is_some()
-                {
-                    self.active_playground_session = None;
+                if (owns_active || owns_terminal) && completed_audio_path.is_some() {
                     if self.status != TranscriptionStatus::Error {
                         self.status = TranscriptionStatus::Idle;
                         self.status_message = "Model playground finished".to_owned();
@@ -1950,22 +2175,33 @@ impl LocalTranscriberApp {
         let Some(model) = self.selected_model() else {
             self.status = TranscriptionStatus::Error;
             self.status_message = "No default model selected".to_owned();
-            if self.active_transcription_session == Some(session_id) {
-                self.active_transcription_session = None;
-                self.active_transcription_request = None;
-            }
+            let _ = self.session_coordinator.fail(session_id);
             let _ = fs::remove_file(audio_path);
             return;
         };
 
-        let request_id = self.allocate_request_id();
-        if self.active_transcription_session != Some(session_id) {
-            let _ = fs::remove_file(audio_path);
-            return;
-        }
-        self.active_transcription_request = Some(request_id);
+        let request_id = match self
+            .session_coordinator
+            .start_request(session_id, ModelId::new(model.id.as_str()))
+        {
+            Ok(request_id) => request_id,
+            Err(_) => {
+                let _ = fs::remove_file(audio_path);
+                return;
+            }
+        };
         latency.transcription_dispatched_at = Some(Instant::now());
         let service = self.transcription_service.with_config(self.config.clone());
+        let task = match service.begin_transcription_task() {
+            Ok(task) => task,
+            Err(err) => {
+                let _ = self.session_coordinator.fail(session_id);
+                let _ = fs::remove_file(audio_path);
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not dispatch transcription: {err}");
+                return;
+            }
+        };
         let tx = self.tx.clone();
 
         thread::spawn(move || {
@@ -1989,7 +2225,7 @@ impl LocalTranscriberApp {
                 TranscriptionRequest::new(session_id, request_id, prepared, model.id.clone());
             request.model_path = model.local_path.clone();
             request.options = TranscriptionOptions::default();
-            let result = service.transcribe(request);
+            let result = service.transcribe_task(request, task);
             let completed_at = Instant::now();
             latency.transcription_job_completed_at = Some(completed_at);
 
@@ -2021,18 +2257,18 @@ impl LocalTranscriberApp {
     fn dispatch_playground_transcriptions(&mut self, session_id: SessionId, audio_path: PathBuf) {
         let models = self.playground_selected_models();
         if let Some(message) = self.playground_run_block_reason() {
-            if self.active_playground_session == Some(session_id) {
-                self.active_playground_session = None;
-                self.playground_pending = 0;
-                self.playground_audio_path = None;
-            }
+            let _ = self.session_coordinator.fail(session_id);
+            self.playground_pending = 0;
+            self.playground_audio_path = None;
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
             let _ = fs::remove_file(audio_path);
             return;
         }
 
-        if self.active_playground_session != Some(session_id) {
+        if self.session_coordinator.active_session_id() != Some(session_id)
+            || self.session_coordinator.active_purpose() != Some(SessionPurpose::Comparison)
+        {
             let _ = fs::remove_file(audio_path);
             return;
         }
@@ -2042,22 +2278,49 @@ impl LocalTranscriberApp {
         let audio_duration_ms = audio::wav_duration_ms(&audio_path);
         let service = self.transcription_service.with_config(self.config.clone());
 
-        let requests = models
-            .into_iter()
-            .map(|model| (self.allocate_request_id(), model))
-            .collect::<Vec<_>>();
+        let mut requests = Vec::with_capacity(models.len());
+        for model in models {
+            let request_id = match self
+                .session_coordinator
+                .start_request(session_id, ModelId::new(model.id.as_str()))
+            {
+                Ok(request_id) => request_id,
+                Err(err) => {
+                    let _ = self.session_coordinator.fail(session_id);
+                    self.playground_pending = 0;
+                    self.playground_audio_path = None;
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not start model comparison: {err}");
+                    let _ = fs::remove_file(audio_path);
+                    return;
+                }
+            };
+            let task = match service.begin_transcription_task() {
+                Ok(task) => task,
+                Err(err) => {
+                    let _ = self.session_coordinator.fail(session_id);
+                    self.playground_pending = 0;
+                    self.playground_audio_path = None;
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = format!("Could not dispatch model comparison: {err}");
+                    let _ = fs::remove_file(audio_path);
+                    return;
+                }
+            };
+            requests.push((request_id, model, task));
+        }
         self.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: requests
                     .iter()
-                    .map(|(request_id, model)| (*request_id, model.id.clone()))
+                    .map(|(request_id, model, _)| (*request_id, model.id.clone()))
                     .collect(),
                 audio_path: audio_path.clone(),
             },
         );
 
-        for (_, model) in &requests {
+        for (_, model, _) in &requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
@@ -2079,7 +2342,7 @@ impl LocalTranscriberApp {
             let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    for (request_id, model) in requests {
+                    for (request_id, model, _) in requests {
                         let _ = tx.send(AppEvent::TranscriptionFailed {
                             source: RecordingSource::Playground,
                             session_id,
@@ -2093,7 +2356,7 @@ impl LocalTranscriberApp {
                 }
             };
 
-            for (request_id, model) in requests {
+            for (request_id, model, task) in requests {
                 let tx = tx.clone();
                 let service = service.clone();
                 let prepared = prepared.clone();
@@ -2106,7 +2369,7 @@ impl LocalTranscriberApp {
                     );
                     request.model_path = model.local_path.clone();
                     request.options = TranscriptionOptions::default();
-                    match service.transcribe(request) {
+                    match service.transcribe_task(request, task) {
                         Ok(result) => {
                             let _ = tx.send(AppEvent::TranscriptionDone {
                                 source: RecordingSource::Playground,
@@ -2152,7 +2415,8 @@ impl LocalTranscriberApp {
     }
 
     fn apply_playground_result(&mut self, result: TranscriptionOutcome) {
-        let is_active_model = result.model_id.as_str() == self.config.selected_default_model;
+        let is_active_model =
+            result.model_id.as_str() == self.config.general.selected_default_model;
         let duration_ms = result.processing_duration_ms;
         let transcript = result.transcript.text;
         if let Some(card) = self
@@ -2190,7 +2454,8 @@ impl LocalTranscriberApp {
 
     fn open_playground_selector(&mut self, opener_id: Option<egui::Id>) {
         if !self.playground_selector_busy() {
-            self.playground_selector_draft = Some(self.config.playground_selected_models.clone());
+            self.playground_selector_draft =
+                Some(self.config.general.playground_selected_models.clone());
             self.playground_selector_return_focus = opener_id;
             self.playground_selector_needs_initial_focus = true;
         }
@@ -2225,12 +2490,14 @@ impl LocalTranscriberApp {
 
     fn playground_run_block_reason(&self) -> Option<String> {
         if self.playground_cards.is_empty() {
-            return Some(if self.config.playground_selected_models.is_empty() {
-                "Choose models to test before starting a test recording.".to_owned()
-            } else {
-                "Install the selected Playground models before starting a test recording."
-                    .to_owned()
-            });
+            return Some(
+                if self.config.general.playground_selected_models.is_empty() {
+                    "Choose models to test before starting a test recording.".to_owned()
+                } else {
+                    "Install the selected Playground models before starting a test recording."
+                        .to_owned()
+                },
+            );
         }
         self.playground_cards
             .iter()
@@ -2247,7 +2514,7 @@ impl LocalTranscriberApp {
         self.playground_cards
             .iter()
             .find(|card| {
-                card.descriptor.id.as_str() == self.config.selected_default_model
+                card.descriptor.id.as_str() == self.config.general.selected_default_model
                     && !card.transcript.trim().is_empty()
             })
             .map(|card| {
@@ -2296,9 +2563,9 @@ impl LocalTranscriberApp {
         match self.hotkey_service.register(&self.hotkey_input) {
             Ok(()) => {
                 self.capturing_hotkey = false;
-                self.config.hotkey = self.hotkey_input.clone();
+                self.config.recording.hotkey = self.hotkey_input.clone();
                 self.save_config();
-                self.status_message = format!("Registered hotkey {}", self.config.hotkey);
+                self.status_message = format!("Registered hotkey {}", self.config.recording.hotkey);
             }
             Err(err) => {
                 self.status = TranscriptionStatus::Error;
@@ -2309,7 +2576,7 @@ impl LocalTranscriberApp {
 
     fn apply_theme(&self, ctx: &egui::Context, frame: &eframe::Frame) {
         ctx.set_visuals(stitch_visuals(resolve_theme_mode(
-            self.config.theme_mode,
+            self.config.general.theme_mode,
             frame.info().system_theme,
         )));
     }
@@ -2339,7 +2606,7 @@ impl LocalTranscriberApp {
     }
 
     fn select_model_as_default(&mut self, model: &SttModelInfo) {
-        self.config.selected_default_model = model.id.clone();
+        self.config.general.selected_default_model = model.id.clone();
         compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
     }
@@ -2354,7 +2621,7 @@ impl LocalTranscriberApp {
     fn runtime_consumer_activity(&self, runtime_id: &str) -> RuntimeConsumerActivity {
         RuntimeConsumerActivity {
             recording: self.active_recording.is_some(),
-            transcribing: self.status == TranscriptionStatus::Transcribing,
+            transcribing: self.effective_status() == TranscriptionStatus::Transcribing,
             playground_jobs: self.playground_pending > 0,
             model_download: model_download_uses_runtime(
                 &self.config,
@@ -2426,11 +2693,11 @@ impl LocalTranscriberApp {
     fn uninstall_model(&mut self, model: &SttModelInfo) {
         let removal = uninstall_model_files(&self.config, model);
         self.model_downloads.remove(&model.id);
-        self.config.managed_models.remove(&model.id);
-        self.config.model_paths.remove(&model.id);
+        self.config.general.managed_models.remove(&model.id);
+        self.config.general.model_paths.remove(&model.id);
         set_model_selected(&mut self.config, &model.id, false);
 
-        if self.config.selected_default_model == model.id {
+        if self.config.general.selected_default_model == model.id {
             select_first_installed_model(&mut self.config);
         }
 
@@ -2623,6 +2890,7 @@ impl eframe::App for LocalTranscriberApp {
         }
         self.poll_recording();
         self.poll_events();
+        self.poll_settings_save();
         self.sync_tray_state();
 
         egui::SidePanel::left("navigation")
@@ -2664,11 +2932,23 @@ impl eframe::App for LocalTranscriberApp {
 
         ctx.request_repaint_after(self.next_repaint_delay());
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_and_discard_active_recording();
+        if !self
+            .transcription_service
+            .cancel_active_and_wait(Duration::from_secs(2))
+        {
+            eprintln!("transcription workers did not stop before the exit timeout");
+        }
+        let _ = self.session_coordinator.cancel_active();
+        self.flush_settings();
+    }
 }
 
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
-        let status = self.status;
+        let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Transcribe", status, &status_message, |ui| {
             let selected_model = self.selected_model();
@@ -2688,7 +2968,7 @@ impl LocalTranscriberApp {
                         )
                     })
             });
-            let hotkey = self.config.hotkey.clone();
+            let hotkey = self.config.recording.hotkey.clone();
             let mut requested_tab = None;
 
             ui.columns(2, |columns| {
@@ -2812,7 +3092,7 @@ impl LocalTranscriberApp {
                 ui.horizontal(|ui| {
                     ui.label(section_heading("Transcript"));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ready_dot(ui, self.status);
+                        ready_dot(ui, self.effective_status());
                     });
                 });
                 ui.add_space(10.0);
@@ -2842,7 +3122,7 @@ impl LocalTranscriberApp {
             .map(|descriptor| (descriptor.id.as_str(), descriptor))
             .collect::<HashMap<_, _>>();
 
-        let status = self.status;
+        let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Models Catalog", status, &status_message, |ui| {
             panel(ui, |ui| {
@@ -3005,7 +3285,7 @@ impl LocalTranscriberApp {
                 let descriptor = descriptors_by_id
                     .get(model.id.as_str())
                     .expect("filtered normalized model must have a descriptor");
-                let selected = self.config.selected_default_model == model.id;
+                let selected = self.config.general.selected_default_model == model.id;
                 let install_status = self.effective_install_status(&model);
                 let runtime_ready =
                     compatibility_bridge::provider_for_model(&model).is_some_and(|provider| {
@@ -3086,7 +3366,7 @@ impl LocalTranscriberApp {
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
-        let status = self.status;
+        let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
             panel(ui, |ui| {
@@ -3135,7 +3415,7 @@ impl LocalTranscriberApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         badge(
                             ui,
-                            &format!("{} selected", self.config.playground_selected_models.len()),
+                            &format!("{} selected", self.config.general.playground_selected_models.len()),
                             ChipTone::Neutral,
                         );
                     });
@@ -3237,7 +3517,7 @@ impl LocalTranscriberApp {
                     ui,
                     &benchmark_results,
                     self.playground_ranking_mode,
-                    &self.config.selected_default_model,
+                    &self.config.general.selected_default_model,
                 );
             }
 
@@ -3274,7 +3554,7 @@ impl LocalTranscriberApp {
             let card_count = self.playground_cards.len();
             for (card_index, card_state) in self.playground_cards.iter_mut().enumerate() {
                 let model_id = card_state.descriptor.id.as_str().to_owned();
-                let is_active_model = model_id == self.config.selected_default_model;
+                let is_active_model = model_id == self.config.general.selected_default_model;
                 let drag_id = ui.id().with(("playground-card", &model_id));
                 let outer_width = usable_width(ui);
                 let (inner, dropped_payload) = ui
@@ -3494,42 +3774,42 @@ impl LocalTranscriberApp {
     }
 
     fn ui_settings(&mut self, ui: &mut Ui) {
-        let status = self.status;
+        let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Settings", status, &status_message, |ui| {
             card(ui, |ui| {
                 ui.label(section_heading("General"));
                 ui.add_space(8.0);
-                let mut close_to_tray = self.config.close_to_tray;
+                let mut close_to_tray = self.config.general.close_to_tray;
                 if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
-                    self.config.close_to_tray = close_to_tray;
+                    self.config.general.close_to_tray = close_to_tray;
                     self.save_config();
                 }
-                let mut auto_insert = self.config.auto_insert_transcript;
+                let mut auto_insert = self.config.output.auto_insert_transcript;
                 if ui
                     .checkbox(&mut auto_insert, "Insert transcript into focused app")
                     .changed()
                 {
-                    self.config.auto_insert_transcript = auto_insert;
+                    self.config.output.auto_insert_transcript = auto_insert;
                     self.save_config();
                 }
-                ui.add_enabled_ui(self.config.auto_insert_transcript, |ui| {
-                    let mut restore_clipboard = self.config.restore_clipboard_after_insert;
+                ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
+                    let mut restore_clipboard = self.config.output.restore_clipboard_after_insert;
                     if ui
                         .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
                         .changed()
                     {
-                        self.config.restore_clipboard_after_insert = restore_clipboard;
+                        self.config.output.restore_clipboard_after_insert = restore_clipboard;
                         self.save_config();
                     }
-                    let mut paste_delay = self.config.paste_delay_ms as i32;
+                    let mut paste_delay = self.config.output.paste_delay_ms as i32;
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Paste delay ms");
                         if ui
                             .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
                             .changed()
                         {
-                            self.config.paste_delay_ms = paste_delay.max(1) as u64;
+                            self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
                             self.save_config();
                         }
                     });
@@ -3565,20 +3845,20 @@ impl LocalTranscriberApp {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    let before = self.config.hotkey_mode;
+                    let before = self.config.recording.hotkey_mode;
                     ui.label("Hotkey mode");
                     ComboBox::from_id_source("hotkey-mode")
-                        .selected_text(self.config.hotkey_mode.label())
+                        .selected_text(self.config.recording.hotkey_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in HotkeyMode::ALL {
                                 ui.selectable_value(
-                                    &mut self.config.hotkey_mode,
+                                    &mut self.config.recording.hotkey_mode,
                                     mode,
                                     mode.label(),
                                 );
                             }
                         });
-                    if before != self.config.hotkey_mode {
+                    if before != self.config.recording.hotkey_mode {
                         self.save_config();
                     }
                 });
@@ -3591,12 +3871,12 @@ impl LocalTranscriberApp {
                 let gpu_available = self
                     .transcription_service
                     .model_descriptor(&crate::transcription::ModelId::new(
-                        &self.config.selected_default_model,
+                        &self.config.general.selected_default_model,
                     ))
                     .is_ok_and(|descriptor| descriptor.capabilities.gpu);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Transcription device");
-                    let mut preference = self.config.acceleration_preference;
+                    let mut preference = self.config.performance.acceleration_preference;
                     ComboBox::from_id_source("transcription-device-mode")
                         .selected_text(preference.label())
                         .show_ui(ui, |ui| {
@@ -3607,8 +3887,8 @@ impl LocalTranscriberApp {
                                 });
                             }
                         });
-                    if preference != self.config.acceleration_preference {
-                        self.config.acceleration_preference = preference;
+                    if preference != self.config.performance.acceleration_preference {
+                        self.config.performance.acceleration_preference = preference;
                         self.save_config();
                     }
                 });
@@ -3628,44 +3908,45 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Audio"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    let before = self.config.audio_input_device_name.clone();
+                    let before = self.config.recording.audio_input_device_name.clone();
                     ui.label("Microphone");
                     ComboBox::from_id_source("audio-input-device")
                         .selected_text(
                             self.config
+                                .recording
                                 .audio_input_device_name
                                 .as_deref()
                                 .unwrap_or("OS default"),
                         )
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut self.config.audio_input_device_name,
+                                &mut self.config.recording.audio_input_device_name,
                                 None,
                                 "OS default",
                             );
                             for device in &self.audio_devices {
                                 ui.selectable_value(
-                                    &mut self.config.audio_input_device_name,
+                                    &mut self.config.recording.audio_input_device_name,
                                     Some(device.clone()),
                                     device,
                                 );
                             }
                         });
-                    if before != self.config.audio_input_device_name {
+                    if before != self.config.recording.audio_input_device_name {
                         self.save_config();
                     }
                     if ui.add(small_button(ui, "Refresh")).clicked() {
                         self.refresh_audio_devices();
                     }
                 });
-                let mut max_duration = self.config.max_recording_seconds as i32;
+                let mut max_duration = self.config.recording.max_recording_seconds as i32;
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Max recording seconds");
                     if ui
                         .add(egui::DragValue::new(&mut max_duration).clamp_range(1..=600))
                         .changed()
                     {
-                        self.config.max_recording_seconds = max_duration.max(1) as u32;
+                        self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
                         self.save_config();
                     }
                 });
@@ -3676,20 +3957,20 @@ impl LocalTranscriberApp {
                 ui.label(section_heading("Appearance"));
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    let before = self.config.theme_mode;
+                    let before = self.config.general.theme_mode;
                     ui.label("Theme");
                     ComboBox::from_id_source("theme-mode")
-                        .selected_text(self.config.theme_mode.label())
+                        .selected_text(self.config.general.theme_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in ThemeMode::ALL {
                                 ui.selectable_value(
-                                    &mut self.config.theme_mode,
+                                    &mut self.config.general.theme_mode,
                                     mode,
                                     mode.label(),
                                 );
                             }
                         });
-                    if before != self.config.theme_mode {
+                    if before != self.config.general.theme_mode {
                         self.save_config();
                     }
                 });
@@ -5315,7 +5596,7 @@ fn uninstall_model_files(config: &AppConfig, model: &SttModelInfo) -> Result<boo
 }
 
 fn uninstall_runtime_files(config: &AppConfig, runtime_id: &str) -> Result<bool, String> {
-    let Some(install) = config.managed_runtimes.get(runtime_id) else {
+    let Some(install) = config.general.managed_runtimes.get(runtime_id) else {
         return Ok(false);
     };
     let Some(target) =
@@ -5766,7 +6047,7 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
 }
 
 fn select_first_installed_model(config: &mut AppConfig) {
-    config.selected_default_model = config::configured_models(config)
+    config.general.selected_default_model = config::configured_models(config)
         .into_iter()
         .find(|model| model.install_status.is_runnable())
         .map(|model| model.id)
@@ -5776,14 +6057,19 @@ fn select_first_installed_model(config: &mut AppConfig) {
 fn set_model_selected(config: &mut AppConfig, model_id: &str, selected: bool) {
     if selected {
         if !config
+            .general
             .playground_selected_models
             .iter()
             .any(|id| id == model_id)
         {
-            config.playground_selected_models.push(model_id.to_owned());
+            config
+                .general
+                .playground_selected_models
+                .push(model_id.to_owned());
         }
     } else {
         config
+            .general
             .playground_selected_models
             .retain(|id| id != model_id);
     }
@@ -5795,7 +6081,7 @@ fn apply_playground_selector_draft(config: &mut AppConfig, draft: Vec<String>) {
         .filter(|model| model.install_status.is_runnable())
         .map(|model| model.id)
         .collect::<Vec<_>>();
-    config.playground_selected_models = draft
+    config.general.playground_selected_models = draft
         .into_iter()
         .filter(|id| installed_ids.iter().any(|installed| installed == id))
         .collect();
@@ -6158,14 +6444,15 @@ mod layout_tests {
     #[test]
     fn active_model_can_stay_pinned_when_removed_from_playground_selection() {
         let mut config = AppConfig::default();
-        let active_model = config.selected_default_model.clone();
+        let active_model = config.general.selected_default_model.clone();
 
         set_model_selected(&mut config, &active_model, false);
         config::normalize_config(&mut config);
 
-        assert_eq!(config.selected_default_model, active_model);
+        assert_eq!(config.general.selected_default_model, active_model);
         assert!(
             !config
+                .general
                 .playground_selected_models
                 .iter()
                 .any(|id| id == &active_model)
@@ -6356,10 +6643,16 @@ mod layout_tests {
         fs::write(&temp_path, b"wav").unwrap();
 
         let mut app = test_app();
-        app.config.debug_mode = true;
+        app.config.developer.debug_mode = true;
         let session_id = SessionId(7);
         let request_id = RequestId(9);
-        app.active_playground_session = Some(session_id);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            session_id,
+            request_id,
+            "test-model",
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
         app.playground_runs.insert(
@@ -6378,20 +6671,101 @@ mod layout_tests {
     #[test]
     fn correlation_identifiers_are_monotonic() {
         let mut app = test_app();
+        let first = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        assert_eq!(first, SessionId(1));
+        app.session_coordinator.cancel(first).unwrap();
+        let second = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        assert_eq!(second, SessionId(2));
+        app.session_coordinator.capture_started(second).unwrap();
+        app.session_coordinator.capture_finalized(second).unwrap();
+        assert_eq!(
+            app.session_coordinator
+                .start_request(second, ModelId::new("first"))
+                .unwrap(),
+            RequestId(1)
+        );
+        assert_eq!(
+            app.session_coordinator
+                .start_request(second, ModelId::new("second"))
+                .unwrap(),
+            RequestId(2)
+        );
+    }
 
-        assert_eq!(app.allocate_session_id(), SessionId(1));
-        assert_eq!(app.allocate_session_id(), SessionId(2));
-        assert_eq!(app.allocate_request_id(), RequestId(1));
-        assert_eq!(app.allocate_request_id(), RequestId(2));
+    #[test]
+    fn model_preload_is_dispatched_while_capture_is_active() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+
+        app.start_model_preload(session_id, model);
+
+        assert!(matches!(
+            app.session_coordinator.active().unwrap().model_load(),
+            crate::core::ModelLoadState::Loading { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_preload_completion_cannot_change_the_active_session() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        app.session_coordinator.capture_started(session_id).unwrap();
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        app.session_coordinator
+            .model_load_started(session_id, model_id.clone())
+            .unwrap();
+        app.tx
+            .send(AppEvent::ModelPreloadFinished {
+                session_id: SessionId(session_id.0 + 1),
+                model_id: model_id.clone(),
+                load_duration_ms: 1,
+            })
+            .unwrap();
+        app.tx
+            .send(AppEvent::ModelPreloadFinished {
+                session_id,
+                model_id,
+                load_duration_ms: 2,
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(matches!(
+            app.session_coordinator.active().unwrap().model_load(),
+            crate::core::ModelLoadState::Ready { .. }
+        ));
     }
 
     #[test]
     fn current_normal_success_is_applied_and_completed() {
         let mut app = test_app();
-        app.config.auto_insert_transcript = false;
+        app.config.output.auto_insert_transcript = false;
         app.status = TranscriptionStatus::Transcribing;
-        app.active_transcription_session = Some(SessionId(1));
-        app.active_transcription_request = Some(RequestId(10));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(1),
+            RequestId(10),
+            "whisper_cpp_base_en",
+        );
         app.tx
             .send(AppEvent::TranscriptionDone {
                 source: RecordingSource::Transcribe,
@@ -6411,16 +6785,20 @@ mod layout_tests {
         assert_eq!(app.transcript, "accepted result");
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert!(app.status_message.contains("finished in 42 ms"));
-        assert_eq!(app.active_transcription_session, None);
-        assert_eq!(app.active_transcription_request, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 
     #[test]
     fn current_normal_failure_is_applied_and_completed() {
         let mut app = test_app();
         app.status = TranscriptionStatus::Transcribing;
-        app.active_transcription_session = Some(SessionId(1));
-        app.active_transcription_request = Some(RequestId(10));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(1),
+            RequestId(10),
+            "whisper_cpp_base_en",
+        );
         app.tx
             .send(AppEvent::TranscriptionFailed {
                 source: RecordingSource::Transcribe,
@@ -6436,8 +6814,7 @@ mod layout_tests {
 
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert_eq!(app.status_message, "runtime stopped");
-        assert_eq!(app.active_transcription_session, None);
-        assert_eq!(app.active_transcription_request, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 
     #[test]
@@ -6453,7 +6830,13 @@ mod layout_tests {
         let session_id = SessionId(3);
         let request_id = RequestId(30);
         app.status = TranscriptionStatus::Transcribing;
-        app.active_playground_session = Some(session_id);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            session_id,
+            request_id,
+            &model_id,
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
         app.playground_runs.insert(
@@ -6484,7 +6867,7 @@ mod layout_tests {
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert_eq!(app.playground_pending, 0);
         assert_eq!(app.playground_audio_path, None);
-        assert_eq!(app.active_playground_session, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
         assert!(!app.playground_runs.contains_key(&session_id));
         let card = app
             .playground_cards
@@ -6507,7 +6890,13 @@ mod layout_tests {
         let session_id = SessionId(4);
         let request_id = RequestId(40);
         app.status = TranscriptionStatus::Transcribing;
-        app.active_playground_session = Some(session_id);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            session_id,
+            request_id,
+            &model_id,
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
         app.playground_runs.insert(
@@ -6534,7 +6923,7 @@ mod layout_tests {
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert_eq!(app.status_message, "expected failure");
         assert_eq!(app.playground_pending, 0);
-        assert_eq!(app.active_playground_session, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
         assert!(!app.playground_runs.contains_key(&session_id));
         let card = app
             .playground_cards
@@ -6550,11 +6939,16 @@ mod layout_tests {
     #[test]
     fn mismatched_service_ids_are_rejected_without_output() {
         let mut app = test_app();
-        app.config.auto_insert_transcript = false;
+        app.config.output.auto_insert_transcript = false;
         app.transcript = "preserve me".to_owned();
         app.status = TranscriptionStatus::Transcribing;
-        app.active_transcription_session = Some(SessionId(4));
-        app.active_transcription_request = Some(RequestId(40));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(4),
+            RequestId(40),
+            "whisper_cpp_base_en",
+        );
         app.tx
             .send(AppEvent::TranscriptionDone {
                 source: RecordingSource::Transcribe,
@@ -6574,8 +6968,7 @@ mod layout_tests {
         assert_eq!(app.transcript, "preserve me");
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("mismatched correlation IDs"));
-        assert_eq!(app.active_transcription_session, None);
-        assert_eq!(app.active_transcription_request, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 
     #[test]
@@ -6590,7 +6983,13 @@ mod layout_tests {
         let session_id = SessionId(5);
         let request_id = RequestId(50);
         app.status = TranscriptionStatus::Transcribing;
-        app.active_playground_session = Some(session_id);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            session_id,
+            request_id,
+            &model_id,
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
         app.playground_runs.insert(
@@ -6621,7 +7020,7 @@ mod layout_tests {
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("mismatched correlation IDs"));
         assert_eq!(app.playground_pending, 0);
-        assert_eq!(app.active_playground_session, None);
+        assert_eq!(app.session_coordinator.active_session_id(), None);
         let card = app
             .playground_cards
             .iter()
@@ -6642,7 +7041,13 @@ mod layout_tests {
         let session_id = SessionId(6);
         let request_id = RequestId(60);
         app.status = TranscriptionStatus::Transcribing;
-        app.active_playground_session = Some(session_id);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            session_id,
+            request_id,
+            &expected_model_id,
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(temp_path.clone());
         app.playground_runs.insert(
@@ -6687,8 +7092,13 @@ mod layout_tests {
         app.transcript = "newer transcript".to_owned();
         app.status = TranscriptionStatus::Listening;
         app.status_message = "newer session is listening".to_owned();
-        app.active_transcription_session = Some(SessionId(2));
-        app.active_transcription_request = Some(RequestId(20));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(2),
+            RequestId(20),
+            "whisper_cpp_base_en",
+        );
 
         app.tx
             .send(AppEvent::TranscriptionDone {
@@ -6719,8 +7129,10 @@ mod layout_tests {
         assert_eq!(app.transcript, "newer transcript");
         assert_eq!(app.status, TranscriptionStatus::Listening);
         assert_eq!(app.status_message, "newer session is listening");
-        assert_eq!(app.active_transcription_session, Some(SessionId(2)));
-        assert_eq!(app.active_transcription_request, Some(RequestId(20)));
+        assert_eq!(
+            app.session_coordinator.active_session_id(),
+            Some(SessionId(2))
+        );
     }
 
     #[test]
@@ -6729,9 +7141,7 @@ mod layout_tests {
         app.transcript = "preserve me".to_owned();
         app.status = TranscriptionStatus::Listening;
         app.status_message = "Playground is listening".to_owned();
-        app.active_transcription_session = Some(SessionId(1));
-        app.active_transcription_request = Some(RequestId(10));
-        app.active_playground_session = Some(SessionId(2));
+        seed_test_session(&mut app, RecordingSource::Playground, SessionId(2));
 
         app.tx
             .send(AppEvent::TranscriptionDone {
@@ -6752,7 +7162,10 @@ mod layout_tests {
         assert_eq!(app.transcript, "preserve me");
         assert_eq!(app.status, TranscriptionStatus::Listening);
         assert_eq!(app.status_message, "Playground is listening");
-        assert_eq!(app.active_playground_session, Some(SessionId(2)));
+        assert_eq!(
+            app.session_coordinator.active_session_id(),
+            Some(SessionId(2))
+        );
     }
 
     #[test]
@@ -6766,8 +7179,13 @@ mod layout_tests {
         app.transcript = "preserve me".to_owned();
         app.status = TranscriptionStatus::Listening;
         app.status_message = "Normal dictation is listening".to_owned();
-        app.active_transcription_session = Some(SessionId(2));
-        app.active_transcription_request = Some(RequestId(20));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(2),
+            RequestId(20),
+            "whisper_cpp_base_en",
+        );
         app.playground_runs.insert(
             SessionId(1),
             PlaygroundRunState {
@@ -6798,8 +7216,10 @@ mod layout_tests {
         assert_eq!(app.transcript, "preserve me");
         assert_eq!(app.status, TranscriptionStatus::Listening);
         assert_eq!(app.status_message, "Normal dictation is listening");
-        assert_eq!(app.active_transcription_session, Some(SessionId(2)));
-        assert_eq!(app.active_transcription_request, Some(RequestId(20)));
+        assert_eq!(
+            app.session_coordinator.active_session_id(),
+            Some(SessionId(2))
+        );
 
         app.tx
             .send(AppEvent::TranscriptionFailed {
@@ -6834,7 +7254,13 @@ mod layout_tests {
         let mut app = test_app();
         app.playground_cards[0].transcript = "current result".to_owned();
         app.playground_cards[0].status = ModelRuntimeStatus::Running;
-        app.active_playground_session = Some(SessionId(2));
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            SessionId(2),
+            RequestId(20),
+            "whisper_cpp_base_en",
+        );
         app.playground_pending = 1;
         app.playground_audio_path = Some(current_audio.clone());
         app.playground_runs.insert(
@@ -6897,6 +7323,60 @@ mod layout_tests {
         assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
 
         fs::remove_file(current_audio).unwrap();
+    }
+
+    #[test]
+    fn superseding_playground_resets_cards_before_new_capture_can_fail() {
+        let audio = std::env::temp_dir().join(format!(
+            "scribe-playground-superseded-{}.wav",
+            std::process::id()
+        ));
+        fs::write(&audio, b"superseded wav").unwrap();
+        let mut app = test_app();
+        app.playground_cards[0].status = ModelRuntimeStatus::Running;
+        seed_test_request(
+            &mut app,
+            RecordingSource::Playground,
+            SessionId(7),
+            RequestId(70),
+            "whisper_cpp_base_en",
+        );
+        app.playground_runs.insert(
+            SessionId(7),
+            PlaygroundRunState {
+                pending_requests: HashMap::from([(
+                    RequestId(70),
+                    "whisper_cpp_base_en".to_owned(),
+                )]),
+                audio_path: audio.clone(),
+            },
+        );
+        app.playground_pending = 1;
+        app.playground_audio_path = Some(audio.clone());
+
+        app.supersede_active_session();
+
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.playground_audio_path, None);
+        assert!(!audio.exists());
+        assert_ne!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
+    }
+
+    #[test]
+    fn active_session_does_not_hide_an_actionable_error_badge() {
+        let mut app = test_app();
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            SessionId(8),
+            RequestId(80),
+            "whisper_cpp_base_en",
+        );
+        app.status = TranscriptionStatus::Error;
+        app.status_message = "Failed to save settings".to_owned();
+
+        assert_eq!(app.effective_status(), TranscriptionStatus::Error);
     }
 
     #[test]
@@ -7303,7 +7783,7 @@ mod layout_tests {
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
         LocalTranscriberApp {
-            hotkey_input: config.hotkey.clone(),
+            hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
             audio_devices: Vec::new(),
             capturing_hotkey: false,
@@ -7317,9 +7797,10 @@ mod layout_tests {
             playground_reference_transcript: String::new(),
             playground_reference_user_edited: false,
             playground_ranking_mode: RankingMode::Balanced,
-            hotkey_service: HotkeyService::new(&config.hotkey),
+            hotkey_service: HotkeyService::new(&config.recording.hotkey),
             config,
             config_path: None,
+            settings_store: None,
             current_tab: Tab::Models,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -7330,17 +7811,39 @@ mod layout_tests {
             rx,
             playground_pending: 0,
             playground_audio_path: None,
-            next_session_id: 1,
-            next_request_id: 1,
-            active_transcription_session: None,
-            active_transcription_request: None,
-            active_playground_session: None,
+            session_coordinator: SessionCoordinator::default(),
             playground_runs: HashMap::new(),
             latest_latency: None,
             tray_service: None,
             last_tray_state: None,
             quit_requested: false,
         }
+    }
+
+    fn seed_test_request(
+        app: &mut LocalTranscriberApp,
+        source: RecordingSource,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &str,
+    ) {
+        app.session_coordinator.seed_active_for_test(
+            session_id,
+            source.purpose(),
+            [(request_id, ModelId::new(model_id))],
+        );
+    }
+
+    fn seed_test_session(
+        app: &mut LocalTranscriberApp,
+        source: RecordingSource,
+        session_id: SessionId,
+    ) {
+        app.session_coordinator.seed_active_for_test(
+            session_id,
+            source.purpose(),
+            std::iter::empty(),
+        );
     }
 
     fn test_transcription_outcome(
@@ -7803,7 +8306,7 @@ mod layout_tests {
             fs::write(&current, b"current").unwrap();
             fs::write(&staged, b"staged").unwrap();
             let mut config = AppConfig::default();
-            config.managed_runtimes.insert(
+            config.general.managed_runtimes.insert(
                 runtime_id.to_owned(),
                 config::ManagedRuntimeInstall::new(current.clone()),
             );
@@ -7832,7 +8335,7 @@ mod layout_tests {
         let _ = fs::remove_dir_all(&runtime_root);
         let executable = write_vosk_runtime(&runtime_root.join("vosk"));
         let mut config = AppConfig::default();
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(executable, Some("0.3.44")),
         );
@@ -7894,6 +8397,7 @@ mod layout_tests {
         let mut previous_record = config::ManagedRuntimeInstall::new(previous_executable.clone());
         previous_record.source = Some("previous".to_owned());
         config
+            .general
             .managed_runtimes
             .insert("vosk".to_owned(), previous_record.clone());
         let mut new_record = config::ManagedRuntimeInstall::new(replacement.installed_path.clone());
@@ -7905,7 +8409,10 @@ mod layout_tests {
         rollback_runtime_record(&mut config, "vosk", replaced);
         replacement.rollback().unwrap();
 
-        assert_eq!(config.managed_runtimes.get("vosk"), Some(&previous_record));
+        assert_eq!(
+            config.general.managed_runtimes.get("vosk"),
+            Some(&previous_record)
+        );
         assert!(target_root.join("previous.marker").is_file());
         assert!(!target_root.join("new.marker").exists());
         let _ = fs::remove_dir_all(root);
@@ -7916,6 +8423,7 @@ mod layout_tests {
         let mut config = AppConfig::default();
         let previous = config::ManagedRuntimeInstall::new(PathBuf::from("previous-runtime"));
         config
+            .general
             .managed_runtimes
             .insert("vosk".to_owned(), previous.clone());
         let replacement = config::ManagedRuntimeInstall::new(PathBuf::from("replacement-runtime"));
@@ -7938,7 +8446,7 @@ mod layout_tests {
         );
 
         assert!(persistence_attempted.get());
-        assert_eq!(config.managed_runtimes.get("vosk"), Some(&previous));
+        assert_eq!(config.general.managed_runtimes.get("vosk"), Some(&previous));
         assert!(matches!(
             failed,
             RuntimePersistenceTransition::Failed {
@@ -7972,6 +8480,7 @@ mod layout_tests {
         let mut config = AppConfig::default();
         let install = config::ManagedRuntimeInstall::new(PathBuf::from("managed-runtime"));
         config
+            .general
             .managed_runtimes
             .insert("vosk".to_owned(), install.clone());
 
@@ -7983,13 +8492,13 @@ mod layout_tests {
             )
             .is_err()
         );
-        assert_eq!(config.managed_runtimes.get("vosk"), Some(&install));
+        assert_eq!(config.general.managed_runtimes.get("vosk"), Some(&install));
 
         assert_eq!(
             apply_runtime_uninstall_result(&mut config, "vosk", Ok(false)),
             Ok(false)
         );
-        assert!(!config.managed_runtimes.contains_key("vosk"));
+        assert!(!config.general.managed_runtimes.contains_key("vosk"));
     }
 
     #[test]
@@ -8003,21 +8512,24 @@ mod layout_tests {
         let mut config = AppConfig::default();
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
         set_model_selected(&mut config, "whisper_cpp_tiny_en", true);
-        assert_eq!(config.playground_selected_models, ["whisper_cpp_tiny_en"]);
+        assert_eq!(
+            config.general.playground_selected_models,
+            ["whisper_cpp_tiny_en"]
+        );
         set_model_selected(&mut config, "whisper_cpp_tiny_en", false);
-        assert!(config.playground_selected_models.is_empty());
+        assert!(config.general.playground_selected_models.is_empty());
     }
 
     #[test]
     fn playground_selector_draft_opens_cancels_and_stays_closed_while_busy() {
         let mut app = test_app();
-        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+        app.config.general.model_storage_dir = std::env::temp_dir().join(format!(
             "scribe-selector-state-missing-models-{}",
             std::process::id()
         ));
-        app.config.managed_models.clear();
-        app.config.model_paths.clear();
-        app.config.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
+        app.config.general.managed_models.clear();
+        app.config.general.model_paths.clear();
+        app.config.general.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
 
         app.open_playground_selector(None);
         assert_eq!(
@@ -8028,7 +8540,7 @@ mod layout_tests {
         app.close_playground_selector(&egui::Context::default());
         assert!(app.playground_selector_draft.is_none());
         assert_eq!(
-            app.config.playground_selected_models,
+            app.config.general.playground_selected_models,
             ["whisper_cpp_tiny_en"]
         );
 
@@ -8036,13 +8548,13 @@ mod layout_tests {
         app.open_playground_selector(None);
         assert!(app.playground_selector_draft.is_none());
 
-        let before_apply = app.config.playground_selected_models.clone();
+        let before_apply = app.config.general.playground_selected_models.clone();
         app.playground_selector_draft = Some(vec!["whisper_cpp_base_en".to_owned()]);
         app.apply_playground_selector(&egui::Context::default());
-        assert_eq!(app.config.playground_selected_models, before_apply);
+        assert_eq!(app.config.general.playground_selected_models, before_apply);
 
         apply_playground_selector_draft(&mut app.config, vec!["whisper_cpp_base_en".to_owned()]);
-        assert!(app.config.playground_selected_models.is_empty());
+        assert!(app.config.general.playground_selected_models.is_empty());
     }
 
     #[test]
@@ -8050,7 +8562,7 @@ mod layout_tests {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.config.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
+        app.config.general.playground_selected_models = vec!["whisper_cpp_tiny_en".to_owned()];
         let opener_id = egui::Id::new("selector-test-opener");
         app.open_playground_selector(Some(opener_id));
         app.playground_selector_draft.as_mut().unwrap().clear();
@@ -8070,7 +8582,7 @@ mod layout_tests {
 
         assert!(app.playground_selector_draft.is_none());
         assert_eq!(
-            app.config.playground_selected_models,
+            app.config.general.playground_selected_models,
             ["whisper_cpp_tiny_en"]
         );
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(opener_id));
@@ -8082,11 +8594,11 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+        app.config.general.model_storage_dir = std::env::temp_dir().join(format!(
             "scribe-missing-selector-models-{}",
             std::process::id()
         ));
-        app.config.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
         app.open_playground_selector(None);
 
         let output = render_selector(&ctx, &mut app, Vec::new());
@@ -8104,7 +8616,7 @@ mod layout_tests {
         );
 
         assert!(app.playground_selector_draft.is_none());
-        assert!(app.config.playground_selected_models.is_empty());
+        assert!(app.config.general.playground_selected_models.is_empty());
     }
 
     #[test]
@@ -8113,13 +8625,13 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.config.model_storage_dir = std::env::temp_dir().join(format!(
+        app.config.general.model_storage_dir = std::env::temp_dir().join(format!(
             "scribe-selector-empty-state-{}",
             std::process::id()
         ));
-        app.config.managed_models.clear();
-        app.config.model_paths.clear();
-        app.config.playground_selected_models.clear();
+        app.config.general.managed_models.clear();
+        app.config.general.model_paths.clear();
+        app.config.general.playground_selected_models.clear();
         app.open_playground_selector(None);
 
         let output = render_selector(&ctx, &mut app, Vec::new());
@@ -8136,11 +8648,11 @@ mod layout_tests {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.config.model_storage_dir =
+        app.config.general.model_storage_dir =
             std::env::temp_dir().join(format!("scribe-selector-min-width-{}", std::process::id()));
-        app.config.managed_models.clear();
-        app.config.model_paths.clear();
-        app.config.playground_selected_models.clear();
+        app.config.general.managed_models.clear();
+        app.config.general.model_paths.clear();
+        app.config.general.playground_selected_models.clear();
         app.open_playground_selector(None);
 
         render_selector(&ctx, &mut app, Vec::new());
@@ -8170,10 +8682,10 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.config.model_storage_dir = root.clone();
-        app.config.managed_models.clear();
-        app.config.model_paths.clear();
-        app.config.playground_selected_models.clear();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.managed_models.clear();
+        app.config.general.model_paths.clear();
+        app.config.general.playground_selected_models.clear();
         config::normalize_config(&mut app.config);
         app.refresh_playground_cards_from_config();
 
@@ -8223,7 +8735,7 @@ mod layout_tests {
                 .any(|(_, node)| node.name() == Some("Choose models to test"))
         );
         assert_eq!(
-            app.config.playground_selected_models,
+            app.config.general.playground_selected_models,
             ["whisper_cpp_tiny_en"]
         );
         let _ = fs::remove_dir_all(root);
@@ -8254,12 +8766,12 @@ mod layout_tests {
         fs::write(model_dir.join("ggml-base.en.bin"), b"base").unwrap();
 
         let mut app = test_app();
-        app.config.model_storage_dir = root.clone();
-        app.config.playground_selected_models = vec![
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.playground_selected_models = vec![
             "whisper_cpp_tiny_en".to_owned(),
             "whisper_cpp_base_en".to_owned(),
         ];
-        app.config.playground_model_order = vec![
+        app.config.general.playground_model_order = vec![
             "whisper_cpp_base_en".to_owned(),
             "whisper_cpp_tiny_en".to_owned(),
         ];
@@ -8267,12 +8779,13 @@ mod layout_tests {
         app.refresh_playground_cards_from_config();
         app.playground_cards[0].transcript = "retained".to_owned();
 
-        app.config.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
         app.refresh_playground_cards_from_config();
         assert_eq!(app.playground_cards.len(), 1);
         assert_eq!(app.playground_cards[0].transcript, "retained");
 
         app.config
+            .general
             .playground_selected_models
             .push("whisper_cpp_tiny_en".to_owned());
         app.refresh_playground_cards_from_config();
@@ -8284,7 +8797,7 @@ mod layout_tests {
     #[test]
     fn playground_run_requires_a_selection_and_ready_cards() {
         let mut app = test_app();
-        app.config.playground_selected_models.clear();
+        app.config.general.playground_selected_models.clear();
         app.playground_cards.clear();
         assert!(
             app.playground_run_block_reason()
@@ -8702,12 +9215,14 @@ mod layout_tests {
 
         let mut config = AppConfig::default();
         config
+            .general
             .model_paths
             .insert("whisper_cpp_base_en".to_owned(), primary);
         config
+            .general
             .model_paths
             .insert("vosk_small_en".to_owned(), legacy);
-        config.playground_selected_models =
+        config.general.playground_selected_models =
             vec!["whisper_cpp_base_en".to_owned(), "vosk_small_en".to_owned()];
         let service = TranscriptionService::new(config.clone());
 
@@ -8786,7 +9301,7 @@ mod layout_tests {
             .join("whisper-cli");
         fs::create_dir_all(whisper_runtime.parent().unwrap()).unwrap();
         fs::write(&whisper_runtime, b"whisper runtime").unwrap();
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "whisper_cpp".to_owned(),
             managed_runtime_with_version(whisper_runtime, None),
         );
@@ -8821,8 +9336,8 @@ mod layout_tests {
             expected_runtime_install_action(&vosk.backend)
         );
 
-        config.managed_runtimes.clear();
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.clear();
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(
                 write_vosk_runtime(&runtime_root.join("vosk")),
@@ -8870,8 +9385,8 @@ mod layout_tests {
                 "{backend} should be installable"
             );
 
-            config.managed_runtimes.clear();
-            config.managed_runtimes.insert(
+            config.general.managed_runtimes.clear();
+            config.general.managed_runtimes.insert(
                 runtime_id.to_owned(),
                 managed_runtime_with_version(
                     write_sherpa_family_runtime(
@@ -8916,7 +9431,7 @@ mod layout_tests {
         let _ = fs::remove_dir_all(&runtime_root);
 
         let mut config = AppConfig::default();
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "faster_whisper".to_owned(),
             config::ManagedRuntimeInstall::new(PathBuf::from(
                 "/tmp/scribe-runtimes/missing/bin/scribe-faster-whisper",
@@ -8931,8 +9446,8 @@ mod layout_tests {
         assert_eq!(action.kind, RuntimeActionKind::Install);
         assert_eq!(action, expected_runtime_install_action(&model.backend));
 
-        config.managed_runtimes.clear();
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.clear();
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             config::ManagedRuntimeInstall::new(write_vosk_runtime_with_revision(
                 &runtime_root.join("vosk"),
@@ -8956,7 +9471,7 @@ mod layout_tests {
         let provider = compatibility_bridge::provider_for_model(&model).unwrap();
         let mut config = AppConfig::default();
 
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.45")),
         );
@@ -8965,7 +9480,7 @@ mod layout_tests {
             RuntimeVersionState::Current("0.3.45".to_owned())
         );
 
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), Some("0.3.44")),
         );
@@ -8977,7 +9492,7 @@ mod layout_tests {
             }
         );
 
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(PathBuf::from("/tmp/scribe/vosk"), None),
         );
@@ -9000,7 +9515,7 @@ mod layout_tests {
         model.id = "vosk_small_en".to_owned();
         model.backend = "Vosk".to_owned();
         model.download_model = Some("vosk-model-small-en-us-0.15".to_owned());
-        config.managed_runtimes.insert(
+        config.general.managed_runtimes.insert(
             "vosk".to_owned(),
             managed_runtime_with_version(
                 write_vosk_runtime(&runtime_root.join("vosk")),
@@ -9201,16 +9716,14 @@ mod layout_tests {
         fs::write(&base_path, b"base").unwrap();
         fs::write(&small_path, b"small").unwrap();
 
-        let mut config = AppConfig {
-            selected_default_model: "whisper_cpp_base_en".to_owned(),
-            model_storage_dir: temp_dir.clone(),
-            ..AppConfig::default()
-        };
-        config.managed_models.insert(
+        let mut config = AppConfig::default();
+        config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        config.general.model_storage_dir = temp_dir.clone();
+        config.general.managed_models.insert(
             "whisper_cpp_base_en".to_owned(),
             config::ManagedModelInstall::new(base_path.clone()),
         );
-        config.managed_models.insert(
+        config.general.managed_models.insert(
             "whisper_cpp_small_en".to_owned(),
             config::ManagedModelInstall::new(small_path.clone()),
         );
@@ -9222,10 +9735,13 @@ mod layout_tests {
 
         assert!(uninstall_model_files(&config, &base_model).unwrap());
         assert!(!base_path.exists());
-        config.managed_models.remove("whisper_cpp_base_en");
+        config.general.managed_models.remove("whisper_cpp_base_en");
         select_first_installed_model(&mut config);
 
-        assert_eq!(config.selected_default_model, "whisper_cpp_small_en");
+        assert_eq!(
+            config.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -9235,15 +9751,13 @@ mod layout_tests {
         let temp_dir =
             std::env::temp_dir().join(format!("scribe-empty-models-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
-        let mut config = AppConfig {
-            selected_default_model: "whisper_cpp_base_en".to_owned(),
-            model_storage_dir: temp_dir.clone(),
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        config.general.model_storage_dir = temp_dir.clone();
 
         select_first_installed_model(&mut config);
 
-        assert!(config.selected_default_model.is_empty());
+        assert!(config.general.selected_default_model.is_empty());
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -9260,11 +9774,9 @@ mod layout_tests {
 
         let mut model_paths = HashMap::new();
         model_paths.insert("whisper_cpp_base_en".to_owned(), external_path.clone());
-        let config = AppConfig {
-            model_storage_dir: app_storage,
-            model_paths,
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = app_storage;
+        config.general.model_paths = model_paths;
         let model = config::configured_models(&config)
             .into_iter()
             .find(|model| model.id == "whisper_cpp_base_en")

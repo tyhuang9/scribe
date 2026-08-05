@@ -1,161 +1,861 @@
-#![allow(dead_code)]
+use std::collections::HashMap;
 
-use crate::models::{RecordingStatus, TranscriptResult, TranscriptionStatus};
+use thiserror::Error;
+
+use crate::transcription::{ModelId, RequestId, SessionId};
+
+/// Runtime-neutral reason a user session exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionPurpose {
+    Dictation,
+    Comparison,
+}
+
+/// Authoritative active-session phase. Terminal outcomes are retained
+/// separately while the coordinator returns to `Idle` immediately.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DictationPhase {
+    #[default]
+    Idle,
+    StartingCapture,
+    Capturing,
+    FinalizingCapture,
+    Transcribing,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum StopReason {
+    #[allow(dead_code)] // Native endpointing begins emitting this in Phase 6.
+    Endpoint,
+    MaximumDuration,
+    Explicit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum InsertionStatus {
-    NotRequested,
-    Inserted,
-    CopiedOnly,
-    Failed(String),
+pub struct TerminalSession {
+    pub session_id: SessionId,
+    pub purpose: SessionPurpose,
+    pub outcome: TerminalOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelLoadState {
+    NotStarted,
+    Loading { model_id: ModelId },
+    Ready { model_id: ModelId },
+    Failed { model_id: ModelId },
 }
 
 #[derive(Clone, Debug)]
-pub struct CoreState {
-    pub recording_status: RecordingStatus,
-    pub transcription_status: TranscriptionStatus,
-    pub transcript: Option<TranscriptResult>,
-    pub insertion_status: InsertionStatus,
-    pub last_error: Option<String>,
+struct RequestState {
+    model_id: ModelId,
+    #[allow(dead_code)] // Consumed by incremental StreamUpdate events in Phase 7.
+    last_sequence: Option<u64>,
+    completed: bool,
+    failed: bool,
 }
 
-impl Default for CoreState {
+#[derive(Clone, Debug)]
+pub struct ActiveSession {
+    session_id: SessionId,
+    purpose: SessionPurpose,
+    phase: DictationPhase,
+    stop_reason: Option<StopReason>,
+    model_load: ModelLoadState,
+    requests: HashMap<RequestId, RequestState>,
+}
+
+impl ActiveSession {
+    pub fn id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn purpose(&self) -> SessionPurpose {
+        self.purpose
+    }
+
+    pub fn phase(&self) -> DictationPhase {
+        self.phase
+    }
+
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    #[cfg(test)]
+    pub fn model_load(&self) -> &ModelLoadState {
+        &self.model_load
+    }
+
+    #[cfg(test)]
+    pub fn pending_request_count(&self) -> usize {
+        self.requests
+            .values()
+            .filter(|request| !request.completed)
+            .count()
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CoordinatorError {
+    #[error("another dictation session is already active")]
+    Busy,
+    #[error("session identifier space is exhausted")]
+    SessionIdExhausted,
+    #[error("request identifier space is exhausted")]
+    RequestIdExhausted,
+    #[error("event belongs to stale session {0:?}")]
+    StaleSession(SessionId),
+    #[error("illegal transition from {from:?} to {to:?}")]
+    IllegalTransition {
+        from: DictationPhase,
+        to: DictationPhase,
+    },
+    #[error("request {0:?} is unknown for the active session")]
+    UnknownRequest(RequestId),
+    #[error("request {0:?} has already completed")]
+    DuplicateCompletion(RequestId),
+    #[error("request {request_id:?} expected model {expected}, got {actual}")]
+    WrongModel {
+        request_id: RequestId,
+        expected: ModelId,
+        actual: ModelId,
+    },
+    #[error("update sequence {actual} is not newer than {previous}")]
+    #[allow(dead_code)] // Produced by the Phase 7 incremental update entrypoint.
+    StaleSequence { previous: u64, actual: u64 },
+    #[error("model-load event expected {expected}, got {actual}")]
+    WrongPreloadModel { expected: ModelId, actual: ModelId },
+    #[error("session still has pending transcription requests")]
+    PendingRequests,
+    #[error("session contains a failed transcription request")]
+    FailedRequests,
+}
+
+/// Owns all correlation and legal-transition decisions for the one active
+/// user session. Concrete runtimes never appear at this boundary.
+#[derive(Debug)]
+pub struct SessionCoordinator {
+    next_session_id: u64,
+    next_request_id: u64,
+    active: Option<ActiveSession>,
+    last_terminal: Option<TerminalSession>,
+}
+
+impl Default for SessionCoordinator {
     fn default() -> Self {
         Self {
-            recording_status: RecordingStatus::Idle,
-            transcription_status: TranscriptionStatus::Idle,
-            transcript: None,
-            insertion_status: InsertionStatus::NotRequested,
-            last_error: None,
+            next_session_id: 1,
+            next_request_id: 1,
+            active: None,
+            last_terminal: None,
         }
     }
 }
 
-pub enum CoreEvent {
-    RecordingStarted,
-    RecordingFailed(String),
-    RecordingFinished,
-    TranscriptionStarted,
-    TranscriptionSucceeded(TranscriptResult),
-    TranscriptionFailed(String),
-    InsertionSucceeded,
-    InsertionCopiedOnly,
-    InsertionFailed(String),
-    ClearTranscript,
-}
+impl SessionCoordinator {
+    #[cfg(test)]
+    fn with_next_ids(next_session_id: u64, next_request_id: u64) -> Self {
+        Self {
+            next_session_id,
+            next_request_id,
+            ..Self::default()
+        }
+    }
 
-pub fn reduce(state: &mut CoreState, event: CoreEvent) {
-    match event {
-        CoreEvent::RecordingStarted => {
-            state.recording_status = RecordingStatus::Recording;
-            state.transcription_status = TranscriptionStatus::Listening;
-            state.last_error = None;
+    #[cfg(test)]
+    pub(crate) fn seed_active_for_test(
+        &mut self,
+        session_id: SessionId,
+        purpose: SessionPurpose,
+        requests: impl IntoIterator<Item = (RequestId, ModelId)>,
+    ) {
+        let requests = requests
+            .into_iter()
+            .map(|(request_id, model_id)| {
+                (
+                    request_id,
+                    RequestState {
+                        model_id,
+                        last_sequence: None,
+                        completed: false,
+                        failed: false,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.next_session_id = self.next_session_id.max(session_id.0.saturating_add(1));
+        if let Some(maximum_request_id) = requests.keys().map(|request| request.0).max() {
+            self.next_request_id = self
+                .next_request_id
+                .max(maximum_request_id.saturating_add(1));
         }
-        CoreEvent::RecordingFailed(message) => {
-            state.recording_status = RecordingStatus::Error;
-            state.transcription_status = TranscriptionStatus::Error;
-            state.last_error = Some(message);
+        self.active = Some(ActiveSession {
+            session_id,
+            purpose,
+            phase: DictationPhase::Transcribing,
+            stop_reason: Some(StopReason::Explicit),
+            model_load: ModelLoadState::NotStarted,
+            requests,
+        });
+    }
+
+    pub fn phase(&self) -> DictationPhase {
+        self.active
+            .as_ref()
+            .map_or(DictationPhase::Idle, ActiveSession::phase)
+    }
+
+    #[cfg(test)]
+    pub fn active(&self) -> Option<&ActiveSession> {
+        self.active.as_ref()
+    }
+
+    pub fn active_session_id(&self) -> Option<SessionId> {
+        self.active.as_ref().map(ActiveSession::id)
+    }
+
+    pub fn active_purpose(&self) -> Option<SessionPurpose> {
+        self.active.as_ref().map(ActiveSession::purpose)
+    }
+
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.active.as_ref().and_then(ActiveSession::stop_reason)
+    }
+
+    pub fn last_terminal(&self) -> Option<&TerminalSession> {
+        self.last_terminal.as_ref()
+    }
+
+    pub fn begin(&mut self, purpose: SessionPurpose) -> Result<SessionId, CoordinatorError> {
+        if self.active.is_some() {
+            return Err(CoordinatorError::Busy);
         }
-        CoreEvent::RecordingFinished => {
-            state.recording_status = RecordingStatus::Finalizing;
-            state.transcription_status = TranscriptionStatus::Transcribing;
+        let session_id = SessionId(self.next_session_id);
+        self.next_session_id = self
+            .next_session_id
+            .checked_add(1)
+            .ok_or(CoordinatorError::SessionIdExhausted)?;
+        self.active = Some(ActiveSession {
+            session_id,
+            purpose,
+            phase: DictationPhase::StartingCapture,
+            stop_reason: None,
+            model_load: ModelLoadState::NotStarted,
+            requests: HashMap::new(),
+        });
+        Ok(session_id)
+    }
+
+    pub fn capture_started(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        self.transition(
+            session_id,
+            DictationPhase::StartingCapture,
+            DictationPhase::Capturing,
+        )
+    }
+
+    pub fn request_stop(
+        &mut self,
+        session_id: SessionId,
+        reason: StopReason,
+    ) -> Result<StopReason, CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        if !matches!(
+            active.phase,
+            DictationPhase::StartingCapture
+                | DictationPhase::Capturing
+                | DictationPhase::FinalizingCapture
+        ) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: DictationPhase::FinalizingCapture,
+            });
         }
-        CoreEvent::TranscriptionStarted => {
-            state.recording_status = RecordingStatus::Idle;
-            state.transcription_status = TranscriptionStatus::Transcribing;
-            state.last_error = None;
+        let resolved = active
+            .stop_reason
+            .map_or(reason, |current| current.max(reason));
+        active.stop_reason = Some(resolved);
+        Ok(resolved)
+    }
+
+    pub fn capture_finalized(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        self.transition(
+            session_id,
+            DictationPhase::Capturing,
+            DictationPhase::FinalizingCapture,
+        )
+    }
+
+    pub fn model_load_started(
+        &mut self,
+        session_id: SessionId,
+        model_id: ModelId,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        if !matches!(
+            active.phase,
+            DictationPhase::StartingCapture | DictationPhase::Capturing
+        ) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: active.phase,
+            });
         }
-        CoreEvent::TranscriptionSucceeded(result) => {
-            state.recording_status = RecordingStatus::Idle;
-            state.transcription_status = TranscriptionStatus::Idle;
-            state.transcript = Some(result);
-            state.last_error = None;
+        active.model_load = ModelLoadState::Loading { model_id };
+        Ok(())
+    }
+
+    pub fn model_load_finished(
+        &mut self,
+        session_id: SessionId,
+        model_id: &ModelId,
+        succeeded: bool,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        let ModelLoadState::Loading { model_id: expected } = &active.model_load else {
+            return Err(CoordinatorError::WrongPreloadModel {
+                expected: model_id.clone(),
+                actual: model_id.clone(),
+            });
+        };
+        if expected != model_id {
+            return Err(CoordinatorError::WrongPreloadModel {
+                expected: expected.clone(),
+                actual: model_id.clone(),
+            });
         }
-        CoreEvent::TranscriptionFailed(message) => {
-            state.recording_status = RecordingStatus::Idle;
-            state.transcription_status = TranscriptionStatus::Error;
-            state.last_error = Some(message);
+        active.model_load = if succeeded {
+            ModelLoadState::Ready {
+                model_id: model_id.clone(),
+            }
+        } else {
+            ModelLoadState::Failed {
+                model_id: model_id.clone(),
+            }
+        };
+        Ok(())
+    }
+
+    pub fn start_request(
+        &mut self,
+        session_id: SessionId,
+        model_id: ModelId,
+    ) -> Result<RequestId, CoordinatorError> {
+        let phase = self.active_ref(session_id)?.phase;
+        if !matches!(
+            phase,
+            DictationPhase::FinalizingCapture | DictationPhase::Transcribing
+        ) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: phase,
+                to: DictationPhase::Transcribing,
+            });
         }
-        CoreEvent::InsertionSucceeded => {
-            state.insertion_status = InsertionStatus::Inserted;
+        let request_id = RequestId(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or(CoordinatorError::RequestIdExhausted)?;
+        let active = self.active_mut(session_id)?;
+        active.phase = DictationPhase::Transcribing;
+        active.requests.insert(
+            request_id,
+            RequestState {
+                model_id,
+                last_sequence: None,
+                completed: false,
+                failed: false,
+            },
+        );
+        Ok(request_id)
+    }
+
+    #[allow(dead_code)] // Phase 7 calls this for committed/tentative updates.
+    pub fn accept_update(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+        sequence: u64,
+    ) -> Result<(), CoordinatorError> {
+        let request = self.request_mut(session_id, request_id, model_id)?;
+        if request.completed {
+            return Err(CoordinatorError::DuplicateCompletion(request_id));
         }
-        CoreEvent::InsertionCopiedOnly => {
-            state.insertion_status = InsertionStatus::CopiedOnly;
+        if let Some(previous) = request.last_sequence
+            && sequence <= previous
+        {
+            return Err(CoordinatorError::StaleSequence {
+                previous,
+                actual: sequence,
+            });
         }
-        CoreEvent::InsertionFailed(message) => {
-            state.insertion_status = InsertionStatus::Failed(message);
+        request.last_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub fn complete_request(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+    ) -> Result<bool, CoordinatorError> {
+        self.finish_request(session_id, request_id, model_id, false)
+    }
+
+    pub fn fail_request(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+    ) -> Result<bool, CoordinatorError> {
+        self.finish_request(session_id, request_id, model_id, true)
+    }
+
+    fn finish_request(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+        failed: bool,
+    ) -> Result<bool, CoordinatorError> {
+        let request = self.request_mut(session_id, request_id, model_id)?;
+        if request.completed {
+            return Err(CoordinatorError::DuplicateCompletion(request_id));
         }
-        CoreEvent::ClearTranscript => {
-            state.transcript = None;
-            state.insertion_status = InsertionStatus::NotRequested;
+        request.completed = true;
+        request.failed = failed;
+        Ok(self
+            .active_ref(session_id)?
+            .requests
+            .values()
+            .all(|request| request.completed))
+    }
+
+    pub fn is_current_request(
+        &self,
+        purpose: SessionPurpose,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.session_id == session_id
+                && active.purpose == purpose
+                && active
+                    .requests
+                    .get(&request_id)
+                    .is_some_and(|request| !request.completed)
+        })
+    }
+
+    pub fn request_model(&self, session_id: SessionId, request_id: RequestId) -> Option<&ModelId> {
+        self.active
+            .as_ref()
+            .filter(|active| active.session_id == session_id)?
+            .requests
+            .get(&request_id)
+            .map(|request| &request.model_id)
+    }
+
+    #[cfg(test)]
+    pub fn pending_request_count(&self, session_id: SessionId) -> Option<usize> {
+        self.active
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .map(ActiveSession::pending_request_count)
+    }
+
+    pub fn has_failed_requests(&self, session_id: SessionId) -> Option<bool> {
+        self.active
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .map(|active| active.requests.values().any(|request| request.failed))
+    }
+
+    pub fn begin_output(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        if active.phase != DictationPhase::Transcribing {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: DictationPhase::Output,
+            });
         }
+        if active.requests.values().any(|request| !request.completed) {
+            return Err(CoordinatorError::PendingRequests);
+        }
+        if active.requests.values().any(|request| request.failed) {
+            return Err(CoordinatorError::FailedRequests);
+        }
+        active.phase = DictationPhase::Output;
+        Ok(())
+    }
+
+    pub fn complete(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        let active = self.active_ref(session_id)?;
+        let legal = active.phase == DictationPhase::Output
+            || (active.phase == DictationPhase::Transcribing
+                && active.requests.values().all(|request| request.completed)
+                && active.requests.values().all(|request| !request.failed));
+        if !legal {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to: DictationPhase::Idle,
+            });
+        }
+        self.retire(session_id, TerminalOutcome::Completed)
+    }
+
+    #[cfg(test)]
+    pub fn cancel(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        self.retire(session_id, TerminalOutcome::Cancelled)
+    }
+
+    pub fn cancel_active(&mut self) -> Option<SessionId> {
+        let session_id = self.active_session_id()?;
+        self.retire(session_id, TerminalOutcome::Cancelled)
+            .expect("active session must be cancellable");
+        Some(session_id)
+    }
+
+    pub fn fail(&mut self, session_id: SessionId) -> Result<(), CoordinatorError> {
+        self.retire(session_id, TerminalOutcome::Failed)
+    }
+
+    fn request_mut(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: &ModelId,
+    ) -> Result<&mut RequestState, CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        let request = active
+            .requests
+            .get_mut(&request_id)
+            .ok_or(CoordinatorError::UnknownRequest(request_id))?;
+        if &request.model_id != model_id {
+            return Err(CoordinatorError::WrongModel {
+                request_id,
+                expected: request.model_id.clone(),
+                actual: model_id.clone(),
+            });
+        }
+        Ok(request)
+    }
+
+    fn transition(
+        &mut self,
+        session_id: SessionId,
+        from: DictationPhase,
+        to: DictationPhase,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active_mut(session_id)?;
+        if active.phase != from {
+            return Err(CoordinatorError::IllegalTransition {
+                from: active.phase,
+                to,
+            });
+        }
+        active.phase = to;
+        Ok(())
+    }
+
+    fn retire(
+        &mut self,
+        session_id: SessionId,
+        outcome: TerminalOutcome,
+    ) -> Result<(), CoordinatorError> {
+        let active = self
+            .active
+            .take()
+            .ok_or(CoordinatorError::StaleSession(session_id))?;
+        if active.session_id != session_id {
+            self.active = Some(active);
+            return Err(CoordinatorError::StaleSession(session_id));
+        }
+        self.last_terminal = Some(TerminalSession {
+            session_id,
+            purpose: active.purpose,
+            outcome,
+        });
+        Ok(())
+    }
+
+    fn active_ref(&self, session_id: SessionId) -> Result<&ActiveSession, CoordinatorError> {
+        self.active
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .ok_or(CoordinatorError::StaleSession(session_id))
+    }
+
+    fn active_mut(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<&mut ActiveSession, CoordinatorError> {
+        self.active
+            .as_mut()
+            .filter(|active| active.session_id == session_id)
+            .ok_or(CoordinatorError::StaleSession(session_id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::TranscriptSegment;
 
-    #[test]
-    fn reducer_tracks_successful_recording_transcription_and_insertion() {
-        let mut state = CoreState::default();
-        reduce(&mut state, CoreEvent::RecordingStarted);
-        assert_eq!(state.recording_status, RecordingStatus::Recording);
-        assert_eq!(state.transcription_status, TranscriptionStatus::Listening);
+    fn model(id: &str) -> ModelId {
+        ModelId::new(id)
+    }
 
-        reduce(&mut state, CoreEvent::RecordingFinished);
-        assert_eq!(state.recording_status, RecordingStatus::Finalizing);
-        assert_eq!(
-            state.transcription_status,
-            TranscriptionStatus::Transcribing
-        );
+    fn captured(coordinator: &mut SessionCoordinator, purpose: SessionPurpose) -> SessionId {
+        let session_id = coordinator.begin(purpose).unwrap();
+        coordinator.capture_started(session_id).unwrap();
+        session_id
+    }
 
-        reduce(
-            &mut state,
-            CoreEvent::TranscriptionSucceeded(fake_transcript("hello")),
-        );
-        reduce(&mut state, CoreEvent::InsertionSucceeded);
-
-        assert_eq!(state.recording_status, RecordingStatus::Idle);
-        assert_eq!(state.transcription_status, TranscriptionStatus::Idle);
-        assert_eq!(state.transcript.as_ref().unwrap().text, "hello");
-        assert_eq!(state.insertion_status, InsertionStatus::Inserted);
+    fn transcribing(
+        coordinator: &mut SessionCoordinator,
+        purpose: SessionPurpose,
+        model_id: &str,
+    ) -> (SessionId, RequestId) {
+        let session_id = captured(coordinator, purpose);
+        coordinator
+            .request_stop(session_id, StopReason::Explicit)
+            .unwrap();
+        coordinator.capture_finalized(session_id).unwrap();
+        let request_id = coordinator
+            .start_request(session_id, model(model_id))
+            .unwrap();
+        (session_id, request_id)
     }
 
     #[test]
-    fn reducer_preserves_transcript_when_insertion_fails() {
-        let mut state = CoreState::default();
-        reduce(
-            &mut state,
-            CoreEvent::TranscriptionSucceeded(fake_transcript("visible text")),
+    fn legal_dictation_path_returns_to_idle_with_terminal_outcome() {
+        let mut coordinator = SessionCoordinator::default();
+        let (session_id, request_id) =
+            transcribing(&mut coordinator, SessionPurpose::Dictation, "balanced");
+        coordinator
+            .accept_update(session_id, request_id, &model("balanced"), 1)
+            .unwrap();
+        assert!(
+            coordinator
+                .complete_request(session_id, request_id, &model("balanced"))
+                .unwrap()
         );
-        reduce(
-            &mut state,
-            CoreEvent::InsertionFailed("paste automation failed".to_owned()),
-        );
-
-        assert_eq!(state.transcript.as_ref().unwrap().text, "visible text");
+        coordinator.begin_output(session_id).unwrap();
+        coordinator.complete(session_id).unwrap();
+        assert_eq!(coordinator.phase(), DictationPhase::Idle);
         assert_eq!(
-            state.insertion_status,
-            InsertionStatus::Failed("paste automation failed".to_owned())
+            coordinator.last_terminal().unwrap().outcome,
+            TerminalOutcome::Completed
         );
     }
 
-    fn fake_transcript(text: &str) -> TranscriptResult {
-        TranscriptResult {
-            model_id: "whisper_cpp_base_en".to_owned(),
-            model_name: "whisper.cpp base.en".to_owned(),
-            backend: "whisper.cpp".to_owned(),
-            text: text.to_owned(),
-            segments: vec![TranscriptSegment {
-                start_ms: None,
-                end_ms: None,
-                text: text.to_owned(),
-            }],
-            duration_ms: Some(12),
-            stdout: text.to_owned(),
-            stderr: String::new(),
+    #[test]
+    fn illegal_transitions_do_not_mutate_phase() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        assert!(matches!(
+            coordinator.capture_finalized(session_id),
+            Err(CoordinatorError::IllegalTransition { .. })
+        ));
+        assert_eq!(coordinator.phase(), DictationPhase::StartingCapture);
+    }
+
+    #[test]
+    fn busy_begin_is_rejected_without_consuming_an_identifier() {
+        let mut coordinator = SessionCoordinator::default();
+        let first = coordinator.begin(SessionPurpose::Dictation).unwrap();
+        assert_eq!(
+            coordinator.begin(SessionPurpose::Comparison),
+            Err(CoordinatorError::Busy)
+        );
+        coordinator.cancel(first).unwrap();
+        assert_eq!(
+            coordinator.begin(SessionPurpose::Comparison).unwrap(),
+            SessionId(2)
+        );
+    }
+
+    #[test]
+    fn identifier_overflow_fails_closed() {
+        let mut sessions = SessionCoordinator::with_next_ids(u64::MAX, 1);
+        assert_eq!(
+            sessions.begin(SessionPurpose::Dictation),
+            Err(CoordinatorError::SessionIdExhausted)
+        );
+        assert!(sessions.active().is_none());
+
+        let mut requests = SessionCoordinator::with_next_ids(1, u64::MAX);
+        let session_id = captured(&mut requests, SessionPurpose::Dictation);
+        requests.capture_finalized(session_id).unwrap();
+        assert_eq!(
+            requests.start_request(session_id, model("balanced")),
+            Err(CoordinatorError::RequestIdExhausted)
+        );
+    }
+
+    #[test]
+    fn explicit_stop_outranks_endpoint_and_maximum_duration() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = captured(&mut coordinator, SessionPurpose::Dictation);
+        assert_eq!(
+            coordinator
+                .request_stop(session_id, StopReason::Endpoint)
+                .unwrap(),
+            StopReason::Endpoint
+        );
+        assert_eq!(
+            coordinator
+                .request_stop(session_id, StopReason::MaximumDuration)
+                .unwrap(),
+            StopReason::MaximumDuration
+        );
+        assert_eq!(
+            coordinator
+                .request_stop(session_id, StopReason::Explicit)
+                .unwrap(),
+            StopReason::Explicit
+        );
+        assert_eq!(
+            coordinator
+                .request_stop(session_id, StopReason::Endpoint)
+                .unwrap(),
+            StopReason::Explicit
+        );
+    }
+
+    #[test]
+    fn stale_cross_purpose_and_wrong_model_events_are_rejected() {
+        let mut coordinator = SessionCoordinator::default();
+        let (session_id, request_id) =
+            transcribing(&mut coordinator, SessionPurpose::Comparison, "first");
+        assert!(!coordinator.is_current_request(SessionPurpose::Dictation, session_id, request_id));
+        assert!(matches!(
+            coordinator.complete_request(session_id, request_id, &model("second")),
+            Err(CoordinatorError::WrongModel { .. })
+        ));
+        assert!(matches!(
+            coordinator.complete_request(SessionId(session_id.0 + 1), request_id, &model("first")),
+            Err(CoordinatorError::StaleSession(_))
+        ));
+    }
+
+    #[test]
+    fn sequence_and_completion_are_monotonic_and_exactly_once() {
+        let mut coordinator = SessionCoordinator::default();
+        let (session_id, request_id) =
+            transcribing(&mut coordinator, SessionPurpose::Dictation, "balanced");
+        coordinator
+            .accept_update(session_id, request_id, &model("balanced"), 7)
+            .unwrap();
+        assert_eq!(
+            coordinator.accept_update(session_id, request_id, &model("balanced"), 7),
+            Err(CoordinatorError::StaleSequence {
+                previous: 7,
+                actual: 7
+            })
+        );
+        coordinator
+            .complete_request(session_id, request_id, &model("balanced"))
+            .unwrap();
+        assert_eq!(
+            coordinator.complete_request(session_id, request_id, &model("balanced")),
+            Err(CoordinatorError::DuplicateCompletion(request_id))
+        );
+    }
+
+    #[test]
+    fn comparison_waits_for_every_registered_request() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = captured(&mut coordinator, SessionPurpose::Comparison);
+        coordinator.capture_finalized(session_id).unwrap();
+        let first = coordinator
+            .start_request(session_id, model("first"))
+            .unwrap();
+        let second = coordinator
+            .start_request(session_id, model("second"))
+            .unwrap();
+        assert!(
+            !coordinator
+                .complete_request(session_id, first, &model("first"))
+                .unwrap()
+        );
+        assert_eq!(coordinator.pending_request_count(session_id), Some(1));
+        assert!(
+            coordinator
+                .complete_request(session_id, second, &model("second"))
+                .unwrap()
+        );
+        coordinator.complete(session_id).unwrap();
+    }
+
+    #[test]
+    fn cancellation_retires_every_active_phase() {
+        for phase in [
+            DictationPhase::StartingCapture,
+            DictationPhase::Capturing,
+            DictationPhase::FinalizingCapture,
+            DictationPhase::Transcribing,
+            DictationPhase::Output,
+        ] {
+            let mut coordinator = SessionCoordinator::default();
+            let session_id = coordinator.begin(SessionPurpose::Dictation).unwrap();
+            if phase >= DictationPhase::Capturing {
+                coordinator.capture_started(session_id).unwrap();
+            }
+            if phase >= DictationPhase::FinalizingCapture {
+                coordinator.capture_finalized(session_id).unwrap();
+            }
+            if phase >= DictationPhase::Transcribing {
+                let request = coordinator
+                    .start_request(session_id, model("balanced"))
+                    .unwrap();
+                if phase == DictationPhase::Output {
+                    coordinator
+                        .complete_request(session_id, request, &model("balanced"))
+                        .unwrap();
+                    coordinator.begin_output(session_id).unwrap();
+                }
+            }
+            coordinator.cancel(session_id).unwrap();
+            assert_eq!(coordinator.phase(), DictationPhase::Idle);
+            assert_eq!(
+                coordinator.last_terminal().unwrap().outcome,
+                TerminalOutcome::Cancelled
+            );
         }
+    }
+
+    #[test]
+    fn preload_events_are_correlated_to_session_and_model() {
+        let mut coordinator = SessionCoordinator::default();
+        let session_id = captured(&mut coordinator, SessionPurpose::Dictation);
+        coordinator
+            .model_load_started(session_id, model("balanced"))
+            .unwrap();
+        assert!(matches!(
+            coordinator.model_load_finished(session_id, &model("other"), true),
+            Err(CoordinatorError::WrongPreloadModel { .. })
+        ));
+        coordinator
+            .model_load_finished(session_id, &model("balanced"), true)
+            .unwrap();
+        assert!(matches!(
+            coordinator.active().unwrap().model_load(),
+            ModelLoadState::Ready { .. }
+        ));
+        assert!(matches!(
+            coordinator.model_load_finished(SessionId(99), &model("balanced"), true),
+            Err(CoordinatorError::StaleSession(_))
+        ));
     }
 }

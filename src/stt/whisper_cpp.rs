@@ -95,9 +95,11 @@ impl SttBackend for WhisperCppBackend {
         let mut command = Command::new(&executable);
         command.args(whisper_cli_args(&model_path, &audio_path, &self.options));
         apply_whisper_environment(&mut command, &executable, &self.options)?;
-        let output = command
-            .output()
-            .with_context(|| format!("failed to run {}", executable.display()))?;
+        let output = crate::stt::run_cancellable_command(
+            &mut command,
+            crate::stt::current_cancellation_snapshot(),
+        )
+        .with_context(|| format!("failed to run {}", executable.display()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -166,7 +168,7 @@ fn dev_runtime_paths(config: &AppConfig) -> Vec<PathBuf> {
     [
         env::var_os("SCRIBE_WHISPER_CPP_CLI").map(PathBuf::from),
         env::var_os("SCRIBE_WHISPER_CUDA_CLI").map(PathBuf::from),
-        config.whisper_executable_path.clone(),
+        config.developer.whisper_executable_path.clone(),
     ]
     .into_iter()
     .flatten()

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -253,6 +253,21 @@ pub struct TranscriptionRequest {
     /// Optional per-request override for a configured model location.
     pub model_path: Option<PathBuf>,
     pub options: TranscriptionOptions,
+}
+
+/// Opaque, runtime-neutral cancellation state captured before dispatching a
+/// transcription task to a worker thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptionTicket {
+    native_generation: u64,
+    process_generation: crate::stt::CancellationSnapshot,
+}
+
+/// Owned registration that spans native audio preparation and the complete
+/// transcription request on a worker thread.
+pub struct TranscriptionTask {
+    ticket: TranscriptionTicket,
+    _registration: crate::stt::RegisteredRequest,
 }
 
 impl TranscriptionRequest {
@@ -560,7 +575,10 @@ impl TranscriptionService {
         let runtime_model = self.resolve_runtime_model(model)?;
         let execution = self
             .worker
-            .load(runtime_model, self.config.acceleration_preference)
+            .load(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+            )
             .map_err(|error| anyhow!(error))?;
         Ok(ModelLoadOutcome {
             model_id: model_id.clone(),
@@ -576,7 +594,10 @@ impl TranscriptionService {
         let model = self.resolve_model(model_id, model_path)?;
         let runtime_model = self.resolve_runtime_model(model)?;
         self.worker
-            .health_check(runtime_model, self.config.acceleration_preference)
+            .health_check(
+                runtime_model,
+                self.config.performance.acceleration_preference,
+            )
             .map_err(|error| anyhow!(error))
     }
 
@@ -584,6 +605,39 @@ impl TranscriptionService {
     /// call. Later requests capture the new generation and are unaffected.
     pub fn cancel_active(&self) {
         self.router.cancel_active();
+        crate::stt::cancel_active_processes();
+    }
+
+    /// Cancels active work and waits for service requests and compatibility
+    /// processes to release their transient audio resources.
+    pub fn cancel_active_and_wait(&self, timeout: Duration) -> bool {
+        self.router.cancel_active();
+        crate::stt::cancel_active_processes_and_wait(timeout)
+    }
+
+    /// Captures cancellation state synchronously before a caller dispatches
+    /// audio preparation or transcription to another thread.
+    pub fn transcription_ticket(&self) -> TranscriptionTicket {
+        TranscriptionTicket {
+            native_generation: self.router.cancellation_snapshot(),
+            process_generation: crate::stt::cancellation_snapshot(),
+        }
+    }
+
+    /// Registers work synchronously before the caller starts an audio worker.
+    pub fn begin_transcription_task(&self) -> Result<TranscriptionTask> {
+        let ticket = self.transcription_ticket();
+        let registration = crate::stt::register_cancellable_request(ticket.process_generation)
+            .map_err(|error| anyhow!(error))?;
+        if self.router.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(
+                "transcription request was cancelled before dispatch"
+            ));
+        }
+        Ok(TranscriptionTask {
+            ticket,
+            _registration: registration,
+        })
     }
 
     /// Drops all retained native model state on the dedicated worker.
@@ -595,33 +649,65 @@ impl TranscriptionService {
     /// opportunity to handle every model; unretired providers remain behind a
     /// private compatibility bridge until Phase 11 retirement evidence exists.
     pub fn transcribe(&self, request: TranscriptionRequest) -> Result<TranscriptionOutcome> {
+        let task = self.begin_transcription_task()?;
+        self.transcribe_task(request, task)
+    }
+
+    pub fn transcribe_with_ticket(
+        &self,
+        request: TranscriptionRequest,
+        ticket: TranscriptionTicket,
+    ) -> Result<TranscriptionOutcome> {
+        let registration = crate::stt::register_cancellable_request(ticket.process_generation)
+            .map_err(|error| anyhow!(error))?;
+        self.transcribe_task(
+            request,
+            TranscriptionTask {
+                ticket,
+                _registration: registration,
+            },
+        )
+    }
+
+    pub fn transcribe_task(
+        &self,
+        request: TranscriptionRequest,
+        task: TranscriptionTask,
+    ) -> Result<TranscriptionOutcome> {
+        let ticket = task.ticket;
+        if self.router.cancellation_snapshot() != ticket.native_generation {
+            return Err(anyhow!(
+                "transcription request was cancelled before dispatch"
+            ));
+        }
         let model = self.resolve_model(&request.model_id, request.model_path.clone())?;
         if self.router.handles_model(&request.model_id) {
-            return self.transcribe_primary(request, model);
+            return self.transcribe_primary(request, model, ticket);
         }
 
-        self.transcribe_legacy(request, model)
+        self.transcribe_legacy(request, model, ticket)
     }
 
     fn transcribe_primary(
         &self,
         request: TranscriptionRequest,
         model: SttModelInfo,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
         validate_default_options(&request.options)?;
         let runtime_model = self.resolve_runtime_model(model.clone())?;
         match self.worker.transcribe(
             runtime_model,
-            self.config.acceleration_preference,
+            self.config.performance.acceleration_preference,
             Arc::clone(&request.audio),
             request.options.clone(),
-            self.router.cancellation_snapshot(),
+            ticket.native_generation,
         ) {
             Ok(execution) => Ok(map_native_execution(request, model, execution)),
             Err(crate::runtime_router::RuntimeError::Bootstrap(failure))
                 if failure.cli_fallback_eligible() =>
             {
-                self.transcribe_legacy_with_fallback_reason(request, model, failure)
+                self.transcribe_legacy_with_fallback_reason(request, model, failure, ticket)
             }
             Err(error) => Err(anyhow!(error)),
         }
@@ -631,8 +717,9 @@ impl TranscriptionService {
         &self,
         request: TranscriptionRequest,
         model: SttModelInfo,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, None)
+        self.transcribe_legacy_inner(request, model, None, ticket)
     }
 
     fn transcribe_legacy_with_fallback_reason(
@@ -640,8 +727,9 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         model: SttModelInfo,
         failure: NativeBootstrapFailure,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
-        self.transcribe_legacy_inner(request, model, Some(failure.to_string()))
+        self.transcribe_legacy_inner(request, model, Some(failure.to_string()), ticket)
     }
 
     fn transcribe_legacy_inner(
@@ -649,13 +737,15 @@ impl TranscriptionService {
         request: TranscriptionRequest,
         model: SttModelInfo,
         fallback_reason: Option<String>,
+        ticket: TranscriptionTicket,
     ) -> Result<TranscriptionOutcome> {
         if fallback_reason.is_some() {
             let cli = crate::compatibility_bridge::primary_runtime_entrypoint(&self.config)
                 .ok_or_else(|| anyhow!("the verified compatibility CLI is unavailable"))?;
             verify_compatibility_cli(&cli).map_err(|error| anyhow!(error))?;
         }
-        let mut engine = LegacyBatchAdapter::new(self.config.clone(), model);
+        let mut engine =
+            LegacyBatchAdapter::new(self.config.clone(), model, ticket.process_generation);
         engine.load()?;
         let transcription = engine.transcribe(&request.audio, &request.options);
         let unload_result = engine.unload();
@@ -781,14 +871,20 @@ fn map_native_execution(
 struct LegacyBatchAdapter {
     config: AppConfig,
     model: SttModelInfo,
+    cancellation_snapshot: crate::stt::CancellationSnapshot,
     diagnostics: Option<LegacyDiagnostics>,
 }
 
 impl LegacyBatchAdapter {
-    fn new(config: AppConfig, model: SttModelInfo) -> Self {
+    fn new(
+        config: AppConfig,
+        model: SttModelInfo,
+        cancellation_snapshot: crate::stt::CancellationSnapshot,
+    ) -> Self {
         Self {
             config,
             model,
+            cancellation_snapshot,
             diagnostics: None,
         }
     }
@@ -817,6 +913,7 @@ impl SpeechEngine for LegacyBatchAdapter {
             &self.config,
             prepared_wav.path().to_path_buf(),
             self.model.clone(),
+            self.cancellation_snapshot,
         )?;
         let (transcript, diagnostics) = map_legacy_result(result);
         self.diagnostics = Some(diagnostics);
@@ -834,9 +931,8 @@ impl SpeechEngine for LegacyBatchAdapter {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(anyhow!(
-            "cancellation is not supported by the Phase 1 legacy transcription path"
-        ))
+        crate::stt::cancel_active_processes();
+        Ok(())
     }
 
     fn unload(&mut self) -> Result<()> {
@@ -1065,6 +1161,7 @@ fn capabilities_for_legacy_model(model: &SttModelInfo) -> RuntimeCapabilities {
         // timestamp values. whisper.cpp strips its text timing and the sherpa
         // family currently reports null segment bounds.
         timestamps: matches!(model.backend.as_str(), "faster-whisper" | "Vosk"),
+        cancellation: true,
         ..RuntimeCapabilities::default()
     }
 }
@@ -1221,6 +1318,7 @@ mod tests {
                 "{} timestamp capability",
                 model.backend
             );
+            assert!(capabilities.cancellation, "{} cancellation", model.backend);
             assert!(!capabilities.streaming, "{} streaming", model.backend);
             assert!(!capabilities.translation, "{} translation", model.backend);
             assert!(
@@ -1325,6 +1423,51 @@ mod tests {
     }
 
     #[test]
+    fn ticket_captured_before_cancellation_cannot_dispatch_later() {
+        let _test_lock = crate::stt::cancellation_test_lock();
+        let service = TranscriptionService::new(AppConfig::default());
+        let ticket = service.transcription_ticket();
+        service.cancel_active();
+        let request = TranscriptionRequest::new(
+            SessionId(91),
+            RequestId(92),
+            prepared_audio(),
+            "whisper_cpp_tiny_en",
+        );
+
+        let error = service.transcribe_with_ticket(request, ticket).unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn registered_task_keeps_shutdown_waiting_through_audio_cleanup() {
+        let _test_lock = crate::stt::cancellation_test_lock();
+        let service = TranscriptionService::new(AppConfig::default());
+        let task = service.begin_transcription_task().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "scribe-dispatch-cleanup-{}-{}.wav",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&path, b"pcm").unwrap();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            fs::remove_file(&worker_path).unwrap();
+            drop(task);
+        });
+
+        assert!(service.cancel_active_and_wait(Duration::from_secs(2)));
+
+        worker.join().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn service_returns_legacy_adapter_option_errors_without_needing_a_runtime() {
         let service = TranscriptionService::new(AppConfig::default());
         let mut request = TranscriptionRequest::new(
@@ -1346,7 +1489,11 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
             .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(AppConfig::default(), model);
+        let mut adapter = LegacyBatchAdapter::new(
+            AppConfig::default(),
+            model,
+            crate::stt::cancellation_snapshot(),
+        );
 
         let error = adapter.health_check().unwrap_err();
 
@@ -1354,22 +1501,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_adapter_has_explicit_stateless_load_and_unsupported_cancel_semantics() {
+    fn legacy_adapter_has_explicit_stateless_load_and_process_cancel_semantics() {
         let model = config::configured_models(&AppConfig::default())
             .into_iter()
             .find(|model| model.id == "whisper_cpp_tiny_en")
             .expect("whisper.cpp tiny model exists");
-        let mut adapter = LegacyBatchAdapter::new(AppConfig::default(), model);
+        let mut adapter = LegacyBatchAdapter::new(
+            AppConfig::default(),
+            model,
+            crate::stt::cancellation_snapshot(),
+        );
 
         adapter
             .load()
             .expect("legacy adapter has no persistent load");
-        let error = adapter.cancel().unwrap_err();
+        adapter
+            .cancel()
+            .expect("legacy child cancellation is available");
         adapter
             .unload()
             .expect("legacy adapter has no persistent unload");
-
-        assert!(error.to_string().contains("cancellation is not supported"));
     }
 
     #[test]
@@ -1467,10 +1618,8 @@ mod tests {
                 .expect("set SCRIBE_WHISPER_CPP_AUDIO to the JFK WAV fixture"),
         );
 
-        let config = AppConfig {
-            whisper_executable_path: Some(whisper_cli),
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(whisper_cli);
         let service = TranscriptionService::new(config);
         let session_id = SessionId(701);
         let request_id = RequestId(1701);
@@ -1558,11 +1707,9 @@ mod tests {
         let model_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_MODEL").unwrap());
         let audio_path = PathBuf::from(std::env::var_os("SCRIBE_WHISPER_CPP_AUDIO").unwrap());
         let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
-        let config = AppConfig {
-            whisper_executable_path: Some(cli),
-            acceleration_preference: AccelerationPreference::Cpu,
-            ..AppConfig::default()
-        };
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(cli);
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
         let make_request = |request_id: u64| {
             let mut request = TranscriptionRequest::new(
                 SessionId(8_000 + request_id),
@@ -1628,11 +1775,10 @@ mod tests {
             source_sample_rate: fixture.sample_rate,
             source_channels: 1,
         });
-        let service = TranscriptionService::new(AppConfig {
-            whisper_executable_path: Some(cli),
-            acceleration_preference: AccelerationPreference::Cpu,
-            ..AppConfig::default()
-        });
+        let mut config = AppConfig::default();
+        config.developer.whisper_executable_path = Some(cli);
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        let service = TranscriptionService::new(config);
         service
             .preload_model(
                 &ModelId::new("whisper_cpp_base_en"),
