@@ -15,7 +15,7 @@ pub(crate) use screens::{RecordingSettingsView, ScreenAction, ScreenView, render
 pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
     MicrophonePermission, ModelCompatibility, ModelDownloadState, ModelSizeTier, ModelSpeedTier,
-    ModelViewModel, UiRoute,
+    ModelViewModel, RecordingMode, SettingsTab, UiRoute,
 };
 pub(crate) use theme::{ThemePalette, theme_palette, ui_palette};
 

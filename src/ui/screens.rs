@@ -17,20 +17,34 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecordingSettingsView {
+    pub close_to_tray: bool,
+    pub duration_seconds: u32,
     pub duration_label: String,
     pub provisional_feedback: bool,
+    pub selected_audio_device: Option<String>,
+    pub audio_devices: Vec<String>,
     pub device_label: String,
     pub input_level: f32,
+    pub auto_insert_transcript: bool,
+    pub restore_clipboard_after_insert: bool,
+    pub paste_delay_ms: u64,
     pub save_state: SettingsSaveState,
 }
 
 impl Default for RecordingSettingsView {
     fn default() -> Self {
         Self {
+            close_to_tray: true,
+            duration_seconds: 30,
             duration_label: "30 seconds".into(),
             provisional_feedback: true,
+            selected_audio_device: None,
+            audio_devices: Vec::new(),
             device_label: "OS default".into(),
             input_level: 0.0,
+            auto_insert_transcript: false,
+            restore_clipboard_after_insert: true,
+            paste_delay_ms: 60,
             save_state: SettingsSaveState::Clean,
         }
     }
@@ -59,10 +73,16 @@ pub(crate) enum ScreenAction {
     ToggleComparisonModel(String),
     StartComparison,
     SetSettingsTab(SettingsTab),
+    SetCloseToTray(bool),
     SetRecordingMode(RecordingMode),
+    SetDurationSeconds(u32),
     ToggleProvisionalFeedback,
+    SetAudioDevice(Option<String>),
     RefreshDevices,
     ChangeShortcut,
+    SetAutoInsertTranscript(bool),
+    SetRestoreClipboardAfterInsert(bool),
+    SetPasteDelayMs(u64),
 }
 
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
@@ -927,21 +947,9 @@ fn settings(
         Layout::top_down(Align::LEFT),
         |ui| match active_tab {
             SettingsTab::Recording => recording_settings_panel(ui, state, settings, &mut action),
-            SettingsTab::General => settings_placeholder(
-                ui,
-                "General settings",
-                "General settings are available in the production preferences view.",
-            ),
-            SettingsTab::Output => settings_placeholder(
-                ui,
-                "Output settings",
-                "Output settings are available in the production preferences view.",
-            ),
-            SettingsTab::Advanced => settings_placeholder(
-                ui,
-                "Advanced settings",
-                "Advanced settings are available in the production preferences view.",
-            ),
+            SettingsTab::General => general_settings_panel(ui, settings, &mut action),
+            SettingsTab::Output => output_settings_panel(ui, settings, &mut action),
+            SettingsTab::Advanced => advanced_settings_panel(ui, settings, &mut action),
         },
     );
     ui.ctx()
@@ -1122,12 +1130,18 @@ fn recording_settings_panel(
         ui.separator();
         ui.add_space(8.0);
         setting_row(ui, "Duration limit", |ui| {
+            let mut duration = settings.duration_seconds;
             ComboBox::from_id_source("duration-limit")
                 .selected_text(&settings.duration_label)
                 .width(240.0)
                 .show_ui(ui, |ui| {
-                    ui.label("30 seconds");
+                    for seconds in [15, 30, 60, 120, 300, 600] {
+                        ui.selectable_value(&mut duration, seconds, format!("{seconds} seconds"));
+                    }
                 });
+            if duration != settings.duration_seconds {
+                *action = ScreenAction::SetDurationSeconds(duration);
+            }
         });
         setting_row(ui, "Visual feedback", |ui| {
             let mut enabled = settings.provisional_feedback;
@@ -1147,12 +1161,19 @@ fn recording_settings_panel(
         ui.label(RichText::new("Audio input").strong());
         ui.add_space(12.0);
         setting_row(ui, "Device", |ui| {
+            let mut selected = settings.selected_audio_device.clone();
             ComboBox::from_id_source("audio-device")
                 .selected_text(&settings.device_label)
                 .width(360.0)
                 .show_ui(ui, |ui| {
-                    ui.label(&settings.device_label);
+                    ui.selectable_value(&mut selected, None, "OS default");
+                    for device in &settings.audio_devices {
+                        ui.selectable_value(&mut selected, Some(device.clone()), device);
+                    }
                 });
+            if selected != settings.selected_audio_device {
+                *action = ScreenAction::SetAudioDevice(selected);
+            }
             let refresh = button(
                 ui,
                 format!("{}  Refresh devices", icon_glyph(Icon::Refresh)),
@@ -1191,11 +1212,84 @@ fn recording_settings_panel(
     });
 }
 
-fn settings_placeholder(ui: &mut egui::Ui, title: &str, message: &str) {
+fn general_settings_panel(
+    ui: &mut egui::Ui,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
     card(ui, |ui| {
-        ui.label(RichText::new(title).strong());
+        ui.label(RichText::new("General settings").strong());
         ui.add_space(8.0);
-        ui.label(RichText::new(message).color(ui_palette(ui).muted_text));
+        let mut close_to_tray = settings.close_to_tray;
+        if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
+            *action = ScreenAction::SetCloseToTray(close_to_tray);
+        }
+        ui.label(
+            RichText::new("Scribe keeps audio and transcripts on this device.")
+                .color(ui_palette(ui).muted_text),
+        );
+    });
+}
+
+fn output_settings_panel(
+    ui: &mut egui::Ui,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
+    card(ui, |ui| {
+        ui.label(RichText::new("Output settings").strong());
+        ui.add_space(8.0);
+        let mut auto_insert = settings.auto_insert_transcript;
+        if ui
+            .checkbox(&mut auto_insert, "Automatically insert final transcript")
+            .changed()
+        {
+            *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
+        }
+        ui.add_enabled_ui(auto_insert, |ui| {
+            let mut restore = settings.restore_clipboard_after_insert;
+            if ui
+                .checkbox(&mut restore, "Restore clipboard after insert")
+                .changed()
+            {
+                *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
+            }
+            ui.horizontal(|ui| {
+                let label = ui.label("Paste delay (ms)");
+                let mut delay = settings.paste_delay_ms as i64;
+                if ui
+                    .add(egui::DragValue::new(&mut delay).clamp_range(1..=1_000))
+                    .labelled_by(label.id)
+                    .changed()
+                {
+                    *action = ScreenAction::SetPasteDelayMs(delay as u64);
+                }
+            });
+        });
+    });
+}
+
+fn advanced_settings_panel(
+    ui: &mut egui::Ui,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
+    card(ui, |ui| {
+        ui.label(RichText::new("Advanced settings").strong());
+        ui.add_space(8.0);
+        let mut preview = settings.provisional_feedback;
+        if ui
+            .checkbox(&mut preview, "Use live provisional preview")
+            .changed()
+        {
+            *action = ScreenAction::ToggleProvisionalFeedback;
+        }
+        ui.label(
+            RichText::new(
+                "Preview text remains inside Scribe until final transcription completes.",
+            )
+            .color(ui_palette(ui).muted_text),
+        );
     });
 }
 

@@ -71,10 +71,11 @@ use crate::transcription::{
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
     AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCompatibility,
-    ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingSettingsView,
-    ScreenAction, ScreenView, ThemePalette, UiRoute, about_page, configure_accessible_style,
-    history_page, minimum_primary_target_height, recording_mode, render_screen,
-    settings_save_state, show_navigation, theme_palette, transcription_state, ui_palette,
+    ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
+    RecordingSettingsView, ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute,
+    about_page, configure_accessible_style, history_page, minimum_primary_target_height,
+    recording_mode, render_screen, settings_save_state, show_navigation, theme_palette,
+    transcription_state, ui_palette,
 };
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
@@ -2672,6 +2673,7 @@ pub struct LocalTranscriberApp {
     config_path: Option<PathBuf>,
     settings_store: Option<SettingsStore>,
     current_tab: Tab,
+    settings_tab: SettingsTab,
     models_show_comparison: bool,
     status: TranscriptionStatus,
     transcript: String,
@@ -2835,6 +2837,7 @@ impl LocalTranscriberApp {
             config_path,
             settings_store,
             current_tab: initial_tab(),
+            settings_tab: SettingsTab::General,
             models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -8037,6 +8040,10 @@ impl eframe::App for LocalTranscriberApp {
         self.sync_tray_state();
 
         show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        if self.current_tab == Tab::Advanced {
+            self.settings_tab = SettingsTab::Advanced;
+            self.current_tab = Tab::General;
+        }
         if self.current_tab != Tab::General {
             self.suspend_microphone_monitor();
         }
@@ -8049,7 +8056,7 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Models if self.models_show_comparison => self.ui_playground(ui),
                 Tab::Models => self.ui_models(ui),
                 Tab::History => self.ui_history(ui),
-                Tab::Advanced => self.ui_advanced_settings(ui),
+                Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                 Tab::About => self.ui_about(ui),
                 Tab::Debug => self.ui_playground(ui),
             });
@@ -8144,6 +8151,7 @@ impl LocalTranscriberApp {
                 self.effective_status() == TranscriptionStatus::Error
                     && self.status_message.starts_with("Failed to save settings:"),
             ),
+            ..Default::default()
         };
         let action = render_screen(
             ui,
@@ -8250,10 +8258,16 @@ impl LocalTranscriberApp {
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
             | ScreenAction::SetSettingsTab(_)
+            | ScreenAction::SetCloseToTray(_)
             | ScreenAction::SetRecordingMode(_)
+            | ScreenAction::SetDurationSeconds(_)
             | ScreenAction::ToggleProvisionalFeedback
+            | ScreenAction::SetAudioDevice(_)
             | ScreenAction::RefreshDevices
-            | ScreenAction::ChangeShortcut => {}
+            | ScreenAction::ChangeShortcut
+            | ScreenAction::SetAutoInsertTranscript(_)
+            | ScreenAction::SetRestoreClipboardAfterInsert(_)
+            | ScreenAction::SetPasteDelayMs(_) => {}
         }
     }
 
@@ -9608,6 +9622,127 @@ impl LocalTranscriberApp {
     }
 
     fn ui_general_settings(&mut self, ui: &mut Ui) {
+        let state = transcription_state(
+            self.effective_status(),
+            self.selected_ready_model_id(),
+            self.pending_recording.is_some(),
+            self.status_message == "No speech detected; nothing was pasted.",
+            0,
+            self.transcript.clone(),
+            String::new(),
+            (!self.status_message.is_empty()).then(|| self.status_message.clone()),
+            self.config.recording.hotkey.clone(),
+            recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
+            self.microphone_permission(),
+        );
+        let settings = RecordingSettingsView {
+            close_to_tray: self.config.general.close_to_tray,
+            duration_seconds: self.config.recording.max_recording_seconds,
+            duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
+            provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
+            selected_audio_device: self.config.recording.audio_input_device_name.clone(),
+            audio_devices: self.audio_devices.clone(),
+            device_label: self
+                .config
+                .recording
+                .audio_input_device_name
+                .clone()
+                .unwrap_or_else(|| "OS default".to_owned()),
+            input_level: self
+                .capture_is_active()
+                .then(|| self.current_audio_level())
+                .unwrap_or_default(),
+            auto_insert_transcript: self.config.output.auto_insert_transcript,
+            restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
+            paste_delay_ms: self.config.output.paste_delay_ms,
+            save_state: settings_save_state(
+                self.settings_store
+                    .as_ref()
+                    .is_some_and(SettingsStore::has_pending),
+                self.effective_status() == TranscriptionStatus::Error
+                    && self.status_message.starts_with("Failed to save settings:"),
+            ),
+        };
+        let comparison = Default::default();
+        let action = render_screen(
+            ui,
+            &ScreenView {
+                route: UiRoute::Settings(self.settings_tab),
+                transcription: &state,
+                models: &[],
+                comparison: &comparison,
+                recording_settings: &settings,
+            },
+        );
+        self.apply_settings_screen_action(action);
+    }
+
+    fn apply_settings_screen_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::SetSettingsTab(tab) => self.settings_tab = tab,
+            ScreenAction::SetCloseToTray(value) => {
+                self.config.general.close_to_tray = value;
+                self.save_config();
+            }
+            ScreenAction::SetRecordingMode(mode) => {
+                self.config.recording.hotkey_mode = match mode {
+                    RecordingMode::PressOnce => HotkeyMode::Toggle,
+                    RecordingMode::Hold => HotkeyMode::HoldToTalk,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetDurationSeconds(seconds) => {
+                self.config.recording.max_recording_seconds =
+                    seconds.clamp(1, config::MAX_RECORDING_SECONDS);
+                self.save_config();
+            }
+            ScreenAction::ToggleProvisionalFeedback => {
+                self.config.streaming.mode =
+                    if self.config.streaming.mode == StreamingMode::FinalOnly {
+                        StreamingMode::Auto
+                    } else {
+                        StreamingMode::FinalOnly
+                    };
+                self.save_config();
+            }
+            ScreenAction::SetAudioDevice(device) => {
+                self.config.recording.audio_input_device_name = device;
+                self.save_config();
+            }
+            ScreenAction::RefreshDevices => self.refresh_audio_devices(),
+            ScreenAction::ChangeShortcut => {
+                self.capturing_hotkey = true;
+                self.status_message = "Press the new hotkey combination.".to_owned();
+            }
+            ScreenAction::SetAutoInsertTranscript(value) => {
+                self.config.output.auto_insert_transcript = value;
+                self.save_config();
+            }
+            ScreenAction::SetRestoreClipboardAfterInsert(value) => {
+                self.config.output.restore_clipboard_after_insert = value;
+                self.save_config();
+            }
+            ScreenAction::SetPasteDelayMs(value) => {
+                self.config.output.paste_delay_ms = value.clamp(1, 1_000);
+                self.save_config();
+            }
+            ScreenAction::None
+            | ScreenAction::AddModel
+            | ScreenAction::ChangeModel
+            | ScreenAction::StartRecording
+            | ScreenAction::StopRecording
+            | ScreenAction::OpenAudioSettings
+            | ScreenAction::RetryMicrophone
+            | ScreenAction::ClearTranscript
+            | ScreenAction::CopyTranscript
+            | ScreenAction::ToggleComparison
+            | ScreenAction::ToggleComparisonModel(_)
+            | ScreenAction::StartComparison => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn ui_general_settings_legacy(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "General", status, &status_message, |ui| {
@@ -16355,6 +16490,7 @@ mod layout_tests {
             config_path: None,
             settings_store: None,
             current_tab: Tab::Models,
+            settings_tab: SettingsTab::General,
             models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
