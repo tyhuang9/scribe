@@ -8288,50 +8288,53 @@ impl LocalTranscriberApp {
             return Vec::new();
         };
         let install_status = self.effective_install_status(&model);
-        vec![ModelViewModel {
-            id: model.id.clone(),
-            display_name: descriptor.display_name.to_owned(),
-            variant_label: descriptor.speed_guidance.to_owned(),
-            description: Some(descriptor.description.to_owned()),
-            runtime_group: "Local speech runtime".to_owned(),
-            installed: install_status.is_runnable(),
-            active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
-            download_state: match install_status {
-                ModelInstallStatus::Installed => ModelDownloadState::Installed,
-                ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
-                ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
-                ModelInstallStatus::Error(_) | ModelInstallStatus::RuntimeError(_) => {
-                    ModelDownloadState::Failed
-                }
-                _ => ModelDownloadState::NotInstalled,
-            },
-            total_bytes: Some(descriptor.artifact_size_bytes),
-            disk_bytes: model
-                .local_path
-                .as_ref()
-                .and_then(|path| std::fs::metadata(path).ok())
-                .map(|metadata| metadata.len()),
-            estimated_ram_bytes: descriptor
-                .expected_ram
-                .trim_end_matches("MB")
-                .parse::<u64>()
-                .ok()
-                .map(|megabytes| megabytes * 1_000_000),
-            languages: descriptor
-                .languages
-                .iter()
-                .map(|language| (*language).to_owned())
-                .collect(),
-            language_summary: descriptor.languages.join(", "),
-            speed_tier: ModelSpeedTier::Unknown,
-            size_tier: ModelSizeTier::Unknown,
-            compatibility: match descriptor.compatibility {
-                CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
-                CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
-                CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
-            },
-            ..Default::default()
-        }]
+        vec![
+            ModelViewModel {
+                id: model.id.clone(),
+                display_name: descriptor.display_name.to_owned(),
+                variant_label: descriptor.speed_guidance.to_owned(),
+                description: Some(descriptor.description.to_owned()),
+                runtime_group: "Local speech runtime".to_owned(),
+                installed: install_status.is_runnable(),
+                active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
+                download_state: match install_status {
+                    ModelInstallStatus::Installed => ModelDownloadState::Installed,
+                    ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
+                    ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
+                    ModelInstallStatus::Error(_) | ModelInstallStatus::RuntimeError(_) => {
+                        ModelDownloadState::Failed
+                    }
+                    _ => ModelDownloadState::NotInstalled,
+                },
+                total_bytes: Some(descriptor.artifact_size_bytes),
+                disk_bytes: model
+                    .local_path
+                    .as_ref()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .map(|metadata| metadata.len()),
+                estimated_ram_bytes: descriptor
+                    .expected_ram
+                    .trim_end_matches("MB")
+                    .parse::<u64>()
+                    .ok()
+                    .map(|megabytes| megabytes * 1_000_000),
+                languages: descriptor
+                    .languages
+                    .iter()
+                    .map(|language| (*language).to_owned())
+                    .collect(),
+                language_summary: descriptor.languages.join(", "),
+                speed_tier: ModelSpeedTier::Unknown,
+                size_tier: ModelSizeTier::Unknown,
+                compatibility: match descriptor.compatibility {
+                    CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
+                    CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                    CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
+                },
+                ..Default::default()
+            }
+            .normalize(),
+        ]
         .into_iter()
         .collect()
     }
@@ -8654,6 +8657,8 @@ impl LocalTranscriberApp {
             self.request_remote_catalog(false);
         }
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        self.model_comparison.start_disabled_reason =
+            self.comparison_start_block_reason().map(str::to_owned);
         let catalog = self.model_management_catalog();
         let installed = catalog
             .iter()
@@ -8773,6 +8778,15 @@ impl LocalTranscriberApp {
             } else {
                 ComparisonPhase::Idle
             };
+    }
+
+    fn comparison_start_block_reason(&self) -> Option<&'static str> {
+        (self.pending_output.is_some()
+            || matches!(
+                self.session_coordinator.active_purpose(),
+                Some(SessionPurpose::Dictation)
+            ))
+        .then_some("Finish the current dictation before starting a comparison.")
     }
 
     fn model_management_catalog(&self) -> Vec<ModelViewModel> {
@@ -8906,6 +8920,7 @@ impl LocalTranscriberApp {
             },
             ..Default::default()
         }
+        .normalize()
     }
 
     fn apply_model_management_action(&mut self, action: ScreenAction) {
@@ -8943,11 +8958,15 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::StartComparison => {
-                if !self.model_comparison.begin() {
+                if let Some(reason) = self.comparison_start_block_reason() {
+                    self.model_comparison.start_disabled_reason = Some(reason.to_owned());
+                    self.model_comparison.selection_feedback = Some(reason.to_owned());
+                } else if !self.model_comparison.begin() {
                     self.model_comparison.selection_feedback = Some(
                         "Select two to four ready models before starting a comparison.".to_owned(),
                     );
                 } else {
+                    self.model_comparison.start_disabled_reason = None;
                     self.comparison_run_model_ids = Some(
                         self.model_comparison
                             .selected_model_ids
@@ -16465,6 +16484,72 @@ mod layout_tests {
             ComparisonResultPhase::Error
         );
         assert_eq!(app.model_comparison.results[1].1.word_error_rate, Some(0.0));
+    }
+
+    #[test]
+    fn comparison_start_does_not_supersede_active_dictation_or_output() {
+        for output_pending in [false, true] {
+            let mut app = test_app();
+            let session_id = SessionId(44);
+            let request_id = RequestId(440);
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            app.transcript = "keep transcript".to_owned();
+            app.raw_transcript = "keep raw transcript".to_owned();
+            app.status = TranscriptionStatus::Transcribing;
+            app.model_comparison
+                .selected_model_ids
+                .extend(["one".to_owned(), "two".to_owned()]);
+            seed_test_request(
+                &mut app,
+                RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                model_id.as_str(),
+            );
+            if output_pending {
+                app.session_coordinator
+                    .complete_request(session_id, request_id, &model_id)
+                    .unwrap();
+                app.session_coordinator.begin_output(session_id).unwrap();
+                app.pending_output = Some(PendingOutput {
+                    session_id,
+                    history_id: None,
+                    transcript: "queued output".to_owned(),
+                    completion_message: "Complete".to_owned(),
+                    config: app.config.clone(),
+                    latency: None,
+                });
+            }
+            let phase = app.session_coordinator.phase();
+            let history = app.history_records.clone();
+
+            app.apply_model_management_action(ScreenAction::StartComparison);
+
+            assert_eq!(
+                app.session_coordinator.active_session_id(),
+                Some(session_id)
+            );
+            assert_eq!(
+                app.session_coordinator.active_purpose(),
+                Some(SessionPurpose::Dictation)
+            );
+            assert_eq!(app.session_coordinator.phase(), phase);
+            assert_eq!(app.transcript, "keep transcript");
+            assert_eq!(app.raw_transcript, "keep raw transcript");
+            assert_eq!(app.history_records, history);
+            assert_eq!(
+                app.pending_output
+                    .as_ref()
+                    .map(|pending| pending.session_id),
+                output_pending.then_some(session_id)
+            );
+            assert!(app.comparison_run_model_ids.is_none());
+            assert_eq!(app.model_comparison.phase, ComparisonPhase::Idle);
+            assert_eq!(
+                app.model_comparison.start_disabled_reason.as_deref(),
+                Some("Finish the current dictation before starting a comparison.")
+            );
+        }
     }
 
     #[test]

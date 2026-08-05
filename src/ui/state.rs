@@ -361,6 +361,7 @@ pub(crate) struct ModelComparisonState {
     pub reference_draft: String,
     pub reference_transcript: Option<String>,
     pub selection_feedback: Option<String>,
+    pub start_disabled_reason: Option<String>,
     pub results: Vec<(String, ComparisonResult)>,
 }
 

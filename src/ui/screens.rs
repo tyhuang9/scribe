@@ -1145,7 +1145,7 @@ fn models(
                             ui.label(
                                 result
                                     .and_then(|r| r.realtime_factor)
-                                    .map_or("â€”".into(), |rtf| format!("{rtf:.2}x")),
+                                    .map_or("—".into(), |rtf| format!("{rtf:.2}x")),
                             );
                             if let Some(error) = result.and_then(|result| result.error.as_deref()) {
                                 egui::CollapsingHeader::new("View error")
@@ -1226,7 +1226,7 @@ fn models(
                                 let can_cancel = model.cancel_supported;
                                 let install = ui.add_enabled(
                                     model.install_action_enabled,
-                                    egui::Button::new(if model.download_state == ModelDownloadState::Failed { "Retry" } else { "Install" }),
+                                    egui::Button::new(model_install_action_label(model.download_state)),
                                 );
                                 if !model.install_supported {
                                     install.clone().on_hover_text("This model has no supported managed download in this build.");
@@ -1363,8 +1363,18 @@ fn model_download_label(model: &ModelViewModel) -> String {
     }
 }
 
-fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option<&'static str> {
-    if matches!(
+fn model_install_action_label(state: ModelDownloadState) -> &'static str {
+    match state {
+        ModelDownloadState::Cancelled => "Resume",
+        ModelDownloadState::Failed => "Retry",
+        _ => "Install",
+    }
+}
+
+fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option<&str> {
+    if let Some(reason) = comparison.start_disabled_reason.as_deref() {
+        Some(reason)
+    } else if matches!(
         comparison.phase,
         super::state::ComparisonPhase::Recording | super::state::ComparisonPhase::Processing
     ) {
@@ -2591,6 +2601,99 @@ mod tests {
             comparison_start_disabled_reason(&comparison),
             Some("Select no more than four installed models for a comparison.")
         );
+    }
+
+    #[test]
+    fn add_model_dialog_uses_resumable_install_labels_accessibly() {
+        for (state, label) in [
+            (ModelDownloadState::Cancelled, "Resume"),
+            (ModelDownloadState::Failed, "Retry"),
+            (ModelDownloadState::NotInstalled, "Install"),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let model = ModelViewModel {
+                id: "base.en".into(),
+                display_name: "base.en".into(),
+                install_supported: true,
+                install_action_enabled: true,
+                download_state: state,
+                ..Default::default()
+            };
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_screen(
+                        ui,
+                        &ScreenView {
+                            route: UiRoute::Models,
+                            transcription: &Default::default(),
+                            models: &[],
+                            model_catalog: &[model],
+                            comparison: &Default::default(),
+                            model_management: &ModelManagementState {
+                                dialog: Some(ModelDialog::Add),
+                                ..Default::default()
+                            },
+                            recording_settings: &Default::default(),
+                        },
+                    )
+                });
+            });
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some(label))
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_empty_cells_render_an_em_dash() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let comparison = ModelComparisonState {
+            expanded: true,
+            selected_model_ids: ["base.en".to_owned()].into_iter().collect(),
+            ..Default::default()
+        };
+        let model = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "base.en".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        };
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[model],
+                        model_catalog: &[],
+                        comparison: &comparison,
+                        model_management: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                )
+            });
+        });
+        let dashes = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.name() == Some("—"))
+            .count();
+        assert!(dashes >= 3);
+        assert!(include_str!("screens.rs").contains("map_or(\"—\".into(), |rtf|"));
     }
 
     #[test]
