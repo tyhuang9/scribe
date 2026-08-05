@@ -250,11 +250,27 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.route = UiRoute::Settings(tab);
             *page = AppPage::General;
         }
+        ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
+        ScreenAction::SetDurationSeconds(seconds) => {
+            data.settings.duration_seconds = seconds;
+            data.settings.duration_label = format!("{seconds} seconds");
+        }
         ScreenAction::ToggleProvisionalFeedback => {
             data.settings.provisional_feedback = !data.settings.provisional_feedback
         }
+        ScreenAction::SetAudioDevice(device) => {
+            data.settings.selected_audio_device = device.clone();
+            data.settings.device_label = device.unwrap_or_else(|| "OS default".into());
+        }
         ScreenAction::RefreshDevices | ScreenAction::ChangeShortcut => {}
+        ScreenAction::SetAutoInsertTranscript(value) => {
+            data.settings.auto_insert_transcript = value
+        }
+        ScreenAction::SetRestoreClipboardAfterInsert(value) => {
+            data.settings.restore_clipboard_after_insert = value
+        }
+        ScreenAction::SetPasteDelayMs(value) => data.settings.paste_delay_ms = value,
     }
 }
 

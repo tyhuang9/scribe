@@ -6,9 +6,17 @@ use super::state::{
     MicrophonePermission, RecordingMode, SettingsSaveState, TranscriptionPhase, TranscriptionState,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ModelReadiness {
+    Ready,
+    Loading,
+    Error,
+}
+
 pub(crate) fn transcription_state(
     status: TranscriptionStatus,
     selected_model_id: Option<String>,
+    model_readiness: ModelReadiness,
     requesting_microphone: bool,
     no_speech: bool,
     elapsed_ms: u64,
@@ -32,7 +40,11 @@ pub(crate) fn transcription_state(
             TranscriptionPhase::MicrophoneError
         }
         (TranscriptionStatus::Error, _, _, _) => TranscriptionPhase::ModelError,
-        _ => TranscriptionPhase::Ready,
+        _ => match model_readiness {
+            ModelReadiness::Ready => TranscriptionPhase::Ready,
+            ModelReadiness::Loading => TranscriptionPhase::ModelLoading,
+            ModelReadiness::Error => TranscriptionPhase::ModelError,
+        },
     };
 
     TranscriptionState {
@@ -79,6 +91,7 @@ mod tests {
         let listening = transcription_state(
             TranscriptionStatus::Listening,
             Some("base.en".into()),
+            ModelReadiness::Ready,
             false,
             false,
             1_000,
@@ -95,6 +108,7 @@ mod tests {
         let denied = transcription_state(
             TranscriptionStatus::Error,
             Some("base.en".into()),
+            ModelReadiness::Error,
             false,
             false,
             0,
@@ -115,5 +129,58 @@ mod tests {
         assert_eq!(recording_mode(true), RecordingMode::Hold);
         assert_eq!(settings_save_state(true, false), SettingsSaveState::Saving);
         assert_eq!(settings_save_state(false, true), SettingsSaveState::Failed);
+    }
+
+    #[test]
+    fn preserves_a_configured_model_while_its_runtime_is_not_ready() {
+        let loading = transcription_state(
+            TranscriptionStatus::Idle,
+            Some("base.en".into()),
+            ModelReadiness::Loading,
+            false,
+            false,
+            0,
+            String::new(),
+            String::new(),
+            None,
+            "Ctrl+Shift+Space".into(),
+            RecordingMode::PressOnce,
+            MicrophonePermission::Unknown,
+        );
+        assert_eq!(loading.phase, TranscriptionPhase::ModelLoading);
+        assert_eq!(loading.selected_model_id.as_deref(), Some("base.en"));
+
+        let failed = transcription_state(
+            TranscriptionStatus::Idle,
+            Some("base.en".into()),
+            ModelReadiness::Error,
+            false,
+            false,
+            0,
+            String::new(),
+            String::new(),
+            None,
+            "Ctrl+Shift+Space".into(),
+            RecordingMode::PressOnce,
+            MicrophonePermission::Unknown,
+        );
+        assert_eq!(failed.phase, TranscriptionPhase::ModelError);
+        assert_eq!(failed.selected_model_id.as_deref(), Some("base.en"));
+
+        let no_model = transcription_state(
+            TranscriptionStatus::Idle,
+            None,
+            ModelReadiness::Error,
+            false,
+            false,
+            0,
+            String::new(),
+            String::new(),
+            None,
+            "Ctrl+Shift+Space".into(),
+            RecordingMode::PressOnce,
+            MicrophonePermission::Unknown,
+        );
+        assert_eq!(no_model.phase, TranscriptionPhase::NoModel);
     }
 }

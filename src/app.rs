@@ -71,9 +71,9 @@ use crate::transcription::{
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
     AppPage, HistoryPageAction, HistoryPageState, MicrophonePermission, ModelCompatibility,
-    ModelDownloadState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-    RecordingSettingsView, ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute,
-    about_page, configure_accessible_style, history_page, minimum_primary_target_height,
+    ModelDownloadState, ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+    RecordingMode, RecordingSettingsView, ScreenAction, ScreenView, SettingsTab, ThemePalette,
+    UiRoute, about_page, configure_accessible_style, history_page, minimum_primary_target_height,
     recording_mode, render_screen, settings_save_state, show_navigation, theme_palette,
     transcription_state, ui_palette,
 };
@@ -8105,8 +8105,9 @@ impl eframe::App for LocalTranscriberApp {
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
         let models = self.transcribe_screen_models();
-        let selected_model_id = self.selected_ready_model_id();
+        let (selected_model_id, model_readiness) = self.selected_model_screen_state();
         let microphone_permission = self.microphone_permission();
+        let no_speech = self.status_message == "No speech detected; nothing was pasted.";
         let provisional_transcript = self.capture_is_active().then(|| {
             let preview = &self.overlay_controller.state().transcript;
             [preview.committed.as_str(), preview.tentative.as_str()]
@@ -8118,15 +8119,20 @@ impl LocalTranscriberApp {
         let state = transcription_state(
             self.effective_status(),
             selected_model_id,
+            model_readiness,
             self.pending_recording.is_some(),
-            self.status_message == "No speech detected; nothing was pasted.",
+            no_speech,
             self.active_recording
                 .as_ref()
                 .map(|recording| recording.started_at.elapsed().as_millis() as u64)
                 .unwrap_or_default(),
             self.transcript.clone(),
             provisional_transcript.unwrap_or_default(),
-            (!self.status_message.is_empty()).then(|| self.status_message.clone()),
+            if no_speech {
+                Some("No speech detected — nothing was added.".to_owned())
+            } else {
+                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+            },
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             microphone_permission,
@@ -8166,10 +8172,21 @@ impl LocalTranscriberApp {
         self.apply_transcribe_screen_action(action);
     }
 
-    fn selected_ready_model_id(&self) -> Option<String> {
-        let model = self.selected_model()?;
-        (runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready)
-            .then_some(model.id)
+    fn selected_model_screen_state(&self) -> (Option<String>, ModelReadiness) {
+        let Some(model) = self.selected_model() else {
+            return (None, ModelReadiness::Error);
+        };
+        let readiness = match runtime_status_for_model(&self.config, &model) {
+            ModelRuntimeStatus::Ready => ModelReadiness::Ready,
+            ModelRuntimeStatus::Downloading | ModelRuntimeStatus::Running => {
+                ModelReadiness::Loading
+            }
+            ModelRuntimeStatus::MissingConfiguration
+            | ModelRuntimeStatus::NotInstalled
+            | ModelRuntimeStatus::NotImplemented
+            | ModelRuntimeStatus::Error(_) => ModelReadiness::Error,
+        };
+        (Some(model.id), readiness)
     }
 
     fn microphone_permission(&self) -> MicrophonePermission {
@@ -8200,7 +8217,7 @@ impl LocalTranscriberApp {
             display_name: descriptor.display_name.to_owned(),
             variant_label: descriptor.speed_guidance.to_owned(),
             description: Some(descriptor.description.to_owned()),
-            runtime_group: model.backend.clone(),
+            runtime_group: "Local speech runtime".to_owned(),
             installed: install_status.is_runnable(),
             active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
             download_state: match install_status {
@@ -8250,7 +8267,10 @@ impl LocalTranscriberApp {
                 self.start_recording(RecordingSource::Transcribe)
             }
             ScreenAction::StopRecording => self.stop_recording(),
-            ScreenAction::OpenAudioSettings => self.current_tab = Tab::General,
+            ScreenAction::OpenAudioSettings => {
+                self.settings_tab = SettingsTab::Recording;
+                self.current_tab = Tab::General;
+            }
             ScreenAction::ClearTranscript => self.clear_transcript_history(),
             ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
             ScreenAction::None
@@ -9622,15 +9642,22 @@ impl LocalTranscriberApp {
     }
 
     fn ui_general_settings(&mut self, ui: &mut Ui) {
+        let (selected_model_id, model_readiness) = self.selected_model_screen_state();
+        let no_speech = self.status_message == "No speech detected; nothing was pasted.";
         let state = transcription_state(
             self.effective_status(),
-            self.selected_ready_model_id(),
+            selected_model_id,
+            model_readiness,
             self.pending_recording.is_some(),
-            self.status_message == "No speech detected; nothing was pasted.",
+            no_speech,
             0,
             self.transcript.clone(),
             String::new(),
-            (!self.status_message.is_empty()).then(|| self.status_message.clone()),
+            if no_speech {
+                Some("No speech detected — nothing was added.".to_owned())
+            } else {
+                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+            },
             self.config.recording.hotkey.clone(),
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),

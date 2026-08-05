@@ -398,6 +398,11 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
             }
 
             let has_committed_transcript = !state.committed_transcript.trim().is_empty();
+            let transcript_heading = ui.label(RichText::new("Transcript").strong());
+            ui.ctx().accesskit_node_builder(transcript_heading.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Heading);
+            });
+            ui.add_space(8.0);
             if state.phase == TranscriptionPhase::NoModel && !has_committed_transcript {
                 action = no_model_empty_state(ui);
             } else {
@@ -470,7 +475,7 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
                         action = ScreenAction::CopyTranscript;
                     }
                     let clear = ui.add_enabled(
-                        enabled && has_committed_transcript,
+                        has_committed_transcript,
                         egui::Button::new("Clear").min_size(Vec2::new(72.0, 40.0)),
                     );
                     if !clear.enabled() {
@@ -1073,141 +1078,166 @@ fn recording_settings_panel(
     action: &mut ScreenAction,
 ) {
     let colors = ui_palette(ui);
+    let recording_locked = matches!(
+        state.phase,
+        TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
+    );
     card(ui, |ui| {
         ui.label(RichText::new("Recording behavior").strong());
         ui.add_space(12.0);
-        let mut radio_ids = Vec::new();
-        let radio_group_id = ui.make_persistent_id("recording-mode-group");
-        let ctx = ui.ctx().clone();
-        ctx.accesskit_node_builder(radio_group_id, |builder| {
-            builder.set_role(egui::accesskit::Role::RadioGroup);
-            builder.set_name("Recording mode");
-        });
-        ctx.with_accessibility_parent(radio_group_id, || {
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [270.0, 40.0],
-                    egui::Label::new(RichText::new("Mode").color(colors.muted_text)),
-                );
-                for (mode, label) in [
-                    (RecordingMode::PressOnce, "Press once"),
-                    (RecordingMode::Hold, "Hold"),
-                ] {
-                    let response = radio_control(ui, mode, label, state.recording_mode == mode);
-                    radio_ids.push(response.id);
-                    if response.clicked() {
-                        *action = ScreenAction::SetRecordingMode(mode);
-                    }
-                    if response.has_focus()
-                        && ui.input(|input| {
-                            input.key_pressed(egui::Key::ArrowRight)
-                                || input.key_pressed(egui::Key::ArrowLeft)
-                        })
-                    {
-                        let next = if mode == RecordingMode::PressOnce {
-                            RecordingMode::Hold
-                        } else {
-                            RecordingMode::PressOnce
-                        };
-                        ui.memory_mut(|memory| {
-                            memory.request_focus(ui.make_persistent_id(("recording-mode", next)))
-                        });
-                        *action = ScreenAction::SetRecordingMode(next);
-                    }
-                }
-            });
-        });
-        let radio_group = radio_ids
-            .iter()
-            .map(|id| id.value().into())
-            .collect::<Vec<_>>();
-        for id in radio_ids {
-            ui.ctx().accesskit_node_builder(id, |builder| {
-                builder.set_radio_group(radio_group.clone());
-            });
-        }
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-        setting_row(ui, "Duration limit", |ui| {
-            let mut duration = settings.duration_seconds;
-            ComboBox::from_id_source("duration-limit")
-                .selected_text(&settings.duration_label)
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for seconds in [15, 30, 60, 120, 300, 600] {
-                        ui.selectable_value(&mut duration, seconds, format!("{seconds} seconds"));
-                    }
-                });
-            if duration != settings.duration_seconds {
-                *action = ScreenAction::SetDurationSeconds(duration);
-            }
-        });
-        setting_row(ui, "Visual feedback", |ui| {
-            let mut enabled = settings.provisional_feedback;
-            let response = ui.checkbox(&mut enabled, "Show provisional words while recording");
-            if response.clicked() {
-                *action = ScreenAction::ToggleProvisionalFeedback;
-            }
-            ui.label(
-                RichText::new("Improves visual feedback but may use more CPU.")
-                    .small()
+        if recording_locked {
+            let notice = ui.label(
+                RichText::new("Finish recording before changing recording settings.")
                     .color(colors.muted_text),
             );
+            ui.ctx().accesskit_node_builder(notice.id, |builder| {
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        }
+        ui.add_enabled_ui(!recording_locked, |ui| {
+            let mut radio_ids = Vec::new();
+            let radio_group_id = ui.make_persistent_id("recording-mode-group");
+            let ctx = ui.ctx().clone();
+            ctx.accesskit_node_builder(radio_group_id, |builder| {
+                builder.set_role(egui::accesskit::Role::RadioGroup);
+                builder.set_name("Recording mode");
+            });
+            ctx.with_accessibility_parent(radio_group_id, || {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [270.0, 40.0],
+                        egui::Label::new(RichText::new("Mode").color(colors.muted_text)),
+                    );
+                    for (mode, label) in [
+                        (RecordingMode::PressOnce, "Press once"),
+                        (RecordingMode::Hold, "Hold"),
+                    ] {
+                        let response = radio_control(ui, mode, label, state.recording_mode == mode);
+                        radio_ids.push(response.id);
+                        if response.clicked() {
+                            *action = ScreenAction::SetRecordingMode(mode);
+                        }
+                        if response.has_focus()
+                            && ui.input(|input| {
+                                input.key_pressed(egui::Key::ArrowRight)
+                                    || input.key_pressed(egui::Key::ArrowLeft)
+                            })
+                        {
+                            let next = if mode == RecordingMode::PressOnce {
+                                RecordingMode::Hold
+                            } else {
+                                RecordingMode::PressOnce
+                            };
+                            ui.memory_mut(|memory| {
+                                memory
+                                    .request_focus(ui.make_persistent_id(("recording-mode", next)))
+                            });
+                            *action = ScreenAction::SetRecordingMode(next);
+                        }
+                    }
+                });
+            });
+            let radio_group = radio_ids
+                .iter()
+                .map(|id| id.value().into())
+                .collect::<Vec<_>>();
+            for id in radio_ids {
+                ui.ctx().accesskit_node_builder(id, |builder| {
+                    builder.set_radio_group(radio_group.clone());
+                });
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            setting_row(ui, "Duration limit", |ui| {
+                let mut duration = settings.duration_seconds;
+                ComboBox::from_id_source("duration-limit")
+                    .selected_text(&settings.duration_label)
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        for seconds in [15, 30, 60, 120, 300, 600] {
+                            ui.selectable_value(
+                                &mut duration,
+                                seconds,
+                                format!("{seconds} seconds"),
+                            );
+                        }
+                    });
+                if duration != settings.duration_seconds {
+                    *action = ScreenAction::SetDurationSeconds(duration);
+                }
+            });
+            setting_row(ui, "Visual feedback", |ui| {
+                let mut enabled = settings.provisional_feedback;
+                let response = ui.checkbox(&mut enabled, "Show provisional words while recording");
+                if response.clicked() {
+                    *action = ScreenAction::ToggleProvisionalFeedback;
+                }
+                ui.label(
+                    RichText::new("Improves visual feedback but may use more CPU.")
+                        .small()
+                        .color(colors.muted_text),
+                );
+            });
         });
     });
     ui.add_space(16.0);
     card(ui, |ui| {
         ui.label(RichText::new("Audio input").strong());
         ui.add_space(12.0);
-        setting_row(ui, "Device", |ui| {
-            let mut selected = settings.selected_audio_device.clone();
-            ComboBox::from_id_source("audio-device")
-                .selected_text(&settings.device_label)
-                .width(360.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut selected, None, "OS default");
-                    for device in &settings.audio_devices {
-                        ui.selectable_value(&mut selected, Some(device.clone()), device);
-                    }
+        ui.add_enabled_ui(!recording_locked, |ui| {
+            setting_row(ui, "Device", |ui| {
+                let mut selected = settings.selected_audio_device.clone();
+                ComboBox::from_id_source("audio-device")
+                    .selected_text(&settings.device_label)
+                    .width(360.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected, None, "OS default");
+                        for device in &settings.audio_devices {
+                            ui.selectable_value(&mut selected, Some(device.clone()), device);
+                        }
+                    });
+                if selected != settings.selected_audio_device {
+                    *action = ScreenAction::SetAudioDevice(selected);
+                }
+                let refresh = button(
+                    ui,
+                    format!("{}  Refresh devices", icon_glyph(Icon::Refresh)),
+                    ButtonTone::Text,
+                );
+                ui.ctx().accesskit_node_builder(refresh.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name("Refresh devices");
                 });
-            if selected != settings.selected_audio_device {
-                *action = ScreenAction::SetAudioDevice(selected);
-            }
-            let refresh = button(
-                ui,
-                format!("{}  Refresh devices", icon_glyph(Icon::Refresh)),
-                ButtonTone::Text,
-            );
-            ui.ctx().accesskit_node_builder(refresh.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Button);
-                builder.set_name("Refresh devices");
+                if refresh.clicked() {
+                    *action = ScreenAction::RefreshDevices;
+                }
             });
-            if refresh.clicked() {
-                *action = ScreenAction::RefreshDevices;
-            }
-        });
-        setting_row(ui, "Input level", |ui| {
-            ui.label(RichText::new(icon_glyph(Icon::Microphone)).size(18.0));
-            ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0));
+            setting_row(ui, "Input level", |ui| {
+                ui.label(RichText::new(icon_glyph(Icon::Microphone)).size(18.0));
+                ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0));
+            });
         });
     });
     ui.add_space(16.0);
     card(ui, |ui| {
         ui.label(RichText::new("Shortcut").strong());
         ui.add_space(12.0);
-        setting_row(ui, "Global record hotkey", |ui| {
-            for key in state
-                .hotkey
-                .split('+')
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-            {
-                keycap(ui, key);
-            }
-            if button(ui, "Change shortcut", ButtonTone::Secondary).clicked() {
-                *action = ScreenAction::ChangeShortcut;
-            }
+        ui.add_enabled_ui(!recording_locked, |ui| {
+            setting_row(ui, "Global record hotkey", |ui| {
+                for key in state
+                    .hotkey
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                {
+                    keycap(ui, key);
+                }
+                if button(ui, "Change shortcut", ButtonTone::Secondary).clicked() {
+                    *action = ScreenAction::ChangeShortcut;
+                }
+            });
         });
     });
 }
@@ -1667,6 +1697,31 @@ mod tests {
             assert!(nodes.iter().any(|(_, node)| node.name() == Some(expected)));
             assert!(!nodes.iter().any(|(_, node)| node.name() == Some(absent)));
         }
+    }
+
+    #[test]
+    fn recording_controls_explain_why_changes_are_disabled_while_busy() {
+        let mut state = TranscriptionState::default();
+        state.phase = TranscriptionPhase::Listening;
+        let settings_view = RecordingSettingsView::default();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(ui, SettingsTab::Recording, &state, &settings_view);
+            });
+        });
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some("Finish recording before changing recording settings.")
+                })
+        );
     }
 
     #[test]

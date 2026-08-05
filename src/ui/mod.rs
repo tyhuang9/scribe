@@ -10,7 +10,9 @@ mod theme;
 
 pub(crate) use controls::{configure_accessible_style, minimum_primary_target_height};
 pub(crate) use pages::{HistoryPageAction, HistoryPageState, about_page, history_page};
-pub(crate) use production::{recording_mode, settings_save_state, transcription_state};
+pub(crate) use production::{
+    ModelReadiness, recording_mode, settings_save_state, transcription_state,
+};
 pub(crate) use screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen};
 pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
