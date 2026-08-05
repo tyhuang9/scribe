@@ -317,7 +317,11 @@ pub(crate) enum ModelDialog {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
+    /// One-frame focus request when a dialog first appears. egui 0.27 has no modal focus trap.
+    pub focus_dialog_initial: bool,
     pub restore_add_focus: bool,
+    pub restore_details_focus: Option<String>,
+    pub restore_remove_focus: Option<String>,
     pub mutation_block_reason: Option<String>,
 }
 

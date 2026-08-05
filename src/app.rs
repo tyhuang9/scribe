@@ -8297,6 +8297,7 @@ impl LocalTranscriberApp {
                 runtime_group: "Local speech runtime".to_owned(),
                 installed: install_status.is_runnable(),
                 active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
+                recommended: descriptor.recommended,
                 download_state: match install_status {
                     ModelInstallStatus::Installed => ModelDownloadState::Installed,
                     ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
@@ -8673,6 +8674,10 @@ impl LocalTranscriberApp {
             })
         });
         self.sync_model_comparison_state();
+        let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
+        let clear_add_focus = self.model_management.restore_add_focus;
+        let restored_details_focus = self.model_management.restore_details_focus.clone();
+        let restored_remove_focus = self.model_management.restore_remove_focus.clone();
         let action = render_screen(
             ui,
             &ScreenView {
@@ -8685,6 +8690,18 @@ impl LocalTranscriberApp {
                 recording_settings: &Default::default(),
             },
         );
+        if clear_initial_dialog_focus {
+            self.model_management.focus_dialog_initial = false;
+        }
+        if clear_add_focus {
+            self.model_management.restore_add_focus = false;
+        }
+        if restored_details_focus.is_some() {
+            self.model_management.restore_details_focus = None;
+        }
+        if restored_remove_focus.is_some() {
+            self.model_management.restore_remove_focus = None;
+        }
         self.apply_model_management_action(action);
     }
 
@@ -8851,7 +8868,7 @@ impl LocalTranscriberApp {
                 && runtime_ready
                 && self.config.general.selected_default_model == model.id,
             ready: installed && runtime_ready,
-            recommended: model.id == "whisper_cpp_base_en",
+            recommended: descriptor.recommended,
             custom,
             install_supported: supports_managed_install(model),
             install_action_enabled: !mutation_blocked
@@ -8927,15 +8944,26 @@ impl LocalTranscriberApp {
         match action {
             ScreenAction::AddModel => {
                 self.model_management.dialog = Some(ModelDialog::Add);
-                self.model_management.restore_add_focus = true;
+                self.model_management.focus_dialog_initial = true;
             }
             ScreenAction::ShowModelDetails(id) => {
-                self.model_management.dialog = Some(ModelDialog::Details(id))
+                self.model_management.dialog = Some(ModelDialog::Details(id));
+                self.model_management.focus_dialog_initial = true;
             }
             ScreenAction::RequestModelRemoval(id) => {
-                self.model_management.dialog = Some(ModelDialog::Remove(id))
+                self.model_management.dialog = Some(ModelDialog::Remove(id));
+                self.model_management.focus_dialog_initial = true;
             }
-            ScreenAction::CloseModelDialog => self.model_management.dialog = None,
+            ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
+                Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
+                Some(ModelDialog::Details(id)) => {
+                    self.model_management.restore_details_focus = Some(id)
+                }
+                Some(ModelDialog::Remove(id)) => {
+                    self.model_management.restore_remove_focus = Some(id)
+                }
+                None => {}
+            },
             ScreenAction::ToggleComparison => {
                 self.model_comparison.expanded = !self.model_comparison.expanded
             }

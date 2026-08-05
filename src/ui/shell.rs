@@ -227,7 +227,7 @@ fn secondary_navigation(
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
-    ui.add_sized([160.0, 40.0], egui::Button::new(label))
+    ui.add_sized([160.0, 44.0], egui::Button::new(label))
         .clicked()
 }
 
@@ -271,7 +271,7 @@ fn nav_full_button(
     muted: Color32,
 ) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 42.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::click());
     let fill = if active {
         selected
     } else if response.hovered() {
@@ -308,7 +308,7 @@ fn nav_icon_button(
     muted: Color32,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
     let fill = if active {
         selected
     } else if response.hovered() {

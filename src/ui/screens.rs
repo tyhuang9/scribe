@@ -1,7 +1,7 @@
 //! Shared, backend-neutral egui screen renderers.
 
 use eframe::egui::{
-    self, Align, Align2, ComboBox, Frame, Grid, Layout, Margin, RichText, Rounding, Stroke, Vec2,
+    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, Stroke, Vec2,
 };
 
 use super::{
@@ -799,13 +799,15 @@ fn models(
             );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if button(
+            let add_models = button(
                 ui,
                 format!("{}  Add models", icon_glyph(Icon::Plus)),
                 ButtonTone::Primary,
-            )
-            .clicked()
-            {
+            );
+            if management.restore_add_focus {
+                add_models.request_focus();
+            }
+            if add_models.clicked() {
                 action = ScreenAction::AddModel;
             }
             let eligible_models = models
@@ -894,7 +896,11 @@ fn models(
                         ScreenAction::SelectModel(model.id.clone())
                     };
                 }
-                if button(ui, "Details", ButtonTone::Text).clicked() {
+                let details = button(ui, "Details", ButtonTone::Text);
+                if management.restore_details_focus.as_deref() == Some(model.id.as_str()) {
+                    details.request_focus();
+                }
+                if details.clicked() {
                     action = ScreenAction::ShowModelDetails(model.id.clone());
                 }
                 let remove_reason = if model.active {
@@ -907,6 +913,9 @@ fn models(
                     None
                 };
                 let remove = ui.add_enabled(remove_reason.is_none(), egui::Button::new("Remove"));
+                if management.restore_remove_focus.as_deref() == Some(model.id.as_str()) {
+                    remove.request_focus();
+                }
                 if let Some(reason) = remove_reason {
                     remove.clone().on_hover_text(reason);
                 }
@@ -1097,92 +1106,7 @@ fn models(
                     );
                 });
                 ui.separator();
-                Grid::new("comparison-results")
-                    .striped(true)
-                    .min_col_width(115.0)
-                    .show(ui, |ui| {
-                        for heading in [
-                            "Model",
-                            "Status",
-                            "Audio",
-                            "Processing",
-                            "RTF",
-                            "Output",
-                            "Accuracy",
-                        ] {
-                            ui.label(RichText::new(heading).strong().small());
-                        }
-                        ui.end_row();
-                        for model in models
-                            .iter()
-                            .filter(|model| comparison.selected_model_ids.contains(&model.id))
-                        {
-                            let result = comparison
-                                .results
-                                .iter()
-                                .find(|(id, _)| id == &model.id)
-                                .map(|(_, result)| result);
-                            ui.label(&model.display_name);
-                            ui.label(match result.map(|result| result.phase) {
-                                Some(ComparisonResultPhase::Pending) => "Queued",
-                                Some(ComparisonResultPhase::Processing) => "Processing",
-                                Some(ComparisonResultPhase::Complete) => "Complete",
-                                Some(ComparisonResultPhase::Error) => "Failed",
-                                None => "Not run",
-                            });
-                            ui.label(
-                                comparison.audio_duration_ms.map_or("—".into(), |ms| {
-                                    format!("{:.1}s", ms as f32 / 1_000.0)
-                                }),
-                            );
-                            ui.label(
-                                result
-                                    .and_then(|r| r.processing_ms)
-                                    .map_or("—".into(), |ms| {
-                                        format!("{:.1}s", ms as f32 / 1_000.0)
-                                    }),
-                            );
-                            ui.label(
-                                result
-                                    .and_then(|r| r.realtime_factor)
-                                    .map_or("—".into(), |rtf| format!("{rtf:.2}x")),
-                            );
-                            if let Some(error) = result.and_then(|result| result.error.as_deref()) {
-                                egui::CollapsingHeader::new("View error")
-                                    .id_source(("comparison-error", &model.id))
-                                    .show(ui, |ui| {
-                                        ui.label(RichText::new(error).color(colors.warning));
-                                    });
-                            } else if let Some(output) =
-                                result.and_then(|result| result.output.as_deref())
-                            {
-                                egui::CollapsingHeader::new("View output")
-                                    .id_source(("comparison-output", &model.id))
-                                    .show(ui, |ui| {
-                                        ui.label(output);
-                                    });
-                            } else {
-                                ui.label("No data");
-                            }
-                            ui.label(
-                                match (
-                                    comparison.reference_transcript.as_deref(),
-                                    result.and_then(|r| r.word_error_rate),
-                                ) {
-                                    (Some(reference), Some(rate))
-                                        if !reference.trim().is_empty() =>
-                                    {
-                                        format!(
-                                            "{:.0}% accuracy",
-                                            ((1.0 - rate).clamp(0.0, 1.0)) * 100.0
-                                        )
-                                    }
-                                    _ => "Add a reference transcript to measure".into(),
-                                },
-                            );
-                            ui.end_row();
-                        }
-                    });
+                render_comparison_results(ui, models, comparison);
             }
         });
     if used_bytes > 0 {
@@ -1200,11 +1124,16 @@ fn models(
             );
         });
     }
+    if management.dialog.is_some() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        return ScreenAction::CloseModelDialog;
+    }
     match &management.dialog {
         Some(ModelDialog::Add) => {
-            egui::Window::new("Add models")
+            let mut open = true;
+            let dialog = egui::Window::new("Add models")
                 .collapsible(false)
                 .resizable(false)
+                .open(&mut open)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
                     if let Some(reason) = &management.mutation_block_reason {
@@ -1228,10 +1157,28 @@ fn models(
                                     model.install_action_enabled,
                                     egui::Button::new(model_install_action_label(model.download_state)),
                                 );
-                                if !model.install_supported {
-                                    install.clone().on_hover_text("This model has no supported managed download in this build.");
-                                } else if let Some(reason) = &management.mutation_block_reason {
+                                let install_reason = if !model.install_supported {
+                                    Some("This model has no supported managed download in this build.")
+                                } else {
+                                    management.mutation_block_reason.as_deref()
+                                };
+                                if let Some(reason) = install_reason {
+                                    ui.ctx().accesskit_node_builder(install.id, |builder| {
+                                        builder.set_description(reason);
+                                    });
+                                    ui.label(RichText::new(reason).small().color(colors.muted_text));
                                     install.clone().on_hover_text(reason);
+                                }
+                                if model.download_state == ModelDownloadState::Downloading {
+                                    let progress = model.total_bytes.filter(|total| *total > 0).map_or(0.0, |total| {
+                                        (model.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
+                                    });
+                                    let progress = ui.add(egui::ProgressBar::new(progress).text(model_download_label(model)));
+                                    ui.ctx().accesskit_node_builder(progress.id, |builder| {
+                                        builder.set_role(egui::accesskit::Role::ProgressIndicator);
+                                        builder.set_name(format!("{} installation progress", model.display_name));
+                                        builder.set_description(model_download_label(model));
+                                    });
                                 }
                                 if install.clicked() {
                                     action = ScreenAction::InstallModel(model.id.clone());
@@ -1243,10 +1190,24 @@ fn models(
                         });
                         ui.add_space(6.0);
                     }
-                    if button(ui, "Close", ButtonTone::Secondary).clicked() {
+                    let close = button(ui, "Close", ButtonTone::Secondary);
+                    if management.focus_dialog_initial {
+                        close.request_focus();
+                    }
+                    if close.clicked() {
                         action = ScreenAction::CloseModelDialog;
                     }
                 });
+            if let Some(dialog) = dialog {
+                ui.ctx()
+                    .accesskit_node_builder(dialog.response.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Dialog);
+                        builder.set_name("Add models");
+                    });
+            }
+            if !open {
+                action = ScreenAction::CloseModelDialog;
+            }
         }
         Some(ModelDialog::Details(id)) => {
             if let Some(model) = model_catalog
@@ -1254,9 +1215,11 @@ fn models(
                 .chain(models.iter())
                 .find(|model| &model.id == id)
             {
-                egui::Window::new("Model details")
+                let mut open = true;
+                let dialog = egui::Window::new("Model details")
                     .collapsible(false)
                     .resizable(false)
+                    .open(&mut open)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ui.ctx(), |ui| {
                         ui.label(RichText::new(&model.display_name).strong());
@@ -1314,26 +1277,56 @@ fn models(
                                 }
                             });
                         ui.add_space(8.0);
-                        if button(ui, "Close", ButtonTone::Secondary).clicked() {
+                        let close = button(ui, "Close", ButtonTone::Secondary);
+                        if management.focus_dialog_initial {
+                            close.request_focus();
+                        }
+                        if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
                     });
+                if let Some(dialog) = dialog {
+                    ui.ctx()
+                        .accesskit_node_builder(dialog.response.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Dialog);
+                            builder.set_name(format!("Model details for {}", model.display_name));
+                        });
+                }
+                if !open {
+                    action = ScreenAction::CloseModelDialog;
+                }
             }
         }
         Some(ModelDialog::Remove(id)) => {
             if let Some(model) = models.iter().find(|model| &model.id == id) {
-                egui::Window::new("Remove model?")
+                let mut open = true;
+                let dialog = egui::Window::new("Remove model?")
                     .collapsible(false)
                     .resizable(false)
+                    .open(&mut open)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ui.ctx(), |ui| {
                         ui.label(format!("Remove {} from Scribe?", model.display_name));
                         ui.label(RichText::new("Only Scribe-managed artifact files are removed. This cannot be undone.").color(colors.warning));
                         ui.horizontal(|ui| {
-                            if button(ui, "Cancel", ButtonTone::Secondary).clicked() { action = ScreenAction::CloseModelDialog; }
+                            let cancel = button(ui, "Cancel", ButtonTone::Secondary);
+                            if management.focus_dialog_initial {
+                                cancel.request_focus();
+                            }
+                            if cancel.clicked() { action = ScreenAction::CloseModelDialog; }
                             if button(ui, "Remove", ButtonTone::Danger).clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
                         });
                     });
+                if let Some(dialog) = dialog {
+                    ui.ctx()
+                        .accesskit_node_builder(dialog.response.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::AlertDialog);
+                            builder.set_name(format!("Remove {}", model.display_name));
+                        });
+                }
+                if !open {
+                    action = ScreenAction::CloseModelDialog;
+                }
             }
         }
         None => {}
@@ -1360,6 +1353,181 @@ fn model_download_label(model: &ModelViewModel) -> String {
             .unwrap_or_else(|| "Install failed".to_owned()),
         ModelDownloadState::Cancelled => "Cancelled; partial download can be resumed.".to_owned(),
         ModelDownloadState::NotInstalled => "Not installed".to_owned(),
+    }
+}
+
+fn render_comparison_results(
+    ui: &mut egui::Ui,
+    models: &[ModelViewModel],
+    comparison: &ModelComparisonState,
+) {
+    let colors = ui_palette(ui);
+    let selected = models
+        .iter()
+        .filter(|model| comparison.selected_model_ids.contains(&model.id));
+    let status = comparison_status(comparison);
+    if let Some(status) = status.as_deref() {
+        let response = ui.label(RichText::new(status).small().color(colors.muted_text));
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_live(egui::accesskit::Live::Polite);
+            builder.set_live_atomic();
+        });
+    }
+
+    if ui.available_width() < 720.0 {
+        for model in selected {
+            let result = comparison
+                .results
+                .iter()
+                .find(|(id, _)| id == &model.id)
+                .map(|(_, result)| result);
+            let group = ui.group(|ui| {
+                ui.label(RichText::new(&model.display_name).strong());
+                ui.label(format!("Status: {}", comparison_result_status(result)));
+                ui.label(format!("Duration: {}", comparison_duration(comparison)));
+                ui.label(format!(
+                    "Processing time: {}",
+                    comparison_processing(result)
+                ));
+                ui.label(format!("Output: {}", comparison_output_summary(result)));
+                ui.label(format!(
+                    "Accuracy: {}",
+                    comparison_accuracy(comparison, result)
+                ));
+                if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
+                    ui.label(RichText::new(format!("Real-time factor: {rtf:.2}x")).small());
+                }
+            });
+            ui.ctx()
+                .accesskit_node_builder(group.response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Group);
+                    builder.set_name(format!("Comparison result for {}", model.display_name));
+                });
+        }
+        return;
+    }
+
+    let table = ui.vertical(|ui| {
+        ui.columns(5, |columns| {
+            for (column, heading) in columns.iter_mut().zip([
+                "Model",
+                "Duration",
+                "Processing time",
+                "Output",
+                "Accuracy",
+            ]) {
+                let response = column.label(RichText::new(heading).strong().small());
+                column.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::ColumnHeader);
+                    builder.set_name(heading);
+                });
+            }
+        });
+        for model in selected {
+            let result = comparison
+                .results
+                .iter()
+                .find(|(id, _)| id == &model.id)
+                .map(|(_, result)| result);
+            let row = ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 0.0),
+                Layout::top_down(Align::LEFT),
+                |ui| {
+                    ui.columns(5, |columns| {
+                        let cells = [
+                            format!(
+                                "{}\n{}",
+                                model.display_name,
+                                comparison_result_status(result)
+                            ),
+                            comparison_duration(comparison),
+                            comparison_processing(result),
+                            comparison_output_summary(result),
+                            comparison_accuracy(comparison, result),
+                        ];
+                        for (column, cell) in columns.iter_mut().zip(cells) {
+                            let response = column.label(cell);
+                            column.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_role(egui::accesskit::Role::Cell);
+                                if let Some(rtf) = result.and_then(|result| result.realtime_factor)
+                                {
+                                    builder.set_description(format!("Real-time factor: {rtf:.2}x"));
+                                }
+                            });
+                        }
+                    });
+                },
+            );
+            ui.ctx().accesskit_node_builder(row.response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Row);
+                builder.set_name(format!("Comparison result for {}", model.display_name));
+            });
+        }
+    });
+    ui.ctx()
+        .accesskit_node_builder(table.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Table);
+            builder.set_name("Model comparison results");
+        });
+}
+
+fn comparison_status(comparison: &ModelComparisonState) -> Option<String> {
+    match comparison.phase {
+        ComparisonPhase::Recording => Some("Comparison recording in progress.".into()),
+        ComparisonPhase::Processing => Some("Comparison processing in progress.".into()),
+        ComparisonPhase::Complete => Some("Comparison results are ready.".into()),
+        ComparisonPhase::Error => Some("Comparison finished with an error.".into()),
+        ComparisonPhase::Idle if comparison.reference_transcript.is_some() => {
+            Some("Reference transcript applied.".into())
+        }
+        ComparisonPhase::Idle => None,
+    }
+}
+
+fn comparison_result_status(result: Option<&super::state::ComparisonResult>) -> &'static str {
+    match result.map(|result| result.phase) {
+        Some(ComparisonResultPhase::Pending) => "Queued",
+        Some(ComparisonResultPhase::Processing) => "Processing",
+        Some(ComparisonResultPhase::Complete) => "Complete",
+        Some(ComparisonResultPhase::Error) => "Failed",
+        None => "Not run",
+    }
+}
+
+fn comparison_duration(comparison: &ModelComparisonState) -> String {
+    comparison
+        .audio_duration_ms
+        .map_or("—".into(), |ms| format!("{:.1}s", ms as f32 / 1_000.0))
+}
+
+fn comparison_processing(result: Option<&super::state::ComparisonResult>) -> String {
+    result
+        .and_then(|result| result.processing_ms)
+        .map_or("—".into(), |ms| format!("{:.1}s", ms as f32 / 1_000.0))
+}
+
+fn comparison_output_summary(result: Option<&super::state::ComparisonResult>) -> String {
+    if let Some(error) = result.and_then(|result| result.error.as_deref()) {
+        format!("Error: {error}")
+    } else if let Some(output) = result.and_then(|result| result.output.as_deref()) {
+        output.to_owned()
+    } else {
+        "No data".into()
+    }
+}
+
+fn comparison_accuracy(
+    comparison: &ModelComparisonState,
+    result: Option<&super::state::ComparisonResult>,
+) -> String {
+    match (
+        comparison.reference_transcript.as_deref(),
+        result.and_then(|result| result.word_error_rate),
+    ) {
+        (Some(reference), Some(rate)) if !reference.trim().is_empty() => {
+            format!("{:.0}% accuracy", ((1.0 - rate).clamp(0.0, 1.0)) * 100.0)
+        }
+        _ => "Add a reference transcript to measure".into(),
     }
 }
 
@@ -2692,8 +2860,7 @@ mod tests {
             .iter()
             .filter(|(_, node)| node.name() == Some("—"))
             .count();
-        assert!(dashes >= 3);
-        assert!(include_str!("screens.rs").contains("map_or(\"—\".into(), |rtf|"));
+        assert!(dashes >= 2);
     }
 
     #[test]

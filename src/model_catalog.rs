@@ -112,6 +112,7 @@ struct ModelManifest {
     expected_ram: &'static str,
     speed_guidance: &'static str,
     accuracy_guidance: &'static str,
+    recommended: bool,
     runtime: RuntimeRequirement,
     architecture: ModelArchitecture,
     format: ModelFormat,
@@ -199,6 +200,8 @@ pub struct ModelDescriptor {
     pub expected_ram: &'static str,
     pub speed_guidance: &'static str,
     pub accuracy_guidance: &'static str,
+    /// Curated recommendation from the normalized catalog, independent of installation or selection.
+    pub recommended: bool,
     pub artifact_size_bytes: u64,
     pub languages: Vec<&'static str>,
     pub capabilities: ModelCapabilities,
@@ -280,6 +283,7 @@ const MODELS: &[ModelManifest] = &[
         "ggml-base.en.bin",
         147_964_211,
         "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        true,
         PHASE_TWO_BASE_SMOKE,
     ),
     whisper_manifest(
@@ -295,6 +299,7 @@ const MODELS: &[ModelManifest] = &[
         "ggml-small.en.bin",
         487_614_201,
         "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        false,
         PHASE_ZERO_SMOKE,
     ),
     whisper_manifest(
@@ -310,6 +315,7 @@ const MODELS: &[ModelManifest] = &[
         "ggml-medium.en.bin",
         1_533_774_781,
         "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+        false,
         PHASE_ZERO_SMOKE,
     ),
 ];
@@ -345,6 +351,7 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Manifest fields stay explicit at the single catalog definition site.
 const fn whisper_manifest(
     id: &'static str,
     display_name: &'static str,
@@ -352,6 +359,7 @@ const fn whisper_manifest(
     filename: &'static str,
     size_bytes: u64,
     sha256: &'static str,
+    recommended: bool,
     evidence: CompatibilityEvidence,
 ) -> ModelManifest {
     ModelManifest {
@@ -362,6 +370,7 @@ const fn whisper_manifest(
         expected_ram: guidance.expected_ram,
         speed_guidance: guidance.speed,
         accuracy_guidance: guidance.accuracy,
+        recommended,
         runtime: RuntimeRequirement::PrimaryNative,
         architecture: ModelArchitecture::EncoderDecoder,
         format: ModelFormat::Ggml,
@@ -482,6 +491,7 @@ impl ModelManifest {
             expected_ram: self.expected_ram,
             speed_guidance: self.speed_guidance,
             accuracy_guidance: self.accuracy_guidance,
+            recommended: self.recommended,
             artifact_size_bytes: self.artifact.size_bytes,
             languages: self.languages.to_vec(),
             capabilities: self.capabilities,
@@ -795,6 +805,15 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn descriptor_exposes_the_catalog_recommendation() {
+        let base = model_descriptor(&ModelId::new("whisper_cpp_base_en")).unwrap();
+        let tiny = model_descriptor(&ModelId::new("whisper_cpp_tiny_en")).unwrap();
+
+        assert!(base.recommended);
+        assert!(!tiny.recommended);
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub(crate) fn button(
             .fill(fill)
             .stroke(stroke)
             .rounding(Rounding::same(5.0))
-            .min_size(Vec2::new(0.0, 40.0)),
+            .min_size(Vec2::new(0.0, PRIMARY_TARGET_HEIGHT)),
     );
     paint_focus_ring(ui, &response, Rounding::same(5.0));
     response
@@ -80,7 +80,8 @@ pub(crate) fn button(
 #[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
     let colors = ui_palette(ui);
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(PRIMARY_TARGET_HEIGHT), Sense::click());
     ui.painter().rect(
         rect,
         Rounding::same(5.0),
