@@ -1,6 +1,6 @@
 use eframe::egui::{
-    self, Button, Color32, FontFamily, FontId, Frame, Margin, Response, Rounding, Sense, Stroke,
-    TextStyle, Ui, Vec2,
+    self, Align, Button, Color32, FontFamily, FontId, Frame, Layout, Margin, Response, Rounding,
+    Sense, Stroke, TextStyle, Ui, Vec2,
 };
 
 use super::theme::ui_palette;
@@ -103,14 +103,21 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Res
     response.on_hover_text(accessible_name)
 }
 
-pub(crate) fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+pub(crate) fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) -> Response {
     let colors = ui_palette(ui);
-    Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(6.0))
-        .inner_margin(Margin::same(16.0))
-        .show(ui, add_contents);
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
+        Frame::none()
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0, colors.border))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_min_width((width - 32.0).max(0.0));
+                add_contents(ui);
+            });
+    })
+    .response
 }
 
 pub(crate) fn badge(ui: &mut Ui, text: &str, dot: Option<Color32>) {
@@ -153,7 +160,7 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         });
 }
 
-pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) {
+pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
     let colors = ui_palette(ui);
     let (fill, stroke, color, icon) = if error {
         (
@@ -170,21 +177,26 @@ pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) {
             Icon::Info,
         )
     };
-    Frame::none()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, stroke))
-        .rounding(Rounding::same(5.0))
-        .inner_margin(Margin::same(12.0))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(icon_glyph(icon))
-                        .size(18.0)
-                        .color(color),
-                );
-                ui.label(egui::RichText::new(text).color(color));
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::LEFT), |ui| {
+        Frame::none()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, stroke))
+            .rounding(Rounding::same(5.0))
+            .inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_min_width((width - 24.0).max(0.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(icon_glyph(icon))
+                            .size(18.0)
+                            .color(color),
+                    );
+                    ui.label(egui::RichText::new(text).color(color));
+                });
             });
-        });
+    })
+    .response
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,5 +248,37 @@ mod tests {
         let ctx = egui::Context::default();
         configure_accessible_style(&ctx);
         assert!(ctx.style().spacing.interact_size.y >= 44.0);
+    }
+
+    #[test]
+    fn cards_and_notices_allocate_the_available_content_width() {
+        let ctx = egui::Context::default();
+        let mut available_width = 0.0;
+        let mut card_width = 0.0;
+        let mut notice_width = 0.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640.0, 320.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    available_width = ui.available_width();
+                    card_width = card(ui, |_| {}).rect.width();
+                    notice_width = notice(ui, "A full-width notice", false).rect.width();
+                });
+            },
+        );
+        assert!(
+            card_width >= available_width - 1.0,
+            "card={card_width}, available={available_width}"
+        );
+        assert!(
+            notice_width >= available_width - 1.0,
+            "notice={notice_width}, available={available_width}"
+        );
     }
 }

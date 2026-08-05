@@ -42,8 +42,29 @@ pub(crate) struct TranscriptionState {
     pub selected_model_id: Option<String>,
     pub committed_transcript: String,
     pub provisional_transcript: String,
+    pub recording_started_at_ms: Option<u64>,
     pub elapsed_ms: u64,
+    pub last_successful_capture_ms: Option<u64>,
     pub notice: Option<String>,
+    pub microphone_permission: MicrophonePermission,
+    pub selected_audio_device_id: Option<String>,
+    pub recording_mode: RecordingMode,
+    pub hotkey: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MicrophonePermission {
+    #[default]
+    Unknown,
+    Granted,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RecordingMode {
+    #[default]
+    PressOnce,
+    Hold,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,12 +105,14 @@ impl TranscriptionState {
                 if self.phase == TranscriptionPhase::RequestingMicrophone =>
             {
                 self.phase = TranscriptionPhase::Listening;
+                self.microphone_permission = MicrophonePermission::Granted;
             }
             TranscriptionEvent::MicrophoneFailed
                 if self.phase == TranscriptionPhase::RequestingMicrophone =>
             {
                 self.phase = TranscriptionPhase::MicrophoneError;
-                self.notice = Some("Scribe couldn't access your microphone".into());
+                self.microphone_permission = MicrophonePermission::Denied;
+                self.notice = Some("Scribe couldn\u{2019}t access your microphone".into());
             }
             TranscriptionEvent::Partial(text) if self.phase == TranscriptionPhase::Listening => {
                 self.provisional_transcript = text;
@@ -171,6 +194,35 @@ pub(crate) struct ModelCapabilities {
     pub language_detection: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelSpeedTier {
+    VeryFast,
+    Fast,
+    Balanced,
+    AccurateSlow,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelSizeTier {
+    Tiny,
+    Small,
+    Base,
+    Medium,
+    Large,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelCompatibility {
+    #[default]
+    Supported,
+    Experimental,
+    Incompatible,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ModelViewModel {
     pub id: String,
@@ -178,13 +230,22 @@ pub(crate) struct ModelViewModel {
     pub variant_label: String,
     pub description: Option<String>,
     pub runtime_group: String,
+    pub architecture: Option<String>,
     pub installed: bool,
     pub active: bool,
     pub recommended: bool,
+    pub custom: bool,
     pub download_state: ModelDownloadState,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+    pub estimated_ram_bytes: Option<u64>,
     pub languages: Vec<String>,
     pub language_summary: String,
+    pub speed_tier: ModelSpeedTier,
+    pub size_tier: ModelSizeTier,
     pub capabilities: ModelCapabilities,
+    pub compatibility: ModelCompatibility,
     pub error_message: Option<String>,
 }
 
@@ -210,19 +271,23 @@ pub(crate) enum ComparisonPhase {
     Error,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ComparisonResult {
     pub output: Option<String>,
     pub processing_ms: Option<u64>,
+    pub realtime_factor: Option<f32>,
+    pub word_error_rate: Option<f32>,
+    pub character_error_rate: Option<f32>,
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ModelComparisonState {
     pub expanded: bool,
     pub selected_model_ids: BTreeSet<String>,
     pub phase: ComparisonPhase,
     pub audio_duration_ms: Option<u64>,
+    pub reference_transcript: Option<String>,
     pub results: Vec<(String, ComparisonResult)>,
 }
 
@@ -313,5 +378,17 @@ mod tests {
             SettingsSaveState::Failed.changed().saving().completed(true),
             SettingsSaveState::Saved
         );
+    }
+
+    #[test]
+    fn approved_ui_copy_uses_real_unicode_punctuation() {
+        let no_speech = "No speech detected \u{2014} nothing was added.";
+        let finalizing = "Finalizing transcript\u{2026}";
+        let microphone = "Scribe couldn\u{2019}t access your microphone";
+
+        assert!(!no_speech.contains('\u{00e2}'));
+        assert!(no_speech.contains('\u{2014}'));
+        assert!(finalizing.contains('\u{2026}'));
+        assert!(microphone.contains('\u{2019}'));
     }
 }

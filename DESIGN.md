@@ -8,10 +8,11 @@ Scribe should feel like a native utility, not a dashboard. The default Transcrib
 
 ## Layout
 
-- 200px left sidebar with the Scribe name, primary navigation, and quiet local-first cues.
+- Canonical shell: 214px labeled sidebar at widths of 1000px and above; 66px icon rail below that breakpoint. The same shell wraps Transcribe, Models, and Settings, with Settings pinned to the bottom.
+- Transcribe and Models are the primary navigation. History, About, Advanced, and debug-only Playground remain secondary destinations.
 - Light cool-gray app canvas with white bordered panels.
 - Compact page headers and dense rows on Models, Playground, and Settings.
-- 24px outer content margins, 12-16px panel spacing, and 4-8px radii.
+- 28px outer content margins, 12-16px panel spacing, and 4-8px radii.
 - No decorative shadows, gradients, marketing hero sections, or nested card layouts.
 
 ## Color
@@ -25,6 +26,7 @@ Scribe should feel like a native utility, not a dashboard. The default Transcrib
 - Success: `#16A34A`
 - Warning: `#CA8A04`
 - Error: `#DC2626`
+- Package status green `#12B76A` is an indicator/fill color. Use the accessible success-text token for text on light surfaces.
 
 ## Product Rules
 

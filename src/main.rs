@@ -52,7 +52,13 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "Scribe",
         native_options(),
-        Box::new(|cc| Box::new(app::LocalTranscriberApp::new(cc))),
+        Box::new(|cc| {
+            #[cfg(all(feature = "ui-harness", debug_assertions))]
+            if let Some(fixture) = ui::fixture_from_env() {
+                return Box::new(ui::UiHarnessApp::new(cc, fixture));
+            }
+            Box::new(app::LocalTranscriberApp::new(cc))
+        }),
     );
     if let Err(err) = &result {
         eprintln!("Scribe failed to start: {err}");
