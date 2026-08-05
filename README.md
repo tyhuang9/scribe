@@ -16,7 +16,7 @@ The app shell stays small and only invokes an STT runtime when the user records 
 - Models page install/select/uninstall flow for whisper.cpp `tiny.en`, `base.en`, `small.en`, and `medium.en` files plus faster-whisper, Vosk, sherpa-onnx, Moonshine, and Parakeet model directories.
 - Non-blocking UI for recording and transcription using background threads and channels, with a diagnostic latest-transcription latency breakdown.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
-- Optional insertion of the completed transcript into the focused app through clipboard plus paste automation.
+- Optional Windows insertion of the completed transcript into the captured app; other platforms use an explicit clipboard-only fallback.
 - Model metadata for:
   - whisper.cpp tiny.en
   - whisper.cpp base.en
@@ -89,7 +89,7 @@ until the user enables it in Settings. Linux global hotkeys remain opt-in with
 | Microphone capture | Desktop/session prompt depends on the audio stack. | Requires macOS Microphone privacy access. | Uses the normal desktop audio capture path; no installer permission is expected. |
 | Global hotkeys | Disabled by default. A future Wayland-native path should use the [XDG Global Shortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html). | May require Input Monitoring depending on the global-hotkey backend and OS version. | Uses the system-wide [`RegisterHotKey`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey) API; no installer permission prompt is expected. |
 | Clipboard access | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. | Used only for copy or focused-app insertion. |
-| Focused-app insertion | Uses clipboard plus paste automation; Wayland falls back to clipboard-only. A portal-based input path would belong behind the [XDG Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html). | Requires user-granted Accessibility access when macOS blocks synthetic input. | Uses paste-key automation through [`SendInput`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput); it cannot reliably inject into higher-integrity/elevated apps. |
+| Focused-app insertion | Clipboard-only until a focus-safe native adapter is verified. A future input path would belong behind the [XDG Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html). | Clipboard-only until a focus-safe native adapter is verified. | Captures and revalidates the original HWND/process/window-generation property, then uses one [`SendInput`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) batch; activation denial and higher-integrity/elevated targets fall back to copy-only. |
 
 Relevant Apple controls live in Privacy & Security, including
 [Microphone](https://support.apple.com/guide/mac-help/change-privacy-security-settings-on-mac-mchl211c911f/mac),
@@ -335,7 +335,7 @@ Temporary WAV files are deleted after transcription in normal operation. The lat
 - Scribe has no cleanup/reasoning pipeline today. If one is added later, it must be local, optional, and off by default, and it must never send audio or text to a cloud service.
 - The app does not load models at launch.
 - Recording and transcription run off the UI thread.
-- Global hotkeys and paste automation can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button and falls back to copying transcripts to the clipboard.
+- Global hotkeys can fail on some Linux Wayland/session configurations; the app remains usable through the Start/Stop button, and non-Windows output is deliberately clipboard-only.
 - The window close button hides the app to the tray when tray integration is available. Use the tray Quit action to exit fully.
 
 ## Development
@@ -357,5 +357,5 @@ The main modules are:
 - `src/stt/whisper_cpp.rs`: whisper.cpp child-process integration.
 - `src/stt/faster_whisper.rs`: faster-whisper child-process integration.
 - `src/stt/sherpa_onnx.rs`: sherpa-onnx-family child-process integration for sherpa-onnx, Moonshine, and Parakeet.
-- `src/text_output.rs`: focused-app transcript insertion through clipboard plus paste automation.
+- `src/text_output.rs`: transactional Windows target insertion and conservative cross-platform clipboard output.
 - `src/tray.rs`: tray icon, tray menu, and tray command mapping.

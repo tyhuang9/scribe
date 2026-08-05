@@ -1,6 +1,6 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 6 implemented on its stacked branch (2026-08-04). This document
+**Status:** Phase 8 implemented on its stacked branch (2026-08-04). This document
 preserves the Phase 0 audit and records each implemented phase against the
 consolidated revamp plan. It does not claim that uncompleted later phases are
 implemented.
@@ -246,7 +246,7 @@ cold/warm state:
 | `recording_duration_ms` | capture start to stop | Derivable from recorder/stop timestamps; not displayed as a dedicated value. |
 | `recording_end_to_final_text_ms` | stop/WAV finalization to successful final transcript | `stop_requested_at` to `final_text_ready_at` is shown as “Stop to final text”; `transcription_job_completed_at` is worker completion and is not final-text readiness on failures. |
 | `post_processing_ms` | final transcript to chosen output text | No post-processing stage. **NOT VERIFIED**. |
-| `final_text_to_paste_ms` | successful final-text-ready timestamp to paste automation completion | `final_text_ready_at` to `paste_completed_at`; this means Enigo/clipboard automation returned after its configured delay and restoration, not that the target application consumed the text. Clipboard-only/failure is not a successful paste. Output-start→output-complete remains a separate component metric. |
+| `final_text_to_paste_ms` | successful final-text-ready timestamp to paste automation completion | `final_text_ready_at` to the native Windows `SendInput` return timestamp; it does not claim that the target application consumed the text. Clipboard-only/failure and injected test results without native timing do not fabricate a successful paste timestamp. Output-start→output-complete remains a separate component metric. |
 | `total_end_to_end_ms` | hotkey observation to output completion | `summary_lines` reports total observed; it excludes unobserved physical event/overlay/VAD work. |
 | `realtime_factor` | transcription compute time / audio duration | Playground benchmark has an RTF helper; dictation latency does not persist this metric. |
 
@@ -1445,3 +1445,117 @@ Phase 8 can now harden final-pass shutdown and output safety on top of a tested
 overlay-only preview path. The release remains **NO-GO** until the manual
 Windows vertical slice, native-streaming Definition of Done, supported-model
 evidence, and final latency matrix are complete.
+
+## Phase 8 - Final pass and safe output
+
+Phase 8 hardens the existing final-only output system; it does not add another
+audio, output, runtime, or clipboard subsystem. The logical handler count
+remains **one** (`TranscribeCppRuntime`), all four catalog models remain
+**Experimental**, zero are Supported, and `OnnxSpeechRuntime` remains omitted.
+
+### Finalization and output decisions
+
+- Explicit stop retains the Phase 6 native post-roll path. Capture closes the
+  preview mailbox, drops its pending snapshot, permits the active decode a
+  two-second grace period, then requests cancellation once. If cancellation is
+  not acknowledged within another two seconds, the user session fails
+  terminally: its queued final pass and paste are discarded, the captured
+  target is retired, and the owned worker handle is retained and reaped before
+  a new session may use the one runtime. Scribe never detaches the worker or
+  races a second handler.
+- A normal preview drain still dispatches exactly one full-utterance
+  `PreparedAudio` final request. Tentative overlay text is never an output
+  candidate. VAD no-speech and a whitespace-only engine result both complete
+  without arming output or replacing the previously finalized transcript.
+- Raw model text and chosen final text are stored separately. No optional
+  cleanup transform is configured in this build, so they are currently
+  identical. If a future local transform makes them differ, the current
+  History view exposes and copies the preserved raw text rather than silently
+  destroying it.
+- Windows target capture now records HWND, window thread, PID, process creation
+  time, and a unique generation token installed as a property on the captured
+  HWND after two stable foreground samples. Windows removes that property with
+  the window, so a recycled HWND cannot satisfy the generation check. Property
+  installation or lookup failure is copy-only. Before output, Scribe validates
+  the live window/process/property identity, requests ordinary
+  `SetForegroundWindow`, immediately revalidates the exact foreground target,
+  and checks it once more adjacent to the single `SendInput` paste batch.
+  Activation denial, dead/recycled identity, or focus mismatch is copy-only. No
+  `AttachThreadInput`, forced focus bypass, or paste retry is used.
+  Correlated session retirement removes only a still-matching property, and app
+  shutdown retires any remaining captured targets.
+- Clipboard restoration is transactional for empty state and a bounded
+  set of native Windows text/locale/PNG/DIBV5 formats. Snapshot bytes are copied
+  while one native clipboard open prevents replacement; payload size is bounded
+  before allocation, and PNG/DIBV5 header dimensions before restoration.
+  Conditional transcript replacement and conditional restoration each recheck
+  the nonzero clipboard sequence and
+  expected text while the same native open excludes another writer. Mixed
+  source-order detection distinguishes a CF_DIBV5 source from bitmap formats
+  converted by Windows. Supported source payloads are treated as bounded opaque
+  clipboard bytes and restored together, while derived bitmap/DIB/palette and
+  text conversions are regenerated by Windows. HTML, RTF, file-list, private,
+  unsafe-header/size, unavailable, or zero-sequence state becomes explicit
+  copy-only output with no synthetic keys; this layer does not claim complete
+  PNG/DIB semantic decoding.
+  A hidden message-only Scribe HWND owns native clipboard mutations so
+  `EmptyClipboard`/`SetClipboardData` never operate with a null owner.
+- Clipboard generation and exact transcript text are checked again after target
+  activation, immediately before `SendInput`, because activation can wake a
+  clipboard manager. A partial input batch sends individually checked
+  Control-up and V-up cleanup events (one key-up retry each), never another
+  paste chord. The transcript editor is disabled while correlated output is
+  queued so a one-frame UI edit cannot diverge from the final text being sent.
+- Output returns native-boundary timestamps for verified target activation and
+  successful paste. A paste followed by clipboard-restore failure is recorded
+  as a completed paste, shows non-retry guidance, and never sends a second
+  paste command.
+- Platforms without a verified focus/clipboard-generation adapter remain
+  explicit copy-only fallbacks; Phase 8 does not claim macOS or Linux paste
+  safety.
+
+### Verification
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/lint/build | `cargo fmt --all -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo build --all-features` | **PASS** |
+| Unit/integration suite | `cargo test --all-targets --all-features` | **PASS** - 436 discovered, 430 passed, 0 failed, 6 environment-gated tests ignored |
+| Finalization safety | App, coordinator, capture, and rolling-preview tests | **PASS** - post-roll preserved; no-speech/empty final produces no output; slow preview cancel is bounded and terminal; late/duplicate output remains exactly once |
+| Target safety | 14 Windows platform probe tests | **PASS** - Scribe/dead/recycled/changing targets and property installation/loss rejected; stable external identity captured; activation denial/focus change fail closed; exact target generation revalidated |
+| Clipboard/output safety | 26 injected-driver, format-validation, and Windows input-batch tests | **PASS** - zero sequences rejected; native payloads bounded; source/conversion order classified; supported-format selection validated; activation/snapshot/restore races rejected; missing target, failed paste, exactly-one paste, and individually checked key-release cleanup covered. Actual native mixed-format restoration remains NOT VERIFIED. |
+| Output UI accessibility | AccessKit semantic tests | **PASS** - Transcript editor labelled and exposes queued-output disabled/description state; Advanced numeric and combo controls labelled; page and History card titles are semantic headings; copy actions have distinct names |
+| Architecture boundary | `scripts/check-catalog-boundaries.py` and Rust source guards | **PASS** - one handler; runtime and native PCM boundaries unchanged |
+| Pinned native fixture | Exact ignored base.en/JFK service smoke using the v1.9.1 CPU package | **PASS** - debug-harness first load 4,367 ms, first decode 801 ms, warm decode 792 ms; not comparable to the saved release benchmark |
+
+Independent code, security, accessibility, QA, and final-integration reviews
+all returned **GO** after their findings were fixed. These review results do
+not replace physical desktop verification.
+
+Phase 8 changes no inference path, model artifact, resolved backend, or preview
+scheduler, so the saved Phase 7 native final/preview measurements remain the
+current comparable latency evidence. Actual target-activation and paste timing
+are now instrumented but cannot be measured truthfully without the real Windows
+desktop matrix.
+
+### Risks and Phase 9 entry
+
+- **High - desktop evidence:** SetForegroundWindow policy, standard/elevated
+  target behavior, image clipboard restoration, and the unavoidable final
+  focus-check-to-SendInput race require the Windows OUT matrix. The code uses
+  an HWND generation property, adjacent validation, and no retry; it does not claim
+  atomic focus ownership.
+- **Medium - clipboard formats:** HTML, file lists, and arbitrary private
+  clipboard formats are intentionally not reconstructed. They fail closed to
+  explicit copy-only output; text, image, and empty states have automated
+  coverage.
+- **Medium - hung runtime:** after four seconds the session is a terminal
+  failure and no output can occur, but new runtime work remains blocked until
+  the retained native worker actually exits.
+- **Low - cleanup:** no local cleanup option exists, so raw and final text are
+  identical. The split and recoverable raw view prevent a future cleanup path
+  from silently discarding source text.
+
+The release remains **NO-GO** until the Windows manual matrix, native-streaming
+Definition of Done, Supported-model evidence, and complete comparable latency
+report pass. Phase 9 may now replace installation with manifest-driven
+transactions without changing the safe output boundary.

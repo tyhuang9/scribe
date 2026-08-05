@@ -1,8 +1,8 @@
 # Scribe manual test matrix
 
-**Status:** living Phase 7 matrix (2026-08-04). No manual desktop, microphone,
+**Status:** living Phase 8 matrix (2026-08-04). No manual desktop, microphone,
 model-runtime, tray, hotkey, overlay, accessibility, or paste test was executed
-during the Phase 0-7 automated work. Every manual row below therefore remains **NOT VERIFIED** until
+during the Phase 0-8 automated work. Every manual row below therefore remains **NOT VERIFIED** until
 an operator records evidence. Automated Rust checks are listed separately and
 are not a substitute for the platform rows.
 
@@ -177,6 +177,23 @@ All desktop rows remain NOT VERIFIED. Four catalog models
 remain Experimental, zero are Supported, native streaming remains false, and
 the Zipformer/second-handler decision remains NO-GO.
 
+## Automated Phase 8 checkpoint
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Format/lint/build | `cargo fmt --all -- --check`; strict Clippy; `cargo build --all-features` | PASS |
+| Unit/integration tests | `cargo test --all-targets --all-features` | PASS - 436 discovered, 430 passed, 0 failed, 6 environment-gated tests ignored |
+| Final pass | App/coordinator/capture/preview tests | PASS - post-roll and one full final path retained; no-speech/empty final and timed-out preview cancellation produce zero output |
+| Windows target identity | 14 injected native target probes | PASS - dead/recycled/changing targets, generation-property loss, and activation denial fail closed; stable HWND/thread/PID/process-creation/property identity reactivates and revalidates |
+| Clipboard/output transaction | 26 injected-driver, native-format-validation, and Windows input-batch cases | PASS - zero sequence rejection, one-open bounded snapshot, source-order classification, supported-format selection, activation/snapshot/restore races, target loss, failed paste, exactly-one output, and individually checked key-release cleanup. Actual native mixed-format restoration remains NOT VERIFIED. |
+| Output UI accessibility | AccessKit control relationships and semantic-role tests | PASS - Transcript editor is labelled and exposes its temporary disabled/output state; Advanced numeric/combo controls are labelled; page and History card titles are headings; copy actions are unambiguous. Physical screen-reader behavior remains NOT VERIFIED. |
+| Runtime/PCM boundary | Catalog boundary script and existing source guards | PASS - one logical handler and native-only PCM remain unchanged |
+| Pinned native smoke | Exact ignored base.en/JFK service fixture | PASS - debug-harness first load 4,367 ms, first decode 801 ms, warm decode 792 ms; retained release numbers remain the comparable evidence |
+
+These are deterministic code-level checks, not a physical Windows paste run.
+OUT-01, OUT-05, OUT-06, target elevation, image clipboard round trips, and the
+new activation/paste latency timestamps remain NOT VERIFIED on a desktop.
+
 ## Prerequisites and test data
 
 | Code | Prerequisite |
@@ -240,12 +257,14 @@ the Zipformer/second-handler decision remains NO-GO.
 | ID | Platform | Prereq | Steps | Expected result/evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | OUT-01 | Windows | P1, P2, P3, P4, P7 | Put sentinel text on clipboard; focus browser/editor; run HK-01 with auto-insert enabled. | Final text is pasted once into the original field and clipboard is restored when configured. Verify target text and clipboard sentinel manually. | **NOT VERIFIED** |
-| OUT-02 | Linux X11 | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on X11. | Clipboard + paste automation works where Enigo permits; capture output status and clipboard before/after. | **NOT VERIFIED** |
+| OUT-02 | Linux X11 | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on X11. | Until native target identity and clipboard generation are verified, final text is copied only with an explicit status and no synthetic key input. | **NOT VERIFIED** |
 | OUT-03 | Linux Wayland | P1, P2, P3, P4, P6, P7 | Repeat OUT-01 on Wayland. | If synthetic paste is blocked, final text is copied only with an explicit notice; no paste into an unrelated field. | **NOT VERIFIED** |
-| OUT-04 | macOS | P1, P2, P3, P4, P6, P7 | Grant Accessibility, repeat OUT-01; revoke permission and repeat. | Granted path inserts once; denied path falls back to clipboard/actionable error without focus theft. | **NOT VERIFIED** |
+| OUT-04 | macOS | P1, P2, P3, P4, P6, P7 | Grant Accessibility, repeat OUT-01; revoke permission and repeat. | Until native target identity and clipboard generation are verified, both permission states remain explicit copy-only with no synthetic key input. | **NOT VERIFIED** |
 | OUT-05 | Win/Linux/macOS | P1, P2, P3, P4 | Begin dictation in target A, switch focus to unrelated target B before completion. | On Windows, no synthetic key is sent and final text remains copied because the captured target no longer matches. On Linux/macOS, current behavior is conservatively copy-only. Never accept text pasted into B as PASS. | **NOT VERIFIED** |
 | OUT-06 | Win/Linux/macOS | P1, P2, P3, P4 | Close target app during finalization; then change clipboard from another app before restoration delay expires. | No unrelated paste; final text is recoverable from clipboard/status; restoration does not overwrite an independently changed clipboard. | **NOT VERIFIED** |
 | OUT-07 | Win/Linux/macOS | P1, P2, P3 | Disable auto-insert; transcribe fixture and use Copy Transcript. | No synthetic key input occurs; explicit copy places the final transcript on clipboard. | **NOT VERIFIED** |
+| OUT-08 | Windows | P1, P2, P3, P4, P7 | Copy an image to the clipboard, transcribe and auto-insert, then inspect the clipboard; repeat with mixed text+image, empty, HTML/RTF/file-list, >64 MiB, invalid PNG/DIB header or dimensions, and unsupported private payloads. | Supported text/locale/PNG/DIBV5 source payloads are copied as bounded opaque bytes under native single-open transactions and restored while Scribe retains the same nonzero sequence; Windows regenerates documented conversions. Unsafe-size/header, unavailable, or unsupported formats become copy-only with no synthetic keys and explicit status. | **NOT VERIFIED** |
+| OUT-09 | Windows | P1, P2, P3, P4 | Begin in a normal target, then close/reopen it or restart its process before final output; repeat against an elevated target and while Windows denies foreground activation. | HWND/PID/process-creation mismatch or activation denial produces copy-only output. Scribe never forces focus, retries paste, or targets the replacement window. | **NOT VERIFIED** |
 
 ## Downloads, install, settings, privacy, and recovery
 

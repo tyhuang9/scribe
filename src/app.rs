@@ -49,7 +49,7 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, ThemePalette, about_page, configure_accessible_style, history_page,
+    AppPage, HistoryPageAction, ThemePalette, about_page, configure_accessible_style, history_page,
     minimum_primary_target_height, show_navigation, theme_palette, ui_palette,
 };
 
@@ -145,6 +145,24 @@ struct PendingOutput {
     latency: Option<LatencyTrace>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FinalizedText {
+    raw: String,
+    final_text: String,
+}
+
+impl FinalizedText {
+    fn without_cleanup(raw: String) -> Option<Self> {
+        if raw.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            final_text: raw.clone(),
+            raw,
+        })
+    }
+}
+
 struct FinishedCapture {
     session_id: SessionId,
     source: RecordingSource,
@@ -157,6 +175,7 @@ struct FinishedCapture {
 enum PreviewDrainAction {
     Continue,
     FinishCapture(Box<FinishedCapture>),
+    ReapAfterFailure,
     Fail {
         session_id: SessionId,
         message: String,
@@ -1108,6 +1127,7 @@ pub struct LocalTranscriberApp {
     models_show_comparison: bool,
     status: TranscriptionStatus,
     transcript: String,
+    raw_transcript: String,
     status_message: String,
     hotkey_input: String,
     model_search: String,
@@ -1191,6 +1211,7 @@ impl LocalTranscriberApp {
             models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
+            raw_transcript: String::new(),
             status_message,
             active_recording: None,
             pending_recording: None,
@@ -1300,13 +1321,13 @@ impl LocalTranscriberApp {
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
             let _ = self.session_coordinator.cancel_active();
-            self.captured_targets.remove(&pending.session_id);
+            self.retire_captured_target(pending.session_id);
             let _ = self.overlay_controller.hide(pending.session_id);
         }
         let Some(active) = self.active_recording.take() else {
             return;
         };
-        self.captured_targets.remove(&active.session_id);
+        self.retire_captured_target(active.session_id);
         let _ = self.overlay_controller.hide(active.session_id);
         if let Err(err) = active.session.stop_and_discard(Duration::from_secs(2)) {
             eprintln!("failed to stop and discard active recording: {err:#}");
@@ -1410,7 +1431,7 @@ impl LocalTranscriberApp {
                 && let Some(session_id) = self.overlay_controller.state().session_id
             {
                 let _ = self.overlay_controller.hide(session_id);
-                self.captured_targets.remove(&session_id);
+                self.retire_captured_target(session_id);
                 self.overlay_hide_at = None;
             }
             return;
@@ -1500,6 +1521,12 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn retire_captured_target(&mut self, session_id: SessionId) {
+        if let Some(target) = self.captured_targets.remove(&session_id) {
+            crate::overlay::platform::release_captured_target(&target);
+        }
+    }
+
     fn begin_overlay_session(
         &mut self,
         session_id: SessionId,
@@ -1509,7 +1536,7 @@ impl LocalTranscriberApp {
         if let Some(previous_session_id) = self.overlay_controller.state().session_id
             && previous_session_id != session_id
         {
-            self.captured_targets.remove(&previous_session_id);
+            self.retire_captured_target(previous_session_id);
         }
         if let Some(target) = target {
             self.captured_targets.insert(session_id, target);
@@ -1552,14 +1579,12 @@ impl LocalTranscriberApp {
         self.poll_pending_output_with(text_output::write_to_captured_target);
     }
 
-    fn poll_pending_output_with(
+    fn poll_pending_output_with<O>(
         &mut self,
-        write_output: impl FnOnce(
-            &str,
-            &AppConfig,
-            Option<&CapturedTarget>,
-        ) -> text_output::TextOutputResult,
-    ) {
+        write_output: impl FnOnce(&str, &AppConfig, Option<&CapturedTarget>) -> O,
+    ) where
+        O: Into<text_output::TextOutputOutcome>,
+    {
         let Some(mut pending) = self.pending_output.take() else {
             return;
         };
@@ -1572,16 +1597,17 @@ impl LocalTranscriberApp {
         if let Some(latency) = pending.latency.as_mut() {
             latency.output_started_at = Some(Instant::now());
         }
-        let result = write_output(
+        let outcome = write_output(
             &pending.transcript,
             &pending.config,
             self.captured_targets.get(&pending.session_id),
-        );
+        )
+        .into();
+        let result = outcome.result;
         if let Some(latency) = pending.latency.as_mut() {
             let completed_at = Instant::now();
-            if result == text_output::TextOutputResult::Inserted {
-                latency.paste_completed_at = Some(completed_at);
-            }
+            latency.target_activated_at = outcome.timing.target_activated_at;
+            latency.paste_completed_at = outcome.timing.paste_completed_at;
             latency.output_completed_at = Some(completed_at);
         }
 
@@ -1589,12 +1615,24 @@ impl LocalTranscriberApp {
         self.status_message = format!("{}. {}", pending.completion_message, output_message);
         self.latest_latency = pending.latency;
         let _ = self.session_coordinator.complete(pending.session_id);
-        if let text_output::TextOutputResult::Failed(message) = result {
+        if let text_output::TextOutputResult::Failed(message) = &result {
             self.status = TranscriptionStatus::Error;
-            self.finish_overlay_error(pending.session_id, &message);
-        } else if result != text_output::TextOutputResult::Inserted {
+            self.finish_overlay_error(pending.session_id, message);
+        } else if !result.did_insert() {
             self.status = TranscriptionStatus::Idle;
             self.finish_overlay_error(pending.session_id, &output_message);
+        } else if matches!(
+            result,
+            text_output::TextOutputResult::InsertedClipboardRestoreFailed(_)
+        ) {
+            self.status = TranscriptionStatus::Idle;
+            if self.overlay_controller.show_error(
+                pending.session_id,
+                output_message,
+                OverlayRecovery::None,
+            ) {
+                self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(3));
+            }
         } else {
             self.status = TranscriptionStatus::Idle;
             self.finish_overlay_success(pending.session_id);
@@ -1742,6 +1780,9 @@ impl LocalTranscriberApp {
         let session_id = match self.session_coordinator.begin(source.purpose()) {
             Ok(session_id) => session_id,
             Err(err) => {
+                if let Some(target) = captured_target.as_ref() {
+                    crate::overlay::platform::release_captured_target(target);
+                }
                 self.status = TranscriptionStatus::Error;
                 self.status_message = format!("Could not start dictation: {err}");
                 return;
@@ -1899,7 +1940,7 @@ impl LocalTranscriberApp {
         }
         self.transcription_service.cancel_active();
         let _ = self.session_coordinator.cancel_active();
-        self.captured_targets.remove(&previous_session);
+        self.retire_captured_target(previous_session);
         let _ = self.overlay_controller.hide(previous_session);
         self.playground_runs.remove(&previous_session);
         self.playground_pending = 0;
@@ -1954,6 +1995,7 @@ impl LocalTranscriberApp {
         let Some(pending) = self.pending_preview_drain.as_mut() else {
             return;
         };
+        let mut terminal_timeout = None;
         if !pending.preview.is_finished() {
             if pending.cancel_requested_at.is_none()
                 && now.saturating_duration_since(pending.closed_at) >= PREVIEW_FINISH_GRACE
@@ -1966,8 +2008,18 @@ impl LocalTranscriberApp {
             }) && !pending.timeout_reported
             {
                 pending.timeout_reported = true;
+                let session_id = pending.preview.identity().session_id;
+                pending.action = PreviewDrainAction::ReapAfterFailure;
+                terminal_timeout = Some(session_id);
+            }
+            if let Some(session_id) = terminal_timeout {
+                let message = "Live preview did not acknowledge cancellation; final transcription and paste were cancelled. New dictation is blocked until the native worker exits";
+                let _ = self.session_coordinator.fail(session_id);
+                self.pending_output = None;
+                self.retire_captured_target(session_id);
                 self.status = TranscriptionStatus::Error;
-                self.status_message = "Live preview has not acknowledged cancellation; new dictation is blocked until the native worker exits".to_owned();
+                self.status_message = message.to_owned();
+                self.finish_overlay_error(session_id, message);
             }
             return;
         }
@@ -2000,13 +2052,14 @@ impl LocalTranscriberApp {
                 }
             }
             PreviewDrainAction::FinishCapture(capture) => self.finish_capture(*capture),
+            PreviewDrainAction::ReapAfterFailure => {}
             PreviewDrainAction::Fail {
                 session_id,
                 message,
             } => self.fail_dictation_session_now(session_id, message),
             PreviewDrainAction::Cancel { session_id } => {
                 let _ = self.session_coordinator.cancel_active();
-                self.captured_targets.remove(&session_id);
+                self.retire_captured_target(session_id);
                 let _ = self.overlay_controller.hide(session_id);
                 self.playground_runs.remove(&session_id);
                 self.playground_pending = 0;
@@ -2336,14 +2389,33 @@ impl LocalTranscriberApp {
     }
 
     fn copy_transcript_to_clipboard(&mut self) {
-        if self.transcript.trim().is_empty() {
-            self.status_message = "No transcript to copy".to_owned();
+        let transcript = self.transcript.clone();
+        self.copy_text_to_clipboard(&transcript, "Transcript");
+    }
+
+    fn clear_transcript_history(&mut self) {
+        self.transcript.clear();
+        self.raw_transcript.clear();
+        if let Some(pending) = self.pending_output.take() {
+            let _ = self.session_coordinator.cancel_active();
+            self.retire_captured_target(pending.session_id);
+            let _ = self.overlay_controller.hide(pending.session_id);
+            self.overlay_hide_at = None;
+            self.status = TranscriptionStatus::Idle;
+            self.status_message = "Transcript cleared; pending output cancelled".to_owned();
+        } else {
+            self.status_message = "Transcript cleared".to_owned();
+        }
+    }
+
+    fn copy_text_to_clipboard(&mut self, text: &str, label: &str) {
+        if text.trim().is_empty() {
+            self.status_message = format!("No {} to copy", label.to_ascii_lowercase());
             return;
         }
 
-        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(self.transcript.clone()))
-        {
-            Ok(()) => self.status_message = "Transcript copied".to_owned(),
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_owned())) {
+            Ok(()) => self.status_message = format!("{label} copied"),
             Err(err) => {
                 self.status_message = format!("Clipboard failed: {err}");
             }
@@ -2587,12 +2659,36 @@ impl LocalTranscriberApp {
                         }
                     };
 
-                    let latency = latency.map(|mut latency| {
+                    let mut latency = latency.map(|mut latency| {
                         latency.ui_result_at = Some(Instant::now());
                         latency
                     });
                     match source {
                         RecordingSource::Transcribe => {
+                            let Some(finalized_text) =
+                                FinalizedText::without_cleanup(result.transcript.text.clone())
+                            else {
+                                if let Some(latency) = latency.as_mut() {
+                                    latency.final_text_ready_at = None;
+                                    latency.output_started_at = None;
+                                    latency.target_activated_at = None;
+                                    latency.paste_completed_at = None;
+                                    latency.output_completed_at = None;
+                                }
+                                let _ = self.session_coordinator.cancel_active();
+                                self.status = TranscriptionStatus::Idle;
+                                self.status_message =
+                                    "No speech detected; nothing was pasted.".to_owned();
+                                self.latest_latency = latency;
+                                self.finish_overlay_error(session_id, "No speech detected");
+                                self.cleanup_after_job(source, session_id, request_id);
+                                continue;
+                            };
+                            if let Some(latency) = latency.as_mut() {
+                                latency.final_text_ready_at = latency
+                                    .transcription_job_completed_at
+                                    .or_else(|| Some(Instant::now()));
+                            }
                             if let Err(err) = self.session_coordinator.begin_output(session_id) {
                                 self.fail_dictation_session(
                                     session_id,
@@ -2618,7 +2714,8 @@ impl LocalTranscriberApp {
                                 .sum::<usize>();
                             let stdout_bytes = result.stdout.len();
                             let stderr_bytes = result.stderr.len();
-                            self.transcript = result.transcript.text.clone();
+                            self.raw_transcript = finalized_text.raw;
+                            self.transcript = finalized_text.final_text;
                             let _ = self
                                 .overlay_controller
                                 .replace_with_final(session_id, self.transcript.clone());
@@ -2990,7 +3087,6 @@ impl LocalTranscriberApp {
 
             match result {
                 Ok(result) => {
-                    latency.final_text_ready_at = Some(completed_at);
                     let _ = tx.send(AppEvent::TranscriptionDone {
                         source: RecordingSource::Transcribe,
                         session_id,
@@ -3599,6 +3695,14 @@ impl LocalTranscriberApp {
     }
 }
 
+impl Drop for LocalTranscriberApp {
+    fn drop(&mut self) {
+        for (_, target) in self.captured_targets.drain() {
+            crate::overlay::platform::release_captured_target(&target);
+        }
+    }
+}
+
 impl eframe::App for LocalTranscriberApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         ThemePalette::from_visuals(visuals)
@@ -3820,25 +3924,52 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             transcript_panel(ui, status, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(section_heading("Transcript"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ready_dot(ui, self.effective_status());
-                    });
-                });
+                let transcript_label = ui
+                    .horizontal(|ui| {
+                        let heading = semantic_heading(ui, section_heading("Transcript"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ready_dot(ui, self.effective_status());
+                        });
+                        heading
+                    })
+                    .inner;
                 ui.add_space(10.0);
-                ui.add(
-                    TextEdit::multiline(&mut self.transcript)
-                        .desired_rows(14)
-                        .desired_width(usable_width(ui))
-                        .hint_text("Your transcription appears here..."),
-                );
+                let output_is_queued = self.pending_output.is_some()
+                    || self.session_coordinator.phase() == DictationPhase::Output;
+                let editor = ui
+                    .add_enabled(
+                        !output_is_queued,
+                        TextEdit::multiline(&mut self.transcript)
+                            .desired_rows(14)
+                            .desired_width(usable_width(ui))
+                            .hint_text("Your transcription appears here..."),
+                    )
+                    .labelled_by(transcript_label.id);
+                if output_is_queued {
+                    let lock_message =
+                        "Transcript editing is temporarily locked while final output is sent.";
+                    ui.ctx().accesskit_node_builder(editor.id, |builder| {
+                        builder.set_description(lock_message);
+                        builder.set_disabled();
+                    });
+                    ui.add_space(6.0);
+                    ui.label(mut_text(lock_message));
+                }
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(small_button(ui, "Clear")).clicked() {
-                        self.transcript.clear();
+                    let clear_label = if output_is_queued {
+                        "Cancel pending output and clear transcript"
+                    } else {
+                        "Clear transcript"
+                    };
+                    let clear = ui.add(small_button(ui, clear_label));
+                    if output_is_queued && editor.has_focus() {
+                        clear.request_focus();
                     }
-                    if ui.add(small_button(ui, "Copy")).clicked() {
+                    if clear.clicked() {
+                        self.clear_transcript_history();
+                    }
+                    if ui.add(small_button(ui, "Copy transcript")).clicked() {
                         self.copy_transcript_to_clipboard();
                     }
                 });
@@ -4701,11 +4832,20 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         let transcript = self.transcript.clone();
-        page(ui, "History", status, &status_message, |ui| {
-            if history_page(ui, &transcript) {
-                self.copy_transcript_to_clipboard();
-            }
-        });
+        let raw_transcript = self.raw_transcript.clone();
+        page(
+            ui,
+            "History",
+            status,
+            &status_message,
+            |ui| match history_page(ui, &transcript, &raw_transcript) {
+                Some(HistoryPageAction::CopyFinal) => self.copy_transcript_to_clipboard(),
+                Some(HistoryPageAction::CopyRaw) => {
+                    self.copy_text_to_clipboard(&raw_transcript, "Raw transcript")
+                }
+                None => {}
+            },
+        );
     }
 
     fn ui_about(&mut self, ui: &mut Ui) {
@@ -4723,45 +4863,52 @@ impl LocalTranscriberApp {
         let status_message = self.status_message.clone();
         page(ui, "Advanced", status, &status_message, |ui| {
             card(ui, |ui| {
-                ui.label(section_heading("Output"));
+                semantic_heading(ui, section_heading("Output"));
                 ui.add_space(8.0);
                 let mut auto_insert = self.config.output.auto_insert_transcript;
-                if ui
-                    .checkbox(
-                        &mut auto_insert,
-                        "Insert final transcript into captured app",
-                    )
-                    .changed()
-                {
+                let output_label = if cfg!(target_os = "windows") {
+                    "Insert final transcript into captured app"
+                } else {
+                    "Copy final transcript to clipboard automatically"
+                };
+                if ui.checkbox(&mut auto_insert, output_label).changed() {
                     self.config.output.auto_insert_transcript = auto_insert;
                     self.save_config();
                 }
-                ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
-                    let mut restore_clipboard = self.config.output.restore_clipboard_after_insert;
-                    if ui
-                        .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                        .changed()
-                    {
-                        self.config.output.restore_clipboard_after_insert = restore_clipboard;
-                        self.save_config();
-                    }
-                    let mut paste_delay = self.config.output.paste_delay_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Paste delay ms");
+                if cfg!(target_os = "windows") {
+                    ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
+                        let mut restore_clipboard =
+                            self.config.output.restore_clipboard_after_insert;
                         if ui
-                            .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                            .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
                             .changed()
                         {
-                            self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
+                            self.config.output.restore_clipboard_after_insert = restore_clipboard;
                             self.save_config();
                         }
+                        let mut paste_delay = self.config.output.paste_delay_ms as i32;
+                        ui.horizontal_wrapped(|ui| {
+                            let label = ui.label("Paste delay ms");
+                            if ui
+                                .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
+                                .labelled_by(label.id)
+                                .changed()
+                            {
+                                self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
+                                self.save_config();
+                            }
+                        });
                     });
-                });
+                } else if self.config.output.auto_insert_transcript
+                    && let Some(notice) = text_output::paste_automation_notice()
+                {
+                    ui.label(notice);
+                }
             });
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Capture limits"));
+                semantic_heading(ui, section_heading("Capture limits"));
                 let mut max_duration = self.config.recording.max_recording_seconds as i32;
                 ui.horizontal_wrapped(|ui| {
                     let label = ui.label("Maximum recording seconds");
@@ -4876,8 +5023,8 @@ impl LocalTranscriberApp {
                 });
                 ui.horizontal_wrapped(|ui| {
                     let before = self.config.overlay.position;
-                    ui.label("Overlay position");
-                    ComboBox::from_id_source("overlay-position")
+                    let label = ui.label("Overlay position");
+                    let combo = ComboBox::from_id_source("overlay-position")
                         .selected_text(self.config.overlay.position.label())
                         .show_ui(ui, |ui| {
                             for position in OverlayPosition::ALL {
@@ -4888,6 +5035,7 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
+                    combo.response.labelled_by(label.id);
                     if before != self.config.overlay.position {
                         self.save_config();
                     }
@@ -4896,7 +5044,7 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Live transcription"));
+                semantic_heading(ui, section_heading("Live transcription"));
                 ui.horizontal_wrapped(|ui| {
                     let mut mode = self.config.streaming.mode;
                     if streaming_mode_selector(ui, &mut mode) {
@@ -4911,15 +5059,15 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Performance"));
+                semantic_heading(ui, section_heading("Performance"));
                 let gpu_available = self
                     .transcription_service
                     .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
                     .is_ok_and(|descriptor| descriptor.capabilities.gpu);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Transcription device");
+                    let label = ui.label("Transcription device");
                     let mut preference = self.config.performance.acceleration_preference;
-                    ComboBox::from_id_source("advanced-transcription-device-mode")
+                    let combo = ComboBox::from_id_source("advanced-transcription-device-mode")
                         .selected_text(preference.label())
                         .show_ui(ui, |ui| {
                             for mode in AccelerationPreference::ALL {
@@ -4931,6 +5079,7 @@ impl LocalTranscriberApp {
                                 );
                             }
                         });
+                    combo.response.labelled_by(label.id);
                     if preference != self.config.performance.acceleration_preference {
                         self.config.performance.acceleration_preference = preference;
                         self.save_config();
@@ -4940,7 +5089,7 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Developer"));
+                semantic_heading(ui, section_heading("Developer"));
                 let mut debug_mode = self.config.developer.debug_mode;
                 if ui
                     .checkbox(&mut debug_mode, "Enable local model Playground")
@@ -4959,7 +5108,7 @@ impl LocalTranscriberApp {
 
             ui.add_space(12.0);
             card(ui, |ui| {
-                ui.label(section_heading("Diagnostics"));
+                semantic_heading(ui, section_heading("Diagnostics"));
                 if let Some(latency) = &self.latest_latency {
                     for line in latency.summary_lines() {
                         ui.label(mut_text(line));
@@ -5020,12 +5169,15 @@ fn page(
             set_exact_width(ui, page_width);
             ui.add_space(24.0);
             ui.horizontal(|ui| {
-                ui.label(
+                let heading = ui.label(
                     RichText::new(title)
                         .font(FontId::proportional(24.0))
                         .color(ui_palette(ui).primary)
                         .strong(),
                 );
+                ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Heading);
+                });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     status_badge(ui, status);
                 });
@@ -6082,6 +6234,14 @@ fn section_heading(label: &str) -> RichText {
     RichText::new(label)
         .font(FontId::proportional(16.0))
         .strong()
+}
+
+fn semantic_heading(ui: &mut Ui, text: RichText) -> egui::Response {
+    let response = ui.label(text);
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Heading);
+    });
+    response
 }
 
 fn body_strong(label: &str) -> RichText {
@@ -7852,6 +8012,12 @@ mod layout_tests {
             RequestId(10),
             "whisper_cpp_base_en",
         );
+        let completed_at = Instant::now() - Duration::from_millis(10);
+        let mut latency = LatencyTrace::started_at(
+            completed_at - Duration::from_secs(1),
+            TriggerObservation::AppAction,
+        );
+        latency.transcription_job_completed_at = Some(completed_at);
         app.tx
             .send(AppEvent::TranscriptionDone {
                 source: RecordingSource::Transcribe,
@@ -7862,16 +8028,86 @@ mod layout_tests {
                     RequestId(10),
                     "accepted result",
                 )),
-                latency: None,
+                latency: Some(latency),
             })
             .unwrap();
 
         app.poll_events();
 
         assert_eq!(app.transcript, "accepted result");
+        assert_eq!(app.raw_transcript, "accepted result");
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert!(app.status_message.contains("finished in 42 ms"));
         assert_eq!(app.session_coordinator.active_session_id(), None);
+        let latency = app.latest_latency.as_ref().unwrap();
+        assert_eq!(latency.final_text_ready_at, Some(completed_at));
+        assert!(latency.output_started_at.is_none());
+        assert!(latency.target_activated_at.is_none());
+        assert!(latency.paste_completed_at.is_none());
+    }
+
+    #[test]
+    fn empty_final_result_is_clean_no_speech_and_never_arms_output() {
+        let mut app = test_app();
+        app.config.output.auto_insert_transcript = true;
+        app.status = TranscriptionStatus::Transcribing;
+        app.transcript = "previous final".to_owned();
+        app.raw_transcript = "previous raw".to_owned();
+        let session_id = SessionId(1);
+        let request_id = RequestId(10);
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            "whisper_cpp_base_en",
+        );
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        let now = Instant::now();
+        let mut latency =
+            LatencyTrace::started_at(now - Duration::from_secs(1), TriggerObservation::AppAction);
+        latency.transcription_job_completed_at = Some(now - Duration::from_millis(10));
+        latency.final_text_ready_at = Some(now - Duration::from_millis(9));
+        latency.output_started_at = Some(now - Duration::from_millis(8));
+        latency.target_activated_at = Some(now - Duration::from_millis(7));
+        latency.paste_completed_at = Some(now - Duration::from_millis(6));
+        latency.output_completed_at = Some(now - Duration::from_millis(5));
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                result: Box::new(test_transcription_outcome(session_id, request_id, " \n\t")),
+                latency: Some(latency),
+            })
+            .unwrap();
+
+        app.poll_events();
+        app.poll_pending_output_with(|_, _, _| -> text_output::TextOutputResult {
+            panic!("empty final text must not reach output")
+        });
+
+        assert_eq!(app.transcript, "previous final");
+        assert_eq!(app.raw_transcript, "previous raw");
+        assert!(app.pending_output.is_none());
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(
+            app.status_message,
+            "No speech detected; nothing was pasted."
+        );
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Cancelled
+        );
+        let latency = app.latest_latency.as_ref().unwrap();
+        assert!(latency.transcription_job_completed_at.is_some());
+        assert!(latency.ui_result_at.is_some());
+        assert!(latency.final_text_ready_at.is_none());
+        assert!(latency.output_started_at.is_none());
+        assert!(latency.target_activated_at.is_none());
+        assert!(latency.paste_completed_at.is_none());
+        assert!(latency.output_completed_at.is_none());
     }
 
     #[test]
@@ -8013,7 +8249,119 @@ mod layout_tests {
     }
 
     #[test]
-    fn blocked_preview_is_drained_without_blocking_and_finalizes_capture_once() {
+    fn clearing_transcript_cancels_correlated_output_and_retires_active_status() {
+        let mut app = test_app();
+        let session_id = SessionId(14);
+        let request_id = RequestId(15);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.begin_overlay_session(
+            session_id,
+            NativeOverlayMode::Live,
+            Some(CapturedTarget::for_test(11, 22)),
+        );
+        app.transcript = "cleaned final".to_owned();
+        app.raw_transcript = "raw private text".to_owned();
+        app.status = TranscriptionStatus::Transcribing;
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            transcript: "final text edited after it was queued".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: None,
+        });
+
+        app.clear_transcript_history();
+        app.poll_pending_output_with(|_, _, _| -> text_output::TextOutputResult {
+            panic!("cleared content must not be pasted")
+        });
+
+        assert!(app.transcript.is_empty());
+        assert!(app.raw_transcript.is_empty());
+        assert!(app.pending_output.is_none());
+        assert!(!app.captured_targets.contains_key(&session_id));
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(app.effective_status(), TranscriptionStatus::Idle);
+        assert!(!app.has_active_work());
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn successful_paste_with_restore_failure_keeps_timing_and_never_offers_retry() {
+        let mut app = test_app();
+        let session_id = SessionId(14);
+        let request_id = RequestId(15);
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        seed_test_request(
+            &mut app,
+            RecordingSource::Transcribe,
+            session_id,
+            request_id,
+            model_id.as_str(),
+        );
+        app.session_coordinator
+            .complete_request(session_id, request_id, &model_id)
+            .unwrap();
+        app.session_coordinator.begin_output(session_id).unwrap();
+        app.overlay_controller
+            .begin_session(session_id, NativeOverlayMode::Live);
+        let activation = Instant::now();
+        let paste = activation + Duration::from_millis(1);
+        app.pending_output = Some(PendingOutput {
+            session_id,
+            transcript: "once".to_owned(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: Some(LatencyTrace::started_at(
+                activation,
+                TriggerObservation::HotkeyPoll,
+            )),
+        });
+
+        app.poll_pending_output_with(|_, _, _| text_output::TextOutputOutcome {
+            result: text_output::TextOutputResult::InsertedClipboardRestoreFailed(
+                "restore failed".to_owned(),
+            ),
+            timing: text_output::TextOutputTiming {
+                target_activated_at: Some(activation),
+                paste_completed_at: Some(paste),
+            },
+        });
+
+        let latency = app.latest_latency.as_ref().unwrap();
+        assert_eq!(latency.target_activated_at, Some(activation));
+        assert_eq!(latency.paste_completed_at, Some(paste));
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(
+            app.overlay_controller
+                .state()
+                .error
+                .as_ref()
+                .unwrap()
+                .recovery,
+            OverlayRecovery::None
+        );
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn blocked_preview_timeout_fails_without_final_pass_or_paste_and_reaps_worker() {
         use std::cell::Cell;
         use std::sync::{Condvar, Mutex, mpsc};
 
@@ -8063,7 +8411,7 @@ mod layout_tests {
             session_id,
             source: RecordingSource::Transcribe,
             result: Ok(CaptureCompletion {
-                audio: None,
+                audio: Some(test_prepared_audio()),
                 stop_reason: CaptureStopReason::Explicit,
                 metrics: CaptureMetrics {
                     duration: Duration::from_millis(100),
@@ -8072,7 +8420,7 @@ mod layout_tests {
                     source_sample_rate: 16_000,
                     source_channels: 1,
                     source_frames: 1_600,
-                    prepared_frames: 0,
+                    prepared_frames: 1_600,
                     dropped_samples: 0,
                     stream_restarts: 0,
                 },
@@ -8116,7 +8464,16 @@ mod layout_tests {
         });
         assert!(app.pending_preview_drain.is_some());
         assert!(app.capture_is_active());
-        assert!(app.status_message.contains("new dictation is blocked"));
+        assert_eq!(app.session_coordinator.active_session_id(), None);
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Failed
+        );
+        assert!(app.pending_output.is_none());
+        assert!(
+            app.status_message
+                .contains("final transcription and paste were cancelled")
+        );
 
         {
             let (lock, wake) = &*release;
@@ -8133,19 +8490,18 @@ mod layout_tests {
 
         assert!(app.pending_preview_drain.is_none());
         assert!(!app.capture_is_active());
-        assert_eq!(app.session_coordinator.active_session_id(), None);
-        assert_eq!(
-            app.status_message,
-            "No speech detected; nothing was pasted."
+        assert!(
+            app.status_message
+                .contains("final transcription and paste were cancelled")
         );
         assert!(
             started_rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "the pending snapshot should be dropped when preview closes"
         );
         app.poll_preview_drain_at(Instant::now(), || panic!("already finalized"));
-        assert_eq!(
-            app.status_message,
-            "No speech detected; nothing was pasted."
+        assert!(
+            app.status_message
+                .contains("final transcription and paste were cancelled")
         );
     }
 
@@ -9148,6 +9504,7 @@ mod layout_tests {
             models_show_comparison: false,
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
+            raw_transcript: String::new(),
             status_message: "Ready".to_owned(),
             active_recording: None,
             pending_recording: None,
@@ -10542,6 +10899,7 @@ mod layout_tests {
             .collect::<Vec<_>>();
 
         for expected in [
+            "Paste delay ms",
             "Maximum recording seconds",
             "Speech confirmation ms",
             "Internal pause ms",
@@ -10561,6 +10919,111 @@ mod layout_tests {
                     .any(|(_, node)| node.labelled_by().contains(&label_id)),
                 "no spin button is programmatically labelled by {expected:?}"
             );
+        }
+
+        let combo_boxes = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
+            .collect::<Vec<_>>();
+        for expected in ["Overlay position", "Transcription device"] {
+            let label_id = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.name() == Some(expected))
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("missing AccessKit label {expected:?}"));
+            assert!(
+                combo_boxes
+                    .iter()
+                    .any(|(_, node)| node.labelled_by().contains(&label_id)),
+                "no combo box is programmatically labelled by {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_editor_and_queued_output_state_are_accessible() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Transcribe;
+        app.transcript = "final text".to_owned();
+        app.pending_output = Some(PendingOutput {
+            session_id: SessionId(1),
+            transcript: app.transcript.clone(),
+            completion_message: "Complete".to_owned(),
+            config: app.config.clone(),
+            latency: None,
+        });
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_024.0, 1_100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| app.ui_transcribe(ui));
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let transcript_label_id = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
+            })
+            .map(|(id, _)| *id)
+            .expect("missing semantic Transcript heading");
+        let editor = update
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.role() == egui::accesskit::Role::MultilineTextInput)
+            .expect("missing transcript editor");
+
+        assert!(editor.labelled_by().contains(&transcript_label_id));
+        assert!(editor.is_disabled());
+        assert_eq!(
+            editor.description(),
+            Some("Transcript editing is temporarily locked while final output is sent.")
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Cancel pending output and clear transcript")
+        }));
+    }
+
+    #[test]
+    fn page_and_history_card_titles_are_semantic_headings() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                page(ui, "History", TranscriptionStatus::Idle, "Ready", |ui| {
+                    history_page(ui, "clean final", "raw final");
+                });
+            });
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+
+        for expected in ["History", "Latest finalized text", "Raw model text"] {
+            assert!(update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some(expected)
+            }));
+        }
+        for expected in ["Copy finalized transcript", "Copy raw transcript"] {
+            assert!(update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some(expected)
+            }));
         }
     }
 
