@@ -1400,9 +1400,10 @@ fn recording_settings_panel(
                     *action = ScreenAction::RefreshDevices;
                 }
             });
-            setting_row(ui, "Input level", |ui, _| {
+            setting_row(ui, "Input level", |ui, label_id| {
                 ui.label(RichText::new(icon_glyph(Icon::Microphone)).size(18.0));
-                ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0));
+                ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0))
+                    .labelled_by(label_id);
             });
         });
     });
@@ -2377,6 +2378,7 @@ mod tests {
                     egui::accesskit::Role::ComboBox
                         | egui::accesskit::Role::SpinButton
                         | egui::accesskit::Role::TextInput
+                        | egui::accesskit::Role::ProgressIndicator
                 )
             }) {
                 assert!(
