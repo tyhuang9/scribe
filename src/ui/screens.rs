@@ -28,6 +28,17 @@ pub(crate) struct RecordingSettingsView {
     pub auto_insert_transcript: bool,
     pub restore_clipboard_after_insert: bool,
     pub paste_delay_ms: u64,
+    pub active_model_label: String,
+    pub hotkey_input: String,
+    pub theme_label: String,
+    pub overlay_label: String,
+    pub overlay_available: bool,
+    pub vad_enabled: bool,
+    pub speech_confirmation_ms: u32,
+    pub internal_pause_ms: u32,
+    pub endpoint_silence_ms: u32,
+    pub pre_roll_ms: u32,
+    pub post_roll_ms: u32,
     pub save_state: SettingsSaveState,
 }
 
@@ -45,6 +56,17 @@ impl Default for RecordingSettingsView {
             auto_insert_transcript: false,
             restore_clipboard_after_insert: true,
             paste_delay_ms: 60,
+            active_model_label: "No model selected".into(),
+            hotkey_input: "Ctrl+Shift+Space".into(),
+            theme_label: "Light".into(),
+            overlay_label: "Live".into(),
+            overlay_available: true,
+            vad_enabled: true,
+            speech_confirmation_ms: 150,
+            internal_pause_ms: 450,
+            endpoint_silence_ms: 900,
+            pre_roll_ms: 250,
+            post_roll_ms: 200,
             save_state: SettingsSaveState::Clean,
         }
     }
@@ -74,6 +96,11 @@ pub(crate) enum ScreenAction {
     StartComparison,
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
+    OpenModelSettings,
+    SetHotkeyInput(String),
+    ApplyHotkey,
+    SetTheme(String),
+    SetOverlayMode(String),
     SetRecordingMode(RecordingMode),
     SetDurationSeconds(u32),
     ToggleProvisionalFeedback,
@@ -83,6 +110,12 @@ pub(crate) enum ScreenAction {
     SetAutoInsertTranscript(bool),
     SetRestoreClipboardAfterInsert(bool),
     SetPasteDelayMs(u64),
+    SetVadEnabled(bool),
+    SetSpeechConfirmationMs(u32),
+    SetInternalPauseMs(u32),
+    SetEndpointSilenceMs(u32),
+    SetPreRollMs(u32),
+    SetPostRollMs(u32),
 }
 
 pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenAction {
@@ -1180,6 +1213,39 @@ fn recording_settings_panel(
                         .color(colors.muted_text),
                 );
             });
+            ui.separator();
+            let mut vad_enabled = settings.vad_enabled;
+            if ui
+                .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
+                .changed()
+            {
+                *action = ScreenAction::SetVadEnabled(vad_enabled);
+            }
+            if vad_enabled {
+                for (label, value, action_for) in [
+                    ("Speech confirmation ms", settings.speech_confirmation_ms, 0),
+                    ("Internal pause ms", settings.internal_pause_ms, 1),
+                    ("End after silence ms", settings.endpoint_silence_ms, 2),
+                    ("Pre-roll ms", settings.pre_roll_ms, 3),
+                    ("Post-roll ms", settings.post_roll_ms, 4),
+                ] {
+                    setting_row(ui, label, |ui| {
+                        let mut edited = value as i64;
+                        if ui
+                            .add(egui::DragValue::new(&mut edited).clamp_range(0..=5_000))
+                            .changed()
+                        {
+                            *action = match action_for {
+                                0 => ScreenAction::SetSpeechConfirmationMs(edited.max(50) as u32),
+                                1 => ScreenAction::SetInternalPauseMs(edited.max(100) as u32),
+                                2 => ScreenAction::SetEndpointSilenceMs(edited as u32),
+                                3 => ScreenAction::SetPreRollMs(edited as u32),
+                                _ => ScreenAction::SetPostRollMs(edited as u32),
+                            };
+                        }
+                    });
+                }
+            }
         });
     });
     ui.add_space(16.0);
@@ -1258,6 +1324,68 @@ fn general_settings_panel(
             RichText::new("Scribe keeps audio and transcripts on this device.")
                 .color(ui_palette(ui).muted_text),
         );
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Active model").strong());
+        ui.horizontal(|ui| {
+            ui.label(&settings.active_model_label);
+            if button(ui, "Manage models", ButtonTone::Secondary).clicked() {
+                *action = ScreenAction::OpenModelSettings;
+            }
+        });
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Shortcuts").strong());
+        let mut hotkey = settings.hotkey_input.clone();
+        ui.horizontal(|ui| {
+            ui.label("Record toggle");
+            ui.add(egui::TextEdit::singleline(&mut hotkey).desired_width(240.0));
+            if button(ui, "Apply", ButtonTone::Secondary).clicked() {
+                *action = ScreenAction::ApplyHotkey;
+            } else if hotkey != settings.hotkey_input {
+                *action = ScreenAction::SetHotkeyInput(hotkey);
+            }
+            if button(ui, "Capture", ButtonTone::Secondary).clicked() {
+                *action = ScreenAction::ChangeShortcut;
+            }
+        });
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Appearance").strong());
+        let mut theme = settings.theme_label.clone();
+        setting_row(ui, "Theme", |ui| {
+            ComboBox::from_id_source("theme-mode")
+                .selected_text(&theme)
+                .show_ui(ui, |ui| {
+                    for value in ["Light", "Dark", "System"] {
+                        ui.selectable_value(&mut theme, value.to_owned(), value);
+                    }
+                });
+        });
+        if theme != settings.theme_label {
+            *action = ScreenAction::SetTheme(theme);
+        }
+        let mut overlay = settings.overlay_label.clone();
+        setting_row(ui, "Dictation overlay", |ui| {
+            ui.add_enabled_ui(settings.overlay_available, |ui| {
+                ComboBox::from_id_source("overlay-mode")
+                    .selected_text(&overlay)
+                    .show_ui(ui, |ui| {
+                        for value in ["Live", "Minimal", "Off"] {
+                            ui.selectable_value(&mut overlay, value.to_owned(), value);
+                        }
+                    });
+            });
+        });
+        if overlay != settings.overlay_label {
+            *action = ScreenAction::SetOverlayMode(overlay);
+        }
+        if !settings.overlay_available {
+            ui.label(RichText::new("The overlay is unavailable because focus safety is not verified on this platform.").color(ui_palette(ui).warning));
+        }
     });
 }
 

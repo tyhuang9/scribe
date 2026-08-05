@@ -8287,7 +8287,18 @@ impl LocalTranscriberApp {
             | ScreenAction::ChangeShortcut
             | ScreenAction::SetAutoInsertTranscript(_)
             | ScreenAction::SetRestoreClipboardAfterInsert(_)
-            | ScreenAction::SetPasteDelayMs(_) => {}
+            | ScreenAction::SetPasteDelayMs(_)
+            | ScreenAction::OpenModelSettings
+            | ScreenAction::SetHotkeyInput(_)
+            | ScreenAction::ApplyHotkey
+            | ScreenAction::SetTheme(_)
+            | ScreenAction::SetOverlayMode(_)
+            | ScreenAction::SetVadEnabled(_)
+            | ScreenAction::SetSpeechConfirmationMs(_)
+            | ScreenAction::SetInternalPauseMs(_)
+            | ScreenAction::SetEndpointSilenceMs(_)
+            | ScreenAction::SetPreRollMs(_)
+            | ScreenAction::SetPostRollMs(_) => {}
         }
     }
 
@@ -9682,6 +9693,21 @@ impl LocalTranscriberApp {
             auto_insert_transcript: self.config.output.auto_insert_transcript,
             restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
             paste_delay_ms: self.config.output.paste_delay_ms,
+            active_model_label: self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
+                .map(|descriptor| descriptor.display_name.to_owned())
+                .unwrap_or_else(|_| "No model selected".to_owned()),
+            hotkey_input: self.hotkey_input.clone(),
+            theme_label: self.config.general.theme_mode.label().to_owned(),
+            overlay_label: self.config.overlay.mode.label().to_owned(),
+            overlay_available: overlay::overlay_focus_safety_available(),
+            vad_enabled: self.config.recording.vad_enabled,
+            speech_confirmation_ms: self.config.recording.speech_confirmation_ms,
+            internal_pause_ms: self.config.recording.internal_pause_ms,
+            endpoint_silence_ms: self.config.recording.endpoint_silence_ms,
+            pre_roll_ms: self.config.recording.pre_roll_ms,
+            post_roll_ms: self.config.recording.post_roll_ms,
             save_state: settings_save_state(
                 self.settings_store
                     .as_ref()
@@ -9709,6 +9735,25 @@ impl LocalTranscriberApp {
             ScreenAction::SetSettingsTab(tab) => self.settings_tab = tab,
             ScreenAction::SetCloseToTray(value) => {
                 self.config.general.close_to_tray = value;
+                self.save_config();
+            }
+            ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
+            ScreenAction::SetHotkeyInput(value) => self.hotkey_input = value,
+            ScreenAction::ApplyHotkey => self.apply_hotkey(),
+            ScreenAction::SetTheme(value) => {
+                self.config.general.theme_mode = match value.as_str() {
+                    "Dark" => ThemeMode::Dark,
+                    "System" => ThemeMode::System,
+                    _ => ThemeMode::Light,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetOverlayMode(value) => {
+                self.config.overlay.mode = match value.as_str() {
+                    "Minimal" => OverlayMode::Minimal,
+                    "Off" => OverlayMode::Off,
+                    _ => OverlayMode::Live,
+                };
                 self.save_config();
             }
             ScreenAction::SetRecordingMode(mode) => {
@@ -9751,6 +9796,42 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetPasteDelayMs(value) => {
                 self.config.output.paste_delay_ms = value.clamp(1, 1_000);
+                self.save_config();
+            }
+            ScreenAction::SetVadEnabled(value) => {
+                self.config.recording.vad_enabled = value;
+                self.save_config();
+            }
+            ScreenAction::SetSpeechConfirmationMs(value) => {
+                self.config.recording.speech_confirmation_ms = value.clamp(50, 1_000);
+                self.config.recording.internal_pause_ms = self
+                    .config
+                    .recording
+                    .internal_pause_ms
+                    .max(self.config.recording.speech_confirmation_ms);
+                self.save_config();
+            }
+            ScreenAction::SetInternalPauseMs(value) => {
+                self.config.recording.internal_pause_ms =
+                    value.clamp(self.config.recording.speech_confirmation_ms, 3_000);
+                self.config.recording.endpoint_silence_ms = self
+                    .config
+                    .recording
+                    .endpoint_silence_ms
+                    .max(self.config.recording.internal_pause_ms);
+                self.save_config();
+            }
+            ScreenAction::SetEndpointSilenceMs(value) => {
+                self.config.recording.endpoint_silence_ms =
+                    value.clamp(self.config.recording.internal_pause_ms, 5_000);
+                self.save_config();
+            }
+            ScreenAction::SetPreRollMs(value) => {
+                self.config.recording.pre_roll_ms = value.min(2_000);
+                self.save_config();
+            }
+            ScreenAction::SetPostRollMs(value) => {
+                self.config.recording.post_roll_ms = value.min(2_000);
                 self.save_config();
             }
             ScreenAction::None

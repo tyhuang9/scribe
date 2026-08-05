@@ -251,6 +251,11 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             *page = AppPage::General;
         }
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
+        ScreenAction::OpenModelSettings => *page = AppPage::Models,
+        ScreenAction::SetHotkeyInput(value) => data.transcription.hotkey = value,
+        ScreenAction::ApplyHotkey => {}
+        ScreenAction::SetTheme(value) => data.settings.theme_label = value,
+        ScreenAction::SetOverlayMode(value) => data.settings.overlay_label = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
         ScreenAction::SetDurationSeconds(seconds) => {
             data.settings.duration_seconds = seconds;
@@ -271,6 +276,14 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.settings.restore_clipboard_after_insert = value
         }
         ScreenAction::SetPasteDelayMs(value) => data.settings.paste_delay_ms = value,
+        ScreenAction::SetVadEnabled(value) => data.settings.vad_enabled = value,
+        ScreenAction::SetSpeechConfirmationMs(value) => {
+            data.settings.speech_confirmation_ms = value
+        }
+        ScreenAction::SetInternalPauseMs(value) => data.settings.internal_pause_ms = value,
+        ScreenAction::SetEndpointSilenceMs(value) => data.settings.endpoint_silence_ms = value,
+        ScreenAction::SetPreRollMs(value) => data.settings.pre_roll_ms = value,
+        ScreenAction::SetPostRollMs(value) => data.settings.post_roll_ms = value,
     }
 }
 
