@@ -9736,6 +9736,8 @@ impl LocalTranscriberApp {
                 .map(|descriptor| descriptor.display_name.to_owned())
                 .unwrap_or_else(|_| "No model selected".to_owned()),
             hotkey_input: self.hotkey_input.clone(),
+            hotkey_capture_active: self.capturing_hotkey,
+            hotkey_capture_status: self.capturing_hotkey.then(|| self.status_message.clone()),
             theme_label: self.config.general.theme_mode.label().to_owned(),
             overlay_label: self.config.overlay.mode.label().to_owned(),
             overlay_available: overlay::overlay_focus_safety_available(),
@@ -9840,8 +9842,12 @@ impl LocalTranscriberApp {
             }
             ScreenAction::RefreshDevices => self.refresh_audio_devices(),
             ScreenAction::ChangeShortcut => {
-                self.capturing_hotkey = true;
-                self.status_message = "Press the new hotkey combination.".to_owned();
+                self.capturing_hotkey = !self.capturing_hotkey;
+                self.status_message = if self.capturing_hotkey {
+                    "Press the new hotkey combination. Press Capture again to cancel.".to_owned()
+                } else {
+                    "Hotkey capture cancelled.".to_owned()
+                };
             }
             ScreenAction::SetAutoInsertTranscript(value) => {
                 self.config.output.auto_insert_transcript = value;
@@ -9917,6 +9923,10 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetDebugMode(value) => {
                 self.config.developer.debug_mode = value;
+                if !value && self.current_tab == Tab::Debug {
+                    self.settings_tab = SettingsTab::Advanced;
+                    self.current_tab = Tab::General;
+                }
                 self.save_config();
             }
             ScreenAction::SetHistoryMode(value) => {

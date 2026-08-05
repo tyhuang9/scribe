@@ -33,6 +33,8 @@ pub(crate) struct RecordingSettingsView {
     pub paste_delay_ms: u64,
     pub active_model_label: String,
     pub hotkey_input: String,
+    pub hotkey_capture_active: bool,
+    pub hotkey_capture_status: Option<String>,
     pub theme_label: String,
     pub overlay_label: String,
     pub overlay_available: bool,
@@ -76,6 +78,8 @@ impl Default for RecordingSettingsView {
             paste_delay_ms: 60,
             active_model_label: "No model selected".into(),
             hotkey_input: "Ctrl+Shift+Space".into(),
+            hotkey_capture_active: false,
+            hotkey_capture_status: None,
             theme_label: "Light".into(),
             overlay_label: "Live".into(),
             overlay_available: true,
@@ -1107,10 +1111,12 @@ fn settings(
         .copied()
         .find_map(|(tab, id)| (tab == active_tab).then_some(id))
         .expect("selected settings tab is rendered");
-    for (_, tab_id) in tab_ids {
-        ui.ctx().accesskit_node_builder(tab_id, |builder| {
-            builder.push_controlled(panel.response.id.value().into());
-        });
+    for (tab, tab_id) in tab_ids {
+        if tab == active_tab {
+            ui.ctx().accesskit_node_builder(tab_id, |builder| {
+                builder.push_controlled(panel.response.id.value().into());
+            });
+        }
     }
     ui.ctx()
         .accesskit_node_builder(panel.response.id, |builder| {
@@ -1285,7 +1291,7 @@ fn recording_settings_panel(
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
-            setting_row(ui, "Duration limit", |ui| {
+            setting_row(ui, "Duration limit", |ui, label_id| {
                 let mut duration = settings.duration_seconds;
                 ComboBox::from_id_source("duration-limit")
                     .selected_text(&settings.duration_label)
@@ -1298,12 +1304,14 @@ fn recording_settings_panel(
                                 format!("{seconds} seconds"),
                             );
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label_id);
                 if duration != settings.duration_seconds {
                     *action = ScreenAction::SetDurationSeconds(duration);
                 }
             });
-            setting_row(ui, "Visual feedback", |ui| {
+            setting_row(ui, "Visual feedback", |ui, _| {
                 let mut enabled = settings.provisional_feedback;
                 let response = ui.checkbox(&mut enabled, "Show provisional words while recording");
                 if response.clicked() {
@@ -1363,7 +1371,7 @@ fn recording_settings_panel(
         ui.label(RichText::new("Audio input").strong());
         ui.add_space(12.0);
         ui.add_enabled_ui(!recording_locked, |ui| {
-            setting_row(ui, "Device", |ui| {
+            setting_row(ui, "Device", |ui, label_id| {
                 let mut selected = settings.selected_audio_device.clone();
                 ComboBox::from_id_source("audio-device")
                     .selected_text(&settings.device_label)
@@ -1373,7 +1381,9 @@ fn recording_settings_panel(
                         for device in &settings.audio_devices {
                             ui.selectable_value(&mut selected, Some(device.clone()), device);
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label_id);
                 if selected != settings.selected_audio_device {
                     *action = ScreenAction::SetAudioDevice(selected);
                 }
@@ -1390,7 +1400,7 @@ fn recording_settings_panel(
                     *action = ScreenAction::RefreshDevices;
                 }
             });
-            setting_row(ui, "Input level", |ui| {
+            setting_row(ui, "Input level", |ui, _| {
                 ui.label(RichText::new(icon_glyph(Icon::Microphone)).size(18.0));
                 ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0));
             });
@@ -1401,7 +1411,7 @@ fn recording_settings_panel(
         ui.label(RichText::new("Shortcut").strong());
         ui.add_space(12.0);
         ui.add_enabled_ui(!recording_locked, |ui| {
-            setting_row(ui, "Global record hotkey", |ui| {
+            setting_row(ui, "Global record hotkey", |ui, _| {
                 for key in state
                     .hotkey
                     .split('+')
@@ -1410,10 +1420,27 @@ fn recording_settings_panel(
                 {
                     keycap(ui, key);
                 }
-                if button(ui, "Change shortcut", ButtonTone::Secondary).clicked() {
+                let capture_name = if settings.hotkey_capture_active {
+                    "Cancel hotkey capture"
+                } else {
+                    "Change shortcut"
+                };
+                let capture = button(ui, capture_name, ButtonTone::Secondary);
+                ui.ctx().accesskit_node_builder(capture.id, |builder| {
+                    builder.set_name(capture_name);
+                    builder.set_selected(settings.hotkey_capture_active);
+                });
+                if capture.clicked() {
                     *action = ScreenAction::ChangeShortcut;
                 }
             });
+            if let Some(status) = &settings.hotkey_capture_status {
+                let response = ui.label(status);
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
+            }
         });
     });
 }
@@ -1450,36 +1477,56 @@ fn general_settings_panel(
         ui.label(RichText::new("Shortcuts").strong());
         let mut hotkey = settings.hotkey_input.clone();
         ui.horizontal(|ui| {
-            ui.label("Record toggle");
-            ui.add(egui::TextEdit::singleline(&mut hotkey).desired_width(240.0));
+            let label = ui.label("Record toggle");
+            ui.add(egui::TextEdit::singleline(&mut hotkey).desired_width(240.0))
+                .labelled_by(label.id);
             if button(ui, "Apply", ButtonTone::Secondary).clicked() {
                 *action = ScreenAction::ApplyHotkey;
             } else if hotkey != settings.hotkey_input {
                 *action = ScreenAction::SetHotkeyInput(hotkey);
             }
-            if button(ui, "Capture", ButtonTone::Secondary).clicked() {
+            let capture_name = if settings.hotkey_capture_active {
+                "Cancel hotkey capture"
+            } else {
+                "Capture hotkey"
+            };
+            let capture = button(ui, capture_name, ButtonTone::Secondary);
+            ui.ctx().accesskit_node_builder(capture.id, |builder| {
+                builder.set_name(capture_name);
+                builder.set_selected(settings.hotkey_capture_active);
+            });
+            if capture.clicked() {
                 *action = ScreenAction::ChangeShortcut;
             }
         });
+        if let Some(status) = &settings.hotkey_capture_status {
+            let response = ui.label(status);
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+        }
     });
     ui.add_space(16.0);
     card(ui, |ui| {
         ui.label(RichText::new("Appearance").strong());
         let mut theme = settings.theme_label.clone();
-        setting_row(ui, "Theme", |ui| {
+        setting_row(ui, "Theme", |ui, label_id| {
             ComboBox::from_id_source("theme-mode")
                 .selected_text(&theme)
                 .show_ui(ui, |ui| {
                     for value in ["Light", "Dark", "System"] {
                         ui.selectable_value(&mut theme, value.to_owned(), value);
                     }
-                });
+                })
+                .response
+                .labelled_by(label_id);
         });
         if theme != settings.theme_label {
             *action = ScreenAction::SetTheme(theme);
         }
         let mut overlay = settings.overlay_label.clone();
-        setting_row(ui, "Dictation overlay", |ui| {
+        setting_row(ui, "Dictation overlay", |ui, label_id| {
             ui.add_enabled_ui(settings.overlay_available, |ui| {
                 ComboBox::from_id_source("overlay-mode")
                     .selected_text(&overlay)
@@ -1487,7 +1534,9 @@ fn general_settings_panel(
                         for value in ["Live", "Minimal", "Off"] {
                             ui.selectable_value(&mut overlay, value.to_owned(), value);
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label_id);
             });
         });
         if overlay != settings.overlay_label {
@@ -1567,14 +1616,16 @@ fn advanced_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("Live transcription").strong());
         let mut streaming = settings.streaming_label.clone();
-        setting_row(ui, "Mode", |ui| {
+        setting_row(ui, "Mode", |ui, label_id| {
             ComboBox::from_id_source("streaming-mode")
                 .selected_text(&streaming)
                 .show_ui(ui, |ui| {
                     for value in ["Auto", "Rolling preview", "Final text only"] {
                         ui.selectable_value(&mut streaming, value.to_owned(), value);
                     }
-                });
+                })
+                .response
+                .labelled_by(label_id);
         });
         if streaming != settings.streaming_label {
             *action = ScreenAction::SetStreamingMode(streaming);
@@ -1584,7 +1635,7 @@ fn advanced_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("Performance").strong());
         let mut acceleration = settings.acceleration_label.clone();
-        setting_row(ui, "Transcription device", |ui| {
+        setting_row(ui, "Transcription device", |ui, label_id| {
             ComboBox::from_id_source("advanced-transcription-device-mode")
                 .selected_text(&acceleration)
                 .show_ui(ui, |ui| {
@@ -1593,7 +1644,9 @@ fn advanced_settings_panel(
                             ui.selectable_value(&mut acceleration, value.to_owned(), value);
                         });
                     }
-                });
+                })
+                .response
+                .labelled_by(label_id);
         });
         if acceleration != settings.acceleration_label {
             *action = ScreenAction::SetAcceleration(acceleration);
@@ -1603,14 +1656,16 @@ fn advanced_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("Overlay").strong());
         let mut position = settings.overlay_position_label.clone();
-        setting_row(ui, "Overlay position", |ui| {
+        setting_row(ui, "Overlay position", |ui, label_id| {
             ComboBox::from_id_source("overlay-position")
                 .selected_text(&position)
                 .show_ui(ui, |ui| {
                     for value in ["Top", "Bottom"] {
                         ui.selectable_value(&mut position, value.to_owned(), value);
                     }
-                });
+                })
+                .response
+                .labelled_by(label_id);
         });
         if position != settings.overlay_position_label {
             *action = ScreenAction::SetOverlayPosition(position);
@@ -1620,26 +1675,32 @@ fn advanced_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("History and privacy").strong());
         if settings.history_locked {
-            ui.label(
+            let notice = ui.label(
                 RichText::new(
                     "History retention is locked while a retained-audio retry owns its row.",
                 )
                 .color(ui_palette(ui).warning),
             );
+            ui.ctx().accesskit_node_builder(notice.id, |builder| {
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
         }
         ui.add_enabled_ui(!settings.history_locked, |ui| {
             let mut mode = settings.history_mode_label.clone();
-            setting_row(ui, "History storage", |ui| { ComboBox::from_id_source("history-storage-mode").selected_text(&mode).show_ui(ui, |ui| { for value in ["Off", "Transcript only", "Transcript and audio"] { ui.selectable_value(&mut mode, value.to_owned(), value); } }); });
+            setting_row(ui, "History storage", |ui, label_id| { let response = ComboBox::from_id_source("history-storage-mode").selected_text(&mode).show_ui(ui, |ui| { for value in ["Off", "Transcript only", "Transcript and audio"] { ui.selectable_value(&mut mode, value.to_owned(), value); } }).response.labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); });
             if mode != settings.history_mode_label { *action = ScreenAction::SetHistoryMode(mode.clone()); }
             if mode != "Off" {
                 let mut maximum = settings.max_history_entries as i64;
-                setting_row(ui, "Maximum unpinned entries", |ui| { if ui.add(egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
-                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, action, ScreenAction::SetTranscriptRetentionDays);
+                setting_row(ui, "Maximum unpinned entries", |ui, label_id| { let response = ui.add(egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); if response.changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
+                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, action, ScreenAction::SetTranscriptRetentionDays);
                 if mode == "Transcript and audio" {
-                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, action, ScreenAction::SetAudioRetentionDays);
+                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, action, ScreenAction::SetAudioRetentionDays);
                 }
                 let mut identity = settings.store_application_identity;
-                if ui.checkbox(&mut identity, "Store coarse application identity with new entries").on_hover_text("Stores only a coarse local application label, never a window title or document name.").changed() { *action = ScreenAction::SetStoreApplicationIdentity(identity); }
+                let identity_control = ui.checkbox(&mut identity, "Store coarse application identity with new entries").on_hover_text("Stores only a coarse local application label, never a window title or document name.");
+                describe_history_lock(ui, &identity_control, settings.history_locked);
+                if identity_control.changed() { *action = ScreenAction::SetStoreApplicationIdentity(identity); }
             }
         });
     });
@@ -1670,20 +1731,24 @@ fn optional_retention_control(
     label: &str,
     unlimited_label: &str,
     configured_days: Option<u32>,
+    history_locked: bool,
     action: &mut ScreenAction,
     update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
 ) {
     let mut limited = configured_days.is_some();
-    if ui.checkbox(&mut limited, label).changed() {
+    let limit = ui.checkbox(&mut limited, label);
+    describe_history_lock(ui, &limit, history_locked);
+    if limit.changed() {
         *action = update(limited.then_some(configured_days.unwrap_or(30)));
     }
     if limited {
         let mut days = configured_days.unwrap_or(30) as i64;
-        setting_row(ui, "Days", |ui| {
-            if ui
+        setting_row(ui, "Days", |ui, label_id| {
+            let response = ui
                 .add(egui::DragValue::new(&mut days).clamp_range(1..=3_650))
-                .changed()
-            {
+                .labelled_by(label_id);
+            describe_history_lock(ui, &response, history_locked);
+            if response.changed() {
                 *action = update(Some(days as u32));
             }
         });
@@ -1692,13 +1757,22 @@ fn optional_retention_control(
     }
 }
 
-fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
+fn describe_history_lock(ui: &egui::Ui, response: &egui::Response, locked: bool) {
+    if locked {
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder
+                .set_description("Unavailable while a retained-audio retry owns its history row.");
+        });
+    }
+}
+
+fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui, egui::Id)) {
     ui.horizontal(|ui| {
-        ui.add_sized(
+        let label = ui.add_sized(
             [270.0, 40.0],
             egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
         );
-        contents(ui);
+        contents(ui, label.id);
     });
     ui.add_space(8.0);
     ui.separator();
@@ -2269,11 +2343,14 @@ mod tests {
             .iter()
             .find(|(_, node)| node.role() == egui::accesskit::Role::TabPanel)
             .unwrap();
-        assert!(
+        assert_eq!(
             nodes
                 .iter()
-                .filter(|(_, node)| node.role() == egui::accesskit::Role::Tab)
-                .all(|(_, node)| node.controls().contains(&panel.0))
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Tab && node.controls().contains(&panel.0)
+                })
+                .count(),
+            1
         );
         assert!(panel.1.labelled_by().contains(&selected_tab.0));
         assert!(nodes.iter().any(|(_, node)| {
@@ -2282,6 +2359,71 @@ mod tests {
                 && node.checked() == Some(egui::accesskit::Checked::True)
                 && node.radio_group().len() == 2
         }));
+    }
+
+    #[test]
+    fn settings_inputs_are_labelled_by_their_visible_rows() {
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::Recording,
+            SettingsTab::Output,
+            SettingsTab::Advanced,
+        ] {
+            let output = render_route(UiRoute::Settings(tab));
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            for (_, node) in nodes.iter().filter(|(_, node)| {
+                matches!(
+                    node.role(),
+                    egui::accesskit::Role::ComboBox
+                        | egui::accesskit::Role::SpinButton
+                        | egui::accesskit::Role::TextInput
+                )
+            }) {
+                assert!(
+                    !node.labelled_by().is_empty() || node.name().is_some(),
+                    "unlabelled {:?} on {tab:?}",
+                    node.role()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_hotkey_capture_and_history_lock_are_announced() {
+        let state = TranscriptionState::default();
+        let settings_view = RecordingSettingsView {
+            hotkey_capture_active: true,
+            hotkey_capture_status: Some(
+                "Press the new hotkey combination. Press Capture again to cancel.".into(),
+            ),
+            history_locked: true,
+            history_mode_label: "Transcript and audio".into(),
+            ..Default::default()
+        };
+        for tab in [SettingsTab::General, SettingsTab::Advanced] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, tab, &state, &settings_view);
+                });
+            });
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            if tab == SettingsTab::General {
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.name() == Some("Cancel hotkey capture") && node.is_selected() == Some(true)
+                }));
+            } else {
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.name()
+                        == Some(
+                            "History retention is locked while a retained-audio retry owns its row.",
+                        )
+                        && node.live() == Some(egui::accesskit::Live::Polite)
+                        && node.is_live_atomic()
+                }));
+            }
+        }
     }
 
     #[test]
