@@ -363,6 +363,38 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui.label("This may take a moment.");
             });
         }
+        TranscriptionPhase::RequestingMicrophone => {
+            ui.spinner();
+            ui.vertical(|ui| {
+                let status = ui.label(RichText::new("Requesting microphone access…").strong());
+                ui.ctx().accesskit_node_builder(status.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
+                ui.label("Recording will start after access is granted.");
+            });
+        }
+        TranscriptionPhase::ModelLoading => {
+            ui.spinner();
+            ui.vertical(|ui| {
+                let status = ui.label(RichText::new("Loading speech model…").strong());
+                ui.ctx().accesskit_node_builder(status.id, |builder| {
+                    builder.set_live(egui::accesskit::Live::Polite);
+                    builder.set_live_atomic();
+                });
+                ui.label("Recording will be available when the model is ready.");
+            });
+        }
+        TranscriptionPhase::ModelError => {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Speech model unavailable")
+                        .strong()
+                        .color(colors.error),
+                );
+                ui.label("Open model settings to repair or choose another model.");
+            });
+        }
         _ => {
             let start = recording_square_button(
                 ui,
@@ -501,6 +533,21 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
                     }
                     ui.add_space(12.0);
                 }
+                if state.phase == TranscriptionPhase::ModelError {
+                    let response = neutral_notice(
+                        ui,
+                        "The selected speech model could not be loaded. Open model settings to repair it or choose another model.",
+                    );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Alert);
+                        builder.set_live(egui::accesskit::Live::Assertive);
+                        builder.set_live_atomic();
+                    });
+                    if button(ui, "Open model settings", ButtonTone::Danger).clicked() {
+                        action = ScreenAction::ChangeModel;
+                    }
+                    ui.add_space(12.0);
+                }
                 if state.committed_transcript.trim().is_empty() {
                     ui.label(
                         RichText::new("Your transcript will appear here.")
@@ -547,13 +594,20 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
                         action = ScreenAction::CopyTranscript;
                     }
                     let clear = ui.add_enabled(
-                        has_committed_transcript,
+                        enabled && has_committed_transcript,
                         egui::Button::new("Clear").min_size(Vec2::new(72.0, 40.0)),
                     );
                     if !clear.enabled() {
+                        let reason = if !enabled {
+                            "Clear is unavailable while recording or finalizing the current transcript."
+                        } else {
+                            "Clear is unavailable until a final transcript exists."
+                        };
                         ui.ctx().accesskit_node_builder(clear.id, |builder| {
-                            builder.set_description("Clear is unavailable while recording or until a final transcript exists.")
+                            builder.set_description(reason)
                         });
+                        focus_tooltip(ui, &clear, reason);
+                        clear.clone().on_hover_text(reason);
                     }
                     if clear.clicked() {
                         action = ScreenAction::ClearTranscript;
@@ -587,7 +641,7 @@ fn neutral_notice(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .response
 }
 
-fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
+fn microphone_error_notice(ui: &mut egui::Ui, technical_detail: &str) -> ScreenAction {
     let colors = ui_palette(ui);
     let width = ui.available_width();
     let mut action = ScreenAction::None;
@@ -614,11 +668,20 @@ fn microphone_error_notice(ui: &mut egui::Ui, text: &str) -> ScreenAction {
                                 .color(colors.error_text),
                         );
                         let message_width = (ui.available_width() - 300.0).max(180.0);
-                        ui.add_sized(
-                            [message_width, 40.0],
-                            egui::Label::new(RichText::new(text).color(colors.error_text))
-                                .wrap(true),
-                        );
+                        ui.vertical(|ui| {
+                            ui.set_max_width(message_width);
+                            ui.label(
+                                RichText::new("Scribe couldn’t access your microphone.")
+                                    .strong()
+                                    .color(colors.error_text),
+                            );
+                            let detail = technical_detail.trim();
+                            if !detail.is_empty()
+                                && detail != "Scribe couldn’t access your microphone."
+                            {
+                                ui.label(RichText::new(detail).small().color(colors.error_text));
+                            }
+                        });
                         let open_settings = button(ui, "Open audio settings", ButtonTone::Text);
                         if open_settings.clicked() {
                             action = ScreenAction::OpenAudioSettings;
@@ -1774,6 +1837,80 @@ mod tests {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(expected_name)
             }));
         }
+    }
+
+    #[test]
+    fn busy_and_model_setup_phases_never_offer_start_or_clear() {
+        for (phase, expected_status) in [
+            (
+                TranscriptionPhase::RequestingMicrophone,
+                "Requesting microphone access…",
+            ),
+            (TranscriptionPhase::ModelLoading, "Loading speech model…"),
+            (TranscriptionPhase::ModelError, "Speech model unavailable"),
+        ] {
+            let state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                committed_transcript: "Keep this text.".into(),
+                ..Default::default()
+            };
+            let output = render_transcribe(&state, &[]);
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(expected_status))
+            );
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Start recording"))
+            );
+        }
+
+        for phase in [
+            TranscriptionPhase::Listening,
+            TranscriptionPhase::Finalizing,
+        ] {
+            let state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                committed_transcript: "Keep this text.".into(),
+                ..Default::default()
+            };
+            let output = render_transcribe(&state, &[]);
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Clear")
+                    && node.description()
+                        == Some(
+                            "Clear is unavailable while recording or finalizing the current transcript.",
+                        )
+            }));
+        }
+    }
+
+    #[test]
+    fn microphone_error_uses_canonical_primary_copy_and_secondary_detail() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::MicrophoneError,
+            selected_model_id: Some("base.en".into()),
+            notice: Some("Microphone failed: device disconnected".into()),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes.iter().any(|(_, node)| {
+                node.name() == Some("Scribe couldn’t access your microphone.")
+            })
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| { node.name() == Some("Microphone failed: device disconnected") })
+        );
     }
 
     #[test]

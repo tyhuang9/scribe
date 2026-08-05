@@ -121,7 +121,7 @@ impl TranscriptionState {
             {
                 self.phase = TranscriptionPhase::MicrophoneError;
                 self.microphone_permission = MicrophonePermission::Denied;
-                self.notice = Some("Scribe couldn\u{2019}t access your microphone".into());
+                self.notice = Some("Scribe couldn\u{2019}t access your microphone.".into());
             }
             TranscriptionEvent::Partial(text) if self.phase == TranscriptionPhase::Listening => {
                 self.provisional_transcript = text;
