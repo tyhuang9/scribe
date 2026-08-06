@@ -73,6 +73,11 @@ pub(crate) fn button(
             .rounding(Rounding::same(5.0))
             .min_size(Vec2::new(0.0, PRIMARY_TARGET_HEIGHT)),
     );
+    if !response.enabled() {
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_disabled();
+        });
+    }
     paint_focus_ring(ui, &response, Rounding::same(5.0));
     response
 }

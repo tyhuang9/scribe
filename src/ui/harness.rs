@@ -696,6 +696,21 @@ mod tests {
             .unwrap_or_else(|| panic!("missing AccessKit node for {name}"))
     }
 
+    fn node_id_matching(
+        output: &egui::FullOutput,
+        predicate: impl Fn(&egui::accesskit::Node) -> bool,
+    ) -> egui::accesskit::NodeId {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes
+            .iter()
+            .find_map(|(id, node)| predicate(node).then_some(*id))
+            .expect("expected AccessKit node")
+    }
+
     fn click_named_control(
         ctx: &egui::Context,
         data: &mut FixtureData,
@@ -939,6 +954,131 @@ mod tests {
                 repeat: false,
                 modifiers: egui::Modifiers::NONE,
             }],
+        );
+        assert_eq!(action, ScreenAction::ConfirmModelRemoval("tiny.en".into()));
+    }
+
+    #[test]
+    fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
+        let (width, height) = (1180.0, 815.0);
+        for (dialog, background_control, dialog_name, expected_focus) in [
+            (ModelDialog::Add, "Add models", "Add models", "Close"),
+            (
+                ModelDialog::Details("base.en".into()),
+                "Details for Base English",
+                "Model details for Base English",
+                "Close",
+            ),
+            (
+                ModelDialog::Remove("tiny.en".into()),
+                "Expand comparison",
+                "Remove Tiny English",
+                "Cancel",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = Fixture::ModelsInstalled.page();
+            data.model_management.dialog = Some(dialog);
+            data.model_management.focus_dialog_initial = true;
+
+            let (initial, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let dialog_node = node_matching(&initial, |node| node.name() == Some(dialog_name));
+            assert!(dialog_node.is_modal(), "{dialog_name} must be modal");
+            let background = node_matching(&initial, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node
+                        .name()
+                        .is_some_and(|name| name.contains(background_control))
+            });
+            assert!(
+                background.is_disabled(),
+                "{background_control} must be disabled behind {dialog_name}"
+            );
+            let background_id = node_id_matching(&initial, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node
+                        .name()
+                        .is_some_and(|name| name.contains(background_control))
+            });
+
+            let (focused, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target: background_id,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(action, ScreenAction::None);
+            assert_eq!(focused_node(&focused).name(), Some(expected_focus));
+
+            let (_, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: background_id,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(
+                action,
+                ScreenAction::None,
+                "{background_control} must not act while {dialog_name} is open"
+            );
+        }
+    }
+
+    #[test]
+    fn model_dialog_controls_remain_enabled_and_accesskit_actionable() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let remove = node_matching(&initial, |node| node.name() == Some("Remove"));
+        assert_eq!(remove.role(), egui::accesskit::Role::Button);
+        assert!(
+            !remove.is_disabled(),
+            "dialog Remove control must remain enabled"
+        );
+        let remove_id = named_node_id(&initial, "Remove");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: remove_id,
+                    data: None,
+                },
+            )],
         );
         assert_eq!(action, ScreenAction::ConfirmModelRemoval("tiny.en".into()));
     }
