@@ -187,7 +187,19 @@ impl UiHarnessApp {
 }
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
+        let clear_reference_action_focus = self.data.comparison.restore_reference_action_focus;
+        let clear_reference_notice = self.data.comparison.reference_notice.is_some();
         let action = show_harness(ctx, &self.data, &mut self.page);
+        if clear_reference_editor_focus {
+            self.data.comparison.focus_reference_editor = false;
+        }
+        if clear_reference_action_focus {
+            self.data.comparison.restore_reference_action_focus = false;
+        }
+        if clear_reference_notice {
+            self.data.comparison.reference_notice = None;
+        }
         apply_action(&mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
     }
@@ -268,7 +280,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             if let Some(reference) = data.comparison.reference_transcript.as_deref() {
                 data.comparison.reference_draft = reference.to_owned();
             }
-            data.comparison.reference_editor_visible = true
+            data.comparison.reference_editor_visible = true;
+            data.comparison.focus_reference_editor = true;
+            data.comparison.restore_reference_action_focus = false;
         }
         ScreenAction::HideComparisonReferenceEditor => {
             data.comparison.reference_draft = data
@@ -276,7 +290,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
                 .reference_transcript
                 .clone()
                 .unwrap_or_default();
-            data.comparison.reference_editor_visible = false
+            data.comparison.reference_editor_visible = false;
+            data.comparison.focus_reference_editor = false;
+            data.comparison.restore_reference_action_focus = true;
         }
         ScreenAction::EditComparisonReference(reference) => {
             data.comparison.reference_draft = reference
@@ -286,11 +302,17 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.comparison.reference_draft = reference.clone();
             data.comparison.reference_transcript = (!reference.is_empty()).then_some(reference);
             data.comparison.reference_editor_visible = false;
+            data.comparison.focus_reference_editor = false;
+            data.comparison.restore_reference_action_focus = true;
+            data.comparison.reference_notice = Some("Reference transcript applied.".to_owned());
         }
         ScreenAction::ClearComparisonReference => {
             data.comparison.reference_draft.clear();
             data.comparison.reference_transcript = None;
             data.comparison.reference_editor_visible = false;
+            data.comparison.focus_reference_editor = false;
+            data.comparison.restore_reference_action_focus = true;
+            data.comparison.reference_notice = Some("Reference transcript cleared.".to_owned());
         }
         ScreenAction::SetSettingsTab(tab) => {
             data.route = UiRoute::Settings(tab);
@@ -377,12 +399,15 @@ mod tests {
 
     fn render_with_input(
         ctx: &egui::Context,
-        data: &FixtureData,
+        data: &mut FixtureData,
         page: &mut AppPage,
         width: f32,
         height: f32,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, ScreenAction) {
+        let clear_reference_editor_focus = data.comparison.focus_reference_editor;
+        let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
+        let clear_reference_notice = data.comparison.reference_notice.is_some();
         let mut action = ScreenAction::None;
         let output = ctx.run(
             egui::RawInput {
@@ -395,6 +420,15 @@ mod tests {
             },
             |ctx| action = show_harness(ctx, data, page),
         );
+        if clear_reference_editor_focus {
+            data.comparison.focus_reference_editor = false;
+        }
+        if clear_reference_action_focus {
+            data.comparison.restore_reference_action_focus = false;
+        }
+        if clear_reference_notice {
+            data.comparison.reference_notice = None;
+        }
         (output, action)
     }
 
@@ -424,7 +458,7 @@ mod tests {
 
     fn click_named_control(
         ctx: &egui::Context,
-        data: &FixtureData,
+        data: &mut FixtureData,
         page: &mut AppPage,
         width: f32,
         height: f32,
@@ -488,6 +522,37 @@ mod tests {
             .map(|(_, node)| node)
             .find(|node| predicate(node))
             .expect("expected AccessKit node")
+    }
+
+    fn focused_node(output: &egui::FullOutput) -> &egui::accesskit::Node {
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update");
+        update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == update.focus)
+            .map(|(_, node)| node)
+            .expect("focused control should remain in the accessibility tree")
+    }
+
+    fn assert_polite_atomic_notice(output: &egui::FullOutput, expected: &str) {
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some(expected)
+                        && node.live() == Some(egui::accesskit::Live::Polite)
+                        && node.is_live_atomic()
+                })
+        );
     }
 
     fn assert_near(actual: f64, expected: f64, label: &str) {
@@ -638,13 +703,19 @@ mod tests {
         let mut data = Fixture::ModelsInstalled.data();
         let mut page = Fixture::ModelsInstalled.page();
 
-        let action =
-            click_named_control(&ctx, &data, &mut page, width, height, "Expand comparison");
+        let action = click_named_control(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            "Expand comparison",
+        );
         assert_eq!(action, ScreenAction::ToggleComparison);
         apply_action(&mut data, &mut page, action);
         assert!(data.comparison.expanded);
         assert_eq!(
-            render_with_input(&ctx, &data, &mut page, width, height, Vec::new()).1,
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).1,
             ScreenAction::None
         );
 
@@ -653,12 +724,13 @@ mod tests {
         configure_accessible_style(&ctx);
         let mut data = Fixture::ModelsInstalled.data();
         let mut page = Fixture::ModelsInstalled.page();
-        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
         let chevron = named_node_id(&output, "Expand comparison");
         let (_, action) = render_with_input(
             &ctx,
-            &data,
+            &mut data,
             &mut page,
             width,
             height,
@@ -674,7 +746,7 @@ mod tests {
         apply_action(&mut data, &mut page, action);
         assert!(data.comparison.expanded);
         assert_eq!(
-            render_with_input(&ctx, &data, &mut page, width, height, Vec::new()).1,
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).1,
             ScreenAction::None
         );
     }
@@ -689,7 +761,7 @@ mod tests {
         let mut page = Fixture::ModelsInstalled.page();
 
         let (initial_output, initial_action) =
-            render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(initial_action, ScreenAction::None);
         assert!(!data.comparison.expanded);
 
@@ -734,7 +806,7 @@ mod tests {
 
         let (press_output, press_action) = render_with_input(
             &ctx,
-            &data,
+            &mut data,
             &mut page,
             width,
             height,
@@ -754,7 +826,7 @@ mod tests {
 
         let (release_output, release_action) = render_with_input(
             &ctx,
-            &data,
+            &mut data,
             &mut page,
             width,
             height,
@@ -773,7 +845,7 @@ mod tests {
         assert!(data.comparison.expanded);
 
         let (expanded_output, expanded_action) =
-            render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(expanded_action, ScreenAction::None);
         let expanded_chevron = node_matching(&expanded_output, |node| {
             node.name() == Some("Collapse comparison")
@@ -803,7 +875,8 @@ mod tests {
         let mut data = Fixture::ModelsCompareExpanded.data();
         let mut page = Fixture::ModelsCompareExpanded.page();
 
-        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
         let update = output.platform_output.accesskit_update.as_ref().unwrap();
         assert!(
@@ -819,7 +892,7 @@ mod tests {
 
         let action = click_named_control(
             &ctx,
-            &data,
+            &mut data,
             &mut page,
             width,
             height,
@@ -828,8 +901,11 @@ mod tests {
         assert_eq!(action, ScreenAction::ShowComparisonReferenceEditor);
         apply_action(&mut data, &mut page, action);
         assert!(data.comparison.reference_editor_visible);
-        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Reference transcript"));
+        assert!(!data.comparison.focus_reference_editor);
         assert!(
             output
                 .platform_output
@@ -840,6 +916,105 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Reference transcript"))
         );
+    }
+
+    #[test]
+    fn comparison_reference_focus_and_feedback_follow_conditional_controls() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCompareExpanded.data();
+        let mut page = Fixture::ModelsCompareExpanded.page();
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Reference transcript"));
+        assert!(!data.comparison.focus_reference_editor);
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::EditComparisonReference("spoken words".into()),
+        );
+        apply_action(&mut data, &mut page, ScreenAction::ApplyComparisonReference);
+        assert!(data.comparison.restore_reference_action_focus);
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Edit reference"));
+        assert_polite_atomic_notice(&output, "Reference transcript applied.");
+        assert!(!data.comparison.restore_reference_action_focus);
+        assert_eq!(data.comparison.reference_notice, None);
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        apply_action(&mut data, &mut page, ScreenAction::ClearComparisonReference);
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(
+            focused_node(&output).description(),
+            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
+        );
+        assert_polite_atomic_notice(&output, "Reference transcript cleared.");
+        assert!(!data.comparison.restore_reference_action_focus);
+        assert_eq!(data.comparison.reference_notice, None);
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::HideComparisonReferenceEditor,
+        );
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(
+            focused_node(&output).description(),
+            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
+        );
+        assert_eq!(data.comparison.reference_notice, None);
+
+        data.comparison.reference_transcript = Some("spoken words".into());
+        data.comparison.reference_draft = "spoken words".into();
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::EditComparisonReference("unsaved change".into()),
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::HideComparisonReferenceEditor,
+        );
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Edit reference"));
+        assert_eq!(data.comparison.reference_draft, "spoken words");
+        assert_eq!(data.comparison.reference_notice, None);
+        assert!(!data.comparison.restore_reference_action_focus);
     }
 
     #[test]

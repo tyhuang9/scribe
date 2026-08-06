@@ -8680,6 +8680,10 @@ impl LocalTranscriberApp {
         let clear_add_focus = self.model_management.restore_add_focus;
         let restored_details_focus = self.model_management.restore_details_focus.clone();
         let restored_remove_focus = self.model_management.restore_remove_focus.clone();
+        let clear_removal_notice = self.model_management.removal_notice.is_some();
+        let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
+        let clear_reference_action_focus = self.model_comparison.restore_reference_action_focus;
+        let clear_reference_notice = self.model_comparison.reference_notice.is_some();
         let action = render_screen(
             ui,
             &ScreenView {
@@ -8703,6 +8707,18 @@ impl LocalTranscriberApp {
         }
         if restored_remove_focus.is_some() {
             self.model_management.restore_remove_focus = None;
+        }
+        if clear_removal_notice {
+            self.model_management.removal_notice = None;
+        }
+        if clear_reference_editor_focus {
+            self.model_comparison.focus_reference_editor = false;
+        }
+        if clear_reference_action_focus {
+            self.model_comparison.restore_reference_action_focus = false;
+        }
+        if clear_reference_notice {
+            self.model_comparison.reference_notice = None;
         }
         self.apply_model_management_action(action);
     }
@@ -9021,6 +9037,8 @@ impl LocalTranscriberApp {
                     self.model_comparison.reference_draft = reference.to_owned();
                 }
                 self.model_comparison.reference_editor_visible = true;
+                self.model_comparison.focus_reference_editor = true;
+                self.model_comparison.restore_reference_action_focus = false;
             }
             ScreenAction::HideComparisonReferenceEditor => {
                 self.model_comparison.reference_draft = self
@@ -9029,6 +9047,8 @@ impl LocalTranscriberApp {
                     .clone()
                     .unwrap_or_default();
                 self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
             }
             ScreenAction::EditComparisonReference(reference) => {
                 self.model_comparison.reference_draft = reference;
@@ -9039,12 +9059,20 @@ impl LocalTranscriberApp {
                 self.model_comparison.reference_transcript =
                     (!reference.is_empty()).then_some(reference);
                 self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
+                self.model_comparison.reference_notice =
+                    Some("Reference transcript applied.".to_owned());
                 self.sync_model_comparison_state();
             }
             ScreenAction::ClearComparisonReference => {
                 self.model_comparison.reference_draft.clear();
                 self.model_comparison.reference_transcript = None;
                 self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
+                self.model_comparison.reference_notice =
+                    Some("Reference transcript cleared.".to_owned());
                 self.sync_model_comparison_state();
             }
             ScreenAction::InstallModel(id) => {
@@ -16533,6 +16561,69 @@ mod layout_tests {
             ComparisonResultPhase::Error
         );
         assert_eq!(app.model_comparison.results[1].1.word_error_rate, Some(0.0));
+    }
+
+    #[test]
+    fn models_render_clears_reference_focus_requests_and_notice_after_one_frame() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.model_comparison.expanded = true;
+        app.model_comparison.reference_editor_visible = true;
+        app.model_comparison.focus_reference_editor = true;
+
+        let render = |ctx: &egui::Context, app: &mut LocalTranscriberApp| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_180.0, 815.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| app.ui_models(ui));
+                },
+            )
+        };
+
+        let output = render(&ctx, &mut app);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.name()),
+            Some("Reference transcript")
+        );
+        assert!(!app.model_comparison.focus_reference_editor);
+
+        app.model_comparison.reference_editor_visible = false;
+        app.model_comparison.reference_draft = "spoken words".into();
+        app.model_comparison.reference_transcript = Some("spoken words".into());
+        app.model_comparison.restore_reference_action_focus = true;
+        app.model_comparison.reference_notice = Some("Reference transcript applied.".into());
+        let output = render(&ctx, &mut app);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.name()),
+            Some("Edit reference")
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some("Reference transcript applied.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
+        assert!(!app.model_comparison.restore_reference_action_focus);
+        assert_eq!(app.model_comparison.reference_notice, None);
     }
 
     #[test]

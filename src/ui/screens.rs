@@ -1107,6 +1107,13 @@ fn models(
                 if let Some(feedback) = comparison.selection_feedback.as_deref() {
                     ui.label(RichText::new(feedback).small().color(colors.warning));
                 }
+                if let Some(notice) = comparison.reference_notice.as_deref() {
+                    let response = ui.label(RichText::new(notice).small().color(colors.muted_text));
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    });
+                }
                 if comparison.reference_editor_visible {
                     ui.separator();
                     ui.label(RichText::new("Reference transcript (optional)").strong());
@@ -1123,14 +1130,27 @@ fn models(
                             "Optional reference text used to calculate word error rate after the run.",
                         );
                     });
+                    if comparison.focus_reference_editor {
+                        reference.request_focus();
+                    }
+                    let can_apply_reference = !reference_draft.trim().is_empty();
                     if reference.changed() {
                         action = ScreenAction::EditComparisonReference(reference_draft);
                     }
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Apply reference"))
-                            .clicked()
-                        {
+                        let apply_reference = ui.add_enabled(
+                            can_apply_reference,
+                            egui::Button::new("Apply reference")
+                                .min_size(Vec2::new(0.0, 44.0)),
+                        );
+                        if !can_apply_reference {
+                            ui.ctx().accesskit_node_builder(apply_reference.id, |builder| {
+                                builder.set_description(
+                                    "Enter a reference transcript before applying it.",
+                                );
+                            });
+                        }
+                        if apply_reference.clicked() {
                             action = ScreenAction::ApplyComparisonReference;
                         }
                         if ui
@@ -1159,7 +1179,11 @@ fn models(
                                 .small()
                                 .color(colors.muted_text),
                         );
-                        if button(ui, "Edit reference", ButtonTone::Text).clicked() {
+                        let edit_reference = button(ui, "Edit reference", ButtonTone::Text);
+                        if comparison.restore_reference_action_focus {
+                            edit_reference.request_focus();
+                        }
+                        if edit_reference.clicked() {
                             action = ScreenAction::ShowComparisonReferenceEditor;
                         }
                     });
@@ -1483,6 +1507,8 @@ fn render_comparison_results(
     }
 
     let mut action = ScreenAction::None;
+    // Rows follow visible model order, so the first rendered Add action is the stable return target.
+    let mut restore_reference_focus = comparison.restore_reference_action_focus;
     if ui.available_width() < 720.0 {
         for model in selected {
             let result = comparison
@@ -1501,7 +1527,13 @@ fn render_comparison_results(
                 ui.label(format!("Output: {}", comparison_output_summary(result)));
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Accuracy:");
-                    let accuracy_action = comparison_accuracy_cell(ui, comparison, result);
+                    let accuracy_action = comparison_accuracy_cell(
+                        ui,
+                        model,
+                        comparison,
+                        result,
+                        &mut restore_reference_focus,
+                    );
                     if accuracy_action != ScreenAction::None {
                         action = accuracy_action;
                     }
@@ -1562,8 +1594,13 @@ fn render_comparison_results(
                                 builder.set_role(egui::accesskit::Role::Cell);
                             });
                         }
-                        let accuracy_action =
-                            comparison_accuracy_cell(&mut columns[4], comparison, result);
+                        let accuracy_action = comparison_accuracy_cell(
+                            &mut columns[4],
+                            model,
+                            comparison,
+                            result,
+                            &mut restore_reference_focus,
+                        );
                         if accuracy_action != ScreenAction::None {
                             action = accuracy_action;
                         }
@@ -1593,9 +1630,6 @@ fn comparison_status(comparison: &ModelComparisonState) -> Option<String> {
         ComparisonPhase::Processing => Some("Comparison processing in progress.".into()),
         ComparisonPhase::Complete => Some("Comparison results are ready.".into()),
         ComparisonPhase::Error => Some("Comparison finished with an error.".into()),
-        ComparisonPhase::Idle if comparison.reference_transcript.is_some() => {
-            Some("Reference transcript applied.".into())
-        }
         ComparisonPhase::Idle => None,
     }
 }
@@ -1634,8 +1668,10 @@ fn comparison_output_summary(result: Option<&super::state::ComparisonResult>) ->
 
 fn comparison_accuracy_cell(
     ui: &mut egui::Ui,
+    model: &ModelViewModel,
     comparison: &ModelComparisonState,
     result: Option<&super::state::ComparisonResult>,
+    restore_reference_focus: &mut bool,
 ) -> ScreenAction {
     match (
         comparison.reference_transcript.as_deref(),
@@ -1662,7 +1698,15 @@ fn comparison_accuracy_cell(
                 .accesskit_node_builder(add_reference.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Button);
                     builder.set_name("Add a reference transcript to measure");
+                    builder.set_description(format!(
+                        "Add a reference transcript to measure accuracy for {}.",
+                        model.display_name
+                    ));
                 });
+            if *restore_reference_focus {
+                add_reference.request_focus();
+                *restore_reference_focus = false;
+            }
             if add_reference.clicked() {
                 ScreenAction::ShowComparisonReferenceEditor
             } else {

@@ -365,8 +365,12 @@ pub(crate) struct ModelComparisonState {
     pub audio_duration_ms: Option<u64>,
     pub recording_elapsed_ms: u64,
     pub reference_editor_visible: bool,
+    pub focus_reference_editor: bool,
+    pub restore_reference_action_focus: bool,
     pub reference_draft: String,
     pub reference_transcript: Option<String>,
+    /// One-frame polite confirmation after applying or clearing a reference transcript.
+    pub reference_notice: Option<String>,
     pub selection_feedback: Option<String>,
     pub start_disabled_reason: Option<String>,
     pub results: Vec<(String, ComparisonResult)>,
@@ -559,7 +563,11 @@ mod tests {
 
     #[test]
     fn comparison_reference_editor_starts_hidden() {
-        assert!(!ModelComparisonState::default().reference_editor_visible);
+        let comparison = ModelComparisonState::default();
+        assert!(!comparison.reference_editor_visible);
+        assert!(!comparison.focus_reference_editor);
+        assert!(!comparison.restore_reference_action_focus);
+        assert_eq!(comparison.reference_notice, None);
     }
 
     #[test]
