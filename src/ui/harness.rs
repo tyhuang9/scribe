@@ -229,9 +229,15 @@ pub(crate) struct UiHarnessApp {
     page: AppPage,
     data: FixtureData,
 }
+
+fn configure_harness_style(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::light());
+    configure_accessible_style(ctx);
+}
+
 impl UiHarnessApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, fixture: Fixture) -> Self {
-        configure_accessible_style(&cc.egui_ctx);
+        configure_harness_style(&cc.egui_ctx);
         Self {
             page: fixture.page(),
             data: fixture.data(),
@@ -541,6 +547,22 @@ mod tests {
     use super::*;
 
     const LAYOUT_TOLERANCE: f64 = 1.0;
+
+    #[test]
+    fn harness_initialization_forces_light_visuals_and_keeps_accessible_style() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::dark());
+
+        configure_harness_style(&ctx);
+
+        let style = ctx.style();
+        assert!(!style.visuals.dark_mode);
+        assert_eq!(style.spacing.interact_size, egui::vec2(44.0, 44.0));
+        assert_eq!(
+            style.text_styles[&egui::TextStyle::Body],
+            egui::FontId::new(14.0, egui::FontFamily::Proportional)
+        );
+    }
 
     fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();

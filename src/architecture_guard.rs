@@ -237,3 +237,43 @@ fn no_web_runtime_or_ui_pcm_transport_is_present() {
         }
     }
 }
+
+#[test]
+fn production_native_path_does_not_force_harness_light_visuals() {
+    let sources = rust_sources();
+    let main = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("main.rs"))
+        .map(|(_, source)| source)
+        .expect("main source exists");
+    let app = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("app.rs"))
+        .map(|(_, source)| source)
+        .expect("app source exists");
+
+    assert!(
+        main.contains("follow_system_theme: true"),
+        "native options must continue following the system theme"
+    );
+    assert!(
+        main.contains("Box::new(app::LocalTranscriberApp::new(cc))"),
+        "normal startup must retain the production app path"
+    );
+    assert!(
+        !main.contains("set_visuals(egui::Visuals::light())"),
+        "native options/startup must not force light visuals"
+    );
+    assert!(
+        app.contains("cc.egui_ctx.set_visuals(stitch_visuals(resolve_theme_mode("),
+        "production app startup must keep its theme selection path"
+    );
+    assert!(
+        app.contains("frame.info().system_theme"),
+        "production app updates must retain system-theme resolution"
+    );
+    assert!(
+        !app.contains("configure_harness_style"),
+        "harness-only theme initialization must not leak into production"
+    );
+}
