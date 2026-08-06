@@ -24,7 +24,7 @@ pub(crate) struct RecordingSettingsView {
     pub selected_audio_device: Option<String>,
     pub audio_devices: Vec<String>,
     pub device_label: String,
-    pub input_level: f32,
+    pub input_sensitivity_percent: u8,
     pub auto_insert_transcript: bool,
     pub output_label: String,
     pub show_restore_clipboard: bool,
@@ -69,7 +69,7 @@ impl Default for RecordingSettingsView {
             selected_audio_device: None,
             audio_devices: Vec::new(),
             device_label: "OS default".into(),
-            input_level: 0.0,
+            input_sensitivity_percent: 50,
             auto_insert_transcript: false,
             output_label: "Automatically insert final transcript".into(),
             show_restore_clipboard: cfg!(target_os = "windows"),
@@ -139,6 +139,7 @@ pub(crate) enum ScreenAction {
     SetDurationSeconds(u32),
     ToggleProvisionalFeedback,
     SetAudioDevice(Option<String>),
+    SetInputSensitivity(u8),
     RefreshDevices,
     ChangeShortcut,
     SetAutoInsertTranscript(bool),
@@ -1368,7 +1369,11 @@ fn recording_settings_panel(
     });
     ui.add_space(16.0);
     card(ui, |ui| {
-        ui.label(RichText::new("Audio input").strong());
+        let audio_heading = ui.label(RichText::new("Audio input").strong());
+        ui.ctx()
+            .accesskit_node_builder(audio_heading.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Heading);
+            });
         ui.add_space(12.0);
         ui.add_enabled_ui(!recording_locked, |ui| {
             setting_row(ui, "Device", |ui, label_id| {
@@ -1400,10 +1405,24 @@ fn recording_settings_panel(
                     *action = ScreenAction::RefreshDevices;
                 }
             });
-            setting_row(ui, "Input level", |ui, label_id| {
-                ui.label(RichText::new(icon_glyph(Icon::Microphone)).size(18.0));
-                ui.add(egui::ProgressBar::new(settings.input_level).desired_width(320.0))
+            setting_row(ui, "Input sensitivity", |ui, label_id| {
+                let mut percent = settings.input_sensitivity_percent;
+                let sensitivity = ui
+                    .add_sized(
+                        [320.0, 40.0],
+                        egui::Slider::new(&mut percent, 0..=100)
+                            .show_value(false),
+                    )
                     .labelled_by(label_id);
+                ui.ctx().accesskit_node_builder(sensitivity.id, |builder| {
+                    builder.set_name("Input sensitivity");
+                    builder.set_description(
+                        "Minimum microphone level treated as speech. Use Left and Right arrow keys to adjust.",
+                    );
+                });
+                if sensitivity.changed() {
+                    *action = ScreenAction::SetInputSensitivity(percent);
+                }
             });
         });
     });
@@ -2388,6 +2407,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn recording_settings_exposes_one_sensitivity_slider_without_live_input_meter() {
+        use egui::accesskit::Role;
+
+        let settings_view = RecordingSettingsView {
+            input_sensitivity_percent: 42,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = settings(
+                    ui,
+                    SettingsTab::Recording,
+                    &TranscriptionState::default(),
+                    &settings_view,
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let sliders = nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == Role::Slider && node.name() == Some("Input sensitivity")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sliders.len(), 1);
+        let slider = &sliders[0].1;
+        assert_eq!(slider.min_numeric_value(), Some(0.0));
+        assert_eq!(slider.max_numeric_value(), Some(100.0));
+        assert_eq!(slider.numeric_value(), Some(42.0));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == Role::Heading && node.name() == Some("Audio input")
+        }));
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.role() == Role::ProgressIndicator)
+        );
     }
 
     #[test]

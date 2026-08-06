@@ -71,7 +71,6 @@ impl Fixture {
             duration_label: "30 seconds".into(),
             provisional_feedback: true,
             device_label: "Microphone (fifine Microphone)".into(),
-            input_level: 0.45,
             ..Default::default()
         };
         let route = match self {
@@ -267,6 +266,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetAudioDevice(device) => {
             data.settings.selected_audio_device = device.clone();
             data.settings.device_label = device.unwrap_or_else(|| "OS default".into());
+        }
+        ScreenAction::SetInputSensitivity(percent) => {
+            data.settings.input_sensitivity_percent = percent;
         }
         ScreenAction::RefreshDevices | ScreenAction::ChangeShortcut => {}
         ScreenAction::SetAutoInsertTranscript(value) => {

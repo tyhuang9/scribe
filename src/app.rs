@@ -8146,10 +8146,6 @@ impl LocalTranscriberApp {
                 .audio_input_device_name
                 .clone()
                 .unwrap_or_else(|| "OS default".to_owned()),
-            input_level: self
-                .capture_is_active()
-                .then(|| self.current_audio_level())
-                .unwrap_or_default(),
             save_state: settings_save_state(
                 self.settings_store
                     .as_ref()
@@ -8283,6 +8279,7 @@ impl LocalTranscriberApp {
             | ScreenAction::SetDurationSeconds(_)
             | ScreenAction::ToggleProvisionalFeedback
             | ScreenAction::SetAudioDevice(_)
+            | ScreenAction::SetInputSensitivity(_)
             | ScreenAction::RefreshDevices
             | ScreenAction::ChangeShortcut
             | ScreenAction::SetAutoInsertTranscript(_)
@@ -9710,10 +9707,10 @@ impl LocalTranscriberApp {
                 .audio_input_device_name
                 .clone()
                 .unwrap_or_else(|| "OS default".to_owned()),
-            input_level: self
-                .capture_is_active()
-                .then(|| self.current_audio_level())
-                .unwrap_or_default(),
+            input_sensitivity_percent: (rms_to_slider_position(
+                self.config.recording.manual_activation_rms,
+            ) * 100.0)
+                .round() as u8,
             auto_insert_transcript: self.config.output.auto_insert_transcript,
             output_label: if cfg!(target_os = "windows") {
                 "Insert final transcript into captured app".to_owned()
@@ -9840,6 +9837,12 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetAudioDevice(device) => {
                 self.config.recording.audio_input_device_name = device;
+                self.save_config();
+            }
+            ScreenAction::SetInputSensitivity(percent) => {
+                self.config.recording.manual_activation_rms =
+                    dbfs_to_rms(slider_position_to_dbfs(f32::from(percent) / 100.0));
+                self.apply_input_sensitivity_threshold();
                 self.save_config();
             }
             ScreenAction::RefreshDevices => self.refresh_audio_devices(),
@@ -18448,6 +18451,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Recording;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
@@ -18466,15 +18470,15 @@ mod layout_tests {
         );
         let update = output.platform_output.accesskit_update.unwrap();
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Audio")
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Audio input")
         }));
 
         let microphone_label_id = update
             .nodes
             .iter()
-            .find(|(_, node)| node.name() == Some("Microphone"))
+            .find(|(_, node)| node.name() == Some("Device"))
             .map(|(id, _)| *id)
-            .expect("missing Microphone label");
+            .expect("missing Device label");
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ComboBox
                 && node.labelled_by().contains(&microphone_label_id)
@@ -18721,6 +18725,7 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test = MicrophoneTest::Starting {
             request_id: 1,
             stop_requested: false,
@@ -18749,6 +18754,7 @@ mod layout_tests {
             peak: 0.15,
         });
         let mut app = test_app();
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
@@ -18762,6 +18768,7 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
+        app.settings_tab = SettingsTab::Recording;
         app.microphone_test_error = Some("Microphone permission denied".to_owned());
         app.microphone_monitor_retry_at = Some(Instant::now() + Duration::from_secs(60));
         let update = render(&ctx, &mut app);
