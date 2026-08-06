@@ -67,9 +67,16 @@ impl Fixture {
         }
     }
     fn data(self) -> FixtureData {
-        let mut transcription = TranscriptionState { selected_model_id: Some("base.en".into()), hotkey: "Ctrl + Space".into(), committed_transcript: "Today’s meeting notes regarding the local-first architecture. We discussed the importance of privacy and keeping all model inference on this device.".into(), elapsed_ms: 8_000, ..Default::default() };
+        let mut transcription = TranscriptionState {
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl + Space".into(),
+            committed_transcript: "Today's meeting notes regarding the local-first architecture. We discussed the importance of privacy and keeping all model inference on the user's machine to ensure zero data leakage. The performance of the small models is acceptable for dictation, but we might need to explore quantized larger models for complex technical jargon.".into(),
+            elapsed_ms: 8_000,
+            last_successful_capture_ms: Some(120_000),
+            ..Default::default()
+        };
         let models = vec![
-            model("Base English", "base.en", true, true, 400),
+            model("whisper.cpp base.en", "base.en", true, true, 400),
             model("Tiny English", "tiny.en", false, false, 75),
         ];
         let mut comparison = ModelComparisonState::default();
@@ -839,6 +846,27 @@ mod tests {
         );
     }
 
+    fn assert_bounds_within(
+        inner: egui::accesskit::Rect,
+        outer: egui::accesskit::Rect,
+        label: &str,
+    ) {
+        assert!(
+            inner.x0 >= outer.x0 - LAYOUT_TOLERANCE
+                && inner.x1 <= outer.x1 + LAYOUT_TOLERANCE
+                && inner.y0 >= outer.y0 - LAYOUT_TOLERANCE
+                && inner.y1 <= outer.y1 + LAYOUT_TOLERANCE,
+            "{label} {inner:?} must remain within {outer:?}"
+        );
+    }
+
+    fn assert_within_tolerance(actual: f64, expected: f64, tolerance: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: expected {expected} ± {tolerance}, got {actual}"
+        );
+    }
+
     fn node_names(output: &egui::FullOutput) -> Vec<String> {
         output
             .platform_output
@@ -849,6 +877,408 @@ mod tests {
             .iter()
             .filter_map(|(_, node)| node.name().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn transcribe_layout_stays_within_shell_at_reference_widths() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::TranscribeReady.data();
+            let mut page = Fixture::TranscribeReady.page();
+            let committed = "A deliberately long committed transcript should wrap within the bounded transcript panel without pushing any controls beyond the application content region. ".repeat(8);
+            let provisional = "A deliberately long provisional transcript should also wrap within the bounded transcript panel rather than creating horizontal overflow. ".repeat(8);
+            data.transcription.committed_transcript = committed.clone();
+            data.transcription.provisional_transcript = provisional.clone();
+
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+
+            let viewport = egui::accesskit::Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width.into(),
+                y1: height.into(),
+            };
+            let panel = named_node_bounds(&output, "Transcript panel");
+            let model = named_node_bounds(&output, "Selected model");
+            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            assert!(
+                panel.x0 >= viewport.x0 - LAYOUT_TOLERANCE
+                    && panel.x1 <= viewport.x1 + LAYOUT_TOLERANCE,
+                "transcript panel must remain within the viewport width: {panel:?}"
+            );
+            for (label, card) in [("selected model card", model), ("hotkey card", hotkey)] {
+                assert!(
+                    card.x0 >= panel.x0 - LAYOUT_TOLERANCE
+                        && card.x1 <= panel.x1 + LAYOUT_TOLERANCE,
+                    "{label} {card:?} must remain within content width {panel:?}"
+                );
+                assert_bounds_within(card, viewport, label);
+                assert_within_tolerance(
+                    card.y1 - card.y0,
+                    50.0,
+                    3.0,
+                    "compact selector card height",
+                );
+            }
+            assert_within_tolerance(model.y0, 118.0, 3.0, "selector row start");
+            if width <= 960.0 {
+                assert!(
+                    model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE,
+                    "compact selector cards must stack: {model:?} and {hotkey:?}"
+                );
+                assert_within_tolerance(hotkey.y0, 184.0, 3.0, "stacked hotkey row start");
+                assert_within_tolerance(panel.y0, 254.0, 6.0, "compact transcript panel top");
+            } else {
+                assert!(
+                    model.x1 <= hotkey.x0 + LAYOUT_TOLERANCE,
+                    "selector cards overlap: {model:?} and {hotkey:?}"
+                );
+                assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
+                assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
+            }
+
+            let inline_transcript = format!("{committed} {provisional}");
+            let bounds = node_matching(&output, |node| {
+                node.name() == Some(inline_transcript.as_str())
+            })
+            .bounds()
+            .expect("inline transcript label should expose bounds");
+            assert_bounds_within(bounds, panel, "wrapped inline transcript text");
+            assert!(
+                bounds.y1 - bounds.y0 > 32.0,
+                "inline transcript label did not wrap: {bounds:?}"
+            );
+            assert!(
+                !node_names(&output).iter().any(|name| name == &provisional),
+                "provisional text should be appended to the committed transcript"
+            );
+            for name in ["Clear", "Copy"] {
+                let bounds = node_matching(&output, |node| {
+                    node.name()
+                        .is_some_and(|actual| actual == name || actual.contains(name))
+                })
+                .bounds()
+                .expect("transcript action should expose bounds");
+                assert_bounds_within(bounds, panel, name);
+            }
+            let normal = render(Fixture::TranscribeReady, width, height);
+            let normal_panel = named_node_bounds(&normal, "Transcript panel");
+            let clear = node_matching(&normal, |node| node.name() == Some("Clear"))
+                .bounds()
+                .expect("Clear should expose bounds");
+            let copy = node_matching(&normal, |node| {
+                node.name()
+                    .is_some_and(|name| name == "Copy" || name.contains("Copy"))
+            })
+            .bounds()
+            .expect("Copy should expose bounds");
+            let helper = node_matching(&normal, |node| {
+                node.name()
+                    .is_some_and(|name| name.contains("Silence is ignored"))
+            })
+            .bounds()
+            .expect("Silence helper should expose bounds");
+            let (panel_top, panel_height, footer_top) = if width <= 960.0 {
+                (254.0, 394.0, 590.0)
+            } else {
+                (185.0, 565.0, 694.0)
+            };
+            assert_within_tolerance(
+                normal_panel.y0,
+                panel_top,
+                6.0,
+                "reference transcript panel top",
+            );
+            assert_within_tolerance(
+                normal_panel.y1 - normal_panel.y0,
+                panel_height,
+                8.0,
+                "reference transcript panel height",
+            );
+            for action_bounds in [clear, copy] {
+                assert_within_tolerance(action_bounds.y0, footer_top, 7.0, "transcript footer top");
+                assert_within_tolerance(
+                    normal_panel.y1 - action_bounds.y1,
+                    14.0,
+                    3.0,
+                    "transcript footer bottom inset",
+                );
+            }
+            assert_within_tolerance(normal_panel.x1 - copy.x1, 16.0, 3.0, "Copy right inset");
+            if width > 960.0 {
+                assert_bounds_within(helper, viewport, "Silence helper");
+                assert!(
+                    helper.y1 <= viewport.y1 - 16.0,
+                    "Silence helper must remain above the canonical viewport edge: {helper:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_model_layout_keeps_the_bordered_empty_state_and_hides_transcript_controls() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::TranscribeNoModel.data();
+            let mut page = Fixture::TranscribeNoModel.page();
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+
+            let viewport = egui::accesskit::Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width.into(),
+                y1: height.into(),
+            };
+            let panel = named_node_bounds(&output, "Transcript panel");
+            let selector = named_node_bounds(&output, "Selected model");
+            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            let empty_state = named_node_bounds(&output, "Model required empty state");
+            let select = node_matching(&output, |node| node.name() == Some("Select"))
+                .bounds()
+                .expect("Select should expose bounds");
+            assert_bounds_within(panel, viewport, "transcript panel");
+            assert_bounds_within(selector, viewport, "selected model card");
+            assert_bounds_within(hotkey, viewport, "hotkey card");
+            assert_bounds_within(empty_state, panel, "model-required empty state");
+            for card in [selector, hotkey] {
+                assert_within_tolerance(card.y1 - card.y0, 50.0, 3.0, "selector card height");
+            }
+            assert_within_tolerance(selector.y0, 118.0, 3.0, "model row start");
+            assert!(
+                selector.x0 >= panel.x0 - LAYOUT_TOLERANCE
+                    && selector.x1 <= panel.x1 + LAYOUT_TOLERANCE,
+                "selected model card {selector:?} must fit transcript panel {panel:?}"
+            );
+            if width <= 960.0 {
+                assert!(selector.y1 <= hotkey.y0 + LAYOUT_TOLERANCE);
+                assert_within_tolerance(hotkey.y0, 184.0, 3.0, "stacked hotkey row start");
+                assert_within_tolerance(panel.y0, 254.0, 6.0, "compact model-required panel top");
+                assert_within_tolerance(
+                    panel.y1 - panel.y0,
+                    394.0,
+                    8.0,
+                    "compact model-required panel height",
+                );
+            } else {
+                assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
+                assert_within_tolerance(panel.y0, 185.0, 6.0, "wide model-required panel top");
+                assert_within_tolerance(
+                    panel.y1 - panel.y0,
+                    565.0,
+                    6.0,
+                    "wide model-required panel height",
+                );
+                let helper = node_matching(&output, |node| {
+                    node.name()
+                        .is_some_and(|name| name.contains("Silence is ignored"))
+                })
+                .bounds()
+                .expect("Silence helper should expose bounds");
+                assert_bounds_within(helper, viewport, "Silence helper");
+            }
+            assert_within_tolerance(selector.x1 - select.x1, 16.0, 1.0, "Select right inset");
+
+            let panel_midpoint = (panel.y0 + panel.y1) / 2.0;
+            let empty_midpoint = (empty_state.y0 + empty_state.y1) / 2.0;
+            assert!(
+                (empty_midpoint - panel_midpoint).abs() <= (panel.y1 - panel.y0) * 0.04,
+                "empty state should remain centered in its panel: panel={panel:?}, empty={empty_state:?}"
+            );
+            let update = output.platform_output.accesskit_update.as_ref().unwrap();
+            assert!(!update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
+            }));
+            assert!(!update.nodes.iter().any(|(_, node)| {
+                node.name()
+                    .is_some_and(|name| name == "Clear" || name.contains("Copy"))
+            }));
+        }
+    }
+
+    #[test]
+    fn selector_actions_use_fixed_trailing_accessible_targets() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+
+        let mut no_model_data = Fixture::TranscribeNoModel.data();
+        let mut no_model_page = Fixture::TranscribeNoModel.page();
+        let (no_model_output, no_model_action) = render_with_input(
+            &ctx,
+            &mut no_model_data,
+            &mut no_model_page,
+            width,
+            height,
+            Vec::new(),
+        );
+        assert_eq!(no_model_action, ScreenAction::None);
+        let card = named_node_bounds(&no_model_output, "Selected model");
+        let select = node_matching(&no_model_output, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Select")
+        });
+        let select_bounds = select.bounds().expect("Select should expose bounds");
+        assert!(!select.is_disabled());
+        assert_within_tolerance(
+            card.x1,
+            896.0,
+            1.0,
+            "Selected model card right edge at the 1180px reference width",
+        );
+        assert_within_tolerance(
+            select_bounds.x1 - select_bounds.x0,
+            72.0,
+            1.0,
+            "Select target width",
+        );
+        assert_within_tolerance(
+            select_bounds.y1 - select_bounds.y0,
+            44.0,
+            1.0,
+            "Select target height",
+        );
+        assert_within_tolerance(
+            card.x1 - select_bounds.x1,
+            16.0,
+            1.0,
+            "Select right inset from visible model card",
+        );
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut no_model_data,
+                &mut no_model_page,
+                width,
+                height,
+                "Select",
+            ),
+            ScreenAction::AddModel,
+        );
+
+        let mut ready_data = Fixture::TranscribeReady.data();
+        let mut ready_page = Fixture::TranscribeReady.page();
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut ready_data,
+                &mut ready_page,
+                width,
+                height,
+                "Change",
+            ),
+            ScreenAction::ChangeModel,
+        );
+
+        let listening = render(Fixture::TranscribeListening, width, height);
+        let disabled_change = node_matching(&listening, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Change")
+        });
+        assert!(disabled_change.is_disabled());
+        assert_eq!(
+            disabled_change.description(),
+            Some("Model selection is unavailable while recording.")
+        );
+    }
+
+    #[test]
+    fn transcribe_fixtures_keep_the_polished_reference_content_and_insets() {
+        let ready = render(Fixture::TranscribeReady, 1180.0, 815.0);
+        let panel = named_node_bounds(&ready, "Transcript panel");
+        let ready_status = named_node_bounds(&ready, "Recording status");
+        let start = node_matching(&ready, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Start recording")
+        })
+        .bounds()
+        .expect("Start recording should expose bounds");
+        let transcript = node_matching(&ready, |node| {
+            node.name()
+                == Some(
+                    "Today's meeting notes regarding the local-first architecture. We discussed the importance of privacy and keeping all model inference on the user's machine to ensure zero data leakage. The performance of the small models is acceptable for dictation, but we might need to explore quantized larger models for complex technical jargon.",
+                )
+        })
+        .bounds()
+        .expect("reference transcript should expose bounds");
+        let relative_time = node_matching(&ready, |node| node.name() == Some("2 MINS AGO"))
+            .bounds()
+            .expect("relative-time chip should expose bounds");
+        let model_chip = node_matching(&ready, |node| node.name() == Some("BASE.EN"))
+            .bounds()
+            .expect("model chip should expose bounds");
+
+        for name in ["whisper.cpp base.en", "+", "2 MINS AGO", "BASE.EN"] {
+            assert!(
+                node_names(&ready).iter().any(|actual| actual == name),
+                "ready fixture missing polished reference content {name}"
+            );
+        }
+        assert!(
+            start.y1 - start.y0 >= 44.0 - LAYOUT_TOLERANCE,
+            "recording control must retain a 44px target: {start:?}"
+        );
+        assert_within_tolerance(
+            ready_status.y1 - ready_status.y0,
+            80.0,
+            1.0,
+            "ready status strip height",
+        );
+        assert_within_tolerance(
+            start.y0 - ready_status.y0,
+            18.0,
+            3.0,
+            "centered recording control top inset",
+        );
+        assert_within_tolerance(
+            ready_status.y1 - start.y1,
+            12.0,
+            1.0,
+            "centered recording control bottom inset",
+        );
+        assert_within_tolerance(
+            transcript.x0 - panel.x0,
+            27.0,
+            4.0,
+            "transcript body left inset",
+        );
+        for (name, bounds) in [
+            ("relative-time chip", relative_time),
+            ("model chip", model_chip),
+        ] {
+            assert_within_tolerance(bounds.y1 - bounds.y0, 26.0, 1.0, name);
+            assert_bounds_within(bounds, panel, name);
+        }
+
+        let microphone = render(Fixture::TranscribeMicrophoneError, 1180.0, 815.0);
+        let canonical_count = node_names(&microphone)
+            .iter()
+            .filter(|name| name.as_str() == "Scribe couldn’t access your microphone.")
+            .count();
+        assert_eq!(
+            canonical_count, 1,
+            "microphone error should not repeat its headline"
+        );
+
+        for fixture in [Fixture::TranscribeListening, Fixture::TranscribeFinalizing] {
+            let output = render(fixture, 1180.0, 815.0);
+            let status = named_node_bounds(&output, "Recording status");
+            assert_within_tolerance(
+                status.y1 - status.y0,
+                80.0,
+                1.0,
+                "every transcript-present phase uses the same status strip height",
+            );
+        }
+
+        let no_model = render(Fixture::TranscribeNoModel, 1180.0, 815.0);
+        assert!(node_names(&no_model).iter().any(|name| name == "Add model"));
+        assert!(!node_names(&ready).iter().any(|name| name == "Transcript"));
     }
 
     fn tab_event(backwards: bool) -> egui::Event {

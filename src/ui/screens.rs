@@ -18,6 +18,44 @@ use super::{
     ui_palette,
 };
 
+const TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT: f32 = 565.0;
+const TRANSCRIPT_PANEL_MIN_HEIGHT: f32 = 272.0;
+const MODEL_REQUIRED_CONTENT_HEIGHT: f32 = 176.0;
+const COMPACT_SELECTOR_BREAKPOINT: f32 = 880.0;
+const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 3.0;
+const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
+const SELECTOR_ACTION_WIDTH: f32 = 72.0;
+const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
+const TRANSCRIPT_BODY_PADDING: f32 = 26.0;
+const TRANSCRIPT_BODY_VERTICAL_PADDING: f32 = 24.0;
+const TRANSCRIPT_STATUS_VERTICAL_PADDING: f32 = 13.0;
+const TRANSCRIPT_STATUS_CONTENT_HEIGHT: f32 = 54.0;
+const TRANSCRIPT_STATUS_SPINNER_SLOT: f32 = 44.0;
+const TRANSCRIPT_STATUS_SPINNER_SIZE: f32 = 26.0;
+const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.";
+
+fn current_content_width(ui: &egui::Ui) -> f32 {
+    let available = ui.available_rect_before_wrap();
+    let clip = ui.clip_rect();
+    let viewport = ui.ctx().screen_rect();
+    (available.max.x.min(clip.max.x).min(viewport.max.x)
+        - available.min.x.max(clip.min.x).max(viewport.min.x))
+    .max(0.0)
+}
+
+fn transcript_panel_height(ui: &egui::Ui) -> f32 {
+    let helper_height = ui.text_style_height(&egui::TextStyle::Body);
+    let remaining_height = ui.clip_rect().max.y
+        - ui.available_rect_before_wrap().min.y
+        - ui.spacing().item_spacing.y
+        - helper_height
+        - 8.0;
+    remaining_height.clamp(
+        TRANSCRIPT_PANEL_MIN_HEIGHT,
+        TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT,
+    )
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RecordingSettingsView {
     pub close_to_tray: bool,
@@ -284,73 +322,203 @@ fn selector_row(
     let no_model = state.phase == TranscriptionPhase::NoModel;
     let disabled_reason = model_selector_disabled_reason(state.phase);
     let mut action = ScreenAction::None;
-    ui.horizontal(|ui| {
-        let model_width = (ui.available_width() - 300.0).max(260.0);
-        Frame::none()
-            .fill(ui_palette(ui).card_bg)
-            .stroke(Stroke::new(1.0, ui_palette(ui).border))
-            .rounding(Rounding::same(5.0))
-            .inner_margin(Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_min_width(model_width - 32.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(icon_glyph(Icon::Cpu))
-                            .size(20.0)
-                            .color(ui_palette(ui).muted_text),
-                    );
-                    ui.label(RichText::new(name).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let response = ui
-                            .add_enabled_ui(disabled_reason.is_none(), |ui| {
-                                button(
-                                    ui,
-                                    if no_model { "Select" } else { "Change" },
-                                    ButtonTone::Text,
-                                )
-                            })
-                            .inner;
-                        if let Some(reason) = disabled_reason {
-                            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                                builder.set_description(reason);
-                            });
-                            focus_tooltip(ui, &response, reason);
-                            response.clone().on_hover_text(reason);
-                        }
-                        if response.clicked() {
-                            action = if no_model {
-                                ScreenAction::AddModel
-                            } else {
-                                ScreenAction::ChangeModel
-                            };
-                        }
-                    });
+    let available_width = current_content_width(ui);
+    let hotkey_width = (available_width * 0.28).clamp(220.0, 280.0);
+    let gap = ui.spacing().item_spacing.x;
+    let model_width = available_width - hotkey_width - gap;
+    let compact = available_width < COMPACT_SELECTOR_BREAKPOINT;
+    ui.allocate_ui_with_layout(
+        Vec2::new(available_width, 0.0),
+        if compact {
+            Layout::top_down(Align::LEFT)
+        } else {
+            Layout::left_to_right(Align::TOP)
+        },
+        |ui| {
+            let model_width = if compact {
+                available_width
+            } else {
+                model_width
+            };
+            let model_card_id = ui.make_persistent_id("selected-model-card");
+            let card_height = SELECTOR_CONTROL_HEIGHT + SELECTOR_CARD_VERTICAL_MARGIN * 2.0;
+            let (model_card_rect, _) =
+                ui.allocate_exact_size(Vec2::new(model_width, card_height), egui::Sense::hover());
+            let model_card_frame = Frame::none()
+                .fill(ui_palette(ui).card_bg)
+                .stroke(Stroke::new(1.0, ui_palette(ui).border))
+                .rounding(Rounding::same(5.0));
+            ui.painter().add(model_card_frame.paint(model_card_rect));
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    model_card_rect.min.x + 16.0,
+                    model_card_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                ),
+                egui::pos2(
+                    model_card_rect.max.x - 16.0,
+                    model_card_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                ),
+            );
+            let action_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    (content_rect.max.x - SELECTOR_ACTION_WIDTH).max(content_rect.min.x),
+                    content_rect.min.y,
+                ),
+                content_rect.max,
+            );
+            let label_rect = egui::Rect::from_min_max(
+                content_rect.min,
+                egui::pos2(action_rect.min.x, content_rect.max.y),
+            );
+            let mut label_ui = ui.child_ui(label_rect, Layout::left_to_right(Align::Center));
+            label_ui.label(
+                RichText::new(icon_glyph(Icon::Cpu))
+                    .size(20.0)
+                    .color(ui_palette(&label_ui).muted_text),
+            );
+            label_ui.label(RichText::new(name).strong());
+            let action_label = if no_model { "Select" } else { "Change" };
+            let was_enabled = ui.is_enabled();
+            ui.set_enabled(was_enabled && disabled_reason.is_none());
+            let response = ui.interact(
+                action_rect,
+                ui.make_persistent_id("selected-model-action"),
+                egui::Sense::click(),
+            );
+            ui.set_enabled(was_enabled);
+            let colors = ui_palette(ui);
+            let hovered = response.enabled() && response.hovered();
+            ui.painter().rect(
+                action_rect,
+                Rounding::same(5.0),
+                if hovered {
+                    colors.panel_bg
+                } else {
+                    egui::Color32::TRANSPARENT
+                },
+                if hovered {
+                    Stroke::new(1.0, colors.border)
+                } else {
+                    Stroke::NONE
+                },
+            );
+            ui.painter().text(
+                action_rect.center(),
+                Align2::CENTER_CENTER,
+                action_label,
+                egui::FontId::proportional(13.0),
+                if response.enabled() {
+                    colors.text
+                } else {
+                    colors.muted_text
+                },
+            );
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, action_label));
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Button);
+                builder.set_name(action_label);
+                builder.set_bounds(egui::accesskit::Rect {
+                    x0: action_rect.min.x.into(),
+                    y0: action_rect.min.y.into(),
+                    x1: action_rect.max.x.into(),
+                    y1: action_rect.max.y.into(),
+                });
+                if !response.enabled() {
+                    builder.set_disabled();
+                }
+            });
+            paint_focus_ring(ui, &response, Rounding::same(5.0));
+            if let Some(reason) = disabled_reason {
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_description(reason);
+                });
+                focus_tooltip(ui, &response, reason);
+                response.clone().on_hover_text(reason);
+            }
+            if response.clicked() {
+                action = if no_model {
+                    ScreenAction::AddModel
+                } else {
+                    ScreenAction::ChangeModel
+                };
+            }
+            ui.ctx().accesskit_node_builder(model_card_id, |builder| {
+                builder.set_role(egui::accesskit::Role::Group);
+                builder.set_name("Selected model");
+                builder.set_bounds(egui::accesskit::Rect {
+                    x0: model_card_rect.min.x.into(),
+                    y0: model_card_rect.min.y.into(),
+                    x1: model_card_rect.max.x.into(),
+                    y1: model_card_rect.max.y.into(),
                 });
             });
-        Frame::none()
-            .fill(ui_palette(ui).card_bg)
-            .stroke(Stroke::new(1.0, ui_palette(ui).border))
-            .rounding(Rounding::same(5.0))
-            .inner_margin(Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(icon_glyph(Icon::Keyboard))
-                            .size(18.0)
-                            .color(ui_palette(ui).muted_text),
-                    );
-                    ui.label("Hotkey:");
-                    for key in state
-                        .hotkey
-                        .split('+')
-                        .map(str::trim)
-                        .filter(|key| !key.is_empty())
-                    {
-                        keycap(ui, key);
+            if compact {
+                ui.add_space(ui.spacing().item_spacing.y);
+            } else {
+                ui.add_space(gap);
+            }
+            let hotkey_width = if compact {
+                available_width
+            } else {
+                hotkey_width
+            };
+            let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
+            let (hotkey_card_rect, _) =
+                ui.allocate_exact_size(Vec2::new(hotkey_width, card_height), egui::Sense::hover());
+            let hotkey_card_frame = Frame::none()
+                .fill(if no_model {
+                    ui_palette(ui).disabled_bg
+                } else {
+                    ui_palette(ui).card_bg
+                })
+                .stroke(Stroke::new(1.0, ui_palette(ui).border))
+                .rounding(Rounding::same(5.0));
+            ui.painter().add(hotkey_card_frame.paint(hotkey_card_rect));
+            let hotkey_content_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    hotkey_card_rect.min.x + 16.0,
+                    hotkey_card_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                ),
+                egui::pos2(
+                    hotkey_card_rect.max.x - 16.0,
+                    hotkey_card_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                ),
+            );
+            let mut hotkey_content_ui =
+                ui.child_ui(hotkey_content_rect, Layout::left_to_right(Align::Center));
+            hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
+                ui.label(
+                    RichText::new(icon_glyph(Icon::Keyboard))
+                        .size(18.0)
+                        .color(ui_palette(ui).muted_text),
+                );
+                ui.label("Hotkey:");
+                let mut keys = state
+                    .hotkey
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .peekable();
+                while let Some(key) = keys.next() {
+                    keycap(ui, key);
+                    if keys.peek().is_some() {
+                        ui.label(RichText::new("+").color(ui_palette(ui).muted_text));
                     }
+                }
+            });
+            ui.ctx().accesskit_node_builder(hotkey_card_id, |builder| {
+                builder.set_role(egui::accesskit::Role::Group);
+                builder.set_name("Recording hotkey");
+                builder.set_bounds(egui::accesskit::Rect {
+                    x0: hotkey_card_rect.min.x.into(),
+                    y0: hotkey_card_rect.min.y.into(),
+                    x1: hotkey_card_rect.max.x.into(),
+                    y1: hotkey_card_rect.max.y.into(),
                 });
             });
-    });
+        },
+    );
     action
 }
 
@@ -394,6 +562,24 @@ fn recording_square_button(
     response.on_hover_text(accessible_name)
 }
 
+fn status_spinner(ui: &mut egui::Ui, accessible_name: &str) {
+    let (slot, response) = ui.allocate_exact_size(
+        Vec2::splat(TRANSCRIPT_STATUS_SPINNER_SLOT),
+        egui::Sense::hover(),
+    );
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::ProgressIndicator);
+        builder.set_name(accessible_name);
+    });
+    ui.painter().text(
+        slot.center(),
+        Align2::CENTER_CENTER,
+        egui_phosphor::regular::CIRCLE_NOTCH,
+        egui::FontId::proportional(TRANSCRIPT_STATUS_SPINNER_SIZE),
+        ui_palette(ui).muted_text,
+    );
+}
+
 fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
@@ -411,6 +597,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 action = ScreenAction::StopRecording;
             }
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 ui.horizontal(|ui| {
                     let (dot_rect, _) =
                         ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
@@ -426,8 +613,9 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
             });
         }
         TranscriptionPhase::Finalizing => {
-            ui.spinner();
+            status_spinner(ui, "Finalizing transcript progress");
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Finalizing transcript…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
                     builder.set_live(egui::accesskit::Live::Polite);
@@ -437,8 +625,9 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
             });
         }
         TranscriptionPhase::RequestingMicrophone => {
-            ui.spinner();
+            status_spinner(ui, "Requesting microphone access progress");
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Requesting microphone access…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
                     builder.set_live(egui::accesskit::Live::Polite);
@@ -448,8 +637,9 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
             });
         }
         TranscriptionPhase::ModelLoading => {
-            ui.spinner();
+            status_spinner(ui, "Loading speech model progress");
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Loading speech model…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
                     builder.set_live(egui::accesskit::Live::Polite);
@@ -460,6 +650,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
         }
         TranscriptionPhase::ModelError => {
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 ui.label(
                     RichText::new("Speech model unavailable")
                         .strong()
@@ -481,6 +672,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 action = ScreenAction::StartRecording;
             }
             ui.vertical(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
                 ui.label(RichText::new("Start recording").strong());
                 ui.label(match state.recording_mode {
                     RecordingMode::Hold => format!("Hold {} to record", state.hotkey),
@@ -492,22 +684,26 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
     action
 }
 
-fn no_model_empty_state(ui: &mut egui::Ui) -> ScreenAction {
+fn no_model_empty_state(ui: &mut egui::Ui, panel_height: f32) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
-    ui.with_layout(Layout::top_down(Align::Center), |ui| {
-        ui.add_space(130.0);
-        Frame::none()
-            .fill(colors.panel_bg)
-            .rounding(Rounding::same(8.0))
-            .inner_margin(Margin::same(12.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(icon_glyph(Icon::Models))
-                        .size(30.0)
-                        .color(colors.muted_text),
-                );
-            });
+    // Center the intrinsic control stack in the bounded transcript panel.
+    ui.add_space(((panel_height - MODEL_REQUIRED_CONTENT_HEIGHT) / 2.0).max(24.0));
+    let empty_state = ui.with_layout(Layout::top_down(Align::Center), |ui| {
+        let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(68.0), egui::Sense::hover());
+        ui.painter().rect(
+            icon_rect,
+            Rounding::same(8.0),
+            colors.panel_bg,
+            Stroke::NONE,
+        );
+        ui.painter().text(
+            icon_rect.center(),
+            Align2::CENTER_CENTER,
+            icon_glyph(Icon::Models),
+            egui::FontId::proportional(30.0),
+            colors.muted_text,
+        );
         ui.add_space(12.0);
         ui.label(
             RichText::new("Add a speech model to start transcribing")
@@ -516,9 +712,21 @@ fn no_model_empty_state(ui: &mut egui::Ui) -> ScreenAction {
         );
         ui.label("Your audio stays on this device.");
         ui.add_space(12.0);
-        if button(ui, "Add model", ButtonTone::Primary).clicked() {
+        let add_model = button(ui, "Add model", ButtonTone::Primary);
+        if add_model.clicked() {
             action = ScreenAction::AddModel;
         }
+    });
+    let empty_state_id = ui.make_persistent_id("model-required-empty-state");
+    ui.ctx().accesskit_node_builder(empty_state_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Group);
+        builder.set_name("Model required empty state");
+        builder.set_bounds(egui::accesskit::Rect {
+            x0: empty_state.response.rect.min.x.into(),
+            y0: empty_state.response.rect.min.y.into(),
+            x1: empty_state.response.rect.max.x.into(),
+            y1: empty_state.response.rect.max.y.into(),
+        });
     });
     action
 }
@@ -555,100 +763,190 @@ fn no_model_recovery_callout(ui: &mut egui::Ui) -> ScreenAction {
     action
 }
 
-fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenAction {
+fn transcript_frame(
+    ui: &mut egui::Ui,
+    state: &TranscriptionState,
+    panel_height: f32,
+) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
-    Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(5.0))
-        .show(ui, |ui| {
-            ui.set_min_height(530.0);
+    let width = current_content_width(ui);
+    let transcript_panel_id = ui.make_persistent_id("transcript-panel");
+    let transcript_panel = ui.allocate_ui_with_layout(
+        Vec2::new(width, 0.0),
+        Layout::top_down(Align::LEFT),
+        |ui| {
+            ui.set_width(width);
+            Frame::none()
+                .fill(colors.card_bg)
+                .stroke(Stroke::new(1.0, colors.border))
+                .rounding(Rounding::same(5.0))
+                .show(ui, |ui| {
+            ui.set_width(width);
+            ui.set_min_height(panel_height);
+            let panel_bottom = ui.min_rect().bottom();
             if state.phase != TranscriptionPhase::NoModel {
-                Frame::none()
+                let status_width = ui.available_width();
+                let status_strip_id = ui.make_persistent_id("recording-status-strip");
+                let status_strip = Frame::none()
                     .fill(colors.panel_bg)
-                    .inner_margin(Margin::symmetric(30.0, 20.0))
+                    .inner_margin(Margin::symmetric(
+                        TRANSCRIPT_BODY_PADDING,
+                        TRANSCRIPT_STATUS_VERTICAL_PADDING,
+                    ))
                     .show(ui, |ui| {
-                        action = recording_status_header(ui, state);
+                        let status_content_width =
+                            (status_width - TRANSCRIPT_BODY_PADDING * 2.0).max(0.0);
+                        ui.set_min_width(status_content_width);
+                        let (status_content_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(status_content_width, TRANSCRIPT_STATUS_CONTENT_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        ui.allocate_ui_at_rect(status_content_rect, |ui| {
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                action = recording_status_header(ui, state);
+                            });
+                        });
                     });
+                ui.ctx().accesskit_node_builder(status_strip_id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Group);
+                    builder.set_name("Recording status");
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: status_strip.response.rect.min.x.into(),
+                        y0: status_strip.response.rect.min.y.into(),
+                        x1: status_strip.response.rect.max.x.into(),
+                        y1: status_strip.response.rect.max.y.into(),
+                    });
+                });
+                let separator_gap = ui.spacing().item_spacing.y;
+                ui.add_space(-separator_gap);
                 ui.separator();
+                ui.add_space(-separator_gap);
             }
 
             let has_committed_transcript = !state.committed_transcript.trim().is_empty();
-            let transcript_heading = ui.label(RichText::new("Transcript").strong());
-            ui.ctx().accesskit_node_builder(transcript_heading.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Heading);
-            });
-            ui.add_space(8.0);
             if state.phase == TranscriptionPhase::NoModel && !has_committed_transcript {
-                action = no_model_empty_state(ui);
+                action = no_model_empty_state(ui, panel_height);
             } else {
-                ui.add_space(16.0);
-                if state.phase == TranscriptionPhase::NoModel {
-                    let recovery_action = no_model_recovery_callout(ui);
-                    if recovery_action != ScreenAction::None {
-                        action = recovery_action;
-                    }
-                    ui.add_space(16.0);
-                }
-                if let Some(text) = &state.notice {
-                    if state.phase == TranscriptionPhase::MicrophoneError {
-                        let alert_action = microphone_error_notice(ui, text);
-                        if alert_action != ScreenAction::None {
-                            action = alert_action;
+                Frame::none()
+                    .inner_margin(Margin::symmetric(
+                        TRANSCRIPT_BODY_PADDING,
+                        TRANSCRIPT_BODY_VERTICAL_PADDING,
+                    ))
+                    .show(ui, |ui| {
+                        if state.phase == TranscriptionPhase::NoModel {
+                            let recovery_action = no_model_recovery_callout(ui);
+                            if recovery_action != ScreenAction::None {
+                                action = recovery_action;
+                            }
+                            ui.add_space(16.0);
                         }
-                    } else {
-                        let response = neutral_notice(ui, text);
-                        ui.ctx().accesskit_node_builder(response.id, |builder| {
-                            builder.set_live(egui::accesskit::Live::Polite);
-                            builder.set_live_atomic();
-                        });
-                    }
-                    ui.add_space(12.0);
-                }
-                if state.phase == TranscriptionPhase::ModelError {
-                    let response = neutral_notice(
-                        ui,
-                        "The selected speech model could not be loaded. Open model settings to repair it or choose another model.",
-                    );
-                    ui.ctx().accesskit_node_builder(response.id, |builder| {
-                        builder.set_role(egui::accesskit::Role::Alert);
-                        builder.set_live(egui::accesskit::Live::Assertive);
-                        builder.set_live_atomic();
+                        if let Some(text) = &state.notice {
+                            if state.phase == TranscriptionPhase::MicrophoneError {
+                                let alert_action = microphone_error_notice(ui, text);
+                                if alert_action != ScreenAction::None {
+                                    action = alert_action;
+                                }
+                            } else {
+                                let response = neutral_notice(ui, text);
+                                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                    builder.set_live(egui::accesskit::Live::Polite);
+                                    builder.set_live_atomic();
+                                });
+                            }
+                            ui.add_space(12.0);
+                        }
+                        if state.phase == TranscriptionPhase::ModelError {
+                            let response = neutral_notice(
+                                ui,
+                                "The selected speech model could not be loaded. Open model settings to repair it or choose another model.",
+                            );
+                            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_role(egui::accesskit::Role::Alert);
+                                builder.set_live(egui::accesskit::Live::Assertive);
+                                builder.set_live_atomic();
+                            });
+                            if button(ui, "Open model settings", ButtonTone::Danger).clicked() {
+                                action = ScreenAction::ChangeModel;
+                            }
+                            ui.add_space(12.0);
+                        }
+                        if state.committed_transcript.trim().is_empty() {
+                            ui.label(
+                                RichText::new("Your transcript will appear here.")
+                                    .color(colors.tertiary_text),
+                            );
+                        } else {
+                            let response = if state.provisional_transcript.is_empty() {
+                                ui.label(&state.committed_transcript)
+                            } else {
+                                let mut transcript = egui::text::LayoutJob::default();
+                                let body_format = egui::TextFormat {
+                                    font_id: egui::TextStyle::Body.resolve(ui.style()),
+                                    color: colors.text,
+                                    ..Default::default()
+                                };
+                                transcript.append(
+                                    &state.committed_transcript,
+                                    0.0,
+                                    body_format.clone(),
+                                );
+                                transcript.append(" ", 0.0, body_format);
+                                transcript.append(
+                                    &state.provisional_transcript,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::TextStyle::Body.resolve(ui.style()),
+                                        color: colors.tertiary_text,
+                                        italics: true,
+                                        ..Default::default()
+                                    },
+                                );
+                                ui.label(transcript)
+                            };
+                            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                builder.set_live(egui::accesskit::Live::Polite);
+                                builder.set_live_atomic();
+                            });
+                        }
+                        if state.committed_transcript.trim().is_empty()
+                            && !state.provisional_transcript.is_empty()
+                        {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(&state.provisional_transcript)
+                                    .italics()
+                                    .color(colors.tertiary_text),
+                            );
+                        }
+                        if state.last_successful_capture_ms.is_some()
+                            || state.selected_model_id.is_some()
+                        {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if let Some(capture_ms) = state.last_successful_capture_ms {
+                                    transcript_metadata_chip(
+                                        ui,
+                                        &format_relative_capture_time(capture_ms),
+                                    );
+                                }
+                                if let Some(model_id) = &state.selected_model_id {
+                                    transcript_metadata_chip(ui, &model_id.to_ascii_uppercase());
+                                }
+                            });
+                        }
                     });
-                    if button(ui, "Open model settings", ButtonTone::Danger).clicked() {
-                        action = ScreenAction::ChangeModel;
-                    }
-                    ui.add_space(12.0);
-                }
-                if state.committed_transcript.trim().is_empty() {
-                    ui.label(
-                        RichText::new("Your transcript will appear here.")
-                            .color(colors.tertiary_text),
-                    );
-                } else {
-                    let response = ui.label(&state.committed_transcript);
-                    ui.ctx().accesskit_node_builder(response.id, |builder| {
-                        builder.set_live(egui::accesskit::Live::Polite);
-                        builder.set_live_atomic();
-                    });
-                }
-                if !state.provisional_transcript.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(&state.provisional_transcript)
-                            .italics()
-                            .color(colors.tertiary_text),
-                    );
-                }
-                ui.add_space(10.0);
-                if let Some(model_id) = &state.selected_model_id {
-                    badge(ui, &model_id.to_ascii_uppercase(), None);
-                }
-                let remaining = (220.0 - ui.min_rect().height()).max(24.0);
-                ui.add_space(remaining);
+                let footer_height = 40.0;
+                let separator_footprint = ui.spacing().item_spacing.y * 2.0;
+                let footer_top = (panel_bottom - TRANSCRIPT_FOOTER_INSET - footer_height)
+                    - separator_footprint;
+                let footer_top = footer_top.max(ui.cursor().top() + 24.0);
+                ui.add_space((footer_top - ui.cursor().top()).max(0.0));
                 ui.separator();
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new((width - TRANSCRIPT_FOOTER_INSET).max(0.0), 0.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
                     let enabled = !matches!(
                         state.phase,
                         TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
@@ -685,8 +983,23 @@ fn transcript_frame(ui: &mut egui::Ui, state: &TranscriptionState) -> ScreenActi
                     if clear.clicked() {
                         action = ScreenAction::ClearTranscript;
                     }
-                });
-            }
+                    },
+                );
+                }
+            })
+            .response
+        },
+    );
+    ui.ctx()
+        .accesskit_node_builder(transcript_panel_id, |builder| {
+            builder.set_role(egui::accesskit::Role::Group);
+            builder.set_name("Transcript panel");
+            builder.set_bounds(egui::accesskit::Rect {
+                x0: transcript_panel.inner.rect.min.x.into(),
+                y0: transcript_panel.inner.rect.min.y.into(),
+                x1: transcript_panel.inner.rect.max.x.into(),
+                y1: transcript_panel.inner.rect.max.y.into(),
+            });
         });
     action
 }
@@ -701,6 +1014,7 @@ fn neutral_notice(ui: &mut egui::Ui, text: &str) -> egui::Response {
             .rounding(Rounding::same(5.0))
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
+                ui.set_min_width((width - 24.0).max(0.0));
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(icon_glyph(Icon::Info))
@@ -712,6 +1026,59 @@ fn neutral_notice(ui: &mut egui::Ui, text: &str) -> egui::Response {
             });
     })
     .response
+}
+
+fn transcript_metadata_chip(ui: &mut egui::Ui, text: &str) {
+    let colors = ui_palette(ui);
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        colors.muted_text,
+    );
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 14.0, 26.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect(
+        rect,
+        Rounding::same(3.0),
+        colors.panel_bg,
+        Stroke::new(1.0, colors.border),
+    );
+    ui.painter().galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        colors.muted_text,
+    );
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::StaticText);
+        builder.set_name(text);
+        builder.set_bounds(egui::accesskit::Rect {
+            x0: rect.min.x.into(),
+            y0: rect.min.y.into(),
+            x1: rect.max.x.into(),
+            y1: rect.max.y.into(),
+        });
+    });
+}
+
+fn format_relative_capture_time(capture_age_ms: u64) -> String {
+    let minutes = capture_age_ms / 60_000;
+    match minutes {
+        0 => "JUST NOW".to_owned(),
+        1 => "1 MIN AGO".to_owned(),
+        minutes => format!("{minutes} MINS AGO"),
+    }
+}
+
+fn is_repeated_microphone_error(detail: &str) -> bool {
+    let normalized = detail
+        .trim()
+        .trim_end_matches(|character: char| matches!(character, '.' | '!' | '…'))
+        .trim()
+        .replace('’', "'")
+        .to_ascii_lowercase();
+    normalized == "scribe couldn't access your microphone"
 }
 
 fn microphone_error_notice(ui: &mut egui::Ui, technical_detail: &str) -> ScreenAction {
@@ -734,36 +1101,83 @@ fn microphone_error_notice(ui: &mut egui::Ui, technical_detail: &str) -> ScreenA
                 .rounding(Rounding::same(5.0))
                 .inner_margin(Margin::same(12.0))
                 .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+                    ui.set_min_width((width - 24.0).max(0.0));
+                    let detail = technical_detail.trim();
+                    let has_distinct_detail =
+                        !detail.is_empty() && !is_repeated_microphone_error(detail);
+                    let row_height = if has_distinct_detail { 64.0 } else { 44.0 };
+                    let (row, _) = ui.allocate_exact_size(
+                        Vec2::new((width - 24.0).max(0.0), row_height),
+                        egui::Sense::hover(),
+                    );
+                    let retry_size = Vec2::new(80.0, 44.0);
+                    let open_settings_size = Vec2::new(152.0, 44.0);
+                    let retry_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            row.max.x - retry_size.x,
+                            row.center().y - retry_size.y / 2.0,
+                        ),
+                        retry_size,
+                    );
+                    let open_settings_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            retry_rect.min.x - ui.spacing().item_spacing.x - open_settings_size.x,
+                            row.center().y - open_settings_size.y / 2.0,
+                        ),
+                        open_settings_size,
+                    );
+                    let icon_rect = egui::Rect::from_min_size(row.min, Vec2::new(26.0, row_height));
+                    ui.painter().text(
+                        icon_rect.center(),
+                        Align2::CENTER_CENTER,
+                        icon_glyph(Icon::MicrophoneOff),
+                        egui::FontId::proportional(18.0),
+                        colors.error_text,
+                    );
+                    let message_rect = egui::Rect::from_min_max(
+                        egui::pos2(icon_rect.max.x + ui.spacing().item_spacing.x, row.min.y),
+                        egui::pos2(
+                            open_settings_rect.min.x - ui.spacing().item_spacing.x,
+                            row.max.y,
+                        ),
+                    );
+                    ui.allocate_ui_at_rect(message_rect, |ui| {
+                        ui.set_max_width(message_rect.width());
                         ui.label(
-                            RichText::new(icon_glyph(Icon::MicrophoneOff))
-                                .size(18.0)
+                            RichText::new(MICROPHONE_ACCESS_ERROR)
+                                .strong()
                                 .color(colors.error_text),
                         );
-                        let message_width = (ui.available_width() - 300.0).max(180.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width(message_width);
-                            ui.label(
-                                RichText::new("Scribe couldn’t access your microphone.")
-                                    .strong()
-                                    .color(colors.error_text),
-                            );
-                            let detail = technical_detail.trim();
-                            if !detail.is_empty()
-                                && detail != "Scribe couldn’t access your microphone."
-                            {
-                                ui.label(RichText::new(detail).small().color(colors.error_text));
-                            }
-                        });
-                        let open_settings = button(ui, "Open audio settings", ButtonTone::Text);
-                        if open_settings.clicked() {
-                            action = ScreenAction::OpenAudioSettings;
-                        }
-                        let retry = button(ui, "Try again", ButtonTone::Danger);
-                        if retry.clicked() {
-                            action = ScreenAction::RetryMicrophone;
+                        if has_distinct_detail {
+                            ui.label(RichText::new(detail).small().color(colors.error_text));
                         }
                     });
+                    let open_settings = ui.put(
+                        open_settings_rect,
+                        egui::Button::new(RichText::new("Open audio settings").color(colors.text))
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .rounding(Rounding::same(5.0))
+                            .min_size(open_settings_size),
+                    );
+                    paint_focus_ring(ui, &open_settings, Rounding::same(5.0));
+                    if open_settings.clicked() {
+                        action = ScreenAction::OpenAudioSettings;
+                    }
+                    let retry = ui.put(
+                        retry_rect,
+                        egui::Button::new(
+                            RichText::new("Try again").color(colors.danger_button_text),
+                        )
+                        .fill(colors.error)
+                        .stroke(Stroke::NONE)
+                        .rounding(Rounding::same(5.0))
+                        .min_size(retry_size),
+                    );
+                    paint_focus_ring(ui, &retry, Rounding::same(5.0));
+                    if retry.clicked() {
+                        action = ScreenAction::RetryMicrophone;
+                    }
                 });
         });
     });
@@ -778,7 +1192,7 @@ fn transcribe(
     header(ui, "Transcribe", "Audio stays on this device.");
     let action = selector_row(ui, state, models);
     ui.add_space(12.0);
-    let panel_action = transcript_frame(ui, state);
+    let panel_action = transcript_frame(ui, state, transcript_panel_height(ui));
     ui.add_space(14.0);
     ui.horizontal_centered(|ui| {
         ui.label(
@@ -3327,6 +3741,58 @@ mod tests {
     }
 
     #[test]
+    fn relative_capture_time_uses_the_compact_reference_labels() {
+        assert_eq!(format_relative_capture_time(0), "JUST NOW");
+        assert_eq!(format_relative_capture_time(60_000), "1 MIN AGO");
+        assert_eq!(format_relative_capture_time(120_000), "2 MINS AGO");
+    }
+
+    #[test]
+    fn transcribe_metadata_and_hotkey_preserve_visible_and_semantic_labels() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            last_successful_capture_ms: Some(120_000),
+            hotkey: "Ctrl + Space".into(),
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "base.en".into(),
+            display_name: "whisper.cpp base.en".into(),
+            variant_label: "base.en".into(),
+            ..Default::default()
+        }];
+        let output = render_transcribe(&state, &models);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        for name in ["+", "2 MINS AGO", "BASE.EN"] {
+            assert!(
+                nodes.iter().any(|(_, node)| node.name() == Some(name)),
+                "missing visible Transcribe label {name}"
+            );
+        }
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Group && node.name() == Some("Recording hotkey")
+        }));
+    }
+
+    #[test]
+    fn transcript_panel_keeps_its_semantic_name_without_a_visible_heading() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Group && node.name() == Some("Transcript panel")
+        }));
+        assert!(!nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
+        }));
+    }
+
+    #[test]
     fn reference_recording_controls_have_named_square_actions() {
         for (phase, expected_name) in [
             (TranscriptionPhase::Ready, "Start recording"),
@@ -3416,6 +3882,26 @@ mod tests {
             nodes
                 .iter()
                 .any(|(_, node)| { node.name() == Some("Microphone failed: device disconnected") })
+        );
+
+        let repeated = TranscriptionState {
+            phase: TranscriptionPhase::MicrophoneError,
+            selected_model_id: Some("base.en".into()),
+            notice: Some("Scribe couldn’t access your microphone".into()),
+            ..Default::default()
+        };
+        let output = render_transcribe(&repeated, &[]);
+        let canonical_count = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.name() == Some(MICROPHONE_ACCESS_ERROR))
+            .count();
+        assert_eq!(
+            canonical_count, 1,
+            "canonical microphone message was repeated"
         );
     }
 
