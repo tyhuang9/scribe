@@ -17839,6 +17839,31 @@ mod layout_tests {
     }
 
     #[test]
+    fn local_gguf_ui_completion_performs_no_source_file_read_or_fingerprint() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn finish_local_gguf_import(")
+            .expect("local GGUF completion boundary exists");
+        let end = source[start..]
+            .find("\n    fn uninstall_model(")
+            .map(|offset| start + offset)
+            .expect("local GGUF completion boundary remains scoped");
+        let completion = &source[start..end];
+
+        for forbidden in [
+            "fingerprint_file_cancellable",
+            "fs::read",
+            "fs::metadata",
+            "fs::canonicalize",
+        ] {
+            assert!(
+                !completion.contains(forbidden),
+                "UI completion must not call source I/O boundary {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn preview_updates_are_overlay_only_and_reject_stale_or_wrong_model_events() {
         let mut app = test_app();
         app.transcript = "previous final".to_owned();
