@@ -128,8 +128,6 @@ pub enum OverlayMode {
 }
 
 impl OverlayMode {
-    pub const ALL: [Self; 3] = [Self::Live, Self::Minimal, Self::Off];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "Live",

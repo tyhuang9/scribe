@@ -90,13 +90,6 @@ const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
 const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
-const INPUT_LEVEL_KEYBOARD_STEP_DB: f32 = 1.0;
-const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
-const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
-const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
-const INPUT_SENSITIVITY_TRACK_HEIGHT: f32 = 10.0;
-const INPUT_SENSITIVITY_LIVE_FILL_HEIGHT: f32 = 8.0;
-const MICROPHONE_MONITOR_RETRY_DELAY: Duration = Duration::from_secs(2);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
@@ -167,268 +160,8 @@ fn slider_position_to_dbfs(position: f32) -> f32 {
     INPUT_LEVEL_MIN_DBFS + position.clamp(0.0, 1.0) * (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS)
 }
 
-fn input_sensitivity_db_label(dbfs: f32) -> String {
-    format!(
-        "{:.0} dB",
-        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
-    )
-}
-
 fn rms_to_slider_position(rms: f32) -> f32 {
     dbfs_to_slider_position(rms_to_dbfs(rms))
-}
-
-#[derive(Clone, Debug)]
-struct MicrophoneLevelEnvelope {
-    position: f32,
-    last_step_at: Option<Instant>,
-    last_fresh_sample_at: Option<Instant>,
-    last_revision: Option<u64>,
-}
-
-impl Default for MicrophoneLevelEnvelope {
-    fn default() -> Self {
-        Self {
-            position: 0.0,
-            last_step_at: None,
-            last_fresh_sample_at: None,
-            last_revision: None,
-        }
-    }
-}
-
-impl MicrophoneLevelEnvelope {
-    fn reset_source(&mut self) {
-        self.last_fresh_sample_at = None;
-        self.last_revision = None;
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn update(
-        &mut self,
-        rms: f32,
-        revision: Option<u64>,
-        source_active: bool,
-        now: Instant,
-    ) -> f32 {
-        if source_active && revision != self.last_revision {
-            self.last_revision = revision;
-            self.last_fresh_sample_at = Some(now);
-        }
-        let fresh = source_active
-            && self.last_fresh_sample_at.is_some_and(|observed| {
-                now.saturating_duration_since(observed) <= INPUT_LEVEL_STALE_AFTER
-            });
-        let target = if fresh {
-            rms_to_slider_position(rms)
-        } else {
-            0.0
-        };
-        let elapsed = self.last_step_at.map_or(METER_REPAINT_DELAY, |previous| {
-            now.saturating_duration_since(previous)
-        });
-        self.last_step_at = Some(now);
-        let time_constant = if target > self.position {
-            INPUT_LEVEL_ATTACK
-        } else {
-            INPUT_LEVEL_RELEASE
-        };
-        let alpha = 1.0 - (-elapsed.as_secs_f32() / time_constant.as_secs_f32()).exp();
-        self.position += (target - self.position) * alpha.clamp(0.0, 1.0);
-        if target == 0.0 && self.position < 0.001 {
-            self.position = 0.0;
-        }
-        self.position
-    }
-
-    fn is_animating(&self) -> bool {
-        self.position > 0.0
-    }
-}
-
-fn microphone_sensitivity_slider(
-    ui: &mut Ui,
-    live_level_position: f32,
-    threshold_rms: &mut f32,
-) -> egui::Response {
-    use egui::accesskit::{Action, ActionData};
-
-    let desired = Vec2::new(usable_width(ui), minimum_primary_target_height());
-    let (rect, mut response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
-    let previous = *threshold_rms;
-    let mut threshold_dbfs = rms_to_dbfs(*threshold_rms);
-
-    if response.clicked() {
-        response.request_focus();
-    }
-    if (response.clicked() || response.dragged())
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        let position = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        threshold_dbfs = slider_position_to_dbfs(position);
-    }
-
-    let mut decrement = 0usize;
-    let mut increment = 0usize;
-    if response.has_focus() {
-        ui.ctx().memory_mut(|memory| {
-            memory.set_focus_lock_filter(
-                response.id,
-                egui::EventFilter {
-                    horizontal_arrows: true,
-                    ..Default::default()
-                },
-            );
-        });
-        ui.input(|input| {
-            decrement += input.num_presses(egui::Key::ArrowLeft);
-            increment += input.num_presses(egui::Key::ArrowRight);
-        });
-    }
-    ui.input(|input| {
-        decrement += input.num_accesskit_action_requests(response.id, Action::Decrement);
-        increment += input.num_accesskit_action_requests(response.id, Action::Increment);
-        for request in input.accesskit_action_requests(response.id, Action::SetValue) {
-            if let Some(ActionData::NumericValue(value)) = request.data {
-                threshold_dbfs = slider_position_to_dbfs((value as f32 / 100.0).clamp(0.0, 1.0));
-            }
-        }
-    });
-    threshold_dbfs += (increment as f32 - decrement as f32) * INPUT_LEVEL_KEYBOARD_STEP_DB;
-    *threshold_rms = dbfs_to_rms(threshold_dbfs);
-    if *threshold_rms != previous {
-        response.mark_changed();
-    }
-
-    let threshold_position = rms_to_slider_position(*threshold_rms);
-    response.widget_info(|| {
-        egui::WidgetInfo::slider(f64::from(threshold_position * 100.0), "Input sensitivity")
-    });
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_description(format!(
-            "Minimum microphone level treated as speech. Current threshold {}. Use Left and Right arrow keys to adjust.",
-            input_sensitivity_db_label(threshold_dbfs)
-        ));
-        builder.set_min_numeric_value(0.0);
-        builder.set_max_numeric_value(100.0);
-        builder.set_numeric_value_step(f64::from(
-            100.0 * INPUT_LEVEL_KEYBOARD_STEP_DB / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS),
-        ));
-        builder.add_action(Action::SetValue);
-        if threshold_position < 1.0 {
-            builder.add_action(Action::Increment);
-        }
-        if threshold_position > 0.0 {
-            builder.add_action(Action::Decrement);
-        }
-    });
-
-    let colors = ui_palette(ui);
-    let track = egui::Rect::from_center_size(
-        rect.center(),
-        Vec2::new(rect.width(), INPUT_SENSITIVITY_TRACK_HEIGHT),
-    );
-    let rounding = Rounding::same(5.0);
-    ui.painter()
-        .rect_filled(track, rounding, colors.slider_remainder_fill);
-    let threshold_x = track.left() + track.width() * threshold_position;
-    let threshold_region = egui::Rect::from_min_max(
-        track.min,
-        egui::pos2(
-            threshold_x.clamp(track.left(), track.right()),
-            track.bottom(),
-        ),
-    );
-    if threshold_region.width() > 0.0 {
-        ui.painter()
-            .rect_filled(threshold_region, rounding, colors.slider_threshold_fill);
-    }
-    ui.painter().rect_stroke(
-        track,
-        rounding,
-        Stroke::new(1.0, colors.slider_track_border),
-    );
-    let crossed = live_level_position >= threshold_position && live_level_position > 0.0;
-    let fill_width = track.width() * live_level_position.clamp(0.0, 1.0);
-    if fill_width > 0.0 {
-        let fill = egui::Rect::from_min_size(
-            egui::pos2(
-                track.left(),
-                track.center().y - INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0,
-            ),
-            Vec2::new(fill_width, INPUT_SENSITIVITY_LIVE_FILL_HEIGHT),
-        );
-        let fill_color = if crossed {
-            colors.success
-        } else {
-            colors.slider_live_below
-        };
-        ui.painter().rect_filled(
-            fill,
-            Rounding::same(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0),
-            fill_color,
-        );
-    }
-
-    let thumb_center = egui::pos2(
-        track.left() + track.width() * threshold_position,
-        track.center().y,
-    );
-    let thumb_radius = if response.dragged() { 9.0 } else { 8.0 };
-    ui.painter()
-        .circle_filled(thumb_center, thumb_radius, colors.card_bg);
-    let thumb_stroke_width = if response.has_focus() { 3.0 } else { 2.0 };
-    ui.painter().circle_stroke(
-        thumb_center,
-        thumb_radius,
-        Stroke::new(thumb_stroke_width, colors.primary),
-    );
-    if response.has_focus() {
-        ui.painter()
-            .circle_filled(thumb_center, 2.0, colors.primary);
-    } else if response.hovered() {
-        ui.painter().circle_stroke(
-            thumb_center,
-            thumb_radius + 2.0,
-            Stroke::new(1.0, colors.border_strong),
-        );
-    }
-    if response.dragged() || response.has_focus() {
-        let label = input_sensitivity_db_label(threshold_dbfs);
-        let font = FontId::proportional(13.0);
-        let text_width = ui
-            .painter()
-            .layout_no_wrap(label.clone(), font.clone(), colors.text)
-            .size()
-            .x;
-        let bubble_size = Vec2::new(text_width + 18.0, 28.0);
-        let bubble_center_x = thumb_center.x.clamp(
-            rect.left() + bubble_size.x / 2.0,
-            rect.right() - bubble_size.x / 2.0,
-        );
-        let bubble_rect = egui::Rect::from_center_size(
-            egui::pos2(bubble_center_x, track.top() - bubble_size.y / 2.0 - 6.0),
-            bubble_size,
-        );
-        ui.painter()
-            .rect_filled(bubble_rect, Rounding::same(8.0), colors.card_bg);
-        ui.painter().rect_stroke(
-            bubble_rect,
-            Rounding::same(8.0),
-            Stroke::new(1.0, colors.border_strong),
-        );
-        ui.painter().text(
-            bubble_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font,
-            colors.text,
-        );
-    }
-    response
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -481,14 +214,6 @@ fn no_speech_feedback_for_capture(
 
 fn diagnostic_activation_floor(config: &AppConfig) -> f32 {
     config.recording.manual_activation_rms
-}
-
-fn discard_recording_async(session: RecordingSession) {
-    let _ = thread::Builder::new()
-        .name("scribe-stale-audio-cleanup".to_owned())
-        .spawn(move || {
-            let _ = session.stop_and_discard(Duration::from_secs(2));
-        });
 }
 
 fn history_retention_policy(config: &AppConfig) -> HistoryRetentionPolicy {
@@ -642,13 +367,6 @@ enum TriggerObservation {
     HotkeyPoll,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DeferredRecordingStart {
-    source: RecordingSource,
-    activation_at: Instant,
-    trigger_observation: TriggerObservation,
-}
-
 struct ActiveRecording {
     session_id: SessionId,
     session: RecordingSession,
@@ -690,32 +408,6 @@ impl Default for CaptureDiagnosticContext {
         Self {
             activation_floor: audio::MIN_SPEECH_ACTIVATION_RMS,
             input_device_name: None,
-        }
-    }
-}
-
-#[derive(Default)]
-enum MicrophoneTest {
-    #[default]
-    Idle,
-    Starting {
-        request_id: u64,
-        stop_requested: bool,
-        cancellation: CaptureCancellation,
-    },
-    Active {
-        session: RecordingSession,
-    },
-    Stopping {
-        session: RecordingSession,
-    },
-}
-
-impl MicrophoneTest {
-    fn session(&self) -> Option<&RecordingSession> {
-        match self {
-            Self::Active { session } | Self::Stopping { session } => Some(session),
-            Self::Idle | Self::Starting { .. } => None,
         }
     }
 }
@@ -1157,10 +849,6 @@ enum PlaygroundAction {
 enum AppEvent {
     CaptureReady {
         session_id: SessionId,
-        result: Result<RecordingSession, audio::CaptureError>,
-    },
-    MicrophoneTestReady {
-        request_id: u64,
         result: Result<RecordingSession, audio::CaptureError>,
     },
     ModelPreloadFinished {
@@ -2464,13 +2152,6 @@ pub struct LocalTranscriberApp {
     model_import_path: String,
     remote_catalog: RemoteCatalogState,
     audio_devices: Vec<String>,
-    microphone_test: MicrophoneTest,
-    microphone_test_sequence: u64,
-    microphone_test_error: Option<String>,
-    microphone_monitor_retry_at: Option<Instant>,
-    microphone_level_envelope: MicrophoneLevelEnvelope,
-    deferred_recording_start: Option<DeferredRecordingStart>,
-    deferred_history_playback: Option<i64>,
     capturing_hotkey: bool,
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
@@ -2589,13 +2270,6 @@ impl LocalTranscriberApp {
             model_import_path: String::new(),
             remote_catalog: RemoteCatalogState::default(),
             audio_devices: Vec::new(),
-            microphone_test: MicrophoneTest::Idle,
-            microphone_test_sequence: 0,
-            microphone_test_error: None,
-            microphone_monitor_retry_at: None,
-            microphone_level_envelope: MicrophoneLevelEnvelope::default(),
-            deferred_recording_start: None,
-            deferred_history_playback: None,
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
@@ -3238,10 +2912,7 @@ impl LocalTranscriberApp {
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.capture_is_active()
-            || self.microphone_test_is_active()
-            || self.microphone_level_envelope.is_animating()
-        {
+        if self.capture_is_active() {
             METER_REPAINT_DELAY
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
@@ -3254,9 +2925,6 @@ impl LocalTranscriberApp {
 
     fn has_active_work(&self) -> bool {
         self.capture_is_active()
-            || self.microphone_test_is_active()
-            || self.deferred_recording_start.is_some()
-            || self.deferred_history_playback.is_some()
             || self.session_coordinator.phase() != DictationPhase::Idle
             || self.playground_pending > 0
             || self.history_loading
@@ -3299,7 +2967,6 @@ impl LocalTranscriberApp {
                         _ => None,
                     })
             })
-            .or_else(|| self.deferred_recording_start.map(|pending| pending.source))
     }
 
     fn current_audio_levels(&self) -> LevelSnapshot {
@@ -3318,141 +2985,6 @@ impl LocalTranscriberApp {
         }
         if let Some(pending) = self.pending_recording.as_mut() {
             pending.capture_diagnostics.activation_floor = threshold;
-        }
-        if let Some(session) = self.microphone_test.session() {
-            session.set_manual_activation_threshold(threshold);
-        }
-    }
-
-    fn microphone_test_is_active(&self) -> bool {
-        !matches!(self.microphone_test, MicrophoneTest::Idle)
-    }
-
-    fn current_sensitivity_level_sample(&self) -> (LevelSnapshot, Option<u64>, bool) {
-        if let Some(active) = self.active_recording.as_ref() {
-            return (
-                active.session.latest_levels(),
-                Some(active.session.latest_level_revision()),
-                true,
-            );
-        }
-        if let MicrophoneTest::Active { session } = &self.microphone_test {
-            return (
-                session.latest_levels(),
-                Some(session.latest_level_revision()),
-                true,
-            );
-        }
-        (LevelSnapshot::default(), None, false)
-    }
-
-    fn ensure_microphone_monitor(&mut self) {
-        if self.capture_is_active()
-            || self.deferred_recording_start.is_some()
-            || self.deferred_history_playback.is_some()
-            || self.playing_history_id.is_some()
-            || self.microphone_test_is_active()
-            || self
-                .microphone_monitor_retry_at
-                .is_some_and(|retry_at| Instant::now() < retry_at)
-        {
-            return;
-        }
-        self.start_microphone_test();
-    }
-
-    fn start_microphone_test(&mut self) {
-        if self.microphone_test_is_active() {
-            return;
-        }
-        if self.capture_is_active() || self.playing_history_id.is_some() {
-            return;
-        }
-
-        let mut options = capture_options_from_config(&self.config);
-        options.intent = CaptureIntent::MeterOnly;
-        options.vad_enabled = true;
-        options.endpointing_enabled = false;
-        let input_device_name = self.config.recording.audio_input_device_name.clone();
-        let max_duration_seconds = config::MAX_RECORDING_SECONDS;
-        self.microphone_test_sequence = self.microphone_test_sequence.wrapping_add(1);
-        let request_id = self.microphone_test_sequence;
-        let cancellation = CaptureCancellation::new();
-        self.microphone_test = MicrophoneTest::Starting {
-            request_id,
-            stop_requested: false,
-            cancellation: cancellation.clone(),
-        };
-        self.microphone_test_error = None;
-        self.microphone_monitor_retry_at = None;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let result = audio::start_recording(
-                max_duration_seconds,
-                input_device_name,
-                options,
-                None,
-                cancellation,
-            );
-            let _ = tx.send(AppEvent::MicrophoneTestReady { request_id, result });
-        });
-    }
-
-    fn stop_microphone_test(&mut self) {
-        self.microphone_test = match std::mem::take(&mut self.microphone_test) {
-            MicrophoneTest::Starting {
-                request_id,
-                cancellation,
-                ..
-            } => {
-                cancellation.cancel();
-                MicrophoneTest::Starting {
-                    request_id,
-                    stop_requested: true,
-                    cancellation,
-                }
-            }
-            MicrophoneTest::Active { session } => {
-                session.stop();
-                MicrophoneTest::Stopping { session }
-            }
-            state @ (MicrophoneTest::Idle | MicrophoneTest::Stopping { .. }) => state,
-        };
-    }
-
-    fn suspend_microphone_monitor(&mut self) {
-        self.stop_microphone_test();
-        self.microphone_level_envelope.clear();
-    }
-
-    fn poll_microphone_test(&mut self) {
-        let completion = self
-            .microphone_test
-            .session()
-            .and_then(RecordingSession::try_finish);
-        if let Some(result) = completion {
-            self.microphone_test = MicrophoneTest::Idle;
-            self.microphone_level_envelope.reset_source();
-            self.microphone_test_error = result.err().map(|error| error.to_string());
-            if let Some(error) = self.microphone_test_error.as_ref() {
-                self.microphone_monitor_retry_at =
-                    Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
-                self.status_message = format!("Microphone monitoring unavailable: {error}");
-            }
-        }
-        if matches!(self.microphone_test, MicrophoneTest::Idle)
-            && let Some(pending) = self.deferred_recording_start.take()
-        {
-            self.deferred_history_playback = None;
-            self.start_recording_at(
-                pending.source,
-                pending.activation_at,
-                pending.trigger_observation,
-            );
-        } else if matches!(self.microphone_test, MicrophoneTest::Idle)
-            && let Some(history_id) = self.deferred_history_playback.take()
-        {
-            self.apply_history_action(HistoryPageAction::Play(history_id));
         }
     }
 
@@ -3936,19 +3468,6 @@ impl LocalTranscriberApp {
     ) {
         // A recording request has priority over retained-audio playback that was waiting
         // for the same monitor teardown. Never allow the two deferred audio owners to coexist.
-        self.deferred_history_playback = None;
-        if self.microphone_test_is_active() {
-            if self.deferred_recording_start.is_none() {
-                self.deferred_recording_start = Some(DeferredRecordingStart {
-                    source,
-                    activation_at,
-                    trigger_observation,
-                });
-                self.stop_microphone_test();
-                self.status_message = "Preparing microphone".to_owned();
-            }
-            return;
-        }
         if self.playing_history_id.is_some() {
             self.status_message =
                 "Stop retained-audio playback before starting dictation".to_owned();
@@ -4449,11 +3968,6 @@ impl LocalTranscriberApp {
     }
 
     fn stop_recording(&mut self) {
-        if self.deferred_recording_start.take().is_some() {
-            self.status = TranscriptionStatus::Idle;
-            self.status_message = "Recording cancelled".to_owned();
-            return;
-        }
         if let Some(pending) = self.pending_recording.as_mut()
             && !pending.stop_requested
         {
@@ -4487,7 +4001,7 @@ impl LocalTranscriberApp {
         activation_at: Instant,
         trigger_observation: TriggerObservation,
     ) {
-        if self.capture_is_active() || self.deferred_recording_start.is_some() {
+        if self.capture_is_active() {
             self.stop_recording();
         } else {
             self.start_recording_at(
@@ -4845,14 +4359,8 @@ impl LocalTranscriberApp {
                 );
             }
             HistoryPageAction::Play(history_id) => {
-                if self.capture_is_active() || self.deferred_recording_start.is_some() {
+                if self.capture_is_active() {
                     self.status_message = "Stop recording before playing retained audio".to_owned();
-                    return;
-                }
-                if self.microphone_test_is_active() {
-                    self.deferred_history_playback = Some(history_id);
-                    self.stop_microphone_test();
-                    self.status_message = "Preparing audio playback".to_owned();
                     return;
                 }
                 let Some(store) = self.history_store.clone() else {
@@ -5304,48 +4812,6 @@ impl LocalTranscriberApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                AppEvent::MicrophoneTestReady { request_id, result } => {
-                    let state = std::mem::take(&mut self.microphone_test);
-                    match state {
-                        MicrophoneTest::Starting {
-                            request_id: expected,
-                            stop_requested,
-                            cancellation: _,
-                        } if expected == request_id => match result {
-                            Ok(session)
-                                if stop_requested
-                                    || self.capture_is_active()
-                                    || self.playing_history_id.is_some() =>
-                            {
-                                session.stop();
-                                self.microphone_test = MicrophoneTest::Stopping { session };
-                            }
-                            Ok(session) => {
-                                session.set_manual_activation_threshold(
-                                    self.config.recording.manual_activation_rms,
-                                );
-                                self.microphone_level_envelope.reset_source();
-                                self.microphone_test = MicrophoneTest::Active { session };
-                            }
-                            Err(error) => {
-                                self.microphone_level_envelope.reset_source();
-                                if !stop_requested {
-                                    self.microphone_test_error = Some(error.to_string());
-                                    self.microphone_monitor_retry_at =
-                                        Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
-                                    self.status_message =
-                                        format!("Microphone monitoring unavailable: {error}");
-                                }
-                            }
-                        },
-                        current => {
-                            self.microphone_test = current;
-                            if let Ok(session) = result {
-                                discard_recording_async(session);
-                            }
-                        }
-                    }
-                }
                 AppEvent::CaptureReady { session_id, result } => {
                     let Some(mut pending) = self.pending_recording.take() else {
                         if let Ok(session) = result {
@@ -7882,7 +7348,6 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_rolling_preview();
         self.poll_preview_drain();
         self.poll_recording();
-        self.poll_microphone_test();
         self.poll_preview_drain();
         // Pending output was created in the prior frame, allowing the overlay
         // to present the correlated Output/Pasting phase before any blocking
@@ -7899,10 +7364,6 @@ impl eframe::App for LocalTranscriberApp {
             self.settings_tab = SettingsTab::Advanced;
             self.current_tab = Tab::General;
         }
-        if self.current_tab != Tab::General {
-            self.suspend_microphone_monitor();
-        }
-
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
@@ -7914,10 +7375,6 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::About => self.ui_about(ui),
                 Tab::Debug => self.ui_playground(ui),
             });
-
-        if self.current_tab != Tab::General {
-            self.suspend_microphone_monitor();
-        }
 
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
@@ -7946,7 +7403,6 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.stop_microphone_test();
         for (_, cancellation) in self.artifact_installations.values() {
             cancellation.cancel();
         }
@@ -8196,218 +7652,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetAudioRetentionDays(_)
             | ScreenAction::SetStoreApplicationIdentity(_) => {}
         }
-    }
-
-    #[allow(dead_code)]
-    fn ui_transcribe_legacy(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Transcribe", status, &status_message, |ui| {
-            let selected_model = self.selected_model();
-            let runtime_status = selected_model
-                .as_ref()
-                .map(|model| runtime_status_for_model(&self.config, model));
-            let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
-            let selected_model_summary = selected_model.as_ref().and_then(|model| {
-                let remote = self
-                    .config
-                    .general
-                    .managed_remote_models
-                    .contains_key(&model.id);
-                self.transcription_service
-                    .model_descriptor(&crate::transcription::ModelId::new(&model.id))
-                    .ok()
-                    .map(|descriptor| {
-                        (
-                            descriptor.display_name,
-                            descriptor.compatibility.label(),
-                            self.effective_install_status(model),
-                        )
-                    })
-                    .or_else(|| {
-                        remote.then(|| {
-                            (
-                                model.name.as_str(),
-                                "Experimental",
-                                self.effective_install_status(model),
-                            )
-                        })
-                    })
-            });
-            let hotkey = self.config.recording.hotkey.clone();
-            let mut requested_tab = None;
-
-            ui.columns(2, |columns| {
-                summary_card(
-                    &mut columns[0],
-                    "Current Model",
-                    |ui| {
-                        if let Some((name, compatibility, install_status)) = &selected_model_summary
-                        {
-                            ui.label(body_strong(name));
-                            ui.horizontal_wrapped(|ui| {
-                                badge(ui, compatibility, ChipTone::Warning);
-                                badge(
-                                    ui,
-                                    &install_status.label(),
-                                    install_chip_tone(install_status),
-                                );
-                            });
-                        } else {
-                            ui.label(body_strong("No model selected"));
-                        }
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Change")).clicked() {
-                            requested_tab = Some(Tab::Models);
-                        }
-                    },
-                );
-
-                summary_card(
-                    &mut columns[1],
-                    "Hotkey",
-                    |ui| {
-                        ui.label(body_strong(&hotkey));
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Edit")).clicked() {
-                            requested_tab = Some(Tab::General);
-                        }
-                    },
-                );
-            });
-            if let Some(tab) = requested_tab {
-                self.current_tab = tab;
-            }
-
-            if !ready && !self.capture_is_active() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    let setup_message = runtime_status
-                        .as_ref()
-                        .map(setup_message_for_status)
-                        .unwrap_or_else(|| {
-                            "Choose an installed local model to start transcribing.".to_owned()
-                        });
-                    ui.label(section_heading("Setup required"));
-                    ui.label(mut_text(setup_message));
-                    ui.add_space(10.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(small_button(ui, "Manage models")).clicked() {
-                            self.current_tab = Tab::Models;
-                        }
-                    });
-                });
-            }
-
-            ui.add_space(12.0);
-            recessed_panel(ui, 110.0, |ui| {
-                ui.vertical_centered(|ui| {
-                    let listening = self.capture_is_active();
-                    let button_text = if listening {
-                        "Stop Listening"
-                    } else {
-                        "Start Listening"
-                    };
-                    let disabled_tooltip = if listening || ready {
-                        None
-                    } else {
-                        Some(
-                            runtime_status
-                                .as_ref()
-                                .map(setup_message_for_status)
-                                .unwrap_or_else(|| {
-                                    "Choose or install a local model before transcribing."
-                                        .to_owned()
-                                }),
-                        )
-                    };
-                    let record_button = primary_button(ui, button_text);
-                    if add_enabled_button(
-                        ui,
-                        listening || ready,
-                        record_button,
-                        disabled_tooltip.as_deref(),
-                    )
-                    .clicked()
-                    {
-                        self.toggle_recording();
-                    }
-                    ui.add_space(8.0);
-                    if let Some(active) = &self.active_recording {
-                        let elapsed = active.started_at.elapsed().as_secs_f32();
-                        let total = active.max_duration_seconds.max(1) as f32;
-                        ui.add(
-                            egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
-                                .desired_width(220.0)
-                                .text(recording_timer_text(active)),
-                        );
-                    } else if self.pending_recording.is_some() {
-                        ui.label(RichText::new("Preparing microphone").small().weak());
-                    } else if ready {
-                        ui.label(
-                            RichText::new("System audio & microphone active")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            transcript_panel(ui, status, |ui| {
-                let transcript_label = ui
-                    .horizontal(|ui| {
-                        let heading = semantic_heading(ui, section_heading("Transcript"));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ready_dot(ui, self.effective_status());
-                        });
-                        heading
-                    })
-                    .inner;
-                ui.add_space(10.0);
-                let output_is_queued = self.pending_output.is_some()
-                    || self.session_coordinator.phase() == DictationPhase::Output;
-                let editor = ui
-                    .add_enabled(
-                        !output_is_queued,
-                        TextEdit::multiline(&mut self.transcript)
-                            .desired_rows(14)
-                            .desired_width(usable_width(ui))
-                            .hint_text("Your transcription appears here..."),
-                    )
-                    .labelled_by(transcript_label.id);
-                if output_is_queued {
-                    let lock_message =
-                        "Transcript editing is temporarily locked while final output is sent.";
-                    ui.ctx().accesskit_node_builder(editor.id, |builder| {
-                        builder.set_description(lock_message);
-                        builder.set_disabled();
-                    });
-                    ui.add_space(6.0);
-                    ui.label(mut_text(lock_message));
-                }
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clear_label = if output_is_queued {
-                        "Cancel pending output and clear transcript"
-                    } else {
-                        "Clear transcript"
-                    };
-                    let clear = ui.add(small_button(ui, clear_label));
-                    if output_is_queued && editor.has_focus() {
-                        clear.request_focus();
-                    }
-                    if clear.clicked() {
-                        self.clear_transcript_history();
-                    }
-                    if ui.add(small_button(ui, "Copy transcript")).clicked() {
-                        self.copy_transcript_to_clipboard();
-                    }
-                });
-            });
-        });
     }
 
     fn request_remote_catalog(&mut self, force: bool) {
@@ -10068,198 +9312,6 @@ impl LocalTranscriberApp {
         }
     }
 
-    #[allow(dead_code)]
-    fn ui_general_settings_legacy(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "General", status, &status_message, |ui| {
-            card(ui, |ui| {
-                ui.label(section_heading("General"));
-                ui.add_space(8.0);
-                let mut close_to_tray = self.config.general.close_to_tray;
-                if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
-                    self.config.general.close_to_tray = close_to_tray;
-                    self.save_config();
-                }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Active model"));
-                let model_name = self
-                    .selected_model()
-                    .map(|model| model.name)
-                    .unwrap_or_else(|| "No model selected".to_owned());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(body_strong(&model_name));
-                    if ui.add(small_button(ui, "Manage models")).clicked() {
-                        self.current_tab = Tab::Models;
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Shortcuts"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Record toggle");
-                    ui.add(
-                        TextEdit::singleline(&mut self.hotkey_input)
-                            .desired_width(width_before_trailing(ui, 154.0, 96.0)),
-                    );
-                    if ui.add(small_button(ui, "Apply")).clicked() {
-                        self.apply_hotkey();
-                    }
-                    if ui
-                        .add(small_button(
-                            ui,
-                            if self.capturing_hotkey {
-                                "Listening..."
-                            } else {
-                                "Capture"
-                            },
-                        ))
-                        .clicked()
-                    {
-                        self.capturing_hotkey = true;
-                        self.status_message = "Press the new hotkey combination.".to_owned();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.recording.hotkey_mode;
-                    ui.label("Hotkey mode");
-                    ComboBox::from_id_source("hotkey-mode")
-                        .selected_text(self.config.recording.hotkey_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in HotkeyMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.recording.hotkey_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    if before != self.config.recording.hotkey_mode {
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Audio"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.recording.audio_input_device_name.clone();
-                    let label = ui.label("Microphone");
-                    let combo = ComboBox::from_id_source("audio-input-device")
-                        .selected_text(
-                            self.config
-                                .recording
-                                .audio_input_device_name
-                                .as_deref()
-                                .unwrap_or("OS default"),
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.recording.audio_input_device_name,
-                                None,
-                                "OS default",
-                            );
-                            for device in &self.audio_devices {
-                                ui.selectable_value(
-                                    &mut self.config.recording.audio_input_device_name,
-                                    Some(device.clone()),
-                                    device,
-                                );
-                            }
-                        });
-                    combo.response.labelled_by(label.id);
-                    if before != self.config.recording.audio_input_device_name {
-                        self.stop_microphone_test();
-                        self.microphone_monitor_retry_at = None;
-                        self.microphone_level_envelope.reset_source();
-                        self.save_config();
-                    }
-                    if ui.add(small_button(ui, "Refresh")).clicked() {
-                        self.refresh_audio_devices();
-                    }
-                });
-                self.ensure_microphone_monitor();
-                ui.add_space(10.0);
-                let (levels, revision, source_active) = self.current_sensitivity_level_sample();
-                let live_level_position = self.microphone_level_envelope.update(
-                    levels.rms,
-                    revision,
-                    source_active,
-                    Instant::now(),
-                );
-                let label = ui.label("Input sensitivity");
-                let response = microphone_sensitivity_slider(
-                    ui,
-                    live_level_position,
-                    &mut self.config.recording.manual_activation_rms,
-                )
-                .labelled_by(label.id);
-                if response.changed() {
-                    self.apply_input_sensitivity_threshold();
-                    self.save_config();
-                }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Appearance"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.general.theme_mode;
-                    ui.label("Theme");
-                    ComboBox::from_id_source("theme-mode")
-                        .selected_text(self.config.general.theme_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in ThemeMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.general.theme_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    if before != self.config.general.theme_mode {
-                        self.save_config();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.overlay.mode;
-                    ui.label("Dictation overlay");
-                    ui.add_enabled_ui(overlay::overlay_focus_safety_available(), |ui| {
-                        ComboBox::from_id_source("overlay-mode")
-                            .selected_text(self.config.overlay.mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in OverlayMode::ALL {
-                                    ui.selectable_value(
-                                        &mut self.config.overlay.mode,
-                                        mode,
-                                        mode.label(),
-                                    );
-                                }
-                            });
-                    });
-                    if before != self.config.overlay.mode {
-                        self.save_config();
-                    }
-                });
-                if !overlay::overlay_focus_safety_available() {
-                    ui.colored_label(
-                        ui_palette(ui).warning,
-                        "The overlay is forced Off because no-focus window safety is not verified on this platform.",
-                    );
-                }
-            });
-        });
-    }
-
     fn ui_history(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
@@ -10497,44 +9549,6 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
             .inner_margin(Margin::same(14.0)),
         add_contents,
     );
-}
-
-fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
-    let colors = ui_palette(ui);
-    full_width_frame(
-        ui,
-        Frame::none()
-            .fill(colors.panel_bg)
-            .stroke(Stroke::new(1.0, colors.border_strong))
-            .rounding(Rounding::same(8.0))
-            .inner_margin(Margin::same(18.0)),
-        |ui| {
-            ui.set_min_height(min_height);
-            ui.centered_and_justified(add_contents);
-        },
-    );
-}
-
-fn transcript_panel(ui: &mut Ui, _status: TranscriptionStatus, add_contents: impl FnOnce(&mut Ui)) {
-    card(ui, add_contents);
-}
-
-fn summary_card(
-    ui: &mut Ui,
-    title: &str,
-    body: impl FnOnce(&mut Ui),
-    actions: impl FnOnce(&mut Ui),
-) {
-    full_width_frame(ui, card_frame(ui), |ui| {
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.label(label_caps(title));
-                ui.add_space(6.0);
-                body(ui);
-            });
-            ui.with_layout(Layout::right_to_left(Align::TOP), actions);
-        });
-    });
 }
 
 fn remote_model_matches_search(model: &RemoteModel, search: &str) -> bool {
@@ -11244,29 +10258,6 @@ fn full_width_frame<R>(
     egui::InnerResponse::new(inner, response)
 }
 
-fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
-    let available = usable_width(ui);
-    if available <= trailing_width {
-        return available.max(0.0);
-    }
-    (available - trailing_width)
-        .max(min_width)
-        .min(available - trailing_width)
-}
-
-fn primary_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
-    let colors = ui_palette(ui);
-    Button::new(
-        RichText::new(label)
-            .color(colors.primary_button_text)
-            .strong(),
-    )
-    .fill(colors.primary_button_bg)
-    .stroke(Stroke::new(1.0, colors.primary_button_bg))
-    .rounding(Rounding::same(24.0))
-    .min_size(Vec2::new(190.0, 46.0))
-}
-
 fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
     let colors = ui_palette(ui);
     Button::new(
@@ -11320,10 +10311,6 @@ fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
         TranscriptionStatus::Error => ChipTone::Error,
     };
     badge(ui, &status.to_string(), tone);
-}
-
-fn ready_dot(ui: &mut Ui, status: TranscriptionStatus) {
-    status_badge(ui, status);
 }
 
 fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
@@ -12482,74 +11469,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_track_boundary_meets_non_text_contrast() {
-        for palette in [ThemePalette::light(), ThemePalette::dark()] {
-            for adjacent in [palette.panel_bg, palette.card_bg] {
-                let ratio = contrast_ratio(palette.slider_track_border, adjacent);
-                assert!(
-                    ratio >= 3.0,
-                    "input-sensitivity track contrast was {ratio:.2}"
-                );
-            }
-            let live_ratio =
-                contrast_ratio(palette.slider_live_below, palette.slider_threshold_fill);
-            assert!(
-                live_ratio >= 3.0,
-                "below-threshold live-fill contrast was {live_ratio:.2}"
-            );
-        }
-    }
-
-    #[test]
-    fn input_sensitivity_track_has_split_fills_and_constant_live_height() {
-        let palette = ThemePalette::light();
-        assert_ne!(palette.slider_threshold_fill, palette.slider_remainder_fill);
-        let threshold_position = 0.5;
-
-        for (live_position, expected_live_color) in
-            [(0.25, palette.slider_live_below), (0.75, palette.success)]
-        {
-            let ctx = egui::Context::default();
-            configure_stitch_style(&ctx);
-            ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-            let mut threshold = dbfs_to_rms(slider_position_to_dbfs(threshold_position));
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(480.0, 120.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        microphone_sensitivity_slider(ui, live_position, &mut threshold);
-                    });
-                },
-            );
-
-            let rects = output.shapes.iter().filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) => Some(rect),
-                _ => None,
-            });
-            let mut saw_threshold_fill = false;
-            let mut saw_remainder_fill = false;
-            let mut live_height = None;
-            for rect in rects {
-                saw_threshold_fill |= rect.fill == palette.slider_threshold_fill;
-                saw_remainder_fill |= rect.fill == palette.slider_remainder_fill;
-                if rect.fill == expected_live_color {
-                    live_height = Some(rect.rect.height());
-                }
-            }
-
-            assert!(saw_threshold_fill);
-            assert!(saw_remainder_fill);
-            assert_eq!(live_height, Some(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT));
-        }
-    }
-
-    #[test]
     fn benchmark_heatmap_text_meets_aa_in_light_and_dark_themes() {
         for (dark_mode, palette) in [(false, ThemePalette::light()), (true, ThemePalette::dark())] {
             for score in [0.0, 0.25, 0.5, 0.75, 1.0] {
@@ -12884,14 +11803,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_db_label_rounds_to_a_compact_whole_db_value() {
-        assert_eq!(input_sensitivity_db_label(-54.4), "-54 dB");
-        assert_eq!(input_sensitivity_db_label(-53.6), "-54 dB");
-        assert_eq!(input_sensitivity_db_label(4.0), "0 dB");
-        assert_eq!(input_sensitivity_db_label(-80.0), "-72 dB");
-    }
-
-    #[test]
     fn sensitivity_slider_endpoints_remain_valid_capture_thresholds() {
         assert!(
             (dbfs_to_rms(INPUT_LEVEL_MIN_DBFS) - config::settings::MIN_MANUAL_ACTIVATION_RMS).abs()
@@ -12915,55 +11826,6 @@ mod layout_tests {
             let round_trip = dbfs_to_slider_position(slider_position_to_dbfs(position));
             assert!((round_trip - position).abs() < 1e-6);
         }
-    }
-
-    #[test]
-    fn microphone_level_envelope_attacks_fast_releases_slowly_and_resets_stale_input() {
-        let base = Instant::now();
-        let mut envelope = MicrophoneLevelEnvelope::default();
-        let attack = envelope.update(1.0, Some(1), true, base);
-        assert!(
-            attack > 0.5,
-            "attack should move most of the way in one meter frame"
-        );
-
-        let release = envelope.update(0.0, Some(2), true, base + METER_REPAINT_DELAY);
-        assert!(
-            release > 0.4,
-            "release should settle more slowly than attack"
-        );
-        assert!(release < attack);
-
-        let stale = envelope.update(
-            1.0,
-            Some(2),
-            true,
-            base + INPUT_LEVEL_STALE_AFTER + Duration::from_millis(81),
-        );
-        assert!(stale < release, "a stale unchanged sample must decay");
-        let settled = envelope.update(
-            1.0,
-            Some(2),
-            true,
-            base + INPUT_LEVEL_STALE_AFTER + Duration::from_secs(3),
-        );
-        assert_eq!(settled, 0.0);
-    }
-
-    #[test]
-    fn leaving_general_clears_sensitivity_animation_and_fast_repaint() {
-        let mut app = test_app();
-        let now = Instant::now();
-        app.microphone_level_envelope
-            .update(0.1, Some(1), true, now);
-        assert!(app.microphone_level_envelope.is_animating());
-        assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
-
-        app.current_tab = Tab::Transcribe;
-        app.suspend_microphone_monitor();
-
-        assert!(!app.microphone_level_envelope.is_animating());
-        assert_ne!(app.next_repaint_delay(), METER_REPAINT_DELAY);
     }
 
     #[test]
@@ -13093,207 +11955,6 @@ mod layout_tests {
                 activation_rms: 0.025
             }
         );
-    }
-
-    #[test]
-    fn stale_microphone_test_ready_is_discarded_without_replacing_the_current_request() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 2,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 1,
-                result: Ok(RecordingSession::simulated(
-                    None,
-                    CaptureStopReason::Explicit,
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 2,
-                stop_requested: false,
-                ..
-            }
-        ));
-        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
-    }
-
-    #[test]
-    fn microphone_test_ready_keeps_capture_outside_dictation_lifecycle() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 1,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 1,
-                result: Ok(RecordingSession::simulated(
-                    None,
-                    CaptureStopReason::Explicit,
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(app.microphone_test, MicrophoneTest::Active { .. }));
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
-        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
-        app.stop_microphone_test();
-    }
-
-    #[test]
-    fn microphone_monitor_defers_retained_audio_playback_until_teardown() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Active {
-            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
-        };
-
-        app.apply_history_action(HistoryPageAction::Play(7));
-
-        assert!(app.playing_history_id.is_none());
-        assert_eq!(app.deferred_history_playback, Some(7));
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        assert_eq!(app.status_message, "Preparing audio playback");
-    }
-
-    #[test]
-    fn stopping_microphone_test_keeps_all_audio_owners_excluded_until_completion() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Active {
-            session: RecordingSession::simulated_with_stop_delay(
-                None,
-                CaptureStopReason::Explicit,
-                Duration::from_millis(80),
-            ),
-        };
-
-        app.stop_microphone_test();
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-
-        let sequence = app.microphone_test_sequence;
-        app.start_microphone_test();
-        assert_eq!(app.microphone_test_sequence, sequence);
-        app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-
-        app.poll_microphone_test();
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        app.stop_recording();
-        assert!(app.deferred_recording_start.is_none());
-        thread::sleep(Duration::from_millis(100));
-        app.poll_microphone_test();
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-    }
-
-    #[test]
-    fn stopping_during_microphone_startup_adopts_ready_session_until_teardown() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 9,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.stop_microphone_test();
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 9,
-                result: Ok(RecordingSession::simulated_with_stop_delay(
-                    None,
-                    CaptureStopReason::Explicit,
-                    Duration::from_millis(50),
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        assert!(app.microphone_test_is_active());
-        thread::sleep(Duration::from_millis(70));
-        app.poll_microphone_test();
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-    }
-
-    #[test]
-    fn cancelled_microphone_startup_keeps_audio_excluded_until_worker_confirmation() {
-        let mut app = test_app();
-        let cancellation = CaptureCancellation::new();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 12,
-            stop_requested: false,
-            cancellation: cancellation.clone(),
-        };
-
-        app.stop_microphone_test();
-        assert!(cancellation.is_cancelled());
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 12,
-                stop_requested: true,
-                ..
-            }
-        ));
-        let sequence = app.microphone_test_sequence;
-        app.start_microphone_test();
-        assert_eq!(app.microphone_test_sequence, sequence);
-        app.apply_history_action(HistoryPageAction::Play(7));
-        assert_eq!(app.deferred_history_playback, Some(7));
-        app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.deferred_history_playback.is_none());
-        assert_eq!(app.status_message, "Preparing microphone");
-        app.apply_history_action(HistoryPageAction::Play(8));
-        assert!(app.playing_history_id.is_none());
-        assert!(app.deferred_history_playback.is_none());
-        assert_eq!(
-            app.status_message,
-            "Stop recording before playing retained audio"
-        );
-        assert!(app.microphone_test_is_active());
-
-        app.stop_recording();
-
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 12,
-                result: Err(CaptureError::StartupCancelled),
-            })
-            .unwrap();
-        app.poll_events();
-
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-        assert!(app.microphone_test_error.is_none());
     }
 
     #[test]
@@ -15864,13 +14525,6 @@ mod layout_tests {
             model_import_path: String::new(),
             remote_catalog: RemoteCatalogState::default(),
             audio_devices: Vec::new(),
-            microphone_test: MicrophoneTest::Idle,
-            microphone_test_sequence: 0,
-            microphone_test_error: None,
-            microphone_monitor_retry_at: None,
-            microphone_level_envelope: MicrophoneLevelEnvelope::default(),
-            deferred_recording_start: None,
-            deferred_history_playback: None,
             capturing_hotkey: false,
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
@@ -17540,170 +16194,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_slider_supports_click_drag_and_arrow_keys() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
-        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
-        let mut slider_rect = egui::Rect::NOTHING;
-        let render = |ctx: &egui::Context,
-                      raw_input: egui::RawInput,
-                      threshold: &mut f32,
-                      slider_rect: &mut egui::Rect| {
-            let _ = ctx.run(raw_input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    *slider_rect = microphone_sensitivity_slider(ui, 0.4, threshold).rect;
-                });
-            });
-        };
-
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        let click = egui::pos2(
-            slider_rect.left() + slider_rect.width() * 0.8,
-            slider_rect.center().y,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(click),
-                    egui::Event::PointerButton {
-                        pos: click,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    egui::Event::PointerButton {
-                        pos: click,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        let clicked_position = rms_to_slider_position(threshold);
-        assert!((clicked_position - 0.8).abs() < 0.02);
-
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::Key {
-                    key: egui::Key::ArrowLeft,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        assert!(rms_to_slider_position(threshold) < clicked_position);
-
-        let drag_start = egui::pos2(
-            slider_rect.left() + slider_rect.width() * rms_to_slider_position(threshold),
-            slider_rect.center().y,
-        );
-        let drag_target = egui::pos2(
-            slider_rect.left() + slider_rect.width() * 0.25,
-            slider_rect.center().y,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(drag_start),
-                    egui::Event::PointerButton {
-                        pos: drag_start,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerMoved(drag_target)],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos: drag_target,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        assert!((rms_to_slider_position(threshold) - 0.25).abs() < 0.02);
-    }
-
-    #[test]
-    fn input_sensitivity_slider_accepts_tab_focus() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
-        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
-        let mut slider_id = egui::Id::NULL;
-        let mut render = |raw_input: egui::RawInput| {
-            let _ = ctx.run(raw_input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    slider_id = microphone_sensitivity_slider(ui, 0.0, &mut threshold).id;
-                });
-            });
-        };
-
-        render(egui::RawInput {
-            screen_rect: Some(screen),
-            ..Default::default()
-        });
-        render(egui::RawInput {
-            screen_rect: Some(screen),
-            events: vec![egui::Event::Key {
-                key: egui::Key::Tab,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        });
-
-        assert!(ctx.memory(|memory| memory.has_focus(slider_id)));
-    }
-
-    #[test]
     fn input_sensitivity_avoids_live_meter_announcements_and_remains_usable() {
         fn render(
             ctx: &egui::Context,
@@ -17733,11 +16223,6 @@ mod layout_tests {
         configure_stitch_style(&ctx);
         let mut app = test_app();
         app.settings_tab = SettingsTab::Recording;
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 1,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
@@ -17755,14 +16240,8 @@ mod layout_tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
-        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
-        session.set_simulated_telemetry(LevelSnapshot {
-            rms: 0.08,
-            peak: 0.15,
-        });
         let mut app = test_app();
         app.settings_tab = SettingsTab::Recording;
-        app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
@@ -17776,8 +16255,6 @@ mod layout_tests {
         configure_stitch_style(&ctx);
         let mut app = test_app();
         app.settings_tab = SettingsTab::Recording;
-        app.microphone_test_error = Some("Microphone permission denied".to_owned());
-        app.microphone_monitor_retry_at = Some(Instant::now() + Duration::from_secs(60));
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")

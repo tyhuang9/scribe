@@ -278,8 +278,6 @@ pub enum ThemeMode {
 }
 
 impl ThemeMode {
-    pub const ALL: [ThemeMode; 3] = [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Light => "Light",
@@ -295,17 +293,6 @@ pub enum HotkeyMode {
     #[default]
     Toggle,
     HoldToTalk,
-}
-
-impl HotkeyMode {
-    pub const ALL: [HotkeyMode; 2] = [HotkeyMode::Toggle, HotkeyMode::HoldToTalk];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Toggle => "Toggle record",
-            Self::HoldToTalk => "Hold to talk",
-        }
-    }
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {

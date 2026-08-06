@@ -1072,58 +1072,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_meter_only_capture_detects_voice_without_retaining_audio() {
-        let (rms_bits, peak_bits, observed, revision) = level_state();
-        let threshold_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let speech_detected = Arc::new(AtomicBool::new(false));
-        let mut pipeline = Pipeline::new(
-            PREPARED_SAMPLE_RATE,
-            1,
-            CaptureOptions {
-                sensitivity: Sensitivity::Manual {
-                    activation_rms: 0.02,
-                },
-                intent: CaptureIntent::MeterOnly,
-                ..CaptureOptions::default()
-            },
-            Arc::clone(&rms_bits),
-            Arc::clone(&peak_bits),
-            Arc::clone(&observed),
-            Arc::clone(&revision),
-        )
-        .unwrap()
-        .with_vad_telemetry(
-            Arc::clone(&threshold_bits),
-            Arc::new(AtomicU32::new(0.02_f32.to_bits())),
-            Arc::clone(&speech_detected),
-        );
-        push_mono_ms(&mut pipeline, 150, 0.03);
-
-        assert!(speech_detected.load(Ordering::Acquire));
-        assert_eq!(f32::from_bits(threshold_bits.load(Ordering::Relaxed)), 0.02);
-        assert!(observed.load(Ordering::Acquire));
-        assert!(revision.load(Ordering::Acquire) > 0);
-        assert!(f32::from_bits(rms_bits.load(Ordering::Relaxed)) > 0.0);
-        assert!(f32::from_bits(peak_bits.load(Ordering::Relaxed)) > 0.0);
-        assert!(pipeline.prepared.is_empty());
-        assert_eq!(
-            pipeline.prepared.len(),
-            0,
-            "prepared_frames must remain zero"
-        );
-        assert!(
-            pipeline.preview_publisher.is_none(),
-            "meter-only never publishes preview audio"
-        );
-        let audio = pipeline.finish(CaptureStopReason::Explicit).unwrap();
-        assert!(
-            audio.is_none(),
-            "meter-only completion has no PreparedAudio"
-        );
-        assert!(pipeline.prepared.is_empty());
-    }
-
-    #[test]
     fn adaptive_vad_confirms_pauses_and_endpoints_at_configured_times() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
         push_mono_ms(&mut pipeline, 300, 0.001);

@@ -121,7 +121,6 @@ pub struct CaptureOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureIntent {
     Dictation,
-    MeterOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -292,7 +291,6 @@ pub struct RecordingSession {
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
-    level_revision: Arc<AtomicU64>,
     manual_activation_threshold_bits: Arc<AtomicU32>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -323,10 +321,6 @@ impl RecordingSession {
 
     pub fn has_level_update(&self) -> bool {
         self.level_observed.load(Ordering::Acquire)
-    }
-
-    pub fn latest_level_revision(&self) -> u64 {
-        self.level_revision.load(Ordering::Acquire)
     }
 
     pub fn set_manual_activation_threshold(&self, activation_rms: f32) {
@@ -443,21 +437,11 @@ impl RecordingSession {
             rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             level_observed: Arc::new(AtomicBool::new(false)),
-            level_revision: Arc::new(AtomicU64::new(0)),
             manual_activation_threshold_bits: Arc::new(AtomicU32::new(
                 DEFAULT_MANUAL_ACTIVATION_RMS.to_bits(),
             )),
             worker: Mutex::new(Some(worker)),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_simulated_telemetry(&self, levels: LevelSnapshot) {
-        self.rms_bits.store(levels.rms.to_bits(), Ordering::Relaxed);
-        self.peak_bits
-            .store(levels.peak.to_bits(), Ordering::Relaxed);
-        self.level_observed.store(true, Ordering::Release);
-        self.level_revision.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -544,7 +528,6 @@ pub fn start_recording(
             rms_bits,
             peak_bits,
             level_observed,
-            level_revision,
             manual_activation_threshold_bits,
             worker: Mutex::new(Some(worker)),
         }),
@@ -1230,23 +1213,6 @@ mod tests {
         }
 
         assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn simulated_telemetry_advances_the_latest_meter_revision() {
-        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
-        assert_eq!(session.latest_level_revision(), 0);
-
-        session.set_simulated_telemetry(LevelSnapshot {
-            rms: 0.02,
-            peak: 0.04,
-        });
-        assert_eq!(session.latest_level_revision(), 1);
-        assert_eq!(session.latest_levels().peak, 0.04);
-
-        session.set_simulated_telemetry(LevelSnapshot::default());
-        assert_eq!(session.latest_level_revision(), 2);
-        session.stop_and_discard(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
