@@ -63,8 +63,8 @@ impl Fixture {
     fn data(self) -> FixtureData {
         let mut transcription = TranscriptionState { selected_model_id: Some("base.en".into()), hotkey: "Ctrl + Space".into(), committed_transcript: "Today’s meeting notes regarding the local-first architecture. We discussed the importance of privacy and keeping all model inference on this device.".into(), elapsed_ms: 8_000, ..Default::default() };
         let models = vec![
-            model("whisper.cpp base.en", "base.en", true, true, 400),
-            model("whisper.cpp tiny.en", "tiny.en", false, false, 75),
+            model("Base English", "base.en", true, true, 400),
+            model("Tiny English", "tiny.en", false, false, 75),
         ];
         let mut comparison = ModelComparisonState::default();
         let settings = RecordingSettingsView {
