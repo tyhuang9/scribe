@@ -1,8 +1,7 @@
 //! Shared, backend-neutral egui screen renderers.
 
 use eframe::egui::{
-    self, Align, Align2, ComboBox, Frame, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke,
-    Vec2,
+    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, Sense, Stroke, Vec2,
 };
 
 use super::{
@@ -974,7 +973,6 @@ fn models(
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
             ui.set_min_width(comparison_content_min_width(comparison_width, 16.0));
-            let header_min = ui.cursor().min;
             let mut toggle_clicked = false;
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -1011,9 +1009,8 @@ fn models(
                 let toggle = toggle.on_hover_text(toggle_name);
                 toggle_clicked = toggle.clicked();
             });
-            let header_rect = Rect::from_min_max(header_min, ui.cursor().min);
             let header = ui.interact(
-                header_rect,
+                ui.min_rect(),
                 ui.make_persistent_id("comparison-header"),
                 Sense::click(),
             );
@@ -1153,10 +1150,17 @@ fn models(
                 render_comparison_results(ui, models, comparison);
             }
         });
-    ui.ctx().accesskit_node_builder(comparison_surface.response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Group);
-        builder.set_name("Model comparison surface");
-    });
+    ui.ctx()
+        .accesskit_node_builder(comparison_surface.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Group);
+            builder.set_name("Model comparison surface");
+            builder.set_bounds(egui::accesskit::Rect {
+                x0: comparison_surface.response.rect.min.x.into(),
+                y0: comparison_surface.response.rect.min.y.into(),
+                x1: comparison_surface.response.rect.max.x.into(),
+                y1: comparison_surface.response.rect.max.y.into(),
+            });
+        });
     if used_bytes > 0 {
         ui.add_space(12.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2490,17 +2494,6 @@ fn size_label(tier: ModelSizeTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn comparison_surface_uses_all_available_width_at_preferred_and_compact_sizes() {
-        for available_width in [860.0, 640.0] {
-            assert_eq!(comparison_surface_width(available_width), available_width);
-            assert_eq!(
-                comparison_content_min_width(available_width, 16.0) + 32.0,
-                available_width
-            );
-        }
-    }
 
     fn render_route(route: UiRoute) -> egui::FullOutput {
         let ctx = egui::Context::default();

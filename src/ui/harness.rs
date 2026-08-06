@@ -336,6 +336,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LAYOUT_TOLERANCE: f64 = 1.0;
+
     fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -355,6 +358,65 @@ mod tests {
             },
         )
     }
+
+    fn render_with_input(
+        ctx: &egui::Context,
+        data: &FixtureData,
+        page: &mut AppPage,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(width, height),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| action = show_harness(ctx, data, page),
+        );
+        (output, action)
+    }
+
+    fn named_node_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()).flatten())
+            .unwrap_or_else(|| panic!("missing AccessKit bounds for {name}"))
+    }
+
+    fn node_matching(
+        output: &egui::FullOutput,
+        predicate: impl Fn(&egui::accesskit::Node) -> bool,
+    ) -> &egui::accesskit::Node {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| predicate(node))
+            .expect("expected AccessKit node")
+    }
+
+    fn assert_near(actual: f64, expected: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= LAYOUT_TOLERANCE,
+            "{label}: expected {expected} ± {LAYOUT_TOLERANCE}, got {actual}"
+        );
+    }
+
     fn node_names(output: &egui::FullOutput) -> Vec<String> {
         output
             .platform_output
@@ -438,6 +500,159 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn model_comparison_surface_matches_main_content_width_at_preferred_and_compact_sizes() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            for (fixture, toggle_name) in [
+                (Fixture::ModelsInstalled, "Expand comparison"),
+                (Fixture::ModelsCompareExpanded, "Collapse comparison"),
+            ] {
+                let output = render(fixture, width, height);
+                let surface_node = node_matching(&output, |node| {
+                    node.name() == Some("Model comparison surface")
+                });
+                assert_eq!(surface_node.role(), egui::accesskit::Role::Group);
+                let surface = surface_node
+                    .bounds()
+                    .expect("comparison surface should expose bounds");
+                let models = node_matching(&output, |node| {
+                    node.role() == egui::accesskit::Role::Heading && node.name() == Some("Models")
+                })
+                .bounds()
+                .expect("Models heading should expose bounds");
+                let add_models_node = node_matching(&output, |node| {
+                    node.name().is_some_and(|name| name.contains("Add models"))
+                });
+                assert_eq!(add_models_node.role(), egui::accesskit::Role::Button);
+                let add_models = add_models_node
+                    .bounds()
+                    .expect("Add models should expose bounds");
+                let chevron = named_node_bounds(&output, toggle_name);
+
+                assert_near(
+                    surface.x0,
+                    models.x0,
+                    "surface left should align with Models heading",
+                );
+                assert_near(
+                    surface.x1,
+                    add_models.x1,
+                    "surface right should align with Add models",
+                );
+                assert_near(
+                    chevron.x1,
+                    surface.x1 - 16.0,
+                    "chevron should align with the surface inner right edge",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_header_pointer_toggles_without_creating_an_accessible_header_button() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let (initial_output, initial_action) =
+            render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+        assert!(!data.comparison.expanded);
+
+        let heading = named_node_bounds(&initial_output, "Compare installed models");
+        let chevron = named_node_bounds(&initial_output, "Expand comparison");
+        let click_point = egui::pos2(
+            heading.x0 as f32 + 1.0,
+            ((heading.y0 + heading.y1) / 2.0) as f32,
+        );
+        assert!(
+            (click_point.x as f64) >= heading.x0
+                && (click_point.x as f64) <= heading.x1
+                && (click_point.y as f64) >= heading.y0
+                && (click_point.y as f64) <= heading.y1
+        );
+        assert!(
+            (click_point.x as f64) < chevron.x0
+                || (click_point.x as f64) > chevron.x1
+                || (click_point.y as f64) < chevron.y0
+                || (click_point.y as f64) > chevron.y1,
+            "header click point must not overlap the chevron"
+        );
+        let chevron_node = node_matching(&initial_output, |node| {
+            node.name() == Some("Expand comparison")
+        });
+        assert_eq!(chevron_node.role(), egui::accesskit::Role::Button);
+        assert_eq!(chevron_node.is_expanded(), Some(false));
+        assert!(
+            !initial_output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Compare installed models")
+                }),
+            "the pointer-only header must not become a second accessible button"
+        );
+
+        let (press_output, press_action) = render_with_input(
+            &ctx,
+            &data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(click_point),
+                egui::Event::PointerButton {
+                    pos: click_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        assert!(!data.comparison.expanded);
+        drop(press_output);
+
+        let (release_output, release_action) = render_with_input(
+            &ctx,
+            &data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(click_point),
+                egui::Event::PointerButton {
+                    pos: click_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(release_action, ScreenAction::ToggleComparison);
+        apply_action(&mut data, &mut page, release_action);
+        assert!(data.comparison.expanded);
+
+        let (expanded_output, expanded_action) =
+            render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        assert_eq!(expanded_action, ScreenAction::None);
+        let expanded_chevron = node_matching(&expanded_output, |node| {
+            node.name() == Some("Collapse comparison")
+        });
+        assert_eq!(expanded_chevron.role(), egui::accesskit::Role::Button);
+        assert_eq!(expanded_chevron.is_expanded(), Some(true));
+        drop(release_output);
+    }
+
     #[test]
     fn comparison_fixture_matches_the_pre_run_reference_state() {
         let data = Fixture::ModelsCompareExpanded.data();
