@@ -39,6 +39,6 @@ Then reopen WSL and try `cargo run`. See [Linux and WSL](../platforms/linux-wsl/
 
 ## Pasting fails
 
-Copy the transcript and paste manually. Linux and macOS are intentionally clipboard-only. Windows falls back to copy-only when the original target changed, activation is denied, the clipboard changed externally, or the target has higher integrity.
+Copy the transcript and paste manually. Linux and macOS are intentionally clipboard-only. On Windows, a changed target, activation denial, or a higher-integrity target produces an explicit copy-only fallback. If another app changes the clipboard during Scribe's output transaction, Scribe preserves that newer clipboard content, sends no paste command, and leaves the final transcript in Scribe for you to copy manually.
 
 If the issue persists, capture the exact error and the operating system/runtime combination when reporting it upstream.

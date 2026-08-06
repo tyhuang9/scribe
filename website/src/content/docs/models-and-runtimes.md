@@ -17,7 +17,7 @@ The application has one logical runtime kind. Only the private `RuntimeRouter` s
 
 The normal GGUF path uses the safe `transcribe-cpp` 0.1.3 API with a statically linked CPU backend in-process. It has no downloaded runtime package, CLI, localhost service, or Python dependency. Models can remain loaded for warm reuse.
 
-The pinned whisper.cpp v1.9.1 package at commit `f049fff95a089aa9969deb009cdd4892b3e74916` is retained only for older GGML compatibility. Its DLL route is in-process and a hash-verified CLI exists only as a failure fallback. `OnnxSpeechRuntime` is absent because the named streaming candidate has not passed its evidence gate.
+The pinned whisper.cpp v1.9.1 package at commit `f049fff95a089aa9969deb009cdd4892b3e74916` is retained for older GGML compatibility and as a narrowly scoped bootstrap fallback when the primary native GGUF adapter cannot initialize. Its DLL route is in-process and a hash-verified CLI is the last compatibility fallback, not the normal route. `OnnxSpeechRuntime` is absent because the named streaming candidate has not passed its evidence gate.
 
 ## Storage and performance
 

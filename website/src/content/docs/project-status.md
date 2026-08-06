@@ -5,13 +5,15 @@ description: The current documented scope and the source references behind this 
 
 ## Current documented scope
 
-Scribe is a local-first Rust desktop application with General, Models, History, Advanced, and About pages plus opt-in Debug tools. Native workers capture and prepare microphone audio, produce bounded rolling preview, finalize the utterance, and can copy or safely insert the completed transcript.
+Scribe is a local-first Rust desktop application with Transcribe, General, Models, History, Advanced, and About pages plus opt-in Debug tools. Native workers capture and prepare microphone audio, produce bounded rolling preview, finalize the utterance, and can copy or safely insert the completed transcript.
 
 ## Backends and models
 
 The final application has exactly one logical runtime kind, selected only by `RuntimeRouter`. The normal UI exposes a package-free embedded GGUF catalog with one pinned fallback plus trusted discovered or imported variants. Every normal model is Experimental and the Supported count is zero. Three GGML records remain resolution-only migration compatibility. No model advertises native streaming; preview uses shared rolling batch decoding. `OnnxSpeechRuntime` is omitted because its exact evidence gate has not passed.
 
 The current release decision is **NO-GO** pending the dated Windows manual matrix, physical shutdown/restart soak, complete compatibility suites, desktop latency/resource measurements, and conservative Linux/macOS exercises. Automated gates passing does not promote a model or replace those manual results.
+
+The physical microphone/VAD transcription path and the complete tray action set remain manually unverified. Live Windows evidence covers tray Show/Hide, while Start/Stop Recording, Copy Last Transcript, and Quit still require the UI-04 matrix. These are implemented behaviors, not release-qualified reliability claims.
 
 ## Known platform limits
 

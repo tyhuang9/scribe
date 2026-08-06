@@ -5,6 +5,6 @@ description: Windows-specific input and output boundaries.
 
 Scribe uses the normal desktop audio-capture path on Windows; no installer permission is expected for that path. Global hotkeys use the system-wide `RegisterHotKey` API.
 
-Focused-app insertion captures the original foreground HWND and process, revalidates it before output, and uses the clipboard plus one `SendInput` batch. Target loss, activation denial, clipboard races, and elevated or higher-integrity applications fall back to copy-only without synthetic keystrokes.
+Focused-app insertion captures the original foreground HWND and process, revalidates it before output, and uses the clipboard plus one `SendInput` batch. Target loss, activation denial, and elevated or higher-integrity applications fall back to copy-only without synthetic keystrokes. A clipboard race instead suppresses the paste and preserves the other app's newer clipboard content; the final transcript remains in Scribe for manual copying.
 
-The normal GGUF path uses a statically linked CPU backend and needs no runtime package. `Auto` resolves to CPU. An explicit GPU preference reports that no verified accelerator is available. A pinned Windows x64 package exists only for retained GGML compatibility.
+The normal GGUF path uses a statically linked CPU backend and needs no runtime package. `Auto` resolves to CPU. An explicit GPU preference reports that no verified accelerator is available. A pinned Windows x64 package serves retained GGML compatibility and a narrowly scoped bootstrap fallback when the primary native GGUF adapter cannot initialize; it is not the normal route.

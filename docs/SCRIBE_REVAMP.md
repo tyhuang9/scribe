@@ -1,9 +1,10 @@
 # Scribe revamp implementation record
 
-**Status:** Phase 8 implemented on its stacked branch (2026-08-04). This document
-preserves the Phase 0 audit and records each implemented phase against the
-consolidated revamp plan. It does not claim that uncompleted later phases are
-implemented.
+**Status:** Phases 0-11 are implemented on `main`, with post-Phase-11 tray and
+microphone-input checkpoints recorded through 2026-08-05. The release decision
+remains **NO-GO** pending the manual, compatibility, streaming, soak, and
+measurement evidence identified below. This document preserves the historical
+Phase 0 audit and records each implemented phase against the consolidated plan.
 
 ## How to read this document
 
