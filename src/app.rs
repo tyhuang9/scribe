@@ -11696,10 +11696,7 @@ mod layout_tests {
         }
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
-                && node.name()
-                    == Some(
-                        "Bundled offline catalog fallback · Showing 1 of 1 trusted catalog models.",
-                    )
+                && node.name() == Some("Bundled offline catalog fallback · Showing 1 of 1 models.")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
