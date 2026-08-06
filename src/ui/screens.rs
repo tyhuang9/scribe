@@ -967,7 +967,7 @@ fn models(
         used_bytes > 0,
     ));
     let comparison_width = comparison_surface_width(ui.available_width());
-    Frame::none()
+    let comparison_surface = Frame::none()
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border))
         .rounding(Rounding::same(5.0))
@@ -1153,6 +1153,10 @@ fn models(
                 render_comparison_results(ui, models, comparison);
             }
         });
+    ui.ctx().accesskit_node_builder(comparison_surface.response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Group);
+        builder.set_name("Model comparison surface");
+    });
     if used_bytes > 0 {
         ui.add_space(12.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
