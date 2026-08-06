@@ -7315,6 +7315,15 @@ impl LocalTranscriberApp {
             None
         }
     }
+
+    fn cancel_installations_for_shutdown(&self) {
+        for (_, cancellation) in self.artifact_installations.values() {
+            cancellation.cancel();
+        }
+        if let Some(cancellation) = self.local_gguf_import.as_ref() {
+            cancellation.cancel();
+        }
+    }
 }
 
 impl Drop for LocalTranscriberApp {
@@ -7403,9 +7412,7 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        for (_, cancellation) in self.artifact_installations.values() {
-            cancellation.cancel();
-        }
+        self.cancel_installations_for_shutdown();
         self.shutdown_transcription_for_exit();
         let _ = self.session_coordinator.cancel_active();
         self.flush_settings();
@@ -14870,6 +14877,23 @@ mod layout_tests {
             app.status_message
                 .contains("no longer in the validated snapshot")
         );
+    }
+
+    #[test]
+    fn shutdown_cancels_artifact_and_local_gguf_imports() {
+        let mut app = test_app();
+        let artifact_cancellation = InstallCancellation::default();
+        let local_cancellation = InstallCancellation::default();
+        app.artifact_installations.insert(
+            "managed-shutdown-fixture".to_owned(),
+            (1, artifact_cancellation.clone()),
+        );
+        app.local_gguf_import = Some(local_cancellation.clone());
+
+        app.cancel_installations_for_shutdown();
+
+        assert!(artifact_cancellation.is_cancelled());
+        assert!(local_cancellation.is_cancelled());
     }
 
     #[test]
