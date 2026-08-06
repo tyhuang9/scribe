@@ -327,6 +327,163 @@ pub(crate) struct ModelManagementState {
     pub mutation_block_reason: Option<String>,
 }
 
+/// Ephemeral catalog controls. These values affect browsing only and are not
+/// part of the persisted model configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogFilters {
+    pub installed_only: bool,
+    pub recommended_only: bool,
+    pub multilingual_only: bool,
+    pub size_tier: RemoteCatalogSizeTier,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RemoteCatalogSizeTier {
+    #[default]
+    Any,
+    Compact,
+    Standard,
+    Large,
+}
+
+impl RemoteCatalogSizeTier {
+    pub(crate) const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any size",
+            Self::Compact => "Compact (up to 512 MiB)",
+            Self::Standard => "Standard (512 MiB to 1 GiB)",
+            Self::Large => "Large (over 1 GiB)",
+        }
+    }
+
+    pub(crate) fn matches(self, size_bytes: Option<u64>) -> bool {
+        const MIB: u64 = 1024 * 1024;
+        const COMPACT_MAX: u64 = 512 * MIB;
+        const STANDARD_MAX: u64 = 1024 * MIB;
+
+        match self {
+            Self::Any => true,
+            Self::Compact => size_bytes.is_some_and(|size| size <= COMPACT_MAX),
+            Self::Standard => {
+                size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
+            }
+            Self::Large => size_bytes.is_some_and(|size| size > STANDARD_MAX),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RemoteCatalogSort {
+    #[default]
+    Recommended,
+    Smallest,
+    Largest,
+    Name,
+}
+
+impl RemoteCatalogSort {
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Recommended first",
+            Self::Smallest => "Smallest first",
+            Self::Largest => "Largest first",
+            Self::Name => "Name",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RemoteCatalogStatusKind {
+    Loading,
+    Available,
+    Offline,
+    Error,
+    #[default]
+    Idle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogStatusView {
+    pub kind: RemoteCatalogStatusKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteCatalogActionKind {
+    Install {
+        remote_model_id: String,
+        variant_id: String,
+    },
+    Cancel {
+        model_id: String,
+    },
+    Use {
+        model_id: String,
+    },
+    Remove {
+        model_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogActionView {
+    pub label: String,
+    pub kind: RemoteCatalogActionKind,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogVariantView {
+    pub id: String,
+    pub filename: String,
+    pub size_label: String,
+    pub status_label: Option<String>,
+    pub expected_sha256: String,
+    pub actions: Vec<RemoteCatalogActionView>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogEntryView {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub languages: Vec<String>,
+    pub recommended: bool,
+    pub trust_label: String,
+    pub compatibility_detail: String,
+    pub repository: String,
+    pub pinned_revision: String,
+    pub variants: Vec<RemoteCatalogVariantView>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LocalGgufImportView {
+    pub path: String,
+    pub in_progress: bool,
+    pub import_enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteCatalogView {
+    pub local_import: LocalGgufImportView,
+    pub query: String,
+    pub filters: RemoteCatalogFilters,
+    pub sort: RemoteCatalogSort,
+    pub status: RemoteCatalogStatusView,
+    pub refresh_enabled: bool,
+    /// True only when the backend has a validated snapshot, including an
+    /// offline cache or bundled fallback.
+    pub has_snapshot: bool,
+    pub entries: Vec<RemoteCatalogEntryView>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum ComparisonPhase {

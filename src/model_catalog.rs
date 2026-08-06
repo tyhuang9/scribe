@@ -342,6 +342,7 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
         },
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
+        recommended: false,
         roles: NO_ROLES,
         compatibility: CompatibilityStatus::Experimental {
             evidence: PHASE_ZERO_SMOKE.link(),

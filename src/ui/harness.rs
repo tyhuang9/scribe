@@ -8,11 +8,16 @@ use super::{
     shell::{AppPage, show_navigation},
     state::{
         ComparisonPhase, ModelComparisonState, ModelDownloadState, ModelManagementState,
-        ModelSizeTier, ModelSpeedTier, ModelViewModel, SettingsTab, TranscriptionPhase,
-        TranscriptionState, UiRoute,
+        ModelSizeTier, ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind,
+        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
+        RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
 };
+
+#[cfg(test)]
+use super::screens::{render_remote_catalog, screen_action_for_remote_catalog_action};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -116,6 +121,7 @@ impl Fixture {
             models,
             comparison,
             model_management: ModelManagementState::default(),
+            remote_catalog: remote_catalog_fixture(),
             settings,
         }
     }
@@ -164,7 +170,54 @@ struct FixtureData {
     models: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
     model_management: ModelManagementState,
+    remote_catalog: RemoteCatalogView,
     settings: RecordingSettingsView,
+}
+
+fn remote_catalog_fixture() -> RemoteCatalogView {
+    RemoteCatalogView {
+        local_import: super::state::LocalGgufImportView {
+            path: String::new(),
+            in_progress: false,
+            import_enabled: true,
+            disabled_reason: None,
+        },
+        status: RemoteCatalogStatusView {
+            kind: RemoteCatalogStatusKind::Available,
+            message: "Cached trusted catalog · Showing 1 of 1 trusted catalog models.".into(),
+        },
+        refresh_enabled: true,
+        has_snapshot: true,
+        entries: vec![RemoteCatalogEntryView {
+            id: "trusted-speech/compact-english".into(),
+            display_name: "Compact English".into(),
+            description: "A compact English speech recognition candidate.".into(),
+            languages: vec!["English".into()],
+            trust_label: "Trusted publisher".into(),
+            compatibility_detail: "Cross-platform compatibility is still being validated.".into(),
+            repository: "trusted-speech/compact-english".into(),
+            pinned_revision: "1111111111111111111111111111111111111111".into(),
+            variants: vec![RemoteCatalogVariantView {
+                id: "compact-english-q5".into(),
+                filename: "compact-english-q5.gguf".into(),
+                size_label: "82 MB".into(),
+                status_label: Some("Pinned GGUF".into()),
+                expected_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+                actions: vec![RemoteCatalogActionView {
+                    label: "Install".into(),
+                    kind: RemoteCatalogActionKind::Install {
+                        remote_model_id: "trusted-speech/compact-english".into(),
+                        variant_id: "compact-english-q5".into(),
+                    },
+                    enabled: true,
+                    disabled_reason: None,
+                }],
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 pub(crate) fn fixture_from_env() -> Option<Fixture> {
     std::env::var("SCRIBE_UI_HARNESS")
@@ -227,6 +280,7 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
         model_catalog: &data.models,
         comparison: &data.comparison,
         model_management: &data.model_management,
+        remote_catalog: &data.remote_catalog,
         recording_settings: &data.settings,
     };
     CentralPanel::default()
@@ -255,7 +309,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         | ScreenAction::ShowModelDetails(_)
         | ScreenAction::RequestModelRemoval(_)
         | ScreenAction::ConfirmModelRemoval(_)
-        | ScreenAction::CloseModelDialog => {}
+        | ScreenAction::CloseModelDialog
+        | ScreenAction::RetryRemoteCatalog => {}
         ScreenAction::AddModel | ScreenAction::ChangeModel => {
             data.transcription.selected_model_id = Some("base.en".into());
             data.transcription.phase = TranscriptionPhase::Ready;
@@ -313,6 +368,87 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.comparison.focus_reference_editor = false;
             data.comparison.restore_reference_action_focus = true;
             data.comparison.reference_notice = Some("Reference transcript cleared.".to_owned());
+        }
+        ScreenAction::SetRemoteCatalogQuery(query) => data.remote_catalog.query = query,
+        ScreenAction::SetLocalGgufImportPath(path) => data.remote_catalog.local_import.path = path,
+        ScreenAction::ValidateAndImportLocalGguf => {
+            data.remote_catalog.local_import.in_progress = true;
+            data.remote_catalog.local_import.import_enabled = false;
+        }
+        ScreenAction::CancelLocalGgufImport => {
+            data.remote_catalog.local_import.in_progress = false;
+            data.remote_catalog.local_import.import_enabled = true;
+        }
+        ScreenAction::SetRemoteCatalogInstalledOnly(selected) => {
+            data.remote_catalog.filters.installed_only = selected
+        }
+        ScreenAction::SetRemoteCatalogRecommendedOnly(selected) => {
+            data.remote_catalog.filters.recommended_only = selected
+        }
+        ScreenAction::SetRemoteCatalogMultilingualOnly(selected) => {
+            data.remote_catalog.filters.multilingual_only = selected
+        }
+        ScreenAction::SetRemoteCatalogSizeTier(size_tier) => {
+            data.remote_catalog.filters.size_tier = size_tier
+        }
+        ScreenAction::SetRemoteCatalogSort(sort) => data.remote_catalog.sort = sort,
+        ScreenAction::InstallRemoteCatalogVariant {
+            remote_model_id,
+            variant_id,
+        } => {
+            if let Some(variant) = data
+                .remote_catalog
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == remote_model_id)
+                .and_then(|entry| {
+                    entry
+                        .variants
+                        .iter_mut()
+                        .find(|variant| variant.id == variant_id)
+                })
+            {
+                variant.status_label = Some("Downloading".into());
+                variant.actions = vec![RemoteCatalogActionView {
+                    label: "Cancel".into(),
+                    kind: RemoteCatalogActionKind::Cancel {
+                        model_id: "managed-compact-english".into(),
+                    },
+                    enabled: true,
+                    disabled_reason: None,
+                }];
+            }
+        }
+        ScreenAction::CancelRemoteCatalogInstall(model_id) => {
+            for entry in &mut data.remote_catalog.entries {
+                for variant in &mut entry.variants {
+                    if variant.actions.iter().any(|action| {
+                        matches!(
+                            &action.kind,
+                            RemoteCatalogActionKind::Cancel {
+                                model_id: action_model_id
+                            } if action_model_id == &model_id
+                        )
+                    }) {
+                        variant.status_label = Some("Cancelled".into());
+                        variant.actions = vec![RemoteCatalogActionView {
+                            label: "Resume".into(),
+                            kind: RemoteCatalogActionKind::Install {
+                                remote_model_id: entry.id.clone(),
+                                variant_id: variant.id.clone(),
+                            },
+                            enabled: true,
+                            disabled_reason: None,
+                        }];
+                    }
+                }
+            }
+        }
+        ScreenAction::UseRemoteCatalogModel(model_id) => {
+            data.remote_catalog.status.message = format!("Selected catalog model {model_id}.");
+        }
+        ScreenAction::RemoveRemoteCatalogModel(model_id) => {
+            data.remote_catalog.status.message = format!("Removed catalog model {model_id}.");
         }
         ScreenAction::SetSettingsTab(tab) => {
             data.route = UiRoute::Settings(tab);
@@ -430,6 +566,72 @@ mod tests {
             data.comparison.reference_notice = None;
         }
         (output, action)
+    }
+
+    fn render_catalog_with_input(
+        ctx: &egui::Context,
+        catalog: &RemoteCatalogView,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 1200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_remote_catalog(ui, catalog, &mut action);
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn click_catalog_control(
+        ctx: &egui::Context,
+        catalog: &RemoteCatalogView,
+        name: &str,
+    ) -> ScreenAction {
+        let (initial, initial_action) = render_catalog_with_input(ctx, catalog, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+        let bounds = named_node_bounds(&initial, name);
+        let point = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let (_, press_action) = render_catalog_with_input(
+            ctx,
+            catalog,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        render_catalog_with_input(
+            ctx,
+            catalog,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .1
     }
 
     fn named_node_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {
@@ -980,7 +1182,7 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         assert_eq!(
             focused_node(&output).description(),
-            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
+            Some("Add a reference transcript to measure accuracy for Base English.")
         );
         assert_polite_atomic_notice(&output, "Reference transcript cleared.");
         assert!(!data.comparison.restore_reference_action_focus);
@@ -1001,7 +1203,7 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         assert_eq!(
             focused_node(&output).description(),
-            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
+            Some("Add a reference transcript to measure accuracy for Base English.")
         );
         assert_eq!(data.comparison.reference_notice, None);
 
@@ -1106,7 +1308,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .nodes;
-        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+        for model in ["Base English", "Tiny English"] {
             assert!(compact_nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Group
                     && node.name() == Some(format!("Comparison result for {model}").as_str())
@@ -1160,6 +1362,74 @@ mod tests {
                 bounds.y1
             );
         }
+    }
+    #[test]
+    fn remote_catalog_fixture_emits_typed_actions_and_tracks_lifecycle_state() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        let import = click_catalog_control(&ctx, &data.remote_catalog, "Validate and import");
+        assert_eq!(import, ScreenAction::ValidateAndImportLocalGguf);
+        apply_action(&mut data, &mut page, import);
+        assert!(data.remote_catalog.local_import.in_progress);
+        let cancel_import = click_catalog_control(&ctx, &data.remote_catalog, "Cancel import");
+        assert_eq!(cancel_import, ScreenAction::CancelLocalGgufImport);
+        apply_action(&mut data, &mut page, cancel_import);
+        assert!(!data.remote_catalog.local_import.in_progress);
+
+        let expected_install = screen_action_for_remote_catalog_action(
+            &data.remote_catalog.entries[0].variants[0].actions[0].kind,
+        );
+        let install = click_catalog_control(&ctx, &data.remote_catalog, "Install");
+        assert_eq!(
+            install,
+            ScreenAction::InstallRemoteCatalogVariant {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            }
+        );
+        assert_eq!(install, expected_install);
+        apply_action(&mut data, &mut page, install);
+        let variant = &data.remote_catalog.entries[0].variants[0];
+        assert_eq!(variant.status_label.as_deref(), Some("Downloading"));
+        assert!(matches!(
+            &variant.actions[0].kind,
+            RemoteCatalogActionKind::Cancel { model_id }
+                if model_id == "managed-compact-english"
+        ));
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into()),
+        );
+        let variant = &data.remote_catalog.entries[0].variants[0];
+        assert_eq!(variant.status_label.as_deref(), Some("Cancelled"));
+        assert_eq!(variant.actions[0].label, "Resume");
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::SetRemoteCatalogQuery("compact".into()),
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::SetRemoteCatalogRecommendedOnly(true),
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::SetRemoteCatalogSort(super::super::state::RemoteCatalogSort::Name),
+        );
+        assert_eq!(data.remote_catalog.query, "compact");
+        assert!(data.remote_catalog.filters.recommended_only);
+        assert_eq!(
+            data.remote_catalog.sort,
+            super::super::state::RemoteCatalogSort::Name
+        );
     }
     #[test]
     fn harness_actions_mutate_only_visible_fixture_state() {

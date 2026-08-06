@@ -16,11 +16,16 @@ pub(crate) use production::{
 pub(crate) use screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen};
 pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
-    ComparisonPhase, ComparisonResult, ComparisonResultPhase, MicrophonePermission,
-    ModelCapabilities, ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
-    ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-    SettingsTab, UiRoute,
+    ComparisonPhase, ComparisonResult, ComparisonResultPhase, LocalGgufImportView,
+    MicrophonePermission, ModelCapabilities, ModelComparisonState, ModelCompatibility, ModelDialog,
+    ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+    RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+    RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogStatusView,
+    RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, UiRoute,
 };
+
+#[cfg(test)]
+pub(crate) use state::RemoteCatalogSizeTier;
 pub(crate) use theme::{ThemePalette, theme_palette, ui_palette};
 
 #[cfg(all(feature = "ui-harness", debug_assertions))]

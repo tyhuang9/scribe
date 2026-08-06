@@ -43,7 +43,7 @@ use crate::history::{
 use crate::history_playback::{PlaybackEvent, PlaybackService};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::huggingface_catalog::{
-    CatalogSnapshot, HuggingFaceCatalogService, RemoteModel, TrustedArtifact,
+    CatalogSnapshot, CatalogSource, HuggingFaceCatalogService, RemoteModel, TrustedArtifact,
 };
 use crate::installations::{
     ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
@@ -74,11 +74,16 @@ use crate::ui::{
     HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
     ModelCompatibility, ModelDialog, ModelDownloadState, ModelManagementState, ModelReadiness,
     ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode, RecordingSettingsView,
-    ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, about_page,
+    RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogFilters,
+    RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
+    RemoteCatalogView, ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, about_page,
     configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
     render_screen, settings_save_state, show_navigation, theme_palette, transcription_state,
     ui_palette,
 };
+
+#[cfg(test)]
+use crate::ui::RemoteCatalogSizeTier;
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
@@ -1109,18 +1114,6 @@ fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool
     source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
 }
 
-fn streaming_mode_selector(ui: &mut Ui, mode: &mut StreamingMode) -> bool {
-    let before = *mode;
-    ComboBox::new("advanced-streaming-mode", "Preview mode")
-        .selected_text(mode.label())
-        .show_ui(ui, |ui| {
-            for candidate in StreamingMode::ALL {
-                ui.selectable_value(mode, candidate, candidate.label());
-            }
-        });
-    *mode != before
-}
-
 fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
     match position {
         OverlayPosition::Top => NativeOverlayPosition::TopCenter,
@@ -1145,76 +1138,8 @@ struct RemoteCatalogState {
     snapshot: Option<CatalogSnapshot>,
     loading: bool,
     attempted: bool,
+    force_refresh_requested: bool,
     error: Option<String>,
-}
-
-/// Ephemeral Models-page controls. They deliberately are not persisted: they
-/// change what the user is browsing, not the installed-model configuration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RemoteCatalogFilters {
-    installed_only: bool,
-    recommended_only: bool,
-    multilingual_only: bool,
-    size_tier: RemoteCatalogSizeTier,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum RemoteCatalogSizeTier {
-    #[default]
-    Any,
-    Compact,
-    Standard,
-    Large,
-}
-
-impl RemoteCatalogSizeTier {
-    const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any size",
-            Self::Compact => "Compact (up to 512 MiB)",
-            Self::Standard => "Standard (512 MiB to 1 GiB)",
-            Self::Large => "Large (over 1 GiB)",
-        }
-    }
-
-    fn matches(self, size_bytes: Option<u64>) -> bool {
-        const MIB: u64 = 1024 * 1024;
-        const COMPACT_MAX: u64 = 512 * MIB;
-        const STANDARD_MAX: u64 = 1024 * MIB;
-
-        match self {
-            Self::Any => true,
-            Self::Compact => size_bytes.is_some_and(|size| size <= COMPACT_MAX),
-            Self::Standard => {
-                size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
-            }
-            Self::Large => size_bytes.is_some_and(|size| size > STANDARD_MAX),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum RemoteCatalogSort {
-    #[default]
-    Recommended,
-    Smallest,
-    Largest,
-    Name,
-}
-
-impl RemoteCatalogSort {
-    const ALL: [Self; 4] = [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Recommended => "Recommended first",
-            Self::Smallest => "Smallest first",
-            Self::Largest => "Largest first",
-            Self::Name => "Name",
-        }
-    }
 }
 
 enum PlaygroundAction {
@@ -1974,78 +1899,10 @@ fn local_gguf_import_error(error: anyhow::Error) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelPrimaryAction {
-    Install,
-    Retry,
-    Installing,
-    Repair,
-    Select,
-    Active,
-}
-
-impl ModelPrimaryAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Install => "Install",
-            Self::Retry => "Retry",
-            Self::Installing => "Installing",
-            Self::Repair => "Repair",
-            Self::Select => "Select",
-            Self::Active => "Active",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeActionKind {
     Install,
     Update,
     Uninstall,
-}
-
-fn runtime_action_label(kind: RuntimeActionKind, runtime_label: &str, busy: bool) -> String {
-    if busy {
-        return format!("Preparing {runtime_label} runtime");
-    }
-    let action = match kind {
-        RuntimeActionKind::Install => "Install",
-        RuntimeActionKind::Update => "Update",
-        RuntimeActionKind::Uninstall => "Remove",
-    };
-    format!("{action} {runtime_label} runtime")
-}
-
-fn model_primary_action_label(
-    action: ModelPrimaryAction,
-    _model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-) -> String {
-    match action {
-        ModelPrimaryAction::Repair => "Repair runtime".to_owned(),
-        ModelPrimaryAction::Retry
-            if matches!(
-                install_status,
-                ModelInstallStatus::Error(message)
-                    if message.contains("resumable partial retained")
-                        || message.contains("Installation cancelled")
-            ) =>
-        {
-            "Resume".to_owned()
-        }
-        ModelPrimaryAction::Installing
-            if matches!(install_status, ModelInstallStatus::InstallingRuntime) =>
-        {
-            "Installing".to_owned()
-        }
-        _ => action.label().to_owned(),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ModelActionState {
-    primary: ModelPrimaryAction,
-    primary_enabled: bool,
-    show_uninstall: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2201,96 +2058,6 @@ struct RuntimeManifestMetadata {
     version: Option<String>,
     sha256: Option<String>,
     checksum: Option<String>,
-}
-
-#[cfg(test)]
-fn model_action_state(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-) -> ModelActionState {
-    model_action_state_with_runtime(model, install_status, selected, true)
-}
-
-fn model_action_state_with_runtime(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    runtime_ready: bool,
-) -> ModelActionState {
-    match install_status {
-        ModelInstallStatus::Installed => ModelActionState {
-            primary: if !runtime_ready {
-                ModelPrimaryAction::Repair
-            } else if selected {
-                ModelPrimaryAction::Active
-            } else {
-                ModelPrimaryAction::Select
-            },
-            primary_enabled: !selected || !runtime_ready,
-            show_uninstall: supports_managed_uninstall(model, install_status),
-        },
-        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
-            ModelActionState {
-                primary: ModelPrimaryAction::Installing,
-                primary_enabled: false,
-                show_uninstall: false,
-            }
-        }
-        ModelInstallStatus::Error(_) => ModelActionState {
-            primary: ModelPrimaryAction::Retry,
-            primary_enabled: supports_managed_install(model),
-            show_uninstall: false,
-        },
-        ModelInstallStatus::RuntimeError(_) => ModelActionState {
-            primary: ModelPrimaryAction::Repair,
-            primary_enabled: true,
-            show_uninstall: true,
-        },
-        ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => ModelActionState {
-            primary: ModelPrimaryAction::Install,
-            primary_enabled: supports_managed_install(model),
-            show_uninstall: false,
-        },
-    }
-}
-
-fn model_primary_disabled_tooltip(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    action_state: &ModelActionState,
-) -> Option<String> {
-    if action_state.primary_enabled {
-        return None;
-    }
-
-    match action_state.primary {
-        ModelPrimaryAction::Active if selected => {
-            Some("This model is already the active transcription model.".to_owned())
-        }
-        ModelPrimaryAction::Installing => Some("This model is still being installed.".to_owned()),
-        ModelPrimaryAction::Install | ModelPrimaryAction::Retry
-            if !supports_managed_install(model) =>
-        {
-            Some("Managed downloads are not available for this model in this build.".to_owned())
-        }
-        ModelPrimaryAction::Retry => match install_status {
-            ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
-            _ => Some("Retry is not available for this model.".to_owned()),
-        },
-        ModelPrimaryAction::Select => Some("Install this model before selecting it.".to_owned()),
-        ModelPrimaryAction::Repair => match install_status {
-            ModelInstallStatus::RuntimeError(message) => {
-                Some(format!("Runtime repair failed: {message}"))
-            }
-            _ => Some("The local runtime is not ready for this installed model.".to_owned()),
-        },
-        ModelPrimaryAction::Install => {
-            Some("This model does not have a managed installer.".to_owned())
-        }
-        ModelPrimaryAction::Active => Some("This model cannot be selected right now.".to_owned()),
-    }
 }
 
 #[cfg(test)]
@@ -7499,7 +7266,16 @@ impl LocalTranscriberApp {
     }
 
     fn finish_local_gguf_import(&mut self, result: Result<Box<ValidatedLocalGgufImport>, String>) {
-        self.local_gguf_import = None;
+        if self
+            .local_gguf_import
+            .take()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            self.status = TranscriptionStatus::Idle;
+            self.status_message =
+                "Local GGUF import was cancelled. The source file was left unchanged.".to_owned();
+            return;
+        }
         let imported = match result {
             Ok(imported) => *imported,
             Err(error) => {
@@ -8242,6 +8018,7 @@ impl LocalTranscriberApp {
                 model_catalog: &[],
                 comparison: &Default::default(),
                 model_management: &Default::default(),
+                remote_catalog: &Default::default(),
                 recording_settings: &settings,
             },
         );
@@ -8377,6 +8154,22 @@ impl LocalTranscriberApp {
             | ScreenAction::ToggleProvisionalFeedback
             | ScreenAction::SetAudioDevice(_)
             | ScreenAction::SetInputSensitivity(_)
+            | ScreenAction::RepairModelRuntime(_)
+            | ScreenAction::MaintainModelRuntime(_)
+            | ScreenAction::SetRemoteCatalogQuery(_)
+            | ScreenAction::SetRemoteCatalogInstalledOnly(_)
+            | ScreenAction::SetRemoteCatalogRecommendedOnly(_)
+            | ScreenAction::SetRemoteCatalogMultilingualOnly(_)
+            | ScreenAction::SetRemoteCatalogSizeTier(_)
+            | ScreenAction::SetRemoteCatalogSort(_)
+            | ScreenAction::RetryRemoteCatalog
+            | ScreenAction::InstallRemoteCatalogVariant { .. }
+            | ScreenAction::CancelRemoteCatalogInstall(_)
+            | ScreenAction::UseRemoteCatalogModel(_)
+            | ScreenAction::RemoveRemoteCatalogModel(_)
+            | ScreenAction::SetLocalGgufImportPath(_)
+            | ScreenAction::ValidateAndImportLocalGguf
+            | ScreenAction::CancelLocalGgufImport
             | ScreenAction::RefreshDevices
             | ScreenAction::ChangeShortcut
             | ScreenAction::SetAutoInsertTranscript(_)
@@ -8656,7 +8449,10 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        if !cfg!(test) && !self.remote_catalog.attempted {
+        if self.remote_catalog.force_refresh_requested {
+            self.remote_catalog.force_refresh_requested = false;
+            self.request_remote_catalog(true);
+        } else if !cfg!(test) && !self.remote_catalog.attempted {
             self.request_remote_catalog(false);
         }
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
@@ -8676,6 +8472,7 @@ impl LocalTranscriberApp {
             })
         });
         self.sync_model_comparison_state();
+        let remote_catalog = self.remote_catalog_view();
         let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
         let clear_add_focus = self.model_management.restore_add_focus;
         let restored_details_focus = self.model_management.restore_details_focus.clone();
@@ -8693,6 +8490,7 @@ impl LocalTranscriberApp {
                 model_catalog: &catalog,
                 comparison: &self.model_comparison,
                 model_management: &self.model_management,
+                remote_catalog: &remote_catalog,
                 recording_settings: &Default::default(),
             },
         );
@@ -8721,6 +8519,228 @@ impl LocalTranscriberApp {
             self.model_comparison.reference_notice = None;
         }
         self.apply_model_management_action(action);
+    }
+
+    fn remote_catalog_view(&self) -> RemoteCatalogView {
+        let search = self.model_search.trim().to_ascii_lowercase();
+        let snapshot = self.remote_catalog.snapshot.as_ref();
+        let entries = snapshot
+            .map(|snapshot| {
+                filtered_remote_models(
+                    &snapshot.models,
+                    &self.config,
+                    &search,
+                    self.remote_catalog_filters,
+                    self.remote_catalog_sort,
+                )
+                .into_iter()
+                .map(|model| self.remote_catalog_entry_view(model))
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let matching_count = entries.len();
+        let total_count = snapshot.map_or(0, |snapshot| snapshot.models.len());
+        let (kind, message) = if self.remote_catalog.loading {
+            let message = snapshot.map_or_else(
+                || "Loading the trusted catalog.".to_owned(),
+                |snapshot| {
+                    format!(
+                        "Refreshing the trusted catalog. Showing {matching_count} of {total_count} models from {}.",
+                        snapshot.source.label()
+                    )
+                },
+            );
+            (RemoteCatalogStatusKind::Loading, message)
+        } else if let Some(error) = self.remote_catalog.error.as_deref() {
+            let message = snapshot.map_or_else(
+                || format!("Catalog unavailable: {error}"),
+                |snapshot| {
+                    format!(
+                        "Catalog refresh failed; showing {matching_count} of {total_count} models from {}. {error}",
+                        snapshot.source.label()
+                    )
+                },
+            );
+            (RemoteCatalogStatusKind::Error, message)
+        } else if let Some(snapshot) = snapshot {
+            let kind = match snapshot.source {
+                CatalogSource::StaleCache | CatalogSource::BundledFallback => {
+                    RemoteCatalogStatusKind::Offline
+                }
+                CatalogSource::Network | CatalogSource::FreshCache => {
+                    RemoteCatalogStatusKind::Available
+                }
+            };
+            (
+                kind,
+                format!(
+                    "{} · Showing {matching_count} of {total_count} trusted catalog models.",
+                    snapshot.source.label()
+                ),
+            )
+        } else {
+            (
+                RemoteCatalogStatusKind::Idle,
+                "Catalog discovery has not completed yet. Refresh to retry.".to_owned(),
+            )
+        };
+
+        RemoteCatalogView {
+            local_import: crate::ui::LocalGgufImportView {
+                path: self.model_import_path.clone(),
+                in_progress: self.local_gguf_import.is_some(),
+                import_enabled: self.local_gguf_import.is_none()
+                    && self.artifact_mutation_block_reason().is_none(),
+                disabled_reason: self.artifact_mutation_block_reason(),
+            },
+            query: self.model_search.clone(),
+            filters: self.remote_catalog_filters,
+            sort: self.remote_catalog_sort,
+            status: RemoteCatalogStatusView { kind, message },
+            refresh_enabled: !self.remote_catalog.loading,
+            has_snapshot: snapshot.is_some(),
+            entries,
+        }
+    }
+
+    fn remote_catalog_entry_view(&self, model: &RemoteModel) -> RemoteCatalogEntryView {
+        let mutation_block_reason = self.artifact_mutation_block_reason();
+        let variants = model
+            .variants
+            .iter()
+            .map(|variant| {
+                let artifact = model.artifact_for(&variant.id);
+                let normalized_model_id = artifact.as_ref().and_then(|artifact| {
+                    crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                        &artifact.model_id,
+                        &artifact.revision,
+                        &artifact.filename,
+                    )
+                });
+                let remote_id = artifact.as_ref().and_then(|artifact| {
+                    config::managed_remote_model_id(
+                        &artifact.model_id,
+                        &artifact.revision,
+                        &artifact.filename,
+                    )
+                });
+                let installed_id = remote_id.as_ref().and_then(|id| {
+                    self.config
+                        .general
+                        .managed_remote_models
+                        .contains_key(id)
+                        .then(|| id.clone())
+                });
+                let previous_revision = artifact.as_ref().is_some_and(|artifact| {
+                    self.config
+                        .general
+                        .managed_remote_models
+                        .values()
+                        .any(|install| {
+                            install.repository == artifact.model_id
+                                && install.filename == artifact.filename
+                                && install.revision != artifact.revision
+                        })
+                });
+                let install_disabled_reason = mutation_block_reason.clone().or_else(|| {
+                    artifact.as_ref().and_then(|artifact| {
+                        normalized_model_id.as_ref().map_or_else(
+                            || trusted_model_install_space_error(&self.config, artifact),
+                            |model_id| {
+                                normalized_model_install_space_error(&self.config, model_id)
+                            },
+                        )
+                    })
+                });
+                let install_action = |label: &str| RemoteCatalogActionView {
+                    label: label.to_owned(),
+                    kind: RemoteCatalogActionKind::Install {
+                        remote_model_id: model.id.clone(),
+                        variant_id: variant.id.clone(),
+                    },
+                    enabled: artifact.is_some() && install_disabled_reason.is_none(),
+                    disabled_reason: install_disabled_reason.clone().or_else(|| {
+                        artifact.is_none().then(|| {
+                            "This catalog entry no longer resolves to a validated pinned artifact. Refresh the catalog."
+                                .to_owned()
+                        })
+                    }),
+                };
+
+                let status_label;
+                let mut actions = Vec::new();
+                if let Some(remote_id) = remote_id.as_deref()
+                    && let Some(status) = self.model_downloads.get(remote_id)
+                {
+                    status_label = Some(status.label());
+                    if matches!(
+                        status,
+                        ModelInstallStatus::Downloading { .. }
+                            | ModelInstallStatus::InstallingRuntime
+                    ) {
+                        actions.push(RemoteCatalogActionView {
+                            label: "Cancel".to_owned(),
+                            kind: RemoteCatalogActionKind::Cancel {
+                                model_id: remote_id.to_owned(),
+                            },
+                            enabled: true,
+                            disabled_reason: None,
+                        });
+                    } else if matches!(status, ModelInstallStatus::Error(_)) {
+                        actions.push(install_action("Resume"));
+                    }
+                } else if let Some(installed_id) = installed_id {
+                    status_label = Some("Installed and verified".to_owned());
+                    actions.push(RemoteCatalogActionView {
+                        label: "Use".to_owned(),
+                        kind: RemoteCatalogActionKind::Use {
+                            model_id: installed_id.clone(),
+                        },
+                        enabled: mutation_block_reason.is_none(),
+                        disabled_reason: mutation_block_reason.clone(),
+                    });
+                    actions.push(RemoteCatalogActionView {
+                        label: "Remove".to_owned(),
+                        kind: RemoteCatalogActionKind::Remove {
+                            model_id: installed_id,
+                        },
+                        enabled: mutation_block_reason.is_none(),
+                        disabled_reason: mutation_block_reason.clone(),
+                    });
+                } else if previous_revision {
+                    status_label = Some("Update available".to_owned());
+                    actions.push(install_action("Install update"));
+                } else if normalized_model_id.is_some() {
+                    status_label = Some("Available in local catalog".to_owned());
+                    actions.push(install_action("Install verified variant"));
+                } else {
+                    status_label = Some("Pinned GGUF".to_owned());
+                    actions.push(install_action("Install"));
+                }
+
+                RemoteCatalogVariantView {
+                    id: variant.id.clone(),
+                    filename: variant.filename.clone(),
+                    size_label: format_bytes(variant.size_bytes),
+                    status_label,
+                    expected_sha256: variant.expected_sha256.clone(),
+                    actions,
+                }
+            })
+            .collect();
+
+        RemoteCatalogEntryView {
+            id: model.id.clone(),
+            display_name: model.display_name.clone(),
+            description: model.description.clone(),
+            languages: model.languages.clone(),
+            recommended: model.recommended,
+            trust_label: model.trust.label().to_owned(),
+            compatibility_detail: model.compatibility.detail().to_owned(),
+            repository: model.id.clone(),
+            pinned_revision: model.revision.clone(),
+            variants,
+        }
     }
 
     fn sync_model_comparison_state(&mut self) {
@@ -9107,692 +9127,165 @@ impl LocalTranscriberApp {
                     self.uninstall_model(&model);
                 }
             }
+            ScreenAction::RepairModelRuntime(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    self.request_runtime_install(&model, RuntimeJobIntent::RepairModel(id));
+                }
+            }
+            ScreenAction::MaintainModelRuntime(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    && let Some(provider) = compatibility_bridge::provider_for_model(&model)
+                {
+                    let state = runtime_action_state_with_activity(
+                        &self.config,
+                        &model,
+                        self.runtime_jobs.contains_key(provider.id()),
+                        self.runtime_consumer_activity(provider.id()),
+                    );
+                    if state.enabled {
+                        match state.kind {
+                            RuntimeActionKind::Install | RuntimeActionKind::Update => {
+                                self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
+                            }
+                            RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
+                        }
+                    }
+                }
+            }
+            ScreenAction::SetLocalGgufImportPath(path) => self.model_import_path = path,
+            ScreenAction::ValidateAndImportLocalGguf => self.start_local_gguf_import(),
+            ScreenAction::CancelLocalGgufImport => {
+                if let Some(cancellation) = self.local_gguf_import.as_ref() {
+                    cancellation.cancel();
+                    self.status_message =
+                        "Cancelling local GGUF validation; source bytes are unchanged.".to_owned();
+                }
+            }
+            ScreenAction::SetRemoteCatalogQuery(query) => self.model_search = query,
+            ScreenAction::SetRemoteCatalogInstalledOnly(selected) => {
+                self.remote_catalog_filters.installed_only = selected
+            }
+            ScreenAction::SetRemoteCatalogRecommendedOnly(selected) => {
+                self.remote_catalog_filters.recommended_only = selected
+            }
+            ScreenAction::SetRemoteCatalogMultilingualOnly(selected) => {
+                self.remote_catalog_filters.multilingual_only = selected
+            }
+            ScreenAction::SetRemoteCatalogSizeTier(size_tier) => {
+                self.remote_catalog_filters.size_tier = size_tier
+            }
+            ScreenAction::SetRemoteCatalogSort(sort) => self.remote_catalog_sort = sort,
+            ScreenAction::RetryRemoteCatalog => {
+                self.remote_catalog.force_refresh_requested = true;
+            }
+            ScreenAction::InstallRemoteCatalogVariant {
+                remote_model_id,
+                variant_id,
+            } => {
+                let action = self
+                    .remote_catalog
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .models
+                            .iter()
+                            .find(|model| model.id == remote_model_id)
+                    })
+                    .and_then(|model| {
+                        let artifact = model.artifact_for(&variant_id)?;
+                        let action = crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                            &artifact.model_id,
+                            &artifact.revision,
+                            &artifact.filename,
+                        )
+                        .map_or_else(
+                            || {
+                                RemoteModelCardAction::InstallTrusted(
+                                    trusted_remote_install_request(model, &artifact),
+                                )
+                            },
+                            RemoteModelCardAction::InstallNormalized,
+                        );
+                        Some(action)
+                    });
+                if let Some(action) = action {
+                    self.apply_remote_model_card_action(action);
+                } else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The selected catalog variant is no longer in the validated snapshot. Refresh the catalog and try again."
+                            .to_owned();
+                }
+            }
+            ScreenAction::CancelRemoteCatalogInstall(model_id) => self
+                .apply_remote_model_card_action(RemoteModelCardAction::CancelInstall(
+                    ModelId::new(model_id),
+                )),
+            ScreenAction::UseRemoteCatalogModel(model_id) => self.apply_remote_model_card_action(
+                RemoteModelCardAction::SelectInstalled(ModelId::new(model_id)),
+            ),
+            ScreenAction::RemoveRemoteCatalogModel(model_id) => self
+                .apply_remote_model_card_action(RemoteModelCardAction::RemoveInstalled(
+                    ModelId::new(model_id),
+                )),
             ScreenAction::None => {}
             other => self.apply_transcribe_screen_action(other),
         }
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
     }
 
-    fn ui_models_legacy(&mut self, ui: &mut Ui) {
-        let descriptors = self.transcription_service.model_descriptors();
-        let descriptors_by_id = descriptors
-            .iter()
-            .map(|descriptor| (descriptor.id.as_str(), descriptor))
-            .collect::<HashMap<_, _>>();
-        let remote_catalog = self.remote_catalog.snapshot.clone();
-        let remote_catalog_loading = self.remote_catalog.loading;
-        let remote_catalog_error = self.remote_catalog.error.clone();
-        let mut refresh_remote_catalog = false;
-        let mut remote_model_action = None;
-        let mut start_local_import = false;
-        let local_import_in_progress = self.local_gguf_import.is_some();
-        let local_import_cancellation = self.local_gguf_import.clone();
-
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Models Catalog", status, &status_message, |ui| {
-            panel(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(section_heading("Compare installed models"));
-                        ui.label(mut_text(
-                            "Record one local sample and compare the selected installed models.",
-                        ));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(primary_small_button(ui, "Open comparison"))
-                            .clicked()
-                        {
-                            self.models_show_comparison = true;
-                        }
-                    });
-                });
-            });
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                remote_catalog_filter_controls(
-                    ui,
-                    &mut self.model_search,
-                    &mut self.remote_catalog_filters,
-                    &mut self.remote_catalog_sort,
-                );
-                ui.add_space(6.0);
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Size uses each model's smallest available GGUF variant. The trusted catalog does not currently publish download counts, update timestamps, or native-streaming capability.",
-                    ),
-                );
-            });
-
-            let remote_search = self.model_search.trim().to_ascii_lowercase();
-            if let Some(snapshot) = remote_catalog.as_ref() {
-                let matching_count = filtered_remote_models(
-                    &snapshot.models,
-                    &self.config,
-                    &remote_search,
-                    self.remote_catalog_filters,
-                    self.remote_catalog_sort,
-                )
-                .len();
-                catalog_status_label(
-                    ui,
-                    format!(
-                        "Showing {matching_count} of {} trusted catalog models",
-                        snapshot.models.len()
-                    ),
-                );
-            }
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(section_heading("Discover compatible models"));
-                        ui.label(mut_text(
-                            "Catalog metadata is retrieved by Scribe from a trusted public publisher; model data never passes through the UI.",
-                        ));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let refresh = ui
-                            .add_enabled(
-                                !remote_catalog_loading,
-                                small_button(ui, "Refresh catalog"),
-                            )
-                            .on_hover_text(
-                                "Re-query the trusted Hugging Face catalog and replace the cache only after validation.",
-                            );
-                        if refresh.clicked() {
-                            refresh_remote_catalog = true;
-                        }
-                        if remote_catalog_loading {
-                            badge(ui, "Loading", ChipTone::Neutral);
-                        }
-                    });
-                });
-                if let Some(snapshot) = remote_catalog.as_ref() {
-                    ui.add_space(8.0);
-                    catalog_status_label(
-                        ui,
-                        format!(
-                            "{} · {} compatible candidate(s)",
-                            snapshot.source.label(),
-                            snapshot.models.len(),
-                        ),
-                    );
-                } else if let Some(error) = remote_catalog_error.as_deref() {
-                    ui.add_space(8.0);
-                    catalog_status_label(ui, format!("Catalog unavailable: {error}"));
-                } else {
-                    ui.add_space(8.0);
-                    catalog_status_label(
-                        ui,
-                        "Catalog discovery has not completed yet. Refresh to retry.",
-                    );
-                }
-            });
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                ui.label(section_heading("Import local GGUF"));
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Validate an existing .gguf file in place. Scribe hashes and smoke-tests it through the embedded runtime, but never copies, uploads, or deletes the source file.",
-                    ),
-                );
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label(label_caps("GGUF file path"));
-                    let path_input = ui.add_sized(
-                        [usable_width(ui).min(460.0), 28.0],
-                        TextEdit::singleline(&mut self.model_import_path)
-                            .hint_text("C:\\Models\\model.gguf"),
-                    );
-                    path_input.labelled_by(label.id);
-                });
-                ui.add_space(6.0);
-                if local_import_in_progress {
-                    ui.horizontal_wrapped(|ui| {
-                        badge(ui, "Validating local file", ChipTone::Neutral);
-                        if ui.add(small_button(ui, "Cancel import")).clicked()
-                            && let Some(cancellation) = local_import_cancellation.as_ref()
-                        {
-                            cancellation.cancel();
-                            self.status_message =
-                                "Cancelling local GGUF validation; source bytes are unchanged."
-                                    .to_owned();
-                        }
-                    });
-                } else if ui
-                    .add(primary_small_button(ui, "Validate and import"))
-                    .on_hover_text(
-                        "Hash and smoke-test this local GGUF before adding it to Scribe.",
-                    )
-                    .clicked()
+    fn apply_remote_model_card_action(&mut self, action: RemoteModelCardAction) {
+        match action {
+            RemoteModelCardAction::InstallNormalized(model_id) => {
+                if self.artifact_installations.contains_key(model_id.as_str()) {
+                    self.status_message =
+                        "That verified model variant is already being installed.".to_owned();
+                } else if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
                 {
-                    start_local_import = true;
-                }
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "A local SHA-256 is an observed fingerprint, not an upstream checksum. Remove from Scribe only forgets its record and receipt.",
-                    ),
-                );
-            });
-
-            let imported_local_models = config::configured_models(&self.config)
-                .into_iter()
-                .filter_map(|model| {
-                    self.config
-                        .general
-                        .imported_gguf_models
-                        .get(&model.id)
-                        .cloned()
-                        .map(|install| (model, install))
-                })
-                .filter(|(model, install)| {
-                    remote_search.is_empty()
-                        || model.name.to_ascii_lowercase().contains(&remote_search)
-                        || install
-                            .path
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .contains(&remote_search)
-                })
-                .collect::<Vec<_>>();
-            if !imported_local_models.is_empty() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    ui.label(section_heading("Imported local models"));
-                    ui.add_space(8.0);
-                    for (index, (model, install)) in imported_local_models.iter().enumerate() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(body_strong(&model.name));
-                            badge(ui, "Imported in place", ChipTone::Neutral);
-                            badge(ui, "Embedded runtime", ChipTone::Neutral);
-                            if ui.add(small_button(ui, "Use")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                            if ui.add(small_button(ui, "Remove from Scribe")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                        });
-                        wrapped_label(
-                            ui,
-                            mut_text(format!(
-                                "{} · observed SHA-256 {}",
-                                install.path.display(),
-                                install.sha256
-                            )),
-                        );
-                        if index + 1 < imported_local_models.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
-                });
-            }
-
-            let installed_remote_models = config::configured_models(&self.config)
-                .into_iter()
-                .filter_map(|model| {
-                    self.config
-                        .general
-                        .managed_remote_models
-                        .get(&model.id)
-                        .cloned()
-                        .map(|install| (model, install))
-                })
-                .filter(|(model, install)| {
-                    remote_search.is_empty()
-                        || model.name.to_ascii_lowercase().contains(&remote_search)
-                        || install
-                            .repository
-                            .to_ascii_lowercase()
-                            .contains(&remote_search)
-                        || install
-                            .languages
-                            .iter()
-                            .any(|language| language.to_ascii_lowercase().contains(&remote_search))
-                })
-                .collect::<Vec<_>>();
-            if !installed_remote_models.is_empty() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    ui.label(section_heading("Installed Hugging Face models"));
-                    ui.add_space(8.0);
-                    for (index, (model, install)) in installed_remote_models.iter().enumerate() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(body_strong(&model.name));
-                            badge(
-                                ui,
-                                &model.install_status.label(),
-                                if model.install_status.is_runnable() {
-                                    ChipTone::Success
-                                } else {
-                                    ChipTone::Error
-                                },
-                            );
-                            badge(ui, "Embedded runtime", ChipTone::Neutral);
-                            if ui.add(small_button(ui, "Use")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                            if ui.add(small_button(ui, "Remove")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                        });
-                        wrapped_label(
-                            ui,
-                            mut_text(format!(
-                                "{} @ {} · {}",
-                                install.repository, install.revision, install.filename
-                            )),
-                        );
-                        if index + 1 < installed_remote_models.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
-                });
-            }
-
-            if let Some(snapshot) = remote_catalog.as_ref() {
-                let remote_models = filtered_remote_models(
-                    &snapshot.models,
-                    &self.config,
-                    &remote_search,
-                    self.remote_catalog_filters,
-                    self.remote_catalog_sort,
-                );
-                if remote_models.is_empty() {
-                    ui.add_space(8.0);
-                    wrapped_label(
-                        ui,
-                        mut_text("No trusted catalog models match the current search or filters."),
-                    );
-                } else if self.remote_catalog_sort == RemoteCatalogSort::Recommended {
-                    let recommended_models = remote_models
-                        .iter()
-                        .copied()
-                        .filter(|model| model.recommended)
-                        .collect::<Vec<_>>();
-                    if !recommended_models.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(section_heading("Recommended"));
-                        for model in recommended_models {
-                            if let Some(action) =
-                                remote_model_card(ui, model, &self.config, &self.model_downloads)
-                            {
-                                remote_model_action = Some(action);
-                            }
-                            ui.add_space(8.0);
-                        }
-                    }
-                    let experimental_models = remote_models
-                        .iter()
-                        .copied()
-                        .filter(|model| !model.recommended)
-                        .collect::<Vec<_>>();
-                    if !experimental_models.is_empty() {
-                        ui.add_space(8.0);
-                        let experimental =
-                            egui::CollapsingHeader::new("Browse compatible models (Experimental)")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    for model in experimental_models {
-                                        if let Some(action) = remote_model_card(
-                                            ui,
-                                            model,
-                                            &self.config,
-                                            &self.model_downloads,
-                                        ) {
-                                            remote_model_action = Some(action);
-                                        }
-                                        ui.add_space(8.0);
-                                    }
-                                });
-                        set_collapsing_header_accessibility(ui.ctx(), &experimental);
-                    } else {
-                        ui.add_space(8.0);
-                        wrapped_label(
-                            ui,
-                            mut_text(
-                                "All matching candidates are shown above. Additional trusted candidates will appear here after refresh.",
-                            ),
-                        );
-                    }
+                    self.start_model_download(&model);
                 } else {
-                    ui.add_space(12.0);
-                    ui.label(section_heading("Matching trusted catalog models"));
-                    for model in remote_models {
-                        if let Some(action) =
-                            remote_model_card(ui, model, &self.config, &self.model_downloads)
-                        {
-                            remote_model_action = Some(action);
-                        }
-                        ui.add_space(8.0);
-                    }
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The selected catalog variant is no longer available in Scribe's verified local catalog. Refresh and try again."
+                            .to_owned();
                 }
             }
-
-            ui.add_space(12.0);
-            let download_rows = current_download_rows(&self.config, &self.model_downloads)
-                .into_iter()
-                .filter(|(model, _)| descriptors_by_id.contains_key(model.id.as_str()))
-                .collect::<Vec<_>>();
-            if !download_rows.is_empty() {
-                panel(ui, |ui| {
-                    ui.label(section_heading("Downloads"));
-                    ui.add_space(8.0);
-                    for (index, (model, install_status)) in download_rows.iter().enumerate() {
-                        let descriptor = descriptors_by_id
-                            .get(model.id.as_str())
-                            .copied()
-                            .expect("filtered download row must have a neutral descriptor");
-                        download_summary_row(ui, descriptor, install_status);
-                        if let Some((_, cancellation)) = self.artifact_installations.get(&model.id)
-                        {
-                            let cancellation = cancellation.clone();
-                            let response = ui
-                                .add(small_button(ui, "Cancel installation"))
-                                .on_hover_text(
-                                    "Stop after the current native chunk and retain resumable download bytes.",
-                                );
-                            if response.clicked() {
-                                cancellation.cancel();
-                                self.status_message = format!(
-                                    "Cancelling {}. Downloaded partials will be kept for Resume.",
-                                    descriptor.display_name
-                                );
-                            }
-                        }
-                        if index + 1 < download_rows.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
-                });
-                ui.add_space(12.0);
+            RemoteModelCardAction::InstallTrusted(request) => {
+                self.start_trusted_remote_model_download(request);
             }
-
-            // Runtime packages are a compatibility-only path. None of the
-            // normal embedded GGUF descriptors may expose their install or
-            // maintenance controls in the Models experience.
-            let runtime_models = runtime_representative_models(&self.config)
-                .into_iter()
-                .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
-                .filter(|model| {
-                    !crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
-                })
-                .collect::<Vec<_>>();
-            if !runtime_models.is_empty() {
-                let mut runtime_action = None;
-                let runtime_maintenance = egui::CollapsingHeader::new("Runtime maintenance")
-                .default_open(false)
-                .show(ui, |ui| panel(ui, |ui| {
-                ui.label(mut_text(
-                    "Install, update, or remove the local speech runtime. Models prepare a missing runtime automatically.",
-                ));
-                wrapped_label(
-                    ui,
-                    mut_text(format!(
-                        "Storage: models in {} · runtimes in {}",
-                        config::model_storage_dir(&self.config).display(),
-                        config::runtime_storage_dir().display()
-                    )),
-                );
-                ui.add_space(8.0);
-                for model in runtime_models {
-                    let provider = compatibility_bridge::provider_for_model(&model);
-                    let runtime_busy = provider.is_some_and(|provider| {
-                        self.runtime_jobs.contains_key(provider.id())
-                    });
-                    let consumer_activity = provider
-                        .map(|provider| self.runtime_consumer_activity(provider.id()))
-                        .unwrap_or_default();
-                    let runtime_status = provider
-                        .map(|provider| provider.runtime_status(&self.config))
-                        .unwrap_or_else(|| {
-                            ModelRuntimeStatus::Error(
-                                "The model provider is not available.".to_owned(),
-                            )
-                        });
-                    let action_state = runtime_action_state_with_activity(
-                        &self.config,
-                        &model,
-                        runtime_busy,
-                        consumer_activity,
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(body_strong("Local speech runtime"));
-                            wrapped_label(
-                                ui,
-                                mut_text(runtime_detail_text(
-                                    &self.config,
-                                    &model,
-                                    &runtime_status,
-                                )),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                            let label = runtime_action_label(
-                                action_state.kind,
-                                "speech",
-                                runtime_busy,
-                            );
-                            let runtime_button = small_button(ui, &label);
-                            let response = add_enabled_button(
-                                ui,
-                                action_state.enabled,
-                                runtime_button,
-                                action_state.disabled_tooltip.as_deref(),
-                            )
-                            .on_hover_text("Manage the shared native runtime used by this model.");
-                            if response.clicked() {
-                                runtime_action = Some((model.clone(), action_state.kind));
-                            }
-                            badge(
-                                ui,
-                                &runtime_status.to_string(),
-                                runtime_chip_tone(&runtime_status),
-                            );
-                            if let Some((label, tone)) = runtime_version_badge(&self.config, &model)
-                            {
-                                badge(ui, &label, tone);
-                            }
-                            badge(
-                                ui,
-                                &format!(
-                                    "Runtime {}",
-                                    compatibility_bridge::runtime_storage_estimate(&model)
-                                ),
-                                ChipTone::Neutral,
-                            );
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-            }));
-                set_collapsing_header_accessibility(ui.ctx(), &runtime_maintenance);
-
-                if let Some((model, kind)) = runtime_action {
-                    match kind {
-                        RuntimeActionKind::Install | RuntimeActionKind::Update => {
-                            self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
-                        }
-                        RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
-                    }
+            RemoteModelCardAction::CancelInstall(model_id) => {
+                if let Some((_, cancellation)) = self.artifact_installations.get(model_id.as_str())
+                {
+                    cancellation.cancel();
+                    self.status_message =
+                        "Cancelling verified model installation. Downloaded partial bytes will be retained for Resume."
+                            .to_owned();
                 }
             }
-
-            ui.add_space(12.0);
-            let search = self.model_search.trim().to_ascii_lowercase();
-            let models = config::configured_models(&self.config)
-                .into_iter()
-                .filter(|model| {
-                    descriptors_by_id
-                        .get(model.id.as_str())
-                        .is_some_and(|descriptor| {
-                            search.is_empty()
-                                || descriptor
-                                    .display_name
-                                    .to_ascii_lowercase()
-                                    .contains(&search)
-                                || descriptor
-                                    .description
-                                    .to_ascii_lowercase()
-                                    .contains(&search)
-                                || descriptor
-                                    .languages
-                                    .iter()
-                                    .any(|language| language.to_ascii_lowercase().contains(&search))
-                        })
-                })
-                .collect::<Vec<_>>();
-
-            for model in models {
-                let descriptor = descriptors_by_id
-                    .get(model.id.as_str())
-                    .expect("filtered normalized model must have a descriptor");
-                let selected = self.config.general.selected_default_model == model.id;
-                let install_status = self.effective_install_status(&model);
-                let runtime_ready =
-                    runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready;
-                let action_state = model_action_state_with_runtime(
-                    &model,
-                    &install_status,
-                    selected,
-                    runtime_ready,
-                );
-                let primary_disabled_tooltip = model_primary_disabled_tooltip(
-                    &model,
-                    &install_status,
-                    selected,
-                    &action_state,
-                );
-                let mut select_default = false;
-                let mut start_install = false;
-                let mut uninstall = false;
-
-                model_catalog_row(ui, descriptor, &install_status, selected, |ui| {
-                    let primary_label =
-                        model_primary_action_label(action_state.primary, &model, &install_status);
-                    let primary_button = match action_state.primary {
-                        ModelPrimaryAction::Select | ModelPrimaryAction::Active => {
-                            primary_small_button(ui, &primary_label)
-                        }
-                        _ => small_button(ui, &primary_label),
-                    };
-                    let primary_response = add_enabled_button(
-                        ui,
-                        action_state.primary_enabled,
-                        primary_button,
-                        primary_disabled_tooltip.as_deref(),
-                    )
-                    .on_hover_text(match action_state.primary {
-                        ModelPrimaryAction::Repair => format!(
-                            "Prepare the shared local runtime for {} without downloading the model again.",
-                            descriptor.display_name
-                        ),
-                        _ => format!("{} for {}.", primary_label, descriptor.display_name),
-                    });
-                    if primary_response.clicked() {
-                        match action_state.primary {
-                            ModelPrimaryAction::Select => select_default = true,
-                            ModelPrimaryAction::Install | ModelPrimaryAction::Retry => {
-                                start_install = true;
-                            }
-                            ModelPrimaryAction::Repair => {
-                                self.request_runtime_install(
-                                    &model,
-                                    RuntimeJobIntent::RepairModel(model.id.clone()),
-                                );
-                            }
-                            ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
-                        }
-                    }
-                    if action_state.show_uninstall
-                        && ui.add(small_button(ui, "Uninstall")).clicked()
-                    {
-                        uninstall = true;
-                    }
-                });
-
-                if select_default {
+            RemoteModelCardAction::SelectInstalled(model_id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
+                {
                     self.select_model_as_default(&model);
                 }
-                if start_install {
-                    self.start_model_download(&model);
-                }
-                if uninstall {
+            }
+            RemoteModelCardAction::RemoveInstalled(model_id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
+                {
                     self.uninstall_model(&model);
                 }
-                ui.add_space(8.0);
             }
-        });
-        if start_local_import {
-            self.start_local_gguf_import();
-        }
-        if let Some(action) = remote_model_action {
-            match action {
-                RemoteModelCardAction::InstallNormalized(model_id) => {
-                    if self.artifact_installations.contains_key(model_id.as_str()) {
-                        self.status_message =
-                            "That verified model variant is already being installed.".to_owned();
-                    } else if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.start_model_download(&model);
-                    } else {
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message =
-                            "The selected catalog variant is no longer available in Scribe's verified local catalog. Refresh and try again."
-                                .to_owned();
-                    }
-                }
-                RemoteModelCardAction::InstallTrusted(request) => {
-                    self.start_trusted_remote_model_download(request);
-                }
-                RemoteModelCardAction::CancelInstall(model_id) => {
-                    if let Some((_, cancellation)) =
-                        self.artifact_installations.get(model_id.as_str())
-                    {
-                        cancellation.cancel();
-                        self.status_message =
-                            "Cancelling verified model installation. Downloaded partial bytes will be retained for Resume."
-                                .to_owned();
-                    }
-                }
-                RemoteModelCardAction::SelectInstalled(model_id) => {
-                    if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.select_model_as_default(&model);
-                    }
-                }
-                RemoteModelCardAction::RemoveInstalled(model_id) => {
-                    if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.uninstall_model(&model);
-                    }
-                }
-            }
-        }
-        if refresh_remote_catalog && !cfg!(test) {
-            self.request_remote_catalog(true);
         }
     }
 
@@ -10336,6 +9829,7 @@ impl LocalTranscriberApp {
                 model_catalog: &[],
                 comparison: &comparison,
                 model_management: &Default::default(),
+                remote_catalog: &Default::default(),
                 recording_settings: &settings,
             },
         );
@@ -10554,7 +10048,23 @@ impl LocalTranscriberApp {
             | ScreenAction::HideComparisonReferenceEditor
             | ScreenAction::EditComparisonReference(_)
             | ScreenAction::ApplyComparisonReference
-            | ScreenAction::ClearComparisonReference => {}
+            | ScreenAction::ClearComparisonReference
+            | ScreenAction::SetRemoteCatalogQuery(_)
+            | ScreenAction::SetRemoteCatalogInstalledOnly(_)
+            | ScreenAction::SetRemoteCatalogRecommendedOnly(_)
+            | ScreenAction::SetRemoteCatalogMultilingualOnly(_)
+            | ScreenAction::SetRemoteCatalogSizeTier(_)
+            | ScreenAction::SetRemoteCatalogSort(_)
+            | ScreenAction::RetryRemoteCatalog
+            | ScreenAction::InstallRemoteCatalogVariant { .. }
+            | ScreenAction::CancelRemoteCatalogInstall(_)
+            | ScreenAction::UseRemoteCatalogModel(_)
+            | ScreenAction::RemoveRemoteCatalogModel(_) => {}
+            ScreenAction::RepairModelRuntime(_)
+            | ScreenAction::MaintainModelRuntime(_)
+            | ScreenAction::SetLocalGgufImportPath(_)
+            | ScreenAction::ValidateAndImportLocalGguf
+            | ScreenAction::CancelLocalGgufImport => {}
         }
     }
 
@@ -10834,445 +10344,6 @@ impl LocalTranscriberApp {
             }
         }
     }
-
-    fn ui_advanced_settings(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Advanced", status, &status_message, |ui| {
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Output"));
-                ui.add_space(8.0);
-                let mut auto_insert = self.config.output.auto_insert_transcript;
-                let output_label = if cfg!(target_os = "windows") {
-                    "Insert final transcript into captured app"
-                } else {
-                    "Copy final transcript to clipboard automatically"
-                };
-                if ui.checkbox(&mut auto_insert, output_label).changed() {
-                    self.config.output.auto_insert_transcript = auto_insert;
-                    self.save_config();
-                }
-                if cfg!(target_os = "windows") {
-                    ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
-                        let mut restore_clipboard =
-                            self.config.output.restore_clipboard_after_insert;
-                        if ui
-                            .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                            .changed()
-                        {
-                            self.config.output.restore_clipboard_after_insert = restore_clipboard;
-                            self.save_config();
-                        }
-                        let mut paste_delay = self.config.output.paste_delay_ms as i32;
-                        ui.horizontal_wrapped(|ui| {
-                            let label = ui.label("Paste delay ms");
-                            if ui
-                                .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
-                                .labelled_by(label.id)
-                                .changed()
-                            {
-                                self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
-                                self.save_config();
-                            }
-                        });
-                    });
-                } else if self.config.output.auto_insert_transcript
-                    && let Some(notice) = text_output::paste_automation_notice()
-                {
-                    ui.label(notice);
-                }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Capture limits"));
-                let mut max_duration = self.config.recording.max_recording_seconds as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Maximum recording seconds");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut max_duration)
-                                .clamp_range(1..=config::MAX_RECORDING_SECONDS as i32),
-                        )
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
-                        self.save_config();
-                    }
-                });
-                ui.add_space(6.0);
-                let mut vad_enabled = self.config.recording.vad_enabled;
-                if ui
-                    .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
-                    .on_hover_text(
-                        "Stops after the configured silence interval. Input sensitivity still controls speech detection when this option is off, and an explicit shortcut release or Stop action always takes priority.",
-                    )
-                    .changed()
-                {
-                    self.config.recording.vad_enabled = vad_enabled;
-                    self.save_config();
-                }
-                let mut speech_confirmation = self.config.recording.speech_confirmation_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Speech confirmation ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut speech_confirmation).clamp_range(50..=1000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.speech_confirmation_ms =
-                            speech_confirmation.max(50) as u32;
-                        self.config.recording.internal_pause_ms = self
-                            .config
-                            .recording
-                            .internal_pause_ms
-                            .max(self.config.recording.speech_confirmation_ms);
-                        self.save_config();
-                    }
-                });
-                let mut internal_pause = self.config.recording.internal_pause_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Internal pause ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.internal_pause_ms = internal_pause
-                            .max(self.config.recording.speech_confirmation_ms as i32)
-                            as u32;
-                        self.config.recording.endpoint_silence_ms = self
-                            .config
-                            .recording
-                            .endpoint_silence_ms
-                            .max(self.config.recording.internal_pause_ms);
-                        self.save_config();
-                    }
-                });
-                ui.add_enabled_ui(self.config.recording.vad_enabled, |ui| {
-                    let mut endpoint_silence = self.config.recording.endpoint_silence_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("End after silence ms");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut endpoint_silence).clamp_range(
-                                    self.config.recording.internal_pause_ms as i32..=5000,
-                                ),
-                            )
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.endpoint_silence_ms = endpoint_silence
-                                .max(self.config.recording.internal_pause_ms as i32)
-                                as u32;
-                            self.save_config();
-                        }
-                    });
-                });
-                let mut pre_roll = self.config.recording.pre_roll_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Pre-roll ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
-                        self.save_config();
-                    }
-                });
-                let mut post_roll = self.config.recording.post_roll_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Post-roll ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.post_roll_ms = post_roll.max(0) as u32;
-                        self.save_config();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.overlay.position;
-                    let label = ui.label("Overlay position");
-                    let combo = ComboBox::from_id_source("overlay-position")
-                        .selected_text(self.config.overlay.position.label())
-                        .show_ui(ui, |ui| {
-                            for position in OverlayPosition::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.overlay.position,
-                                    position,
-                                    position.label(),
-                                );
-                            }
-                        });
-                    combo.response.clone().labelled_by(label.id);
-                    if before != self.config.overlay.position {
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Live transcription"));
-                ui.horizontal_wrapped(|ui| {
-                    let mut mode = self.config.streaming.mode;
-                    if streaming_mode_selector(ui, &mut mode) {
-                        self.config.streaming.mode = mode;
-                        self.save_config();
-                    }
-                });
-                ui.label(mut_text(
-                    "Rolling preview uses 250 ms decode intervals, 3-second windows, 650 ms overlap, two stability passes, and a 700 ms horizon. Tentative text stays inside Scribe; only the full final pass may reach another application.",
-                ));
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Performance"));
-                let gpu_available = self
-                    .transcription_service
-                    .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
-                    .is_ok_and(|descriptor| descriptor.capabilities.gpu);
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Transcription device");
-                    let mut preference = self.config.performance.acceleration_preference;
-                    let combo = ComboBox::from_id_source("advanced-transcription-device-mode")
-                        .selected_text(preference.label())
-                        .show_ui(ui, |ui| {
-                            for mode in AccelerationPreference::ALL {
-                                ui.add_enabled_ui(
-                                    mode != AccelerationPreference::Gpu || gpu_available,
-                                    |ui| {
-                                        ui.selectable_value(&mut preference, mode, mode.label());
-                                    },
-                                );
-                            }
-                        });
-                    combo.response.labelled_by(label.id);
-                    if preference != self.config.performance.acceleration_preference {
-                        self.config.performance.acceleration_preference = preference;
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("History and privacy"));
-                let retry_active = self.history_retry_is_active();
-                let history_lock_reason = retry_active
-                    .then_some("Unavailable while a retained-audio retry owns its history row.");
-                if retry_active {
-                    let locked = ui.label(mut_text(
-                        "History retention is locked while a retained-audio retry owns its row.",
-                    ));
-                    ui.ctx().accesskit_node_builder(locked.id, |builder| {
-                        builder.set_live(egui::accesskit::Live::Polite);
-                        builder.set_live_atomic();
-                    });
-                }
-                ui.add_enabled_ui(!retry_active, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.history.mode;
-                    let label = ui.label("History storage");
-                    let combo = ComboBox::from_id_source("history-storage-mode")
-                        .selected_text(self.config.history.mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in HistoryMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.history.mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    combo.response.clone().labelled_by(label.id);
-                    if let Some(reason) = history_lock_reason {
-                        ui.ctx()
-                            .accesskit_node_builder(combo.response.id, |builder| {
-                                builder.set_description(reason);
-                            });
-                    }
-                    if before != self.config.history.mode {
-                        self.save_history_config();
-                    }
-                });
-                ui.label(mut_text(match self.config.history.mode {
-                    HistoryMode::Off => {
-                        "New dictations are not added to history. Existing entries remain subject to configured retention and manual deletion."
-                    }
-                    HistoryMode::TranscriptOnly => {
-                        "Final and raw transcripts stay on this device. Microphone audio is not retained."
-                    }
-                    HistoryMode::TranscriptAndAudio => {
-                        "Transcripts and canonical mono 16 kHz audio stay on this device for playback and retry."
-                    }
-                }));
-
-                ui.add_space(8.0);
-                ui.add_enabled_ui(self.config.history.mode.stores_transcripts(), |ui| {
-                    let mut maximum = self.config.history.max_unpinned_entries as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Maximum unpinned entries");
-                        let maximum_control = ui
-                            .add(
-                                egui::DragValue::new(&mut maximum)
-                                    .clamp_range(1..=config::MAX_HISTORY_ENTRIES as i32),
-                            )
-                            .labelled_by(label.id);
-                        if let Some(reason) = history_lock_reason {
-                            ui.ctx().accesskit_node_builder(
-                                maximum_control.id,
-                                |builder| builder.set_description(reason),
-                            );
-                        }
-                        if maximum_control.changed() {
-                            self.config.history.max_unpinned_entries = maximum.max(1) as u32;
-                            self.save_history_config();
-                        }
-                    });
-
-                    if optional_retention_days_control(
-                        ui,
-                        "Transcript age limit",
-                        "Keep transcripts until deleted",
-                        &mut self.config.history.transcript_retention_days,
-                        history_lock_reason,
-                    ) {
-                        self.save_history_config();
-                    }
-
-                    if self.config.history.mode.stores_audio()
-                        && optional_retention_days_control(
-                            ui,
-                            "Audio age limit",
-                            "Keep retained audio until its entry is deleted",
-                            &mut self.config.history.audio_retention_days,
-                            history_lock_reason,
-                        )
-                    {
-                        self.save_history_config();
-                    }
-
-                    let mut store_identity = self.config.history.store_application_identity;
-                    let identity_control = ui
-                        .checkbox(
-                            &mut store_identity,
-                            "Store coarse application identity with new entries",
-                        )
-                        .on_hover_text(
-                            "Stores only a coarse local application label, never a window title or document name.",
-                        );
-                    if let Some(reason) = history_lock_reason {
-                        ui.ctx().accesskit_node_builder(
-                            identity_control.id,
-                            |builder| builder.set_description(reason),
-                        );
-                    }
-                    if identity_control.changed() {
-                        self.config.history.store_application_identity = store_identity;
-                        self.save_history_config();
-                    }
-                });
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Developer"));
-                let mut debug_mode = self.config.developer.debug_mode;
-                if ui
-                    .checkbox(&mut debug_mode, "Enable local model Playground")
-                    .changed()
-                {
-                    self.config.developer.debug_mode = debug_mode;
-                    if !debug_mode && self.current_tab == Tab::Debug {
-                        self.current_tab = Tab::Advanced;
-                    }
-                    self.save_config();
-                }
-                ui.label(mut_text(
-                    "Debug enables the existing functional local comparison tools. It does not enable cloud processing.",
-                ));
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Diagnostics"));
-                if let Some(latency) = &self.latest_latency {
-                    for line in latency.summary_lines() {
-                        ui.label(mut_text(line));
-                    }
-                } else {
-                    ui.label(mut_text("No completed session latency is available yet."));
-                }
-                if self.tray_service.is_none() {
-                    ui.colored_label(
-                        ui_palette(ui).error,
-                        "Tray integration is unavailable in this desktop session.",
-                    );
-                }
-                if let Some(notice) = text_output::paste_automation_notice() {
-                    ui.colored_label(ui_palette(ui).warning, notice);
-                }
-            });
-        });
-    }
-}
-
-fn optional_retention_days_control(
-    ui: &mut Ui,
-    label_text: &str,
-    unlimited_text: &str,
-    value: &mut Option<u32>,
-    disabled_reason: Option<&str>,
-) -> bool {
-    let mut limited = value.is_some();
-    let limit_control = ui.checkbox(&mut limited, label_text);
-    if let Some(reason) = disabled_reason {
-        ui.ctx()
-            .accesskit_node_builder(limit_control.id, |builder| {
-                builder.set_description(reason);
-            });
-    }
-    let mut changed = limit_control.changed();
-    if !limited {
-        if value.take().is_some() {
-            changed = true;
-        }
-        ui.label(mut_text(unlimited_text));
-        return changed;
-    }
-
-    let mut days = value.unwrap_or(30) as i32;
-    ui.horizontal_wrapped(|ui| {
-        let label = ui.label("Days");
-        let days_control = ui
-            .add(
-                egui::DragValue::new(&mut days)
-                    .clamp_range(1..=config::MAX_HISTORY_RETENTION_DAYS as i32),
-            )
-            .labelled_by(label.id);
-        if let Some(reason) = disabled_reason {
-            ui.ctx().accesskit_node_builder(days_control.id, |builder| {
-                builder.set_description(reason);
-            });
-        }
-        if days_control.changed() {
-            changed = true;
-        }
-    });
-    let normalized = days.max(1) as u32;
-    if *value != Some(normalized) {
-        *value = Some(normalized);
-        changed = true;
-    }
-    changed
 }
 
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
@@ -11426,83 +10497,6 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
             .inner_margin(Margin::same(14.0)),
         add_contents,
     );
-}
-
-fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
-    ui.vertical(|ui| {
-        let label = ui.label(label_caps("Search imports and trusted catalog"));
-        let input = ui.add_sized(
-            [190.0, 28.0],
-            TextEdit::singleline(search).hint_text("Name, language, or filename"),
-        );
-        input.labelled_by(label.id);
-    });
-}
-
-fn remote_catalog_filter_controls(
-    ui: &mut Ui,
-    search: &mut String,
-    filters: &mut RemoteCatalogFilters,
-    sort: &mut RemoteCatalogSort,
-) {
-    model_search_filter_control(ui, search);
-    ui.add_space(6.0);
-    ui.label(label_caps("Trusted catalog filters"));
-    ui.horizontal_wrapped(|ui| {
-        ui.checkbox(
-            &mut filters.installed_only,
-            "Installed trusted catalog models only",
-        );
-        ui.checkbox(
-            &mut filters.recommended_only,
-            "Recommended trusted catalog models only",
-        );
-        ui.checkbox(
-            &mut filters.multilingual_only,
-            "Multilingual trusted catalog models only",
-        );
-    });
-    ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.vertical(|ui| {
-            let label = ui.label(label_caps("Trusted catalog size tier"));
-            let combo = ComboBox::from_id_source("remote-catalog-size-tier")
-                .selected_text(filters.size_tier.label())
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for tier in RemoteCatalogSizeTier::ALL {
-                        ui.selectable_value(&mut filters.size_tier, tier, tier.label());
-                    }
-            });
-            combo.response.clone().labelled_by(label.id);
-            ui.ctx().accesskit_node_builder(combo.response.id, |builder| {
-                builder.set_description(
-                    "Filters by the smallest available GGUF variant for each trusted catalog model.",
-                );
-            });
-        });
-        ui.vertical(|ui| {
-            let label = ui.label(label_caps("Sort trusted catalog results"));
-            let combo = ComboBox::from_id_source("remote-catalog-sort")
-                .selected_text(sort.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for order in RemoteCatalogSort::ALL {
-                        ui.selectable_value(sort, order, order.label());
-                    }
-                });
-            combo.response.labelled_by(label.id);
-        });
-    });
-}
-
-fn catalog_status_label(ui: &mut Ui, text: impl Into<String>) {
-    let response = ui.add(egui::Label::new(mut_text(text)).wrap(true));
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Status);
-        builder.set_live(egui::accesskit::Live::Polite);
-        builder.set_live_atomic();
-    });
 }
 
 fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
@@ -11675,210 +10669,6 @@ fn trusted_model_install_space_error(
     ))
 }
 
-fn install_button(
-    ui: &mut Ui,
-    label: &str,
-    default_tooltip: &str,
-    disk_space_error: Option<&str>,
-) -> egui::Response {
-    match disk_space_error {
-        Some(reason) => ui
-            .add_enabled(false, small_button(ui, label))
-            .on_hover_text(reason),
-        None => ui
-            .add(small_button(ui, label))
-            .on_hover_text(default_tooltip),
-    }
-}
-
-fn remote_model_card(
-    ui: &mut Ui,
-    model: &RemoteModel,
-    app_config: &AppConfig,
-    downloads: &HashMap<String, ModelInstallStatus>,
-) -> Option<RemoteModelCardAction> {
-    let mut action = None;
-    panel(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading(&model.display_name));
-            if model.recommended {
-                badge(ui, "Recommended", ChipTone::Success);
-            }
-            badge(ui, model.trust.label(), ChipTone::Neutral);
-            badge(ui, "Experimental", ChipTone::Warning);
-        });
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(&model.description));
-        if !model.languages.is_empty() {
-            ui.add_space(4.0);
-            wrapped_label(
-                ui,
-                mut_text(format!("Languages: {}", model.languages.join(", "))),
-            );
-        }
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(model.compatibility.detail()));
-        ui.add_space(8.0);
-        ui.label(body_strong("Variants"));
-        for variant in &model.variants {
-            let artifact = model.artifact_for(&variant.id);
-            let normalized_model_id = artifact.as_ref().and_then(|artifact| {
-                crate::model_catalog::normalized_model_id_for_pinned_artifact(
-                    &artifact.model_id,
-                    &artifact.revision,
-                    &artifact.filename,
-                )
-            });
-            let is_available_in_local_catalog = normalized_model_id.is_some();
-            let disk_space_error = artifact
-                .as_ref()
-                .and_then(|artifact| match normalized_model_id.as_ref() {
-                    Some(model_id) => normalized_model_install_space_error(app_config, model_id),
-                    None => trusted_model_install_space_error(app_config, artifact),
-                });
-            let remote_id = artifact.as_ref().and_then(|artifact| {
-                config::managed_remote_model_id(
-                    &artifact.model_id,
-                    &artifact.revision,
-                    &artifact.filename,
-                )
-            });
-            let installed = remote_id.as_ref().and_then(|id| {
-                app_config
-                    .general
-                    .managed_remote_models
-                    .get_key_value(id)
-                    .map(|(id, _)| ModelId::new(id.clone()))
-            });
-            let previous_revision = artifact.as_ref().and_then(|artifact| {
-                app_config
-                    .general
-                    .managed_remote_models
-                    .iter()
-                    .find(|(_, install)| {
-                        install.repository == artifact.model_id
-                            && install.filename == artifact.filename
-                            && install.revision != artifact.revision
-                    })
-                    .map(|(id, _)| ModelId::new(id.clone()))
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(mut_text(&variant.filename));
-                badge(ui, &format_bytes(variant.size_bytes), ChipTone::Neutral);
-                if let Some(remote_id) = remote_id.as_ref()
-                    && let Some(status) = downloads.get(remote_id)
-                {
-                    badge(ui, &status.label(), ChipTone::Neutral);
-                    if matches!(
-                        status,
-                        ModelInstallStatus::Downloading { .. }
-                            | ModelInstallStatus::InstallingRuntime
-                    ) {
-                        if ui.add(small_button(ui, "Cancel")).clicked() {
-                            action = Some(RemoteModelCardAction::CancelInstall(ModelId::new(
-                                remote_id.clone(),
-                            )));
-                        }
-                    } else if matches!(status, ModelInstallStatus::Error(_))
-                        && install_button(
-                            ui,
-                            "Resume",
-                            "Resume this verified download from its retained partial bytes.",
-                            disk_space_error.as_deref(),
-                        )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                } else if let Some(installed_id) = installed {
-                    badge(ui, "Installed and verified", ChipTone::Success);
-                    if ui.add(small_button(ui, "Use")).clicked() {
-                        action = Some(RemoteModelCardAction::SelectInstalled(installed_id.clone()));
-                    }
-                    if ui.add(small_button(ui, "Remove")).clicked() {
-                        action = Some(RemoteModelCardAction::RemoveInstalled(installed_id));
-                    }
-                } else if let Some(previous_id) = previous_revision {
-                    badge(ui, "Update available", ChipTone::Warning);
-                    if install_button(
-                        ui,
-                        "Install update",
-                        "Download and validate this new pinned revision before switching models.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                    let _ = previous_id;
-                } else if is_available_in_local_catalog {
-                    badge(ui, "Available in local catalog", ChipTone::Success);
-                    if install_button(
-                        ui,
-                        "Install verified variant",
-                            "Download this exact revision and checksum through Scribe's verified local installer.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = normalized_model_id
-                            .clone()
-                            .map(RemoteModelCardAction::InstallNormalized);
-                    }
-                } else {
-                    badge(ui, "Pinned GGUF", ChipTone::Neutral);
-                    if install_button(
-                        ui,
-                        "Install",
-                        "Download this exact verified revision through Scribe's transactional installer.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                }
-            });
-        }
-        ui.add_space(4.0);
-        let details = egui::CollapsingHeader::new("Source and verification details")
-            .default_open(false)
-            .show(ui, |ui| {
-                wrapped_label(ui, mut_text(format!("Repository: {}", model.id)));
-                wrapped_label(ui, mut_text(format!("Pinned revision: {}", model.revision)));
-                for variant in &model.variants {
-                    wrapped_label(
-                        ui,
-                        mut_text(format!(
-                            "{} · SHA-256 {}",
-                            variant.filename, variant.expected_sha256
-                        )),
-                    );
-                }
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Scribe pins the full repository revision, expected size, and SHA-256 before download. The model is selectable only after isolated runtime smoke validation and transactional activation.",
-                    ),
-                );
-            });
-        set_collapsing_header_accessibility(ui.ctx(), &details);
-    });
-    action
-}
-
 fn trusted_remote_install_request(
     model: &RemoteModel,
     artifact: &TrustedArtifact,
@@ -11889,278 +10679,6 @@ fn trusted_remote_install_request(
         description: model.description.clone(),
         languages: model.languages.clone(),
         recommended: model.recommended,
-    }
-}
-
-fn model_catalog_row(
-    ui: &mut Ui,
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    actions: impl FnOnce(&mut Ui),
-) {
-    full_width_frame(ui, model_card_frame(ui, selected), |ui| {
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let actions_width = 92.0;
-            let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(detail_width, 0.0),
-                    Layout::top_down(Align::LEFT),
-                    |ui| {
-                        set_exact_width(ui, detail_width);
-                        wrapped_label(ui, card_title(ui, descriptor.display_name, selected));
-                        wrapped_label(ui, mut_text(descriptor.description));
-                        match descriptor.compatibility {
-                            CompatibilityStatus::Experimental { reason, .. }
-                            | CompatibilityStatus::Incompatible { reason, .. } => {
-                                ui.add_space(4.0);
-                                wrapped_label(
-                                    ui,
-                                    mut_text(format!(
-                                        "{}: {reason}",
-                                        descriptor.compatibility.label()
-                                    )),
-                                );
-                            }
-                            CompatibilityStatus::Supported { .. } => {}
-                        }
-                        if let Some(detail) = model_install_detail(descriptor, install_status) {
-                            ui.add_space(4.0);
-                            wrapped_label(ui, mut_text(&detail));
-                        }
-                        if matches!(
-                            install_status,
-                            ModelInstallStatus::Downloading { .. }
-                                | ModelInstallStatus::InstallingRuntime
-                        ) {
-                            ui.add_space(8.0);
-                            download_progress_bar(ui, install_status);
-                        }
-                        ui.add_space(8.0);
-                        tag_row(ui, |ui| {
-                            badge(
-                                ui,
-                                descriptor.compatibility.label(),
-                                match descriptor.compatibility {
-                                    CompatibilityStatus::Supported { .. } => ChipTone::Success,
-                                    CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
-                                    CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
-                                },
-                            );
-                            badge(
-                                ui,
-                                if descriptor.capabilities.gpu {
-                                    "Device CPU/GPU"
-                                } else {
-                                    "Device CPU"
-                                },
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("Model {}", format_bytes(descriptor.artifact_size_bytes)),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("RAM {}", descriptor.expected_ram),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("{} speed", descriptor.speed_guidance),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("{} accuracy", descriptor.accuracy_guidance),
-                                ChipTone::Neutral,
-                            );
-                        });
-                    },
-                );
-                ui.add_space(12.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(actions_width, 0.0),
-                    Layout::top_down(Align::RIGHT),
-                    |ui| {
-                        set_exact_width(ui, actions_width);
-                        actions(ui);
-                    },
-                );
-            });
-        });
-    });
-}
-
-fn current_download_rows(
-    config: &AppConfig,
-    downloads: &HashMap<String, ModelInstallStatus>,
-) -> Vec<(SttModelInfo, ModelInstallStatus)> {
-    let mut rows = config::configured_models(config)
-        .into_iter()
-        .filter_map(|model| {
-            downloads
-                .get(&model.id)
-                .cloned()
-                .map(|status| (model, status))
-        })
-        .filter(|(_, status)| !matches!(status, ModelInstallStatus::NotInstalled))
-        .collect::<Vec<_>>();
-
-    rows.sort_by_key(|(_, status)| match status {
-        ModelInstallStatus::InstallingRuntime => 0,
-        ModelInstallStatus::Downloading { .. } => 0,
-        ModelInstallStatus::Error(_) => 1,
-        ModelInstallStatus::RuntimeError(_) => 1,
-        ModelInstallStatus::Installed => 2,
-        ModelInstallStatus::Missing => 3,
-        ModelInstallStatus::NotInstalled => 4,
-    });
-    rows
-}
-
-fn download_summary_row(
-    ui: &mut Ui,
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-) {
-    full_width_frame(
-        ui,
-        Frame::none().inner_margin(Margin::symmetric(0.0, 4.0)),
-        |ui| {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    wrapped_label(ui, body_strong(descriptor.display_name));
-                    tag_row(ui, |ui| {
-                        badge(
-                            ui,
-                            descriptor.compatibility.label(),
-                            match descriptor.compatibility {
-                                CompatibilityStatus::Supported { .. } => ChipTone::Success,
-                                CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
-                                CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
-                            },
-                        );
-                        badge(
-                            ui,
-                            &install_status.label(),
-                            install_chip_tone(install_status),
-                        );
-                    });
-                    ui.add_space(6.0);
-                    download_progress_bar(ui, install_status);
-                });
-            });
-        },
-    );
-}
-
-fn download_progress_bar(ui: &mut Ui, install_status: &ModelInstallStatus) {
-    let progress = download_progress_fraction(install_status);
-    let text = download_progress_bar_text(install_status);
-    let indeterminate = progress.is_none()
-        && matches!(
-            install_status,
-            ModelInstallStatus::InstallingRuntime | ModelInstallStatus::Downloading { .. }
-        );
-    let response = ui.add(
-        egui::ProgressBar::new(progress.unwrap_or_default())
-            .desired_width(usable_width(ui).max(1.0))
-            .desired_height(18.0)
-            .text(text)
-            .animate(indeterminate),
-    );
-    if indeterminate {
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.clear_numeric_value();
-            builder.clear_min_numeric_value();
-            builder.clear_max_numeric_value();
-        });
-    }
-    if let Some(detail) = download_progress_detail(install_status) {
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(detail));
-    }
-}
-
-fn set_collapsing_header_accessibility<R>(
-    ctx: &egui::Context,
-    response: &egui::containers::CollapsingResponse<R>,
-) {
-    ctx.accesskit_node_builder(response.header_response.id, |builder| {
-        builder.set_expanded(response.body_response.is_some());
-    });
-}
-
-fn download_progress_fraction(install_status: &ModelInstallStatus) -> Option<f32> {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes: Some(total_bytes),
-            ..
-        } if *total_bytes > 0 => {
-            Some((*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0))
-        }
-        ModelInstallStatus::Installed => Some(1.0),
-        _ => None,
-    }
-}
-
-fn download_progress_bar_text(install_status: &ModelInstallStatus) -> String {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes: Some(total_bytes),
-            ..
-        } if *total_bytes > 0 => {
-            let percent =
-                (*downloaded_bytes as f64 / *total_bytes as f64 * 100.0).clamp(0.0, 100.0);
-            format!("{percent:.0}% Completed")
-        }
-        ModelInstallStatus::Downloading { .. } => "Downloading".to_owned(),
-        ModelInstallStatus::InstallingRuntime => "Verifying and installing".to_owned(),
-        ModelInstallStatus::Installed => "100% Completed".to_owned(),
-        ModelInstallStatus::Error(_) => "Failed".to_owned(),
-        ModelInstallStatus::RuntimeError(_) => "Runtime repair failed".to_owned(),
-        ModelInstallStatus::Missing => "Missing".to_owned(),
-        ModelInstallStatus::NotInstalled => "Not installed".to_owned(),
-    }
-}
-
-fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<String> {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes,
-            bytes_per_second,
-        } => {
-            let transferred = match total_bytes {
-                Some(total_bytes) if *total_bytes > 0 => {
-                    let displayed_total = (*total_bytes).max(*downloaded_bytes);
-                    format!(
-                        "{} / {}",
-                        format_bytes(*downloaded_bytes),
-                        format_bytes(displayed_total)
-                    )
-                }
-                _ => format_bytes(*downloaded_bytes),
-            };
-            Some(match bytes_per_second.filter(|speed| *speed > 0) {
-                Some(speed) => format!("{transferred} · {}/s", format_bytes(speed)),
-                None => transferred,
-            })
-        }
-        ModelInstallStatus::Installed => Some("Installed".to_owned()),
-        ModelInstallStatus::InstallingRuntime => {
-            Some("Preparing the shared local runtime before downloading this model.".to_owned())
-        }
-        ModelInstallStatus::Error(message) => Some(message.clone()),
-        ModelInstallStatus::RuntimeError(message) => Some(message.clone()),
-        ModelInstallStatus::Missing => Some("Missing file".to_owned()),
-        ModelInstallStatus::NotInstalled => None,
     }
 }
 
@@ -13039,92 +11557,6 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     visuals
 }
 
-fn model_install_detail(
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-) -> Option<String> {
-    let base = format!(
-        "Model storage: {}",
-        format_bytes(descriptor.artifact_size_bytes)
-    );
-    match install_status {
-        ModelInstallStatus::Downloading { .. } => {
-            Some(format!("{base} · {}", install_status.label()))
-        }
-        ModelInstallStatus::InstallingRuntime => {
-            Some(format!("{base} · {}", install_status.label()))
-        }
-        ModelInstallStatus::Missing => Some(format!(
-            "{base} · The configured model path is missing or incomplete. Reinstall to use this model."
-        )),
-        ModelInstallStatus::Error(message) => Some(format!("{base} · Install failed: {message}")),
-        ModelInstallStatus::RuntimeError(message) => {
-            Some(format!("{base} · Runtime repair failed: {message}"))
-        }
-        ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => Some(base),
-    }
-}
-
-fn runtime_representative_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    let mut seen_providers = Vec::new();
-    config::configured_models(config)
-        .into_iter()
-        .filter(|model| {
-            let Some(provider) = compatibility_bridge::provider_for_model(model) else {
-                return false;
-            };
-            if seen_providers.contains(&provider.id()) {
-                false
-            } else {
-                seen_providers.push(provider.id());
-                true
-            }
-        })
-        .collect()
-}
-
-fn runtime_detail_text(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    status: &ModelRuntimeStatus,
-) -> String {
-    let used_by = runtime_model_summary(config, model);
-    let storage = compatibility_bridge::runtime_storage_detail(model);
-    let status_detail = match status {
-        ModelRuntimeStatus::Ready => "The local runtime is ready.".to_owned(),
-        ModelRuntimeStatus::MissingConfiguration => {
-            "The model is installed, but its local runtime is not configured.".to_owned()
-        }
-        ModelRuntimeStatus::NotImplemented => {
-            "No verified local runtime is available for this model.".to_owned()
-        }
-        ModelRuntimeStatus::Error(message) => message.clone(),
-        _ => setup_message_for_status(status),
-    };
-    let version = runtime_version_detail(config, model)
-        .map(|detail| format!(" {detail}"))
-        .unwrap_or_default();
-    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}{version}")
-}
-
-fn runtime_model_summary(config: &AppConfig, representative: &SttModelInfo) -> String {
-    let provider = compatibility_bridge::provider_for_model(representative);
-    let models = config::configured_models(config)
-        .into_iter()
-        .filter(|model| provider.is_some_and(|provider| provider.same_provider(model)))
-        .map(|model| model.name)
-        .collect::<Vec<_>>();
-    let count = models.len();
-    let preview = models.into_iter().take(3).collect::<Vec<_>>().join(", ");
-    if count > 3 {
-        format!("{preview}, +{} more", count - 3)
-    } else if preview.is_empty() {
-        "no catalog models".to_owned()
-    } else {
-        preview
-    }
-}
-
 #[cfg(test)]
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     compatibility_bridge::model_storage_estimate(model)
@@ -13132,56 +11564,6 @@ fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
     compatibility_bridge::model_download_total_bytes(model)
-}
-
-fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(String, ChipTone)> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
-    match runtime_version_state(config, provider) {
-        RuntimeVersionState::NotTracked => None,
-        RuntimeVersionState::Current(version) => {
-            Some((format!("Version {version}"), ChipTone::Success))
-        }
-        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => Some((
-            if runtime_install_source(config, model).is_some() {
-                "Update available"
-            } else {
-                "Update not staged"
-            }
-            .to_owned(),
-            ChipTone::Warning,
-        )),
-        RuntimeVersionState::UpdateAvailable { .. } => {
-            Some(("Version unknown".to_owned(), ChipTone::Warning))
-        }
-    }
-}
-
-fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<String> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
-    match runtime_version_state(config, provider) {
-        RuntimeVersionState::NotTracked => None,
-        RuntimeVersionState::Current(version) => Some(format!("Runtime version: {version}.")),
-        RuntimeVersionState::UpdateAvailable {
-            installed: Some(installed),
-            available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime update available: installed {installed}, available {available}.")
-        } else {
-            format!(
-                "Installed runtime {installed} is usable. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
-        RuntimeVersionState::UpdateAvailable {
-            installed: None,
-            available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime version is unknown; update to the staged {available} runtime.")
-        } else {
-            format!(
-                "Runtime version is unknown. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
-    }
 }
 
 fn build_development_runtime_package(
@@ -13909,19 +12291,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn model_catalog_row_paints_within_viewport_at_minimum_and_wide_widths() {
-        for width in [840.0, 1440.0, 4096.0] {
-            let output = render_model_catalog_row(width);
-            let max_painted_x = max_visible_painted_x(&output);
-
-            assert!(
-                max_painted_x <= width + 1.0,
-                "model catalog row painted beyond viewport: max_x={max_painted_x}, width={width}"
-            );
-        }
-    }
-
-    #[test]
     fn models_page_paints_within_viewport_at_minimum_and_wide_widths() {
         for width in [840.0, 1440.0, 4096.0] {
             let output = render_models_page(width);
@@ -14010,7 +12379,10 @@ mod layout_tests {
         }
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
-                && node.name() == Some("Showing 1 of 1 trusted catalog models")
+                && node.name()
+                    == Some(
+                        "Bundled offline catalog fallback · Showing 1 of 1 trusted catalog models.",
+                    )
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
@@ -17186,56 +15558,6 @@ mod layout_tests {
         );
     }
 
-    fn render_model_catalog_row(width: f32) -> egui::FullOutput {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-
-        let raw_input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(width, 760.0),
-            )),
-            ..Default::default()
-        };
-
-        ctx.run(raw_input, |ctx| {
-            let mut current_tab = Tab::Models;
-            show_test_navigation(ctx, &mut current_tab);
-            egui::CentralPanel::default()
-                .frame(content_panel_frame(ctx))
-                .show(ctx, |ui| {
-                    page(
-                        ui,
-                        "Models Catalog",
-                        TranscriptionStatus::Idle,
-                        "Ready",
-                        |ui| {
-                            panel(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    let mut search = "whisper".to_owned();
-                                    model_search_filter_control(ui, &mut search);
-                                });
-                            });
-
-                            ui.add_space(12.0);
-                            let model = test_model();
-                            let descriptor = crate::model_catalog::model_descriptor(
-                                &crate::transcription::ModelId::new(&model.id),
-                            )
-                            .unwrap();
-                            let install_status = ModelInstallStatus::Installed;
-
-                            model_catalog_row(ui, &descriptor, &install_status, true, |ui| {
-                                let _ = ui.add_enabled(false, primary_small_button(ui, "Active"));
-                                let _ = ui.add(small_button(ui, "Uninstall"));
-                            });
-                        },
-                    );
-                });
-        })
-    }
-
     fn render_page_body_width(width: f32) -> f32 {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
@@ -17802,6 +16124,101 @@ mod layout_tests {
     }
 
     #[test]
+    fn shared_models_catalog_routes_controls_and_revalidates_lifecycle_tokens() {
+        let mut app = test_app();
+        app.remote_catalog.snapshot = Some(CatalogSnapshot {
+            source: CatalogSource::FreshCache,
+            fetched_at_unix_seconds: 0,
+            models: vec![remote_catalog_model(
+                "handy-computer/action-fixture",
+                "Action fixture",
+                &["en", "es"],
+                true,
+                320 * 1024 * 1024,
+            )],
+        });
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("action".into()));
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogInstalledOnly(true));
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogRecommendedOnly(true));
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogMultilingualOnly(true));
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogSizeTier(
+            RemoteCatalogSizeTier::Compact,
+        ));
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogSort(
+            RemoteCatalogSort::Largest,
+        ));
+        assert_eq!(app.model_search, "action");
+        assert_eq!(
+            app.remote_catalog_filters,
+            RemoteCatalogFilters {
+                installed_only: true,
+                recommended_only: true,
+                multilingual_only: true,
+                size_tier: RemoteCatalogSizeTier::Compact,
+            }
+        );
+        assert_eq!(app.remote_catalog_sort, RemoteCatalogSort::Largest);
+
+        app.apply_model_management_action(ScreenAction::ValidateAndImportLocalGguf);
+        assert_eq!(
+            app.status_message,
+            "Enter the path to a local .gguf file to import."
+        );
+        app.apply_model_management_action(ScreenAction::SetLocalGgufImportPath(
+            "C:\\Models\\local.gguf".into(),
+        ));
+        assert_eq!(app.model_import_path, "C:\\Models\\local.gguf");
+        let local_cancellation = InstallCancellation::default();
+        app.local_gguf_import = Some(local_cancellation.clone());
+        let local_view = app.remote_catalog_view().local_import;
+        assert_eq!(local_view.path, "C:\\Models\\local.gguf");
+        assert!(local_view.in_progress);
+        assert!(!local_view.import_enabled);
+        app.apply_model_management_action(ScreenAction::CancelLocalGgufImport);
+        assert!(local_cancellation.is_cancelled());
+        app.finish_local_gguf_import(Err("completion delivered after cancellation".into()));
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(
+            app.status_message,
+            "Local GGUF import was cancelled. The source file was left unchanged."
+        );
+        assert!(app.local_gguf_import.is_none());
+
+        app.apply_model_management_action(ScreenAction::RetryRemoteCatalog);
+        assert!(app.remote_catalog.force_refresh_requested);
+
+        app.remote_catalog_filters.installed_only = false;
+        let view = app.remote_catalog_view();
+        let install = &view.entries[0].variants[0].actions[0];
+        assert!(matches!(
+            &install.kind,
+            RemoteCatalogActionKind::Install {
+                remote_model_id,
+                variant_id,
+            } if remote_model_id == "handy-computer/action-fixture" && variant_id == "q4"
+        ));
+
+        let cancellation = InstallCancellation::default();
+        app.artifact_installations
+            .insert("managed-action-fixture".into(), (1, cancellation.clone()));
+        app.apply_model_management_action(ScreenAction::CancelRemoteCatalogInstall(
+            "managed-action-fixture".into(),
+        ));
+        assert!(cancellation.is_cancelled());
+
+        app.apply_model_management_action(ScreenAction::InstallRemoteCatalogVariant {
+            remote_model_id: "handy-computer/action-fixture".into(),
+            variant_id: "stale-variant".into(),
+        });
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(
+            app.status_message
+                .contains("no longer in the validated snapshot")
+        );
+    }
+
+    #[test]
     fn unknown_settings_labels_are_no_ops() {
         let mut app = test_app();
         app.config.general.theme_mode = ThemeMode::Dark;
@@ -18033,62 +16450,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn model_action_state_matches_install_select_uninstall_rules() {
-        let mut whisper = test_model();
-        whisper.install_status = ModelInstallStatus::NotInstalled;
-
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::NotInstalled, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Install,
-                primary_enabled: true,
-                show_uninstall: false,
-            }
-        );
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::Installed, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Select,
-                primary_enabled: true,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::Installed, true),
-            ModelActionState {
-                primary: ModelPrimaryAction::Active,
-                primary_enabled: false,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_action_state(
-                &whisper,
-                &ModelInstallStatus::Error("network failed".to_owned()),
-                false,
-            ),
-            ModelActionState {
-                primary: ModelPrimaryAction::Retry,
-                primary_enabled: true,
-                show_uninstall: false,
-            }
-        );
-
-        let mut unavailable = whisper;
-        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
-        unavailable.backend = "sherpa-onnx".to_owned();
-        unavailable.download_model = None;
-        assert_eq!(
-            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Install,
-                primary_enabled: false,
-                show_uninstall: false,
-            }
-        );
-    }
-
-    #[test]
     fn installation_failures_preserve_recovery_required_classification() {
         let normal = InstallJobFailure::from(InstallError::Failed("retryable".to_owned()));
         assert!(!normal.recovery_required);
@@ -18097,19 +16458,6 @@ mod layout_tests {
         ));
         assert!(recovery.recovery_required);
         assert!(recovery.message.contains("recovery required"));
-    }
-
-    #[test]
-    fn installed_model_with_missing_runtime_offers_repair() {
-        let model = test_model();
-        assert_eq!(
-            model_action_state_with_runtime(&model, &ModelInstallStatus::Installed, true, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Repair,
-                primary_enabled: true,
-                show_uninstall: true,
-            }
-        );
     }
 
     #[test]
@@ -18867,23 +17215,33 @@ mod layout_tests {
                 .is_some_and(|message| message.contains("Choose models"))
         );
 
-        app.playground_cards.push(PlaygroundCardState {
-            install_status: ModelInstallStatus::Installed,
-            descriptor: app
-                .transcription_service
-                .model_descriptor(&crate::transcription::ModelId::new("whisper_cpp_base_en"))
-                .unwrap(),
-            status: ModelRuntimeStatus::MissingConfiguration,
-            transcript: String::new(),
-            latency_ms: None,
-            audio_duration_ms: None,
-            peak_ram_mb: None,
-            peak_vram_mb: None,
-        });
+        let base_path = std::env::temp_dir().join(format!(
+            "scribe-playground-not-ready-{}-{}.bin",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&base_path, b"test-only installed model").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert("whisper_cpp_base_en".to_owned(), base_path.clone());
+        app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.config.general.playground_model_order = vec!["whisper_cpp_base_en".to_owned()];
+        config::normalize_config(&mut app.config);
+        app.transcription_service = app.transcription_service.with_config(app.config.clone());
+        app.refresh_playground_cards_from_config();
+        let selected = app.playground_selected_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].install_status, ModelInstallStatus::Installed);
+        assert_ne!(
+            runtime_status_for_model(&app.config, &selected[0]),
+            ModelRuntimeStatus::Ready
+        );
         assert!(
             app.playground_run_block_reason()
                 .is_some_and(|message| message.contains("not ready"))
         );
+        let _ = fs::remove_file(base_path);
     }
 
     #[test]
@@ -18920,7 +17278,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn busy_runtime_disables_maintenance_and_repair_keeps_model_installed() {
+    fn busy_runtime_disables_maintenance() {
         let model = test_model();
         let busy = runtime_action_state_with_busy(&AppConfig::default(), &model, true);
         assert!(!busy.enabled);
@@ -18928,37 +17286,6 @@ mod layout_tests {
             busy.disabled_tooltip
                 .as_deref()
                 .is_some_and(|message| message.contains("already being prepared"))
-        );
-        assert_eq!(
-            model_action_state_with_runtime(
-                &model,
-                &ModelInstallStatus::RuntimeError("failed".to_owned()),
-                true,
-                false,
-            ),
-            ModelActionState {
-                primary: ModelPrimaryAction::Repair,
-                primary_enabled: true,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_primary_action_label(
-                ModelPrimaryAction::Repair,
-                &model,
-                &ModelInstallStatus::RuntimeError("failed".to_owned()),
-            ),
-            "Repair runtime"
-        );
-        assert_eq!(
-            model_primary_action_label(
-                ModelPrimaryAction::Retry,
-                &model,
-                &ModelInstallStatus::Error(
-                    "Installation cancelled; resumable partial retained".to_owned(),
-                ),
-            ),
-            "Resume"
         );
     }
 
@@ -19067,152 +17394,6 @@ mod layout_tests {
             &downloads,
             "different-runtime"
         ));
-    }
-
-    #[test]
-    fn disabled_model_actions_explain_why_they_are_disabled() {
-        let whisper = test_model();
-        let active_state = model_action_state(&whisper, &ModelInstallStatus::Installed, true);
-        assert_eq!(
-            model_primary_disabled_tooltip(
-                &whisper,
-                &ModelInstallStatus::Installed,
-                true,
-                &active_state,
-            ),
-            Some("This model is already the active transcription model.".to_owned())
-        );
-
-        let mut unavailable = whisper;
-        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
-        unavailable.backend = "sherpa-onnx".to_owned();
-        unavailable.download_model = None;
-        let unavailable_state =
-            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false);
-        let tooltip = model_primary_disabled_tooltip(
-            &unavailable,
-            &ModelInstallStatus::NotInstalled,
-            false,
-            &unavailable_state,
-        )
-        .unwrap();
-
-        assert!(tooltip.contains("not available"));
-    }
-
-    #[test]
-    fn download_progress_uses_known_total_for_fraction_and_labels() {
-        let status = ModelInstallStatus::Downloading {
-            downloaded_bytes: 256 * 1024 * 1024,
-            total_bytes: Some(1024 * 1024 * 1024),
-            bytes_per_second: Some(4 * 1024 * 1024),
-        };
-
-        assert_eq!(download_progress_fraction(&status), Some(0.25));
-        assert_eq!(download_progress_bar_text(&status), "25% Completed");
-        assert_eq!(
-            download_progress_detail(&status),
-            Some("256 MB / 1.0 GB · 4 MB/s".to_owned())
-        );
-    }
-
-    #[test]
-    fn semantic_progress_bar_paints_proportional_fill_in_full_track() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-        let status = ModelInstallStatus::Downloading {
-            downloaded_bytes: 256 * 1024 * 1024,
-            total_bytes: Some(1024 * 1024 * 1024),
-            bytes_per_second: None,
-        };
-
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(640.0, 220.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(content_panel_frame(ctx))
-                    .show(ctx, |ui| {
-                        with_usable_width_cap(ui, 400.0, |ui| {
-                            download_progress_bar(ui, &status);
-                        });
-                    });
-            },
-        );
-
-        let track_fill = ThemePalette::light().panel_bg;
-        let track = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect)
-                    if rect.fill == track_fill && (rect.rect.height() - 18.0).abs() < 0.1 =>
-                {
-                    Some(rect.rect)
-                }
-                _ => None,
-            })
-            .max_by(|a, b| a.width().total_cmp(&b.width()))
-            .unwrap();
-        let fill = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect)
-                    if rect.fill == ThemePalette::light().accent
-                        && (rect.rect.height() - 18.0).abs() < 0.1 =>
-                {
-                    Some(rect.rect)
-                }
-                _ => None,
-            })
-            .max_by(|a, b| a.width().total_cmp(&b.width()))
-            .unwrap();
-
-        assert!(track.width() >= 390.0, "track width was {}", track.width());
-        assert!(
-            (fill.width() / track.width() - 0.25).abs() <= 0.01,
-            "fill was {} of track {}",
-            fill.width(),
-            track.width()
-        );
-    }
-
-    #[test]
-    fn indeterminate_progress_has_no_accessible_numeric_value() {
-        for status in [
-            ModelInstallStatus::InstallingRuntime,
-            ModelInstallStatus::Downloading {
-                downloaded_bytes: 1024,
-                total_bytes: None,
-                bytes_per_second: None,
-            },
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    download_progress_bar(ui, &status);
-                });
-            });
-            let update = output.platform_output.accesskit_update.unwrap();
-            let progress = update
-                .nodes
-                .iter()
-                .map(|(_, node)| node)
-                .find(|node| node.role() == egui::accesskit::Role::ProgressIndicator)
-                .unwrap();
-
-            assert_eq!(progress.numeric_value(), None);
-            assert_eq!(progress.min_numeric_value(), None);
-            assert_eq!(progress.max_numeric_value(), None);
-        }
     }
 
     #[test]
@@ -19809,31 +17990,6 @@ mod layout_tests {
             .find(|node| node.name() == Some("Raw transcript"))
             .expect("missing raw transcript disclosure");
         assert_eq!(disclosure.is_expanded(), Some(false));
-    }
-
-    #[test]
-    fn collapsing_header_exposes_expanded_accessibility_state() {
-        for open in [false, true] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = egui::CollapsingHeader::new("Runtime maintenance")
-                        .default_open(open)
-                        .show(ui, |ui| ui.label("Runtime controls"));
-                    set_collapsing_header_accessibility(ctx, &response);
-                });
-            });
-            let update = output.platform_output.accesskit_update.unwrap();
-            let header = update
-                .nodes
-                .iter()
-                .map(|(_, node)| node)
-                .find(|node| node.name() == Some("Runtime maintenance"))
-                .unwrap();
-
-            assert_eq!(header.is_expanded(), Some(open));
-        }
     }
 
     #[test]
@@ -20767,23 +18923,5 @@ mod layout_tests {
             RecordingSource::Playground,
             StreamingMode::Auto
         ));
-    }
-
-    #[test]
-    fn streaming_mode_selector_has_an_accessible_name() {
-        let context = egui::Context::default();
-        context.enable_accesskit();
-        let mut mode = StreamingMode::Auto;
-
-        let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                assert!(!streaming_mode_selector(ui, &mut mode));
-            });
-        });
-        let update = output.platform_output.accesskit_update.unwrap();
-
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::ComboBox && node.name() == Some("Preview mode")
-        }));
     }
 }

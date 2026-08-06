@@ -11,8 +11,9 @@ use super::{
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelComparisonState, ModelDialog,
         ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-        RecordingMode, SettingsSaveState, SettingsTab, TranscriptionPhase, TranscriptionState,
-        UiRoute,
+        RecordingMode, RemoteCatalogActionKind, RemoteCatalogFilters, RemoteCatalogSizeTier,
+        RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogView, SettingsSaveState,
+        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -115,6 +116,7 @@ pub(crate) struct ScreenView<'a> {
     pub model_catalog: &'a [ModelViewModel],
     pub comparison: &'a ModelComparisonState,
     pub model_management: &'a ModelManagementState,
+    pub remote_catalog: &'a RemoteCatalogView,
     pub recording_settings: &'a RecordingSettingsView,
 }
 
@@ -147,6 +149,23 @@ pub(crate) enum ScreenAction {
     RequestModelRemoval(String),
     ConfirmModelRemoval(String),
     CloseModelDialog,
+    SetLocalGgufImportPath(String),
+    ValidateAndImportLocalGguf,
+    CancelLocalGgufImport,
+    SetRemoteCatalogQuery(String),
+    SetRemoteCatalogInstalledOnly(bool),
+    SetRemoteCatalogRecommendedOnly(bool),
+    SetRemoteCatalogMultilingualOnly(bool),
+    SetRemoteCatalogSizeTier(RemoteCatalogSizeTier),
+    SetRemoteCatalogSort(RemoteCatalogSort),
+    RetryRemoteCatalog,
+    InstallRemoteCatalogVariant {
+        remote_model_id: String,
+        variant_id: String,
+    },
+    CancelRemoteCatalogInstall(String),
+    UseRemoteCatalogModel(String),
+    RemoveRemoteCatalogModel(String),
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
     OpenModelSettings,
@@ -190,6 +209,7 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             view.model_catalog,
             view.comparison,
             view.model_management,
+            view.remote_catalog,
         ),
         UiRoute::Settings(tab) => settings(ui, tab, view.transcription, view.recording_settings),
         UiRoute::History => placeholder(
@@ -207,6 +227,29 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             "Debug",
             "Debug tools are available only when explicitly enabled.",
         ),
+    }
+}
+
+pub(crate) fn screen_action_for_remote_catalog_action(
+    action: &RemoteCatalogActionKind,
+) -> ScreenAction {
+    match action {
+        RemoteCatalogActionKind::Install {
+            remote_model_id,
+            variant_id,
+        } => ScreenAction::InstallRemoteCatalogVariant {
+            remote_model_id: remote_model_id.clone(),
+            variant_id: variant_id.clone(),
+        },
+        RemoteCatalogActionKind::Cancel { model_id } => {
+            ScreenAction::CancelRemoteCatalogInstall(model_id.clone())
+        }
+        RemoteCatalogActionKind::Use { model_id } => {
+            ScreenAction::UseRemoteCatalogModel(model_id.clone())
+        }
+        RemoteCatalogActionKind::Remove { model_id } => {
+            ScreenAction::RemoveRemoteCatalogModel(model_id.clone())
+        }
     }
 }
 
@@ -794,6 +837,7 @@ fn models(
     model_catalog: &[ModelViewModel],
     comparison: &ModelComparisonState,
     management: &ModelManagementState,
+    remote_catalog: &RemoteCatalogView,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
@@ -1222,6 +1266,8 @@ fn models(
             );
         });
     }
+    ui.add_space(24.0);
+    render_remote_catalog(ui, remote_catalog, &mut action);
     if management.dialog.is_some() {
         model_dialog_interaction_shield(ui.ctx());
     }
@@ -1445,6 +1491,291 @@ fn models(
         None => {}
     }
     action
+}
+
+pub(crate) fn render_remote_catalog(
+    ui: &mut egui::Ui,
+    catalog: &RemoteCatalogView,
+    action: &mut ScreenAction,
+) {
+    let colors = ui_palette(ui);
+    ui.separator();
+    ui.add_space(16.0);
+    ui.label(
+        RichText::new("Discover compatible models")
+            .size(20.0)
+            .strong(),
+    );
+    ui.label(
+        RichText::new(
+            "Browse revision-pinned models discovered by Scribe from a trusted public publisher.",
+        )
+        .color(colors.muted_text),
+    );
+    ui.add_space(12.0);
+
+    card(ui, |ui| {
+        ui.label(RichText::new("Import local GGUF").strong());
+        ui.label(
+            RichText::new(
+                "Validate an existing .gguf file in place. Scribe hashes and smoke-tests it locally, but never copies, uploads, or deletes the source file.",
+            )
+            .color(colors.muted_text),
+        );
+        ui.add_space(8.0);
+        let label = ui.label(RichText::new("GGUF file path").strong());
+        ui.ctx().accesskit_node_builder(label.id, |builder| {
+            builder.set_role(egui::accesskit::Role::StaticText)
+        });
+        let mut path = catalog.local_import.path.clone();
+        let path_input = ui
+            .add_enabled_ui(!catalog.local_import.in_progress, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut path)
+                        .id_source("local-gguf-import-path")
+                        .hint_text("C:\\Models\\model.gguf")
+                        .desired_width(f32::INFINITY),
+                )
+            })
+            .inner;
+        path_input.clone().labelled_by(label.id);
+        if path_input.changed() {
+            *action = ScreenAction::SetLocalGgufImportPath(path);
+        }
+
+        ui.add_space(8.0);
+        if catalog.local_import.in_progress {
+            ui.horizontal_wrapped(|ui| {
+                badge(ui, "Validating local file", None);
+                if button(ui, "Cancel import", ButtonTone::Secondary).clicked() {
+                    *action = ScreenAction::CancelLocalGgufImport;
+                }
+            });
+        } else {
+            let import = ui
+                .add_enabled_ui(catalog.local_import.import_enabled, |ui| {
+                    button(ui, "Validate and import", ButtonTone::Secondary)
+                })
+                .inner;
+            if !catalog.local_import.import_enabled {
+                ui.ctx().accesskit_node_builder(import.id, |builder| {
+                    builder.set_disabled();
+                });
+            }
+            if let Some(reason) = catalog.local_import.disabled_reason.as_deref() {
+                ui.ctx().accesskit_node_builder(import.id, |builder| {
+                    builder.set_description(reason);
+                });
+                focus_tooltip(ui, &import, reason);
+                import.clone().on_hover_text(reason);
+            }
+            if import.clicked() {
+                *action = ScreenAction::ValidateAndImportLocalGguf;
+            }
+        }
+    });
+
+    ui.add_space(12.0);
+
+    card(ui, |ui| {
+        let label = ui.label(RichText::new("Search imports and trusted catalog").strong());
+        ui.ctx().accesskit_node_builder(label.id, |builder| {
+            builder.set_role(egui::accesskit::Role::StaticText)
+        });
+        let mut query = catalog.query.clone();
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut query)
+                .id_source("remote-catalog-query")
+                .hint_text("Name, language, or filename")
+                .desired_width(f32::INFINITY),
+        );
+        search.clone().labelled_by(label.id);
+        if search.changed() {
+            *action = ScreenAction::SetRemoteCatalogQuery(query);
+        }
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Trusted catalog filters").strong());
+        let RemoteCatalogFilters {
+            installed_only,
+            recommended_only,
+            multilingual_only,
+            size_tier,
+        } = catalog.filters;
+        ui.horizontal_wrapped(|ui| {
+            let mut selected = installed_only;
+            if ui
+                .checkbox(&mut selected, "Installed trusted catalog models only")
+                .changed()
+            {
+                *action = ScreenAction::SetRemoteCatalogInstalledOnly(selected);
+            }
+            let mut selected = recommended_only;
+            if ui
+                .checkbox(&mut selected, "Recommended trusted catalog models only")
+                .changed()
+            {
+                *action = ScreenAction::SetRemoteCatalogRecommendedOnly(selected);
+            }
+            let mut selected = multilingual_only;
+            if ui
+                .checkbox(&mut selected, "Multilingual trusted catalog models only")
+                .changed()
+            {
+                *action = ScreenAction::SetRemoteCatalogMultilingualOnly(selected);
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                let label = ui.label("Trusted catalog size tier");
+                let mut selected = size_tier;
+                let combo = ComboBox::from_id_source("remote-catalog-size-tier")
+                    .selected_text(selected.label())
+                    .show_ui(ui, |ui| {
+                        for tier in RemoteCatalogSizeTier::ALL {
+                            ui.selectable_value(&mut selected, tier, tier.label());
+                        }
+                    });
+                combo.response.clone().labelled_by(label.id);
+                ui.ctx()
+                    .accesskit_node_builder(combo.response.id, |builder| {
+                        builder.set_description(
+                            "Filters by the smallest available GGUF variant for each catalog model.",
+                        );
+                    });
+                if selected != size_tier {
+                    *action = ScreenAction::SetRemoteCatalogSizeTier(selected);
+                }
+            });
+            ui.vertical(|ui| {
+                let label = ui.label("Sort trusted catalog results");
+                let mut selected = catalog.sort;
+                let combo = ComboBox::from_id_source("remote-catalog-sort")
+                    .selected_text(selected.label())
+                    .show_ui(ui, |ui| {
+                        for sort in RemoteCatalogSort::ALL {
+                            ui.selectable_value(&mut selected, sort, sort.label());
+                        }
+                    });
+                combo.response.clone().labelled_by(label.id);
+                if selected != catalog.sort {
+                    *action = ScreenAction::SetRemoteCatalogSort(selected);
+                }
+            });
+        });
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        let status = ui.label(RichText::new(&catalog.status.message).color(
+            match catalog.status.kind {
+                RemoteCatalogStatusKind::Error => colors.error,
+                RemoteCatalogStatusKind::Offline => colors.warning,
+                _ => colors.muted_text,
+            },
+        ));
+        ui.ctx().accesskit_node_builder(status.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Status);
+            builder.set_live(egui::accesskit::Live::Polite);
+            builder.set_live_atomic();
+        });
+        if catalog.status.kind == RemoteCatalogStatusKind::Loading {
+            badge(ui, "Loading", None);
+        } else if catalog.status.kind == RemoteCatalogStatusKind::Offline {
+            badge(ui, "Offline", None);
+        }
+        let retry = ui
+            .add_enabled_ui(catalog.refresh_enabled, |ui| {
+                button(ui, "Refresh catalog", ButtonTone::Text)
+            })
+            .inner;
+        if retry.clicked() {
+            *action = ScreenAction::RetryRemoteCatalog;
+        }
+    });
+
+    if catalog.has_snapshot && catalog.entries.is_empty() {
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("No catalog matches").strong());
+            ui.label(
+                RichText::new("No trusted catalog models match the current search or filters.")
+                    .color(colors.muted_text),
+            );
+        });
+        return;
+    }
+
+    for entry in &catalog.entries {
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&entry.display_name).strong());
+                if entry.recommended {
+                    badge(ui, "Recommended", Some(colors.success));
+                }
+                badge(ui, &entry.trust_label, None);
+                badge(ui, "Experimental", Some(colors.warning));
+            });
+            ui.label(RichText::new(&entry.description).color(colors.muted_text));
+            if !entry.languages.is_empty() {
+                ui.label(
+                    RichText::new(format!("Languages: {}", entry.languages.join(", ")))
+                        .small()
+                        .color(colors.muted_text),
+                );
+            }
+            ui.label(
+                RichText::new(&entry.compatibility_detail)
+                    .small()
+                    .color(colors.muted_text),
+            );
+            ui.add_space(6.0);
+            for variant in &entry.variants {
+                ui.push_id((&entry.id, &variant.id), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(&variant.filename);
+                        badge(ui, &variant.size_label, None);
+                        if let Some(status) = variant.status_label.as_deref() {
+                            badge(ui, status, None);
+                        }
+                        for catalog_action in &variant.actions {
+                            let response = ui
+                                .add_enabled_ui(catalog_action.enabled, |ui| {
+                                    button(ui, &catalog_action.label, ButtonTone::Secondary)
+                                })
+                                .inner;
+                            if !catalog_action.enabled {
+                                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                    builder.set_disabled();
+                                });
+                            }
+                            if let Some(reason) = catalog_action.disabled_reason.as_deref() {
+                                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                                    builder.set_description(reason);
+                                });
+                                focus_tooltip(ui, &response, reason);
+                                response.clone().on_hover_text(reason);
+                            }
+                            if response.clicked() {
+                                *action =
+                                    screen_action_for_remote_catalog_action(&catalog_action.kind);
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "Source: {} @ {} · expected SHA-256 {}",
+                            entry.repository, entry.pinned_revision, variant.expected_sha256
+                        ))
+                        .small()
+                        .color(colors.muted_text),
+                    );
+                });
+            }
+        });
+    }
 }
 
 fn model_download_label(model: &ModelViewModel) -> String {
@@ -2615,6 +2946,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -2641,11 +2973,218 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
             });
         })
+    }
+
+    fn render_models_catalog(catalog: &RemoteCatalogView) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[],
+                        comparison: &Default::default(),
+                        model_management: &Default::default(),
+                        remote_catalog: catalog,
+                        recording_settings: &Default::default(),
+                    },
+                )
+            });
+        })
+    }
+
+    #[test]
+    fn remote_catalog_search_filters_status_and_disabled_actions_are_accessible() {
+        let catalog = RemoteCatalogView {
+            local_import: super::super::state::LocalGgufImportView {
+                path: "C:\\Models\\candidate.gguf".into(),
+                in_progress: false,
+                import_enabled: false,
+                disabled_reason: Some("Finish the active model installation first.".into()),
+            },
+            filters: RemoteCatalogFilters {
+                installed_only: true,
+                ..Default::default()
+            },
+            status: super::super::state::RemoteCatalogStatusView {
+                kind: RemoteCatalogStatusKind::Offline,
+                message: "Offline stale catalog cache · Showing 1 of 1 trusted catalog models."
+                    .into(),
+            },
+            refresh_enabled: true,
+            has_snapshot: true,
+            entries: vec![super::super::state::RemoteCatalogEntryView {
+                id: "trusted/catalog-entry".into(),
+                display_name: "Catalog entry".into(),
+                description: "A revision-pinned speech model candidate.".into(),
+                languages: vec!["English".into()],
+                trust_label: "Trusted publisher".into(),
+                compatibility_detail: "Cross-platform validation is incomplete.".into(),
+                repository: "trusted/catalog-entry".into(),
+                pinned_revision: "1".repeat(40),
+                variants: vec![super::super::state::RemoteCatalogVariantView {
+                    id: "compact".into(),
+                    filename: "catalog-entry-q5.gguf".into(),
+                    size_label: "82 MB".into(),
+                    status_label: Some("Pinned GGUF".into()),
+                    expected_sha256: "a".repeat(64),
+                    actions: vec![super::super::state::RemoteCatalogActionView {
+                        label: "Install".into(),
+                        kind: RemoteCatalogActionKind::Install {
+                            remote_model_id: "trusted/catalog-entry".into(),
+                            variant_id: "compact".into(),
+                        },
+                        enabled: false,
+                        disabled_reason: Some("Insufficient verified disk space.".into()),
+                    }],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let output = render_models_catalog(&catalog);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let (import_label_id, import_label) = nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some("GGUF file path"))
+            .expect("local GGUF path label");
+        assert_eq!(import_label.role(), egui::accesskit::Role::StaticText);
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput
+                && node.labelled_by().contains(import_label_id)
+        }));
+        let import = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Validate and import")
+            })
+            .map(|(_, node)| node)
+            .expect("disabled local GGUF import action");
+        assert!(import.is_disabled());
+        assert_eq!(
+            import.description(),
+            Some("Finish the active model installation first.")
+        );
+        let (label_id, label) = nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some("Search imports and trusted catalog"))
+            .expect("catalog search label");
+        assert_eq!(label.role(), egui::accesskit::Role::StaticText);
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::TextInput && node.labelled_by().contains(label_id)
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node.name() == Some("Installed trusted catalog models only")
+                && node.checked() == Some(egui::accesskit::Checked::True)
+        }));
+        for name in ["Trusted catalog size tier", "Sort trusted catalog results"] {
+            let label_id = nodes
+                .iter()
+                .find_map(|(id, node)| (node.name() == Some(name)).then_some(id))
+                .expect("catalog combo label");
+            assert!(nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::ComboBox
+                    && node.labelled_by().contains(label_id)
+            }));
+        }
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.name()
+                    == Some("Offline stale catalog cache · Showing 1 of 1 trusted catalog models.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
+        let install = nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Install")
+            })
+            .map(|(_, node)| node)
+            .expect("disabled catalog install action");
+        assert!(
+            install.is_disabled(),
+            "install node was not disabled: {install:?}"
+        );
+        assert_eq!(
+            install.description(),
+            Some("Insufficient verified disk space.")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Experimental"))
+        );
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name()
+                == Some(
+                    "Source: trusted/catalog-entry @ 1111111111111111111111111111111111111111 · expected SHA-256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+        }));
+    }
+
+    #[test]
+    fn remote_catalog_truthfully_renders_loading_error_and_no_results_states() {
+        for (kind, message, expected_marker) in [
+            (
+                RemoteCatalogStatusKind::Loading,
+                "Loading the trusted catalog.",
+                "Loading",
+            ),
+            (
+                RemoteCatalogStatusKind::Error,
+                "Catalog unavailable: network unavailable",
+                "Catalog unavailable",
+            ),
+        ] {
+            let output = render_models_catalog(&RemoteCatalogView {
+                status: super::super::state::RemoteCatalogStatusView {
+                    kind,
+                    message: message.into(),
+                },
+                refresh_enabled: kind != RemoteCatalogStatusKind::Loading,
+                ..Default::default()
+            });
+            let names = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.name().map(str::to_owned))
+                .collect::<Vec<_>>();
+            assert!(names.iter().any(|name| name.contains(expected_marker)));
+        }
+
+        let output = render_models_catalog(&RemoteCatalogView {
+            status: super::super::state::RemoteCatalogStatusView {
+                kind: RemoteCatalogStatusKind::Available,
+                message: "Live trusted catalog · Showing 0 of 2 trusted catalog models.".into(),
+            },
+            refresh_enabled: true,
+            has_snapshot: true,
+            ..Default::default()
+        });
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("No catalog matches"))
+        );
     }
 
     #[test]
@@ -2843,6 +3382,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -2906,6 +3446,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
@@ -2988,6 +3529,7 @@ mod tests {
                                 dialog: Some(ModelDialog::Add),
                                 ..Default::default()
                             },
+                            remote_catalog: &Default::default(),
                             recording_settings: &Default::default(),
                         },
                     )
@@ -3034,6 +3576,7 @@ mod tests {
                             dialog: Some(ModelDialog::Add),
                             ..Default::default()
                         },
+                        remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
                 );
@@ -3070,6 +3613,7 @@ mod tests {
                             dialog: Some(ModelDialog::Details("base.en".into())),
                             ..Default::default()
                         },
+                        remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
                 );
@@ -3113,6 +3657,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
                 );
@@ -3161,6 +3706,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
                 )
