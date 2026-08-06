@@ -3005,6 +3005,13 @@ impl LocalTranscriberApp {
                 }
             })
             .collect();
+        let removed_outputs = existing_by_id
+            .into_iter()
+            .filter_map(|(model_id, card)| (!card.transcript.is_empty()).then_some(model_id))
+            .collect::<Vec<_>>();
+        for model_id in removed_outputs {
+            self.mark_comparison_output_changed(&model_id);
+        }
     }
 
     fn next_repaint_delay(&self) -> Duration {
@@ -13990,6 +13997,30 @@ mod layout_tests {
             app.model_comparison.results[1].1.word_error_rate,
             Some(benchmark::calculate_wer("hello brave world", "hello word") as f32)
         );
+    }
+
+    #[test]
+    fn comparison_projection_drops_cached_output_when_a_card_is_removed() {
+        let mut app = test_app();
+        let removed_id = "comparison-removed-model".to_owned();
+        let mut removed_card = app.playground_cards[0].clone();
+        removed_card.descriptor.id = ModelId::new(&removed_id);
+        removed_card.transcript = "cached output".to_owned();
+        removed_card.latency_ms = Some(50);
+        app.playground_cards.push(removed_card);
+        app.comparison_run_model_ids = Some(vec![removed_id.clone()]);
+        app.set_comparison_reference(Some("cached output".to_owned()));
+        app.sync_model_comparison_state();
+        assert_eq!(
+            app.model_comparison.results[0].1.output.as_deref(),
+            Some("cached output")
+        );
+
+        app.refresh_playground_cards_from_config();
+        app.sync_model_comparison_state();
+
+        assert!(app.model_comparison.results[0].1.output.is_none());
+        assert!(app.model_comparison.results[0].1.word_error_rate.is_none());
     }
 
     #[test]
