@@ -1,7 +1,8 @@
 //! Shared, backend-neutral egui screen renderers.
 
 use eframe::egui::{
-    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, Stroke, Vec2,
+    self, Align, Align2, ComboBox, Frame, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke,
+    Vec2,
 };
 
 use super::{
@@ -973,6 +974,8 @@ fn models(
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
             ui.set_min_width(comparison_content_min_width(comparison_width, 16.0));
+            let header_min = ui.cursor().min;
+            let mut toggle_clicked = false;
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Compare installed models").strong());
@@ -986,15 +989,19 @@ fn models(
                 } else {
                     "Expand comparison"
                 };
-                let toggle = button(
-                    ui,
-                    icon_glyph(if comparison.expanded {
-                        Icon::ChevronUp
-                    } else {
-                        Icon::ChevronDown
-                    }),
-                    ButtonTone::Text,
-                );
+                let toggle = ui
+                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        button(
+                            ui,
+                            icon_glyph(if comparison.expanded {
+                                Icon::ChevronUp
+                            } else {
+                                Icon::ChevronDown
+                            }),
+                            ButtonTone::Text,
+                        )
+                    })
+                    .inner;
                 ui.ctx().accesskit_node_builder(toggle.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Button);
                     builder.set_name(toggle_name);
@@ -1002,10 +1009,17 @@ fn models(
                 });
                 focus_tooltip(ui, &toggle, toggle_name);
                 let toggle = toggle.on_hover_text(toggle_name);
-                if toggle.clicked() {
-                    action = ScreenAction::ToggleComparison;
-                }
+                toggle_clicked = toggle.clicked();
             });
+            let header_rect = Rect::from_min_max(header_min, ui.cursor().min);
+            let header = ui.interact(
+                header_rect,
+                ui.make_persistent_id("comparison-header"),
+                Sense::click(),
+            );
+            if header.clicked() && !toggle_clicked {
+                action = ScreenAction::ToggleComparison;
+            }
             if comparison.expanded {
                 ui.add_space(12.0);
                 ui.horizontal_wrapped(|ui| {
