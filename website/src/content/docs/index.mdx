@@ -39,7 +39,7 @@ export const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BAS
   },
   {
     title: 'Review before output',
-    body: 'Review the finalized transcript. Windows can paste it once into the captured target; every platform retains a clipboard fallback.',
+    body: 'Review the finalized transcript. Windows can paste it once into the captured target; unsafe targets use copy-only output, while clipboard races preserve newer external content.',
     href: `${base}history-output-and-privacy/`,
     linkText: 'Understand output and privacy'
   }

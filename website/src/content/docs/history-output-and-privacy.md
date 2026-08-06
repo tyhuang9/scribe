@@ -7,7 +7,7 @@ description: Know where a transcript goes and what Scribe does not store or send
 
 The app keeps the latest transcript visible, with copy and clear actions. Tentative preview text stays in Scribe. It can optionally insert finalized text into the captured Windows application by using the clipboard and one paste action.
 
-Enable focused-app insertion deliberately in **Advanced**. Scribe revalidates the original Windows target immediately before output and pastes final text exactly once. If the target or clipboard state is unsafe, it copies the result and reports the fallback without synthetic keystrokes. Linux and macOS are deliberately clipboard-only.
+Enable focused-app insertion deliberately in **Advanced**. Scribe revalidates the original Windows target immediately before output and pastes final text exactly once. Unsafe target, snapshot, or paste failures copy the result and report the fallback without synthetic keystrokes. If another app changes the clipboard during the transaction, Scribe does not paste or overwrite the newer clipboard content; the final text remains in Scribe for manual copying. Linux and macOS are deliberately clipboard-only.
 
 ## Local history
 
