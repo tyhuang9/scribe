@@ -937,6 +937,21 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         assert_eq!(focused_node(&output).name(), Some("Reference transcript"));
         assert!(!data.comparison.focus_reference_editor);
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some("Apply reference")
+                        && node.is_disabled()
+                        && node.description()
+                            == Some("Enter a reference transcript before applying it.")
+                })
+        );
 
         apply_action(
             &mut data,

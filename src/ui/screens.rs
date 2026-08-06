@@ -1145,6 +1145,7 @@ fn models(
                         );
                         if !can_apply_reference {
                             ui.ctx().accesskit_node_builder(apply_reference.id, |builder| {
+                                builder.set_disabled();
                                 builder.set_description(
                                     "Enter a reference transcript before applying it.",
                                 );
