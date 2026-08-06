@@ -7726,6 +7726,7 @@ impl LocalTranscriberApp {
         let remote_catalog = self.remote_catalog_view();
         let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
         let clear_add_focus = self.model_management.restore_add_focus;
+        let clear_after_removal_focus = self.model_management.restore_after_removal_focus;
         let restored_details_focus = self.model_management.restore_details_focus.clone();
         let restored_remove_focus = self.model_management.restore_remove_focus.clone();
         let clear_removal_notice = self.model_management.removal_notice.is_some();
@@ -7750,6 +7751,9 @@ impl LocalTranscriberApp {
         }
         if clear_add_focus {
             self.model_management.restore_add_focus = false;
+        }
+        if clear_after_removal_focus {
+            self.model_management.restore_after_removal_focus = false;
         }
         if restored_details_focus.is_some() {
             self.model_management.restore_details_focus = None;
@@ -8371,6 +8375,7 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
+                self.model_management.restore_after_removal_focus = true;
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)

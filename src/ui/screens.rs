@@ -868,6 +868,9 @@ fn models(
             if management.restore_add_focus {
                 add_models.request_focus();
             }
+            if management.restore_after_removal_focus {
+                add_models.request_focus();
+            }
             if add_models.clicked() {
                 action = ScreenAction::AddModel;
             }
@@ -1271,13 +1274,20 @@ fn models(
     if management.dialog.is_some() {
         model_dialog_interaction_shield(ui.ctx());
     }
+    let dialog_tab_direction = management
+        .dialog
+        .as_ref()
+        .and_then(|_| consume_model_dialog_tab(ui.ctx()));
     if management.dialog.is_some() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         return ScreenAction::CloseModelDialog;
     }
     match &management.dialog {
         Some(ModelDialog::Add) => {
             let mut open = true;
+            let mut focusable_controls = Vec::new();
+            let mut initial_focus = None;
             let dialog = egui::Window::new("Add models")
+                .id(ui.make_persistent_id(("model-dialog", "add")))
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
@@ -1304,6 +1314,9 @@ fn models(
                                     model.install_action_enabled,
                                     egui::Button::new(model_install_action_label(model.download_state)),
                                 );
+                                if model.install_action_enabled {
+                                    focusable_controls.push(install.id);
+                                }
                                 let install_reason = if !model.install_supported {
                                     Some("This model has no supported managed download in this build.")
                                 } else {
@@ -1333,7 +1346,11 @@ fn models(
                                 if install.clicked() {
                                     action = ScreenAction::InstallModel(model.id.clone());
                                 }
-                                if ui.add_enabled(can_cancel, egui::Button::new("Cancel")).clicked() {
+                                let cancel = ui.add_enabled(can_cancel, egui::Button::new("Cancel"));
+                                if can_cancel {
+                                    focusable_controls.push(cancel.id);
+                                }
+                                if cancel.clicked() {
                                     action = ScreenAction::CancelModelInstall(model.id.clone());
                                 }
                             });
@@ -1341,13 +1358,21 @@ fn models(
                         ui.add_space(6.0);
                     }
                     let close = button(ui, "Close", ButtonTone::Secondary);
-                    if management.focus_dialog_initial {
-                        close.request_focus();
-                    }
+                    initial_focus = Some(close.id);
+                    focusable_controls.push(close.id);
                     if close.clicked() {
                         action = ScreenAction::CloseModelDialog;
                     }
                 });
+            contain_model_dialog_focus(
+                ui.ctx(),
+                dialog_tab_direction,
+                &focusable_controls,
+                management
+                    .focus_dialog_initial
+                    .then_some(initial_focus)
+                    .flatten(),
+            );
             if let Some(dialog) = dialog {
                 ui.ctx()
                     .accesskit_node_builder(dialog.response.id, |builder| {
@@ -1366,7 +1391,10 @@ fn models(
                 .find(|model| &model.id == id)
             {
                 let mut open = true;
+                let mut focusable_controls = Vec::new();
+                let mut initial_focus = None;
                 let dialog = egui::Window::new("Model details")
+                    .id(ui.make_persistent_id(("model-dialog", "details", id)))
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut open)
@@ -1413,6 +1441,9 @@ fn models(
                                                 button(ui, label, ButtonTone::Secondary)
                                             })
                                             .inner;
+                                        if model.runtime_action_enabled {
+                                            focusable_controls.push(runtime_action.id);
+                                        }
                                         if let Some(reason) = &model.runtime_action_disabled_reason
                                         {
                                             ui.ctx().accesskit_node_builder(
@@ -1435,15 +1466,24 @@ fn models(
                                 builder.set_expanded(runtime_maintenance.body_response.is_some());
                             },
                         );
+                        focusable_controls.push(runtime_maintenance.header_response.id);
                         ui.add_space(8.0);
                         let close = button(ui, "Close", ButtonTone::Secondary);
-                        if management.focus_dialog_initial {
-                            close.request_focus();
-                        }
+                        initial_focus = Some(close.id);
+                        focusable_controls.push(close.id);
                         if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
                     });
+                contain_model_dialog_focus(
+                    ui.ctx(),
+                    dialog_tab_direction,
+                    &focusable_controls,
+                    management
+                        .focus_dialog_initial
+                        .then_some(initial_focus)
+                        .flatten(),
+                );
                 if let Some(dialog) = dialog {
                     ui.ctx()
                         .accesskit_node_builder(dialog.response.id, |builder| {
@@ -1459,7 +1499,10 @@ fn models(
         Some(ModelDialog::Remove(id)) => {
             if let Some(model) = models.iter().find(|model| &model.id == id) {
                 let mut open = true;
+                let mut focusable_controls = Vec::new();
+                let mut initial_focus = None;
                 let dialog = egui::Window::new("Remove model?")
+                    .id(ui.make_persistent_id(("model-dialog", "remove", id)))
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut open)
@@ -1469,13 +1512,23 @@ fn models(
                         ui.label(RichText::new("Only Scribe-managed artifact files are removed. This cannot be undone.").color(colors.warning));
                         ui.horizontal(|ui| {
                             let cancel = button(ui, "Cancel", ButtonTone::Secondary);
-                            if management.focus_dialog_initial {
-                                cancel.request_focus();
-                            }
+                            initial_focus = Some(cancel.id);
+                            focusable_controls.push(cancel.id);
                             if cancel.clicked() { action = ScreenAction::CloseModelDialog; }
-                            if button(ui, "Remove", ButtonTone::Danger).clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
+                            let remove = button(ui, "Remove", ButtonTone::Danger);
+                            focusable_controls.push(remove.id);
+                            if remove.clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
                         });
                     });
+                contain_model_dialog_focus(
+                    ui.ctx(),
+                    dialog_tab_direction,
+                    &focusable_controls,
+                    management
+                        .focus_dialog_initial
+                        .then_some(initial_focus)
+                        .flatten(),
+                );
                 if let Some(dialog) = dialog {
                     ui.ctx()
                         .accesskit_node_builder(dialog.response.id, |builder| {
@@ -1800,7 +1853,61 @@ fn model_download_label(model: &ModelViewModel) -> String {
     }
 }
 
-/// egui 0.27 has no modal-window focus trap. This mirrors the established
+/// Consume Tab before egui's document-wide navigation sees it, then route it
+/// through the current dialog's enabled controls after they have been rendered.
+/// egui 0.27 exposes individual focus requests but has no modal focus scope.
+fn consume_model_dialog_tab(ctx: &egui::Context) -> Option<bool> {
+    ctx.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+            Some(true)
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// Keep keyboard focus in a model dialog, including wraparound at either end.
+/// `controls` is assembled from the controls that are visible and enabled in
+/// the current frame, so conditional install, cancel, and maintenance actions
+/// cannot receive focus when unavailable.
+fn contain_model_dialog_focus(
+    ctx: &egui::Context,
+    tab_backwards: Option<bool>,
+    controls: &[egui::Id],
+    initial_focus: Option<egui::Id>,
+) {
+    let Some(first) = controls.first().copied() else {
+        return;
+    };
+
+    if let Some(initial_focus) = initial_focus {
+        ctx.memory_mut(|memory| memory.request_focus(initial_focus));
+        return;
+    }
+
+    let Some(tab_backwards) = tab_backwards else {
+        return;
+    };
+    let focused = ctx.memory(|memory| memory.focused());
+    // egui has already advanced focus through controls rendered in this frame.
+    // Keep that normal behavior, and only correct the wraparound case where its
+    // document-wide focus order would otherwise leave the dialog.
+    if focused.is_some_and(|focused| controls.contains(&focused)) {
+        return;
+    }
+    let wrap_target = if tab_backwards {
+        controls.last().copied().unwrap_or(first)
+    } else {
+        first
+    };
+    ctx.memory_mut(|memory| memory.request_focus(wrap_target));
+}
+
+/// Keep pointer input intended for the Models page below the dialog layer.
+/// Keyboard focus is contained separately by `contain_model_dialog_focus`.
+/// This mirrors the established
 /// Playground selector shield: it sits below the middle-layer window while
 /// consuming pointer input intended for the background Models page.
 fn model_dialog_interaction_shield(ctx: &egui::Context) {

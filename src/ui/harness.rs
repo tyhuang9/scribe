@@ -7,11 +7,11 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDownloadState, ModelManagementState,
-        ModelSizeTier, ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind,
-        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
-        RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, SettingsTab,
-        TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+        RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
+        RemoteCatalogView, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
     },
     theme_palette,
 };
@@ -240,9 +240,11 @@ impl UiHarnessApp {
 }
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
         let clear_reference_action_focus = self.data.comparison.restore_reference_action_focus;
         let clear_reference_notice = self.data.comparison.reference_notice.is_some();
+        let clear_after_removal_focus = self.data.model_management.restore_after_removal_focus;
         let action = show_harness(ctx, &self.data, &mut self.page);
         if clear_reference_editor_focus {
             self.data.comparison.focus_reference_editor = false;
@@ -252,6 +254,12 @@ impl eframe::App for UiHarnessApp {
         }
         if clear_reference_notice {
             self.data.comparison.reference_notice = None;
+        }
+        if clear_initial_dialog_focus {
+            self.data.model_management.focus_dialog_initial = false;
+        }
+        if clear_after_removal_focus {
+            self.data.model_management.restore_after_removal_focus = false;
         }
         apply_action(&mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
@@ -306,12 +314,33 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         | ScreenAction::CancelModelInstall(_)
         | ScreenAction::RepairModelRuntime(_)
         | ScreenAction::MaintainModelRuntime(_)
-        | ScreenAction::ShowModelDetails(_)
-        | ScreenAction::RequestModelRemoval(_)
-        | ScreenAction::ConfirmModelRemoval(_)
-        | ScreenAction::CloseModelDialog
         | ScreenAction::RetryRemoteCatalog => {}
-        ScreenAction::AddModel | ScreenAction::ChangeModel => {
+        ScreenAction::AddModel => {
+            data.model_management.dialog = Some(ModelDialog::Add);
+            data.model_management.focus_dialog_initial = true;
+        }
+        ScreenAction::ShowModelDetails(id) => {
+            data.model_management.dialog = Some(ModelDialog::Details(id));
+            data.model_management.focus_dialog_initial = true;
+        }
+        ScreenAction::RequestModelRemoval(id) => {
+            data.model_management.dialog = Some(ModelDialog::Remove(id));
+            data.model_management.focus_dialog_initial = true;
+        }
+        ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
+            Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
+            Some(ModelDialog::Details(id)) => {
+                data.model_management.restore_details_focus = Some(id)
+            }
+            Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
+            None => {}
+        },
+        ScreenAction::ConfirmModelRemoval(id) => {
+            data.model_management.dialog = None;
+            data.models.retain(|model| model.id != id);
+            data.model_management.restore_after_removal_focus = true;
+        }
+        ScreenAction::ChangeModel => {
             data.transcription.selected_model_id = Some("base.en".into());
             data.transcription.phase = TranscriptionPhase::Ready;
         }
@@ -541,9 +570,11 @@ mod tests {
         height: f32,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, ScreenAction) {
+        let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
         let clear_reference_notice = data.comparison.reference_notice.is_some();
+        let clear_after_removal_focus = data.model_management.restore_after_removal_focus;
         let mut action = ScreenAction::None;
         let output = ctx.run(
             egui::RawInput {
@@ -552,6 +583,7 @@ mod tests {
                     egui::Vec2::new(width, height),
                 )),
                 events,
+                focused: true,
                 ..Default::default()
             },
             |ctx| action = show_harness(ctx, data, page),
@@ -564,6 +596,12 @@ mod tests {
         }
         if clear_reference_notice {
             data.comparison.reference_notice = None;
+        }
+        if clear_initial_dialog_focus {
+            data.model_management.focus_dialog_initial = false;
+        }
+        if clear_after_removal_focus {
+            data.model_management.restore_after_removal_focus = false;
         }
         (output, action)
     }
@@ -775,6 +813,172 @@ mod tests {
             .filter_map(|(_, node)| node.name().map(str::to_owned))
             .collect()
     }
+
+    fn tab_event(backwards: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: backwards,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn assert_dialog_focus_cycle(
+        ctx: &egui::Context,
+        data: &mut FixtureData,
+        page: &mut AppPage,
+        expected_controls: &[&str],
+        initial_focus: &str,
+    ) {
+        let (width, height) = (1180.0, 815.0);
+        let (output, action) = render_with_input(ctx, data, page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some(initial_focus));
+
+        for backwards in [false, false, true, true, false, true] {
+            let (output, action) =
+                render_with_input(ctx, data, page, width, height, vec![tab_event(backwards)]);
+            assert_eq!(action, ScreenAction::None);
+            let name = focused_node(&output)
+                .name()
+                .expect("dialog focus should name its control");
+            assert!(
+                expected_controls.contains(&name),
+                "Tab focus escaped the dialog to {name:?}; expected one of {expected_controls:?}"
+            );
+            assert_ne!(
+                name, "Add models",
+                "background Models control received focus"
+            );
+        }
+    }
+
+    #[test]
+    fn model_dialogs_contain_tab_focus_and_keep_background_inactive() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let mut add = Fixture::ModelsInstalled.data();
+        add.models[0].install_action_enabled = true;
+        add.models[0].download_state = ModelDownloadState::NotInstalled;
+        add.model_management.dialog = Some(ModelDialog::Add);
+        add.model_management.focus_dialog_initial = true;
+        assert_dialog_focus_cycle(&ctx, &mut add, &mut page, &["Install", "Close"], "Close");
+        let (output, action) = render_with_input(
+            &ctx,
+            &mut add,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![tab_event(false)],
+        );
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Install"));
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut add,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(action, ScreenAction::InstallModel("base.en".into()));
+
+        let mut details = Fixture::ModelsInstalled.data();
+        details.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
+        details.model_management.focus_dialog_initial = true;
+        assert_dialog_focus_cycle(
+            &ctx,
+            &mut details,
+            &mut page,
+            &["Runtime maintenance", "Close"],
+            "Close",
+        );
+
+        let mut remove = Fixture::ModelsInstalled.data();
+        remove.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+        remove.model_management.focus_dialog_initial = true;
+        assert_dialog_focus_cycle(
+            &ctx,
+            &mut remove,
+            &mut page,
+            &["Cancel", "Remove"],
+            "Cancel",
+        );
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut remove,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![tab_event(false)],
+        );
+        assert_eq!(action, ScreenAction::None);
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut remove,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(action, ScreenAction::ConfirmModelRemoval("tiny.en".into()));
+    }
+
+    #[test]
+    fn confirmed_model_removal_restores_focus_to_add_models() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ConfirmModelRemoval("tiny.en".into()),
+        );
+        assert!(data.model_management.restore_after_removal_focus);
+        assert!(data.model_management.dialog.is_none());
+        assert!(data.models.iter().all(|model| model.id != "tiny.en"));
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert!(
+            focused_node(&output)
+                .name()
+                .is_some_and(|name| name.contains("Add models"))
+        );
+        assert!(!data.model_management.restore_after_removal_focus);
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name.contains("Remove tiny.en")),
+            "the deleted model's Remove control must not receive restored focus"
+        );
+    }
+
     #[test]
     fn every_fixture_renders_at_native_preferred_and_minimum_dimensions() {
         for fixture in Fixture::ALL {
