@@ -778,6 +778,14 @@ fn models_footer_spacer(
     (remaining_height - comparison_height - storage_height).max(16.0)
 }
 
+fn comparison_surface_width(available_width: f32) -> f32 {
+    available_width.max(0.0)
+}
+
+fn comparison_content_min_width(surface_width: f32, inner_margin: f32) -> f32 {
+    (surface_width - inner_margin * 2.0).max(0.0)
+}
+
 fn models(
     ui: &mut egui::Ui,
     models: &[ModelViewModel],
@@ -957,12 +965,14 @@ fn models(
         comparison.expanded,
         used_bytes > 0,
     ));
+    let comparison_width = comparison_surface_width(ui.available_width());
     Frame::none()
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border))
         .rounding(Rounding::same(5.0))
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
+            ui.set_min_width(comparison_content_min_width(comparison_width, 16.0));
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Compare installed models").strong());
@@ -2462,6 +2472,17 @@ fn size_label(tier: ModelSizeTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_surface_uses_all_available_width_at_preferred_and_compact_sizes() {
+        for available_width in [860.0, 640.0] {
+            assert_eq!(comparison_surface_width(available_width), available_width);
+            assert_eq!(
+                comparison_content_min_width(available_width, 16.0) + 32.0,
+                available_width
+            );
+        }
+    }
 
     fn render_route(route: UiRoute) -> egui::FullOutput {
         let ctx = egui::Context::default();
