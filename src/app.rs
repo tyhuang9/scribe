@@ -8365,6 +8365,8 @@ impl LocalTranscriberApp {
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
             | ScreenAction::StopComparison
+            | ScreenAction::ShowComparisonReferenceEditor
+            | ScreenAction::HideComparisonReferenceEditor
             | ScreenAction::EditComparisonReference(_)
             | ScreenAction::ApplyComparisonReference
             | ScreenAction::ClearComparisonReference
@@ -9014,18 +9016,35 @@ impl LocalTranscriberApp {
                     self.stop_recording();
                 }
             }
+            ScreenAction::ShowComparisonReferenceEditor => {
+                if let Some(reference) = self.model_comparison.reference_transcript.as_deref() {
+                    self.model_comparison.reference_draft = reference.to_owned();
+                }
+                self.model_comparison.reference_editor_visible = true;
+            }
+            ScreenAction::HideComparisonReferenceEditor => {
+                self.model_comparison.reference_draft = self
+                    .model_comparison
+                    .reference_transcript
+                    .clone()
+                    .unwrap_or_default();
+                self.model_comparison.reference_editor_visible = false;
+            }
             ScreenAction::EditComparisonReference(reference) => {
                 self.model_comparison.reference_draft = reference;
             }
             ScreenAction::ApplyComparisonReference => {
-                let reference = self.model_comparison.reference_draft.trim();
+                let reference = self.model_comparison.reference_draft.trim().to_owned();
+                self.model_comparison.reference_draft = reference.clone();
                 self.model_comparison.reference_transcript =
-                    (!reference.is_empty()).then(|| reference.to_owned());
+                    (!reference.is_empty()).then_some(reference);
+                self.model_comparison.reference_editor_visible = false;
                 self.sync_model_comparison_state();
             }
             ScreenAction::ClearComparisonReference => {
                 self.model_comparison.reference_draft.clear();
                 self.model_comparison.reference_transcript = None;
+                self.model_comparison.reference_editor_visible = false;
                 self.sync_model_comparison_state();
             }
             ScreenAction::InstallModel(id) => {
@@ -10503,6 +10522,8 @@ impl LocalTranscriberApp {
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
             | ScreenAction::StopComparison
+            | ScreenAction::ShowComparisonReferenceEditor
+            | ScreenAction::HideComparisonReferenceEditor
             | ScreenAction::EditComparisonReference(_)
             | ScreenAction::ApplyComparisonReference
             | ScreenAction::ClearComparisonReference => {}

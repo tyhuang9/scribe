@@ -364,6 +364,7 @@ pub(crate) struct ModelComparisonState {
     pub phase: ComparisonPhase,
     pub audio_duration_ms: Option<u64>,
     pub recording_elapsed_ms: u64,
+    pub reference_editor_visible: bool,
     pub reference_draft: String,
     pub reference_transcript: Option<String>,
     pub selection_feedback: Option<String>,
@@ -554,6 +555,11 @@ mod tests {
             Some("old reference")
         );
         assert!(comparison.results.is_empty());
+    }
+
+    #[test]
+    fn comparison_reference_editor_starts_hidden() {
+        assert!(!ModelComparisonState::default().reference_editor_visible);
     }
 
     #[test]

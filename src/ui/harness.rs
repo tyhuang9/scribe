@@ -264,17 +264,33 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             let _ = data.comparison.begin();
         }
         ScreenAction::StopComparison => data.comparison.phase = ComparisonPhase::Processing,
+        ScreenAction::ShowComparisonReferenceEditor => {
+            if let Some(reference) = data.comparison.reference_transcript.as_deref() {
+                data.comparison.reference_draft = reference.to_owned();
+            }
+            data.comparison.reference_editor_visible = true
+        }
+        ScreenAction::HideComparisonReferenceEditor => {
+            data.comparison.reference_draft = data
+                .comparison
+                .reference_transcript
+                .clone()
+                .unwrap_or_default();
+            data.comparison.reference_editor_visible = false
+        }
         ScreenAction::EditComparisonReference(reference) => {
             data.comparison.reference_draft = reference
         }
         ScreenAction::ApplyComparisonReference => {
-            let reference = data.comparison.reference_draft.trim();
-            data.comparison.reference_transcript =
-                (!reference.is_empty()).then(|| reference.to_owned());
+            let reference = data.comparison.reference_draft.trim().to_owned();
+            data.comparison.reference_draft = reference.clone();
+            data.comparison.reference_transcript = (!reference.is_empty()).then_some(reference);
+            data.comparison.reference_editor_visible = false;
         }
         ScreenAction::ClearComparisonReference => {
             data.comparison.reference_draft.clear();
             data.comparison.reference_transcript = None;
+            data.comparison.reference_editor_visible = false;
         }
         ScreenAction::SetSettingsTab(tab) => {
             data.route = UiRoute::Settings(tab);
@@ -392,6 +408,70 @@ mod tests {
             .iter()
             .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()).flatten())
             .unwrap_or_else(|| panic!("missing AccessKit bounds for {name}"))
+    }
+
+    fn named_node_id(output: &egui::FullOutput, name: &str) -> egui::accesskit::NodeId {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.name() == Some(name)).then_some(*id))
+            .unwrap_or_else(|| panic!("missing AccessKit node for {name}"))
+    }
+
+    fn click_named_control(
+        ctx: &egui::Context,
+        data: &FixtureData,
+        page: &mut AppPage,
+        width: f32,
+        height: f32,
+        name: &str,
+    ) -> ScreenAction {
+        let (initial_output, initial_action) =
+            render_with_input(ctx, data, page, width, height, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+        let bounds = named_node_bounds(&initial_output, name);
+        let point = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let (_, press_action) = render_with_input(
+            ctx,
+            data,
+            page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, release_action) = render_with_input(
+            ctx,
+            data,
+            page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        release_action
     }
 
     fn node_matching(
@@ -550,6 +630,56 @@ mod tests {
     }
 
     #[test]
+    fn comparison_chevron_pointer_and_accesskit_actions_toggle_once() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let action =
+            click_named_control(&ctx, &data, &mut page, width, height, "Expand comparison");
+        assert_eq!(action, ScreenAction::ToggleComparison);
+        apply_action(&mut data, &mut page, action);
+        assert!(data.comparison.expanded);
+        assert_eq!(
+            render_with_input(&ctx, &data, &mut page, width, height, Vec::new()).1,
+            ScreenAction::None
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let chevron = named_node_id(&output, "Expand comparison");
+        let (_, action) = render_with_input(
+            &ctx,
+            &data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: chevron,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::ToggleComparison);
+        apply_action(&mut data, &mut page, action);
+        assert!(data.comparison.expanded);
+        assert_eq!(
+            render_with_input(&ctx, &data, &mut page, width, height, Vec::new()).1,
+            ScreenAction::None
+        );
+    }
+
+    #[test]
     fn comparison_header_pointer_toggles_without_creating_an_accessible_header_button() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
@@ -657,10 +787,189 @@ mod tests {
     fn comparison_fixture_matches_the_pre_run_reference_state() {
         let data = Fixture::ModelsCompareExpanded.data();
         assert!(data.comparison.expanded);
+        assert!(!data.comparison.reference_editor_visible);
         assert_eq!(data.comparison.selected_model_ids.len(), 2);
         assert_eq!(data.comparison.audio_duration_ms, None);
         assert_eq!(data.comparison.reference_transcript, None);
         assert!(data.comparison.results.is_empty());
+    }
+
+    #[test]
+    fn comparison_reference_editor_requires_an_explicit_add_action() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCompareExpanded.data();
+        let mut page = Fixture::ModelsCompareExpanded.page();
+
+        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Reference transcript"))
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Add a reference transcript to measure")
+        }));
+
+        let action = click_named_control(
+            &ctx,
+            &data,
+            &mut page,
+            width,
+            height,
+            "Add a reference transcript to measure",
+        );
+        assert_eq!(action, ScreenAction::ShowComparisonReferenceEditor);
+        apply_action(&mut data, &mut page, action);
+        assert!(data.comparison.reference_editor_visible);
+        let (output, action) = render_with_input(&ctx, &data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Reference transcript"))
+        );
+    }
+
+    #[test]
+    fn comparison_reference_actions_keep_draft_and_visibility_coherent() {
+        let mut data = Fixture::ModelsCompareExpanded.data();
+        let mut page = Fixture::ModelsCompareExpanded.page();
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::EditComparisonReference("  spoken words  ".into()),
+        );
+        apply_action(&mut data, &mut page, ScreenAction::ApplyComparisonReference);
+        assert_eq!(
+            data.comparison.reference_transcript.as_deref(),
+            Some("spoken words")
+        );
+        assert_eq!(data.comparison.reference_draft, "spoken words");
+        assert!(!data.comparison.reference_editor_visible);
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::EditComparisonReference("unsaved change".into()),
+        );
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::HideComparisonReferenceEditor,
+        );
+        assert_eq!(data.comparison.reference_draft, "spoken words");
+        assert!(!data.comparison.reference_editor_visible);
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::ShowComparisonReferenceEditor,
+        );
+        apply_action(&mut data, &mut page, ScreenAction::ClearComparisonReference);
+        assert_eq!(data.comparison.reference_transcript, None);
+        assert!(data.comparison.reference_draft.is_empty());
+        assert!(!data.comparison.reference_editor_visible);
+    }
+
+    #[test]
+    fn comparison_results_expose_wide_table_and_compact_groups() {
+        let wide = render(Fixture::ModelsCompareExpanded, 1180.0, 815.0);
+        let wide_nodes = &wide
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        for heading in ["Model", "Duration", "Processing time", "Output", "Accuracy"] {
+            assert!(wide_nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some(heading)
+            }));
+        }
+
+        let compact = render(Fixture::ModelsCompareExpanded, 680.0, 815.0);
+        let compact_nodes = &compact
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+            assert!(compact_nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some(format!("Comparison result for {model}").as_str())
+            }));
+        }
+        assert_eq!(
+            compact_nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Add a reference transcript to measure")
+                })
+                .count(),
+            2
+        );
+        assert!(!compact_nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some("Model")
+        }));
+    }
+
+    #[test]
+    fn initial_expanded_comparison_table_fits_the_reference_viewport() {
+        let output = render(Fixture::ModelsCompareExpanded, 1180.0, 815.0);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        let accuracy_actions: Vec<_> = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Add a reference transcript to measure")
+            })
+            .collect();
+        assert_eq!(accuracy_actions.len(), 2);
+        assert!(
+            accuracy_actions
+                .iter()
+                .all(|(_, node)| { node.bounds().is_some_and(|bounds| bounds.y1 <= 815.0) })
+        );
+        for name in [
+            "Model",
+            "Duration",
+            "Processing time",
+            "Output",
+            "Accuracy",
+            "Add a reference transcript to measure",
+        ] {
+            let bounds = named_node_bounds(&output, name);
+            assert!(
+                bounds.y1 <= 815.0,
+                "{name} should remain visible at 1180x815, but ended at {}",
+                bounds.y1
+            );
+        }
     }
     #[test]
     fn harness_actions_mutate_only_visible_fixture_state() {

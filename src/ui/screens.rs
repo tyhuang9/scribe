@@ -133,6 +133,8 @@ pub(crate) enum ScreenAction {
     ToggleComparisonModel(String),
     StartComparison,
     StopComparison,
+    ShowComparisonReferenceEditor,
+    HideComparisonReferenceEditor,
     EditComparisonReference(String),
     ApplyComparisonReference,
     ClearComparisonReference,
@@ -1014,7 +1016,7 @@ fn models(
                 ui.make_persistent_id("comparison-header"),
                 Sense::click(),
             );
-            if header.clicked() && !toggle_clicked {
+            if toggle_clicked || header.clicked() {
                 action = ScreenAction::ToggleComparison;
             }
             if comparison.expanded {
@@ -1105,49 +1107,68 @@ fn models(
                 if let Some(feedback) = comparison.selection_feedback.as_deref() {
                     ui.label(RichText::new(feedback).small().color(colors.warning));
                 }
-                ui.separator();
-                ui.label(RichText::new("Reference transcript (optional)").strong());
-                let mut reference_draft = comparison.reference_draft.clone();
-                let reference = ui.add(
-                    egui::TextEdit::multiline(&mut reference_draft)
-                        .id_source("comparison-reference-transcript")
-                        .hint_text("Paste the words that were spoken")
-                        .desired_rows(3),
-                );
-                ui.ctx().accesskit_node_builder(reference.id, |builder| {
-                    builder.set_name("Reference transcript");
-                    builder.set_description(
-                        "Optional reference text used to calculate word error rate after the run.",
+                if comparison.reference_editor_visible {
+                    ui.separator();
+                    ui.label(RichText::new("Reference transcript (optional)").strong());
+                    let mut reference_draft = comparison.reference_draft.clone();
+                    let reference = ui.add(
+                        egui::TextEdit::multiline(&mut reference_draft)
+                            .id_source("comparison-reference-transcript")
+                            .hint_text("Paste the words that were spoken")
+                            .desired_rows(3),
                     );
-                });
-                if reference.changed() {
-                    action = ScreenAction::EditComparisonReference(reference_draft);
+                    ui.ctx().accesskit_node_builder(reference.id, |builder| {
+                        builder.set_name("Reference transcript");
+                        builder.set_description(
+                            "Optional reference text used to calculate word error rate after the run.",
+                        );
+                    });
+                    if reference.changed() {
+                        action = ScreenAction::EditComparisonReference(reference_draft);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Apply reference"))
+                            .clicked()
+                        {
+                            action = ScreenAction::ApplyComparisonReference;
+                        }
+                        if ui
+                            .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Clear reference"))
+                            .clicked()
+                        {
+                            action = ScreenAction::ClearComparisonReference;
+                        }
+                        if button(ui, "Close reference editor", ButtonTone::Text).clicked() {
+                            action = ScreenAction::HideComparisonReferenceEditor;
+                        }
+                        ui.label(
+                            RichText::new(if comparison.reference_transcript.is_some() {
+                                "Reference applied"
+                            } else {
+                                "No reference applied"
+                            })
+                            .small()
+                            .color(colors.muted_text),
+                        );
+                    });
+                } else if comparison.reference_transcript.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Reference applied")
+                                .small()
+                                .color(colors.muted_text),
+                        );
+                        if button(ui, "Edit reference", ButtonTone::Text).clicked() {
+                            action = ScreenAction::ShowComparisonReferenceEditor;
+                        }
+                    });
                 }
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Apply reference"))
-                        .clicked()
-                    {
-                        action = ScreenAction::ApplyComparisonReference;
-                    }
-                    if ui
-                        .add_sized(Vec2::new(0.0, 44.0), egui::Button::new("Clear reference"))
-                        .clicked()
-                    {
-                        action = ScreenAction::ClearComparisonReference;
-                    }
-                    ui.label(
-                        RichText::new(if comparison.reference_transcript.is_some() {
-                            "Reference applied"
-                        } else {
-                            "No reference applied"
-                        })
-                        .small()
-                        .color(colors.muted_text),
-                    );
-                });
                 ui.separator();
-                render_comparison_results(ui, models, comparison);
+                let result_action = render_comparison_results(ui, models, comparison);
+                if result_action != ScreenAction::None {
+                    action = result_action;
+                }
             }
         });
     ui.ctx()
@@ -1447,7 +1468,7 @@ fn render_comparison_results(
     ui: &mut egui::Ui,
     models: &[ModelViewModel],
     comparison: &ModelComparisonState,
-) {
+) -> ScreenAction {
     let colors = ui_palette(ui);
     let selected = models
         .iter()
@@ -1461,6 +1482,7 @@ fn render_comparison_results(
         });
     }
 
+    let mut action = ScreenAction::None;
     if ui.available_width() < 720.0 {
         for model in selected {
             let result = comparison
@@ -1477,10 +1499,13 @@ fn render_comparison_results(
                     comparison_processing(result)
                 ));
                 ui.label(format!("Output: {}", comparison_output_summary(result)));
-                ui.label(format!(
-                    "Accuracy: {}",
-                    comparison_accuracy(comparison, result)
-                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Accuracy:");
+                    let accuracy_action = comparison_accuracy_cell(ui, comparison, result);
+                    if accuracy_action != ScreenAction::None {
+                        action = accuracy_action;
+                    }
+                });
                 if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
                     ui.label(RichText::new(format!("Real-time factor: {rtf:.2}x")).small());
                 }
@@ -1491,7 +1516,7 @@ fn render_comparison_results(
                     builder.set_name(format!("Comparison result for {}", model.display_name));
                 });
         }
-        return;
+        return action;
     }
 
     let table = ui.vertical(|ui| {
@@ -1530,13 +1555,17 @@ fn render_comparison_results(
                             comparison_duration(comparison),
                             comparison_processing(result),
                             comparison_output_summary(result),
-                            comparison_accuracy(comparison, result),
                         ];
                         for (column, cell) in columns.iter_mut().zip(cells) {
                             let response = column.label(cell);
                             column.ctx().accesskit_node_builder(response.id, |builder| {
                                 builder.set_role(egui::accesskit::Role::Cell);
                             });
+                        }
+                        let accuracy_action =
+                            comparison_accuracy_cell(&mut columns[4], comparison, result);
+                        if accuracy_action != ScreenAction::None {
+                            action = accuracy_action;
                         }
                     });
                 },
@@ -1555,6 +1584,7 @@ fn render_comparison_results(
             builder.set_role(egui::accesskit::Role::Table);
             builder.set_name("Model comparison results");
         });
+    action
 }
 
 fn comparison_status(comparison: &ModelComparisonState) -> Option<String> {
@@ -1602,18 +1632,43 @@ fn comparison_output_summary(result: Option<&super::state::ComparisonResult>) ->
     }
 }
 
-fn comparison_accuracy(
+fn comparison_accuracy_cell(
+    ui: &mut egui::Ui,
     comparison: &ModelComparisonState,
     result: Option<&super::state::ComparisonResult>,
-) -> String {
+) -> ScreenAction {
     match (
         comparison.reference_transcript.as_deref(),
         result.and_then(|result| result.word_error_rate),
     ) {
         (Some(reference), Some(rate)) if !reference.trim().is_empty() => {
-            format!("{:.0}% accuracy", ((1.0 - rate).clamp(0.0, 1.0)) * 100.0)
+            ui.label(format!(
+                "{:.0}% accuracy",
+                ((1.0 - rate).clamp(0.0, 1.0)) * 100.0
+            ));
+            ScreenAction::None
         }
-        _ => "Add a reference transcript to measure".into(),
+        (Some(reference), _) if !reference.trim().is_empty() => {
+            ui.label("Run comparison to measure");
+            ScreenAction::None
+        }
+        _ => {
+            let add_reference = button(
+                ui,
+                "Add a reference transcript to measure",
+                ButtonTone::Text,
+            );
+            ui.ctx()
+                .accesskit_node_builder(add_reference.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Button);
+                    builder.set_name("Add a reference transcript to measure");
+                });
+            if add_reference.clicked() {
+                ScreenAction::ShowComparisonReferenceEditor
+            } else {
+                ScreenAction::None
+            }
+        }
     }
 }
 
@@ -2822,7 +2877,7 @@ mod tests {
                 && node.name() == Some("Collapse comparison")
         }));
         assert!(
-            update
+            !update
                 .nodes
                 .iter()
                 .any(|(_, node)| node.name() == Some("Reference transcript"))
