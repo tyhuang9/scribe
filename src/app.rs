@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
     ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
@@ -93,6 +93,7 @@ const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
+const LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
 static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -834,6 +835,47 @@ struct RemoteCatalogState {
     error: Option<String>,
 }
 
+struct LocalGgufImportJob {
+    job_id: u64,
+    cancellation: InstallCancellation,
+    completion: Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LocalGgufImportJob {
+    fn cancel_and_wait(&mut self, timeout: Duration) -> bool {
+        self.cancel_and_wait_with(timeout, |completion, timeout| {
+            matches!(
+                completion.recv_timeout(timeout),
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            )
+        })
+    }
+
+    fn cancel_and_wait_with(
+        &mut self,
+        timeout: Duration,
+        wait: impl FnOnce(&Receiver<()>, Duration) -> bool,
+    ) -> bool {
+        self.cancellation.cancel();
+        if !wait(&self.completion, timeout) {
+            return false;
+        }
+        self.worker
+            .take()
+            .is_none_or(|worker| worker.join().is_ok())
+    }
+
+    fn reap_completed(&mut self) {
+        if matches!(
+            self.completion.try_recv(),
+            Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            let _ = self.worker.take().map(thread::JoinHandle::join);
+        }
+    }
+}
+
 enum PlaygroundAction {
     Clear(String),
     MoveBy {
@@ -936,6 +978,7 @@ enum AppEvent {
         recovery_required: bool,
     },
     LocalGgufImportFinished {
+        job_id: u64,
         result: Result<Box<ValidatedLocalGgufImport>, String>,
     },
     RuntimeInstallDone {
@@ -1501,12 +1544,7 @@ fn validate_local_gguf_import(
         .map_err(local_gguf_import_error)?;
     let after_smoke = fingerprint_file_cancellable(&fingerprint.canonical_path, &cancellation)
         .map_err(local_gguf_import_install_error)?;
-    if after_smoke != fingerprint {
-        return Err(
-            "The local GGUF changed during validation. It was not imported; choose it again to revalidate its current bytes."
-                .to_owned(),
-        );
-    }
+    ensure_local_gguf_fingerprint_unchanged(&fingerprint, &after_smoke)?;
     let install = config::ImportedGgufModelInstall::validated(
         fingerprint.canonical_path.clone(),
         fingerprint.size_bytes,
@@ -1557,13 +1595,18 @@ fn reject_import_source_in_model_storage(
     Ok(())
 }
 
-fn local_gguf_import_fingerprint_matches(
-    install: &config::ImportedGgufModelInstall,
-    fingerprint: &crate::installations::FileFingerprint,
-) -> bool {
-    fingerprint.canonical_path == install.path
-        && fingerprint.size_bytes == install.size_bytes
-        && fingerprint.sha256 == install.sha256
+fn ensure_local_gguf_fingerprint_unchanged(
+    before: &crate::installations::FileFingerprint,
+    after_smoke: &crate::installations::FileFingerprint,
+) -> Result<(), String> {
+    if before == after_smoke {
+        Ok(())
+    } else {
+        Err(
+            "The local GGUF changed during validation. It was not imported; choose it again to revalidate its current bytes."
+                .to_owned(),
+        )
+    }
 }
 
 fn local_gguf_import_install_error(error: InstallError) -> String {
@@ -2156,7 +2199,7 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: HashMap<String, (u64, InstallCancellation)>,
-    local_gguf_import: Option<InstallCancellation>,
+    local_gguf_import: Option<LocalGgufImportJob>,
     artifact_recovery_error: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
@@ -5135,8 +5178,8 @@ impl LocalTranscriberApp {
                         }
                     }
                 }
-                AppEvent::LocalGgufImportFinished { result } => {
-                    self.finish_local_gguf_import(result);
+                AppEvent::LocalGgufImportFinished { job_id, result } => {
+                    self.finish_local_gguf_import(job_id, result);
                 }
                 AppEvent::TranscriptionDone {
                     source,
@@ -6713,30 +6756,62 @@ impl LocalTranscriberApp {
         let source_path = PathBuf::from(source);
         let cancellation = InstallCancellation::default();
         let thread_cancellation = cancellation.clone();
-        self.local_gguf_import = Some(cancellation);
         self.status = TranscriptionStatus::Idle;
         self.status_message = "Hashing and validating the local GGUF...".to_owned();
         let tx = self.tx.clone();
         let service = self.transcription_service.with_config(self.config.clone());
         let model_storage_dir = config::model_storage_dir(&self.config);
-        thread::spawn(move || {
-            let result = validate_local_gguf_import(
-                source_path,
-                model_storage_dir,
-                service,
-                thread_cancellation,
-            )
-            .map(Box::new);
-            let _ = tx.send(AppEvent::LocalGgufImportFinished { result });
-        });
+        let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let (completion_tx, completion) = bounded(1);
+        let worker = thread::Builder::new()
+            .name("scribe-local-gguf-import".to_owned())
+            .spawn(move || {
+                let result = validate_local_gguf_import(
+                    source_path,
+                    model_storage_dir,
+                    service,
+                    thread_cancellation,
+                )
+                .map(Box::new);
+                // Signal only after the final post-smoke fingerprint witness is
+                // complete. The following unbounded event send cannot block.
+                let _ = completion_tx.send(());
+                let _ = tx.send(AppEvent::LocalGgufImportFinished { job_id, result });
+            });
+        match worker {
+            Ok(worker) => {
+                self.local_gguf_import = Some(LocalGgufImportJob {
+                    job_id,
+                    cancellation,
+                    completion,
+                    worker: Some(worker),
+                });
+            }
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.status_message = format!("Could not start local GGUF validation: {error}");
+            }
+        }
     }
 
-    fn finish_local_gguf_import(&mut self, result: Result<Box<ValidatedLocalGgufImport>, String>) {
+    fn finish_local_gguf_import(
+        &mut self,
+        job_id: u64,
+        result: Result<Box<ValidatedLocalGgufImport>, String>,
+    ) {
         if self
             .local_gguf_import
-            .take()
-            .is_some_and(|cancellation| cancellation.is_cancelled())
+            .as_ref()
+            .is_none_or(|job| job.job_id != job_id)
         {
+            return;
+        }
+        let mut job = self
+            .local_gguf_import
+            .take()
+            .expect("the matching local GGUF job must still be active");
+        job.reap_completed();
+        if job.cancellation.is_cancelled() {
             self.status = TranscriptionStatus::Idle;
             self.status_message =
                 "Local GGUF import was cancelled. The source file was left unchanged.".to_owned();
@@ -6750,26 +6825,9 @@ impl LocalTranscriberApp {
                 return;
             }
         };
-        let current_fingerprint = match fingerprint_file_cancellable(
-            &imported.install.path,
-            &InstallCancellation::default(),
-        ) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!(
-                    "Could not recheck local GGUF before persistence: {}",
-                    local_gguf_import_install_error(error)
-                );
-                return;
-            }
-        };
-        if !local_gguf_import_fingerprint_matches(&imported.install, &current_fingerprint) {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "The local GGUF changed after validation and was not imported. Choose it again to validate its current bytes."
-                .to_owned();
-            return;
-        }
+        // The worker supplied the final post-smoke fingerprint witness.
+        // Completion deliberately performs no source file metadata/read/hash
+        // work on the UI thread.
         let previous_config = self.config.clone();
         self.config.general.imported_gguf_models.insert(
             imported.model_id.as_str().to_owned(),
@@ -7309,19 +7367,26 @@ impl LocalTranscriberApp {
             Some("Wait for final transcription and output to finish before changing speech artifacts.".to_owned())
         } else if self.playground_pending > 0 {
             Some("Wait for Playground jobs to finish before changing speech artifacts.".to_owned())
-        } else if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
+        } else if !self.artifact_installations.is_empty()
+            || !self.runtime_jobs.is_empty()
+            || self.local_gguf_import.is_some()
+        {
             Some("Wait for the active installation to finish or cancel it first.".to_owned())
         } else {
             None
         }
     }
 
-    fn cancel_installations_for_shutdown(&self) {
+    fn cancel_installations_for_shutdown(&mut self) {
         for (_, cancellation) in self.artifact_installations.values() {
             cancellation.cancel();
         }
-        if let Some(cancellation) = self.local_gguf_import.as_ref() {
-            cancellation.cancel();
+        if let Some(mut job) = self.local_gguf_import.take()
+            && !job.cancel_and_wait(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT)
+        {
+            eprintln!(
+                "local GGUF import exceeded the shutdown deadline; detaching cancelled worker"
+            );
         }
     }
 }
@@ -8416,8 +8481,8 @@ impl LocalTranscriberApp {
             ScreenAction::SetLocalGgufImportPath(path) => self.model_import_path = path,
             ScreenAction::ValidateAndImportLocalGguf => self.start_local_gguf_import(),
             ScreenAction::CancelLocalGgufImport => {
-                if let Some(cancellation) = self.local_gguf_import.as_ref() {
-                    cancellation.cancel();
+                if let Some(job) = self.local_gguf_import.as_ref() {
+                    job.cancellation.cancel();
                     self.status_message =
                         "Cancelling local GGUF validation; source bytes are unchanged.".to_owned();
                 }
@@ -14508,6 +14573,20 @@ mod layout_tests {
         })
     }
 
+    fn test_local_gguf_import_job(
+        job_id: u64,
+        cancellation: InstallCancellation,
+    ) -> LocalGgufImportJob {
+        let (completed, completion) = bounded(1);
+        completed.send(()).unwrap();
+        LocalGgufImportJob {
+            job_id,
+            cancellation,
+            completion,
+            worker: None,
+        }
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         // Keep Playground event tests independent from whichever legacy model
@@ -14836,14 +14915,29 @@ mod layout_tests {
         ));
         assert_eq!(app.model_import_path, "C:\\Models\\local.gguf");
         let local_cancellation = InstallCancellation::default();
-        app.local_gguf_import = Some(local_cancellation.clone());
+        let local_job_id = 41;
+        app.local_gguf_import = Some(test_local_gguf_import_job(
+            local_job_id,
+            local_cancellation.clone(),
+        ));
         let local_view = app.remote_catalog_view().local_import;
         assert_eq!(local_view.path, "C:\\Models\\local.gguf");
         assert!(local_view.in_progress);
         assert!(!local_view.import_enabled);
+        app.finish_local_gguf_import(
+            local_job_id + 1,
+            Err("stale completion must be ignored".into()),
+        );
+        assert_eq!(
+            app.local_gguf_import.as_ref().map(|job| job.job_id),
+            Some(local_job_id)
+        );
         app.apply_model_management_action(ScreenAction::CancelLocalGgufImport);
         assert!(local_cancellation.is_cancelled());
-        app.finish_local_gguf_import(Err("completion delivered after cancellation".into()));
+        app.finish_local_gguf_import(
+            local_job_id,
+            Err("completion delivered after cancellation".into()),
+        );
         assert_eq!(app.status, TranscriptionStatus::Idle);
         assert_eq!(
             app.status_message,
@@ -14893,12 +14987,36 @@ mod layout_tests {
             "managed-shutdown-fixture".to_owned(),
             (1, artifact_cancellation.clone()),
         );
-        app.local_gguf_import = Some(local_cancellation.clone());
+        app.local_gguf_import = Some(test_local_gguf_import_job(42, local_cancellation.clone()));
 
         app.cancel_installations_for_shutdown();
 
         assert!(artifact_cancellation.is_cancelled());
         assert!(local_cancellation.is_cancelled());
+        assert!(app.local_gguf_import.is_none());
+    }
+
+    #[test]
+    fn local_gguf_shutdown_wait_is_bounded_before_worker_detach() {
+        let cancellation = InstallCancellation::default();
+        let (_completion_tx, completion) = bounded(1);
+        let mut job = LocalGgufImportJob {
+            job_id: 91,
+            cancellation: cancellation.clone(),
+            completion,
+            worker: None,
+        };
+        let expected_timeout = Duration::from_millis(37);
+        let observed_timeout = std::cell::Cell::new(None);
+
+        let completed = job.cancel_and_wait_with(expected_timeout, |_, timeout| {
+            observed_timeout.set(Some(timeout));
+            false
+        });
+
+        assert!(!completed);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(observed_timeout.get(), Some(expected_timeout));
     }
 
     #[test]
@@ -17252,18 +17370,30 @@ mod layout_tests {
         fs::write(&source, b"original").unwrap();
         let before =
             fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
-        let install = config::ImportedGgufModelInstall::validated(
-            before.canonical_path.clone(),
-            before.size_bytes,
-            before.sha256,
-            "Imported fixture".to_owned(),
-        );
-
         fs::write(&source, b"changed!").unwrap();
         let after = fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
 
-        assert_eq!(after.size_bytes, install.size_bytes);
-        assert!(!local_gguf_import_fingerprint_matches(&install, &after));
+        assert_eq!(after.size_bytes, before.size_bytes);
+        assert!(ensure_local_gguf_fingerprint_unchanged(&before, &after).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_gguf_final_fingerprint_honors_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-import-fingerprint-cancel-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("external").join("imported.gguf");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"fixture").unwrap();
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+
+        let result = fingerprint_file_cancellable(&source, &cancellation);
+
+        assert!(matches!(result, Err(InstallError::Cancelled { .. })));
         let _ = fs::remove_dir_all(root);
     }
 
