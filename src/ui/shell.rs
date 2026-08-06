@@ -5,7 +5,10 @@ use super::{
     theme_palette,
 };
 
+/// Painted width of the full navigation panel, including both horizontal margins.
 pub(crate) const FULL_SIDEBAR_WIDTH: f32 = 214.0;
+const SIDEBAR_HORIZONTAL_MARGIN: f32 = 12.0;
+const FULL_SIDEBAR_CONTENT_WIDTH: f32 = FULL_SIDEBAR_WIDTH - SIDEBAR_HORIZONTAL_MARGIN * 2.0;
 pub(crate) const COMPACT_RAIL_WIDTH: f32 = 66.0;
 pub(crate) const COMPACT_NAV_BREAKPOINT: f32 = 1_000.0;
 
@@ -79,11 +82,11 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
             Frame::none()
                 .fill(colors.sidebar_bg)
                 .stroke(Stroke::new(1.0, colors.border))
-                .inner_margin(Margin::symmetric(12.0, 16.0)),
+                .inner_margin(Margin::symmetric(SIDEBAR_HORIZONTAL_MARGIN, 16.0)),
         )
         .resizable(false)
         .exact_width(match mode {
-            NavigationMode::Full => FULL_SIDEBAR_WIDTH,
+            NavigationMode::Full => FULL_SIDEBAR_CONTENT_WIDTH,
             NavigationMode::Compact => COMPACT_RAIL_WIDTH,
         })
         .show(ctx, |ui| {
@@ -351,6 +354,36 @@ mod tests {
     fn navigation_switches_at_the_package_compact_breakpoint() {
         assert_eq!(navigation_mode(1_180.0), NavigationMode::Full);
         assert_eq!(navigation_mode(960.0), NavigationMode::Compact);
+    }
+
+    #[test]
+    fn full_sidebar_painted_width_includes_frame_margins() {
+        let ctx = egui::Context::default();
+        let mut painted_width = 0.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1_180.0, 815.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let colors = theme_palette(ctx);
+                let panel = egui::SidePanel::left("width-test")
+                    .frame(
+                        Frame::none()
+                            .fill(colors.sidebar_bg)
+                            .stroke(Stroke::new(1.0, colors.border))
+                            .inner_margin(Margin::symmetric(SIDEBAR_HORIZONTAL_MARGIN, 16.0)),
+                    )
+                    .resizable(false)
+                    .exact_width(FULL_SIDEBAR_CONTENT_WIDTH)
+                    .show(ctx, |_ui| {});
+                painted_width = panel.response.rect.width();
+            },
+        );
+        assert!((painted_width - FULL_SIDEBAR_WIDTH).abs() < f32::EPSILON);
     }
 
     #[test]
