@@ -1,6 +1,7 @@
 # Scribe runtime-consolidated revamp: implementation report
 
-Date: 2026-08-04
+Initial report date: 2026-08-04
+Evidence updated through: 2026-08-05
 Integration base: `536a85f`
 Final stacked implementation branch: `revamp/phase-11-diagnostics-hardening`
 Release decision: **NO-GO pending manual and compatibility evidence**
@@ -96,8 +97,12 @@ The authoritative coordinator rejects illegal transitions, stale session IDs,
 and out-of-order request sequences. Explicit stop outranks inferred silence.
 The final pass is immutable once accepted. Cancellation and no-speech produce no
 paste. Windows revalidates HWND, PID, process creation identity, foreground
-activation, and clipboard generation before one synthetic paste; unsafe cases
-fall back to copy-only. Linux and macOS remain conservatively copy-only.
+activation, and clipboard generation before one synthetic paste. Unsafe target
+or paste failures and unavailable, unsupported, or erroneous clipboard
+snapshots become explicit copy-only output. If another app changes the
+clipboard during the transaction, Scribe sends no synthetic keys, does not
+overwrite that newer clipboard content, and keeps the final text in Scribe.
+Linux and macOS remain conservatively copy-only.
 
 Settings are versioned and sectioned, preserve unknown fields, salvage valid
 fields, back up corrupt/legacy input, and use debounced atomic replacement.

@@ -16,17 +16,16 @@ documented manual and compatibility evidence; see
 `docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md` and the newer
 `docs/EMBEDDED_STT_AND_MODELS.md` implementation record.
 
-The app shell stays small. It may invoke the selected runtime during startup
-integrity/health validation, and it starts session model loading concurrently
-when the user records audio.
+The application/runtime boundary remains narrow. Scribe may invoke the selected
+runtime during startup integrity/health validation, and it starts session model
+loading concurrently when the user records audio.
 
 ## Documentation
 
-The curated documentation site lives in `website/` and is designed for GitHub
-Pages at [tyhuang9.github.io/scribe](https://tyhuang9.github.io/scribe/). Until
-Pages is configured and its first deployment succeeds, the checked-in
-application code, this README, and the revamp implementation report remain the
-source of truth.
+The curated documentation site lives in `website/` and is published with GitHub
+Pages at [tyhuang9.github.io/scribe](https://tyhuang9.github.io/scribe/). The
+checked-in application code, this README, and the revamp implementation report
+remain the source of truth for implementation and release-readiness claims.
 
 To maintain the site locally:
 
@@ -38,13 +37,13 @@ npm run docs:build
 ```
 
 The documentation workflow checks pull requests that change the site and
-deploys eligible changes after they reach `main`. Before the first deployment,
-set **Settings -> Pages -> Source** to **GitHub Actions**. The default project
-site uses `SITE_URL=https://tyhuang9.github.io` and `BASE_PATH=/scribe`.
+deploys eligible changes after they reach `main`. GitHub Pages is configured to
+use **GitHub Actions** as its source. The default project site uses
+`SITE_URL=https://tyhuang9.github.io` and `BASE_PATH=/scribe`.
 
 ## Current Features
 
-- Native egui desktop UI with General, Models, History, Advanced, About, and opt-in Debug navigation aligned to the checked-in Scribe design tokens.
+- Native egui desktop UI with Transcribe, General, Models, History, Advanced, About, and opt-in Debug navigation aligned to the checked-in Scribe design tokens.
 - Versioned local JSON settings with field-level salvage, unknown-field preservation, debounced atomic replacement, and legacy migration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
@@ -52,7 +51,7 @@ site uses `SITE_URL=https://tyhuang9.github.io` and `BASE_PATH=/scribe`.
 - One application-level logical runtime kind, selected only by the private `RuntimeRouter`. The normal user-facing path uses the statically linked `transcribe-cpp` 0.1.3 adapter for GGUF models; zero models are Supported.
 - Trusted GGUF discovery/import plus resumable, exact-hash model installation with staged native smoke tests, atomic activation, and crash recovery. Runtime-package transactions remain only for retained GGML compatibility.
 - Non-blocking native workers for capture, model preload, rolling batch preview, final transcription, and diagnostic latency breakdowns.
-- Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions.
+- Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions. Show/Hide has live Windows evidence; the remaining tray actions still require the documented manual matrix.
 - Optional Windows insertion of the completed transcript into the captured app; other platforms use an explicit clipboard-only fallback.
 - Runtime-neutral metadata for trusted GGUF variants, with one pinned fallback and private source-owned discovery. Older tiny/base/small/medium family distinctions remain private compatibility data.
 - Debug comparison selection is explicit: choose installed models, retain drag order, and decode the same native prepared audio through the shared `TranscriptionService`.
@@ -60,8 +59,8 @@ site uses `SITE_URL=https://tyhuang9.github.io` and `BASE_PATH=/scribe`.
 
 ## Requirements
 
-- Rust 1.96 or newer.
-- Linux, macOS, or Windows desktop session supported by `eframe` and `global-hotkey`.
+- A current stable Rust toolchain with Rust 2024 edition support. The recorded automated verification used Rust 1.96.0; the project does not currently declare a tested minimum Rust version.
+- A Windows, Linux, or macOS desktop session compatible with `eframe` and `global-hotkey`. Windows x64 is the primary release target; Linux and macOS retain conservative build/output fallbacks but are not release-qualified.
 - A microphone visible to the host OS.
 - Normal transcription requires an installed compatible GGUF model. Its CPU runtime is statically linked in-process; no separate runtime package or sidecar process is required.
 - GPU transcription is not currently verified. An explicit GPU preference fails clearly instead of silently changing the backend.
@@ -203,9 +202,10 @@ Zipformer candidate has not passed the complete evidence gate.
 ### Runtime packaging and legacy development tools
 
 The repository still packages a pinned whisper.cpp v1.9.1 compatibility
-runtime for retained GGML models. It is an in-process DLL path with a
-hash-verified CLI fallback, not the normal GGUF route. Build a Windows release
-bundle with:
+runtime for retained GGML models and a narrowly scoped bootstrap fallback when
+the primary native GGUF adapter cannot initialize. It is an in-process DLL path
+with a hash-verified CLI fallback, not the normal GGUF route. Build a Windows
+release bundle with:
 
 ```bash
 scripts/build-release-bundle.sh
@@ -291,9 +291,9 @@ The main modules are:
 - `src/audio/pipeline.rs`: native preparation, metering, VAD, and endpointing.
 - `src/benchmark.rs`: privacy-bounded command-line benchmark/reporting path.
 - `src/config.rs`: local JSON config loading/saving.
-- `src/coordinator.rs`: authoritative one-active-session state machine.
+- `src/core.rs`: authoritative one-active-session state machine.
 - `src/diagnostics.rs`: bounded allowlisted session metrics and redacted export.
-- `src/history.rs`: SQLite history lifecycle, retention, retry, and reconciliation.
+- `src/history/mod.rs`: SQLite history lifecycle, retention, retry, and reconciliation.
 - `src/hotkey.rs`: global hotkey parsing and registration.
 - `src/models.rs`: normalized runtime-neutral model descriptors and catalog.
 - `src/runtime_router.rs`: the only application-level concrete runtime selector.
