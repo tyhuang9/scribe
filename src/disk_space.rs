@@ -25,21 +25,31 @@ impl DiskSpacePreflight {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct VolumeSpace {
-    volume: String,
-    available_bytes: u64,
+pub(crate) struct DiskSpaceAvailability {
+    pub(crate) volume: String,
+    pub(crate) available_bytes: u64,
 }
 
 trait SpaceProbe {
-    fn probe(&self, existing_directory: &Path) -> Result<VolumeSpace, String>;
+    fn probe(&self, existing_directory: &Path) -> Result<DiskSpaceAvailability, String>;
 }
 
 struct SystemSpaceProbe;
 
 impl SpaceProbe for SystemSpaceProbe {
-    fn probe(&self, existing_directory: &Path) -> Result<VolumeSpace, String> {
+    fn probe(&self, existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
         probe_system_volume(existing_directory)
     }
+}
+
+/// Captures one free-space observation for the volume containing
+/// `destination`. Catalog callers may reuse this advisory snapshot across a
+/// bounded projection; the install backend must still preflight the exact
+/// target and remaining bytes immediately before writing.
+pub(crate) fn available_space_for_destination(
+    destination: &Path,
+) -> Result<DiskSpaceAvailability, String> {
+    availability_with(&SystemSpaceProbe, destination)
 }
 
 /// Checks whether the volume containing `destination` can accommodate the
@@ -60,13 +70,20 @@ fn preflight_with(
     let required_bytes = additional_bytes
         .checked_add(SAFETY_HEADROOM_BYTES)
         .ok_or_else(|| "download-space requirement overflowed".to_owned())?;
-    let existing_directory = nearest_existing_directory(destination)?;
-    let volume = probe.probe(&existing_directory)?;
+    let volume = availability_with(probe, destination)?;
     Ok(DiskSpacePreflight {
         volume: volume.volume,
         available_bytes: volume.available_bytes,
         required_bytes,
     })
+}
+
+fn availability_with(
+    probe: &dyn SpaceProbe,
+    destination: &Path,
+) -> Result<DiskSpaceAvailability, String> {
+    let existing_directory = nearest_existing_directory(destination)?;
+    probe.probe(&existing_directory)
 }
 
 fn nearest_existing_directory(destination: &Path) -> Result<PathBuf, String> {
@@ -108,7 +125,7 @@ fn nearest_existing_directory(destination: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn probe_system_volume(existing_directory: &Path) -> Result<VolumeSpace, String> {
+fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
 
@@ -151,14 +168,14 @@ fn probe_system_volume(existing_directory: &Path) -> Result<VolumeSpace, String>
             "could not read available space on Windows volume {volume}"
         ));
     }
-    Ok(VolumeSpace {
+    Ok(DiskSpaceAvailability {
         volume,
         available_bytes,
     })
 }
 
 #[cfg(unix)]
-fn probe_system_volume(existing_directory: &Path) -> Result<VolumeSpace, String> {
+fn probe_system_volume(existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -185,14 +202,14 @@ fn probe_system_volume(existing_directory: &Path) -> Result<VolumeSpace, String>
         .zip(u64::try_from(filesystem.f_frsize).ok())
         .and_then(|(blocks, block_size)| blocks.checked_mul(block_size))
         .ok_or_else(|| "available Unix filesystem space overflowed".to_owned())?;
-    Ok(VolumeSpace {
+    Ok(DiskSpaceAvailability {
         volume: format!("device:{}", metadata.st_dev),
         available_bytes,
     })
 }
 
 #[cfg(not(any(target_os = "windows", unix)))]
-fn probe_system_volume(_existing_directory: &Path) -> Result<VolumeSpace, String> {
+fn probe_system_volume(_existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
     Err("free-space preflight is unavailable on this operating system".to_owned())
 }
 
@@ -201,11 +218,11 @@ mod tests {
     use super::*;
 
     struct FakeProbe {
-        result: Result<VolumeSpace, String>,
+        result: Result<DiskSpaceAvailability, String>,
     }
 
     impl SpaceProbe for FakeProbe {
-        fn probe(&self, _existing_directory: &Path) -> Result<VolumeSpace, String> {
+        fn probe(&self, _existing_directory: &Path) -> Result<DiskSpaceAvailability, String> {
             self.result.clone()
         }
     }
@@ -219,7 +236,7 @@ mod tests {
     #[test]
     fn preflight_reserves_artifact_bytes_and_safety_headroom() {
         let probe = FakeProbe {
-            result: Ok(VolumeSpace {
+            result: Ok(DiskSpaceAvailability {
                 volume: "test-volume".to_owned(),
                 available_bytes: SAFETY_HEADROOM_BYTES + 100,
             }),
@@ -234,7 +251,7 @@ mod tests {
     #[test]
     fn preflight_reports_an_insufficient_volume_without_rounding_down() {
         let probe = FakeProbe {
-            result: Ok(VolumeSpace {
+            result: Ok(DiskSpaceAvailability {
                 volume: "test-volume".to_owned(),
                 available_bytes: SAFETY_HEADROOM_BYTES + 99,
             }),

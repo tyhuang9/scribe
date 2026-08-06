@@ -94,6 +94,7 @@ const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
 const LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const REMOTE_CATALOG_VISIBLE_LIMIT: usize = 100;
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
 static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -826,6 +827,24 @@ struct PlaygroundCardState {
     peak_vram_mb: Option<f64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteCatalogProjectionKey {
+    revision: u64,
+    search: String,
+    filters: RemoteCatalogFilters,
+    sort: RemoteCatalogSort,
+    model_storage_dir: PathBuf,
+    mutation_block_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteCatalogProjection {
+    key: RemoteCatalogProjectionKey,
+    matching_count: usize,
+    total_count: usize,
+    entries: Vec<RemoteCatalogEntryView>,
+}
+
 #[derive(Default)]
 struct RemoteCatalogState {
     snapshot: Option<CatalogSnapshot>,
@@ -833,6 +852,19 @@ struct RemoteCatalogState {
     attempted: bool,
     force_refresh_requested: bool,
     error: Option<String>,
+    projection_revision: u64,
+    projection: Option<RemoteCatalogProjection>,
+    #[cfg(test)]
+    projection_build_count: usize,
+    #[cfg(test)]
+    disk_probe_count: usize,
+}
+
+impl RemoteCatalogState {
+    fn invalidate_projection(&mut self) {
+        self.projection_revision = self.projection_revision.wrapping_add(1);
+        self.projection = None;
+    }
 }
 
 struct LocalGgufImportJob {
@@ -5172,6 +5204,7 @@ impl LocalTranscriberApp {
                         Ok(snapshot) => {
                             self.remote_catalog.snapshot = Some(snapshot);
                             self.remote_catalog.error = None;
+                            self.remote_catalog.invalidate_projection();
                         }
                         Err(error) => {
                             self.remote_catalog.error = Some(error);
@@ -5614,6 +5647,7 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    self.remote_catalog.invalidate_projection();
                     let stage_label = match progress.stage {
                         InstallStage::Downloading => "Downloading",
                         InstallStage::Verifying => "Verifying checksum",
@@ -5673,6 +5707,7 @@ impl LocalTranscriberApp {
                         }
                         continue;
                     }
+                    self.remote_catalog.invalidate_projection();
                     self.artifact_installations.remove(&model_id);
                     let previous_config = self.config.clone();
                     self.model_downloads
@@ -5883,6 +5918,7 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    self.remote_catalog.invalidate_projection();
                     self.artifact_installations.remove(&model_id);
                     if recovery_required {
                         self.artifact_recovery_error = Some(message.clone());
@@ -5898,6 +5934,7 @@ impl LocalTranscriberApp {
                     replacement,
                     source_label,
                 } => {
+                    self.remote_catalog.invalidate_projection();
                     let installed_path = replacement.installed_path.clone();
                     let new_runtime = managed_runtime_install_record(installed_path, source_label);
                     let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
@@ -6962,6 +6999,7 @@ impl LocalTranscriberApp {
             .as_ref()
             .is_some_and(ManagedRemoval::removed_files);
         let previous_config = self.config.clone();
+        self.remote_catalog.invalidate_projection();
         self.model_downloads.remove(&model.id);
         self.config.general.managed_models.remove(&model.id);
         self.config.general.managed_remote_models.remove(&model.id);
@@ -7172,6 +7210,7 @@ impl LocalTranscriberApp {
     }
 
     fn fail_model_install(&mut self, model_id: &str, message: String) {
+        self.remote_catalog.invalidate_projection();
         self.model_downloads.insert(
             model_id.to_owned(),
             ModelInstallStatus::Error(message.clone()),
@@ -7181,6 +7220,7 @@ impl LocalTranscriberApp {
     }
 
     fn fail_runtime_job(&mut self, runtime_id: &str, message: String) {
+        self.remote_catalog.invalidate_projection();
         if let Some(job) = self.runtime_jobs.remove(runtime_id) {
             for model_id in job.download_model_ids {
                 self.model_downloads
@@ -7841,32 +7881,56 @@ impl LocalTranscriberApp {
         self.apply_model_management_action(action);
     }
 
-    fn remote_catalog_view(&self) -> RemoteCatalogView {
+    fn remote_catalog_view(&mut self) -> RemoteCatalogView {
         let search = self.model_search.trim().to_ascii_lowercase();
+        let projection_key = RemoteCatalogProjectionKey {
+            revision: self.remote_catalog.projection_revision,
+            search: search.clone(),
+            filters: self.remote_catalog_filters,
+            sort: self.remote_catalog_sort,
+            model_storage_dir: config::model_storage_dir(&self.config),
+            mutation_block_reason: self.artifact_mutation_block_reason(),
+        };
+        if self
+            .remote_catalog
+            .projection
+            .as_ref()
+            .is_none_or(|projection| projection.key != projection_key)
+        {
+            let (projection, disk_probes) = self.build_remote_catalog_projection(projection_key);
+            self.remote_catalog.projection = Some(projection);
+            #[cfg(test)]
+            {
+                self.remote_catalog.projection_build_count += 1;
+                self.remote_catalog.disk_probe_count += disk_probes;
+            }
+            #[cfg(not(test))]
+            let _ = disk_probes;
+        }
+        let projection = self
+            .remote_catalog
+            .projection
+            .as_ref()
+            .expect("catalog projection was populated above");
+        let entries = projection.entries.clone();
+        let shown_count = entries.len();
+        let matching_count = projection.matching_count;
+        let total_count = projection.total_count;
+        let count_summary = if matching_count > shown_count {
+            format!(
+                "Showing {shown_count} of {matching_count} matching models ({total_count} total). Refine search or filters to see omitted matches."
+            )
+        } else {
+            format!("Showing {shown_count} of {total_count} models.")
+        };
         let snapshot = self.remote_catalog.snapshot.as_ref();
-        let entries = snapshot
-            .map(|snapshot| {
-                filtered_remote_models(
-                    &snapshot.models,
-                    &self.config,
-                    &search,
-                    self.remote_catalog_filters,
-                    self.remote_catalog_sort,
-                )
-                .into_iter()
-                .map(|model| self.remote_catalog_entry_view(model))
-                .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let matching_count = entries.len();
-        let total_count = snapshot.map_or(0, |snapshot| snapshot.models.len());
         let (kind, message) = if self.remote_catalog.loading {
             let message = snapshot.map_or_else(
                 || "Loading the trusted catalog.".to_owned(),
                 |snapshot| {
                     format!(
-                        "Refreshing the trusted catalog. Showing {matching_count} of {total_count} models from {}.",
-                        snapshot.source.label()
+                        "Refreshing the trusted catalog from {}. {count_summary}",
+                        snapshot.source.label(),
                     )
                 },
             );
@@ -7876,8 +7940,8 @@ impl LocalTranscriberApp {
                 || format!("Catalog unavailable: {error}"),
                 |snapshot| {
                     format!(
-                        "Catalog refresh failed; showing {matching_count} of {total_count} models from {}. {error}",
-                        snapshot.source.label()
+                        "Catalog refresh failed; showing data from {}. {count_summary} {error}",
+                        snapshot.source.label(),
                     )
                 },
             );
@@ -7893,10 +7957,7 @@ impl LocalTranscriberApp {
             };
             (
                 kind,
-                format!(
-                    "{} · Showing {matching_count} of {total_count} trusted catalog models.",
-                    snapshot.source.label()
-                ),
+                format!("{} · {count_summary}", snapshot.source.label(),),
             )
         } else {
             (
@@ -7923,7 +7984,56 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn remote_catalog_entry_view(&self, model: &RemoteModel) -> RemoteCatalogEntryView {
+    fn build_remote_catalog_projection(
+        &self,
+        key: RemoteCatalogProjectionKey,
+    ) -> (RemoteCatalogProjection, usize) {
+        let Some(snapshot) = self.remote_catalog.snapshot.as_ref() else {
+            return (
+                RemoteCatalogProjection {
+                    key,
+                    matching_count: 0,
+                    total_count: 0,
+                    entries: Vec::new(),
+                },
+                0,
+            );
+        };
+        let matching = filtered_remote_models(
+            &snapshot.models,
+            &self.config,
+            &key.search,
+            key.filters,
+            key.sort,
+        );
+        let matching_count = matching.len();
+        let availability = (!matching.is_empty()).then(|| {
+            crate::disk_space::available_space_for_destination(
+                &key.model_storage_dir.join(".catalog-space-probe"),
+            )
+        });
+        let disk_probes = usize::from(availability.is_some());
+        let entries = matching
+            .into_iter()
+            .take(REMOTE_CATALOG_VISIBLE_LIMIT)
+            .map(|model| self.remote_catalog_entry_view(model, availability.as_ref()))
+            .collect();
+        (
+            RemoteCatalogProjection {
+                key,
+                matching_count,
+                total_count: snapshot.models.len(),
+                entries,
+            },
+            disk_probes,
+        )
+    }
+
+    fn remote_catalog_entry_view(
+        &self,
+        model: &RemoteModel,
+        availability: Option<&Result<crate::disk_space::DiskSpaceAvailability, String>>,
+    ) -> RemoteCatalogEntryView {
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let variants = model
             .variants
@@ -7964,12 +8074,9 @@ impl LocalTranscriberApp {
                 });
                 let install_disabled_reason = mutation_block_reason.clone().or_else(|| {
                     artifact.as_ref().and_then(|artifact| {
-                        normalized_model_id.as_ref().map_or_else(
-                            || trusted_model_install_space_error(&self.config, artifact),
-                            |model_id| {
-                                normalized_model_install_space_error(&self.config, model_id)
-                            },
-                        )
+                        availability.and_then(|availability| {
+                            catalog_download_space_error(availability, artifact.size_bytes)
+                        })
                     })
                 });
                 let install_action = |label: &str| RemoteCatalogActionView {
@@ -9741,6 +9848,35 @@ fn disk_space_preflight_error(
         )),
         Err(error) => Some(format!(
             "Install disabled because Scribe could not safely verify available disk space: {error}"
+        )),
+    }
+}
+
+fn catalog_download_space_error(
+    availability: &Result<crate::disk_space::DiskSpaceAvailability, String>,
+    artifact_size_bytes: u64,
+) -> Option<String> {
+    let required_bytes =
+        match artifact_size_bytes.checked_add(crate::disk_space::SAFETY_HEADROOM_BYTES) {
+            Some(required_bytes) => required_bytes,
+            None => {
+                return Some(
+                    "Install disabled because the catalog download-space requirement overflowed."
+                        .to_owned(),
+                );
+            }
+        };
+    match availability {
+        Ok(availability) if availability.available_bytes >= required_bytes => None,
+        Ok(availability) => Some(format!(
+            "Install disabled: {} free is required on {} by the conservative catalog estimate (including Scribe's {} safety headroom); only {} is available. The backend rechecks the exact target and resumable bytes when an enabled install starts.",
+            format_bytes(required_bytes),
+            availability.volume,
+            format_bytes(crate::disk_space::SAFETY_HEADROOM_BYTES),
+            format_bytes(availability.available_bytes),
+        )),
+        Err(error) => Some(format!(
+            "Install disabled because Scribe could not safely inspect catalog storage availability: {error}"
         )),
     }
 }
@@ -14866,6 +15002,92 @@ mod layout_tests {
                 "handy-computer/large"
             ]
         );
+    }
+
+    #[test]
+    fn remote_catalog_projection_is_bounded_cached_and_truthful_at_ten_thousand_models() {
+        let mut app = test_app();
+        let storage = std::env::temp_dir().join(format!(
+            "scribe-catalog-projection-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&storage);
+        fs::create_dir_all(&storage).unwrap();
+        app.config.general.model_storage_dir = storage.clone();
+        app.remote_catalog.snapshot = Some(CatalogSnapshot {
+            source: CatalogSource::FreshCache,
+            fetched_at_unix_seconds: 0,
+            models: (0..10_000)
+                .map(|index| {
+                    remote_catalog_model(
+                        &format!("handy-computer/catalog-{index:05}"),
+                        &format!("Catalog model {index:05}"),
+                        &["en"],
+                        false,
+                        64 * 1024 * 1024,
+                    )
+                })
+                .collect(),
+        });
+
+        let first = app.remote_catalog_view();
+
+        assert_eq!(first.entries.len(), REMOTE_CATALOG_VISIBLE_LIMIT);
+        assert!(first.status.message.contains(
+            "Showing 100 of 10000 matching models (10000 total). Refine search or filters"
+        ));
+        assert_eq!(app.remote_catalog.projection_build_count, 1);
+        assert_eq!(app.remote_catalog.disk_probe_count, 1);
+
+        let second = app.remote_catalog_view();
+
+        assert_eq!(second.entries, first.entries);
+        assert_eq!(app.remote_catalog.projection_build_count, 1);
+        assert_eq!(app.remote_catalog.disk_probe_count, 1);
+
+        let failed_model_id = config::managed_remote_model_id(
+            "handy-computer/catalog-00000",
+            &"a".repeat(40),
+            "fixture.gguf",
+        )
+        .unwrap();
+        app.fail_model_install(&failed_model_id, "synthetic install failure".to_owned());
+        let failed = app.remote_catalog_view();
+
+        assert_eq!(app.remote_catalog.projection_build_count, 2);
+        assert_eq!(app.remote_catalog.disk_probe_count, 2);
+        assert!(
+            failed.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| action.label == "Resume")
+        );
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "catalog model 09999".to_owned(),
+        ));
+        let refined = app.remote_catalog_view();
+
+        assert_eq!(refined.entries.len(), 1);
+        assert!(
+            refined
+                .status
+                .message
+                .contains("Showing 1 of 10000 models.")
+        );
+        assert_eq!(app.remote_catalog.projection_build_count, 3);
+        assert_eq!(app.remote_catalog.disk_probe_count, 3);
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "no catalog model has this phrase".to_owned(),
+        ));
+        let empty = app.remote_catalog_view();
+
+        assert!(empty.entries.is_empty());
+        assert!(empty.status.message.contains("Showing 0 of 10000 models."));
+        assert_eq!(app.remote_catalog.projection_build_count, 4);
+        assert_eq!(app.remote_catalog.disk_probe_count, 3);
+        let _ = fs::remove_dir_all(storage);
     }
 
     #[test]
