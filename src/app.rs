@@ -827,6 +827,13 @@ struct PlaygroundCardState {
     peak_vram_mb: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ComparisonProjectionCacheEntry {
+    reference_revision: u64,
+    output_revision: u64,
+    word_error_rate: Option<f32>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RemoteCatalogProjectionKey {
     revision: u64,
@@ -2215,6 +2222,13 @@ pub struct LocalTranscriberApp {
     model_comparison: ModelComparisonState,
     comparison_run_model_ids: Option<Vec<String>>,
     comparison_started_at: Option<Instant>,
+    comparison_reference_revision: u64,
+    comparison_output_revisions: HashMap<String, u64>,
+    comparison_projection_cache: HashMap<String, ComparisonProjectionCacheEntry>,
+    #[cfg(test)]
+    comparison_wer_compute_count: usize,
+    #[cfg(test)]
+    comparison_output_replacement_count: usize,
     model_management: ModelManagementState,
     status: TranscriptionStatus,
     transcript: String,
@@ -2369,6 +2383,13 @@ impl LocalTranscriberApp {
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,
             comparison_started_at: None,
+            comparison_reference_revision: 0,
+            comparison_output_revisions: HashMap::new(),
+            comparison_projection_cache: HashMap::new(),
+            #[cfg(test)]
+            comparison_wer_compute_count: 0,
+            #[cfg(test)]
+            comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
@@ -3463,16 +3484,21 @@ impl LocalTranscriberApp {
         match action {
             PlaygroundAction::Clear(model_id) => {
                 let clearing_active_model = model_id == self.config.general.selected_default_model;
+                let mut output_changed = false;
                 if let Some(card) = self
                     .playground_cards
                     .iter_mut()
                     .find(|card| card.descriptor.id.as_str() == model_id)
                 {
+                    output_changed = !card.transcript.is_empty();
                     card.transcript.clear();
                     card.latency_ms = None;
                     card.audio_duration_ms = None;
                     card.peak_ram_mb = None;
                     card.peak_vram_mb = None;
+                }
+                if output_changed {
+                    self.mark_comparison_output_changed(&model_id);
                 }
                 if clearing_active_model && !self.playground_reference_user_edited {
                     self.playground_reference_transcript.clear();
@@ -4871,15 +4897,20 @@ impl LocalTranscriberApp {
             let expected_model_id = self
                 .expected_playground_model_id(session_id, request_id)
                 .map(str::to_owned);
-            if let Some(expected_model_id) = expected_model_id
+            let mut output_changed = false;
+            if let Some(expected_model_id) = expected_model_id.as_deref()
                 && let Some(card) = self
                     .playground_cards
                     .iter_mut()
                     .find(|card| card.descriptor.id.as_str() == expected_model_id)
             {
                 card.status = ModelRuntimeStatus::Error(message.to_owned());
+                output_changed = !card.transcript.is_empty();
                 card.transcript.clear();
                 card.latency_ms = None;
+            }
+            if output_changed && let Some(expected_model_id) = expected_model_id {
+                self.mark_comparison_output_changed(&expected_model_id);
             }
         }
     }
@@ -5618,14 +5649,19 @@ impl LocalTranscriberApp {
                         }
                         RecordingSource::Playground => {
                             self.status = TranscriptionStatus::Error;
+                            let mut output_changed = false;
                             if let Some(card) = self
                                 .playground_cards
                                 .iter_mut()
                                 .find(|card| card.descriptor.id.as_str() == model_id)
                             {
                                 card.status = ModelRuntimeStatus::Error(message.clone());
+                                output_changed = !card.transcript.is_empty();
                                 card.transcript.clear();
                                 card.latency_ms = None;
+                            }
+                            if output_changed {
+                                self.mark_comparison_output_changed(&model_id);
                             }
                             self.status_message = message;
                             if all_requests_completed {
@@ -6246,6 +6282,7 @@ impl LocalTranscriberApp {
             },
         );
 
+        let mut changed_outputs = Vec::new();
         for (_, model) in &requests {
             if let Some(card) = self
                 .playground_cards
@@ -6253,12 +6290,18 @@ impl LocalTranscriberApp {
                 .find(|card| card.descriptor.id.as_str() == model.id)
             {
                 card.status = ModelRuntimeStatus::Ready;
+                if !card.transcript.is_empty() {
+                    changed_outputs.push(model.id.clone());
+                }
                 card.transcript.clear();
                 card.latency_ms = None;
                 card.audio_duration_ms = audio_duration_ms;
                 card.peak_ram_mb = None;
                 card.peak_vram_mb = None;
             }
+        }
+        for model_id in changed_outputs {
+            self.mark_comparison_output_changed(&model_id);
         }
 
         let tx = self.tx.clone();
@@ -6317,6 +6360,7 @@ impl LocalTranscriberApp {
     }
 
     fn reset_playground_for_run(&mut self) {
+        self.reset_comparison_output_projection();
         self.playground_cards = cards_for_models(
             &self.config,
             &self.transcription_service,
@@ -6341,14 +6385,19 @@ impl LocalTranscriberApp {
             result.model_id.as_str() == self.config.general.selected_default_model;
         let duration_ms = result.processing_duration_ms;
         let transcript = result.transcript.text;
+        let mut output_changed = false;
         if let Some(card) = self
             .playground_cards
             .iter_mut()
             .find(|card| card.descriptor.id == result.model_id)
         {
             card.status = ModelRuntimeStatus::Ready;
+            output_changed = card.transcript != transcript;
             card.transcript = transcript.clone();
             card.latency_ms = duration_ms;
+        }
+        if output_changed {
+            self.mark_comparison_output_changed(result.model_id.as_str());
         }
         if is_active_model && !self.playground_reference_user_edited {
             self.playground_reference_transcript = transcript;
@@ -6356,6 +6405,7 @@ impl LocalTranscriberApp {
     }
 
     fn clear_playground_results(&mut self, clear_reference: bool) {
+        self.reset_comparison_output_projection();
         for card in &mut self.playground_cards {
             card.transcript.clear();
             card.latency_ms = None;
@@ -8170,6 +8220,27 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn mark_comparison_output_changed(&mut self, model_id: &str) {
+        let revision = self
+            .comparison_output_revisions
+            .entry(model_id.to_owned())
+            .or_default();
+        *revision = revision.wrapping_add(1);
+        self.comparison_projection_cache.remove(model_id);
+    }
+
+    fn reset_comparison_output_projection(&mut self) {
+        self.comparison_output_revisions.clear();
+        self.comparison_projection_cache.clear();
+    }
+
+    fn set_comparison_reference(&mut self, reference: Option<String>) {
+        if self.model_comparison.reference_transcript != reference {
+            self.model_comparison.reference_transcript = reference;
+            self.comparison_reference_revision = self.comparison_reference_revision.wrapping_add(1);
+        }
+    }
+
     fn sync_model_comparison_state(&mut self) {
         let Some(model_ids) = self.comparison_run_model_ids.clone() else {
             return;
@@ -8179,13 +8250,6 @@ impl LocalTranscriberApp {
             .values()
             .flat_map(|run| run.pending_requests.values().cloned())
             .collect::<HashSet<_>>();
-        let reference = self
-            .model_comparison
-            .reference_transcript
-            .as_deref()
-            .filter(|reference| !reference.trim().is_empty())
-            .map(str::to_owned);
-
         self.model_comparison.recording_elapsed_ms = self
             .comparison_started_at
             .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
@@ -8195,53 +8259,107 @@ impl LocalTranscriberApp {
             .iter()
             .find_map(|card| card.audio_duration_ms)
             .and_then(|duration| u64::try_from(duration).ok());
-        self.model_comparison.results = model_ids
-            .iter()
-            .map(|model_id| {
-                let card = self
-                    .playground_cards
-                    .iter()
-                    .find(|card| card.descriptor.id.as_str() == model_id);
-                let phase = match card.map(|card| &card.status) {
-                    Some(ModelRuntimeStatus::Running) => ComparisonResultPhase::Processing,
-                    Some(ModelRuntimeStatus::Error(_)) => ComparisonResultPhase::Error,
-                    Some(_) if card.and_then(|card| card.latency_ms).is_some() => {
-                        ComparisonResultPhase::Complete
-                    }
-                    _ if pending_model_ids.contains(model_id) => ComparisonResultPhase::Pending,
-                    _ => ComparisonResultPhase::Pending,
-                };
-                let output = card
-                    .map(|card| card.transcript.clone())
-                    .filter(|output| !output.trim().is_empty());
-                let processing_ms = card
-                    .and_then(|card| card.latency_ms)
-                    .and_then(|duration| u64::try_from(duration).ok());
-                let realtime_factor = processing_ms
-                    .zip(self.model_comparison.audio_duration_ms)
-                    .filter(|(_, audio)| *audio > 0)
-                    .map(|(processing, audio)| processing as f32 / audio as f32);
-                let word_error_rate = reference
+        let results_rebuilt = self.model_comparison.results.len() != model_ids.len()
+            || self
+                .model_comparison
+                .results
+                .iter()
+                .zip(&model_ids)
+                .any(|((result_model_id, _), model_id)| result_model_id != model_id);
+        if results_rebuilt {
+            self.model_comparison.results = model_ids
+                .iter()
+                .cloned()
+                .map(|model_id| (model_id, ComparisonResult::default()))
+                .collect();
+        }
+
+        for (index, model_id) in model_ids.iter().enumerate() {
+            let card = self
+                .playground_cards
+                .iter()
+                .find(|card| card.descriptor.id.as_str() == model_id);
+            let phase = match card.map(|card| &card.status) {
+                Some(ModelRuntimeStatus::Running) => ComparisonResultPhase::Processing,
+                Some(ModelRuntimeStatus::Error(_)) => ComparisonResultPhase::Error,
+                Some(_) if card.and_then(|card| card.latency_ms).is_some() => {
+                    ComparisonResultPhase::Complete
+                }
+                _ if pending_model_ids.contains(model_id) => ComparisonResultPhase::Pending,
+                _ => ComparisonResultPhase::Pending,
+            };
+            let processing_ms = card
+                .and_then(|card| card.latency_ms)
+                .and_then(|duration| u64::try_from(duration).ok());
+            let realtime_factor = processing_ms
+                .zip(self.model_comparison.audio_duration_ms)
+                .filter(|(_, audio)| *audio > 0)
+                .map(|(processing, audio)| processing as f32 / audio as f32);
+            let error = card.and_then(|card| match &card.status {
+                ModelRuntimeStatus::Error(error) => Some(error.clone()),
+                _ => None,
+            });
+            let output_revision = self
+                .comparison_output_revisions
+                .get(model_id)
+                .copied()
+                .unwrap_or_default();
+            let cached = self.comparison_projection_cache.get(model_id).copied();
+            let output_needs_replacement = results_rebuilt
+                || cached.is_none_or(|cached| cached.output_revision != output_revision);
+            let wer_needs_recompute = cached.is_none_or(|cached| {
+                cached.output_revision != output_revision
+                    || cached.reference_revision != self.comparison_reference_revision
+            });
+            let output_text = (output_needs_replacement || wer_needs_recompute)
+                .then(|| {
+                    card.map(|card| card.transcript.as_str())
+                        .filter(|output| !output.trim().is_empty())
+                })
+                .flatten();
+            let replacement = output_needs_replacement.then(|| output_text.map(str::to_owned));
+            let word_error_rate = if wer_needs_recompute {
+                let reference = self
+                    .model_comparison
+                    .reference_transcript
                     .as_deref()
-                    .zip(output.as_deref())
+                    .filter(|reference| !reference.trim().is_empty());
+                let word_error_rate = reference
+                    .zip(output_text)
                     .map(|(reference, output)| benchmark::calculate_wer(reference, output) as f32);
-                let error = card.and_then(|card| match &card.status {
-                    ModelRuntimeStatus::Error(error) => Some(error.clone()),
-                    _ => None,
-                });
-                (
+                #[cfg(test)]
+                if reference.is_some() && output_text.is_some() {
+                    self.comparison_wer_compute_count += 1;
+                }
+                self.comparison_projection_cache.insert(
                     model_id.clone(),
-                    ComparisonResult {
-                        phase,
-                        output,
-                        processing_ms,
-                        realtime_factor,
+                    ComparisonProjectionCacheEntry {
+                        reference_revision: self.comparison_reference_revision,
+                        output_revision,
                         word_error_rate,
-                        error,
                     },
-                )
-            })
-            .collect();
+                );
+                word_error_rate
+            } else {
+                cached.and_then(|cached| cached.word_error_rate)
+            };
+
+            let result = &mut self.model_comparison.results[index].1;
+            if let Some(replacement) = replacement {
+                result.output = replacement;
+                #[cfg(test)]
+                {
+                    self.comparison_output_replacement_count += 1;
+                }
+            }
+            result.phase = phase;
+            result.processing_ms = processing_ms;
+            result.realtime_factor = realtime_factor;
+            result.word_error_rate = word_error_rate;
+            result.error = error;
+        }
+        self.comparison_projection_cache
+            .retain(|model_id, _| model_ids.contains(model_id));
 
         self.model_comparison.phase =
             if self.recording_source() == Some(RecordingSource::Playground) {
@@ -8503,8 +8621,7 @@ impl LocalTranscriberApp {
             ScreenAction::ApplyComparisonReference => {
                 let reference = self.model_comparison.reference_draft.trim().to_owned();
                 self.model_comparison.reference_draft = reference.clone();
-                self.model_comparison.reference_transcript =
-                    (!reference.is_empty()).then_some(reference);
+                self.set_comparison_reference((!reference.is_empty()).then_some(reference));
                 self.model_comparison.reference_editor_visible = false;
                 self.model_comparison.focus_reference_editor = false;
                 self.model_comparison.restore_reference_action_focus = true;
@@ -8514,7 +8631,7 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ClearComparisonReference => {
                 self.model_comparison.reference_draft.clear();
-                self.model_comparison.reference_transcript = None;
+                self.set_comparison_reference(None);
                 self.model_comparison.reference_editor_visible = false;
                 self.model_comparison.focus_reference_editor = false;
                 self.model_comparison.restore_reference_action_focus = true;
@@ -13810,6 +13927,75 @@ mod layout_tests {
     }
 
     #[test]
+    fn comparison_projection_recomputes_wer_only_for_changed_revisions() {
+        let mut app = test_app();
+        let first_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
+        let second_id = "comparison-cache-second".to_owned();
+        let mut second_card = app.playground_cards[0].clone();
+        second_card.descriptor.id = ModelId::new(&second_id);
+        app.playground_cards.push(second_card);
+        app.playground_cards[0].status = ModelRuntimeStatus::Ready;
+        app.playground_cards[0].transcript = "hello brave world".to_owned();
+        app.playground_cards[0].latency_ms = Some(100);
+        app.playground_cards[1].status = ModelRuntimeStatus::Ready;
+        app.playground_cards[1].transcript = "hello word".to_owned();
+        app.playground_cards[1].latency_ms = Some(120);
+        app.comparison_run_model_ids = Some(vec![first_id.clone(), second_id.clone()]);
+        app.comparison_started_at = Some(Instant::now());
+        app.set_comparison_reference(Some("hello world".to_owned()));
+
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 2);
+        assert_eq!(app.comparison_output_replacement_count, 2);
+        assert_eq!(
+            app.model_comparison.results[0].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello world", "hello brave world") as f32)
+        );
+        let output_pointers = app
+            .model_comparison
+            .results
+            .iter()
+            .map(|(_, result)| result.output.as_ref().unwrap().as_ptr())
+            .collect::<Vec<_>>();
+
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 2);
+        assert_eq!(app.comparison_output_replacement_count, 2);
+        assert_eq!(
+            app.model_comparison
+                .results
+                .iter()
+                .map(|(_, result)| result.output.as_ref().unwrap().as_ptr())
+                .collect::<Vec<_>>(),
+            output_pointers
+        );
+
+        app.playground_cards[0].transcript = "hello world".to_owned();
+        app.mark_comparison_output_changed(&first_id);
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 3);
+        assert_eq!(app.comparison_output_replacement_count, 3);
+        assert_eq!(app.model_comparison.results[0].1.word_error_rate, Some(0.0));
+
+        app.set_comparison_reference(Some("hello brave world".to_owned()));
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 5);
+        assert_eq!(app.comparison_output_replacement_count, 3);
+        assert_eq!(
+            app.model_comparison.results[0].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello brave world", "hello world") as f32)
+        );
+        assert_eq!(
+            app.model_comparison.results[1].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello brave world", "hello word") as f32)
+        );
+    }
+
+    #[test]
     fn models_render_clears_reference_focus_requests_and_notice_after_one_frame() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -14776,6 +14962,11 @@ mod layout_tests {
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,
             comparison_started_at: None,
+            comparison_reference_revision: 0,
+            comparison_output_revisions: HashMap::new(),
+            comparison_projection_cache: HashMap::new(),
+            comparison_wer_compute_count: 0,
+            comparison_output_replacement_count: 0,
             model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
