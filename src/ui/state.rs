@@ -519,6 +519,8 @@ pub(crate) struct ComparisonResult {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ModelComparisonState {
     pub expanded: bool,
+    /// One-frame focus request after the page-header Compare action opens the panel.
+    pub focus_panel: bool,
     pub selected_model_ids: BTreeSet<String>,
     pub phase: ComparisonPhase,
     pub audio_duration_ms: Option<u64>,

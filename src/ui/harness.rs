@@ -7,7 +7,7 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ComparisonPhase, ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
         ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
         RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
@@ -18,6 +18,8 @@ use super::{
 
 #[cfg(test)]
 use super::screens::{render_remote_catalog, screen_action_for_remote_catalog_action};
+#[cfg(test)]
+use super::state::{ComparisonResult, ComparisonResultPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -77,7 +79,7 @@ impl Fixture {
         };
         let models = vec![
             model("whisper.cpp base.en", "base.en", true, true, 400),
-            model("Tiny English", "tiny.en", false, false, 75),
+            model("whisper.cpp tiny.en", "tiny.en", false, false, 75),
         ];
         let mut comparison = ModelComparisonState::default();
         let settings = RecordingSettingsView {
@@ -151,8 +153,10 @@ fn model(
         active,
         ready: true,
         recommended,
-        primary_action_label: if active { "Active" } else { "Use" }.into(),
+        primary_action_label: if active { "Active" } else { "Use this model" }.into(),
         primary_action_enabled: !active,
+        primary_action_disabled_reason: active.then(|| "This model is already active.".to_owned()),
+        removal_supported: true,
         runtime_status_label: "Ready".into(),
         download_state: ModelDownloadState::Installed,
         disk_bytes: Some(ram_mb * 1_000_000),
@@ -257,12 +261,16 @@ impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
+        let clear_comparison_focus = self.data.comparison.focus_panel;
         let clear_reference_action_focus = self.data.comparison.restore_reference_action_focus;
         let clear_reference_notice = self.data.comparison.reference_notice.is_some();
         let clear_after_removal_focus = self.data.model_management.restore_after_removal_focus;
         let action = show_harness(ctx, &self.data, &mut self.page);
         if clear_reference_editor_focus {
             self.data.comparison.focus_reference_editor = false;
+        }
+        if clear_comparison_focus {
+            self.data.comparison.focus_panel = false;
         }
         if clear_reference_action_focus {
             self.data.comparison.restore_reference_action_focus = false;
@@ -324,12 +332,29 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
 fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction) {
     match action {
         ScreenAction::None
-        | ScreenAction::SelectModel(_)
         | ScreenAction::InstallModel(_)
         | ScreenAction::CancelModelInstall(_)
         | ScreenAction::RepairModelRuntime(_)
         | ScreenAction::MaintainModelRuntime(_)
         | ScreenAction::RetryRemoteCatalog => {}
+        ScreenAction::SelectModel(id) => {
+            data.transcription.selected_model_id = Some(id.clone());
+            for model in &mut data.models {
+                model.active = model.id == id;
+                model.primary_action_label = if model.active {
+                    "Active"
+                } else {
+                    "Use this model"
+                }
+                .to_owned();
+                model.primary_action_enabled = !model.active;
+                model.primary_action_disabled_reason = model
+                    .active
+                    .then(|| "This model is already active.".to_owned());
+            }
+            data.model_management.dialog = None;
+            data.model_management.restore_details_focus = Some(id);
+        }
         ScreenAction::AddModel => {
             data.model_management.dialog = Some(ModelDialog::Add);
             data.model_management.focus_dialog_initial = true;
@@ -365,6 +390,23 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
         ScreenAction::CopyTranscript => {}
+        ScreenAction::OpenComparison => {
+            data.comparison.expanded = true;
+            data.comparison.focus_panel = true;
+            if data.comparison.selected_model_ids.is_empty() {
+                data.comparison.selected_model_ids.extend(
+                    data.models
+                        .iter()
+                        .filter(|model| {
+                            model.installed
+                                && model.ready
+                                && model.compatibility != ModelCompatibility::Incompatible
+                        })
+                        .take(2)
+                        .map(|model| model.id.clone()),
+                );
+            }
+        }
         ScreenAction::ToggleComparison => data.comparison.expanded = !data.comparison.expanded,
         ScreenAction::ToggleComparisonModel(id) => {
             if !data.comparison.selected_model_ids.insert(id.clone()) {
@@ -604,6 +646,7 @@ mod tests {
         let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
+        let clear_comparison_panel_focus = data.comparison.focus_panel;
         let clear_reference_notice = data.comparison.reference_notice.is_some();
         let clear_after_removal_focus = data.model_management.restore_after_removal_focus;
         let mut action = ScreenAction::None;
@@ -624,6 +667,9 @@ mod tests {
         }
         if clear_reference_action_focus {
             data.comparison.restore_reference_action_focus = false;
+        }
+        if clear_comparison_panel_focus {
+            data.comparison.focus_panel = false;
         }
         if clear_reference_notice {
             data.comparison.reference_notice = None;
@@ -808,6 +854,30 @@ mod tests {
             .map(|(_, node)| node)
             .find(|node| predicate(node))
             .expect("expected AccessKit node")
+    }
+
+    fn accesskit_descends_from(
+        output: &egui::FullOutput,
+        ancestor: egui::accesskit::NodeId,
+        target: egui::accesskit::NodeId,
+    ) -> bool {
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes;
+        let mut pending = vec![ancestor];
+        while let Some(id) = pending.pop() {
+            let Some((_, node)) = nodes.iter().find(|(node_id, _)| *node_id == id) else {
+                continue;
+            };
+            if node.children().contains(&target) {
+                return true;
+            }
+            pending.extend(node.children());
+        }
+        false
     }
 
     fn focused_node(output: &egui::FullOutput) -> &egui::accesskit::Node {
@@ -1419,14 +1489,14 @@ mod tests {
             (ModelDialog::Add, "Add models", "Add models", "Close"),
             (
                 ModelDialog::Details("base.en".into()),
-                "Details for whisper.cpp base.en",
+                "Open details for whisper.cpp base.en",
                 "Model details for whisper.cpp base.en",
                 "Close",
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),
                 "Expand comparison",
-                "Remove Tiny English",
+                "Remove whisper.cpp tiny.en",
                 "Cancel",
             ),
         ] {
@@ -1538,6 +1608,335 @@ mod tests {
     }
 
     #[test]
+    fn model_dialog_and_comparison_table_preserve_accessible_hierarchy() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+
+        let dialog_output =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let dialog_id = node_id_matching(&dialog_output, |node| {
+            node.role() == egui::accesskit::Role::Dialog
+                && node.name() == Some("Model details for whisper.cpp tiny.en")
+        });
+        for control in ["Use this model", "Remove from device", "Close"] {
+            assert!(
+                accesskit_descends_from(
+                    &dialog_output,
+                    dialog_id,
+                    named_node_id(&dialog_output, control),
+                ),
+                "{control} must descend from the details dialog"
+            );
+        }
+
+        let comparison_output = render(Fixture::ModelsCompareExpanded, width, height);
+        let table_id = node_id_matching(&comparison_output, |node| {
+            node.role() == egui::accesskit::Role::Table
+                && node.name() == Some("Model comparison results")
+        });
+        let surface_id = named_node_id(&comparison_output, "Model comparison surface");
+        assert!(
+            accesskit_descends_from(&comparison_output, surface_id, table_id),
+            "wide result table must descend from the comparison surface"
+        );
+        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+            let row_id = node_id_matching(&comparison_output, |node| {
+                node.role() == egui::accesskit::Role::Row
+                    && node.name() == Some(format!("Comparison result for {model}").as_str())
+            });
+            assert!(
+                accesskit_descends_from(&comparison_output, table_id, row_id),
+                "{model} row must descend from the comparison table"
+            );
+            let accuracy_cell_id = node_id_matching(&comparison_output, |node| {
+                node.role() == egui::accesskit::Role::Cell
+                    && node.name() == Some(format!("Accuracy for {model}").as_str())
+            });
+            let accuracy_action_id = node_id_matching(&comparison_output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.description().is_some_and(|description| {
+                        description
+                            == format!(
+                                "Add a reference transcript to measure accuracy for {model}."
+                            )
+                    })
+            });
+            assert!(
+                accesskit_descends_from(&comparison_output, row_id, accuracy_cell_id),
+                "{model} accuracy cell must descend from its row"
+            );
+            assert!(
+                accesskit_descends_from(&comparison_output, accuracy_cell_id, accuracy_action_id,),
+                "{model} accuracy action must descend from its cell"
+            );
+        }
+
+        let compact_output = render(Fixture::ModelsCompareExpanded, 960.0, 680.0);
+        let compact_surface_id = named_node_id(&compact_output, "Model comparison surface");
+        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+            let group_id = node_id_matching(&compact_output, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some(format!("Comparison result for {model}").as_str())
+            });
+            let accuracy_action_id = node_id_matching(&compact_output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.description().is_some_and(|description| {
+                        description
+                            == format!(
+                                "Add a reference transcript to measure accuracy for {model}."
+                            )
+                    })
+            });
+            assert!(
+                accesskit_descends_from(&compact_output, compact_surface_id, group_id),
+                "{model} compact group must descend from the comparison surface"
+            );
+            assert!(
+                accesskit_descends_from(&compact_output, group_id, accuracy_action_id),
+                "{model} compact accuracy action must descend from its result group"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_model_rows_are_dense_and_open_details_from_every_input() {
+        let (width, height) = (1180.0, 815.0);
+        let row_name = "Open details for whisper.cpp base.en";
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let row = named_node_bounds(&output, row_name);
+        assert!(
+            (76.0..=82.0).contains(&(row.y1 - row.y0)),
+            "installed row height should match the 80 px reference, got {}",
+            row.y1 - row.y0
+        );
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, width, height, row_name),
+            ScreenAction::ShowModelDetails("base.en".into())
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let row_id = named_node_id(&output, row_name);
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: row_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::ShowModelDetails("base.en".into()));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let row_id = named_node_id(&output, row_name);
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: row_id,
+                    data: None,
+                },
+            )],
+        );
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(action, ScreenAction::ShowModelDetails("base.en".into()));
+    }
+
+    #[test]
+    fn model_details_preserve_use_and_remove_actions_with_disabled_reasons() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let use_id = named_node_id(&output, "Use this model");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: use_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::SelectModel("tiny.en".into()));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut repair = Fixture::ModelsInstalled.data();
+        let repair_model = repair
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .unwrap();
+        repair_model.primary_action_label = "Repair runtime".into();
+        repair_model.primary_action_enabled = true;
+        repair_model.primary_action_repairs_runtime = true;
+        repair_model.primary_action_disabled_reason = None;
+        repair.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        let mut repair_page = Fixture::ModelsInstalled.page();
+        let output = render_with_input(
+            &ctx,
+            &mut repair,
+            &mut repair_page,
+            width,
+            height,
+            Vec::new(),
+        )
+        .0;
+        let repair_id = node_id_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Repair runtime")
+                && !node.is_disabled()
+        });
+        let (_, repair_action) = render_with_input(
+            &ctx,
+            &mut repair,
+            &mut repair_page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: repair_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            repair_action,
+            ScreenAction::RepairModelRuntime("tiny.en".into())
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let remove_id = named_node_id(&output, "Remove from device");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: remove_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::RequestModelRemoval("tiny.en".into()));
+
+        let mut active = Fixture::ModelsInstalled.data();
+        active.models[0].primary_action_disabled_reason =
+            Some("This model is already active.".into());
+        active.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
+        let output = render_with_input(&ctx, &mut active, &mut page, width, height, Vec::new()).0;
+        assert!(
+            node_matching(&output, |node| {
+                node.name() == Some("Active")
+                    && node.is_disabled()
+                    && node.description() == Some("This model is already active.")
+            })
+            .is_disabled()
+        );
+        assert!(
+            node_matching(&output, |node| {
+                node.name() == Some("Remove from device")
+                    && node.is_disabled()
+                    && node.description()
+                        == Some("Select another ready model before removing the active model.")
+            })
+            .is_disabled()
+        );
+    }
+
+    #[test]
+    fn harness_model_selection_updates_the_following_transcribe_projection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+
+        apply_action(
+            &mut data,
+            &mut page,
+            ScreenAction::SelectModel("tiny.en".into()),
+        );
+        page = AppPage::Transcribe;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+
+        assert_eq!(
+            data.transcription.selected_model_id.as_deref(),
+            Some("tiny.en")
+        );
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "whisper.cpp tiny.en")
+        );
+    }
+
+    #[test]
     fn confirmed_model_removal_restores_focus_to_add_models() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
@@ -1624,7 +2023,7 @@ mod tests {
     fn comparison_panel_stays_near_the_bottom_without_infinite_scroll_spacing() {
         for (fixture, minimum_top) in [
             (Fixture::ModelsInstalled, 500.0),
-            (Fixture::ModelsCompareExpanded, 430.0),
+            (Fixture::ModelsCompareExpanded, 390.0),
         ] {
             let output = render(fixture, 1180.0, 815.0);
             let bounds = output
@@ -1647,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn model_comparison_surface_matches_main_content_width_at_preferred_and_compact_sizes() {
+    fn model_comparison_surface_bleeds_to_the_body_edges_at_supported_sizes() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
             for (fixture, toggle_name) in [
                 (Fixture::ModelsInstalled, "Expand comparison"),
@@ -1677,13 +2076,13 @@ mod tests {
 
                 assert_near(
                     surface.x0,
-                    models.x0,
-                    "surface left should align with Models heading",
+                    models.x0 - 28.0,
+                    "surface left should bleed beyond the inset Models content",
                 );
                 assert_near(
                     surface.x1,
-                    add_models.x1,
-                    "surface right should align with Add models",
+                    add_models.x1 + 28.0,
+                    "surface right should bleed beyond the inset Models content",
                 );
                 assert_near(
                     chevron.x1,
@@ -1752,7 +2151,47 @@ mod tests {
     }
 
     #[test]
-    fn comparison_header_pointer_toggles_without_creating_an_accessible_header_button() {
+    fn page_compare_action_opens_focuses_and_seeds_two_eligible_models() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.comparison.selected_model_ids.clear();
+
+        let action = click_named_control(&ctx, &mut data, &mut page, width, height, "Compare");
+        assert_eq!(action, ScreenAction::OpenComparison);
+        apply_action(&mut data, &mut page, action);
+        assert!(data.comparison.expanded);
+        assert!(data.comparison.focus_panel);
+        assert_eq!(data.comparison.selected_model_ids.len(), 2);
+
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        assert_eq!(focused_node(&output).name(), Some("Collapse comparison"));
+        assert!(!data.comparison.focus_panel);
+
+        let start_recording_id = named_node_id(&output, "Start test recording");
+        let next = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: start_recording_id,
+                    data: None,
+                },
+            )],
+        )
+        .0;
+        assert_eq!(focused_node(&next).name(), Some("Start test recording"));
+    }
+
+    #[test]
+    fn comparison_header_is_one_full_width_accessible_toggle_target() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1766,7 +2205,7 @@ mod tests {
         assert!(!data.comparison.expanded);
 
         let heading = named_node_bounds(&initial_output, "Compare installed models");
-        let chevron = named_node_bounds(&initial_output, "Expand comparison");
+        let toggle = named_node_bounds(&initial_output, "Expand comparison");
         let click_point = egui::pos2(
             heading.x0 as f32 + 1.0,
             ((heading.y0 + heading.y1) / 2.0) as f32,
@@ -1778,30 +2217,32 @@ mod tests {
                 && (click_point.y as f64) <= heading.y1
         );
         assert!(
-            (click_point.x as f64) < chevron.x0
-                || (click_point.x as f64) > chevron.x1
-                || (click_point.y as f64) < chevron.y0
-                || (click_point.y as f64) > chevron.y1,
-            "header click point must not overlap the chevron"
+            (click_point.x as f64) >= toggle.x0
+                && (click_point.x as f64) <= toggle.x1
+                && (click_point.y as f64) >= toggle.y0
+                && (click_point.y as f64) <= toggle.y1,
+            "the accessible toggle must cover the visible header"
         );
-        let chevron_node = node_matching(&initial_output, |node| {
+        let toggle_node = node_matching(&initial_output, |node| {
             node.name() == Some("Expand comparison")
         });
-        assert_eq!(chevron_node.role(), egui::accesskit::Role::Button);
-        assert_eq!(chevron_node.is_expanded(), Some(false));
-        assert!(
-            !initial_output
+        assert_eq!(toggle_node.role(), egui::accesskit::Role::Button);
+        assert_eq!(toggle_node.is_expanded(), Some(false));
+        assert_eq!(
+            initial_output
                 .platform_output
                 .accesskit_update
                 .as_ref()
                 .unwrap()
                 .nodes
                 .iter()
-                .any(|(_, node)| {
+                .filter(|(_, node)| {
                     node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Compare installed models")
-                }),
-            "the pointer-only header must not become a second accessible button"
+                        && node.name() == Some("Expand comparison")
+                })
+                .count(),
+            1,
+            "the disclosure header must expose one accessible toggle"
         );
 
         let (press_output, press_action) = render_with_input(
@@ -1847,11 +2288,11 @@ mod tests {
         let (expanded_output, expanded_action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(expanded_action, ScreenAction::None);
-        let expanded_chevron = node_matching(&expanded_output, |node| {
+        let expanded_toggle = node_matching(&expanded_output, |node| {
             node.name() == Some("Collapse comparison")
         });
-        assert_eq!(expanded_chevron.role(), egui::accesskit::Role::Button);
-        assert_eq!(expanded_chevron.is_expanded(), Some(true));
+        assert_eq!(expanded_toggle.role(), egui::accesskit::Role::Button);
+        assert_eq!(expanded_toggle.is_expanded(), Some(true));
         drop(release_output);
     }
 
@@ -2098,19 +2539,48 @@ mod tests {
                 node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some(heading)
             }));
         }
+        let header_bounds = ["Model", "Duration", "Processing time", "Output", "Accuracy"]
+            .map(|heading| named_node_bounds(&wide, heading));
+        for pair in header_bounds.windows(2) {
+            assert!(
+                pair[0].x1 <= pair[1].x0 + 1.0,
+                "comparison headers must occupy non-overlapping columns: {pair:?}"
+            );
+        }
+        assert!(
+            !node_names(&wide).iter().any(|name| name == "Not run"),
+            "initial desktop rows should not add redundant Not run lines"
+        );
+        let surface = named_node_bounds(&wide, "Model comparison surface");
+        let start = named_node_bounds(&wide, "Start test recording");
+        assert!(
+            start.x1 >= surface.x1 - 20.0,
+            "wide comparison action should align to the right edge"
+        );
 
-        let compact = render(Fixture::ModelsCompareExpanded, 680.0, 815.0);
+        let compact = render(Fixture::ModelsCompareExpanded, 960.0, 680.0);
         let compact_nodes = &compact
             .platform_output
             .accesskit_update
             .as_ref()
             .unwrap()
             .nodes;
-        for model in ["whisper.cpp base.en", "Tiny English"] {
+        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
             assert!(compact_nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Group
                     && node.name() == Some(format!("Comparison result for {model}").as_str())
             }));
+            let group = node_matching(&compact, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some(format!("Comparison result for {model}").as_str())
+            })
+            .bounds()
+            .expect("compact result group should expose bounds");
+            let surface = named_node_bounds(&compact, "Model comparison surface");
+            assert!(
+                group.x1 - group.x0 >= surface.x1 - surface.x0 - 40.0,
+                "compact result groups should use the comparison content width"
+            );
         }
         assert_eq!(
             compact_nodes
@@ -2125,6 +2595,98 @@ mod tests {
         assert!(!compact_nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some("Model")
         }));
+    }
+
+    #[test]
+    fn four_long_comparison_choices_do_not_overlap_the_recording_action() {
+        let (width, height) = (960.0, 680.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCompareExpanded.data();
+        let template = data.models[0].clone();
+        data.models = [
+            "whisper.cpp exceptionally-long-base-english-quantized",
+            "whisper.cpp exceptionally-long-tiny-english-quantized",
+            "whisper.cpp exceptionally-long-small-english-quantized",
+            "whisper.cpp exceptionally-long-medium-english-quantized",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut model = template.clone();
+            model.id = format!("long-{index}");
+            model.display_name = name.to_owned();
+            model.variant_label = format!("long-{index}");
+            model.active = index == 0;
+            model.recommended = false;
+            model
+        })
+        .collect();
+        data.comparison.selected_model_ids =
+            data.models.iter().map(|model| model.id.clone()).collect();
+        data.comparison.focus_panel = true;
+        let mut page = Fixture::ModelsCompareExpanded.page();
+
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let start = named_node_bounds(&output, "Start test recording");
+        for model in &data.models {
+            let choice = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::CheckBox
+                    && node.name() == Some(model.display_name.as_str())
+            })
+            .bounds()
+            .expect("comparison choice should expose bounds");
+            let overlaps = choice.x0 < start.x1
+                && choice.x1 > start.x0
+                && choice.y0 < start.y1
+                && choice.y1 > start.y0;
+            assert!(
+                !overlaps,
+                "{} overlaps the recording action",
+                model.display_name
+            );
+        }
+
+        let header = named_node_bounds(&output, "Collapse comparison");
+        assert!(header.y0 >= 0.0 && header.y1 <= height.into());
+        assert_eq!(focused_node(&output).name(), Some("Collapse comparison"));
+    }
+
+    #[test]
+    fn completed_comparison_keeps_the_full_output_accessible_when_visually_truncated() {
+        let mut data = Fixture::ModelsCompareExpanded.data();
+        let long_output = "This is a realistic multi-sentence comparison transcript. It stays available in full even when the compact table column uses an ellipsis.";
+        data.comparison.results = vec![(
+            "base.en".into(),
+            ComparisonResult {
+                phase: ComparisonResultPhase::Complete,
+                output: Some(long_output.into()),
+                ..Default::default()
+            },
+        )];
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut page = Fixture::ModelsCompareExpanded.page();
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Cell
+                        && node.name()
+                            == Some(
+                                format!("Output for whisper.cpp base.en: {long_output}").as_str(),
+                            )
+                })
+        );
     }
 
     #[test]

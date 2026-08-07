@@ -68,9 +68,10 @@ fn main() -> eframe::Result<()> {
 }
 
 fn native_options() -> eframe::NativeOptions {
+    let inner_size = initial_window_size();
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 815.0])
+            .with_inner_size(inner_size)
             .with_min_inner_size([960.0, 680.0])
             .with_resizable(true)
             .with_transparent(false),
@@ -79,6 +80,27 @@ fn native_options() -> eframe::NativeOptions {
         event_loop_builder: Some(Box::new(configure_event_loop_backend)),
         ..Default::default()
     }
+}
+
+fn initial_window_size() -> [f32; 2] {
+    #[cfg(all(feature = "ui-harness", debug_assertions))]
+    if ui::fixture_from_env().is_some()
+        && let Some(size) = std::env::var("SCRIBE_UI_HARNESS_VIEWPORT")
+            .ok()
+            .and_then(|value| parse_harness_viewport(&value))
+    {
+        return size;
+    }
+    [1180.0, 815.0]
+}
+
+#[cfg(all(feature = "ui-harness", debug_assertions))]
+fn parse_harness_viewport(value: &str) -> Option<[f32; 2]> {
+    let (width, height) = value.trim().split_once('x')?;
+    let width = width.trim().parse::<f32>().ok()?;
+    let height = height.trim().parse::<f32>().ok()?;
+    (width.is_finite() && height.is_finite() && width >= 960.0 && height >= 680.0)
+        .then_some([width, height])
 }
 
 fn configure_graphics_environment() {
@@ -205,6 +227,19 @@ mod tests {
         assert_eq!(options.viewport.resizable, Some(true));
         assert_eq!(options.viewport.transparent, Some(false));
         assert!(options.follow_system_theme);
+    }
+
+    #[cfg(all(feature = "ui-harness", debug_assertions))]
+    #[test]
+    fn harness_viewport_parser_accepts_supported_sizes_and_rejects_invalid_input() {
+        assert_eq!(parse_harness_viewport("960x680"), Some([960.0, 680.0]));
+        assert_eq!(
+            parse_harness_viewport(" 1180 x 815 "),
+            Some([1180.0, 815.0])
+        );
+        assert_eq!(parse_harness_viewport("959x680"), None);
+        assert_eq!(parse_harness_viewport("960x679"), None);
+        assert_eq!(parse_harness_viewport("wide"), None);
     }
 
     #[test]

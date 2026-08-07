@@ -173,6 +173,7 @@ pub(crate) enum ScreenAction {
     RetryMicrophone,
     ClearTranscript,
     CopyTranscript,
+    OpenComparison,
     ToggleComparison,
     ToggleComparisonModel(String),
     StartComparison,
@@ -1078,7 +1079,7 @@ fn format_relative_capture_time(capture_age_ms: u64) -> String {
 fn is_repeated_microphone_error(detail: &str) -> bool {
     let normalized = detail
         .trim()
-        .trim_end_matches(|character: char| matches!(character, '.' | '!' | '…'))
+        .trim_end_matches(['.', '!', '…'])
         .trim()
         .replace('’', "'")
         .to_ascii_lowercase();
@@ -1222,6 +1223,29 @@ fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
     );
 }
 
+fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color32>) {
+    let colors = ui_palette(ui);
+    Frame::none()
+        .fill(colors.disabled_bg)
+        .rounding(Rounding::same(999.0))
+        .inner_margin(Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.horizontal(|ui| {
+                if let Some(dot) = dot {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.0, dot);
+                }
+                ui.label(
+                    RichText::new(text)
+                        .small()
+                        .color(colors.muted_text)
+                        .strong(),
+                );
+            });
+        });
+}
+
 fn model_family_name(model: &ModelViewModel) -> &str {
     model
         .display_name
@@ -1236,7 +1260,7 @@ fn models_footer_spacer(
     comparison_expanded: bool,
     has_storage_footer: bool,
 ) -> f32 {
-    let comparison_height = if comparison_expanded { 330.0 } else { 92.0 };
+    let comparison_height = if comparison_expanded { 280.0 } else { 92.0 };
     let storage_height = if has_storage_footer { 40.0 } else { 0.0 };
     (remaining_height - comparison_height - storage_height).max(16.0)
 }
@@ -1244,6 +1268,8 @@ fn models_footer_spacer(
 fn comparison_surface_width(available_width: f32) -> f32 {
     available_width.max(0.0)
 }
+
+const MODEL_COMPARISON_BODY_BLEED: f32 = 28.0;
 
 fn comparison_content_min_width(surface_width: f32, inner_margin: f32) -> f32 {
     (surface_width - inner_margin * 2.0).max(0.0)
@@ -1317,7 +1343,7 @@ fn models(
                 compare.clone().on_hover_text(reason);
             }
             if compare.clicked() {
-                action = ScreenAction::ToggleComparison;
+                action = ScreenAction::OpenComparison;
             }
         });
     });
@@ -1333,93 +1359,122 @@ fn models(
         ui.add_space(8.0);
     }
     for model in models {
-        card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_min_width(160.0);
-                    ui.label(RichText::new(model_family_name(model)).strong());
-                    ui.label(
-                        RichText::new(&model.variant_label)
-                            .small()
-                            .color(colors.muted_text),
-                    );
-                });
-                badge(
-                    ui,
-                    if model.active { "Active" } else { "Installed" },
-                    model.active.then_some(colors.success),
-                );
-                if model.recommended {
-                    badge(ui, "Recommended", None);
-                }
-                if let Some(ram) = model.estimated_ram_bytes {
-                    metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
-                }
-                metadata(ui, Icon::Globe, &model.language_summary);
-                metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
-                metadata(ui, Icon::Folder, size_label(model.size_tier));
-            });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                let primary = ui
-                    .add_enabled_ui(model.primary_action_enabled, |ui| {
-                        button(ui, &model.primary_action_label, ButtonTone::Secondary)
-                    })
-                    .inner;
-                if let Some(reason) = &model.primary_action_disabled_reason {
-                    ui.ctx().accesskit_node_builder(primary.id, |builder| {
-                        builder.set_description(reason.as_str());
+        let row_width = ui.available_width();
+        let row = Frame::none()
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0, colors.border))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::symmetric(16.0, 14.0))
+            .show(ui, |ui| {
+                ui.set_min_width((row_width - 32.0).max(0.0));
+                ui.set_min_height(50.0);
+                if row_width >= 900.0 {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(190.0, 50.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new(model_family_name(model)).strong());
+                                ui.label(
+                                    RichText::new(&model.variant_label)
+                                        .small()
+                                        .color(colors.muted_text),
+                                );
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(205.0, 50.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                installed_model_badge(
+                                    ui,
+                                    if model.active { "Active" } else { "Installed" },
+                                    model.active.then_some(colors.success),
+                                );
+                                if model.recommended {
+                                    installed_model_badge(ui, "Recommended", None);
+                                }
+                            },
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(icon_glyph(Icon::ChevronRight))
+                                    .small()
+                                    .color(colors.tertiary_text),
+                            )
+                            .on_hover_text("Open model details and actions");
+                            metadata(ui, Icon::Folder, size_label(model.size_tier));
+                            metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
+                            metadata(ui, Icon::Globe, &model.language_summary);
+                            if let Some(ram) = model.estimated_ram_bytes {
+                                metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
+                            }
+                        });
                     });
-                    focus_tooltip(ui, &primary, reason);
-                    primary.clone().on_hover_text(reason);
-                }
-                if primary.clicked() {
-                    action = if model.primary_action_repairs_runtime {
-                        ScreenAction::RepairModelRuntime(model.id.clone())
-                    } else {
-                        ScreenAction::SelectModel(model.id.clone())
-                    };
-                }
-                let details = button(ui, "Details", ButtonTone::Text);
-                ui.ctx().accesskit_node_builder(details.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Button);
-                    builder.set_name(format!("Details for {}", model.display_name));
-                });
-                if management.restore_details_focus.as_deref() == Some(model.id.as_str()) {
-                    details.request_focus();
-                }
-                if details.clicked() {
-                    action = ScreenAction::ShowModelDetails(model.id.clone());
-                }
-                let remove_reason = if model.active {
-                    Some("Select another ready model before removing the active model.")
-                } else if model.custom {
-                    Some("Custom model files are not managed by Scribe and will not be deleted.")
-                } else if !model.removal_supported {
-                    Some("This model is not an app-managed download and cannot be removed here.")
                 } else {
-                    None
-                };
-                let remove = ui.add_enabled(remove_reason.is_none(), egui::Button::new("Remove"));
-                ui.ctx().accesskit_node_builder(remove.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Button);
-                    builder.set_name(format!("Remove {}", model.display_name));
-                });
-                if management.restore_remove_focus.as_deref() == Some(model.id.as_str()) {
-                    remove.request_focus();
-                }
-                if let Some(reason) = remove_reason {
-                    ui.ctx().accesskit_node_builder(remove.id, |builder| {
-                        builder.set_description(reason);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.set_min_width(160.0);
+                            ui.label(RichText::new(model_family_name(model)).strong());
+                            ui.label(
+                                RichText::new(&model.variant_label)
+                                    .small()
+                                    .color(colors.muted_text),
+                            );
+                        });
+                        installed_model_badge(
+                            ui,
+                            if model.active { "Active" } else { "Installed" },
+                            model.active.then_some(colors.success),
+                        );
+                        if model.recommended {
+                            installed_model_badge(ui, "Recommended", None);
+                        }
+                        if let Some(ram) = model.estimated_ram_bytes {
+                            metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
+                        }
+                        metadata(ui, Icon::Globe, &model.language_summary);
+                        metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
+                        metadata(ui, Icon::Folder, size_label(model.size_tier));
+                        ui.label(
+                            RichText::new(icon_glyph(Icon::ChevronRight))
+                                .small()
+                                .color(colors.tertiary_text),
+                        );
                     });
-                    ui.label(RichText::new(reason).small().color(colors.muted_text));
-                    remove.clone().on_hover_text(reason);
                 }
-                if remove.clicked() {
-                    action = ScreenAction::RequestModelRemoval(model.id.clone());
-                }
+            })
+            .response;
+        let row = ui.interact(
+            row.rect,
+            ui.make_persistent_id(("installed-model-row", &model.id)),
+            Sense::click(),
+        );
+        ui.ctx().accesskit_node_builder(row.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name(format!("Open details for {}", model.display_name));
+            builder.set_description("Open model details and actions.");
+            if dialog_active {
+                builder.set_disabled();
+            }
+            builder.set_bounds(egui::accesskit::Rect {
+                x0: row.rect.min.x.into(),
+                y0: row.rect.min.y.into(),
+                x1: row.rect.max.x.into(),
+                y1: row.rect.max.y.into(),
             });
         });
+        if management.restore_details_focus.as_deref() == Some(model.id.as_str())
+            || management.restore_remove_focus.as_deref() == Some(model.id.as_str())
+        {
+            row.request_focus();
+        }
+        paint_focus_ring(ui, &row, Rounding::same(6.0));
+        if row.clicked() {
+            action = ScreenAction::ShowModelDetails(model.id.clone());
+        }
         ui.add_space(8.0);
     }
     let used_bytes: u64 = models
@@ -1434,16 +1489,41 @@ fn models(
         comparison.expanded,
         used_bytes > 0,
     ));
-    let comparison_width = comparison_surface_width(ui.available_width());
-    let comparison_surface = Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(5.0))
-        .inner_margin(Margin::same(16.0))
-        .show(ui, |ui| {
+    let comparison_top = ui.cursor().top();
+    let comparison_left =
+        (ui.cursor().left() - MODEL_COMPARISON_BODY_BLEED).max(ui.ctx().screen_rect().left());
+    let comparison_right = (ui.cursor().left()
+        + ui.available_width()
+        + MODEL_COMPARISON_BODY_BLEED)
+        .min(ui.ctx().screen_rect().right());
+    let comparison_rect = egui::Rect::from_min_max(
+        egui::pos2(comparison_left, comparison_top),
+        egui::pos2(comparison_right, comparison_top + 10_000.0),
+    );
+    let mut comparison_ui = ui.child_ui(comparison_rect, Layout::top_down(Align::LEFT));
+    comparison_ui.set_clip_rect(ui.clip_rect());
+    let comparison_width = comparison_surface_width(comparison_ui.available_width());
+    let comparison_surface_id = ui.make_persistent_id("model-comparison-surface");
+    let comparison_ctx = ui.ctx().clone();
+    comparison_ctx.accesskit_node_builder(comparison_surface_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Group);
+        builder.set_name("Model comparison surface");
+    });
+    let mut comparison_surface_rect = None;
+    comparison_ctx.with_accessibility_parent(comparison_surface_id, || {
+        let comparison_surface = Frame::none()
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0, colors.border))
+            .rounding(Rounding::same(5.0))
+            .inner_margin(Margin::same(16.0))
+            .show(&mut comparison_ui, |ui| {
             ui.set_min_width(comparison_content_min_width(comparison_width, 16.0));
-            let mut toggle_clicked = false;
-            ui.horizontal(|ui| {
+            let toggle_name = if comparison.expanded {
+                "Collapse comparison"
+            } else {
+                "Expand comparison"
+            };
+            let header_content = ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Compare installed models").strong());
                     ui.label(
@@ -1451,44 +1531,42 @@ fn models(
                             .color(colors.muted_text),
                     );
                 });
-                let toggle_name = if comparison.expanded {
-                    "Collapse comparison"
-                } else {
-                    "Expand comparison"
-                };
-                let toggle = ui
-                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        button(
-                            ui,
-                            icon_glyph(if comparison.expanded {
-                                Icon::ChevronUp
-                            } else {
-                                Icon::ChevronDown
-                            }),
-                            ButtonTone::Text,
-                        )
-                    })
-                    .inner;
-                ui.ctx().accesskit_node_builder(toggle.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Button);
-                    builder.set_name(toggle_name);
-                    builder.set_expanded(comparison.expanded);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(icon_glyph(if comparison.expanded {
+                            Icon::ChevronUp
+                        } else {
+                            Icon::ChevronDown
+                        }))
+                        .color(colors.text),
+                    );
                 });
-                focus_tooltip(ui, &toggle, toggle_name);
-                let toggle = toggle.on_hover_text(toggle_name);
-                toggle_clicked = toggle.clicked();
             });
             let header = ui.interact(
-                ui.min_rect(),
+                header_content.response.rect,
                 ui.make_persistent_id("comparison-header"),
                 Sense::click(),
             );
-            if toggle_clicked || header.clicked() {
+            ui.ctx().accesskit_node_builder(header.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Button);
+                builder.set_name(toggle_name);
+                builder.set_expanded(comparison.expanded);
+                if !ui.is_enabled() {
+                    builder.set_disabled();
+                }
+            });
+            if comparison.focus_panel {
+                header.request_focus();
+                header.scroll_to_me(Some(Align::Center));
+            }
+            focus_tooltip(ui, &header, toggle_name);
+            paint_focus_ring(ui, &header, Rounding::same(4.0));
+            if header.clicked() {
                 action = ScreenAction::ToggleComparison;
             }
             if comparison.expanded {
                 ui.add_space(12.0);
-                ui.horizontal_wrapped(|ui| {
+                let render_selection = |ui: &mut egui::Ui, action: &mut ScreenAction| {
                     for model in models.iter().filter(|model| {
                         model.installed
                             && model.ready
@@ -1524,9 +1602,11 @@ fn models(
                             response.clone().on_hover_text(reason);
                         }
                         if response.clicked() {
-                            action = ScreenAction::ToggleComparisonModel(model.id.clone());
+                            *action = ScreenAction::ToggleComparisonModel(model.id.clone());
                         }
                     }
+                };
+                let render_recording_control = |ui: &mut egui::Ui, action: &mut ScreenAction| {
                     if comparison.phase == ComparisonPhase::Recording {
                         ui.label(format!(
                             "Recording {:.1}s",
@@ -1539,7 +1619,7 @@ fn models(
                             builder.set_name("Stop comparison recording");
                         });
                         if stop.clicked() {
-                            action = ScreenAction::StopComparison;
+                            *action = ScreenAction::StopComparison;
                         }
                     } else {
                         let disabled_reason = comparison_start_disabled_reason(comparison);
@@ -1567,10 +1647,35 @@ fn models(
                             ui.label(RichText::new(reason).small().color(colors.muted_text));
                         }
                         if start.clicked() {
-                            action = ScreenAction::StartComparison;
+                            *action = ScreenAction::StartComparison;
                         }
                     }
-                });
+                };
+                if ui.available_width() >= 720.0 {
+                    let control_width = 196.0;
+                    let selection_width = (ui.available_width()
+                        - control_width
+                        - ui.spacing().item_spacing.x)
+                        .max(0.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(Vec2::new(selection_width, 0.0), |ui| {
+                            ui.set_min_width(selection_width);
+                            ui.horizontal_wrapped(|ui| render_selection(ui, &mut action));
+                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(control_width, 0.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.set_min_width(control_width);
+                                render_recording_control(ui, &mut action);
+                            },
+                        );
+                    });
+                } else {
+                    ui.horizontal_wrapped(|ui| render_selection(ui, &mut action));
+                    ui.add_space(8.0);
+                    render_recording_control(ui, &mut action);
+                }
                 if let Some(feedback) = comparison.selection_feedback.as_deref() {
                     ui.label(RichText::new(feedback).small().color(colors.warning));
                 }
@@ -1663,16 +1768,13 @@ fn models(
                 }
             }
         });
+        comparison_surface_rect = Some(comparison_surface.response.rect);
+    });
+    let comparison_surface_rect = comparison_surface_rect.expect("comparison surface is rendered");
+    ui.allocate_space(Vec2::new(0.0, comparison_surface_rect.height()));
     ui.ctx()
-        .accesskit_node_builder(comparison_surface.response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Group);
-            builder.set_name("Model comparison surface");
-            builder.set_bounds(egui::accesskit::Rect {
-                x0: comparison_surface.response.rect.min.x.into(),
-                y0: comparison_surface.response.rect.min.y.into(),
-                x1: comparison_surface.response.rect.max.x.into(),
-                y1: comparison_surface.response.rect.max.y.into(),
-            });
+        .accesskit_node_builder(comparison_surface_id, |builder| {
+            builder.set_bounds(accesskit_rect(comparison_surface_rect));
         });
     if used_bytes > 0 {
         ui.add_space(12.0);
@@ -1711,14 +1813,24 @@ fn models(
             let mut open = true;
             let mut focusable_controls = Vec::new();
             let mut initial_focus = None;
-            let dialog = egui::Window::new("Add models")
-                .id(ui.make_persistent_id(("model-dialog", "add")))
-                .collapsible(false)
-                .resizable(false)
-                .enabled(true)
-                .open(&mut open)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ui.ctx(), |ui| {
+            let dialog_accessibility_id =
+                ui.make_persistent_id(("model-dialog-accessibility", "add"));
+            let dialog_ctx = ui.ctx().clone();
+            dialog_ctx.accesskit_node_builder(dialog_accessibility_id, |builder| {
+                builder.set_role(egui::accesskit::Role::Dialog);
+                builder.set_name("Add models");
+                builder.set_modal();
+            });
+            let mut dialog = None;
+            dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
+                dialog = egui::Window::new("Add models")
+                    .id(ui.make_persistent_id(("model-dialog", "add")))
+                    .collapsible(false)
+                    .resizable(false)
+                    .enabled(true)
+                    .open(&mut open)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ui.ctx(), |ui| {
                     ui.set_enabled(true);
                     if let Some(reason) = &management.mutation_block_reason {
                         ui.label(RichText::new(reason).color(colors.warning));
@@ -1793,7 +1905,8 @@ fn models(
                     if close.clicked() {
                         action = ScreenAction::CloseModelDialog;
                     }
-                });
+                    });
+            });
             contain_model_dialog_focus(
                 ui.ctx(),
                 dialog_tab_direction,
@@ -1803,10 +1916,8 @@ fn models(
             );
             if let Some(dialog) = dialog {
                 ui.ctx()
-                    .accesskit_node_builder(dialog.response.id, |builder| {
-                        builder.set_role(egui::accesskit::Role::Dialog);
-                        builder.set_name("Add models");
-                        builder.set_modal();
+                    .accesskit_node_builder(dialog_accessibility_id, |builder| {
+                        builder.set_bounds(accesskit_rect(dialog.response.rect));
                     });
             }
             if !open {
@@ -1822,14 +1933,24 @@ fn models(
                 let mut open = true;
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
-                let dialog = egui::Window::new("Model details")
-                    .id(ui.make_persistent_id(("model-dialog", "details", id)))
-                    .collapsible(false)
-                    .resizable(false)
-                    .enabled(true)
-                    .open(&mut open)
-                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                    .show(ui.ctx(), |ui| {
+                let dialog_accessibility_id =
+                    ui.make_persistent_id(("model-dialog-accessibility", "details", id));
+                let dialog_ctx = ui.ctx().clone();
+                dialog_ctx.accesskit_node_builder(dialog_accessibility_id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Dialog);
+                    builder.set_name(format!("Model details for {}", model.display_name));
+                    builder.set_modal();
+                });
+                let mut dialog = None;
+                dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
+                    dialog = egui::Window::new("Model details")
+                        .id(ui.make_persistent_id(("model-dialog", "details", id)))
+                        .collapsible(false)
+                        .resizable(false)
+                        .enabled(true)
+                        .open(&mut open)
+                        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                        .show(ui.ctx(), |ui| {
                         ui.set_enabled(true);
                         ui.label(RichText::new(&model.display_name).strong());
                         if let Some(description) = &model.description {
@@ -1850,6 +1971,63 @@ fn models(
                                 )
                                 .color(colors.muted_text),
                             );
+                        }
+                        ui.add_space(8.0);
+                        let primary = ui
+                            .add_enabled_ui(model.primary_action_enabled, |ui| {
+                                button(ui, &model.primary_action_label, ButtonTone::Secondary)
+                            })
+                            .inner;
+                        if model.primary_action_enabled {
+                            focusable_controls.push(primary.id);
+                            mark_accesskit_enabled(ui, &primary);
+                        }
+                        if let Some(reason) = &model.primary_action_disabled_reason {
+                            ui.ctx().accesskit_node_builder(primary.id, |builder| {
+                                builder.set_description(reason.as_str());
+                            });
+                            focus_tooltip(ui, &primary, reason);
+                            primary.clone().on_hover_text(reason);
+                        }
+                        if primary.clicked() {
+                            action = if model.primary_action_repairs_runtime {
+                                ScreenAction::RepairModelRuntime(model.id.clone())
+                            } else {
+                                ScreenAction::SelectModel(model.id.clone())
+                            };
+                        }
+                        let remove_reason = if model.active {
+                            Some("Select another ready model before removing the active model.")
+                        } else if model.custom {
+                            Some("Custom model files are not managed by Scribe and will not be deleted.")
+                        } else if !model.removal_supported {
+                            Some("This model is not an app-managed download and cannot be removed here.")
+                        } else {
+                            None
+                        };
+                        let remove = ui.add_enabled(
+                            remove_reason.is_none(),
+                            egui::Button::new("Remove from device"),
+                        );
+                        if remove_reason.is_none() {
+                            focusable_controls.push(remove.id);
+                            mark_accesskit_enabled(ui, &remove);
+                        }
+                        ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Button);
+                            if remove_reason.is_some() {
+                                builder.set_disabled();
+                            }
+                        });
+                        if let Some(reason) = remove_reason {
+                            ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                                builder.set_description(reason);
+                            });
+                            ui.label(RichText::new(reason).small().color(colors.muted_text));
+                            remove.clone().on_hover_text(reason);
+                        }
+                        if remove.clicked() {
+                            action = ScreenAction::RequestModelRemoval(model.id.clone());
                         }
                         ui.add_space(8.0);
                         let runtime_maintenance =
@@ -1908,7 +2086,8 @@ fn models(
                         if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
-                    });
+                        });
+                });
                 contain_model_dialog_focus(
                     ui.ctx(),
                     dialog_tab_direction,
@@ -1918,10 +2097,8 @@ fn models(
                 );
                 if let Some(dialog) = dialog {
                     ui.ctx()
-                        .accesskit_node_builder(dialog.response.id, |builder| {
-                            builder.set_role(egui::accesskit::Role::Dialog);
-                            builder.set_name(format!("Model details for {}", model.display_name));
-                            builder.set_modal();
+                        .accesskit_node_builder(dialog_accessibility_id, |builder| {
+                            builder.set_bounds(accesskit_rect(dialog.response.rect));
                         });
                 }
                 if !open {
@@ -1934,14 +2111,24 @@ fn models(
                 let mut open = true;
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
-                let dialog = egui::Window::new("Remove model?")
-                    .id(ui.make_persistent_id(("model-dialog", "remove", id)))
-                    .collapsible(false)
-                    .resizable(false)
-                    .enabled(true)
-                    .open(&mut open)
-                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                    .show(ui.ctx(), |ui| {
+                let dialog_accessibility_id =
+                    ui.make_persistent_id(("model-dialog-accessibility", "remove", id));
+                let dialog_ctx = ui.ctx().clone();
+                dialog_ctx.accesskit_node_builder(dialog_accessibility_id, |builder| {
+                    builder.set_role(egui::accesskit::Role::AlertDialog);
+                    builder.set_name(format!("Remove {}", model.display_name));
+                    builder.set_modal();
+                });
+                let mut dialog = None;
+                dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
+                    dialog = egui::Window::new("Remove model?")
+                        .id(ui.make_persistent_id(("model-dialog", "remove", id)))
+                        .collapsible(false)
+                        .resizable(false)
+                        .enabled(true)
+                        .open(&mut open)
+                        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                        .show(ui.ctx(), |ui| {
                         ui.set_enabled(true);
                         ui.label(format!("Remove {} from Scribe?", model.display_name));
                         ui.label(RichText::new("Only Scribe-managed artifact files are removed. This cannot be undone.").color(colors.warning));
@@ -1956,7 +2143,8 @@ fn models(
                             mark_accesskit_enabled(ui, &remove);
                             if remove.clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
                         });
-                    });
+                        });
+                });
                 contain_model_dialog_focus(
                     ui.ctx(),
                     dialog_tab_direction,
@@ -1966,10 +2154,8 @@ fn models(
                 );
                 if let Some(dialog) = dialog {
                     ui.ctx()
-                        .accesskit_node_builder(dialog.response.id, |builder| {
-                            builder.set_role(egui::accesskit::Role::AlertDialog);
-                            builder.set_name(format!("Remove {}", model.display_name));
-                            builder.set_modal();
+                        .accesskit_node_builder(dialog_accessibility_id, |builder| {
+                            builder.set_bounds(accesskit_rect(dialog.response.rect));
                         });
                 }
                 if !open {
@@ -2393,93 +2579,36 @@ fn render_comparison_results(
     let mut action = ScreenAction::None;
     // Rows follow visible model order, so the first rendered Add action is the stable return target.
     let mut restore_reference_focus = comparison.restore_reference_action_focus;
-    if ui.available_width() < 720.0 {
+    if ui.available_width() < 900.0 {
         for model in selected {
             let result = comparison
                 .results
                 .iter()
                 .find(|(id, _)| id == &model.id)
                 .map(|(_, result)| result);
-            let group = ui.group(|ui| {
-                ui.label(RichText::new(&model.display_name).strong());
-                ui.label(format!("Status: {}", comparison_result_status(result)));
-                ui.label(format!("Duration: {}", comparison_duration(comparison)));
-                ui.label(format!(
-                    "Processing time: {}",
-                    comparison_processing(result)
-                ));
-                ui.label(format!("Output: {}", comparison_output_summary(result)));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Accuracy:");
-                    let accuracy_action = comparison_accuracy_cell(
-                        ui,
-                        model,
-                        comparison,
-                        result,
-                        &mut restore_reference_focus,
-                    );
-                    if accuracy_action != ScreenAction::None {
-                        action = accuracy_action;
-                    }
-                });
-                if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
-                    ui.label(RichText::new(format!("Real-time factor: {rtf:.2}x")).small());
-                }
+            let group_width = ui.available_width();
+            let group_id = ui.make_persistent_id(("compact-comparison-result", &model.id));
+            let group_ctx = ui.ctx().clone();
+            group_ctx.accesskit_node_builder(group_id, |builder| {
+                builder.set_role(egui::accesskit::Role::Group);
+                builder.set_name(format!("Comparison result for {}", model.display_name));
             });
-            ui.ctx()
-                .accesskit_node_builder(group.response.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Group);
-                    builder.set_name(format!("Comparison result for {}", model.display_name));
-                });
-        }
-        return action;
-    }
-
-    let table = ui.vertical(|ui| {
-        ui.columns(5, |columns| {
-            for (column, heading) in columns.iter_mut().zip([
-                "Model",
-                "Duration",
-                "Processing time",
-                "Output",
-                "Accuracy",
-            ]) {
-                let response = column.label(RichText::new(heading).strong().small());
-                column.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::ColumnHeader);
-                    builder.set_name(heading);
-                });
-            }
-        });
-        for model in selected {
-            let result = comparison
-                .results
-                .iter()
-                .find(|(id, _)| id == &model.id)
-                .map(|(_, result)| result);
-            let row = ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 0.0),
-                Layout::top_down(Align::LEFT),
-                |ui| {
-                    ui.columns(5, |columns| {
-                        let cells = [
-                            format!(
-                                "{}\n{}",
-                                model.display_name,
-                                comparison_result_status(result)
-                            ),
-                            comparison_duration(comparison),
-                            comparison_processing(result),
-                            comparison_output_summary(result),
-                        ];
-                        for (column, cell) in columns.iter_mut().zip(cells) {
-                            let response = column.label(cell);
-                            column.ctx().accesskit_node_builder(response.id, |builder| {
-                                builder.set_role(egui::accesskit::Role::Cell);
-                            });
-                        }
+            let mut group_rect = None;
+            group_ctx.with_accessibility_parent(group_id, || {
+                let group = ui.group(|ui| {
+                    ui.set_min_width((group_width - 12.0).max(0.0));
+                    ui.label(RichText::new(&model.display_name).strong());
+                    ui.label(format!("Status: {}", comparison_result_status(result)));
+                    ui.label(format!("Duration: {}", comparison_duration(comparison)));
+                    ui.label(format!(
+                        "Processing time: {}",
+                        comparison_processing(result)
+                    ));
+                    ui.label(format!("Output: {}", comparison_output_summary(result)));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Accuracy:");
                         let accuracy_action = comparison_accuracy_cell(
-                            &mut columns[4],
+                            ui,
                             model,
                             comparison,
                             result,
@@ -2489,23 +2618,251 @@ fn render_comparison_results(
                             action = accuracy_action;
                         }
                     });
-                },
-            );
-            ui.ctx().accesskit_node_builder(row.response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Row);
-                builder.set_name(format!("Comparison result for {}", model.display_name));
-                if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
-                    builder.set_description(format!("Real-time factor: {rtf:.2}x"));
+                    if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
+                        ui.label(RichText::new(format!("Real-time factor: {rtf:.2}x")).small());
+                    }
+                });
+                group_rect = Some(group.response.rect);
+            });
+            if let Some(rect) = group_rect {
+                ui.ctx().accesskit_node_builder(group_id, |builder| {
+                    builder.set_bounds(accesskit_rect(rect));
+                });
+            }
+        }
+        return action;
+    }
+
+    let table_id = ui.make_persistent_id("model-comparison-results-table");
+    let ctx = ui.ctx().clone();
+    ctx.accesskit_node_builder(table_id, |builder| {
+        builder.set_role(egui::accesskit::Role::Table);
+        builder.set_name("Model comparison results");
+    });
+    let mut table_rect = None;
+    ctx.with_accessibility_parent(table_id, || {
+        let table = Frame::none()
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0, colors.border))
+            .rounding(Rounding::same(3.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let widths = comparison_table_column_widths(ui.available_width());
+                let header_id = ui.make_persistent_id("model-comparison-results-header");
+                ui.ctx().accesskit_node_builder(header_id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Row);
+                    builder.set_name("Comparison result columns");
+                });
+                let header_ctx = ui.ctx().clone();
+                let mut header_rect = None;
+                header_ctx.with_accessibility_parent(header_id, || {
+                    let header = Frame::none()
+                        .fill(colors.disabled_bg)
+                        .inner_margin(Margin::symmetric(10.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().interact_size.y = 0.0;
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.horizontal(|ui| {
+                                for (width, heading) in widths.into_iter().zip([
+                                    "Model",
+                                    "Duration",
+                                    "Processing time",
+                                    "Output",
+                                    "Accuracy",
+                                ]) {
+                                    comparison_table_cell(
+                                        ui,
+                                        ("comparison-header-cell", heading),
+                                        width,
+                                        20.0,
+                                        egui::accesskit::Role::ColumnHeader,
+                                        Some(heading),
+                                        |ui| {
+                                            ui.label(RichText::new(heading).strong().small());
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                    header_rect = Some(header.response.rect);
+                });
+                if let Some(rect) = header_rect {
+                    ui.ctx().accesskit_node_builder(header_id, |builder| {
+                        builder.set_bounds(accesskit_rect(rect));
+                    });
+                }
+
+                for model in selected {
+                    comparison_table_separator(ui, colors.border);
+                    let result = comparison
+                        .results
+                        .iter()
+                        .find(|(id, _)| id == &model.id)
+                        .map(|(_, result)| result);
+                    let row_id = ui.make_persistent_id(("comparison-result-row", &model.id));
+                    ui.ctx().accesskit_node_builder(row_id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Row);
+                        builder.set_name(format!("Comparison result for {}", model.display_name));
+                        if let Some(rtf) = result.and_then(|result| result.realtime_factor) {
+                            builder.set_description(format!("Real-time factor: {rtf:.2}x"));
+                        }
+                    });
+                    let row_ctx = ui.ctx().clone();
+                    let mut row_rect = None;
+                    row_ctx.with_accessibility_parent(row_id, || {
+                        let row = Frame::none()
+                            .inner_margin(Margin::symmetric(10.0, 0.0))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = 0.0;
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.horizontal(|ui| {
+                                    for (index, (width, content)) in widths
+                                        .into_iter()
+                                        .zip([
+                                            comparison_model_summary(model, result),
+                                            comparison_duration(comparison),
+                                            comparison_processing(result),
+                                        ])
+                                        .enumerate()
+                                    {
+                                        comparison_table_cell(
+                                            ui,
+                                            ("comparison-result-cell", &model.id, index),
+                                            width,
+                                            44.0,
+                                            egui::accesskit::Role::Cell,
+                                            None,
+                                            |ui| {
+                                                let response = ui.add(
+                                                    egui::Label::new(content.as_str())
+                                                        .truncate(true),
+                                                );
+                                                if index == 0 {
+                                                    response.on_hover_text(content.as_str());
+                                                }
+                                            },
+                                        );
+                                    }
+                                    let output = comparison_output_summary(result);
+                                    let output_cell_name =
+                                        format!("Output for {}: {output}", model.display_name);
+                                    comparison_table_cell(
+                                        ui,
+                                        ("comparison-result-cell", &model.id, 3),
+                                        widths[3],
+                                        44.0,
+                                        egui::accesskit::Role::Cell,
+                                        Some(&output_cell_name),
+                                        |ui| {
+                                            let response = ui.add(
+                                                egui::Label::new(if output == "No data" {
+                                                    RichText::new(&output).italics()
+                                                } else {
+                                                    RichText::new(&output)
+                                                })
+                                                .truncate(true),
+                                            );
+                                            if output != "No data" {
+                                                response.on_hover_text(format!(
+                                                    "Full output: {output}"
+                                                ));
+                                            }
+                                        },
+                                    );
+                                    let accuracy_cell_name =
+                                        format!("Accuracy for {}", model.display_name);
+                                    comparison_table_cell(
+                                        ui,
+                                        ("comparison-result-cell", &model.id, 4),
+                                        widths[4],
+                                        44.0,
+                                        egui::accesskit::Role::Cell,
+                                        Some(&accuracy_cell_name),
+                                        |ui| {
+                                            let accuracy_action = comparison_accuracy_cell(
+                                                ui,
+                                                model,
+                                                comparison,
+                                                result,
+                                                &mut restore_reference_focus,
+                                            );
+                                            if accuracy_action != ScreenAction::None {
+                                                action = accuracy_action;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        row_rect = Some(row.response.rect);
+                    });
+                    if let Some(rect) = row_rect {
+                        ui.ctx().accesskit_node_builder(row_id, |builder| {
+                            builder.set_bounds(accesskit_rect(rect));
+                        });
+                    }
                 }
             });
-        }
+        table_rect = Some(table.response.rect);
     });
-    ui.ctx()
-        .accesskit_node_builder(table.response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Table);
-            builder.set_name("Model comparison results");
+    if let Some(rect) = table_rect {
+        ui.ctx().accesskit_node_builder(table_id, |builder| {
+            builder.set_bounds(accesskit_rect(rect));
         });
+    }
     action
+}
+
+fn comparison_table_column_widths(available_width: f32) -> [f32; 5] {
+    let content_width = (available_width - 20.0).max(0.0);
+    [
+        content_width * 0.15,
+        content_width * 0.11,
+        content_width * 0.19,
+        content_width * 0.13,
+        content_width * 0.42,
+    ]
+}
+
+fn comparison_table_separator(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, color));
+}
+
+fn comparison_table_cell(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    width: f32,
+    height: f32,
+    role: egui::accesskit::Role,
+    name: Option<&str>,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let cell_id = ui.make_persistent_id(id_salt);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    ui.ctx().accesskit_node_builder(cell_id, |builder| {
+        builder.set_role(role);
+        if let Some(name) = name {
+            builder.set_name(name);
+        }
+        builder.set_bounds(accesskit_rect(rect));
+    });
+    let clip_rect = rect.intersect(ui.clip_rect());
+    let ctx = ui.ctx().clone();
+    ctx.with_accessibility_parent(cell_id, || {
+        let mut cell_ui = ui.child_ui(rect, Layout::left_to_right(Align::Center));
+        cell_ui.set_clip_rect(clip_rect);
+        add_contents(&mut cell_ui);
+    });
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
 }
 
 fn comparison_status(comparison: &ModelComparisonState) -> Option<String> {
@@ -2526,6 +2883,22 @@ fn comparison_result_status(result: Option<&super::state::ComparisonResult>) -> 
         Some(ComparisonResultPhase::Error) => "Failed",
         None => "Not run",
     }
+}
+
+fn comparison_model_summary(
+    model: &ModelViewModel,
+    result: Option<&super::state::ComparisonResult>,
+) -> String {
+    result.map_or_else(
+        || model.variant_label.clone(),
+        |result| {
+            format!(
+                "{}\n{}",
+                model.variant_label,
+                comparison_result_status(Some(result))
+            )
+        },
+    )
 }
 
 fn comparison_duration(comparison: &ModelComparisonState) -> String {
@@ -4177,7 +4550,7 @@ mod tests {
     #[test]
     fn model_footer_spacer_uses_remaining_height_and_panel_state() {
         assert_eq!(models_footer_spacer(500.0, false, true), 368.0);
-        assert_eq!(models_footer_spacer(500.0, true, true), 130.0);
+        assert_eq!(models_footer_spacer(500.0, true, true), 180.0);
         assert_eq!(models_footer_spacer(100.0, true, true), 16.0);
     }
 
@@ -4455,7 +4828,7 @@ mod tests {
     }
 
     #[test]
-    fn model_row_actions_are_contextual_and_disabled_remove_is_explained() {
+    fn model_rows_open_details_without_exposing_actions_in_the_list() {
         let model = ModelViewModel {
             id: "base.en".into(),
             display_name: "whisper.cpp base.en".into(),
@@ -4488,14 +4861,14 @@ mod tests {
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Details for whisper.cpp base.en")
+                && node.name() == Some("Open details for whisper.cpp base.en")
+                && node.description() == Some("Open model details and actions.")
         }));
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Remove whisper.cpp base.en")
-                && node.description()
-                    == Some("Select another ready model before removing the active model.")
-        }));
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Remove whisper.cpp base.en"))
+        );
         assert!(nodes.iter().any(|(_, node)| {
             node.name() == Some("Collapse comparison") && node.is_expanded() == Some(true)
         }));

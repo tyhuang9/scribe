@@ -6940,20 +6940,21 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn select_model_as_default(&mut self, model: &SttModelInfo) {
+    fn select_model_as_default(&mut self, model: &SttModelInfo) -> bool {
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
-            return;
+            return false;
         }
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status = TranscriptionStatus::Error;
             self.status_message =
                 format!("Could not unload the warm model before switching: {error}");
-            return;
+            return false;
         }
         self.config.general.selected_default_model = model.id.clone();
         compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
+        true
     }
 
     fn effective_install_status(&self, model: &SttModelInfo) -> ModelInstallStatus {
@@ -8052,63 +8053,11 @@ impl LocalTranscriberApp {
         let Some(model) = self.selected_model() else {
             return Vec::new();
         };
-        let Ok(descriptor) = self
+        let descriptor = self
             .transcription_service
             .model_descriptor(&ModelId::new(&model.id))
-        else {
-            return Vec::new();
-        };
-        let install_status = self.effective_install_status(&model);
-        vec![
-            ModelViewModel {
-                id: model.id.clone(),
-                display_name: descriptor.display_name.to_owned(),
-                variant_label: descriptor.speed_guidance.to_owned(),
-                description: Some(descriptor.description.to_owned()),
-                runtime_group: "Local speech runtime".to_owned(),
-                installed: install_status.is_runnable(),
-                active: runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready,
-                recommended: descriptor.recommended,
-                download_state: match install_status {
-                    ModelInstallStatus::Installed => ModelDownloadState::Installed,
-                    ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
-                    ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
-                    ModelInstallStatus::Error(_) | ModelInstallStatus::RuntimeError(_) => {
-                        ModelDownloadState::Failed
-                    }
-                    _ => ModelDownloadState::NotInstalled,
-                },
-                total_bytes: Some(descriptor.artifact_size_bytes),
-                disk_bytes: model
-                    .local_path
-                    .as_ref()
-                    .and_then(|path| std::fs::metadata(path).ok())
-                    .map(|metadata| metadata.len()),
-                estimated_ram_bytes: descriptor
-                    .expected_ram
-                    .trim_end_matches("MB")
-                    .parse::<u64>()
-                    .ok()
-                    .map(|megabytes| megabytes * 1_000_000),
-                languages: descriptor
-                    .languages
-                    .iter()
-                    .map(|language| (*language).to_owned())
-                    .collect(),
-                language_summary: descriptor.languages.join(", "),
-                speed_tier: ModelSpeedTier::Unknown,
-                size_tier: ModelSizeTier::Unknown,
-                compatibility: match descriptor.compatibility {
-                    CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
-                    CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
-                    CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
-                },
-                ..Default::default()
-            }
-            .normalize(),
-        ]
-        .into_iter()
-        .collect()
+            .ok();
+        vec![self.model_management_view_model(&model, descriptor.as_ref())]
     }
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
@@ -8129,6 +8078,7 @@ impl LocalTranscriberApp {
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
+            | ScreenAction::OpenComparison
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
@@ -8259,21 +8209,23 @@ impl LocalTranscriberApp {
         let restored_remove_focus = self.model_management.restore_remove_focus.clone();
         let clear_removal_notice = self.model_management.removal_notice.is_some();
         let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
+        let clear_comparison_focus = self.model_comparison.focus_panel;
         let clear_reference_action_focus = self.model_comparison.restore_reference_action_focus;
         let clear_reference_notice = self.model_comparison.reference_notice.is_some();
-        let action = render_screen(
-            ui,
-            &ScreenView {
-                route: UiRoute::Models,
-                transcription: &Default::default(),
-                models: &installed,
-                model_catalog: &catalog,
-                comparison: &self.model_comparison,
-                model_management: &self.model_management,
-                remote_catalog: &remote_catalog,
-                recording_settings: &Default::default(),
-            },
-        );
+        let view = ScreenView {
+            route: UiRoute::Models,
+            transcription: &Default::default(),
+            models: &installed,
+            model_catalog: &catalog,
+            comparison: &self.model_comparison,
+            model_management: &self.model_management,
+            remote_catalog: &remote_catalog,
+            recording_settings: &Default::default(),
+        };
+        let action = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| render_screen(ui, &view))
+            .inner;
         if clear_initial_dialog_focus {
             self.model_management.focus_dialog_initial = false;
         }
@@ -8294,6 +8246,9 @@ impl LocalTranscriberApp {
         }
         if clear_reference_editor_focus {
             self.model_comparison.focus_reference_editor = false;
+        }
+        if clear_comparison_focus {
+            self.model_comparison.focus_panel = false;
         }
         if clear_reference_action_focus {
             self.model_comparison.restore_reference_action_focus = false;
@@ -8772,9 +8727,19 @@ impl LocalTranscriberApp {
         config::configured_models(&self.config)
             .into_iter()
             .filter_map(|model| {
-                descriptors
-                    .get(&model.id)
-                    .map(|descriptor| self.model_management_view_model(&model, descriptor))
+                let effective_status = self.effective_install_status(&model);
+                let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+                let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
+                    // Retained compatibility models stay out of discovery, but an existing
+                    // installed model must remain visible so it can be selected or removed.
+                    artifact_present.then(|| {
+                        self.transcription_service
+                            .model_descriptor(&ModelId::new(&model.id))
+                            .ok()
+                    })?
+                });
+                (descriptor.is_some() || artifact_present)
+                    .then(|| self.model_management_view_model(&model, descriptor.as_ref()))
             })
             .collect()
     }
@@ -8782,12 +8747,13 @@ impl LocalTranscriberApp {
     fn model_management_view_model(
         &self,
         model: &SttModelInfo,
-        descriptor: &ModelDescriptor,
+        descriptor: Option<&ModelDescriptor>,
     ) -> ModelViewModel {
+        let (display_name, variant_label) = model_ui_labels(model, descriptor);
         let install_status = self.effective_install_status(model);
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
-        let installed = install_status.is_runnable();
+        let installed = model_artifact_remains_manageable(model, &install_status);
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id);
         let download_state = match &install_status {
@@ -8810,21 +8776,88 @@ impl LocalTranscriberApp {
                 total_bytes,
                 ..
             } => (*downloaded_bytes, *total_bytes),
-            _ => (0, Some(descriptor.artifact_size_bytes)),
+            _ => (
+                0,
+                descriptor.map(|descriptor| descriptor.artifact_size_bytes),
+            ),
         };
-        let mutation_blocked = self.artifact_mutation_block_reason().is_some();
+        let mutation_block_reason = self.artifact_mutation_block_reason();
+        let mutation_blocked = mutation_block_reason.is_some();
+        let active =
+            installed && runtime_ready && self.config.general.selected_default_model == model.id;
+        let (
+            primary_action_label,
+            primary_action_enabled,
+            primary_action_repairs_runtime,
+            primary_action_disabled_reason,
+        ) = if active {
+            (
+                "Active".to_owned(),
+                false,
+                false,
+                Some("This model is already active.".to_owned()),
+            )
+        } else if installed && runtime_ready {
+            (
+                "Use this model".to_owned(),
+                !mutation_blocked,
+                false,
+                mutation_block_reason.clone(),
+            )
+        } else if installed {
+            let runtime_busy = compatibility_bridge::provider_for_model(model)
+                .is_some_and(|provider| self.runtime_jobs.contains_key(provider.id()));
+            let runtime_action = runtime_action_state_with_activity(
+                &self.config,
+                model,
+                runtime_busy,
+                compatibility_bridge::provider_for_model(model)
+                    .map_or_else(RuntimeConsumerActivity::default, |provider| {
+                        self.runtime_consumer_activity(provider.id())
+                    }),
+            );
+            let repairable = matches!(
+                runtime_action.kind,
+                RuntimeActionKind::Install | RuntimeActionKind::Update
+            );
+            (
+                if repairable {
+                    "Repair runtime"
+                } else {
+                    "Runtime unavailable"
+                }
+                .to_owned(),
+                repairable && runtime_action.enabled && !mutation_blocked,
+                repairable,
+                mutation_block_reason
+                    .clone()
+                    .or(runtime_action.disabled_tooltip)
+                    .or_else(|| {
+                        (!repairable)
+                            .then(|| "This model does not have a repairable runtime.".to_owned())
+                    }),
+            )
+        } else {
+            (
+                "Not installed".to_owned(),
+                false,
+                false,
+                Some("Install this model before using it.".to_owned()),
+            )
+        };
         ModelViewModel {
             id: model.id.clone(),
-            display_name: descriptor.display_name.to_owned(),
-            variant_label: descriptor.speed_guidance.to_owned(),
-            description: Some(descriptor.description.to_owned()),
+            display_name,
+            variant_label,
+            description: Some(descriptor.map_or_else(
+                || model.description.clone(),
+                |value| value.description.to_owned(),
+            )),
             runtime_group: "Local speech runtime".to_owned(),
             installed,
-            active: installed
-                && runtime_ready
-                && self.config.general.selected_default_model == model.id,
+            active,
             ready: installed && runtime_ready,
-            recommended: descriptor.recommended,
+            recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
             custom,
             install_supported: supports_managed_install(model),
             install_action_enabled: !mutation_blocked
@@ -8834,6 +8867,10 @@ impl LocalTranscriberApp {
                     ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
                 )
                 && supports_managed_install(model),
+            primary_action_label,
+            primary_action_enabled,
+            primary_action_repairs_runtime,
+            primary_action_disabled_reason,
             cancel_supported: self.artifact_installations.contains_key(&model.id),
             removal_supported: !custom && supports_managed_uninstall(model, &install_status),
             download_state,
@@ -8849,42 +8886,57 @@ impl LocalTranscriberApp {
                 })
                 .flatten(),
             estimated_ram_bytes: descriptor
-                .expected_ram
+                .map_or(model.expected_ram.as_str(), |descriptor| {
+                    descriptor.expected_ram
+                })
                 .trim_end_matches(" GB")
                 .parse::<u64>()
                 .ok()
                 .map(|gigabytes| gigabytes * 1_000_000_000),
-            languages: descriptor
-                .languages
-                .iter()
-                .map(|language| (*language).to_owned())
-                .collect(),
-            language_summary: descriptor.languages.join(", "),
-            speed_tier: match descriptor.speed_guidance {
+            languages: descriptor.map_or_else(Vec::new, |descriptor| {
+                descriptor
+                    .languages
+                    .iter()
+                    .map(|language| (*language).to_owned())
+                    .collect()
+            }),
+            language_summary: descriptor.map_or_else(
+                || "Not specified".to_owned(),
+                |descriptor| descriptor.languages.join(", "),
+            ),
+            speed_tier: match descriptor.map_or(model.speed_tier.as_str(), |descriptor| {
+                descriptor.speed_guidance
+            }) {
                 "Fastest" => ModelSpeedTier::VeryFast,
                 "Fast" => ModelSpeedTier::Fast,
                 "Medium" => ModelSpeedTier::Balanced,
                 "Slower" => ModelSpeedTier::AccurateSlow,
                 _ => ModelSpeedTier::Unknown,
             },
-            size_tier: match descriptor.artifact_size_bytes {
-                0..=100_000_000 => ModelSizeTier::Tiny,
-                100_000_001..=200_000_000 => ModelSizeTier::Base,
-                200_000_001..=600_000_000 => ModelSizeTier::Small,
-                600_000_001..=1_000_000_000 => ModelSizeTier::Medium,
-                _ => ModelSizeTier::Large,
-            },
-            capabilities: ModelCapabilities {
-                streaming_preview: descriptor.capabilities.native_streaming,
-                translation: descriptor.capabilities.translation,
-                timestamps: descriptor.capabilities.timestamps,
-                language_detection: descriptor.capabilities.language_detection,
-            },
-            compatibility: match descriptor.compatibility {
-                CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
-                CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
-                CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
-            },
+            size_tier: descriptor.map_or(ModelSizeTier::Unknown, |descriptor| {
+                match descriptor.artifact_size_bytes {
+                    0..=100_000_000 => ModelSizeTier::Tiny,
+                    100_000_001..=200_000_000 => ModelSizeTier::Base,
+                    200_000_001..=600_000_000 => ModelSizeTier::Small,
+                    600_000_001..=1_000_000_000 => ModelSizeTier::Medium,
+                    _ => ModelSizeTier::Large,
+                }
+            }),
+            capabilities: descriptor.map_or_else(ModelCapabilities::default, |descriptor| {
+                ModelCapabilities {
+                    streaming_preview: descriptor.capabilities.native_streaming,
+                    translation: descriptor.capabilities.translation,
+                    timestamps: descriptor.capabilities.timestamps,
+                    language_detection: descriptor.capabilities.language_detection,
+                }
+            }),
+            compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
+                match descriptor.compatibility {
+                    CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
+                    CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                    CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
+                }
+            }),
             error_message: match install_status {
                 ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message) => {
                     Some(message)
@@ -8920,6 +8972,15 @@ impl LocalTranscriberApp {
                 }
                 None => {}
             },
+            ScreenAction::OpenComparison => {
+                self.model_comparison.expanded = true;
+                self.model_comparison.focus_panel = true;
+                if self.model_comparison.selected_model_ids.is_empty() {
+                    self.model_comparison.selected_model_ids.extend(
+                        initial_comparison_model_selection(&self.model_management_catalog()),
+                    );
+                }
+            }
             ScreenAction::ToggleComparison => {
                 self.model_comparison.expanded = !self.model_comparison.expanded
             }
@@ -9031,8 +9092,10 @@ impl LocalTranscriberApp {
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
+                    && self.select_model_as_default(&model)
                 {
-                    self.select_model_as_default(&model);
+                    self.model_management.dialog = None;
+                    self.model_management.restore_details_focus = Some(id);
                 }
             }
             ScreenAction::ConfirmModelRemoval(id) => {
@@ -9988,6 +10051,7 @@ impl LocalTranscriberApp {
             | ScreenAction::StopRecording
             | ScreenAction::ClearTranscript
             | ScreenAction::CopyTranscript
+            | ScreenAction::OpenComparison
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
@@ -11311,6 +11375,58 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
 #[cfg(test)]
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     compatibility_bridge::model_storage_estimate(model)
+}
+
+fn initial_comparison_model_selection(models: &[ModelViewModel]) -> Vec<String> {
+    models
+        .iter()
+        .filter(|model| {
+            model.installed
+                && model.ready
+                && model.compatibility != ModelCompatibility::Incompatible
+        })
+        .take(2)
+        .map(|model| model.id.clone())
+        .collect()
+}
+
+fn model_ui_labels(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> (String, String) {
+    let variant = model_variant_label(model, descriptor);
+    let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
+    (name.to_owned(), variant)
+}
+
+fn model_artifact_remains_manageable(
+    model: &SttModelInfo,
+    effective_status: &ModelInstallStatus,
+) -> bool {
+    model.install_status.is_runnable() || effective_status.is_runnable()
+}
+
+fn model_variant_label(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> String {
+    let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    let language = descriptor
+        .and_then(|descriptor| (descriptor.languages.len() == 1).then_some(descriptor.languages[0]))
+        .or_else(|| {
+            words
+                .last()
+                .is_some_and(|word| word.eq_ignore_ascii_case("English"))
+                .then_some("en")
+        });
+    let candidate = words
+        .iter()
+        .rev()
+        .find(|word| !word.eq_ignore_ascii_case("English"))
+        .copied()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    match language {
+        Some(language) if !candidate.ends_with(format!(".{language}").as_str()) => {
+            format!("{candidate}.{language}")
+        }
+        _ => candidate,
+    }
 }
 
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
@@ -14787,6 +14903,275 @@ mod layout_tests {
     }
 
     #[test]
+    fn live_model_projection_exposes_details_actions_for_ready_models() {
+        let mut app = test_app();
+        let base_fixture = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+
+        let selected = app.transcribe_screen_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].display_name, "English Tiny");
+        assert_eq!(selected[0].variant_label, "tiny.en");
+
+        app.config.general.selected_default_model = "not-selected".to_owned();
+
+        let ready = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .expect("tiny model should be projected");
+        assert!(ready.installed);
+        assert!(ready.ready);
+        assert!(!ready.active);
+        assert_eq!(ready.primary_action_label, "Use this model");
+        assert!(ready.primary_action_enabled);
+        assert!(!ready.primary_action_repairs_runtime);
+        assert_eq!(ready.primary_action_disabled_reason, None);
+        assert_eq!(ready.display_name, "English Tiny");
+        assert_eq!(ready.variant_label, "tiny.en");
+
+        assert!(
+            app.model_management_catalog()
+                .iter()
+                .any(|model| model.id == "whisper_cpp_base_en" && model.installed),
+            "an installed retained-compatibility model must remain manageable"
+        );
+
+        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        let active = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .expect("active tiny model should be projected");
+        assert!(active.active);
+        assert_eq!(active.primary_action_label, "Active");
+        assert!(!active.primary_action_enabled);
+        assert_eq!(
+            active.primary_action_disabled_reason.as_deref(),
+            Some("This model is already active.")
+        );
+        let _ = fs::remove_file(base_fixture);
+    }
+
+    #[test]
+    fn live_model_projection_exposes_repair_for_an_installed_runtime_failure() {
+        let app = test_app();
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&ModelId::new("whisper_cpp_tiny_en"))
+            .unwrap();
+        let model = SttModelInfo {
+            id: "installed-without-provider".to_owned(),
+            name: "Local compatibility model".to_owned(),
+            backend: "Unavailable runtime".to_owned(),
+            description: "Installed model with a missing runtime provider.".to_owned(),
+            expected_ram: "1 GB".to_owned(),
+            accuracy_tier: "Unknown".to_owned(),
+            speed_tier: "Unknown".to_owned(),
+            local_path: None,
+            install_status: ModelInstallStatus::Installed,
+            download_model: None,
+        };
+
+        let projected = app.model_management_view_model(&model, Some(&descriptor));
+
+        assert!(projected.installed);
+        assert!(!projected.ready);
+        assert_eq!(projected.primary_action_label, "Repair runtime");
+        assert!(projected.primary_action_repairs_runtime);
+        assert!(!projected.primary_action_enabled);
+        assert_eq!(
+            projected.primary_action_disabled_reason.as_deref(),
+            Some("This model has no compatible local provider.")
+        );
+    }
+
+    #[test]
+    fn descriptorless_installed_compatibility_model_remains_manageable_and_selectable() {
+        let mut app = test_app();
+        let id = "vosk_small_en";
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-vosk-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["am", "conf", "graph"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
+        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
+        fs::write(root.join("graph").join("HCLG.fst"), b"graph").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert(id.to_owned(), root.clone());
+        config::normalize_config(&mut app.config);
+        assert!(
+            app.transcription_service
+                .model_descriptor(&ModelId::new(id))
+                .is_err(),
+            "the fixture must exercise the descriptor-less compatibility path"
+        );
+
+        let projected = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("installed compatibility model must remain visible");
+        assert!(projected.installed);
+        assert_eq!(projected.display_name, "Vosk small English");
+        assert_eq!(projected.variant_label, "small.en");
+        assert_eq!(projected.compatibility, ModelCompatibility::Incompatible);
+
+        app.model_downloads
+            .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
+        let repairing = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("compatibility model must remain visible during runtime repair");
+        assert!(repairing.installed);
+        assert!(!repairing.ready);
+        assert_eq!(repairing.download_state, ModelDownloadState::Verifying);
+        assert_eq!(repairing.primary_action_label, "Repair runtime");
+
+        app.model_downloads.insert(
+            id.to_owned(),
+            ModelInstallStatus::RuntimeError("runtime repair failed".into()),
+        );
+        let failed = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("compatibility model must remain visible after runtime repair fails");
+        assert!(failed.installed);
+        assert!(!failed.ready);
+        assert_eq!(failed.download_state, ModelDownloadState::Failed);
+        assert_eq!(failed.primary_action_label, "Repair runtime");
+
+        app.config.general.selected_default_model = id.to_owned();
+        let selected = app.transcribe_screen_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, id);
+        assert_eq!(selected[0].display_name, "Vosk small English");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initial_runtime_preparation_does_not_claim_the_model_artifact_is_installed() {
+        let mut app = test_app();
+        let id = "whisper_cpp_base_en";
+        let mut model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == id)
+            .unwrap();
+        model.local_path = None;
+        model.install_status = ModelInstallStatus::NotInstalled;
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&ModelId::new(id))
+            .unwrap();
+        app.model_downloads
+            .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
+
+        let projected = app.model_management_view_model(&model, Some(&descriptor));
+
+        assert!(!projected.installed);
+        assert!(!projected.ready);
+        assert_eq!(projected.download_state, ModelDownloadState::Verifying);
+        assert_eq!(projected.primary_action_label, "Not installed");
+    }
+
+    #[test]
+    fn blocked_model_selection_keeps_the_details_dialog_open() {
+        let mut app = test_app();
+        let selected = app.config.general.selected_default_model.clone();
+        app.model_management.dialog = Some(ModelDialog::Details("whisper_cpp_tiny_en".into()));
+        app.artifact_recovery_error = Some("Resolve artifact recovery first.".into());
+
+        app.apply_model_management_action(ScreenAction::SelectModel("whisper_cpp_tiny_en".into()));
+
+        assert_eq!(app.config.general.selected_default_model, selected);
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Details("whisper_cpp_tiny_en".into()))
+        );
+        assert_eq!(app.status_message, "Resolve artifact recovery first.");
+        assert_eq!(app.model_management.restore_details_focus, None);
+    }
+
+    #[test]
+    fn comparison_seed_takes_exactly_two_eligible_models_in_visible_order() {
+        let model = |id: &str, installed, ready, compatibility| ModelViewModel {
+            id: id.to_owned(),
+            installed,
+            ready,
+            compatibility,
+            ..Default::default()
+        };
+        let models = vec![
+            model("missing", false, true, ModelCompatibility::Supported),
+            model("first", true, true, ModelCompatibility::Supported),
+            model("not-ready", true, false, ModelCompatibility::Supported),
+            model("second", true, true, ModelCompatibility::Experimental),
+            model("third", true, true, ModelCompatibility::Supported),
+            model("blocked", true, true, ModelCompatibility::Incompatible),
+        ];
+
+        assert_eq!(
+            initial_comparison_model_selection(&models),
+            ["first".to_owned(), "second".to_owned()]
+        );
+    }
+
+    #[test]
+    fn live_compare_action_opens_focuses_and_preserves_existing_selection() {
+        let mut app = test_app();
+        app.model_comparison.selected_model_ids.clear();
+
+        app.apply_model_management_action(ScreenAction::OpenComparison);
+
+        assert!(app.model_comparison.expanded);
+        assert!(app.model_comparison.focus_panel);
+        assert_eq!(
+            app.model_comparison.selected_model_ids,
+            ["whisper_cpp_tiny_en".to_owned()].into_iter().collect()
+        );
+
+        app.model_comparison.focus_panel = false;
+        app.apply_model_management_action(ScreenAction::OpenComparison);
+        assert!(app.model_comparison.focus_panel);
+        assert_eq!(
+            app.model_comparison.selected_model_ids,
+            ["whisper_cpp_tiny_en".to_owned()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn live_compare_selection_rejects_a_fifth_model_and_locks_while_busy() {
+        let mut app = test_app();
+        app.model_comparison
+            .selected_model_ids
+            .extend(["one", "two", "three", "four"].map(str::to_owned));
+
+        app.apply_model_management_action(ScreenAction::ToggleComparisonModel("five".into()));
+
+        assert!(!app.model_comparison.selected_model_ids.contains("five"));
+        assert_eq!(
+            app.model_comparison.selection_feedback.as_deref(),
+            Some("A comparison can include at most four models.")
+        );
+
+        app.model_comparison.phase = ComparisonPhase::Recording;
+        app.apply_model_management_action(ScreenAction::ToggleComparisonModel("one".into()));
+        assert!(app.model_comparison.selected_model_ids.contains("one"));
+        assert_eq!(
+            app.model_comparison.selection_feedback.as_deref(),
+            Some("Model selection is locked during a comparison.")
+        );
+    }
+
+    #[test]
     fn comparison_start_does_not_supersede_active_dictation_or_output() {
         for output_pending in [false, true] {
             let mut app = test_app();
@@ -15751,6 +16136,21 @@ mod layout_tests {
             window_hidden_to_tray: false,
             quit_requested: false,
         }
+    }
+
+    fn install_test_catalog_model(app: &mut LocalTranscriberApp, model_id: &str) -> PathBuf {
+        let fixture = std::env::temp_dir().join(format!(
+            "scribe-app-{model_id}-{}-{}.gguf",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&fixture, b"test-only placeholder").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert(model_id.to_owned(), fixture.clone());
+        config::normalize_config(&mut app.config);
+        fixture
     }
 
     #[test]
