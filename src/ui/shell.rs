@@ -7,9 +7,11 @@ use super::{
 
 /// Painted width of the full navigation panel, including both horizontal margins.
 pub(crate) const FULL_SIDEBAR_WIDTH: f32 = 214.0;
-const SIDEBAR_HORIZONTAL_MARGIN: f32 = 12.0;
-const FULL_SIDEBAR_CONTENT_WIDTH: f32 = FULL_SIDEBAR_WIDTH - SIDEBAR_HORIZONTAL_MARGIN * 2.0;
+const FULL_SIDEBAR_HORIZONTAL_MARGIN: f32 = 12.0;
+const FULL_SIDEBAR_CONTENT_WIDTH: f32 = FULL_SIDEBAR_WIDTH - FULL_SIDEBAR_HORIZONTAL_MARGIN * 2.0;
 pub(crate) const COMPACT_RAIL_WIDTH: f32 = 66.0;
+const COMPACT_RAIL_HORIZONTAL_MARGIN: f32 = 11.0;
+const COMPACT_RAIL_CONTENT_WIDTH: f32 = COMPACT_RAIL_WIDTH - COMPACT_RAIL_HORIZONTAL_MARGIN * 2.0;
 pub(crate) const COMPACT_NAV_BREAKPOINT: f32 = 1_000.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -77,18 +79,19 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
     }
     let mode = navigation_mode(ctx.screen_rect().width());
     let colors = theme_palette(ctx);
+    let (horizontal_margin, content_width) = match mode {
+        NavigationMode::Full => (FULL_SIDEBAR_HORIZONTAL_MARGIN, FULL_SIDEBAR_CONTENT_WIDTH),
+        NavigationMode::Compact => (COMPACT_RAIL_HORIZONTAL_MARGIN, COMPACT_RAIL_CONTENT_WIDTH),
+    };
     let navigation = egui::SidePanel::left("navigation")
         .frame(
             Frame::none()
                 .fill(colors.sidebar_bg)
                 .stroke(Stroke::new(1.0, colors.border))
-                .inner_margin(Margin::symmetric(SIDEBAR_HORIZONTAL_MARGIN, 16.0)),
+                .inner_margin(Margin::symmetric(horizontal_margin, 16.0)),
         )
         .resizable(false)
-        .exact_width(match mode {
-            NavigationMode::Full => FULL_SIDEBAR_CONTENT_WIDTH,
-            NavigationMode::Compact => COMPACT_RAIL_WIDTH,
-        })
+        .exact_width(content_width)
         .show(ctx, |ui| {
             brand(ui, mode, colors.text, colors.muted_text);
             ui.add_space(22.0);
@@ -214,19 +217,24 @@ fn secondary_navigation(
         });
         egui::popup_below_widget(ui, more.id, &more, |ui| {
             if menu_item(ui, "History") {
-                *current = AppPage::History;
+                select_compact_destination(ui, current, AppPage::History);
             }
             if menu_item(ui, "About") {
-                *current = AppPage::About;
+                select_compact_destination(ui, current, AppPage::About);
             }
             if menu_item(ui, "Advanced") {
-                *current = AppPage::Advanced;
+                select_compact_destination(ui, current, AppPage::Advanced);
             }
             if debug_enabled && menu_item(ui, "Debug") {
-                *current = AppPage::Debug;
+                select_compact_destination(ui, current, AppPage::Debug);
             }
         });
     }
+}
+
+fn select_compact_destination(ui: &mut egui::Ui, current: &mut AppPage, destination: AppPage) {
+    *current = destination;
+    ui.memory_mut(|memory| memory.close_popup());
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
@@ -375,7 +383,7 @@ mod tests {
                         Frame::none()
                             .fill(colors.sidebar_bg)
                             .stroke(Stroke::new(1.0, colors.border))
-                            .inner_margin(Margin::symmetric(SIDEBAR_HORIZONTAL_MARGIN, 16.0)),
+                            .inner_margin(Margin::symmetric(FULL_SIDEBAR_HORIZONTAL_MARGIN, 16.0)),
                     )
                     .resizable(false)
                     .exact_width(FULL_SIDEBAR_CONTENT_WIDTH)
@@ -384,6 +392,64 @@ mod tests {
             },
         );
         assert!((painted_width - FULL_SIDEBAR_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn compact_rail_painted_width_preserves_a_44_point_target() {
+        assert_eq!(COMPACT_RAIL_CONTENT_WIDTH, 44.0);
+        let ctx = egui::Context::default();
+        let mut painted_width = 0.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(960.0, 680.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let colors = theme_palette(ctx);
+                let panel = egui::SidePanel::left("compact-width-test")
+                    .frame(
+                        Frame::none()
+                            .fill(colors.sidebar_bg)
+                            .stroke(Stroke::new(1.0, colors.border))
+                            .inner_margin(Margin::symmetric(COMPACT_RAIL_HORIZONTAL_MARGIN, 16.0)),
+                    )
+                    .resizable(false)
+                    .exact_width(COMPACT_RAIL_CONTENT_WIDTH)
+                    .show(ctx, |ui| {
+                        let response = nav_icon_button(
+                            ui,
+                            Icon::Microphone,
+                            "Transcribe",
+                            true,
+                            colors.active_card_bg,
+                            colors.text,
+                            colors.muted_text,
+                        );
+                        assert!(response.rect.width() >= 44.0);
+                        assert!(response.rect.height() >= 44.0);
+                    });
+                painted_width = panel.response.rect.width();
+            },
+        );
+        assert!((painted_width - COMPACT_RAIL_WIDTH).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn compact_more_selection_closes_the_popup() {
+        let ctx = egui::Context::default();
+        let popup_id = egui::Id::new("compact-more-close-test");
+        ctx.memory_mut(|memory| memory.open_popup(popup_id));
+        let mut page = AppPage::Transcribe;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                select_compact_destination(ui, &mut page, AppPage::History);
+            });
+        });
+        assert_eq!(page, AppPage::History);
+        assert!(!ctx.memory(|memory| memory.any_popup_open()));
     }
 
     #[test]

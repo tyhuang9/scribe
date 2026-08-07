@@ -9701,6 +9701,17 @@ impl LocalTranscriberApp {
         diagnostics
     }
 
+    fn selected_model_ui_label(&self) -> String {
+        let Some(model) = self.selected_model() else {
+            return "No model selected".to_owned();
+        };
+        let descriptor = self
+            .transcription_service
+            .model_descriptor(&ModelId::new(&model.id))
+            .ok();
+        model_ui_labels(&model, descriptor.as_ref()).0
+    }
+
     fn ui_general_settings(&mut self, ui: &mut Ui) {
         let (selected_model_id, model_readiness) = self.selected_model_screen_state();
         let (levels, level_revision, level_source_active) = self.current_sensitivity_level_sample();
@@ -9765,11 +9776,7 @@ impl LocalTranscriberApp {
                 .map(str::to_owned),
             restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
             paste_delay_ms: self.config.output.paste_delay_ms,
-            active_model_label: self
-                .transcription_service
-                .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
-                .map(|descriptor| descriptor.display_name.to_owned())
-                .unwrap_or_else(|_| "No model selected".to_owned()),
+            active_model_label: self.selected_model_ui_label(),
             hotkey_input: self.hotkey_input.clone(),
             hotkey_capture_active: self.capturing_hotkey,
             hotkey_capture_status: self.capturing_hotkey.then(|| self.status_message.clone()),
@@ -15050,6 +15057,7 @@ mod layout_tests {
         assert_eq!(failed.primary_action_label, "Repair runtime");
 
         app.config.general.selected_default_model = id.to_owned();
+        assert_eq!(app.selected_model_ui_label(), "Vosk small English");
         let selected = app.transcribe_screen_models();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, id);
