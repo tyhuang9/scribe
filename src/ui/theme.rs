@@ -18,6 +18,7 @@ pub(crate) struct ThemePalette {
     pub slider_threshold_fill: Color32,
     pub slider_remainder_fill: Color32,
     pub slider_live_below: Color32,
+    pub slider_live_above: Color32,
     pub primary: Color32,
     pub accent: Color32,
     /// Package green for fills and dots; use `success_text` for text on light surfaces.
@@ -63,6 +64,7 @@ impl ThemePalette {
             slider_threshold_fill: Color32::from_rgb(147, 197, 253),
             slider_remainder_fill: Color32::from_rgb(226, 232, 240),
             slider_live_below: Color32::from_rgb(29, 78, 216),
+            slider_live_above: Color32::from_rgb(6, 118, 71),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
             success: Color32::from_rgb(18, 183, 106),
@@ -97,6 +99,7 @@ impl ThemePalette {
             slider_threshold_fill: Color32::from_rgb(30, 64, 108),
             slider_remainder_fill: Color32::from_rgb(53, 61, 76),
             slider_live_below: Color32::from_rgb(96, 165, 250),
+            slider_live_above: Color32::from_rgb(74, 222, 128),
             primary: Color32::from_rgb(247, 250, 252),
             accent: Color32::from_rgb(96, 165, 250),
             success: Color32::from_rgb(74, 222, 128),
@@ -144,6 +147,18 @@ mod tests {
 
         assert!(contrast_ratio(palette.error_text, palette.error_pale) >= 4.5);
         assert!(contrast_ratio(palette.danger_button_text, palette.error) >= 4.5);
+    }
+
+    #[test]
+    fn live_meter_fill_has_non_text_contrast_against_both_track_regions() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(
+                contrast_ratio(palette.slider_live_above, palette.slider_threshold_fill) >= 3.0
+            );
+            assert!(
+                contrast_ratio(palette.slider_live_above, palette.slider_remainder_fill) >= 3.0
+            );
+        }
     }
 
     fn contrast_ratio(a: Color32, b: Color32) -> f64 {

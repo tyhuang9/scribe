@@ -84,6 +84,8 @@ impl Fixture {
             duration_label: "30 seconds".into(),
             provisional_feedback: true,
             device_label: "Microphone (fifine Microphone)".into(),
+            input_sensitivity_percent: 38,
+            input_level_percent: 68,
             ..Default::default()
         };
         let route = match self {
@@ -1129,7 +1131,7 @@ mod tests {
         assert!(!select.is_disabled());
         assert_within_tolerance(
             card.x1,
-            896.0,
+            889.2,
             1.0,
             "Selected model card right edge at the 1180px reference width",
         );
@@ -1417,8 +1419,8 @@ mod tests {
             (ModelDialog::Add, "Add models", "Add models", "Close"),
             (
                 ModelDialog::Details("base.en".into()),
-                "Details for Base English",
-                "Model details for Base English",
+                "Details for whisper.cpp base.en",
+                "Model details for whisper.cpp base.en",
                 "Close",
             ),
             (
@@ -1978,7 +1980,7 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         assert_eq!(
             focused_node(&output).description(),
-            Some("Add a reference transcript to measure accuracy for Base English.")
+            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
         );
         assert_polite_atomic_notice(&output, "Reference transcript cleared.");
         assert!(!data.comparison.restore_reference_action_focus);
@@ -1999,7 +2001,7 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         assert_eq!(
             focused_node(&output).description(),
-            Some("Add a reference transcript to measure accuracy for Base English.")
+            Some("Add a reference transcript to measure accuracy for whisper.cpp base.en.")
         );
         assert_eq!(data.comparison.reference_notice, None);
 
@@ -2104,7 +2106,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .nodes;
-        for model in ["Base English", "Tiny English"] {
+        for model in ["whisper.cpp base.en", "Tiny English"] {
             assert!(compact_nodes.iter().any(|(_, node)| {
                 node.role() == egui::accesskit::Role::Group
                     && node.name() == Some(format!("Comparison result for {model}").as_str())
@@ -2251,6 +2253,16 @@ mod tests {
         assert_eq!(
             harness_route(page, data.route),
             UiRoute::Settings(SettingsTab::Output)
+        );
+    }
+    #[test]
+    fn settings_recording_fixture_contains_visible_live_meter_signal() {
+        let data = Fixture::SettingsRecording.data();
+        assert_eq!(data.settings.input_sensitivity_percent, 38);
+        assert_eq!(data.settings.input_level_percent, 68);
+        assert!(
+            data.settings.input_level_percent > data.settings.input_sensitivity_percent,
+            "the deterministic fixture should visibly cross the configured threshold"
         );
     }
     #[test]

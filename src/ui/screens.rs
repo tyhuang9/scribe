@@ -66,6 +66,8 @@ pub(crate) struct RecordingSettingsView {
     pub audio_devices: Vec<String>,
     pub device_label: String,
     pub input_sensitivity_percent: u8,
+    pub input_level_percent: u8,
+    pub microphone_error: Option<String>,
     pub auto_insert_transcript: bool,
     pub output_label: String,
     pub show_restore_clipboard: bool,
@@ -111,6 +113,8 @@ impl Default for RecordingSettingsView {
             audio_devices: Vec::new(),
             device_label: "OS default".into(),
             input_sensitivity_percent: 50,
+            input_level_percent: 0,
+            microphone_error: None,
             auto_insert_transcript: false,
             output_label: "Automatically insert final transcript".into(),
             show_restore_clipboard: cfg!(target_os = "windows"),
@@ -2748,20 +2752,30 @@ fn tab_control(ui: &mut egui::Ui, tab: SettingsTab, label: &str, selected: bool)
     let colors = ui_palette(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 40.0), egui::Sense::hover());
     let response = ui.interact(rect, tab_id(ui, tab), egui::Sense::click());
-    let fill = if selected {
-        colors.active_card_bg
-    } else if response.hovered() {
+    let fill = if !selected && response.hovered() {
         colors.panel_bg
     } else {
         egui::Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    if selected {
+        let underline = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.bottom() - 3.0),
+            egui::pos2(rect.right() - 8.0, rect.bottom()),
+        );
+        ui.painter()
+            .rect_filled(underline, Rounding::same(1.5), colors.accent);
+    }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(14.0),
-        colors.text,
+        if selected {
+            colors.text
+        } else {
+            colors.muted_text
+        },
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -2780,35 +2794,27 @@ fn radio_control(
     checked: bool,
 ) -> egui::Response {
     let colors = ui_palette(ui);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(112.0, 40.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(88.0, 36.0), egui::Sense::hover());
     let response = ui.interact(
         rect,
         ui.make_persistent_id(("recording-mode", mode)),
         egui::Sense::click(),
     );
     let fill = if checked {
-        colors.active_card_bg
+        colors.card_bg
     } else if response.hovered() {
-        colors.panel_bg
+        colors.active_card_bg
     } else {
         egui::Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
-    ui.painter().circle_stroke(
-        rect.left_center() + Vec2::new(12.0, 0.0),
-        7.0,
-        Stroke::new(1.5, colors.muted_text),
-    );
+    ui.painter().rect_filled(rect, Rounding::same(3.0), fill);
     if checked {
-        ui.painter().circle_filled(
-            rect.left_center() + Vec2::new(12.0, 0.0),
-            4.0,
-            colors.accent,
-        );
+        ui.painter()
+            .rect_stroke(rect, Rounding::same(3.0), Stroke::new(2.0, colors.accent));
     }
     ui.painter().text(
-        rect.left_center() + Vec2::new(26.0, 0.0),
-        egui::Align2::LEFT_CENTER,
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(14.0),
         colors.text,
@@ -2860,38 +2866,50 @@ fn recording_settings_panel(
                 builder.set_name("Recording mode");
             });
             ctx.with_accessibility_parent(radio_group_id, || {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [270.0, 40.0],
-                        egui::Label::new(RichText::new("Mode").color(colors.muted_text)),
-                    );
-                    for (mode, label) in [
-                        (RecordingMode::PressOnce, "Press once"),
-                        (RecordingMode::Hold, "Hold"),
-                    ] {
-                        let response = radio_control(ui, mode, label, state.recording_mode == mode);
-                        radio_ids.push(response.id);
-                        if response.clicked() {
-                            *action = ScreenAction::SetRecordingMode(mode);
-                        }
-                        if response.has_focus()
-                            && ui.input(|input| {
-                                input.key_pressed(egui::Key::ArrowRight)
-                                    || input.key_pressed(egui::Key::ArrowLeft)
-                            })
-                        {
-                            let next = if mode == RecordingMode::PressOnce {
-                                RecordingMode::Hold
-                            } else {
-                                RecordingMode::PressOnce
-                            };
-                            ui.memory_mut(|memory| {
-                                memory
-                                    .request_focus(ui.make_persistent_id(("recording-mode", next)))
+                compact_setting_row(ui, "Mode", true, |ui, _| {
+                    Frame::none()
+                        .fill(colors.panel_bg)
+                        .stroke(Stroke::new(1.0, colors.border))
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(Margin::same(4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (mode, label) in [
+                                    (RecordingMode::PressOnce, "Press once"),
+                                    (RecordingMode::Hold, "Hold"),
+                                ] {
+                                    let response = radio_control(
+                                        ui,
+                                        mode,
+                                        label,
+                                        state.recording_mode == mode,
+                                    );
+                                    radio_ids.push(response.id);
+                                    if response.clicked() {
+                                        *action = ScreenAction::SetRecordingMode(mode);
+                                    }
+                                    if response.has_focus()
+                                        && ui.input(|input| {
+                                            input.key_pressed(egui::Key::ArrowRight)
+                                                || input.key_pressed(egui::Key::ArrowLeft)
+                                        })
+                                    {
+                                        let next = if mode == RecordingMode::PressOnce {
+                                            RecordingMode::Hold
+                                        } else {
+                                            RecordingMode::PressOnce
+                                        };
+                                        ui.memory_mut(|memory| {
+                                            memory.request_focus(
+                                                ui.make_persistent_id(("recording-mode", next)),
+                                            )
+                                        });
+                                        *action = ScreenAction::SetRecordingMode(next);
+                                    }
+                                }
                             });
-                            *action = ScreenAction::SetRecordingMode(next);
-                        }
-                    }
+                        });
                 });
             });
             let radio_group = radio_ids
@@ -2903,10 +2921,7 @@ fn recording_settings_panel(
                     builder.set_radio_group(radio_group.clone());
                 });
             }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            setting_row(ui, "Duration limit", |ui, label_id| {
+            compact_setting_row(ui, "Duration limit", true, |ui, label_id| {
                 let mut duration = settings.duration_seconds;
                 ComboBox::from_id_source("duration-limit")
                     .selected_text(&settings.duration_label)
@@ -2926,59 +2941,22 @@ fn recording_settings_panel(
                     *action = ScreenAction::SetDurationSeconds(duration);
                 }
             });
-            setting_row(ui, "Visual feedback", |ui, _| {
+            compact_setting_row(ui, "Visual feedback", false, |ui, _| {
                 let mut enabled = settings.provisional_feedback;
-                let response = ui.checkbox(&mut enabled, "Show provisional words while recording");
-                if response.clicked() {
-                    *action = ScreenAction::ToggleProvisionalFeedback;
-                }
-                ui.label(
-                    RichText::new("Improves visual feedback but may use more CPU.")
-                        .small()
-                        .color(colors.muted_text),
-                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let response =
+                        ui.checkbox(&mut enabled, "Show provisional words while recording");
+                    if response.clicked() {
+                        *action = ScreenAction::ToggleProvisionalFeedback;
+                    }
+                    ui.label(
+                        RichText::new("Improves visual feedback but may use more CPU.")
+                            .small()
+                            .color(colors.muted_text),
+                    );
+                });
             });
-            ui.separator();
-            let mut vad_enabled = settings.vad_enabled;
-            if ui
-                .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
-                .changed()
-            {
-                *action = ScreenAction::SetVadEnabled(vad_enabled);
-            }
-            if vad_enabled {
-                for (label, value, action_for) in [
-                    ("Speech confirmation ms", settings.speech_confirmation_ms, 0),
-                    ("Internal pause ms", settings.internal_pause_ms, 1),
-                    ("End after silence ms", settings.endpoint_silence_ms, 2),
-                    ("Pre-roll ms", settings.pre_roll_ms, 3),
-                    ("Post-roll ms", settings.post_roll_ms, 4),
-                ] {
-                    ui.horizontal(|ui| {
-                        let label_response = ui.add_sized(
-                            [270.0, 40.0],
-                            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-                        );
-                        let mut edited = value as i64;
-                        if ui
-                            .add(egui::DragValue::new(&mut edited).clamp_range(0..=5_000))
-                            .labelled_by(label_response.id)
-                            .changed()
-                        {
-                            *action = match action_for {
-                                0 => ScreenAction::SetSpeechConfirmationMs(edited.max(50) as u32),
-                                1 => ScreenAction::SetInternalPauseMs(edited.max(100) as u32),
-                                2 => ScreenAction::SetEndpointSilenceMs(edited as u32),
-                                3 => ScreenAction::SetPreRollMs(edited as u32),
-                                _ => ScreenAction::SetPostRollMs(edited as u32),
-                            };
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                }
-            }
         });
     });
     ui.add_space(16.0);
@@ -2990,7 +2968,7 @@ fn recording_settings_panel(
             });
         ui.add_space(12.0);
         ui.add_enabled_ui(!recording_locked, |ui| {
-            setting_row(ui, "Device", |ui, label_id| {
+            compact_setting_row(ui, "Device", true, |ui, label_id| {
                 let mut selected = settings.selected_audio_device.clone();
                 ComboBox::from_id_source("audio-device")
                     .selected_text(&settings.device_label)
@@ -3019,39 +2997,48 @@ fn recording_settings_panel(
                     *action = ScreenAction::RefreshDevices;
                 }
             });
-            setting_row(ui, "Input sensitivity", |ui, label_id| {
+            compact_setting_row(ui, "Input level", false, |ui, label_id| {
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(24.0, 40.0), Sense::hover());
+                ui.painter().text(
+                    icon_rect.center(),
+                    Align2::CENTER_CENTER,
+                    icon_glyph(Icon::Microphone),
+                    egui::FontId::proportional(18.0),
+                    colors.muted_text,
+                );
                 let mut percent = settings.input_sensitivity_percent;
-                let sensitivity = ui
-                    .add_sized(
-                        [320.0, 40.0],
-                        egui::Slider::new(&mut percent, 0..=100)
-                            .show_value(false),
-                    )
-                    .labelled_by(label_id);
-                ui.ctx().accesskit_node_builder(sensitivity.id, |builder| {
-                    builder.set_name("Input sensitivity");
-                    builder.set_description(
-                        "Minimum microphone level treated as speech. Use Left and Right arrow keys to adjust.",
-                    );
-                });
+                let sensitivity =
+                    input_sensitivity_meter_slider(ui, settings.input_level_percent, &mut percent)
+                        .labelled_by(label_id);
                 if sensitivity.changed() {
                     *action = ScreenAction::SetInputSensitivity(percent);
                 }
             });
         });
+        if let Some(error) = settings.microphone_error.as_deref() {
+            ui.add_space(8.0);
+            let error_action = microphone_error_notice(ui, error);
+            if error_action != ScreenAction::None {
+                *action = error_action;
+            }
+        }
     });
     ui.add_space(16.0);
     card(ui, |ui| {
         ui.label(RichText::new("Shortcut").strong());
         ui.add_space(12.0);
         ui.add_enabled_ui(!recording_locked, |ui| {
-            setting_row(ui, "Global record hotkey", |ui, _| {
-                for key in state
+            compact_setting_row(ui, "Global record hotkey", false, |ui, _| {
+                for (index, key) in state
                     .hotkey
                     .split('+')
                     .map(str::trim)
                     .filter(|key| !key.is_empty())
+                    .enumerate()
                 {
+                    if index > 0 {
+                        ui.label(RichText::new("+").color(colors.muted_text));
+                    }
                     keycap(ui, key);
                 }
                 let capture_name = if settings.hotkey_capture_active {
@@ -3074,6 +3061,61 @@ fn recording_settings_panel(
                     builder.set_live(egui::accesskit::Live::Polite);
                     builder.set_live_atomic();
                 });
+            }
+        });
+    });
+    ui.add_space(16.0);
+    card(ui, |ui| {
+        ui.label(RichText::new("Advanced voice detection").strong());
+        ui.add_space(12.0);
+        ui.add_enabled_ui(!recording_locked, |ui| {
+            let mut vad_enabled = settings.vad_enabled;
+            if ui
+                .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
+                .changed()
+            {
+                *action = ScreenAction::SetVadEnabled(vad_enabled);
+            }
+            if vad_enabled {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                for (index, (label, value, action_for)) in [
+                    ("Speech confirmation ms", settings.speech_confirmation_ms, 0),
+                    ("Internal pause ms", settings.internal_pause_ms, 1),
+                    ("End after silence ms", settings.endpoint_silence_ms, 2),
+                    ("Pre-roll ms", settings.pre_roll_ms, 3),
+                    ("Post-roll ms", settings.post_roll_ms, 4),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    ui.horizontal(|ui| {
+                        let label_response = ui.add_sized(
+                            [270.0, 40.0],
+                            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+                        );
+                        let mut edited = value as i64;
+                        if ui
+                            .add(egui::DragValue::new(&mut edited).clamp_range(0..=5_000))
+                            .labelled_by(label_response.id)
+                            .changed()
+                        {
+                            *action = match action_for {
+                                0 => ScreenAction::SetSpeechConfirmationMs(edited.max(50) as u32),
+                                1 => ScreenAction::SetInternalPauseMs(edited.max(100) as u32),
+                                2 => ScreenAction::SetEndpointSilenceMs(edited as u32),
+                                3 => ScreenAction::SetPreRollMs(edited as u32),
+                                _ => ScreenAction::SetPostRollMs(edited as u32),
+                            };
+                        }
+                    });
+                    if index < 4 {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                }
             }
         });
     });
@@ -3400,6 +3442,148 @@ fn describe_history_lock(ui: &egui::Ui, response: &egui::Response, locked: bool)
     }
 }
 
+fn input_sensitivity_meter_slider(
+    ui: &mut egui::Ui,
+    live_level_percent: u8,
+    threshold_percent: &mut u8,
+) -> egui::Response {
+    use egui::accesskit::{Action, ActionData};
+
+    let desired = Vec2::new(320.0, 40.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
+    let previous = *threshold_percent;
+    let mut value = f32::from(*threshold_percent).clamp(0.0, 100.0);
+
+    if response.enabled() && response.clicked() {
+        response.request_focus();
+    }
+    if response.enabled()
+        && (response.clicked() || response.dragged())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        value = (100.0 * (pointer.x - rect.left()) / rect.width()).clamp(0.0, 100.0);
+    }
+
+    let mut decrement = 0usize;
+    let mut increment = 0usize;
+    if response.enabled() && response.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+        ui.input(|input| {
+            decrement += input.num_presses(egui::Key::ArrowLeft);
+            increment += input.num_presses(egui::Key::ArrowRight);
+            if input.key_pressed(egui::Key::Home) {
+                value = 0.0;
+            }
+            if input.key_pressed(egui::Key::End) {
+                value = 100.0;
+            }
+        });
+    }
+    if response.enabled() {
+        ui.input(|input| {
+            decrement += input.num_accesskit_action_requests(response.id, Action::Decrement);
+            increment += input.num_accesskit_action_requests(response.id, Action::Increment);
+            for request in input.accesskit_action_requests(response.id, Action::SetValue) {
+                if let Some(ActionData::NumericValue(requested)) = request.data {
+                    value = requested as f32;
+                }
+            }
+        });
+    }
+    value = (value + increment as f32 - decrement as f32).clamp(0.0, 100.0);
+    *threshold_percent = value.round() as u8;
+    if *threshold_percent != previous {
+        response.mark_changed();
+    }
+
+    let live_state = if live_level_percent == 0 {
+        "No input detected."
+    } else if live_level_percent >= *threshold_percent {
+        "Input detected above sensitivity."
+    } else {
+        "Input below sensitivity."
+    };
+    let description = format!(
+        "{live_state} Minimum microphone level treated as speech. The colored fill shows the current input level without changing focus or announcing each update. Use Left and Right arrow keys to adjust."
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::slider(f64::from(*threshold_percent), "Input level sensitivity")
+    });
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name("Input level sensitivity");
+        builder.set_description(description);
+        builder.set_min_numeric_value(0.0);
+        builder.set_max_numeric_value(100.0);
+        builder.set_numeric_value_step(1.0);
+        builder.add_action(Action::SetValue);
+        if *threshold_percent < 100 {
+            builder.add_action(Action::Increment);
+        }
+        if *threshold_percent > 0 {
+            builder.add_action(Action::Decrement);
+        }
+    });
+
+    let colors = ui_palette(ui);
+    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 10.0));
+    let rounding = Rounding::same(5.0);
+    ui.painter()
+        .rect_filled(track, rounding, colors.slider_remainder_fill);
+    let threshold_position = f32::from(*threshold_percent) / 100.0;
+    let threshold_x = track.left() + track.width() * threshold_position;
+    let threshold_region = egui::Rect::from_min_max(
+        track.min,
+        egui::pos2(
+            threshold_x.clamp(track.left(), track.right()),
+            track.bottom(),
+        ),
+    );
+    if threshold_region.width() > 0.0 {
+        ui.painter()
+            .rect_filled(threshold_region, rounding, colors.slider_threshold_fill);
+    }
+    ui.painter().rect_stroke(
+        track,
+        rounding,
+        Stroke::new(1.0, colors.slider_track_border),
+    );
+    let live_position = f32::from(live_level_percent.min(100)) / 100.0;
+    let live_width = track.width() * live_position;
+    if live_width > 0.0 {
+        let live_rect = egui::Rect::from_min_size(
+            egui::pos2(track.left(), track.center().y - 3.0),
+            Vec2::new(live_width, 6.0),
+        );
+        let fill = if live_position >= threshold_position {
+            colors.slider_live_above
+        } else {
+            colors.slider_live_below
+        };
+        ui.painter()
+            .rect_filled(live_rect, Rounding::same(3.0), fill);
+    }
+
+    let thumb_center = egui::pos2(threshold_x, track.center().y);
+    let thumb_radius = if response.dragged() { 9.0 } else { 8.0 };
+    ui.painter()
+        .circle_filled(thumb_center, thumb_radius, colors.card_bg);
+    ui.painter().circle_stroke(
+        thumb_center,
+        thumb_radius,
+        Stroke::new(if response.has_focus() { 3.0 } else { 2.0 }, colors.primary),
+    );
+    paint_focus_ring(ui, &response, Rounding::same(5.0));
+    response
+}
+
 fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui, egui::Id)) {
     ui.horizontal(|ui| {
         let label = ui.add_sized(
@@ -3411,6 +3595,24 @@ fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
+}
+
+fn compact_setting_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    separator_after: bool,
+    contents: impl FnOnce(&mut egui::Ui, egui::Id),
+) {
+    ui.horizontal(|ui| {
+        let label = ui.add_sized(
+            [270.0, 40.0],
+            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+        );
+        contents(ui, label.id);
+    });
+    if separator_after {
+        ui.separator();
+    }
 }
 
 fn next_tab(tab: SettingsTab) -> SettingsTab {
@@ -4556,11 +4758,12 @@ mod tests {
     }
 
     #[test]
-    fn recording_settings_exposes_one_sensitivity_slider_without_live_input_meter() {
+    fn recording_settings_keeps_live_level_paint_inside_one_sensitivity_slider() {
         use egui::accesskit::Role;
 
         let settings_view = RecordingSettingsView {
             input_sensitivity_percent: 42,
+            input_level_percent: 72,
             ..Default::default()
         };
         let ctx = egui::Context::default();
@@ -4579,7 +4782,7 @@ mod tests {
         let sliders = nodes
             .iter()
             .filter(|(_, node)| {
-                node.role() == Role::Slider && node.name() == Some("Input sensitivity")
+                node.role() == Role::Slider && node.name() == Some("Input level sensitivity")
             })
             .collect::<Vec<_>>();
         assert_eq!(sliders.len(), 1);
@@ -4587,6 +4790,16 @@ mod tests {
         assert_eq!(slider.min_numeric_value(), Some(0.0));
         assert_eq!(slider.max_numeric_value(), Some(100.0));
         assert_eq!(slider.numeric_value(), Some(42.0));
+        assert!(
+            slider
+                .description()
+                .is_some_and(|description| description.contains("colored fill"))
+        );
+        assert!(
+            slider
+                .description()
+                .is_some_and(|description| description.contains("Input detected"))
+        );
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == Role::Heading && node.name() == Some("Audio input")
         }));
