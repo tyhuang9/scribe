@@ -34,9 +34,11 @@ struct Shared {
     write: AtomicUsize,
 }
 
-// Safety: `Producer` is the only writer and `Consumer` is the only reader. A
-// release store publishes an initialized slot before the consumer observes it;
-// the consumer's release store publishes completion before a slot is reused.
+// Safety: `Producer` is the only writer of available slots. `Consumer` is the
+// only reader and clears its current consumed slot before publishing the
+// updated read index. A release store publishes an initialized slot before the
+// consumer observes it; the consumer's release store publishes completion
+// before a slot is reused.
 unsafe impl Sync for Shared {}
 
 pub(super) struct Producer {
@@ -80,8 +82,14 @@ impl Consumer {
 
         let index = read % self.shared.slots.len();
         // Safety: the acquire load of `write` observes the producer's
-        // initialization, and only this consumer reads the slot.
-        let sample = unsafe { (*self.shared.slots[index].get()).assume_init_read() };
+        // initialization. Only this consumer reads and clears the slot, and it
+        // publishes the new read index only after both operations complete.
+        let sample = unsafe {
+            let slot = &mut *self.shared.slots[index].get();
+            let sample = slot.assume_init_read();
+            slot.write(0.0);
+            sample
+        };
         self.shared
             .read
             .store(read.wrapping_add(1), Ordering::Release);
@@ -145,6 +153,18 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn consumed_samples_are_cleared_before_the_slot_is_released() {
+        let (mut producer, mut consumer) = ring_buffer(2);
+        producer.push(0.625).unwrap();
+
+        assert_eq!(consumer.pop(), Some(0.625));
+        // Safety: the sample was consumed, the read index has advanced, and
+        // this test performs no concurrent producer work while inspecting it.
+        let cleared = unsafe { (*consumer.shared.slots[0].get()).assume_init() };
+        assert_eq!(cleared, 0.0);
     }
 
     #[test]
