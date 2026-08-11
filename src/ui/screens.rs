@@ -4308,6 +4308,7 @@ mod tests {
                         enabled: false,
                         disabled_reason: Some("Insufficient verified disk space.".into()),
                     }],
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],

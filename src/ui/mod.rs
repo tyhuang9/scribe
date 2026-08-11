@@ -21,10 +21,10 @@ pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
     ComparisonPhase, ComparisonResult, ComparisonResultPhase, LocalGgufImportView,
     MicrophonePermission, ModelCapabilities, ModelComparisonState, ModelCompatibility, ModelDialog,
-    ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-    RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
-    RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogStatusView,
-    RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, UiRoute,
+    ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier,
+    ModelViewModel, RecordingMode, RemoteCatalogActionKind, RemoteCatalogActionView,
+    RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
+    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, UiRoute,
 };
 
 #[cfg(test)]

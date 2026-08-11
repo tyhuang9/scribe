@@ -314,7 +314,7 @@ pub(crate) enum ModelDialog {
     Remove(String),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
     /// One-frame focus request when a dialog first appears.
@@ -327,6 +327,54 @@ pub(crate) struct ModelManagementState {
     /// One-frame polite confirmation after a synchronous model removal attempt.
     pub removal_notice: Option<String>,
     pub mutation_block_reason: Option<String>,
+    pub installed_expanded: bool,
+    pub available_expanded: bool,
+}
+
+impl Default for ModelManagementState {
+    fn default() -> Self {
+        Self {
+            dialog: None,
+            focus_dialog_initial: false,
+            restore_add_focus: false,
+            restore_after_removal_focus: false,
+            restore_details_focus: None,
+            restore_remove_focus: None,
+            removal_notice: None,
+            mutation_block_reason: None,
+            installed_expanded: true,
+            available_expanded: true,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModelLanguageFilter {
+    #[default]
+    All,
+    English,
+    Multilingual,
+}
+
+#[allow(dead_code)]
+impl ModelLanguageFilter {
+    pub(crate) const ALL: [Self; 3] = [Self::All, Self::English, Self::Multilingual];
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All languages",
+            Self::English => "English",
+            Self::Multilingual => "Multilingual",
+        }
+    }
+    pub(crate) fn matches(self, languages: &[String]) -> bool {
+        let english = languages.iter().any(|language| {
+            language.eq_ignore_ascii_case("english") || language.eq_ignore_ascii_case("en")
+        });
+        matches!(self, Self::All)
+            || (matches!(self, Self::English) && english)
+            || (matches!(self, Self::Multilingual) && languages.len() > 1)
+    }
 }
 
 /// Ephemeral catalog controls. These values affect browsing only and are not
@@ -447,6 +495,11 @@ pub(crate) struct RemoteCatalogVariantView {
     pub size_label: String,
     pub status_label: Option<String>,
     pub expected_sha256: String,
+    pub normalized_model_id: Option<String>,
+    pub managed_model_id: Option<String>,
+    pub size_bytes: u64,
+    pub size_tier: ModelSizeTier,
+    pub speed_tier: ModelSpeedTier,
     pub actions: Vec<RemoteCatalogActionView>,
 }
 
@@ -456,6 +509,7 @@ pub(crate) struct RemoteCatalogEntryView {
     pub display_name: String,
     pub description: String,
     pub languages: Vec<String>,
+    pub language_summary: String,
     pub recommended: bool,
     pub trust_label: String,
     pub compatibility_detail: String,
@@ -590,6 +644,20 @@ impl SettingsSaveState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_filter_distinguishes_english_and_true_multilingual_models() {
+        let english = vec!["English".to_owned()];
+        let multilingual = vec!["English".to_owned(), "Spanish".to_owned()];
+        let spanish = vec!["Spanish".to_owned()];
+
+        assert!(ModelLanguageFilter::English.matches(&english));
+        assert!(!ModelLanguageFilter::Multilingual.matches(&english));
+        assert!(ModelLanguageFilter::Multilingual.matches(&multilingual));
+        assert!(!ModelLanguageFilter::English.matches(&spanish));
+        assert!(!ModelLanguageFilter::Multilingual.matches(&spanish));
+        assert!(ModelLanguageFilter::All.matches(&spanish));
+    }
 
     #[test]
     fn finalization_appends_once_and_discards_provisional_text() {

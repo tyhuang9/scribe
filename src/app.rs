@@ -72,14 +72,15 @@ use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
     AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
     HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
-    ModelCompatibility, ModelDialog, ModelDownloadState, ModelManagementState, ModelReadiness,
-    ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode, RecordingSettingsView,
-    RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogFilters,
-    RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
-    RemoteCatalogView, ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, about_page,
-    configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
-    render_screen, scroll_focused_control_into_view, settings_save_state, show_navigation,
-    show_route_scroll, theme_palette, transcription_state, ui_palette,
+    ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
+    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
+    RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
+    RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
+    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
+    SettingsTab, ThemePalette, UiRoute, about_page, configure_accessible_style, history_page,
+    minimum_primary_target_height, recording_mode, render_screen, scroll_focused_control_into_view,
+    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
+    ui_palette,
 };
 
 #[cfg(test)]
@@ -955,6 +956,7 @@ struct RemoteCatalogProjectionKey {
     revision: u64,
     inventory_revision: u64,
     search: String,
+    language_filter: ModelLanguageFilter,
     filters: RemoteCatalogFilters,
     sort: RemoteCatalogSort,
     mutation_block_reason: Option<String>,
@@ -2393,6 +2395,7 @@ pub struct LocalTranscriberApp {
     status_message: String,
     hotkey_input: String,
     model_search: String,
+    model_language_filter: ModelLanguageFilter,
     remote_catalog_filters: RemoteCatalogFilters,
     remote_catalog_sort: RemoteCatalogSort,
     model_import_path: String,
@@ -2518,6 +2521,7 @@ impl LocalTranscriberApp {
         let mut app = Self {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            model_language_filter: ModelLanguageFilter::default(),
             remote_catalog_filters: RemoteCatalogFilters::default(),
             remote_catalog_sort: RemoteCatalogSort::default(),
             model_import_path: String::new(),
@@ -8318,6 +8322,7 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map_or(0, ModelInventorySnapshot::revision),
             search: search.clone(),
+            language_filter: self.model_language_filter,
             filters: self.remote_catalog_filters,
             sort: self.remote_catalog_sort,
             mutation_block_reason: self.artifact_mutation_block_reason(),
@@ -8426,6 +8431,7 @@ impl LocalTranscriberApp {
             &key.search,
             key.filters,
             key.sort,
+            key.language_filter,
         );
         let matching_count = matching.len();
         let entries = matching
@@ -8553,6 +8559,11 @@ impl LocalTranscriberApp {
                     size_label: format_bytes(variant.size_bytes),
                     status_label,
                     expected_sha256: variant.expected_sha256.clone(),
+                    normalized_model_id: normalized_model_id.map(|id| id.to_string()),
+                    managed_model_id: remote_id,
+                    size_bytes: variant.size_bytes,
+                    size_tier: size_tier_for_bytes(variant.size_bytes),
+                    speed_tier: speed_tier_for_bytes(variant.size_bytes),
                     actions,
                 }
             })
@@ -8563,6 +8574,7 @@ impl LocalTranscriberApp {
             display_name: model.display_name.clone(),
             description: model.description.clone(),
             languages: model.languages.clone(),
+            language_summary: model.languages.join(", "),
             recommended: model.recommended,
             trust_label: model.trust.label().to_owned(),
             compatibility_detail: model.compatibility.detail().to_owned(),
@@ -10435,11 +10447,13 @@ fn filtered_remote_models<'model>(
     search: &str,
     filters: RemoteCatalogFilters,
     sort: RemoteCatalogSort,
+    language_filter: ModelLanguageFilter,
 ) -> Vec<&'model RemoteModel> {
     let mut matching = models
         .iter()
         .filter(|model| remote_model_matches_search(model, search))
         .filter(|model| remote_model_matches_catalog_filters(model, app_config, filters))
+        .filter(|model| language_filter.matches(&model.languages))
         .collect::<Vec<_>>();
 
     matching.sort_by(|left, right| match sort {
@@ -10464,6 +10478,27 @@ fn filtered_remote_models<'model>(
             .then_with(|| left.id.cmp(&right.id)),
     });
     matching
+}
+
+fn size_tier_for_bytes(size_bytes: u64) -> ModelSizeTier {
+    const MIB: u64 = 1024 * 1024;
+    match size_bytes / MIB {
+        0..=256 => ModelSizeTier::Tiny,
+        257..=512 => ModelSizeTier::Small,
+        513..=1024 => ModelSizeTier::Base,
+        1025..=2048 => ModelSizeTier::Medium,
+        _ => ModelSizeTier::Large,
+    }
+}
+
+fn speed_tier_for_bytes(size_bytes: u64) -> ModelSpeedTier {
+    match size_tier_for_bytes(size_bytes) {
+        ModelSizeTier::Tiny => ModelSpeedTier::VeryFast,
+        ModelSizeTier::Small => ModelSpeedTier::Fast,
+        ModelSizeTier::Base => ModelSpeedTier::Balanced,
+        ModelSizeTier::Medium | ModelSizeTier::Large => ModelSpeedTier::AccurateSlow,
+        ModelSizeTier::Unknown => ModelSpeedTier::Unknown,
+    }
 }
 
 fn disk_space_preflight_error(
@@ -16245,6 +16280,7 @@ mod layout_tests {
         let mut app = LocalTranscriberApp {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            model_language_filter: ModelLanguageFilter::default(),
             remote_catalog_filters: RemoteCatalogFilters::default(),
             remote_catalog_sort: RemoteCatalogSort::default(),
             model_import_path: String::new(),
@@ -16570,6 +16606,7 @@ mod layout_tests {
                 ..Default::default()
             },
             RemoteCatalogSort::Name,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             installed_only
@@ -16589,6 +16626,7 @@ mod layout_tests {
                 ..Default::default()
             },
             RemoteCatalogSort::Name,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             multilingual_standard
@@ -16604,6 +16642,7 @@ mod layout_tests {
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Recommended,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             recommended_first
@@ -16623,6 +16662,7 @@ mod layout_tests {
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Smallest,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             smallest_first
