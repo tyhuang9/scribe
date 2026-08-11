@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Component, Path};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -18,6 +19,12 @@ const TRUSTED_ORGANIZATION: &str = "handy-computer";
 const CATALOG_PAGE_SIZE: usize = 100;
 const MAX_CATALOG_PAGES: usize = 100;
 const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REFRESH_REQUESTS: usize = 1_100;
+const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_TOTAL_CANDIDATES: usize = 2_000;
 const MAX_INVENTORY_MODELS: usize = 1_000;
 const MAX_TREE_ENTRIES: usize = 10_000;
@@ -217,15 +224,37 @@ pub(crate) struct HubJsonResponse {
     pub(crate) next_page: Option<String>,
 }
 
-#[derive(Default)]
-pub(crate) struct UreqHubHttpClient;
+pub(crate) struct UreqHubHttpClient {
+    agent: ureq::Agent,
+}
+
+impl Default for UreqHubHttpClient {
+    fn default() -> Self {
+        Self {
+            agent: catalog_http_agent(),
+        }
+    }
+}
+
+fn catalog_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .https_only(true)
+        .redirects(0)
+        .timeout_connect(HTTP_CONNECT_TIMEOUT)
+        .timeout_read(HTTP_READ_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+}
 
 impl HubHttpClient for UreqHubHttpClient {
     fn get_json(&self, url: &str) -> Result<HubJsonResponse, CatalogError> {
-        let response = ureq::get(url)
+        let response = self
+            .agent
+            .get(url)
             .set("Accept", "application/json")
             .call()
             .map_err(|error| CatalogError::Network(error.to_string()))?;
+        validate_http_status(response.status())?;
         let next_page = response
             .header("Link")
             .map(next_catalog_page_from_link_header)
@@ -248,6 +277,16 @@ impl HubHttpClient for UreqHubHttpClient {
     }
 }
 
+fn validate_http_status(status: u16) -> Result<(), CatalogError> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(CatalogError::InvalidResponse(format!(
+            "Hugging Face returned unexpected HTTP status {status}"
+        )))
+    }
+}
+
 /// Strict discovery service. All network endpoints are constructed internally
 /// from the fixed Hugging Face origin and trusted organization.
 pub(crate) struct HuggingFaceCatalogService<C = UreqHubHttpClient> {
@@ -256,7 +295,7 @@ pub(crate) struct HuggingFaceCatalogService<C = UreqHubHttpClient> {
 
 impl HuggingFaceCatalogService<UreqHubHttpClient> {
     pub(crate) fn online() -> Self {
-        Self::new(UreqHubHttpClient)
+        Self::new(UreqHubHttpClient::default())
     }
 }
 
@@ -279,6 +318,13 @@ where
     }
 
     fn discover(&self) -> Result<Vec<RemoteModel>, CatalogError> {
+        self.discover_with_budget(RefreshBudget::default())
+    }
+
+    fn discover_with_budget(
+        &self,
+        mut budget: RefreshBudget,
+    ) -> Result<Vec<RemoteModel>, CatalogError> {
         let mut next_page = Some(catalog_index_url());
         let mut requested_pages = BTreeSet::new();
         let mut seen_revisions = BTreeSet::new();
@@ -296,6 +342,7 @@ where
                         .then_with(|| left.display_name.cmp(&right.display_name))
                         .then_with(|| left.id.cmp(&right.id))
                 });
+                budget.check_deadline_at(Instant::now())?;
                 return Ok(models);
             };
             if !requested_pages.insert(page_url.clone()) {
@@ -303,8 +350,7 @@ where
                     "Hugging Face catalog pagination repeated {page_url}"
                 )));
             }
-            let response = self.client.get_json(&page_url)?;
-            ensure_response_size(&response.body)?;
+            let response = self.fetch(&mut budget, &page_url)?;
             let candidates: Vec<HubModelSummary> = serde_json::from_str(&response.body)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
             if candidates.len() > CATALOG_PAGE_SIZE {
@@ -337,7 +383,7 @@ where
                 if models_by_repository.contains_key(&candidate.id) {
                     continue;
                 }
-                if let Some(model) = self.resolve_candidate(candidate, &metadata)? {
+                if let Some(model) = self.resolve_candidate(candidate, &metadata, &mut budget)? {
                     if models_by_repository.len() >= MAX_INVENTORY_MODELS {
                         return Err(CatalogError::InvalidResponse(format!(
                             "Hugging Face catalog exceeded {MAX_INVENTORY_MODELS} models"
@@ -358,6 +404,7 @@ where
         &self,
         candidate: HubModelSummary,
         metadata: &BTreeMap<String, MetadataOverride>,
+        budget: &mut RefreshBudget,
     ) -> Result<Option<RemoteModel>, CatalogError> {
         let revision = candidate.sha.ok_or_else(|| {
             CatalogError::InvalidResponse(format!("{} did not include a revision", candidate.id))
@@ -372,8 +419,7 @@ where
             "{API_ORIGIN}/api/models/{}/tree/{}?recursive=true&expand=true",
             candidate.id, revision
         );
-        let tree_response = self.client.get_json(&tree_url)?;
-        ensure_response_size(&tree_response.body)?;
+        let tree_response = self.fetch(budget, &tree_url)?;
         let tree: Vec<HubTreeEntry> = serde_json::from_str(&tree_response.body)
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         if tree.len() > MAX_TREE_ENTRIES {
@@ -427,6 +473,89 @@ where
             ),
             variants,
         }))
+    }
+
+    fn fetch(
+        &self,
+        budget: &mut RefreshBudget,
+        url: &str,
+    ) -> Result<HubJsonResponse, CatalogError> {
+        budget.begin_request()?;
+        let response = self.client.get_json(url)?;
+        ensure_response_size(&response.body)?;
+        budget.consume_body(response.body.len())?;
+        Ok(response)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RefreshBudget {
+    requests_remaining: usize,
+    response_bytes_remaining: usize,
+    deadline: Instant,
+}
+
+impl Default for RefreshBudget {
+    fn default() -> Self {
+        Self::new(MAX_REFRESH_REQUESTS, MAX_REFRESH_RESPONSE_BYTES)
+    }
+}
+
+impl RefreshBudget {
+    fn new(requests_remaining: usize, response_bytes_remaining: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            requests_remaining,
+            response_bytes_remaining,
+            deadline: now.checked_add(REFRESH_TIMEOUT).unwrap_or(now),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_deadline(
+        requests_remaining: usize,
+        response_bytes_remaining: usize,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            requests_remaining,
+            response_bytes_remaining,
+            deadline,
+        }
+    }
+
+    fn begin_request(&mut self) -> Result<(), CatalogError> {
+        self.check_deadline_at(Instant::now())?;
+        self.requests_remaining = self.requests_remaining.checked_sub(1).ok_or_else(|| {
+            CatalogError::InvalidResponse(format!(
+                "Hugging Face refresh exceeded {MAX_REFRESH_REQUESTS} requests"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn consume_body(&mut self, body_bytes: usize) -> Result<(), CatalogError> {
+        self.check_deadline_at(Instant::now())?;
+        self.response_bytes_remaining = self
+            .response_bytes_remaining
+            .checked_sub(body_bytes)
+            .ok_or_else(|| {
+                CatalogError::InvalidResponse(format!(
+                    "Hugging Face refresh exceeded {MAX_REFRESH_RESPONSE_BYTES} response bytes"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn check_deadline_at(&self, now: Instant) -> Result<(), CatalogError> {
+        if now <= self.deadline {
+            Ok(())
+        } else {
+            Err(CatalogError::InvalidResponse(format!(
+                "Hugging Face refresh exceeded its {}-second deadline",
+                REFRESH_TIMEOUT.as_secs()
+            )))
+        }
     }
 }
 
@@ -973,6 +1102,58 @@ mod tests {
         assert!(matches!(
             service.refresh(2),
             Err(CatalogError::InvalidResponse(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[test]
+    fn catalog_http_policy_is_https_only_bounded_and_rejects_redirects() {
+        let policy = format!("{:?}", catalog_http_agent());
+        assert!(policy.contains("https_only: true"));
+        assert!(policy.contains("redirects: 0"));
+        assert!(policy.contains("timeout_connect: Some(5s)"));
+        assert!(policy.contains("timeout_read: Some(15s)"));
+        assert!(policy.contains("timeout: Some(30s)"));
+        assert!(validate_http_status(200).is_ok());
+        assert!(validate_http_status(299).is_ok());
+        for status in [300, 301, 307, 308, 399] {
+            assert!(matches!(
+                validate_http_status(status),
+                Err(CatalogError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn refresh_budget_counts_catalog_and_tree_requests_and_response_bodies() {
+        let client = MockHub::default()
+            .with_response(index_url(None), index_response())
+            .with_response(
+                tree_url(
+                    "handy-computer/whisper-tiny.en-gguf",
+                    "becb8bcb804405dc97b380a523d9975888820986",
+                ),
+                tree_response(),
+            );
+        let service = HuggingFaceCatalogService::new(client);
+        assert!(matches!(
+            service.discover_with_budget(RefreshBudget::new(1, MAX_REFRESH_RESPONSE_BYTES)),
+            Err(CatalogError::InvalidResponse(message)) if message.contains("requests")
+        ));
+
+        let service = HuggingFaceCatalogService::new(
+            MockHub::default().with_response(index_url(None), index_response()),
+        );
+        assert!(matches!(
+            service.discover_with_budget(RefreshBudget::new(1, index_response().len() - 1)),
+            Err(CatalogError::InvalidResponse(message)) if message.contains("response bytes")
+        ));
+
+        let now = Instant::now();
+        let budget = RefreshBudget::with_deadline(1, 1, now);
+        assert!(budget.check_deadline_at(now).is_ok());
+        assert!(matches!(
+            budget.check_deadline_at(now + Duration::from_nanos(1)),
+            Err(CatalogError::InvalidResponse(message)) if message.contains("deadline")
         ));
     }
 
