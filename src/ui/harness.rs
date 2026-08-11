@@ -307,6 +307,23 @@ fn harness_route(page: AppPage, fixture_route: UiRoute) -> UiRoute {
         AppPage::Debug => UiRoute::Debug,
     }
 }
+
+fn render_settings_playground_fixture(ui: &mut egui::Ui) -> ScreenAction {
+    ui.heading("Settings");
+    ui.add_space(12.0);
+    ui.heading("Developer Playground");
+    ui.label("Compare local model output without leaving Settings.");
+    ui.add_space(12.0);
+    if ui
+        .add_sized([176.0, 44.0], egui::Button::new("Back to Advanced"))
+        .clicked()
+    {
+        ScreenAction::SetSettingsTab(SettingsTab::Advanced)
+    } else {
+        ScreenAction::None
+    }
+}
+
 fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> ScreenAction {
     show_navigation(ctx, page, false);
     let view = ScreenView {
@@ -323,7 +340,13 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
     CentralPanel::default()
         .frame(Frame::none().fill(theme_palette(ctx).content_bg))
         .show(ctx, |ui| {
-            show_route_scroll(ui, view.route, |ui| render_screen(ui, &view))
+            show_route_scroll(ui, view.route, |ui| {
+                if data.settings_playground_open {
+                    render_settings_playground_fixture(ui)
+                } else {
+                    render_screen(ui, &view)
+                }
+            })
         })
         .inner
 }
@@ -526,6 +549,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
                 SettingsTab::Output => SettingsTab::General,
                 tab => tab,
             });
+            data.settings_playground_open = false;
             *page = AppPage::General;
         }
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
@@ -586,13 +610,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.settings.store_application_identity = value
         }
     }
-}
-
-#[cfg(test)]
-fn close_settings_playground(data: &mut FixtureData, page: &mut AppPage) {
-    data.route = UiRoute::Settings(SettingsTab::Advanced);
-    data.settings_playground_open = false;
-    *page = AppPage::General;
 }
 
 #[cfg(test)]
@@ -3775,20 +3792,59 @@ mod tests {
 
     #[test]
     fn playground_actions_remain_inside_settings_and_back_returns_to_advanced() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
         let mut data = Fixture::SettingsRecording.data();
         data.settings.debug_mode = true;
         data.route = UiRoute::Settings(SettingsTab::Advanced);
         let mut page = AppPage::General;
+        let (width, height) = (900.0, 3_000.0);
 
-        apply_action(&mut data, &mut page, ScreenAction::OpenDeveloperPlayground);
+        let open_action = click_named_control(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            "Open model Playground",
+        );
+        assert_eq!(open_action, ScreenAction::OpenDeveloperPlayground);
+        apply_action(&mut data, &mut page, open_action);
         assert_eq!(page, AppPage::General);
         assert_eq!(data.route, UiRoute::Settings(SettingsTab::Advanced));
         assert!(data.settings_playground_open);
 
-        close_settings_playground(&mut data, &mut page);
+        let playground = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let visible = node_names(&playground);
+        assert!(visible.iter().any(|name| name == "Settings"));
+        assert!(visible.iter().any(|name| name == "Developer Playground"));
+        assert!(visible.iter().any(|name| name == "Back to Advanced"));
+        let back_bounds = named_node_bounds(&playground, "Back to Advanced");
+        assert!(back_bounds.x1 - back_bounds.x0 >= 44.0 && back_bounds.y1 - back_bounds.y0 >= 44.0);
+
+        let back_action = click_named_control(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            "Back to Advanced",
+        );
+        assert_eq!(
+            back_action,
+            ScreenAction::SetSettingsTab(SettingsTab::Advanced)
+        );
+        apply_action(&mut data, &mut page, back_action);
         assert_eq!(page, AppPage::General);
         assert_eq!(data.route, UiRoute::Settings(SettingsTab::Advanced));
         assert!(!data.settings_playground_open);
+
+        let advanced = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let visible = node_names(&advanced);
+        assert!(visible.iter().any(|name| name == "Advanced settings"));
+        assert!(visible.iter().any(|name| name == "Open model Playground"));
+        assert!(!visible.iter().any(|name| name == "Back to Advanced"));
     }
 
     #[test]

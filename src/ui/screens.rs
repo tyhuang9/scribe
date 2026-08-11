@@ -4298,14 +4298,15 @@ fn output_settings_panel(
 ) {
     settings_section(ui, "Output settings", |ui| {
         let mut auto_insert = settings.auto_insert_transcript;
-        let has_following_row =
-            auto_insert && (settings.show_restore_clipboard || settings.output_notice.is_some());
-        let _ = SettingsRow::show(ui, "Transcript delivery", has_following_row, |ui, _| {
+        let _ = SettingsRow::show(ui, "Transcript delivery", false, |ui, _| {
             if settings_checkbox(ui, &mut auto_insert, &settings.output_label).changed() {
                 *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
             }
         });
         if auto_insert {
+            if settings.show_restore_clipboard || settings.output_notice.is_some() {
+                ui.separator();
+            }
             if settings.show_restore_clipboard {
                 let mut restore = settings.restore_clipboard_after_insert;
                 let _ = SettingsRow::show(ui, "Clipboard", true, |ui, _| {
@@ -4877,6 +4878,31 @@ mod tests {
                 )
             });
         })
+    }
+
+    fn render_output_settings_with_input(
+        ctx: &egui::Context,
+        settings: &RecordingSettingsView,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 600.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    output_settings_panel(ui, settings, &mut action);
+                });
+            },
+        );
+        (output, action)
     }
 
     fn render_transcribe(
@@ -6302,6 +6328,76 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn output_separator_follows_auto_insert_post_click_state() {
+        for (initially_enabled, expected_action, expected_separators) in [
+            (false, ScreenAction::SetAutoInsertTranscript(true), 1),
+            (true, ScreenAction::SetAutoInsertTranscript(false), 0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let settings = RecordingSettingsView {
+                auto_insert_transcript: initially_enabled,
+                show_restore_clipboard: false,
+                output_notice: Some("Clipboard fallback remains available.".into()),
+                ..Default::default()
+            };
+            let (initial, action) = render_output_settings_with_input(&ctx, &settings, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let bounds = initial
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("output settings should expose AccessKit")
+                .nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some("Automatically insert final transcript"))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .expect("auto-insert checkbox should have bounds");
+            let point = egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let (_, press_action) = render_output_settings_with_input(
+                &ctx,
+                &settings,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(press_action, ScreenAction::None);
+            let (released, action) = render_output_settings_with_input(
+                &ctx,
+                &settings,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(action, expected_action);
+            let separator_count = released
+                .shapes
+                .iter()
+                .filter(|shape| matches!(shape.shape, egui::epaint::Shape::LineSegment { .. }))
+                .count();
+            assert_eq!(separator_count, expected_separators);
         }
     }
 }
