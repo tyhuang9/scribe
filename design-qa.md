@@ -17,7 +17,8 @@
 
 - `cargo fmt --all --check`: passed.
 - `git diff --check`: passed.
-- `cargo check --all-targets --all-features`: blocked before crate compilation because this environment's CMake does not provide the required `Visual Studio 17 2022` generator for `transcribe-cpp-sys`.
+- `cargo check --all-targets --all-features`: passed in the established Windows build environment.
+- Focused four-destination accessibility test: passed.
 
 ## Native verification pending
 
