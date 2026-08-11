@@ -1,39 +1,51 @@
-# Design QA — scrolling, comparison, naming, and runtime follow-up
+# Design QA - Models simple cards
 
 Final result: passed
 
 ## Scope
 
-- Shared 28px route inset and full-viewport scroll ownership.
-- Models comparison dock containment, responsive results, internal scrolling, and modal layering.
-- Installed-row bounds, model display names/variants, and runtime-readiness messaging.
-- Settings and long production-route keyboard focus reachability.
+- Search, language filtering, explicit refresh, and local import controls.
+- Default-open Installed and Available disclosures with search-forced expansion.
+- One fixed-height card surface for installed and available models.
+- Friendly descriptions plus language, capability, size, speed, accuracy, and state.
+- Whole-card primary actions with separate Details, Remove, and Cancel controls.
+- Fixed-height culling, accessible paging, focus restoration, and modal isolation.
+- Floating comparison dock with an exact 24px viewport gap and 24px final-card clearance.
 
 ## Native visual evidence
 
-All captures use a fresh debug harness process and DPI-aware client coordinates.
+Fresh debug-harness processes were captured from the actual Windows framebuffer using DPI-aware client coordinates (125% display scale).
 
-- `1476x1018`: collapsed Models dock is visible; model rows, metadata, chevrons, Compare, and Add models remain inside the content inset.
-- `1180x815`: expanded Models dock stays inside the viewport, uses compact result groups, and keeps Start test recording plus accuracy actions visible.
-- `960x680`: Settings remains bounded and coherent; overflowing content is owned by the outer route scroll area.
+- `1476x1018` Models installed: search/filter/actions, both disclosures, all visible cards, and the collapsed comparison dock remain inside the content column; the dock floats 24px above the viewport edge.
+- `1180x815` Models comparison: the expanded dock is wholly contained, its compact result groups and Start action remain visible, and the fixed header stays above the internally scrollable body.
+- `960x680` Settings recording: no Models work regresses the compact route shell or Settings scrolling.
+- `1280x1024` same-state captures were combined side-by-side with the repository references for installed Models, expanded comparison, and Settings recording before this verdict.
 
 Capture directory:
-`C:\Users\huang\AppData\Local\Temp\scribe-ui-acceptance\final-layer-row-fix-20260811`
+`C:\Users\huang\AppData\Local\Temp\scribe-ui-acceptance\models-simple-cards-20260811`
+
+Combined comparisons:
+
+- `comparison-models-installed.png`
+- `comparison-models-expanded.png`
+- `comparison-settings-recording.png`
 
 ## Automated evidence
 
-- Exact heading inset across production routes and the shared harness shell.
-- Edge-owned route scroll, final-control focus scrolling, and exact 24px dock clearance.
-- Four-result comparison body scrolling at all three viewports with a fixed header and stationary outer route.
-- Foreground dock in normal use; demoted, inert dock below Add/Details/Remove modal windows.
-- AccessKit table/group hierarchy, dialog isolation, variant labels, runtime warnings, and disabled Compare reason.
-- Stable built-in model IDs and artifacts with explicit display and variant labels.
+- Search temporarily expands both result groups without changing saved disclosure state; forced disclosures are disabled and explain how to restore the saved state.
+- Main card names and child controls hide technical variants; multiple remote artifacts use visible size metadata to remain distinguishable.
+- Fixed card height and total content height stay invariant as the culled window changes.
+- AccessKit paging reaches every item in both directions without gaps while offscreen cards remain absent.
+- Pointer, Enter, Space, Page Up/Down, Details/Remove restoration, import cancellation, and modal background rejection are covered.
+- Remote ratings remain `Not rated` unless the catalog provides an honest rating.
+- Expanded comparison focus scrolls only its internal body; the route scroll remains stationary.
+- Final card clearance is 24px in collapsed and expanded dock states.
 
-Final gate: formatting, all-target/all-feature check, warnings-as-errors Clippy, diff hygiene, and 724 passing tests; 9 runtime/network/benchmark smokes remain intentionally ignored.
+Final gate: formatting, all-target/all-feature check, warnings-as-errors Clippy, diff hygiene, and 733 passing tests; 9 environment-gated runtime/network/benchmark smokes remain intentionally ignored.
 
 ## Findings
 
 - P0: none.
 - P1: none.
 - P2: none.
-- Evidence limitation: the preferred Windows Sky automation runtime was unavailable, so native verification used DPI-aware framebuffer captures. Real speech-runtime execution was intentionally outside this UI change.
+- Evidence limitation: the preferred Windows Sky automation runtime was unavailable, so native verification used fresh PID-bound DPI-aware framebuffer captures. Real model downloads and speech-runtime execution remain outside this UI branch.
