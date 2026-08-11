@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,6 @@ use serde::{Deserialize, Serialize};
 const API_ORIGIN: &str = "https://huggingface.co";
 const TRUSTED_ORGANIZATION: &str = "handy-computer";
 const CACHE_SCHEMA_VERSION: u16 = 1;
-const CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
 const CATALOG_PAGE_SIZE: usize = 100;
 const MAX_CATALOG_PAGES: usize = 100;
 const REQUIRED_TAGS: [&str; 2] = ["gguf", "transcribe.cpp"];
@@ -106,7 +106,6 @@ impl RemoteModel {
 pub(crate) enum CatalogSource {
     Network,
     FreshCache,
-    StaleCache,
     BundledFallback,
 }
 
@@ -115,17 +114,66 @@ impl CatalogSource {
         match self {
             Self::Network => "Live Hugging Face catalog",
             Self::FreshCache => "Cached Hugging Face catalog",
-            Self::StaleCache => "Offline stale catalog cache",
             Self::BundledFallback => "Bundled offline catalog fallback",
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogSnapshot {
-    pub(crate) source: CatalogSource,
-    pub(crate) fetched_at_unix_seconds: u64,
-    pub(crate) models: Vec<RemoteModel>,
+pub(crate) struct ModelInventorySnapshot {
+    revision: u64,
+    source: CatalogSource,
+    fetched_at_unix_seconds: u64,
+    models: Arc<[RemoteModel]>,
+}
+
+impl ModelInventorySnapshot {
+    pub(crate) fn bundled() -> Self {
+        Self::validated(1, CatalogSource::BundledFallback, 0, bundled_fallback())
+            .expect("bundled model inventory must remain valid")
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn source(&self) -> CatalogSource {
+        self.source
+    }
+
+    pub(crate) fn models(&self) -> &[RemoteModel] {
+        &self.models
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_trusted_records(
+        revision: u64,
+        source: CatalogSource,
+        fetched_at_unix_seconds: u64,
+        models: Vec<RemoteModel>,
+    ) -> Result<Self, CatalogError> {
+        Self::validated(revision, source, fetched_at_unix_seconds, models)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_records_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.models, &other.models)
+    }
+
+    fn validated(
+        revision: u64,
+        source: CatalogSource,
+        fetched_at_unix_seconds: u64,
+        models: Vec<RemoteModel>,
+    ) -> Result<Self, CatalogError> {
+        validate_inventory(&models)?;
+        Ok(Self {
+            revision,
+            source,
+            fetched_at_unix_seconds,
+            models: models.into(),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -194,63 +242,34 @@ where
         Self { client, cache_path }
     }
 
-    /// Uses a fresh cache when possible. A refresh failure falls back first to
-    /// a stale verified cache and then to a bundled, revision-pinned candidate.
-    pub(crate) fn list(&self) -> Result<CatalogSnapshot, CatalogError> {
-        let now = unix_seconds();
-        if let Some(cache) = read_cache(&self.cache_path)?
-            && cache.is_fresh(now)
-        {
-            return Ok(CatalogSnapshot {
-                source: CatalogSource::FreshCache,
-                fetched_at_unix_seconds: cache.fetched_at_unix_seconds,
-                models: cache.models,
-            });
-        }
-
-        match self.refresh_at(now) {
-            Ok(snapshot) => Ok(snapshot),
-            Err(error) => {
-                if let Some(cache) = read_cache(&self.cache_path)? {
-                    return Ok(CatalogSnapshot {
-                        source: CatalogSource::StaleCache,
-                        fetched_at_unix_seconds: cache.fetched_at_unix_seconds,
-                        models: cache.models,
-                    });
-                }
-                let fallback = bundled_fallback();
-                if fallback.is_empty() {
-                    Err(error)
-                } else {
-                    Ok(CatalogSnapshot {
-                        source: CatalogSource::BundledFallback,
-                        fetched_at_unix_seconds: 0,
-                        models: fallback,
-                    })
-                }
-            }
-        }
-    }
-
     /// Forces a new trusted discovery pass and atomically replaces the cache
     /// only after the full response has passed validation.
-    pub(crate) fn refresh(&self) -> Result<CatalogSnapshot, CatalogError> {
-        self.refresh_at(unix_seconds())
+    pub(crate) fn refresh(
+        &self,
+        inventory_revision: u64,
+    ) -> Result<ModelInventorySnapshot, CatalogError> {
+        self.refresh_at(inventory_revision, unix_seconds())
     }
 
-    fn refresh_at(&self, fetched_at_unix_seconds: u64) -> Result<CatalogSnapshot, CatalogError> {
+    fn refresh_at(
+        &self,
+        inventory_revision: u64,
+        fetched_at_unix_seconds: u64,
+    ) -> Result<ModelInventorySnapshot, CatalogError> {
         let models = self.discover()?;
+        validate_inventory(&models)?;
         let cache = CatalogCache {
             schema_version: CACHE_SCHEMA_VERSION,
             fetched_at_unix_seconds,
             models: models.clone(),
         };
         write_cache(&self.cache_path, &cache)?;
-        Ok(CatalogSnapshot {
-            source: CatalogSource::Network,
+        ModelInventorySnapshot::validated(
+            inventory_revision,
+            CatalogSource::Network,
             fetched_at_unix_seconds,
             models,
-        })
+        )
     }
 
     fn discover(&self) -> Result<Vec<RemoteModel>, CatalogError> {
@@ -369,13 +388,6 @@ struct CatalogCache {
     schema_version: u16,
     fetched_at_unix_seconds: u64,
     models: Vec<RemoteModel>,
-}
-
-impl CatalogCache {
-    fn is_fresh(&self, now: u64) -> bool {
-        self.schema_version == CACHE_SCHEMA_VERSION
-            && now.saturating_sub(self.fetched_at_unix_seconds) <= CACHE_TTL_SECONDS
-    }
 }
 
 #[derive(Deserialize)]
@@ -564,19 +576,6 @@ fn metadata_overrides() -> Result<BTreeMap<String, MetadataOverride>, CatalogErr
     Ok(document.models)
 }
 
-fn read_cache(path: &Path) -> Result<Option<CatalogCache>, CatalogError> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path).map_err(|error| {
-        CatalogError::Cache(format!("failed to read {}: {error}", path.display()))
-    })?;
-    let cache = serde_json::from_slice(&bytes).map_err(|error| {
-        CatalogError::Cache(format!("failed to parse {}: {error}", path.display()))
-    })?;
-    Ok(Some(cache))
-}
-
 fn write_cache(path: &Path, cache: &CatalogCache) -> Result<(), CatalogError> {
     let bytes =
         serde_json::to_vec_pretty(cache).map_err(|error| CatalogError::Cache(error.to_string()))?;
@@ -586,6 +585,42 @@ fn write_cache(path: &Path, cache: &CatalogCache) -> Result<(), CatalogError> {
             path.display()
         ))
     })
+}
+
+fn validate_inventory(models: &[RemoteModel]) -> Result<(), CatalogError> {
+    if models.is_empty() {
+        return Err(CatalogError::InvalidResponse(
+            "trusted model inventory was empty".to_owned(),
+        ));
+    }
+    let mut model_ids = BTreeSet::new();
+    for model in models {
+        if !model.id.starts_with(&format!("{TRUSTED_ORGANIZATION}/"))
+            || !is_full_revision(&model.revision)
+            || model.variants.is_empty()
+            || !model_ids.insert(&model.id)
+        {
+            return Err(CatalogError::InvalidResponse(format!(
+                "{} was not a unique, revision-pinned trusted model",
+                model.id
+            )));
+        }
+        let mut variant_ids = BTreeSet::new();
+        for variant in &model.variants {
+            if variant.size_bytes == 0
+                || !is_safe_relative_filename(&variant.filename)
+                || !variant.filename.to_ascii_lowercase().ends_with(".gguf")
+                || !is_sha256(&variant.expected_sha256)
+                || !variant_ids.insert(&variant.id)
+            {
+                return Err(CatalogError::InvalidResponse(format!(
+                    "{} contained an invalid or duplicate GGUF variant",
+                    model.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bundled_fallback() -> Vec<RemoteModel> {
@@ -695,8 +730,9 @@ mod tests {
             );
         let service = HuggingFaceCatalogService::new(client, cache.clone());
 
-        let snapshot = service.refresh_at(1_000).unwrap();
+        let snapshot = service.refresh_at(2, 1_000).unwrap();
 
+        assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.source, CatalogSource::Network);
         assert_eq!(snapshot.models.len(), 1);
         assert_eq!(snapshot.models[0].revision.len(), 40);
@@ -742,7 +778,7 @@ mod tests {
             );
         let service = HuggingFaceCatalogService::new(client, cache.clone());
 
-        let snapshot = service.refresh_at(1_000).unwrap();
+        let snapshot = service.refresh_at(2, 1_000).unwrap();
 
         assert_eq!(snapshot.models.len(), 2);
         assert_eq!(
@@ -787,7 +823,7 @@ mod tests {
         let client = MockHub::default().with_page(first_page.clone(), "[]", Some(first_page));
         let service = HuggingFaceCatalogService::new(client, cache.clone());
         assert!(matches!(
-            service.refresh_at(1_000),
+            service.refresh_at(2, 1_000),
             Err(CatalogError::InvalidResponse(message)) if message.contains("repeated")
         ));
         let _ = fs::remove_file(cache);
@@ -826,52 +862,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_cache_and_bundled_fallback_keep_catalog_usable_offline() {
-        let cache = temp_cache_path("offline.json");
-        let cache_document = CatalogCache {
-            schema_version: CACHE_SCHEMA_VERSION,
-            fetched_at_unix_seconds: 1,
-            models: bundled_fallback(),
-        };
-        write_cache(&cache, &cache_document).unwrap();
-        let service = HuggingFaceCatalogService::new(
-            MockHub {
-                fail: true,
-                ..MockHub::default()
-            },
-            cache.clone(),
-        );
+    fn bundled_snapshot_is_versioned_and_owns_immutable_records() {
+        let snapshot = ModelInventorySnapshot::bundled();
+        let clone = snapshot.clone();
 
-        let snapshot = service.list().unwrap();
-
-        assert_eq!(snapshot.source, CatalogSource::StaleCache);
-        assert_eq!(snapshot.models, bundled_fallback());
-        let _ = fs::remove_file(cache);
-    }
-
-    #[test]
-    fn fresh_cache_avoids_a_network_request() {
-        let cache = temp_cache_path("fresh.json");
-        let now = unix_seconds();
-        write_cache(
-            &cache,
-            &CatalogCache {
-                schema_version: CACHE_SCHEMA_VERSION,
-                fetched_at_unix_seconds: now,
-                models: bundled_fallback(),
-            },
-        )
-        .unwrap();
-        let service = HuggingFaceCatalogService::new(
-            MockHub {
-                fail: true,
-                ..MockHub::default()
-            },
-            cache.clone(),
-        );
-
-        assert_eq!(service.list().unwrap().source, CatalogSource::FreshCache);
-        let _ = fs::remove_file(cache);
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.source, CatalogSource::BundledFallback);
+        assert!(!snapshot.models.is_empty());
+        assert!(Arc::ptr_eq(&snapshot.models, &clone.models));
     }
 
     #[test]
@@ -896,7 +894,7 @@ mod tests {
         )
         .unwrap();
 
-        let written = read_cache(&cache).unwrap().unwrap();
+        let written: CatalogCache = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
         assert_eq!(written.fetched_at_unix_seconds, 2);
         assert_eq!(written.models, bundled_fallback());
         let _ = fs::remove_file(cache);
@@ -908,7 +906,7 @@ mod tests {
         let cache = temp_cache_path("live.json");
         let service = HuggingFaceCatalogService::for_cache_path(cache.clone());
 
-        let snapshot = service.refresh().unwrap();
+        let snapshot = service.refresh(2).unwrap();
 
         assert_eq!(snapshot.source, CatalogSource::Network);
         assert!(snapshot.models.iter().all(|model| {
