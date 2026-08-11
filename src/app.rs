@@ -15051,6 +15051,8 @@ mod layout_tests {
         assert_eq!(selected[0].variant_label, "tiny.en");
 
         app.config.general.selected_default_model = "not-selected".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
 
         let ready = app
             .model_management_catalog()
@@ -15075,6 +15077,8 @@ mod layout_tests {
         );
 
         app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         let active = app
             .model_management_catalog()
             .into_iter()
@@ -15144,6 +15148,8 @@ mod layout_tests {
             .model_paths
             .insert(id.to_owned(), root.clone());
         config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         assert!(
             app.transcription_service
                 .model_descriptor(&ModelId::new(id))
@@ -15163,6 +15169,8 @@ mod layout_tests {
 
         app.model_downloads
             .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         let repairing = app
             .model_management_catalog()
             .into_iter()
@@ -15177,6 +15185,8 @@ mod layout_tests {
             id.to_owned(),
             ModelInstallStatus::RuntimeError("runtime repair failed".into()),
         );
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         let failed = app
             .model_management_catalog()
             .into_iter()
@@ -16346,6 +16356,8 @@ mod layout_tests {
             .model_paths
             .insert(model_id.to_owned(), fixture.clone());
         config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
         fixture
     }
 
