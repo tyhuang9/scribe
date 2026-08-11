@@ -42,16 +42,6 @@ impl SpaceProbe for SystemSpaceProbe {
     }
 }
 
-/// Captures one free-space observation for the volume containing
-/// `destination`. Catalog callers may reuse this advisory snapshot across a
-/// bounded projection; the install backend must still preflight the exact
-/// target and remaining bytes immediately before writing.
-pub(crate) fn available_space_for_destination(
-    destination: &Path,
-) -> Result<DiskSpaceAvailability, String> {
-    availability_with(&SystemSpaceProbe, destination)
-}
-
 /// Checks whether the volume containing `destination` can accommodate the
 /// additional artifact bytes and a fixed safety reserve. The destination need
 /// not exist; no directories or files are created by this operation.

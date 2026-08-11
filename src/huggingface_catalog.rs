@@ -2,31 +2,43 @@
 //!
 //! The UI never queries Hugging Face or constructs artifact URLs. This module
 //! discovers only a constrained public publisher namespace, resolves a full
-//! commit before accepting a GGUF, and persists a conservative cache for
-//! offline use. It intentionally returns experimental candidates until the
-//! runtime compatibility gate has enough release evidence to promote one.
+//! commit before accepting a GGUF, and publishes a complete validated
+//! in-memory snapshot. It intentionally returns experimental candidates until
+//! the runtime compatibility gate has enough release evidence to promote one.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const API_ORIGIN: &str = "https://huggingface.co";
 const TRUSTED_ORGANIZATION: &str = "handy-computer";
-const CACHE_SCHEMA_VERSION: u16 = 1;
 const CATALOG_PAGE_SIZE: usize = 100;
 const MAX_CATALOG_PAGES: usize = 100;
+const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOTAL_CANDIDATES: usize = 2_000;
+const MAX_INVENTORY_MODELS: usize = 1_000;
+const MAX_TREE_ENTRIES: usize = 10_000;
+const MAX_VARIANTS_PER_MODEL: usize = 32;
+const MAX_TOTAL_VARIANTS: usize = 8_000;
+const MAX_METADATA_BYTES: usize = 256 * 1024;
+const MAX_REPOSITORY_BYTES: usize = 128;
+const MAX_FILENAME_BYTES: usize = 512;
+const MAX_DISPLAY_NAME_BYTES: usize = 256;
+const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
+const MAX_LANGUAGES_PER_MODEL: usize = 64;
+const MAX_LANGUAGE_BYTES: usize = 64;
+const MAX_TAGS_PER_CANDIDATE: usize = 64;
+const MAX_TAG_BYTES: usize = 128;
+const MAX_AGGREGATE_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
 const REQUIRED_TAGS: [&str; 2] = ["gguf", "transcribe.cpp"];
 const ASR_PIPELINE_TAG: &str = "automatic-speech-recognition";
 const METADATA_OVERRIDES_JSON: &str = include_str!("../resources/model_metadata_overrides.json");
 
 /// The publisher gate that allowed a model to appear in this catalog.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelTrust {
     TrustedPublisher,
 }
@@ -40,8 +52,7 @@ impl ModelTrust {
 }
 
 /// Product compatibility is deliberately separate from repository trust.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelCompatibility {
     Experimental(String),
 }
@@ -55,7 +66,7 @@ impl ModelCompatibility {
 }
 
 /// A safe-to-display remote variant. It deliberately does not carry a URL.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteModelVariant {
     pub(crate) id: String,
     pub(crate) filename: String,
@@ -64,7 +75,7 @@ pub(crate) struct RemoteModelVariant {
 }
 
 /// A revision-pinned model discovered through the trusted backend service.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteModel {
     pub(crate) id: String,
     pub(crate) revision: String,
@@ -113,7 +124,7 @@ impl CatalogSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Network => "Live Hugging Face catalog",
-            Self::BundledFallback => "Bundled offline catalog fallback",
+            Self::BundledFallback => "Bundled trusted catalog",
         }
     }
 }
@@ -122,13 +133,12 @@ impl CatalogSource {
 pub(crate) struct ModelInventorySnapshot {
     revision: u64,
     source: CatalogSource,
-    fetched_at_unix_seconds: u64,
     models: Arc<[RemoteModel]>,
 }
 
 impl ModelInventorySnapshot {
     pub(crate) fn bundled() -> Self {
-        Self::validated(1, CatalogSource::BundledFallback, 0, bundled_fallback())
+        Self::validated(1, CatalogSource::BundledFallback, bundled_fallback())
             .expect("bundled model inventory must remain valid")
     }
 
@@ -148,10 +158,9 @@ impl ModelInventorySnapshot {
     pub(crate) fn from_trusted_records(
         revision: u64,
         source: CatalogSource,
-        fetched_at_unix_seconds: u64,
         models: Vec<RemoteModel>,
     ) -> Result<Self, CatalogError> {
-        Self::validated(revision, source, fetched_at_unix_seconds, models)
+        Self::validated(revision, source, models)
     }
 
     #[cfg(test)]
@@ -159,17 +168,28 @@ impl ModelInventorySnapshot {
         Arc::ptr_eq(&self.models, &other.models)
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_records_unchecked_for_projection(
+        revision: u64,
+        source: CatalogSource,
+        models: Vec<RemoteModel>,
+    ) -> Self {
+        Self {
+            revision,
+            source,
+            models: models.into(),
+        }
+    }
+
     fn validated(
         revision: u64,
         source: CatalogSource,
-        fetched_at_unix_seconds: u64,
         models: Vec<RemoteModel>,
     ) -> Result<Self, CatalogError> {
         validate_inventory(&models)?;
         Ok(Self {
             revision,
             source,
-            fetched_at_unix_seconds,
             models: models.into(),
         })
     }
@@ -181,8 +201,6 @@ pub(crate) enum CatalogError {
     Network(String),
     #[error("Hugging Face catalog response was invalid: {0}")]
     InvalidResponse(String),
-    #[error("Hugging Face catalog cache failed: {0}")]
-    Cache(String),
 }
 
 /// Narrow HTTP boundary so discovery tests never call the network.
@@ -213,23 +231,32 @@ impl HubHttpClient for UreqHubHttpClient {
             .map(next_catalog_page_from_link_header)
             .transpose()?
             .flatten();
-        let body = response
-            .into_string()
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .map_err(|error| CatalogError::Network(error.to_string()))?;
+        if bytes.len() > MAX_HTTP_RESPONSE_BYTES {
+            return Err(CatalogError::InvalidResponse(format!(
+                "Hugging Face response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
         Ok(HubJsonResponse { body, next_page })
     }
 }
 
-/// Strict discovery and cache service. All network endpoints are constructed
-/// internally from the fixed Hugging Face origin and trusted organization.
+/// Strict discovery service. All network endpoints are constructed internally
+/// from the fixed Hugging Face origin and trusted organization.
 pub(crate) struct HuggingFaceCatalogService<C = UreqHubHttpClient> {
     client: C,
-    cache_path: PathBuf,
 }
 
 impl HuggingFaceCatalogService<UreqHubHttpClient> {
-    pub(crate) fn for_cache_path(cache_path: PathBuf) -> Self {
-        Self::new(UreqHubHttpClient, cache_path)
+    pub(crate) fn online() -> Self {
+        Self::new(UreqHubHttpClient)
     }
 }
 
@@ -237,38 +264,18 @@ impl<C> HuggingFaceCatalogService<C>
 where
     C: HubHttpClient,
 {
-    pub(crate) fn new(client: C, cache_path: PathBuf) -> Self {
-        Self { client, cache_path }
+    pub(crate) fn new(client: C) -> Self {
+        Self { client }
     }
 
-    /// Forces a new trusted discovery pass and atomically replaces the cache
-    /// only after the full response has passed validation.
+    /// Produces a complete immutable snapshot only after the full response has
+    /// passed validation.
     pub(crate) fn refresh(
         &self,
         inventory_revision: u64,
     ) -> Result<ModelInventorySnapshot, CatalogError> {
-        self.refresh_at(inventory_revision, unix_seconds())
-    }
-
-    fn refresh_at(
-        &self,
-        inventory_revision: u64,
-        fetched_at_unix_seconds: u64,
-    ) -> Result<ModelInventorySnapshot, CatalogError> {
         let models = self.discover()?;
-        validate_inventory(&models)?;
-        let cache = CatalogCache {
-            schema_version: CACHE_SCHEMA_VERSION,
-            fetched_at_unix_seconds,
-            models: models.clone(),
-        };
-        write_cache(&self.cache_path, &cache)?;
-        ModelInventorySnapshot::validated(
-            inventory_revision,
-            CatalogSource::Network,
-            fetched_at_unix_seconds,
-            models,
-        )
+        ModelInventorySnapshot::validated(inventory_revision, CatalogSource::Network, models)
     }
 
     fn discover(&self) -> Result<Vec<RemoteModel>, CatalogError> {
@@ -276,6 +283,8 @@ where
         let mut requested_pages = BTreeSet::new();
         let mut seen_revisions = BTreeSet::new();
         let mut models_by_repository: BTreeMap<String, RemoteModel> = BTreeMap::new();
+        let metadata = metadata_overrides()?;
+        let mut total_candidates = 0_usize;
 
         for _ in 0..MAX_CATALOG_PAGES {
             let Some(page_url) = next_page.take() else {
@@ -295,9 +304,24 @@ where
                 )));
             }
             let response = self.client.get_json(&page_url)?;
+            ensure_response_size(&response.body)?;
             let candidates: Vec<HubModelSummary> = serde_json::from_str(&response.body)
                 .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+            if candidates.len() > CATALOG_PAGE_SIZE {
+                return Err(CatalogError::InvalidResponse(format!(
+                    "Hugging Face returned more than {CATALOG_PAGE_SIZE} candidates in one page"
+                )));
+            }
+            total_candidates = total_candidates
+                .checked_add(candidates.len())
+                .filter(|count| *count <= MAX_TOTAL_CANDIDATES)
+                .ok_or_else(|| {
+                    CatalogError::InvalidResponse(format!(
+                        "Hugging Face catalog exceeded {MAX_TOTAL_CANDIDATES} candidates"
+                    ))
+                })?;
             for candidate in candidates {
+                validate_candidate_bounds(&candidate)?;
                 if !is_trusted_candidate(&candidate) {
                     continue;
                 }
@@ -313,7 +337,12 @@ where
                 if models_by_repository.contains_key(&candidate.id) {
                     continue;
                 }
-                if let Some(model) = self.resolve_candidate(candidate)? {
+                if let Some(model) = self.resolve_candidate(candidate, &metadata)? {
+                    if models_by_repository.len() >= MAX_INVENTORY_MODELS {
+                        return Err(CatalogError::InvalidResponse(format!(
+                            "Hugging Face catalog exceeded {MAX_INVENTORY_MODELS} models"
+                        )));
+                    }
                     models_by_repository.insert(model.id.clone(), model);
                 }
             }
@@ -328,6 +357,7 @@ where
     fn resolve_candidate(
         &self,
         candidate: HubModelSummary,
+        metadata: &BTreeMap<String, MetadataOverride>,
     ) -> Result<Option<RemoteModel>, CatalogError> {
         let revision = candidate.sha.ok_or_else(|| {
             CatalogError::InvalidResponse(format!("{} did not include a revision", candidate.id))
@@ -343,23 +373,42 @@ where
             candidate.id, revision
         );
         let tree_response = self.client.get_json(&tree_url)?;
+        ensure_response_size(&tree_response.body)?;
         let tree: Vec<HubTreeEntry> = serde_json::from_str(&tree_response.body)
             .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        let mut variants = tree
-            .into_iter()
-            .filter_map(trusted_gguf_variant)
-            .collect::<Vec<_>>();
+        if tree.len() > MAX_TREE_ENTRIES {
+            return Err(CatalogError::InvalidResponse(format!(
+                "{} exceeded {MAX_TREE_ENTRIES} tree entries",
+                candidate.id
+            )));
+        }
+        let mut variants = Vec::new();
+        for entry in tree {
+            if entry.path.len() > MAX_FILENAME_BYTES {
+                return Err(CatalogError::InvalidResponse(format!(
+                    "{} contained an oversized tree path",
+                    candidate.id
+                )));
+            }
+            if let Some(variant) = trusted_gguf_variant(entry) {
+                if variants.len() >= MAX_VARIANTS_PER_MODEL {
+                    return Err(CatalogError::InvalidResponse(format!(
+                        "{} exceeded {MAX_VARIANTS_PER_MODEL} GGUF variants",
+                        candidate.id
+                    )));
+                }
+                variants.push(variant);
+            }
+        }
         if variants.is_empty() {
             return Ok(None);
         }
         variants.sort_by(|left, right| left.filename.cmp(&right.filename));
-        let metadata = metadata_overrides()?.remove(&candidate.id);
+        let metadata = metadata.get(&candidate.id);
         let display_name = metadata
-            .as_ref()
             .map(|metadata| metadata.display_name.clone())
             .unwrap_or_else(|| candidate.id.clone());
         let description = metadata
-            .as_ref()
             .map(|metadata| metadata.description.clone())
             .unwrap_or_else(|| "Trusted public ASR GGUF candidate.".to_owned());
         Ok(Some(RemoteModel {
@@ -368,7 +417,6 @@ where
             display_name,
             description,
             languages: metadata
-                .as_ref()
                 .map(|metadata| metadata.languages.clone())
                 .unwrap_or_default(),
             recommended: metadata.is_some_and(|metadata| metadata.recommended),
@@ -380,13 +428,6 @@ where
             variants,
         }))
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CatalogCache {
-    schema_version: u16,
-    fetched_at_unix_seconds: u64,
-    models: Vec<RemoteModel>,
 }
 
 #[derive(Deserialize)]
@@ -442,12 +483,12 @@ struct MetadataOverride {
 }
 
 fn is_trusted_candidate(candidate: &HubModelSummary) -> bool {
-    candidate
-        .id
-        .starts_with(&format!("{TRUSTED_ORGANIZATION}/"))
+    is_safe_repository_id(&candidate.id)
         && !candidate.private
         && !is_gated(&candidate.gated)
         && candidate.pipeline_tag.as_deref() == Some(ASR_PIPELINE_TAG)
+        && candidate.tags.len() <= MAX_TAGS_PER_CANDIDATE
+        && candidate.tags.iter().all(|tag| tag.len() <= MAX_TAG_BYTES)
         && REQUIRED_TAGS.iter().all(|tag| {
             candidate
                 .tags
@@ -460,6 +501,28 @@ fn is_trusted_candidate(candidate: &HubModelSummary) -> bool {
             .any(|tag| tag.eq_ignore_ascii_case("speaker-diarization"))
 }
 
+fn validate_candidate_bounds(candidate: &HubModelSummary) -> Result<(), CatalogError> {
+    if candidate.id.len() > MAX_REPOSITORY_BYTES
+        || candidate.sha.as_ref().is_some_and(|sha| sha.len() > 40)
+        || candidate
+            .pipeline_tag
+            .as_ref()
+            .is_some_and(|tag| tag.len() > MAX_TAG_BYTES)
+        || candidate.tags.len() > MAX_TAGS_PER_CANDIDATE
+        || candidate.tags.iter().any(|tag| tag.len() > MAX_TAG_BYTES)
+        || (candidate
+            .id
+            .starts_with(&format!("{TRUSTED_ORGANIZATION}/"))
+            && !is_safe_repository_id(&candidate.id))
+    {
+        Err(CatalogError::InvalidResponse(
+            "Hugging Face candidate exceeded trusted identifier or string bounds".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_gated(value: &serde_json::Value) -> bool {
     value.as_bool().unwrap_or(false)
         || value
@@ -469,6 +532,27 @@ fn is_gated(value: &serde_json::Value) -> bool {
 
 fn is_full_revision(revision: &str) -> bool {
     revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_safe_identifier(value: &str) -> bool {
+    value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_repository_id(value: &str) -> bool {
+    value.len() <= MAX_REPOSITORY_BYTES
+        && value
+            .split_once('/')
+            .is_some_and(|(organization, repository)| {
+                organization == TRUSTED_ORGANIZATION
+                    && !repository.is_empty()
+                    && is_safe_identifier(repository)
+            })
 }
 
 fn catalog_index_url() -> String {
@@ -551,11 +635,16 @@ fn trusted_gguf_variant(entry: HubTreeEntry) -> Option<RemoteModelVariant> {
 
 fn is_safe_relative_filename(filename: &str) -> bool {
     let path = Path::new(filename);
-    !path.is_absolute()
+    filename.len() <= MAX_FILENAME_BYTES
+        && !path.is_absolute()
         && path.components().all(|component| {
             matches!(component, Component::Normal(_))
                 && component.as_os_str() != "."
                 && component.as_os_str() != ".."
+                && component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(is_safe_identifier)
         })
 }
 
@@ -564,6 +653,11 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn metadata_overrides() -> Result<BTreeMap<String, MetadataOverride>, CatalogError> {
+    if METADATA_OVERRIDES_JSON.len() > MAX_METADATA_BYTES {
+        return Err(CatalogError::InvalidResponse(format!(
+            "metadata overrides exceeded {MAX_METADATA_BYTES} bytes"
+        )));
+    }
     let document: MetadataOverrideDocument = serde_json::from_str(METADATA_OVERRIDES_JSON)
         .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
     if document.schema_version != 1 {
@@ -572,31 +666,48 @@ fn metadata_overrides() -> Result<BTreeMap<String, MetadataOverride>, CatalogErr
             document.schema_version
         )));
     }
+    if document.models.len() > MAX_INVENTORY_MODELS
+        || document.models.iter().any(|(repository, metadata)| {
+            !is_safe_repository_id(repository)
+                || metadata.display_name.len() > MAX_DISPLAY_NAME_BYTES
+                || metadata.description.len() > MAX_DESCRIPTION_BYTES
+                || metadata.languages.len() > MAX_LANGUAGES_PER_MODEL
+                || metadata
+                    .languages
+                    .iter()
+                    .any(|language| language.is_empty() || language.len() > MAX_LANGUAGE_BYTES)
+        })
+    {
+        return Err(CatalogError::InvalidResponse(
+            "metadata overrides exceeded trusted inventory bounds".to_owned(),
+        ));
+    }
     Ok(document.models)
 }
 
-fn write_cache(path: &Path, cache: &CatalogCache) -> Result<(), CatalogError> {
-    let bytes =
-        serde_json::to_vec_pretty(cache).map_err(|error| CatalogError::Cache(error.to_string()))?;
-    crate::config::settings::atomic_write_bytes(path, &bytes).map_err(|error| {
-        CatalogError::Cache(format!(
-            "failed to atomically write catalog cache {}: {error}",
-            path.display()
-        ))
-    })
-}
-
 fn validate_inventory(models: &[RemoteModel]) -> Result<(), CatalogError> {
-    if models.is_empty() {
+    if models.is_empty() || models.len() > MAX_INVENTORY_MODELS {
         return Err(CatalogError::InvalidResponse(
-            "trusted model inventory was empty".to_owned(),
+            "trusted model inventory had an invalid model count".to_owned(),
         ));
     }
     let mut model_ids = BTreeSet::new();
+    let mut total_variants = 0_usize;
+    let mut aggregate_bytes = 0_usize;
     for model in models {
-        if !model.id.starts_with(&format!("{TRUSTED_ORGANIZATION}/"))
+        if !is_safe_repository_id(&model.id)
             || !is_full_revision(&model.revision)
             || model.variants.is_empty()
+            || model.variants.len() > MAX_VARIANTS_PER_MODEL
+            || model.display_name.is_empty()
+            || model.display_name.len() > MAX_DISPLAY_NAME_BYTES
+            || model.description.len() > MAX_DESCRIPTION_BYTES
+            || model.compatibility.detail().len() > MAX_DESCRIPTION_BYTES
+            || model.languages.len() > MAX_LANGUAGES_PER_MODEL
+            || model
+                .languages
+                .iter()
+                .any(|language| language.is_empty() || language.len() > MAX_LANGUAGE_BYTES)
             || !model_ids.insert(&model.id)
         {
             return Err(CatalogError::InvalidResponse(format!(
@@ -604,9 +715,39 @@ fn validate_inventory(models: &[RemoteModel]) -> Result<(), CatalogError> {
                 model.id
             )));
         }
+        total_variants = total_variants
+            .checked_add(model.variants.len())
+            .filter(|count| *count <= MAX_TOTAL_VARIANTS)
+            .ok_or_else(|| {
+                CatalogError::InvalidResponse(
+                    "trusted model inventory exceeded the aggregate variant limit".to_owned(),
+                )
+            })?;
+        for length in [
+            model.id.len(),
+            model.revision.len(),
+            model.display_name.len(),
+            model.description.len(),
+            model.compatibility.detail().len(),
+        ]
+        .into_iter()
+        .chain(model.languages.iter().map(String::len))
+        {
+            aggregate_bytes = aggregate_bytes
+                .checked_add(length)
+                .filter(|bytes| *bytes <= MAX_AGGREGATE_INVENTORY_BYTES)
+                .ok_or_else(|| {
+                    CatalogError::InvalidResponse(
+                        "trusted model inventory exceeded the aggregate byte limit".to_owned(),
+                    )
+                })?;
+        }
         let mut variant_ids = BTreeSet::new();
         for variant in &model.variants {
             if variant.size_bytes == 0
+                || variant.id.is_empty()
+                || variant.id.len() > MAX_FILENAME_BYTES
+                || !is_safe_relative_filename(&variant.id)
                 || !is_safe_relative_filename(&variant.filename)
                 || !variant.filename.to_ascii_lowercase().ends_with(".gguf")
                 || !is_sha256(&variant.expected_sha256)
@@ -617,9 +758,33 @@ fn validate_inventory(models: &[RemoteModel]) -> Result<(), CatalogError> {
                     model.id
                 )));
             }
+            aggregate_bytes = aggregate_bytes
+                .checked_add(
+                    variant
+                        .id
+                        .len()
+                        .saturating_add(variant.filename.len())
+                        .saturating_add(variant.expected_sha256.len()),
+                )
+                .filter(|bytes| *bytes <= MAX_AGGREGATE_INVENTORY_BYTES)
+                .ok_or_else(|| {
+                    CatalogError::InvalidResponse(
+                        "trusted model inventory exceeded the aggregate byte limit".to_owned(),
+                    )
+                })?;
         }
     }
     Ok(())
+}
+
+fn ensure_response_size(body: &str) -> Result<(), CatalogError> {
+    if body.len() > MAX_HTTP_RESPONSE_BYTES {
+        Err(CatalogError::InvalidResponse(format!(
+            "Hugging Face response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn bundled_fallback() -> Vec<RemoteModel> {
@@ -642,13 +807,6 @@ fn bundled_fallback() -> Vec<RemoteModel> {
                 .to_owned(),
         }],
     }]
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
@@ -711,13 +869,8 @@ mod tests {
         r#"[{"type":"file","path":"whisper-tiny.en-Q4_K_M.gguf","size":43545248,"lfs":{"oid":"3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b","size":43545248}},{"type":"file","path":"README.md","size":4}]"#
     }
 
-    fn temp_cache_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("scribe-hf-catalog-{name}-{}", std::process::id()))
-    }
-
     #[test]
     fn trusted_discovery_requires_public_asr_gguf_with_full_revision_and_digest() {
-        let cache = temp_cache_path("trusted.json");
         let client = MockHub::default()
             .with_response(index_url(None), index_response())
             .with_response(
@@ -727,9 +880,9 @@ mod tests {
                 ),
                 tree_response(),
             );
-        let service = HuggingFaceCatalogService::new(client, cache.clone());
+        let service = HuggingFaceCatalogService::new(client);
 
-        let snapshot = service.refresh_at(2, 1_000).unwrap();
+        let snapshot = service.refresh(2).unwrap();
 
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.source, CatalogSource::Network);
@@ -746,12 +899,10 @@ mod tests {
                 .expected_sha256,
             "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b"
         );
-        let _ = fs::remove_file(cache);
     }
 
     #[test]
     fn paginated_discovery_filters_each_page_and_deduplicates_repository_cards() {
-        let cache = temp_cache_path("paginated.json");
         let next_page = index_url(Some("opaque-next-page"));
         let second_page = r#"[
             {"id":"handy-computer/whisper-tiny.en-gguf","sha":"becb8bcb804405dc97b380a523d9975888820986","private":false,"gated":false,"pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp","asr"]},
@@ -775,9 +926,9 @@ mod tests {
                 ),
                 tree_response(),
             );
-        let service = HuggingFaceCatalogService::new(client, cache.clone());
+        let service = HuggingFaceCatalogService::new(client);
 
-        let snapshot = service.refresh_at(2, 1_000).unwrap();
+        let snapshot = service.refresh(2).unwrap();
 
         assert_eq!(snapshot.models.len(), 2);
         assert_eq!(
@@ -800,7 +951,6 @@ mod tests {
                 .iter()
                 .all(|model| model.id != "handy-computer/private")
         );
-        let _ = fs::remove_file(cache);
     }
 
     #[test]
@@ -817,15 +967,13 @@ mod tests {
             Err(CatalogError::InvalidResponse(_))
         ));
 
-        let cache = temp_cache_path("repeated-page.json");
         let first_page = index_url(None);
         let client = MockHub::default().with_page(first_page.clone(), "[]", Some(first_page));
-        let service = HuggingFaceCatalogService::new(client, cache.clone());
+        let service = HuggingFaceCatalogService::new(client);
         assert!(matches!(
-            service.refresh_at(2, 1_000),
+            service.refresh(2),
             Err(CatalogError::InvalidResponse(message)) if message.contains("repeated")
         ));
-        let _ = fs::remove_file(cache);
     }
 
     #[test]
@@ -837,6 +985,9 @@ mod tests {
 
         for replacement in [
             r#"{"id":"other-org/model","sha":"becb8bcb804405dc97b380a523d9975888820986","pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
+            r#"{"id":"handy-computer/../model","sha":"becb8bcb804405dc97b380a523d9975888820986","pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
+            r#"{"id":"handy-computer/model/extra","sha":"becb8bcb804405dc97b380a523d9975888820986","pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
+            r#"{"id":"handy-computer/model?private=true","sha":"becb8bcb804405dc97b380a523d9975888820986","pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
             r#"{"id":"handy-computer/model","sha":"becb8bcb804405dc97b380a523d9975888820986","private":true,"pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
             r#"{"id":"handy-computer/model","sha":"becb8bcb804405dc97b380a523d9975888820986","gated":true,"pipeline_tag":"automatic-speech-recognition","tags":["gguf","transcribe.cpp"]}"#,
             r#"{"id":"handy-computer/model","sha":"becb8bcb804405dc97b380a523d9975888820986","pipeline_tag":"text-classification","tags":["gguf","transcribe.cpp"]}"#,
@@ -861,6 +1012,49 @@ mod tests {
     }
 
     #[test]
+    fn catalog_bounds_fail_closed_before_publishing_a_snapshot() {
+        assert!(matches!(
+            ensure_response_size(&"x".repeat(MAX_HTTP_RESPONSE_BYTES + 1)),
+            Err(CatalogError::InvalidResponse(_))
+        ));
+
+        let candidate: serde_json::Value = serde_json::from_str(index_response()).unwrap();
+        let candidate = candidate.as_array().unwrap()[0].clone();
+        let oversized_page =
+            serde_json::to_string(&vec![candidate; CATALOG_PAGE_SIZE + 1]).unwrap();
+        let service = HuggingFaceCatalogService::new(
+            MockHub::default().with_response(index_url(None), &oversized_page),
+        );
+        assert!(matches!(
+            service.refresh(2),
+            Err(CatalogError::InvalidResponse(message)) if message.contains("one page")
+        ));
+
+        let mut oversized_model = bundled_fallback().remove(0);
+        oversized_model.description = "x".repeat(MAX_DESCRIPTION_BYTES + 1);
+        assert!(matches!(
+            ModelInventorySnapshot::from_trusted_records(
+                2,
+                CatalogSource::Network,
+                vec![oversized_model]
+            ),
+            Err(CatalogError::InvalidResponse(_))
+        ));
+
+        let mut variant_heavy_model = bundled_fallback().remove(0);
+        variant_heavy_model.variants =
+            vec![variant_heavy_model.variants[0].clone(); MAX_VARIANTS_PER_MODEL + 1];
+        assert!(matches!(
+            ModelInventorySnapshot::from_trusted_records(
+                2,
+                CatalogSource::Network,
+                vec![variant_heavy_model]
+            ),
+            Err(CatalogError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
     fn bundled_snapshot_is_versioned_and_owns_immutable_records() {
         let snapshot = ModelInventorySnapshot::bundled();
         let clone = snapshot.clone();
@@ -872,38 +1066,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_refresh_replaces_an_existing_cache_file() {
-        let cache = temp_cache_path("overwrite.json");
-        write_cache(
-            &cache,
-            &CatalogCache {
-                schema_version: CACHE_SCHEMA_VERSION,
-                fetched_at_unix_seconds: 1,
-                models: Vec::new(),
-            },
-        )
-        .unwrap();
-        write_cache(
-            &cache,
-            &CatalogCache {
-                schema_version: CACHE_SCHEMA_VERSION,
-                fetched_at_unix_seconds: 2,
-                models: bundled_fallback(),
-            },
-        )
-        .unwrap();
-
-        let written: CatalogCache = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
-        assert_eq!(written.fetched_at_unix_seconds, 2);
-        assert_eq!(written.models, bundled_fallback());
-        let _ = fs::remove_file(cache);
-    }
-
-    #[test]
     #[ignore = "requires public Hugging Face network access"]
     fn live_trusted_catalog_discovers_only_pinned_gguf_variants() {
-        let cache = temp_cache_path("live.json");
-        let service = HuggingFaceCatalogService::for_cache_path(cache.clone());
+        let service = HuggingFaceCatalogService::online();
 
         let snapshot = service.refresh(2).unwrap();
 
@@ -916,6 +1081,5 @@ mod tests {
                     .iter()
                     .all(|variant| is_sha256(&variant.expected_sha256))
         }));
-        let _ = fs::remove_file(cache);
     }
 }

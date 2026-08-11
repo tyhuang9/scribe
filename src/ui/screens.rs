@@ -4280,8 +4280,7 @@ mod tests {
             },
             status: super::super::state::RemoteCatalogStatusView {
                 kind: RemoteCatalogStatusKind::Offline,
-                message: "Offline stale catalog cache · Showing 1 of 1 trusted catalog models."
-                    .into(),
+                message: "Bundled trusted catalog · Showing 1 of 1 trusted catalog models.".into(),
             },
             refresh_enabled: true,
             has_snapshot: true,
@@ -4364,7 +4363,7 @@ mod tests {
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
                 && node.name()
-                    == Some("Offline stale catalog cache · Showing 1 of 1 trusted catalog models.")
+                    == Some("Bundled trusted catalog · Showing 1 of 1 trusted catalog models.")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));

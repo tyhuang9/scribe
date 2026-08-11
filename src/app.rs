@@ -7370,6 +7370,7 @@ impl LocalTranscriberApp {
         }
         self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_cards_from_config();
+        self.rebuild_local_models_after_committed_change();
         let model_name = imported.install.display_name;
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!(
@@ -7801,6 +7802,7 @@ impl LocalTranscriberApp {
             self.transcription_service =
                 self.transcription_service.with_config(self.config.clone());
             self.refresh_playground_runtime_statuses();
+            self.rebuild_local_models_after_committed_change();
             if let Some(error) = cleanup {
                 let message = format!(
                     "Runtime was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}"
@@ -7840,6 +7842,7 @@ impl LocalTranscriberApp {
         }
         self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_runtime_statuses();
+        self.rebuild_local_models_after_committed_change();
         self.status = TranscriptionStatus::Idle;
         self.status_message = "Removed the legacy runtime from Scribe settings. Its files were preserved because they are not governed by the normalized manifest transaction.".to_owned();
     }
@@ -8209,22 +8212,11 @@ impl LocalTranscriberApp {
         self.remote_catalog.loading = true;
         self.remote_catalog.active_refresh_generation = Some(generation);
         self.remote_catalog.error = None;
-        let cache_path = match config::cache_dir() {
-            Ok(path) => path.join("huggingface-model-catalog-v1.json"),
-            Err(error) => {
-                self.remote_catalog.loading = false;
-                self.remote_catalog.active_refresh_generation = None;
-                self.remote_catalog.error = Some(format!(
-                    "Could not determine the local Hugging Face catalog cache path: {error}"
-                ));
-                return;
-            }
-        };
         let tx = self.tx.clone();
         let spawn = thread::Builder::new()
             .name("scribe-huggingface-catalog".to_owned())
             .spawn(move || {
-                let service = HuggingFaceCatalogService::for_cache_path(cache_path);
+                let service = HuggingFaceCatalogService::online();
                 let result = service
                     .refresh(generation)
                     .map_err(|error| error.to_string());
@@ -8247,7 +8239,7 @@ impl LocalTranscriberApp {
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
         self.model_comparison.start_disabled_reason =
             self.comparison_start_block_reason().map(str::to_owned);
-        let catalog = self.model_management_catalog();
+        let catalog = Arc::clone(&self.remote_catalog.local_models);
         let installed = catalog
             .iter()
             .filter(|model| model.installed)
@@ -8759,6 +8751,11 @@ impl LocalTranscriberApp {
         {
             self.remote_catalog.local_models_build_count += 1;
         }
+    }
+
+    fn rebuild_local_models_after_committed_change(&mut self) {
+        self.remote_catalog.invalidate_local_models();
+        self.rebuild_model_inventory_projection();
     }
 
     fn model_management_catalog(&self) -> Vec<ModelViewModel> {
@@ -10497,7 +10494,6 @@ fn trusted_model_install_space_error(
     config: &AppConfig,
     artifact: &TrustedArtifact,
 ) -> Option<String> {
-    let _ = crate::disk_space::available_space_for_destination;
     disk_space_preflight_error(managed_downloads::trusted_gguf_download_space_preflight(
         config, artifact,
     ))
@@ -12204,7 +12200,6 @@ mod layout_tests {
             ModelInventorySnapshot::from_trusted_records(
                 1,
                 crate::huggingface_catalog::CatalogSource::BundledFallback,
-                0,
                 vec![remote_catalog_model(
                     "handy-computer/catalog-fixture",
                     "Catalog fixture",
@@ -12274,7 +12269,7 @@ mod layout_tests {
         }
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
-                && node.name() == Some("Bundled offline catalog fallback · Showing 1 of 1 models.")
+                && node.name() == Some("Bundled trusted catalog · Showing 1 of 1 models.")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
@@ -16368,7 +16363,6 @@ mod layout_tests {
         let snapshot = ModelInventorySnapshot::from_trusted_records(
             2,
             CatalogSource::Network,
-            1,
             vec![remote_catalog_model(
                 "handy-computer/event-fixture",
                 "Event fixture",
@@ -16407,7 +16401,6 @@ mod layout_tests {
             ModelInventorySnapshot::from_trusted_records(
                 revision,
                 CatalogSource::Network,
-                revision,
                 vec![remote_catalog_model(
                     "handy-computer/refresh-fixture",
                     "Refresh fixture",
@@ -16463,6 +16456,7 @@ mod layout_tests {
         configure_stitch_style(&ctx);
         let mut app = test_app();
         let initial_local_builds = app.remote_catalog.local_models_build_count;
+        let initial_local_models = Arc::clone(&app.remote_catalog.local_models);
         let initial_revision = app.remote_catalog.snapshot.as_ref().unwrap().revision();
 
         for _ in 0..3 {
@@ -16484,6 +16478,10 @@ mod layout_tests {
             app.remote_catalog.local_models_build_count,
             initial_local_builds
         );
+        assert!(Arc::ptr_eq(
+            &initial_local_models,
+            &app.remote_catalog.local_models
+        ));
         assert_eq!(
             app.remote_catalog.snapshot.as_ref().unwrap().revision(),
             initial_revision
@@ -16643,10 +16641,9 @@ mod layout_tests {
     fn remote_catalog_projection_is_bounded_cached_and_truthful_at_ten_thousand_models() {
         let mut app = test_app();
         app.remote_catalog.snapshot = Some(
-            ModelInventorySnapshot::from_trusted_records(
+            ModelInventorySnapshot::from_records_unchecked_for_projection(
                 2,
                 CatalogSource::Network,
-                0,
                 (0..10_000)
                     .map(|index| {
                         remote_catalog_model(
@@ -16658,8 +16655,7 @@ mod layout_tests {
                         )
                     })
                     .collect(),
-            )
-            .unwrap(),
+            ),
         );
 
         let first = app.remote_catalog_view();
@@ -16728,7 +16724,6 @@ mod layout_tests {
             ModelInventorySnapshot::from_trusted_records(
                 2,
                 CatalogSource::Network,
-                0,
                 vec![remote_catalog_model(
                     "handy-computer/action-fixture",
                     "Action fixture",
@@ -19295,6 +19290,54 @@ mod layout_tests {
                 "UI completion must not call source I/O boundary {forbidden}"
             );
         }
+        assert!(completion.contains("self.rebuild_local_models_after_committed_change();"));
+        assert!(
+            completion
+                .find("installed_manifest::persist_manifest_at")
+                .unwrap()
+                < completion
+                    .find("self.rebuild_local_models_after_committed_change();")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn successful_runtime_removal_paths_rebuild_inventory_only_after_commit() {
+        let source = include_str!("app.rs");
+        let start = source.find("    fn uninstall_runtime(").unwrap();
+        let end = source[start..]
+            .find("\n    fn refresh_playground_runtime_statuses(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let uninstall = &source[start..end];
+        let legacy_start = uninstall.find("        let Some(provider)").unwrap();
+        let (managed, legacy) = uninstall.split_at(legacy_start);
+        let refresh = "self.rebuild_local_models_after_committed_change();";
+
+        assert_eq!(uninstall.matches(refresh).count(), 2);
+        assert!(managed.find("removal.commit()").unwrap() < managed.find(refresh).unwrap());
+        assert!(managed.find("config::save_config").unwrap() < managed.find(refresh).unwrap());
+        assert!(legacy.find("config::save_config").unwrap() < legacy.find(refresh).unwrap());
+    }
+
+    #[test]
+    fn committed_inventory_change_replaces_the_cached_local_projection() {
+        let mut app = test_app();
+        let before = Arc::clone(&app.remote_catalog.local_models);
+        let builds = app.remote_catalog.local_models_build_count;
+        app.config.general.selected_default_model = "not-selected".to_owned();
+
+        app.rebuild_local_models_after_committed_change();
+
+        assert_eq!(app.remote_catalog.local_models_build_count, builds + 1);
+        assert!(!Arc::ptr_eq(&before, &app.remote_catalog.local_models));
+        assert!(
+            app.remote_catalog
+                .local_models
+                .iter()
+                .find(|model| model.id == "whisper_cpp_tiny_en")
+                .is_some_and(|model| !model.active)
+        );
     }
 
     #[test]
