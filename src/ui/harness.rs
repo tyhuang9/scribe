@@ -270,7 +270,7 @@ impl eframe::App for UiHarnessApp {
         let clear_reference_action_focus = self.data.comparison.restore_reference_action_focus;
         let clear_reference_notice = self.data.comparison.reference_notice.is_some();
         let clear_after_removal_focus = self.data.model_management.restore_after_removal_focus;
-        let action = show_harness(ctx, &self.data, &mut self.page);
+        let action = show_harness(ctx, &mut self.data, &mut self.page);
         if clear_reference_editor_focus {
             self.data.comparison.focus_reference_editor = false;
         }
@@ -324,8 +324,11 @@ fn render_settings_playground_fixture(ui: &mut egui::Ui) -> ScreenAction {
     }
 }
 
-fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> ScreenAction {
+fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage) -> ScreenAction {
     show_navigation(ctx, page, false);
+    if *page != AppPage::General || !matches!(data.route, UiRoute::Settings(_)) {
+        data.settings_playground_open = false;
+    }
     let view = ScreenView {
         route: harness_route(*page, data.route),
         transcription: &data.transcription,
@@ -639,7 +642,7 @@ mod tests {
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
         let mut page = fixture.page();
-        let data = fixture.data();
+        let mut data = fixture.data();
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -649,7 +652,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                let _ = show_harness(ctx, &data, &mut page);
+                let _ = show_harness(ctx, &mut data, &mut page);
             },
         )
     }
@@ -3844,6 +3847,41 @@ mod tests {
         let visible = node_names(&advanced);
         assert!(visible.iter().any(|name| name == "Advanced settings"));
         assert!(visible.iter().any(|name| name == "Open model Playground"));
+        assert!(!visible.iter().any(|name| name == "Back to Advanced"));
+    }
+
+    #[test]
+    fn settings_playground_closes_when_primary_navigation_changes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.settings.debug_mode = true;
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = AppPage::General;
+        let (width, height) = (900.0, 3_000.0);
+
+        let open_action = click_named_control(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            "Open model Playground",
+        );
+        apply_action(&mut data, &mut page, open_action);
+        assert!(data.settings_playground_open);
+
+        let navigation_action =
+            click_named_control(&ctx, &mut data, &mut page, width, height, "Models");
+        assert_eq!(navigation_action, ScreenAction::None);
+        assert_eq!(page, AppPage::Models);
+        assert!(!data.settings_playground_open);
+
+        let models = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let visible = node_names(&models);
+        assert!(visible.iter().any(|name| name == "Models"));
+        assert!(!visible.iter().any(|name| name == "Developer Playground"));
         assert!(!visible.iter().any(|name| name == "Back to Advanced"));
     }
 
