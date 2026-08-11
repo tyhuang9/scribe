@@ -12,12 +12,12 @@ use super::{
         ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
-        ComparisonPhase, ComparisonResultPhase, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
-        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
-        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
-        RemoteCatalogVariantView, RemoteCatalogView, SettingsSaveState, SettingsTab,
-        TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ComparisonResultPhase, ModelCardControl, ModelCardKey,
+        ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
+        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
+        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
+        RemoteCatalogStatusKind, RemoteCatalogVariantView, RemoteCatalogView, SettingsSaveState,
+        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -244,6 +244,12 @@ pub(crate) enum ScreenAction {
     SetModelLanguageFilter(ModelLanguageFilter),
     ToggleInstalledModels,
     ToggleAvailableModels,
+    FocusModelCard(ModelCardKey),
+    AcknowledgeModelCardFocus(ModelCardKey),
+    AcknowledgeModelControlFocus {
+        model_id: String,
+        control: ModelCardControl,
+    },
     RetryRemoteCatalog,
     InstallRemoteCatalogVariant {
         remote_model_id: String,
@@ -340,14 +346,37 @@ pub(crate) fn show_route_scroll<T>(
                     add_contents(ui)
                 })
                 .inner;
-            if let Some((id, rect)) = ui.data(|data| {
-                data.get_temp::<(egui::Id, egui::Rect)>(egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL))
-            }) && ui.ctx().memory(|memory| memory.focused()) == Some(id)
+            if route != UiRoute::Models
+                && let Some((id, rect)) = ui.data(|data| {
+                    data.get_temp::<(egui::Id, egui::Rect)>(egui::Id::new(
+                        ROUTE_FOCUSED_CONTROL_SCROLL,
+                    ))
+                })
+                && ui.ctx().memory(|memory| memory.focused()) == Some(id)
             {
                 ui.scroll_to_rect(rect, Some(Align::Center));
             }
             content
         });
+    if route == UiRoute::Models {
+        let focused_control_scroll = ui.data_mut(|data| {
+            let key = egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL);
+            let value = data.get_temp::<(egui::Id, egui::Rect)>(key);
+            data.remove::<(egui::Id, egui::Rect)>(key);
+            value
+        });
+        if let Some((id, rect)) = focused_control_scroll
+            && ui.ctx().memory(|memory| memory.focused()) == Some(id)
+        {
+            let mut state = scroll.state;
+            state.offset.y += rect.center().y - scroll.inner_rect.center().y;
+            state.offset.y = state.offset.y.clamp(
+                0.0,
+                (scroll.content_size.y - scroll.inner_rect.height()).max(0.0),
+            );
+            state.store(ui.ctx(), scroll.id);
+        }
+    }
     #[cfg(test)]
     ui.data_mut(|data| {
         data.insert_temp(
@@ -1343,7 +1372,6 @@ const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
 const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
 const MODEL_CARD_HEIGHT: f32 = 92.0;
 const MODEL_CARD_GAP: f32 = 8.0;
-const MODEL_CARD_OVERSCAN: usize = 2;
 
 #[derive(Clone, Copy)]
 enum ModelCard<'a> {
@@ -1352,12 +1380,79 @@ enum ModelCard<'a> {
 }
 
 impl ModelCard<'_> {
-    fn display_name(&self) -> &str {
+    fn key(&self) -> ModelCardKey {
         match *self {
-            Self::Local(model) => &model.display_name,
-            Self::Remote(entry, _) => &entry.display_name,
+            Self::Local(model) => ModelCardKey::Local(model.id.clone()),
+            Self::Remote(entry, variant) => ModelCardKey::Remote {
+                entry_id: entry.id.clone(),
+                variant_id: variant.id.clone(),
+            },
         }
     }
+
+    fn matches_key(&self, key: &ModelCardKey) -> bool {
+        match (*self, key) {
+            (Self::Local(model), ModelCardKey::Local(id)) => model.id == *id,
+            (
+                Self::Remote(entry, variant),
+                ModelCardKey::Remote {
+                    entry_id,
+                    variant_id,
+                },
+            ) => entry.id == *entry_id && variant.id == *variant_id,
+            _ => false,
+        }
+    }
+
+    fn primary_verb(&self) -> &str {
+        match *self {
+            Self::Local(model) if model.installed && model.primary_action_repairs_runtime => {
+                "Repair"
+            }
+            Self::Local(model) if model.installed && model.active => "Active",
+            Self::Local(model) if model.installed => "Select",
+            Self::Local(model)
+                if matches!(
+                    model.download_state,
+                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
+                ) =>
+            {
+                "Resume"
+            }
+            Self::Local(_) => "Install",
+            Self::Remote(_, variant) => {
+                remote_primary_action(variant).map_or("Unavailable", |action| action.label.as_str())
+            }
+        }
+    }
+
+    fn accessible_name(&self) -> String {
+        match *self {
+            Self::Local(model) => format!(
+                "{} {} {} model",
+                self.primary_verb(),
+                model.display_name,
+                model.variant_label
+            ),
+            Self::Remote(entry, variant) => format!(
+                "{} {} {} model",
+                self.primary_verb(),
+                entry.display_name,
+                variant.id
+            ),
+        }
+    }
+}
+
+struct ModelCardRenderResult {
+    action: ScreenAction,
+    primary_has_focus: bool,
+}
+
+struct ModelSectionFocus<'a> {
+    card: Option<&'a ModelCardKey>,
+    restore_details: Option<&'a str>,
+    restore_remove: Option<&'a str>,
 }
 
 fn local_model_matches(
@@ -1433,11 +1528,22 @@ fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCa
     })
 }
 
-fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, egui::Rect) {
+fn render_model_card(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    focus_card: Option<&ModelCardKey>,
+    restore_details_focus: Option<&str>,
+    restore_remove_focus: Option<&str>,
+) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
     let width = ui.available_width();
-    let (card_rect, primary_response) =
-        ui.allocate_exact_size(Vec2::new(width, MODEL_CARD_HEIGHT), Sense::click());
+    let (card_rect, _) =
+        ui.allocate_exact_size(Vec2::new(width, MODEL_CARD_HEIGHT), Sense::hover());
+    let primary_response = ui.interact(
+        card_rect,
+        ui.make_persistent_id(("model-card-primary", card.key())),
+        Sense::click(),
+    );
     let (primary_action, primary_enabled, disabled_reason) = match card {
         ModelCard::Local(model) if model.installed => (
             Some(if model.primary_action_repairs_runtime {
@@ -1479,7 +1585,7 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
     ui.ctx()
         .accesskit_node_builder(primary_response.id, |builder| {
             builder.set_role(egui::accesskit::Role::Button);
-            builder.set_name(format!("{} model", card.display_name()));
+            builder.set_name(card.accessible_name());
             if !primary_enabled {
                 builder.set_disabled();
             }
@@ -1494,7 +1600,14 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
     }
     paint_focus_ring(ui, &primary_response, Rounding::same(6.0));
 
+    let card_focus_requested = focus_card.is_some_and(|key| card.matches_key(key));
+    if card_focus_requested {
+        primary_response.request_focus();
+        scroll_focused_control_into_view(ui, &primary_response);
+    }
+
     let mut child_action = ScreenAction::None;
+    let mut restored_control = None;
     let mut content_ui = ui.child_ui(
         card_rect.shrink2(Vec2::new(14.0, 10.0)),
         Layout::top_down(Align::LEFT),
@@ -1575,16 +1688,33 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| match card {
             ModelCard::Local(model) => {
                 if model.installed {
-                    let details = button(ui, "Details", ButtonTone::Text);
+                    let details = ui
+                        .push_id(("model-card-details", &model.id), |ui| {
+                            button(ui, "Details", ButtonTone::Text)
+                        })
+                        .inner;
+                    if restore_details_focus == Some(model.id.as_str()) {
+                        details.request_focus();
+                        details.scroll_to_me(Some(Align::Center));
+                        restored_control = Some(ModelCardControl::Details);
+                    }
                     if details.clicked() {
                         child_action = ScreenAction::ShowModelDetails(model.id.clone());
                     }
                     if model.removal_supported {
                         let remove = ui
-                            .add_enabled_ui(!model.active, |ui| {
-                                button(ui, "Remove", ButtonTone::Text)
+                            .push_id(("model-card-remove", &model.id), |ui| {
+                                ui.add_enabled_ui(!model.active, |ui| {
+                                    button(ui, "Remove", ButtonTone::Text)
+                                })
                             })
+                            .inner
                             .inner;
+                        if restore_remove_focus == Some(model.id.as_str()) {
+                            remove.request_focus();
+                            remove.scroll_to_me(Some(Align::Center));
+                            restored_control = Some(ModelCardControl::Remove);
+                        }
                         if model.active {
                             let reason =
                                 "Select another ready model before removing the active model.";
@@ -1606,6 +1736,7 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
                     }
                 }
                 ui.vertical(|ui| {
+                    ui.label(RichText::new(card.primary_verb()).small().strong());
                     metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
                     ui.label(
                         RichText::new(accuracy_label(model.size_tier))
@@ -1628,6 +1759,7 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
                     }
                 }
                 ui.vertical(|ui| {
+                    ui.label(RichText::new(card.primary_verb()).small().strong());
                     metadata(ui, Icon::Gauge, speed_label(variant.speed_tier));
                     ui.label(
                         RichText::new(accuracy_label(variant.size_tier))
@@ -1670,8 +1802,104 @@ fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, e
     };
     if child_action != ScreenAction::None {
         action = child_action;
+    } else if action == ScreenAction::None {
+        if let ModelCard::Local(model) = card
+            && let Some(control) = restored_control
+        {
+            action = ScreenAction::AcknowledgeModelControlFocus {
+                model_id: model.id.clone(),
+                control,
+            };
+        } else if card_focus_requested && ui.clip_rect().contains_rect(card_rect) {
+            action = ScreenAction::AcknowledgeModelCardFocus(card.key());
+        }
     }
-    (action, card_rect)
+    ModelCardRenderResult {
+        action,
+        primary_has_focus: primary_response.has_focus(),
+    }
+}
+
+fn is_focus_acknowledgement(action: &ScreenAction) -> bool {
+    matches!(
+        action,
+        ScreenAction::AcknowledgeModelCardFocus(_)
+            | ScreenAction::AcknowledgeModelControlFocus { .. }
+    )
+}
+
+fn merge_model_action(action: &mut ScreenAction, candidate: ScreenAction) {
+    if candidate == ScreenAction::None
+        || (*action != ScreenAction::None
+            && !is_focus_acknowledgement(action)
+            && is_focus_acknowledgement(&candidate))
+    {
+        return;
+    }
+    *action = candidate;
+}
+
+fn render_model_page_sentinel(
+    ui: &mut egui::Ui,
+    section: &str,
+    next: bool,
+    target: ModelCard<'_>,
+) -> ModelCardRenderResult {
+    let (slot_rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), MODEL_CARD_HEIGHT),
+        Sense::hover(),
+    );
+    let content_ui = ui.child_ui_with_id_source(
+        slot_rect,
+        Layout::top_down(Align::Center),
+        ("model-page-sentinel", section, next),
+    );
+    let label = format!(
+        "{} {section} models",
+        if next { "Next" } else { "Previous" }
+    );
+    let button_rect = egui::Rect::from_center_size(
+        slot_rect.center(),
+        Vec2::new(slot_rect.width().min(220.0), 44.0),
+    );
+    let response = content_ui.interact(
+        button_rect,
+        content_ui.make_persistent_id(("model-page-sentinel-button", section, next)),
+        Sense::click(),
+    );
+    let colors = ui_palette(&content_ui);
+    if response.hovered() {
+        content_ui
+            .painter()
+            .rect_filled(button_rect, Rounding::same(5.0), colors.active_card_bg);
+    }
+    content_ui.painter().text(
+        button_rect.center(),
+        Align2::CENTER_CENTER,
+        &label,
+        egui::FontId::proportional(14.0),
+        colors.text,
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, format!("Show {label}"))
+    });
+    content_ui
+        .ctx()
+        .accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name(format!("Show {label}"));
+            builder.set_bounds(accesskit_rect(button_rect));
+        });
+    paint_focus_ring(&content_ui, &response, Rounding::same(5.0));
+    let action = if response.clicked() {
+        ScreenAction::FocusModelCard(target.key())
+    } else {
+        ScreenAction::None
+    };
+    ModelCardRenderResult {
+        action,
+        primary_has_focus: response.has_focus(),
+    }
 }
 
 fn render_model_section(
@@ -1680,6 +1908,7 @@ fn render_model_section(
     cards: &[ModelCard<'_>],
     expanded: bool,
     toggle_action: ScreenAction,
+    focus: ModelSectionFocus<'_>,
     _terminal: bool,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
@@ -1714,6 +1943,7 @@ fn render_model_section(
         builder.set_bounds(accesskit_rect(header_rect));
     });
     paint_focus_ring(ui, &header, Rounding::same(5.0));
+    scroll_focused_control_into_view(ui, &header);
     let mut action = if header.clicked() {
         toggle_action
     } else {
@@ -1727,35 +1957,99 @@ fn render_model_section(
     let start_y = ui.cursor().top();
     let stride = MODEL_CARD_HEIGHT + MODEL_CARD_GAP;
     let clip = ui.clip_rect();
-    let first_visible = (((clip.top() - start_y) / stride).floor().max(0.0) as usize)
-        .saturating_sub(MODEL_CARD_OVERSCAN)
-        .min(cards.len());
-    let last_visible = (((clip.bottom() - start_y) / stride).ceil().max(0.0) as usize)
-        .saturating_add(MODEL_CARD_OVERSCAN)
+    let mut first_visible = ((clip.top() - start_y) / stride).floor().max(0.0) as usize;
+    first_visible = first_visible.min(cards.len());
+    let mut last_visible = (((clip.bottom() - start_y) / stride).ceil().max(0.0) as usize)
         .min(cards.len())
         .max(first_visible);
+    let requested_index = focus
+        .card
+        .and_then(|key| cards.iter().position(|card| card.matches_key(key)));
+    if let Some(index) = requested_index
+        && (index < first_visible || index >= last_visible)
+    {
+        let page_len = last_visible.saturating_sub(first_visible).max(1);
+        first_visible = index
+            .saturating_sub(page_len / 2)
+            .min(cards.len().saturating_sub(page_len));
+        last_visible = (first_visible + page_len).min(cards.len());
+    }
     let total_height = cards.len() as f32 * stride - MODEL_CARD_GAP;
     if first_visible > 0 {
         ui.allocate_space(Vec2::new(0.0, first_visible as f32 * stride));
     }
-    for (index, card) in cards
-        .iter()
-        .enumerate()
-        .take(last_visible)
-        .skip(first_visible)
-    {
-        let (card_action, _card_rect) = render_model_card(ui, *card);
-        if card_action != ScreenAction::None {
-            action = card_action;
-        }
+    let page_len = last_visible.saturating_sub(first_visible).max(1);
+    let previous_page_target =
+        (first_visible > 0).then(|| cards[first_visible.saturating_sub(page_len)].key());
+    let next_page_target = (last_visible < cards.len())
+        .then(|| cards[(last_visible + page_len - 1).min(cards.len() - 1)].key());
+    let top_sentinel = (previous_page_target.is_some() && requested_index != Some(first_visible))
+        .then_some(first_visible);
+    let bottom_sentinel = (last_visible > first_visible
+        && next_page_target.is_some()
+        && requested_index != last_visible.checked_sub(1)
+        && (top_sentinel.is_none() || page_len > 1))
+        .then(|| last_visible - 1);
+    let mut page_control_has_focus = false;
+    for index in first_visible..last_visible {
+        #[cfg(test)]
+        let terminal_card_rect = (_terminal && index + 1 == cards.len()).then(|| {
+            egui::Rect::from_min_size(
+                egui::pos2(ui.cursor().min.x, ui.cursor().top()),
+                Vec2::new(ui.available_width(), MODEL_CARD_HEIGHT),
+            )
+        });
+        let rendered = if top_sentinel == Some(index) {
+            render_model_page_sentinel(
+                ui,
+                name,
+                false,
+                cards[first_visible.saturating_sub(page_len)],
+            )
+        } else if bottom_sentinel == Some(index) {
+            render_model_page_sentinel(
+                ui,
+                name,
+                true,
+                cards[(last_visible + page_len - 1).min(cards.len() - 1)],
+            )
+        } else {
+            let card = cards[index];
+            ui.push_id(("model-card", card.key()), |ui| {
+                render_model_card(
+                    ui,
+                    card,
+                    focus.card,
+                    focus.restore_details,
+                    focus.restore_remove,
+                )
+            })
+            .inner
+        };
+        page_control_has_focus |= rendered.primary_has_focus;
+        merge_model_action(&mut action, rendered.action);
         if index + 1 < cards.len() {
             ui.add_space(MODEL_CARD_GAP);
         }
         #[cfg(test)]
-        if _terminal && index + 1 == cards.len() {
+        if let Some(rect) = terminal_card_rect {
             ui.data_mut(|data| {
-                data.insert_temp(egui::Id::new("models-final-card-rect"), _card_rect);
+                data.insert_temp(egui::Id::new("models-final-card-rect"), rect);
             });
+        }
+    }
+    if action == ScreenAction::None && page_control_has_focus {
+        let page_target = ui.input(|input| {
+            if input.key_pressed(egui::Key::PageDown) {
+                next_page_target.clone()
+            } else if input.key_pressed(egui::Key::PageUp) {
+                previous_page_target.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(target) = page_target {
+            action = ScreenAction::FocusModelCard(target);
         }
     }
     let rendered_end = if last_visible > first_visible {
@@ -1787,6 +2081,7 @@ fn models(
 ) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
+    let mut import_control = None;
     let dialog_active = management.dialog.is_some();
     #[cfg(test)]
     ui.data_mut(|data| {
@@ -1861,6 +2156,7 @@ fn models(
             if management.restore_add_focus || management.restore_after_removal_focus {
                 import.request_focus();
             }
+            import_control = Some(import.clone());
             if import.clicked() {
                 action = ScreenAction::AddModel;
             }
@@ -1879,13 +2175,29 @@ fn models(
         builder.set_live(egui::accesskit::Live::Polite);
         builder.set_live_atomic();
     });
-    ui.add_space(12.0);
     let (installed_cards, available_cards) = build_model_card_lists(
         models,
         model_catalog,
         remote_catalog,
         language_filter,
     );
+    let result_count = ui.label(
+        RichText::new(format!(
+            "{} model results: {} installed, {} available.",
+            installed_cards.len() + available_cards.len(),
+            installed_cards.len(),
+            available_cards.len()
+        ))
+        .small()
+        .color(colors.muted_text),
+    );
+    ui.ctx()
+        .accesskit_node_builder(result_count.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Status);
+            builder.set_live(egui::accesskit::Live::Polite);
+            builder.set_live_atomic();
+        });
+    ui.add_space(12.0);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let installed_action = render_model_section(
@@ -1894,11 +2206,14 @@ fn models(
             &installed_cards,
             management.installed_expanded,
             ScreenAction::ToggleInstalledModels,
+            ModelSectionFocus {
+                card: management.focus_model_card.as_ref(),
+                restore_details: management.restore_details_focus.as_deref(),
+                restore_remove: management.restore_remove_focus.as_deref(),
+            },
             available_cards.is_empty(),
         );
-        if installed_action != ScreenAction::None {
-            action = installed_action;
-        }
+        merge_model_action(&mut action, installed_action);
         ui.add_space(12.0);
         let available_action = render_model_section(
             ui,
@@ -1906,12 +2221,37 @@ fn models(
             &available_cards,
             management.available_expanded,
             ScreenAction::ToggleAvailableModels,
+            ModelSectionFocus {
+                card: management.focus_model_card.as_ref(),
+                restore_details: management.restore_details_focus.as_deref(),
+                restore_remove: management.restore_remove_focus.as_deref(),
+            },
             true,
         );
-        if available_action != ScreenAction::None {
-            action = available_action;
-        }
+        merge_model_action(&mut action, available_action);
     });
+    if action == ScreenAction::None
+        && let Some(import) = import_control.as_ref()
+    {
+        let pending_control = management
+            .restore_details_focus
+            .as_ref()
+            .map(|id| (id, ModelCardControl::Details))
+            .or_else(|| {
+                management
+                    .restore_remove_focus
+                    .as_ref()
+                    .map(|id| (id, ModelCardControl::Remove))
+            });
+        if let Some((model_id, control)) = pending_control {
+            import.request_focus();
+            import.scroll_to_me(Some(Align::Center));
+            action = ScreenAction::AcknowledgeModelControlFocus {
+                model_id: model_id.clone(),
+                control,
+            };
+        }
+    }
     let comparison_viewport = ui
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
         .unwrap_or_else(|| ui.clip_rect());
@@ -2290,7 +2630,7 @@ fn models(
         .as_ref()
         .and_then(|_| consume_model_dialog_tab(ui.ctx()));
     if management.dialog.is_some() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-        return ScreenAction::CloseModelDialog;
+        return model_dialog_dismiss_action(management, remote_catalog);
     }
     match &management.dialog {
         Some(ModelDialog::Add) => {
@@ -2377,6 +2717,11 @@ fn models(
                             } else {
                                 ui.ctx().accesskit_node_builder(import.id, |builder| {
                                     builder.set_disabled();
+                                    if let Some(reason) =
+                                        remote_catalog.local_import.disabled_reason.as_deref()
+                                    {
+                                        builder.set_description(reason);
+                                    }
                                 });
                             }
                             if import.clicked() {
@@ -2390,7 +2735,7 @@ fn models(
                     focusable_controls.push(close.id);
                     mark_accesskit_enabled(ui, &close);
                     if close.clicked() {
-                        action = ScreenAction::CloseModelDialog;
+                        action = model_dialog_dismiss_action(management, remote_catalog);
                     }
                     });
             });
@@ -2408,7 +2753,7 @@ fn models(
                     });
             }
             if !open {
-                action = ScreenAction::CloseModelDialog;
+                action = model_dialog_dismiss_action(management, remote_catalog);
             }
         }
         Some(ModelDialog::Details(id)) => {
@@ -2759,6 +3104,19 @@ fn model_dialog_interaction_shield(ctx: &egui::Context) {
                 egui::Color32::from_black_alpha(72),
             );
         });
+}
+
+fn model_dialog_dismiss_action(
+    management: &ModelManagementState,
+    remote_catalog: &RemoteCatalogView,
+) -> ScreenAction {
+    if matches!(management.dialog, Some(ModelDialog::Add))
+        && remote_catalog.local_import.in_progress
+    {
+        ScreenAction::CancelLocalGgufImport
+    } else {
+        ScreenAction::CloseModelDialog
+    }
 }
 
 fn render_comparison_results(
@@ -4683,12 +5041,14 @@ mod tests {
         let catalog_model = ModelViewModel {
             id: "base.en".into(),
             display_name: "Catalog model must stay outside import dialog".into(),
+            variant_label: "base.en".into(),
             ..Default::default()
         };
         let remote_catalog = RemoteCatalogView {
             local_import: super::super::state::LocalGgufImportView {
                 path: "C:\\Models\\candidate.gguf".into(),
-                import_enabled: true,
+                import_enabled: false,
+                disabled_reason: Some("Choose a readable .gguf file.".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -4728,7 +5088,11 @@ mod tests {
         let path_label_id = update
             .nodes
             .iter()
-            .find_map(|(id, node)| (node.name() == Some("GGUF file path")).then_some(id))
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::StaticText
+                    && node.name() == Some("GGUF file path"))
+                .then_some(id)
+            })
             .expect("path label");
         let path_input_id = update
             .nodes
@@ -4745,11 +5109,24 @@ mod tests {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
             }));
         }
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Validate and import")
+                && node.is_disabled()
+                && node.description() == Some("Choose a readable .gguf file.")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.name() == Some("1 model results: 0 installed, 1 available.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
         let (catalog_id, catalog_node) = update
             .nodes
             .iter()
             .find(|(_, node)| {
-                node.name() == Some("Catalog model must stay outside import dialog model")
+                node.name()
+                    == Some("Install Catalog model must stay outside import dialog base.en model")
             })
             .expect("disabled catalog card behind modal");
         assert!(catalog_node.is_disabled());
@@ -4899,7 +5276,7 @@ mod tests {
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("whisper.cpp base.en model")
+                && node.name() == Some("Active whisper.cpp base.en base.en model")
                 && node.is_disabled()
                 && node.description() == Some("This model is already active.")
         }));

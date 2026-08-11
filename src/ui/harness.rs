@@ -17,7 +17,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase};
+use super::state::{ComparisonResult, ComparisonResultPhase, ModelCardKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -441,6 +441,15 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::ToggleAvailableModels => {
             data.model_management.available_expanded = !data.model_management.available_expanded
         }
+        ScreenAction::FocusModelCard(key) => data.model_management.focus_model_card = Some(key),
+        ScreenAction::AcknowledgeModelCardFocus(key) => {
+            if data.model_management.focus_model_card.as_ref() == Some(&key) {
+                data.model_management.focus_model_card = None;
+            }
+        }
+        ScreenAction::AcknowledgeModelControlFocus { model_id, control } => data
+            .model_management
+            .acknowledge_control_focus(&model_id, control),
         ScreenAction::SetLocalGgufImportPath(path) => data.remote_catalog.local_import.path = path,
         ScreenAction::ValidateAndImportLocalGguf => {
             data.remote_catalog.local_import.in_progress = true;
@@ -665,6 +674,34 @@ mod tests {
         if clear_after_removal_focus {
             data.model_management.restore_after_removal_focus = false;
         }
+        (output, action)
+    }
+
+    fn render_with_input_and_apply(
+        ctx: &egui::Context,
+        data: &mut FixtureData,
+        page: &mut AppPage,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let (output, action) = render_with_input(ctx, data, page, width, height, events);
+        apply_action(data, page, action.clone());
+        (output, action)
+    }
+
+    fn render_with_input_and_apply_at_time(
+        ctx: &egui::Context,
+        data: &mut FixtureData,
+        page: &mut AppPage,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let (output, action) =
+            render_with_input_at_time(ctx, data, page, width, height, events, Some(time));
+        apply_action(data, page, action.clone());
         (output, action)
     }
 
@@ -1285,6 +1322,16 @@ mod tests {
         }
     }
 
+    fn page_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     fn assert_dialog_focus_cycle(
         ctx: &egui::Context,
         data: &mut FixtureData,
@@ -1403,6 +1450,109 @@ mod tests {
     }
 
     #[test]
+    fn escape_during_local_gguf_validation_cancels_instead_of_closing() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Add);
+        data.model_management.focus_dialog_initial = true;
+        data.remote_catalog.local_import.in_progress = true;
+        data.remote_catalog.local_import.import_enabled = false;
+
+        let (_, initial_action) =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![page_event(egui::Key::Escape)],
+        );
+        assert_eq!(action, ScreenAction::CancelLocalGgufImport);
+    }
+
+    #[test]
+    fn details_dialog_escape_restores_the_same_details_control() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![page_event(egui::Key::Escape)],
+        );
+        assert_eq!(action, ScreenAction::CloseModelDialog);
+        apply_action(&mut data, &mut page, action);
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(focused_node(&output).name(), Some("Details"));
+        assert_eq!(
+            action,
+            ScreenAction::AcknowledgeModelControlFocus {
+                model_id: "tiny.en".into(),
+                control: super::super::state::ModelCardControl::Details,
+            }
+        );
+    }
+
+    #[test]
+    fn remove_dialog_cancel_restores_the_same_remove_control() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let cancel_id = named_node_id(&initial, "Cancel");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: cancel_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::CloseModelDialog);
+        apply_action(&mut data, &mut page, action);
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(focused_node(&output).name(), Some("Remove"));
+        assert_eq!(
+            action,
+            ScreenAction::AcknowledgeModelControlFocus {
+                model_id: "tiny.en".into(),
+                control: super::super::state::ModelCardControl::Remove,
+            }
+        );
+    }
+
+    #[test]
     fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
         let (width, height) = (1180.0, 815.0);
         for (dialog, background_control, dialog_name, expected_focus) in [
@@ -1414,7 +1564,7 @@ mod tests {
             ),
             (
                 ModelDialog::Details("base.en".into()),
-                "whisper.cpp base.en model",
+                "Active whisper.cpp base.en base.en model",
                 "Model details for whisper.cpp base.en",
                 "Close",
             ),
@@ -1621,13 +1771,26 @@ mod tests {
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        let remove = node_matching(&initial, |node| node.name() == Some("Remove"));
+        let dialog_id = node_id_matching(&initial, |node| {
+            node.role() == egui::accesskit::Role::AlertDialog
+                && node.name() == Some("Remove whisper.cpp tiny.en")
+        });
+        let update = initial.platform_output.accesskit_update.as_ref().unwrap();
+        let (remove_id, remove) = update
+            .nodes
+            .iter()
+            .find(|(id, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Remove")
+                    && !node.is_disabled()
+                    && accesskit_descends_from(&initial, dialog_id, *id)
+            })
+            .expect("enabled Remove button inside removal dialog");
         assert_eq!(remove.role(), egui::accesskit::Role::Button);
         assert!(
             !remove.is_disabled(),
             "dialog Remove control must remain enabled"
         );
-        let remove_id = named_node_id(&initial, "Remove");
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -1637,7 +1800,7 @@ mod tests {
             vec![egui::Event::AccessKitActionRequest(
                 egui::accesskit::ActionRequest {
                     action: egui::accesskit::Action::Default,
-                    target: remove_id,
+                    target: *remove_id,
                     data: None,
                 },
             )],
@@ -1750,7 +1913,7 @@ mod tests {
     #[test]
     fn installed_model_cards_are_fixed_height_and_activate_from_every_input() {
         let (width, height) = (1180.0, 815.0);
-        let row_name = "whisper.cpp tiny.en model";
+        let row_name = "Select whisper.cpp tiny.en tiny.en model";
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1891,7 +2054,7 @@ mod tests {
 
     #[test]
     fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
-        let row_name = "whisper.cpp base.en model";
+        let row_name = "Active whisper.cpp base.en base.en model";
         for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
             let surface = named_node_bounds(&output, "Model comparison surface");
@@ -2308,7 +2471,12 @@ mod tests {
                     LAYOUT_TOLERANCE,
                     "comparison surface bottom gap",
                 );
-                for name in ["Import", "Refresh", "whisper.cpp base.en model", "Details"] {
+                for name in [
+                    "Import",
+                    "Refresh",
+                    "Active whisper.cpp base.en base.en model",
+                    "Details",
+                ] {
                     let bounds = node_matching(&output, |node| {
                         node.role() == egui::accesskit::Role::Button
                             && node.name().is_some_and(|actual| {
@@ -2487,6 +2655,205 @@ mod tests {
                 "final model card clearance above comparison dock: got {clearance}; final={final_entry:?}, surface={surface:?}, offset={offset:?}, content={content_size:?}, viewport={viewport:?}, layout={layout:?}",
             );
         }
+    }
+
+    #[test]
+    fn model_culling_reaches_the_final_card_through_accessible_focus_and_paging() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.remote_catalog.entries.clear();
+        data.models.extend((0..36).map(|index| ModelViewModel {
+            id: format!("available-{index:02}"),
+            display_name: format!("Available model {index:02}"),
+            variant_label: format!("available-{index:02}"),
+            install_supported: true,
+            install_action_enabled: true,
+            language_summary: "English".into(),
+            languages: vec!["English".into()],
+            speed_tier: ModelSpeedTier::Balanced,
+            size_tier: ModelSizeTier::Base,
+            ..Default::default()
+        }));
+        let mut page = Fixture::ModelsInstalled.page();
+        let first_name = "Install Available model 00 available-00 model";
+        let previous_name = "Install Available model 22 available-22 model";
+        let final_name = "Install Available model 35 available-35 model";
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert!(!node_names(&initial).iter().any(|name| name == final_name));
+        let available_header = named_node_id(&initial, "Collapse Available models");
+        let (_, action) = render_with_input_and_apply(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: available_header,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+        let (mut output, _) =
+            render_with_input_and_apply(&ctx, &mut data, &mut page, width, height, Vec::new());
+
+        for _ in 0..64 {
+            if focused_node(&output).name() == Some(final_name) {
+                break;
+            }
+            let next = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    (node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Show Next Available models")
+                        && !node.is_disabled())
+                    .then_some(*id)
+                });
+            if let Some(next) = next {
+                let (_, action) = render_with_input_and_apply(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Default,
+                            target: next,
+                            data: None,
+                        },
+                    )],
+                );
+                let ScreenAction::FocusModelCard(target) = action else {
+                    panic!("page sentinel should request an exact model card focus");
+                };
+                let mut acknowledged = false;
+                for frame in 0..4 {
+                    let (focused, action) = render_with_input_and_apply_at_time(
+                        &ctx,
+                        &mut data,
+                        &mut page,
+                        width,
+                        height,
+                        Vec::new(),
+                        1.0 + f64::from(frame) * 0.1,
+                    );
+                    match action {
+                        ScreenAction::None => {
+                            assert_eq!(
+                                data.model_management.focus_model_card.as_ref(),
+                                Some(&target),
+                                "card focus must remain pending while its rect is clipped or offscreen"
+                            );
+                            output = focused;
+                        }
+                        ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
+                            assert!(
+                                frame > 0,
+                                "the first pending scroll frame must not acknowledge clipped card focus"
+                            );
+                            assert_eq!(acknowledged_target, target);
+                            assert!(
+                                data.model_management.focus_model_card.is_none(),
+                                "acknowledgement must clear the completed focus request exactly once"
+                            );
+                            output = focused;
+                            acknowledged = true;
+                            break;
+                        }
+                        unexpected => panic!(
+                            "pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
+                        ),
+                    }
+                }
+                assert!(
+                    acknowledged,
+                    "card focus should settle within four empty-event frames"
+                );
+            } else {
+                let (focused, action) = render_with_input_and_apply(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![tab_event(false)],
+                );
+                assert_eq!(action, ScreenAction::None);
+                output = focused;
+            }
+        }
+
+        assert_eq!(focused_node(&output).name(), Some(final_name));
+        assert!(!node_names(&output).iter().any(|name| name == first_name));
+        let (_, action) = render_with_input_and_apply(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![page_event(egui::Key::PageUp)],
+        );
+        let ScreenAction::FocusModelCard(target) = action else {
+            panic!("PageUp from a rendered model primary should request exact previous-page focus");
+        };
+        assert_eq!(target, ModelCardKey::Local("available-22".into()));
+
+        let mut acknowledged = false;
+        for frame in 0..4 {
+            let (focused, action) = render_with_input_and_apply_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                10.0 + f64::from(frame) * 0.1,
+            );
+            match action {
+                ScreenAction::None => {
+                    assert_eq!(
+                        data.model_management.focus_model_card.as_ref(),
+                        Some(&target),
+                        "reverse card focus must remain pending while its rect is clipped or offscreen"
+                    );
+                }
+                ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
+                    assert!(
+                        frame > 0,
+                        "the first reverse pending scroll frame must not acknowledge clipped card focus"
+                    );
+                    assert_eq!(acknowledged_target, target);
+                    assert!(
+                        data.model_management.focus_model_card.is_none(),
+                        "reverse acknowledgement must clear the completed focus request exactly once"
+                    );
+                    assert_eq!(focused_node(&focused).name(), Some(previous_name));
+                    acknowledged = true;
+                    break;
+                }
+                unexpected => panic!(
+                    "reverse pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
+                ),
+            }
+        }
+        assert!(
+            acknowledged,
+            "reverse card focus should settle within four empty-event frames"
+        );
     }
 
     #[test]

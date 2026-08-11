@@ -8159,6 +8159,9 @@ impl LocalTranscriberApp {
             | ScreenAction::SetModelLanguageFilter(_)
             | ScreenAction::ToggleInstalledModels
             | ScreenAction::ToggleAvailableModels
+            | ScreenAction::FocusModelCard(_)
+            | ScreenAction::AcknowledgeModelCardFocus(_)
+            | ScreenAction::AcknowledgeModelControlFocus { .. }
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -8255,8 +8258,6 @@ impl LocalTranscriberApp {
         let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
         let clear_add_focus = self.model_management.restore_add_focus;
         let clear_after_removal_focus = self.model_management.restore_after_removal_focus;
-        let restored_details_focus = self.model_management.restore_details_focus.clone();
-        let restored_remove_focus = self.model_management.restore_remove_focus.clone();
         let clear_removal_notice = self.model_management.removal_notice.is_some();
         let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
         let clear_comparison_focus = self.model_comparison.focus_panel;
@@ -8282,12 +8283,6 @@ impl LocalTranscriberApp {
         }
         if clear_after_removal_focus {
             self.model_management.restore_after_removal_focus = false;
-        }
-        if restored_details_focus.is_some() {
-            self.model_management.restore_details_focus = None;
-        }
-        if restored_remove_focus.is_some() {
-            self.model_management.restore_remove_focus = None;
         }
         if clear_removal_notice {
             self.model_management.removal_notice = None;
@@ -9198,6 +9193,18 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ToggleAvailableModels => {
                 self.model_management.available_expanded = !self.model_management.available_expanded
+            }
+            ScreenAction::FocusModelCard(key) => {
+                self.model_management.focus_model_card = Some(key);
+            }
+            ScreenAction::AcknowledgeModelCardFocus(key) => {
+                if self.model_management.focus_model_card.as_ref() == Some(&key) {
+                    self.model_management.focus_model_card = None;
+                }
+            }
+            ScreenAction::AcknowledgeModelControlFocus { model_id, control } => {
+                self.model_management
+                    .acknowledge_control_focus(&model_id, control);
             }
             ScreenAction::RetryRemoteCatalog => {
                 self.remote_catalog.force_refresh_requested = true;
@@ -10111,6 +10118,9 @@ impl LocalTranscriberApp {
             | ScreenAction::SetModelLanguageFilter(_)
             | ScreenAction::ToggleInstalledModels
             | ScreenAction::ToggleAvailableModels
+            | ScreenAction::FocusModelCard(_)
+            | ScreenAction::AcknowledgeModelCardFocus(_)
+            | ScreenAction::AcknowledgeModelControlFocus { .. }
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -12240,8 +12250,10 @@ mod layout_tests {
                 .nodes
                 .iter()
                 .find(|(_, node)| {
-                    node.name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
+                    node.role() == egui::accesskit::Role::StaticText
+                        && node
+                            .name()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
                 })
                 .map(|(id, _)| *id)
                 .unwrap_or_else(|| panic!("missing Models-page label {label_name:?}"));

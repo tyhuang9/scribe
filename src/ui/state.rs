@@ -314,6 +314,21 @@ pub(crate) enum ModelDialog {
     Remove(String),
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ModelCardKey {
+    Local(String),
+    Remote {
+        entry_id: String,
+        variant_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ModelCardControl {
+    Details,
+    Remove,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
@@ -324,6 +339,7 @@ pub(crate) struct ModelManagementState {
     pub restore_after_removal_focus: bool,
     pub restore_details_focus: Option<String>,
     pub restore_remove_focus: Option<String>,
+    pub focus_model_card: Option<ModelCardKey>,
     /// One-frame polite confirmation after a synchronous model removal attempt.
     pub removal_notice: Option<String>,
     pub mutation_block_reason: Option<String>,
@@ -340,10 +356,23 @@ impl Default for ModelManagementState {
             restore_after_removal_focus: false,
             restore_details_focus: None,
             restore_remove_focus: None,
+            focus_model_card: None,
             removal_notice: None,
             mutation_block_reason: None,
             installed_expanded: true,
             available_expanded: true,
+        }
+    }
+}
+
+impl ModelManagementState {
+    pub(crate) fn acknowledge_control_focus(&mut self, model_id: &str, control: ModelCardControl) {
+        let pending = match control {
+            ModelCardControl::Details => &mut self.restore_details_focus,
+            ModelCardControl::Remove => &mut self.restore_remove_focus,
+        };
+        if pending.as_deref() == Some(model_id) {
+            *pending = None;
         }
     }
 }
