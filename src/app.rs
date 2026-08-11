@@ -88,11 +88,11 @@ use crate::ui::RemoteCatalogSizeTier;
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
+const PASSIVE_MONITOR_REPAINT_DELAY: Duration = Duration::from_millis(50);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
 const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
 const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
 const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
-const INPUT_LEVEL_REPAINT_DELAY: Duration = Duration::from_millis(50);
 const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
 const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -235,10 +235,6 @@ impl MicrophoneLevelEnvelope {
             self.position = 0.0;
         }
         self.position.clamp(0.0, 1.0)
-    }
-
-    fn is_animating(&self) -> bool {
-        self.position > 0.0
     }
 }
 
@@ -2377,6 +2373,7 @@ pub struct LocalTranscriberApp {
     settings_store: Option<SettingsStore>,
     current_tab: Tab,
     settings_tab: SettingsTab,
+    settings_playground_open: bool,
     models_show_comparison: bool,
     model_comparison: ModelComparisonState,
     comparison_run_model_ids: Option<Vec<String>>,
@@ -2556,6 +2553,7 @@ impl LocalTranscriberApp {
             settings_store,
             current_tab: initial_tab(),
             settings_tab: SettingsTab::General,
+            settings_playground_open: false,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,
@@ -3193,8 +3191,10 @@ impl LocalTranscriberApp {
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.capture_is_active() || self.microphone_test_is_active() {
+        if self.capture_is_active() {
             METER_REPAINT_DELAY
+        } else if self.microphone_test_is_active() {
+            PASSIVE_MONITOR_REPAINT_DELAY
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
@@ -7951,7 +7951,6 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_settings_save();
         self.sync_tray_state();
 
-        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
         match self.current_tab {
             Tab::Advanced => {
                 self.settings_tab = SettingsTab::Advanced;
@@ -7961,12 +7960,14 @@ impl eframe::App for LocalTranscriberApp {
                 self.settings_tab = SettingsTab::About;
                 self.current_tab = Tab::General;
             }
-            Tab::Debug if !self.config.developer.debug_mode => {
+            Tab::Debug => {
                 self.settings_tab = SettingsTab::Advanced;
                 self.current_tab = Tab::General;
+                self.settings_playground_open = self.config.developer.debug_mode;
             }
             _ => {}
         }
+        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
         if self.passive_microphone_monitor_needed() {
             self.ensure_microphone_monitor();
         } else {
@@ -7979,13 +7980,17 @@ impl eframe::App for LocalTranscriberApp {
                     show_route_scroll(ui, UiRoute::Transcribe, |ui| self.ui_transcribe(ui))
                 }
                 Tab::General => show_route_scroll(ui, UiRoute::Settings(self.settings_tab), |ui| {
-                    self.ui_general_settings(ui)
+                    if self.settings_playground_open {
+                        self.ui_playground(ui);
+                    } else {
+                        self.ui_general_settings(ui);
+                    }
                 }),
                 Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
                 Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
                 Tab::About => unreachable!("about navigation is routed to Settings"),
-                Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| self.ui_playground(ui)),
+                Tab::Debug => unreachable!("debug navigation is routed to Settings"),
             });
 
         if !self.passive_microphone_monitor_needed() {
@@ -8215,7 +8220,9 @@ impl LocalTranscriberApp {
             | ScreenAction::SetMaxHistoryEntries(_)
             | ScreenAction::SetTranscriptRetentionDays(_)
             | ScreenAction::SetAudioRetentionDays(_)
-            | ScreenAction::SetStoreApplicationIdentity(_) => {}
+            | ScreenAction::SetStoreApplicationIdentity(_)
+            | ScreenAction::OpenDeveloperPlayground
+            | ScreenAction::ExportRedactedDiagnostics => {}
         }
     }
 
@@ -9354,6 +9361,16 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
+            if self.settings_playground_open
+                && ui
+                    .add_sized([176.0, 44.0], Button::new("Back to Advanced"))
+                    .clicked()
+            {
+                self.settings_tab = SettingsTab::Advanced;
+                self.current_tab = Tab::General;
+                self.settings_playground_open = false;
+                return;
+            }
             if self.current_tab == Tab::Models {
                 if ui.add(small_button(ui, "Back to models")).clicked() {
                     self.models_show_comparison = false;
@@ -10081,11 +10098,34 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetDebugMode(value) => {
                 self.config.developer.debug_mode = value;
-                if !value && self.current_tab == Tab::Debug {
+                if !value && self.settings_playground_open {
                     self.settings_tab = SettingsTab::Advanced;
                     self.current_tab = Tab::General;
+                    self.settings_playground_open = false;
                 }
                 self.save_config();
+            }
+            ScreenAction::OpenDeveloperPlayground if self.config.developer.debug_mode => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.settings_playground_open = true;
+            }
+            ScreenAction::OpenDeveloperPlayground => {}
+            ScreenAction::ExportRedactedDiagnostics => {
+                let export_dir = self
+                    .config_path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(|parent| parent.join("diagnostics"));
+                match export_dir {
+                    Some(directory) => match diagnostics::export_redacted(&directory, &self.diagnostics) {
+                        Ok(path) => self.status_message = format!("Redacted diagnostics exported to {}", path.display()),
+                        Err(error) => {
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = format!("Could not export redacted diagnostics: {error}");
+                        }
+                    },
+                    None => self.status_message = "The platform settings directory is unavailable, so Scribe cannot choose a private export location.".to_owned(),
+                }
             }
             ScreenAction::SetHistoryMode(value) => {
                 if !self.history_retry_is_active() {
@@ -10204,6 +10244,7 @@ impl LocalTranscriberApp {
         }
     }
 
+    #[allow(dead_code)]
     fn ui_about(&mut self, ui: &mut Ui) {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
@@ -16259,6 +16300,7 @@ mod layout_tests {
             settings_store: None,
             current_tab: Tab::Models,
             settings_tab: SettingsTab::General,
+            settings_playground_open: false,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,

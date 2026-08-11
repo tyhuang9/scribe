@@ -564,6 +564,11 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetAcceleration(value) => data.settings.acceleration_label = value,
         ScreenAction::SetOverlayPosition(value) => data.settings.overlay_position_label = value,
         ScreenAction::SetDebugMode(value) => data.settings.debug_mode = value,
+        ScreenAction::OpenDeveloperPlayground if data.settings.debug_mode => {
+            data.route = UiRoute::Settings(SettingsTab::Advanced)
+        }
+        ScreenAction::OpenDeveloperPlayground => {}
+        ScreenAction::ExportRedactedDiagnostics => {}
         ScreenAction::SetHistoryMode(value) => data.settings.history_mode_label = value,
         ScreenAction::SetMaxHistoryEntries(value) => data.settings.max_history_entries = value,
         ScreenAction::SetTranscriptRetentionDays(value) => {

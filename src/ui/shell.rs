@@ -369,7 +369,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn full_and_compact_navigation_expose_named_controls() {
         for width in [1_180.0, 960.0] {
             let ctx = egui::Context::default();
@@ -413,10 +412,8 @@ mod tests {
             },
             |ctx| show_navigation(ctx, &mut page, false),
         );
-        let names = output
-            .platform_output
-            .accesskit_update
-            .unwrap()
+        let update = output.platform_output.accesskit_update.unwrap();
+        let names = update
             .nodes
             .iter()
             .filter_map(|(_, node)| {

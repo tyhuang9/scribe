@@ -285,6 +285,8 @@ pub(crate) enum ScreenAction {
     SetAcceleration(String),
     SetOverlayPosition(String),
     SetDebugMode(bool),
+    OpenDeveloperPlayground,
+    ExportRedactedDiagnostics,
     SetHistoryMode(String),
     SetMaxHistoryEntries(u32),
     SetTranscriptRetentionDays(Option<u32>),
@@ -3764,7 +3766,7 @@ fn settings(
                 general_settings_panel(ui, settings, &mut action)
             }
             SettingsTab::Advanced => advanced_settings_panel(ui, settings, &mut action),
-            SettingsTab::About => about_settings_panel(ui, settings),
+            SettingsTab::About => about_settings_panel(ui, settings, &mut action),
         }
     });
     ui.ctx()
@@ -3773,6 +3775,7 @@ fn settings(
             builder.set_name(match active_tab {
                 SettingsTab::General => "General settings",
                 SettingsTab::Recording => "Recording settings",
+                SettingsTab::Output => "General settings",
                 SettingsTab::Advanced => "Advanced settings",
                 SettingsTab::About => "About Scribe",
             });
@@ -4320,7 +4323,11 @@ fn output_settings_panel(
     });
 }
 
-fn about_settings_panel(ui: &mut egui::Ui, settings: &RecordingSettingsView) {
+fn about_settings_panel(
+    ui: &mut egui::Ui,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
     settings_section(ui, "About Scribe", |ui| {
         ui.label("Scribe keeps audio and transcripts on this device.");
         ui.label(
@@ -4333,6 +4340,15 @@ fn about_settings_panel(ui: &mut egui::Ui, settings: &RecordingSettingsView) {
             for line in &settings.diagnostics {
                 ui.label(line);
             }
+        }
+        if ui
+            .add_sized(
+                [220.0, 44.0],
+                egui::Button::new("Export redacted diagnostics"),
+            )
+            .clicked()
+        {
+            *action = ScreenAction::ExportRedactedDiagnostics;
         }
     });
 }
@@ -4459,6 +4475,13 @@ fn advanced_settings_panel(
         scroll_focused_control_into_view(ui, &playground);
         if playground.changed() {
             *action = ScreenAction::SetDebugMode(enabled);
+        }
+        if settings.debug_mode {
+            let open = ui.add_sized([176.0, 44.0], egui::Button::new("Open model Playground"));
+            scroll_focused_control_into_view(ui, &open);
+            if open.clicked() {
+                *action = ScreenAction::OpenDeveloperPlayground;
+            }
         }
     });
     if !settings.diagnostics.is_empty() {
@@ -4687,7 +4710,6 @@ fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::
             });
         }
     });
-    ui.separator();
     let _ = row;
 }
 
