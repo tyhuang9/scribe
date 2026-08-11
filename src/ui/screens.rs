@@ -369,7 +369,20 @@ pub(crate) fn show_route_scroll<T>(
             && ui.ctx().memory(|memory| memory.focused()) == Some(id)
         {
             let mut state = scroll.state;
-            state.offset.y += rect.center().y - scroll.inner_rect.center().y;
+            let mut visible_rect = scroll.inner_rect;
+            if let Some(dock_rect) = ui.data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))
+            }) {
+                visible_rect.max.y = visible_rect
+                    .max
+                    .y
+                    .min(dock_rect.top() - MODEL_LIST_TO_DOCK_GAP);
+            }
+            if rect.top() < visible_rect.top() {
+                state.offset.y -= visible_rect.top() - rect.top();
+            } else if rect.bottom() > visible_rect.bottom() {
+                state.offset.y += rect.bottom() - visible_rect.bottom();
+            }
             state.offset.y = state.offset.y.clamp(
                 0.0,
                 (scroll.content_size.y - scroll.inner_rect.height()).max(0.0),
@@ -1372,6 +1385,8 @@ const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
 const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
 const MODEL_CARD_HEIGHT: f32 = 92.0;
 const MODEL_CARD_GAP: f32 = 8.0;
+const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
+const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
 
 #[derive(Clone, Copy)]
 enum ModelCard<'a> {
@@ -1406,19 +1421,9 @@ impl ModelCard<'_> {
 
     fn primary_verb(&self) -> &str {
         match *self {
-            Self::Local(model) if model.installed && model.primary_action_repairs_runtime => {
-                "Repair"
-            }
-            Self::Local(model) if model.installed && model.active => "Active",
-            Self::Local(model) if model.installed => "Select",
-            Self::Local(model)
-                if matches!(
-                    model.download_state,
-                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
-                ) =>
-            {
-                "Resume"
-            }
+            Self::Local(model) if model.installed => model.primary_action_label.as_str(),
+            Self::Local(model) if model.download_state == ModelDownloadState::Failed => "Retry",
+            Self::Local(model) if model.download_state == ModelDownloadState::Cancelled => "Resume",
             Self::Local(_) => "Install",
             Self::Remote(_, variant) => {
                 remote_primary_action(variant).map_or("Unavailable", |action| action.label.as_str())
@@ -1428,18 +1433,14 @@ impl ModelCard<'_> {
 
     fn accessible_name(&self) -> String {
         match *self {
-            Self::Local(model) => format!(
-                "{} {} {} model",
-                self.primary_verb(),
-                model.display_name,
-                model.variant_label
-            ),
-            Self::Remote(entry, variant) => format!(
-                "{} {} {} model",
+            Self::Local(model) => format!("{} {}", self.primary_verb(), model.display_name),
+            Self::Remote(entry, variant) if !variant.size_label.trim().is_empty() => format!(
+                "{} {}, {}",
                 self.primary_verb(),
                 entry.display_name,
-                variant.id
+                variant.size_label
             ),
+            Self::Remote(entry, _) => format!("{} {}", self.primary_verb(), entry.display_name),
         }
     }
 }
@@ -1453,6 +1454,7 @@ struct ModelSectionFocus<'a> {
     card: Option<&'a ModelCardKey>,
     restore_details: Option<&'a str>,
     restore_remove: Option<&'a str>,
+    visible_rect: egui::Rect,
 }
 
 fn local_model_matches(
@@ -1509,13 +1511,31 @@ fn build_model_card_lists<'a>(
     (installed, available)
 }
 
-fn accuracy_label(tier: ModelSizeTier) -> &'static str {
-    match tier {
-        ModelSizeTier::Tiny => "Basic accuracy",
-        ModelSizeTier::Small | ModelSizeTier::Base => "Balanced accuracy",
-        ModelSizeTier::Medium => "High accuracy",
-        ModelSizeTier::Large => "Highest accuracy",
-        ModelSizeTier::Unknown => "Accuracy varies",
+fn accuracy_label(guidance: &str) -> String {
+    let guidance = guidance.trim();
+    if guidance.is_empty()
+        || guidance.eq_ignore_ascii_case("unknown")
+        || guidance.eq_ignore_ascii_case("not rated")
+    {
+        "Not rated".to_owned()
+    } else if guidance.to_ascii_lowercase().contains("accuracy") {
+        guidance.to_owned()
+    } else {
+        format!("{guidance} accuracy")
+    }
+}
+
+fn model_capability_label(model: &ModelViewModel) -> &'static str {
+    if model.capabilities.streaming_preview {
+        "Streaming"
+    } else if model.capabilities.translation {
+        "Translation"
+    } else if model.capabilities.timestamps {
+        "Timestamps"
+    } else if model.capabilities.language_detection {
+        "Language detection"
+    } else {
+        "Speech-to-text"
     }
 }
 
@@ -1534,6 +1554,7 @@ fn render_model_card(
     focus_card: Option<&ModelCardKey>,
     restore_details_focus: Option<&str>,
     restore_remove_focus: Option<&str>,
+    focus_visible_rect: egui::Rect,
 ) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
     let width = ui.available_width();
@@ -1636,10 +1657,21 @@ fn render_model_card(
                             installed_model_badge(ui, "Unsupported", Some(colors.warning));
                         }
                     });
-                    ui.label(
-                        RichText::new(model_download_label(model))
-                            .small()
-                            .color(colors.muted_text),
+                    if let Some(description) = model.description.as_deref() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(description).small().color(colors.muted_text),
+                            )
+                            .truncate(true),
+                        );
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(model_download_label(model))
+                                .small()
+                                .color(colors.muted_text),
+                        )
+                        .truncate(true),
                     );
                 }
                 ModelCard::Remote(entry, variant) => {
@@ -1648,17 +1680,28 @@ fn render_model_card(
                         if entry.recommended {
                             installed_model_badge(ui, "Recommended", Some(colors.success));
                         }
-                        installed_model_badge(ui, &entry.trust_label, None);
+                        installed_model_badge(ui, "Experimental", Some(colors.warning));
                     });
-                    ui.label(
-                        RichText::new(
-                            variant
-                                .status_label
-                                .as_deref()
-                                .unwrap_or("Available to install"),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&entry.description)
+                                .small()
+                                .color(colors.muted_text),
                         )
-                        .small()
-                        .color(colors.muted_text),
+                        .truncate(true),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                variant
+                                    .status_label
+                                    .as_deref()
+                                    .unwrap_or("Available to install"),
+                            )
+                            .small()
+                            .color(colors.muted_text),
+                        )
+                        .truncate(true),
                     );
                 }
             },
@@ -1669,6 +1712,7 @@ fn render_model_card(
             |ui| match card {
                 ModelCard::Local(model) => {
                     metadata(ui, Icon::Globe, &model.language_summary);
+                    metadata(ui, Icon::Waveform, model_capability_label(model));
                     metadata(
                         ui,
                         Icon::Folder,
@@ -1681,6 +1725,7 @@ fn render_model_card(
                 }
                 ModelCard::Remote(entry, variant) => {
                     metadata(ui, Icon::Globe, &entry.language_summary);
+                    metadata(ui, Icon::Waveform, "Speech-to-text");
                     metadata(ui, Icon::Folder, &variant.size_label);
                 }
             },
@@ -1693,6 +1738,10 @@ fn render_model_card(
                             button(ui, "Details", ButtonTone::Text)
                         })
                         .inner;
+                    ui.ctx().accesskit_node_builder(details.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Button);
+                        builder.set_name(format!("Details for {}", model.display_name));
+                    });
                     if restore_details_focus == Some(model.id.as_str()) {
                         details.request_focus();
                         details.scroll_to_me(Some(Align::Center));
@@ -1710,6 +1759,10 @@ fn render_model_card(
                             })
                             .inner
                             .inner;
+                        ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Button);
+                            builder.set_name(format!("Remove {} from device", model.display_name));
+                        });
                         if restore_remove_focus == Some(model.id.as_str()) {
                             remove.request_focus();
                             remove.scroll_to_me(Some(Align::Center));
@@ -1739,7 +1792,7 @@ fn render_model_card(
                     ui.label(RichText::new(card.primary_verb()).small().strong());
                     metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
                     ui.label(
-                        RichText::new(accuracy_label(model.size_tier))
+                        RichText::new(accuracy_label(&model.accuracy_guidance))
                             .small()
                             .color(colors.muted_text),
                     );
@@ -1760,9 +1813,9 @@ fn render_model_card(
                 }
                 ui.vertical(|ui| {
                     ui.label(RichText::new(card.primary_verb()).small().strong());
-                    metadata(ui, Icon::Gauge, speed_label(variant.speed_tier));
+                    metadata(ui, Icon::Gauge, "Speed: Not rated");
                     ui.label(
-                        RichText::new(accuracy_label(variant.size_tier))
+                        RichText::new("Accuracy: Not rated")
                             .small()
                             .color(colors.muted_text),
                     );
@@ -1810,13 +1863,27 @@ fn render_model_card(
                 model_id: model.id.clone(),
                 control,
             };
-        } else if card_focus_requested && ui.clip_rect().contains_rect(card_rect) {
+        } else if card_focus_requested
+            && card_rect.left() >= focus_visible_rect.left() - MODEL_FOCUS_VISIBILITY_TOLERANCE
+            && card_rect.right() <= focus_visible_rect.right() + MODEL_FOCUS_VISIBILITY_TOLERANCE
+            && card_rect.top() >= focus_visible_rect.top() - MODEL_FOCUS_VISIBILITY_TOLERANCE
+            && card_rect.bottom() <= focus_visible_rect.bottom() + MODEL_FOCUS_VISIBILITY_TOLERANCE
+        {
             action = ScreenAction::AcknowledgeModelCardFocus(card.key());
         }
     }
+    let primary_has_focus = primary_response.has_focus();
+    if primary_has_focus {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(MODEL_FOCUSED_CARD_MEMORY),
+                (primary_response.id, card.key()),
+            );
+        });
+    }
     ModelCardRenderResult {
         action,
-        primary_has_focus: primary_response.has_focus(),
+        primary_has_focus,
     }
 }
 
@@ -1907,13 +1974,20 @@ fn render_model_section(
     name: &'static str,
     cards: &[ModelCard<'_>],
     expanded: bool,
-    toggle_action: ScreenAction,
+    toggle_action: Option<ScreenAction>,
     focus: ModelSectionFocus<'_>,
     _terminal: bool,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
-    let (header_rect, header) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
+    let toggle_enabled = toggle_action.is_some();
+    let (header_rect, header) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 44.0),
+        if toggle_enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
     if header.hovered() {
         ui.painter()
             .rect_filled(header_rect, Rounding::same(5.0), colors.active_card_bg);
@@ -1935,17 +2009,23 @@ fn render_model_section(
     });
     ui.ctx().accesskit_node_builder(header.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
-        builder.set_name(format!(
-            "{} {name} models",
-            if expanded { "Collapse" } else { "Expand" }
-        ));
+        if toggle_enabled {
+            builder.set_name(format!(
+                "{} {name} models",
+                if expanded { "Collapse" } else { "Expand" }
+            ));
+        } else {
+            builder.set_name(format!("{name} models expanded for search"));
+            builder.set_disabled();
+            builder.set_description("Clear the search to restore this section's saved state.");
+        }
         builder.set_expanded(expanded);
         builder.set_bounds(accesskit_rect(header_rect));
     });
     paint_focus_ring(ui, &header, Rounding::same(5.0));
     scroll_focused_control_into_view(ui, &header);
     let mut action = if header.clicked() {
-        toggle_action
+        toggle_action.unwrap_or(ScreenAction::None)
     } else {
         ScreenAction::None
     };
@@ -1962,8 +2042,16 @@ fn render_model_section(
     let mut last_visible = (((clip.bottom() - start_y) / stride).ceil().max(0.0) as usize)
         .min(cards.len())
         .max(first_visible);
+    let focused_response_id = ui.ctx().memory(|memory| memory.focused());
+    let focused_card = focused_response_id.and_then(|focused_id| {
+        ui.data(|data| {
+            data.get_temp::<(egui::Id, ModelCardKey)>(egui::Id::new(MODEL_FOCUSED_CARD_MEMORY))
+        })
+        .and_then(|(response_id, key)| (response_id == focused_id).then_some(key))
+    });
     let requested_index = focus
         .card
+        .or(focused_card.as_ref())
         .and_then(|key| cards.iter().position(|card| card.matches_key(key)));
     if let Some(index) = requested_index
         && (index < first_visible || index >= last_visible)
@@ -1979,10 +2067,20 @@ fn render_model_section(
         ui.allocate_space(Vec2::new(0.0, first_visible as f32 * stride));
     }
     let page_len = last_visible.saturating_sub(first_visible).max(1);
-    let previous_page_target =
-        (first_visible > 0).then(|| cards[first_visible.saturating_sub(page_len)].key());
-    let next_page_target = (last_visible < cards.len())
-        .then(|| cards[(last_visible + page_len - 1).min(cards.len() - 1)].key());
+    let previous_page_target = if first_visible > 0 {
+        Some(cards[first_visible - 1].key())
+    } else {
+        requested_index
+            .filter(|index| *index > 0)
+            .map(|_| cards[0].key())
+    };
+    let next_page_target = if last_visible < cards.len() {
+        Some(cards[last_visible].key())
+    } else {
+        requested_index
+            .filter(|index| *index + 1 < cards.len())
+            .map(|_| cards[cards.len() - 1].key())
+    };
     let top_sentinel = (previous_page_target.is_some() && requested_index != Some(first_visible))
         .then_some(first_visible);
     let bottom_sentinel = (last_visible > first_visible
@@ -2000,19 +2098,9 @@ fn render_model_section(
             )
         });
         let rendered = if top_sentinel == Some(index) {
-            render_model_page_sentinel(
-                ui,
-                name,
-                false,
-                cards[first_visible.saturating_sub(page_len)],
-            )
+            render_model_page_sentinel(ui, name, false, cards[first_visible.saturating_sub(1)])
         } else if bottom_sentinel == Some(index) {
-            render_model_page_sentinel(
-                ui,
-                name,
-                true,
-                cards[(last_visible + page_len - 1).min(cards.len() - 1)],
-            )
+            render_model_page_sentinel(ui, name, true, cards[last_visible.min(cards.len() - 1)])
         } else {
             let card = cards[index];
             ui.push_id(("model-card", card.key()), |ui| {
@@ -2022,6 +2110,7 @@ fn render_model_section(
                     focus.card,
                     focus.restore_details,
                     focus.restore_remove,
+                    focus.visible_rect,
                 )
             })
             .inner
@@ -2181,6 +2270,22 @@ fn models(
         remote_catalog,
         language_filter,
     );
+    let search_active = !remote_catalog.query.trim().is_empty();
+    let comparison_viewport = ui
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
+        .unwrap_or_else(|| ui.clip_rect());
+    let comparison_max_height = if comparison.expanded {
+        comparison_viewport.height() * 0.6
+    } else {
+        MODEL_COMPARISON_COLLAPSED_HEIGHT
+    };
+    let mut model_card_focus_rect = ui.clip_rect();
+    model_card_focus_rect.max.y = model_card_focus_rect.max.y.min(
+        comparison_viewport.bottom()
+            - MODEL_COMPARISON_BOTTOM_GAP
+            - comparison_max_height
+            - MODEL_LIST_TO_DOCK_GAP,
+    );
     let result_count = ui.label(
         RichText::new(format!(
             "{} model results: {} installed, {} available.",
@@ -2204,12 +2309,13 @@ fn models(
             ui,
             "Installed",
             &installed_cards,
-            management.installed_expanded,
-            ScreenAction::ToggleInstalledModels,
+            management.installed_expanded || search_active,
+            (!search_active).then_some(ScreenAction::ToggleInstalledModels),
             ModelSectionFocus {
                 card: management.focus_model_card.as_ref(),
                 restore_details: management.restore_details_focus.as_deref(),
                 restore_remove: management.restore_remove_focus.as_deref(),
+                visible_rect: model_card_focus_rect,
             },
             available_cards.is_empty(),
         );
@@ -2219,12 +2325,13 @@ fn models(
             ui,
             "Available",
             &available_cards,
-            management.available_expanded,
-            ScreenAction::ToggleAvailableModels,
+            management.available_expanded || search_active,
+            (!search_active).then_some(ScreenAction::ToggleAvailableModels),
             ModelSectionFocus {
                 card: management.focus_model_card.as_ref(),
                 restore_details: management.restore_details_focus.as_deref(),
                 restore_remove: management.restore_remove_focus.as_deref(),
+                visible_rect: model_card_focus_rect,
             },
             true,
         );
@@ -2252,14 +2359,6 @@ fn models(
             };
         }
     }
-    let comparison_viewport = ui
-        .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
-        .unwrap_or_else(|| ui.clip_rect());
-    let comparison_max_height = if comparison.expanded {
-        comparison_viewport.height() * 0.6
-    } else {
-        MODEL_COMPARISON_COLLAPSED_HEIGHT
-    };
     let comparison_width =
         (comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0);
     let comparison_surface_id = ui.make_persistent_id("model-comparison-surface");
@@ -2689,6 +2788,22 @@ fn models(
                     }
                     if let Some(reason) = remote_catalog.local_import.disabled_reason.as_deref() {
                         ui.label(RichText::new(reason).small().color(colors.warning));
+                    }
+                    if let Some(message) = remote_catalog.local_import.status_message.as_deref() {
+                        let status = ui
+                            .push_id("local-gguf-import-status", |ui| {
+                                ui.label(
+                                    RichText::new(message)
+                                        .small()
+                                        .color(colors.muted_text),
+                                )
+                            })
+                            .inner;
+                        ui.ctx().accesskit_node_builder(status.id, |builder| {
+                            builder.set_role(egui::accesskit::Role::Status);
+                            builder.set_live(egui::accesskit::Live::Polite);
+                            builder.set_live_atomic();
+                        });
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -4894,6 +5009,155 @@ mod tests {
     }
 
     #[test]
+    fn model_card_ratings_preserve_an_explicit_not_rated_value() {
+        assert_eq!(accuracy_label(""), "Not rated");
+        assert_eq!(accuracy_label("unknown"), "Not rated");
+        assert_eq!(accuracy_label("Not rated"), "Not rated");
+        assert_eq!(accuracy_label("High accuracy"), "High accuracy");
+        assert_eq!(accuracy_label("Basic"), "Basic accuracy");
+    }
+
+    #[test]
+    fn remote_model_card_actions_use_visible_size_without_technical_variants() {
+        let entry = RemoteCatalogEntryView {
+            display_name: "Compact English".into(),
+            ..Default::default()
+        };
+        let variant = |id: &str, size_label: &str| RemoteCatalogVariantView {
+            id: id.into(),
+            size_label: size_label.into(),
+            actions: vec![RemoteCatalogActionView {
+                label: "Install".into(),
+                kind: RemoteCatalogActionKind::Install {
+                    remote_model_id: "compact-english".into(),
+                    variant_id: id.into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..Default::default()
+        };
+        let small = variant("technical-q5", "82 MB");
+        let large = variant("technical-q8", "128 MB");
+
+        assert_eq!(
+            ModelCard::Remote(&entry, &small).accessible_name(),
+            "Install Compact English, 82 MB"
+        );
+        assert_eq!(
+            ModelCard::Remote(&entry, &large).accessible_name(),
+            "Install Compact English, 128 MB"
+        );
+        assert!(
+            !ModelCard::Remote(&entry, &small)
+                .accessible_name()
+                .contains("technical-q5")
+        );
+    }
+
+    #[test]
+    fn model_search_temporarily_expands_sections_without_changing_saved_state() {
+        let render = |query: &str| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let catalog_model = ModelViewModel {
+                id: "catalog-model".into(),
+                display_name: "Catalog model".into(),
+                variant_label: "technical-variant".into(),
+                description: Some("A concise local speech model.".into()),
+                install_supported: true,
+                install_action_enabled: true,
+                language_summary: "English only".into(),
+                languages: vec!["English".into()],
+                capabilities: super::super::state::ModelCapabilities {
+                    timestamps: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let remote_catalog = RemoteCatalogView {
+                query: query.into(),
+                ..Default::default()
+            };
+            let management = ModelManagementState {
+                installed_expanded: false,
+                available_expanded: false,
+                ..Default::default()
+            };
+            ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_screen(
+                        ui,
+                        &ScreenView {
+                            route: UiRoute::Models,
+                            transcription: &Default::default(),
+                            models: &[],
+                            model_catalog: &[catalog_model],
+                            comparison: &Default::default(),
+                            model_management: &management,
+                            model_language_filter: ModelLanguageFilter::default(),
+                            remote_catalog: &remote_catalog,
+                            recording_settings: &Default::default(),
+                        },
+                    )
+                });
+            })
+        };
+
+        let searched = render("catalog");
+        let searched_nodes = &searched.platform_output.accesskit_update.unwrap().nodes;
+        for section in [
+            "Installed models expanded for search",
+            "Available models expanded for search",
+        ] {
+            assert!(searched_nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some(section)
+                    && node.is_expanded() == Some(true)
+                    && node.is_disabled()
+                    && node.description()
+                        == Some("Clear the search to restore this section's saved state.")
+            }));
+        }
+        for visible_text in [
+            "Install Catalog model",
+            "A concise local speech model.",
+            "English only",
+            "Timestamps",
+        ] {
+            assert!(
+                searched_nodes
+                    .iter()
+                    .any(|(_, node)| node.name().is_some_and(|name| name.contains(visible_text))),
+                "searched card should expose {visible_text:?}; names={:?}",
+                searched_nodes
+                    .iter()
+                    .filter_map(|(_, node)| node.name())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(!searched_nodes.iter().any(|(_, node)| {
+            node.name()
+                .is_some_and(|name| name.contains("technical-variant"))
+        }));
+
+        let cleared = render("");
+        let cleared_nodes = &cleared.platform_output.accesskit_update.unwrap().nodes;
+        for section in ["Expand Installed models", "Expand Available models"] {
+            assert!(cleared_nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some(section)
+                    && node.is_expanded() == Some(false)
+            }));
+        }
+        assert!(
+            !cleared_nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Install Catalog model"))
+        );
+    }
+
+    #[test]
     fn microphone_error_alert_groups_message_and_recovery_actions() {
         let mut state = TranscriptionState {
             phase: TranscriptionPhase::MicrophoneError,
@@ -5125,8 +5389,7 @@ mod tests {
             .nodes
             .iter()
             .find(|(_, node)| {
-                node.name()
-                    == Some("Install Catalog model must stay outside import dialog base.en model")
+                node.name() == Some("Install Catalog model must stay outside import dialog")
             })
             .expect("disabled catalog card behind modal");
         assert!(catalog_node.is_disabled());
@@ -5140,6 +5403,9 @@ mod tests {
                 in_progress: true,
                 path: "C:\\Models\\candidate.gguf".into(),
                 import_enabled: false,
+                status_message: Some(
+                    "Cancelling local GGUF validation; source bytes are unchanged.".into(),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -5177,6 +5443,13 @@ mod tests {
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ProgressIndicator
                 && node.name() == Some("Local GGUF validation progress")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Status
+                && node.name()
+                    == Some("Cancelling local GGUF validation; source bytes are unchanged.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
         }));
         let cancel_id = update
             .nodes
@@ -5276,16 +5549,17 @@ mod tests {
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Active whisper.cpp base.en base.en model")
+                && node.name() == Some("Active whisper.cpp base.en")
                 && node.is_disabled()
                 && node.description() == Some("This model is already active.")
         }));
         assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Details")
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Details for whisper.cpp base.en")
         }));
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Remove")
+                && node.name() == Some("Remove whisper.cpp base.en from device")
                 && node.is_disabled()
                 && node.description()
                     == Some("Select another ready model before removing the active model.")
@@ -5293,6 +5567,30 @@ mod tests {
         assert!(nodes.iter().any(|(_, node)| {
             node.name() == Some("Collapse comparison") && node.is_expanded() == Some(true)
         }));
+    }
+
+    #[test]
+    fn model_card_primary_words_follow_authoritative_state() {
+        let failed = ModelViewModel {
+            download_state: ModelDownloadState::Failed,
+            ..Default::default()
+        };
+        let cancelled = ModelViewModel {
+            download_state: ModelDownloadState::Cancelled,
+            ..Default::default()
+        };
+        let runtime_unavailable = ModelViewModel {
+            installed: true,
+            primary_action_label: "Runtime unavailable".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(ModelCard::Local(&failed).primary_verb(), "Retry");
+        assert_eq!(ModelCard::Local(&cancelled).primary_verb(), "Resume");
+        assert_eq!(
+            ModelCard::Local(&runtime_unavailable).primary_verb(),
+            "Runtime unavailable"
+        );
     }
 
     #[test]

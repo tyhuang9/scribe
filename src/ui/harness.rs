@@ -166,6 +166,7 @@ fn model(
         } else {
             ModelSpeedTier::VeryFast
         },
+        accuracy_guidance: if active { "Balanced" } else { "Basic" }.into(),
         size_tier: if active {
             ModelSizeTier::Base
         } else {
@@ -194,6 +195,7 @@ fn remote_catalog_fixture() -> RemoteCatalogView {
             in_progress: false,
             import_enabled: true,
             disabled_reason: None,
+            status_message: None,
         },
         status: RemoteCatalogStatusView {
             kind: RemoteCatalogStatusKind::Available,
@@ -1500,7 +1502,10 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Details"));
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Details for whisper.cpp tiny.en")
+        );
         assert_eq!(
             action,
             ScreenAction::AcknowledgeModelControlFocus {
@@ -1542,7 +1547,10 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Remove"));
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Remove whisper.cpp tiny.en from device")
+        );
         assert_eq!(
             action,
             ScreenAction::AcknowledgeModelControlFocus {
@@ -1564,7 +1572,7 @@ mod tests {
             ),
             (
                 ModelDialog::Details("base.en".into()),
-                "Active whisper.cpp base.en base.en model",
+                "Active whisper.cpp base.en",
                 "Model details for whisper.cpp base.en",
                 "Close",
             ),
@@ -1825,12 +1833,11 @@ mod tests {
                 && node.name() == Some("Model details for whisper.cpp tiny.en")
         });
         for control in ["Use this model", "Remove from device", "Close"] {
+            let control_id = node_id_matching(&dialog_output, |node| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some(control)
+            });
             assert!(
-                accesskit_descends_from(
-                    &dialog_output,
-                    dialog_id,
-                    named_node_id(&dialog_output, control),
-                ),
+                accesskit_descends_from(&dialog_output, dialog_id, control_id),
                 "{control} must descend from the details dialog"
             );
         }
@@ -1913,7 +1920,7 @@ mod tests {
     #[test]
     fn installed_model_cards_are_fixed_height_and_activate_from_every_input() {
         let (width, height) = (1180.0, 815.0);
-        let row_name = "Select whisper.cpp tiny.en tiny.en model";
+        let row_name = "Use this model whisper.cpp tiny.en";
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -2007,9 +2014,10 @@ mod tests {
             .nodes
             .iter()
             .filter_map(|(_, node)| {
-                (node.role() == egui::accesskit::Role::Button && node.name() == Some("Details"))
-                    .then(|| node.bounds())
-                    .flatten()
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Details for whisper.cpp tiny.en"))
+                .then(|| node.bounds())
+                .flatten()
             })
             .find(|bounds| bounds.y0 >= card.y0 && bounds.y1 <= card.y1)
             .expect("tiny model Details child");
@@ -2054,7 +2062,7 @@ mod tests {
 
     #[test]
     fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
-        let row_name = "Active whisper.cpp base.en base.en model";
+        let row_name = "Active whisper.cpp base.en";
         for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
             let surface = named_node_bounds(&output, "Model comparison surface");
@@ -2107,7 +2115,14 @@ mod tests {
         let mut page = Fixture::ModelsInstalled.page();
         data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
         let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let use_id = named_node_id(&output, "Use this model");
+        let dialog_id = node_id_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Dialog
+                && node.name() == Some("Model details for whisper.cpp tiny.en")
+        });
+        let use_id = node_id_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Use this model")
+        });
+        assert!(accesskit_descends_from(&output, dialog_id, use_id));
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -2330,6 +2345,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn remote_cards_are_experimental_and_do_not_infer_performance_from_size() {
+        let names = node_names(&render(Fixture::ModelsInstalled, 1180.0, 815.0));
+
+        assert!(names.iter().any(|name| name == "Experimental"));
+        assert!(names.iter().any(|name| name.contains("Speed: Not rated")));
+        assert!(names.iter().any(|name| name == "Accuracy: Not rated"));
+        assert!(!names.iter().any(|name| name == "Trusted publisher"));
+    }
+
     #[test]
     fn comparison_panel_stays_near_the_bottom_without_infinite_scroll_spacing() {
         for (fixture, expanded) in [
@@ -2474,8 +2500,8 @@ mod tests {
                 for name in [
                     "Import",
                     "Refresh",
-                    "Active whisper.cpp base.en base.en model",
-                    "Details",
+                    "Active whisper.cpp base.en",
+                    "Details for whisper.cpp base.en",
                 ] {
                     let bounds = node_matching(&output, |node| {
                         node.role() == egui::accesskit::Role::Button
@@ -2664,6 +2690,7 @@ mod tests {
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
         let mut data = Fixture::ModelsInstalled.data();
+        data.comparison.expanded = true;
         data.remote_catalog.entries.clear();
         data.models.extend((0..36).map(|index| ModelViewModel {
             id: format!("available-{index:02}"),
@@ -2678,14 +2705,64 @@ mod tests {
             ..Default::default()
         }));
         let mut page = Fixture::ModelsInstalled.page();
-        let first_name = "Install Available model 00 available-00 model";
-        let previous_name = "Install Available model 22 available-22 model";
-        let final_name = "Install Available model 35 available-35 model";
+        let first_name = "Install Available model 00";
+        let final_name = "Install Available model 35";
+        let expected_indices = (0..36).collect::<std::collections::BTreeSet<_>>();
+        let collect_visible_indices =
+            |output: &egui::FullOutput, visible: &mut std::collections::BTreeSet<usize>| {
+                for name in node_names(output) {
+                    let Some(rest) = name.strip_prefix("Install Available model ") else {
+                        continue;
+                    };
+                    let Some(index) = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    visible.insert(index);
+                }
+            };
+        let model_index = |key: &ModelCardKey| match key {
+            ModelCardKey::Local(id) => id
+                .strip_prefix("available-")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("unexpected local card key {id}")),
+            ModelCardKey::Remote { .. } => panic!("expected a local available-model card key"),
+        };
+        let assert_focused_card_visible = |output: &egui::FullOutput| {
+            let bounds = focused_node(output)
+                .bounds()
+                .expect("focused model card should expose bounds");
+            let (_, _, _, viewport) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "route-scroll-diagnostics",
+                    ))
+                })
+                .expect("Models route should expose its scroll viewport");
+            let dock = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))
+                })
+                .expect("Models route should expose the expanded comparison dock");
+            let unobscured_bottom = dock.top() - 24.0;
+            assert!(
+                bounds.x0 >= f64::from(viewport.left())
+                    && bounds.x1 <= f64::from(viewport.right())
+                    && bounds.y0 >= f64::from(viewport.top())
+                    && bounds.y1 <= f64::from(unobscured_bottom),
+                "acknowledged focused card must stay above the expanded dock: {bounds:?} vs viewport {viewport:?}, dock {dock:?}"
+            );
+        };
 
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
         assert!(!node_names(&initial).iter().any(|name| name == final_name));
+        let mut forward_visible = std::collections::BTreeSet::new();
+        collect_visible_indices(&initial, &mut forward_visible);
         let available_header = named_node_id(&initial, "Collapse Available models");
         let (_, action) = render_with_input_and_apply(
             &ctx,
@@ -2704,6 +2781,9 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let (mut output, _) =
             render_with_input_and_apply(&ctx, &mut data, &mut page, width, height, Vec::new());
+        collect_visible_indices(&output, &mut forward_visible);
+        let mut forward_targets = Vec::new();
+        let mut frame_time = 1.0;
 
         for _ in 0..64 {
             if focused_node(&output).name() == Some(final_name) {
@@ -2740,8 +2820,16 @@ mod tests {
                 let ScreenAction::FocusModelCard(target) = action else {
                     panic!("page sentinel should request an exact model card focus");
                 };
+                let target_index = model_index(&target);
+                if let Some(previous) = forward_targets.last() {
+                    assert!(
+                        target_index > *previous,
+                        "forward paging targets must advance monotonically: {forward_targets:?} then {target_index}"
+                    );
+                }
+                forward_targets.push(target_index);
                 let mut acknowledged = false;
-                for frame in 0..4 {
+                for _ in 0..4 {
                     let (focused, action) = render_with_input_and_apply_at_time(
                         &ctx,
                         &mut data,
@@ -2749,8 +2837,10 @@ mod tests {
                         width,
                         height,
                         Vec::new(),
-                        1.0 + f64::from(frame) * 0.1,
+                        frame_time,
                     );
+                    frame_time += 0.1;
+                    collect_visible_indices(&focused, &mut forward_visible);
                     match action {
                         ScreenAction::None => {
                             assert_eq!(
@@ -2761,11 +2851,8 @@ mod tests {
                             output = focused;
                         }
                         ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
-                            assert!(
-                                frame > 0,
-                                "the first pending scroll frame must not acknowledge clipped card focus"
-                            );
                             assert_eq!(acknowledged_target, target);
+                            assert_focused_card_visible(&focused);
                             assert!(
                                 data.model_management.focus_model_card.is_none(),
                                 "acknowledgement must clear the completed focus request exactly once"
@@ -2781,7 +2868,15 @@ mod tests {
                 }
                 assert!(
                     acknowledged,
-                    "card focus should settle within four empty-event frames"
+                    "card focus should settle within four empty-event frames; pending={:?}, focused={:?}, route={:?}, dock={:?}",
+                    data.model_management.focus_model_card,
+                    focused_node(&output).bounds(),
+                    ctx.data(|data| data
+                        .get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(
+                            egui::Id::new("route-scroll-diagnostics")
+                        )),
+                    ctx.data(|data| data
+                        .get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))),
                 );
             } else {
                 let (focused, action) = render_with_input_and_apply(
@@ -2794,65 +2889,102 @@ mod tests {
                 );
                 assert_eq!(action, ScreenAction::None);
                 output = focused;
+                collect_visible_indices(&output, &mut forward_visible);
             }
         }
 
         assert_eq!(focused_node(&output).name(), Some(final_name));
         assert!(!node_names(&output).iter().any(|name| name == first_name));
-        let (_, action) = render_with_input_and_apply(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![page_event(egui::Key::PageUp)],
+        assert_eq!(
+            forward_visible, expected_indices,
+            "forward accessible paging must expose every available model without gaps"
         );
-        let ScreenAction::FocusModelCard(target) = action else {
-            panic!("PageUp from a rendered model primary should request exact previous-page focus");
-        };
-        assert_eq!(target, ModelCardKey::Local("available-22".into()));
 
-        let mut acknowledged = false;
-        for frame in 0..4 {
-            let (focused, action) = render_with_input_and_apply_at_time(
+        let mut reverse_visible = std::collections::BTreeSet::new();
+        collect_visible_indices(&output, &mut reverse_visible);
+        let mut reverse_targets = Vec::new();
+        for _ in 0..64 {
+            if focused_node(&output).name() == Some(first_name) {
+                break;
+            }
+            let (_, action) = render_with_input_and_apply(
                 &ctx,
                 &mut data,
                 &mut page,
                 width,
                 height,
-                Vec::new(),
-                10.0 + f64::from(frame) * 0.1,
+                vec![page_event(egui::Key::PageUp)],
             );
-            match action {
-                ScreenAction::None => {
-                    assert_eq!(
-                        data.model_management.focus_model_card.as_ref(),
-                        Some(&target),
-                        "reverse card focus must remain pending while its rect is clipped or offscreen"
-                    );
-                }
-                ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
-                    assert!(
-                        frame > 0,
-                        "the first reverse pending scroll frame must not acknowledge clipped card focus"
-                    );
-                    assert_eq!(acknowledged_target, target);
-                    assert!(
-                        data.model_management.focus_model_card.is_none(),
-                        "reverse acknowledgement must clear the completed focus request exactly once"
-                    );
-                    assert_eq!(focused_node(&focused).name(), Some(previous_name));
-                    acknowledged = true;
-                    break;
-                }
-                unexpected => panic!(
-                    "reverse pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
-                ),
+            let ScreenAction::FocusModelCard(target) = action else {
+                panic!(
+                    "PageUp from a rendered model primary should request exact previous-page focus"
+                );
+            };
+            let target_index = model_index(&target);
+            if let Some(previous) = reverse_targets.last() {
+                assert!(
+                    target_index < *previous,
+                    "reverse paging targets must retreat monotonically: {reverse_targets:?} then {target_index}"
+                );
             }
+            reverse_targets.push(target_index);
+
+            let mut acknowledged = false;
+            for _ in 0..4 {
+                let (focused, action) = render_with_input_and_apply_at_time(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    Vec::new(),
+                    frame_time,
+                );
+                frame_time += 0.1;
+                collect_visible_indices(&focused, &mut reverse_visible);
+                match action {
+                    ScreenAction::None => {
+                        assert_eq!(
+                            data.model_management.focus_model_card.as_ref(),
+                            Some(&target),
+                            "reverse card focus must remain pending while its rect is clipped or offscreen"
+                        );
+                        output = focused;
+                    }
+                    ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
+                        assert_eq!(acknowledged_target, target);
+                        assert_focused_card_visible(&focused);
+                        assert!(
+                            data.model_management.focus_model_card.is_none(),
+                            "reverse acknowledgement must clear the completed focus request exactly once"
+                        );
+                        output = focused;
+                        acknowledged = true;
+                        break;
+                    }
+                    unexpected => panic!(
+                        "reverse pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
+                    ),
+                }
+            }
+            assert!(
+                acknowledged,
+                "reverse card focus should settle within four empty-event frames; pending={:?}, focused={:?}, route={:?}, dock={:?}",
+                data.model_management.focus_model_card,
+                focused_node(&output).bounds(),
+                ctx.data(
+                    |data| data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(
+                        egui::Id::new("route-scroll-diagnostics")
+                    )
+                ),
+                ctx.data(|data| data
+                    .get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))),
+            );
         }
-        assert!(
-            acknowledged,
-            "reverse card focus should settle within four empty-event frames"
+        assert_eq!(focused_node(&output).name(), Some(first_name));
+        assert_eq!(
+            reverse_visible, expected_indices,
+            "reverse accessible paging must expose every available model without gaps"
         );
     }
 

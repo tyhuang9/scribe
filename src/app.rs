@@ -2413,6 +2413,7 @@ pub struct LocalTranscriberApp {
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: HashMap<String, (u64, InstallCancellation)>,
     local_gguf_import: Option<LocalGgufImportJob>,
+    local_gguf_import_status: Option<String>,
     artifact_recovery_error: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
@@ -2539,6 +2540,7 @@ impl LocalTranscriberApp {
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
             local_gguf_import: None,
+            local_gguf_import_status: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -7231,27 +7233,33 @@ impl LocalTranscriberApp {
     /// Validates a user-chosen GGUF in place. This is deliberately separate
     /// from the downloader: no remote source, app-managed path, or model
     /// replacement is created for an imported file.
+    fn set_local_gguf_import_message(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status_message = message.clone();
+        self.local_gguf_import_status = Some(message);
+    }
+
     fn start_local_gguf_import(&mut self) {
         if self.local_gguf_import.is_some() {
-            self.status_message = "A local GGUF import is already being validated.".to_owned();
+            self.set_local_gguf_import_message("A local GGUF import is already being validated.");
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status = TranscriptionStatus::Error;
-            self.status_message = reason;
+            self.set_local_gguf_import_message(reason);
             return;
         }
         let source = self.model_import_path.trim();
         if source.is_empty() {
             self.status = TranscriptionStatus::Error;
-            self.status_message = "Enter the path to a local .gguf file to import.".to_owned();
+            self.set_local_gguf_import_message("Enter the path to a local .gguf file to import.");
             return;
         }
         let source_path = PathBuf::from(source);
         let cancellation = InstallCancellation::default();
         let thread_cancellation = cancellation.clone();
         self.status = TranscriptionStatus::Idle;
-        self.status_message = "Hashing and validating the local GGUF...".to_owned();
+        self.set_local_gguf_import_message("Hashing and validating the local GGUF...");
         let tx = self.tx.clone();
         let service = self.transcription_service.with_config(self.config.clone());
         let model_storage_dir = config::model_storage_dir(&self.config);
@@ -7283,7 +7291,9 @@ impl LocalTranscriberApp {
             }
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Could not start local GGUF validation: {error}");
+                self.set_local_gguf_import_message(format!(
+                    "Could not start local GGUF validation: {error}"
+                ));
             }
         }
     }
@@ -7307,15 +7317,16 @@ impl LocalTranscriberApp {
         job.reap_completed();
         if job.cancellation.is_cancelled() {
             self.status = TranscriptionStatus::Idle;
-            self.status_message =
-                "Local GGUF import was cancelled. The source file was left unchanged.".to_owned();
+            self.set_local_gguf_import_message(
+                "Local GGUF import was cancelled. The source file was left unchanged.",
+            );
             return;
         }
         let imported = match result {
             Ok(imported) => *imported,
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Local GGUF import failed: {error}");
+                self.set_local_gguf_import_message(format!("Local GGUF import failed: {error}"));
                 return;
             }
         };
@@ -7336,8 +7347,7 @@ impl LocalTranscriberApp {
         {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
-            self.status_message = "The local GGUF changed before Scribe could persist its import receipt. Revalidate it before importing."
-                .to_owned();
+            self.set_local_gguf_import_message("The local GGUF changed before Scribe could persist its import receipt. Revalidate it before importing.");
             return;
         }
         let receipt_path = installed_manifest::imported_manifest_path_for(
@@ -7347,7 +7357,9 @@ impl LocalTranscriberApp {
         if let Err(error) = config::save_config(&self.config) {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!("Could not save the local import record: {error}.");
+            self.set_local_gguf_import_message(format!(
+                "Could not save the local import record: {error}."
+            ));
             return;
         }
         if let Err(error) =
@@ -7366,7 +7378,7 @@ impl LocalTranscriberApp {
                 self.artifact_recovery_error = Some(message.clone());
             }
             self.status = TranscriptionStatus::Error;
-            self.status_message = message;
+            self.set_local_gguf_import_message(message);
             return;
         }
         if let Some(store) = self.settings_store.as_mut() {
@@ -7377,12 +7389,12 @@ impl LocalTranscriberApp {
         self.rebuild_local_models_after_committed_change();
         let model_name = imported.install.display_name;
         self.status = TranscriptionStatus::Idle;
-        self.status_message = format!(
+        self.set_local_gguf_import_message(format!(
             "Imported and smoke-tested {model_name} in place (health {} ms, load {} ms, decode {} ms).",
             imported.smoke.health_duration_ms,
             imported.smoke.load_duration_ms,
             imported.smoke.decode_duration_ms,
-        );
+        ));
     }
 
     fn uninstall_model(&mut self, model: &SttModelInfo) {
@@ -8392,6 +8404,7 @@ impl LocalTranscriberApp {
                 import_enabled: self.local_gguf_import.is_none()
                     && self.artifact_mutation_block_reason().is_none(),
                 disabled_reason: self.artifact_mutation_block_reason(),
+                status_message: self.local_gguf_import_status.clone(),
             },
             query: self.model_search.clone(),
             filters: self.remote_catalog_filters,
@@ -8553,7 +8566,7 @@ impl LocalTranscriberApp {
                     managed_model_id: remote_id,
                     size_bytes: variant.size_bytes,
                     size_tier: size_tier_for_bytes(variant.size_bytes),
-                    speed_tier: speed_tier_for_bytes(variant.size_bytes),
+                    speed_tier: ModelSpeedTier::Unknown,
                     actions,
                 }
             })
@@ -8961,6 +8974,9 @@ impl LocalTranscriberApp {
                 "Slower" => ModelSpeedTier::AccurateSlow,
                 _ => ModelSpeedTier::Unknown,
             },
+            accuracy_guidance: descriptor
+                .map_or("Not rated", |descriptor| descriptor.accuracy_guidance)
+                .to_owned(),
             size_tier: descriptor.map_or(ModelSizeTier::Unknown, |descriptor| {
                 match descriptor.artifact_size_bytes {
                     0..=100_000_000 => ModelSizeTier::Tiny,
@@ -8999,6 +9015,9 @@ impl LocalTranscriberApp {
     fn apply_model_management_action(&mut self, action: ScreenAction) {
         match action {
             ScreenAction::AddModel => {
+                if self.local_gguf_import.is_none() {
+                    self.local_gguf_import_status = None;
+                }
                 self.model_management.dialog = Some(ModelDialog::Add);
                 self.model_management.focus_dialog_initial = true;
             }
@@ -9177,13 +9196,19 @@ impl LocalTranscriberApp {
                     }
                 }
             }
-            ScreenAction::SetLocalGgufImportPath(path) => self.model_import_path = path,
+            ScreenAction::SetLocalGgufImportPath(path) => {
+                self.model_import_path = path;
+                if self.local_gguf_import.is_none() {
+                    self.local_gguf_import_status = None;
+                }
+            }
             ScreenAction::ValidateAndImportLocalGguf => self.start_local_gguf_import(),
             ScreenAction::CancelLocalGgufImport => {
                 if let Some(job) = self.local_gguf_import.as_ref() {
                     job.cancellation.cancel();
-                    self.status_message =
-                        "Cancelling local GGUF validation; source bytes are unchanged.".to_owned();
+                    self.set_local_gguf_import_message(
+                        "Cancelling local GGUF validation; source bytes are unchanged.",
+                    );
                 }
             }
             ScreenAction::SetRemoteCatalogQuery(query) => self.model_search = query,
@@ -10477,16 +10502,6 @@ fn size_tier_for_bytes(size_bytes: u64) -> ModelSizeTier {
         513..=1024 => ModelSizeTier::Base,
         1025..=2048 => ModelSizeTier::Medium,
         _ => ModelSizeTier::Large,
-    }
-}
-
-fn speed_tier_for_bytes(size_bytes: u64) -> ModelSpeedTier {
-    match size_tier_for_bytes(size_bytes) {
-        ModelSizeTier::Tiny => ModelSpeedTier::VeryFast,
-        ModelSizeTier::Small => ModelSpeedTier::Fast,
-        ModelSizeTier::Base => ModelSpeedTier::Balanced,
-        ModelSizeTier::Medium | ModelSizeTier::Large => ModelSpeedTier::AccurateSlow,
-        ModelSizeTier::Unknown => ModelSpeedTier::Unknown,
     }
 }
 
@@ -16219,6 +16234,7 @@ mod layout_tests {
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
             local_gguf_import: None,
+            local_gguf_import_status: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -16620,6 +16636,12 @@ mod layout_tests {
         let first = app.remote_catalog_view();
 
         assert_eq!(first.entries.len(), REMOTE_CATALOG_VISIBLE_LIMIT);
+        assert!(first.entries.iter().all(|entry| {
+            entry
+                .variants
+                .iter()
+                .all(|variant| variant.speed_tier == ModelSpeedTier::Unknown)
+        }));
         assert!(first.status.message.contains(
             "Showing 100 of 10000 matching models (10000 total). Refine search or filters"
         ));
@@ -16719,6 +16741,13 @@ mod layout_tests {
             app.status_message,
             "Enter the path to a local .gguf file to import."
         );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Enter the path to a local .gguf file to import.")
+        );
         app.apply_model_management_action(ScreenAction::SetLocalGgufImportPath(
             "C:\\Models\\local.gguf".into(),
         ));
@@ -16743,6 +16772,13 @@ mod layout_tests {
         );
         app.apply_model_management_action(ScreenAction::CancelLocalGgufImport);
         assert!(local_cancellation.is_cancelled());
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Cancelling local GGUF validation; source bytes are unchanged.")
+        );
         app.finish_local_gguf_import(
             local_job_id,
             Err("completion delivered after cancellation".into()),
@@ -16752,7 +16788,41 @@ mod layout_tests {
             app.status_message,
             "Local GGUF import was cancelled. The source file was left unchanged."
         );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Local GGUF import was cancelled. The source file was left unchanged.")
+        );
         assert!(app.local_gguf_import.is_none());
+
+        let failed_job_id = local_job_id + 2;
+        app.local_gguf_import = Some(test_local_gguf_import_job(
+            failed_job_id,
+            InstallCancellation::default(),
+        ));
+        app.finish_local_gguf_import(failed_job_id, Err("invalid model header".into()));
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Local GGUF import failed: invalid model header")
+        );
+
+        app.set_local_gguf_import_message(
+            "Imported and smoke-tested Example in place (health 1 ms, load 2 ms, decode 3 ms).",
+        );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some(
+                "Imported and smoke-tested Example in place (health 1 ms, load 2 ms, decode 3 ms)."
+            )
+        );
 
         app.apply_model_management_action(ScreenAction::RetryRemoteCatalog);
         assert!(app.remote_catalog.force_refresh_requested);

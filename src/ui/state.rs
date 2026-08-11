@@ -288,6 +288,8 @@ pub(crate) struct ModelViewModel {
     pub languages: Vec<String>,
     pub language_summary: String,
     pub speed_tier: ModelSpeedTier,
+    /// Catalog-authored accuracy guidance. Empty means the model has not been rated.
+    pub accuracy_guidance: String,
     pub size_tier: ModelSizeTier,
     pub capabilities: ModelCapabilities,
     pub compatibility: ModelCompatibility,
@@ -395,12 +397,16 @@ impl ModelLanguageFilter {
         }
     }
     pub(crate) fn matches(self, languages: &[String]) -> bool {
-        let english = languages.iter().any(|language| {
-            language.eq_ignore_ascii_case("english") || language.eq_ignore_ascii_case("en")
-        });
+        let normalized = languages
+            .iter()
+            .map(|language| language.trim().to_ascii_lowercase())
+            .filter(|language| !language.is_empty())
+            .collect::<BTreeSet<_>>();
+        let english = normalized.contains("english") || normalized.contains("en");
+        let multilingual = normalized.len() > 1 || normalized.contains("multilingual");
         matches!(self, Self::All)
             || (matches!(self, Self::English) && english)
-            || (matches!(self, Self::Multilingual) && languages.len() > 1)
+            || (matches!(self, Self::Multilingual) && multilingual)
     }
 }
 
@@ -555,6 +561,7 @@ pub(crate) struct LocalGgufImportView {
     pub in_progress: bool,
     pub import_enabled: bool,
     pub disabled_reason: Option<String>,
+    pub status_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -680,11 +687,16 @@ mod tests {
     fn language_filter_distinguishes_english_and_true_multilingual_models() {
         let english = vec!["English".to_owned()];
         let multilingual = vec!["English".to_owned(), "Spanish".to_owned()];
+        let multilingual_marker = vec!["  MULTILINGUAL  ".to_owned()];
+        let duplicate_english = vec![" en ".to_owned(), "EN".to_owned()];
         let spanish = vec!["Spanish".to_owned()];
 
         assert!(ModelLanguageFilter::English.matches(&english));
         assert!(!ModelLanguageFilter::Multilingual.matches(&english));
         assert!(ModelLanguageFilter::Multilingual.matches(&multilingual));
+        assert!(ModelLanguageFilter::Multilingual.matches(&multilingual_marker));
+        assert!(!ModelLanguageFilter::Multilingual.matches(&duplicate_english));
+        assert!(ModelLanguageFilter::English.matches(&duplicate_english));
         assert!(!ModelLanguageFilter::English.matches(&spanish));
         assert!(!ModelLanguageFilter::Multilingual.matches(&spanish));
         assert!(ModelLanguageFilter::All.matches(&spanish));
