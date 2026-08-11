@@ -348,7 +348,6 @@ impl Default for ModelManagementState {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ModelLanguageFilter {
     #[default]
@@ -357,7 +356,6 @@ pub(crate) enum ModelLanguageFilter {
     Multilingual,
 }
 
-#[allow(dead_code)]
 impl ModelLanguageFilter {
     pub(crate) const ALL: [Self; 3] = [Self::All, Self::English, Self::Multilingual];
     pub(crate) const fn label(self) -> &'static str {
@@ -387,6 +385,7 @@ pub(crate) struct RemoteCatalogFilters {
     pub size_tier: RemoteCatalogSizeTier,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RemoteCatalogSizeTier {
     #[default]
@@ -396,6 +395,7 @@ pub(crate) enum RemoteCatalogSizeTier {
     Large,
 }
 
+#[allow(dead_code)]
 impl RemoteCatalogSizeTier {
     pub(crate) const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
 
@@ -424,6 +424,7 @@ impl RemoteCatalogSizeTier {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RemoteCatalogSort {
     #[default]
@@ -433,6 +434,7 @@ pub(crate) enum RemoteCatalogSort {
     Name,
 }
 
+#[allow(dead_code)]
 impl RemoteCatalogSort {
     pub(crate) const ALL: [Self; 4] =
         [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];

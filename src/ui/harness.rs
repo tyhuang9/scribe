@@ -7,8 +7,8 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
-        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
+        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
         RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
         RemoteCatalogView, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
@@ -16,8 +16,6 @@ use super::{
     theme_palette,
 };
 
-#[cfg(test)]
-use super::screens::{render_remote_catalog, screen_action_for_remote_catalog_action};
 #[cfg(test)]
 use super::state::{ComparisonResult, ComparisonResultPhase};
 
@@ -132,6 +130,7 @@ impl Fixture {
             models,
             comparison,
             model_management: ModelManagementState::default(),
+            model_language_filter: ModelLanguageFilter::default(),
             remote_catalog: remote_catalog_fixture(),
             settings,
         }
@@ -183,6 +182,7 @@ struct FixtureData {
     models: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
     model_management: ModelManagementState,
+    model_language_filter: ModelLanguageFilter,
     remote_catalog: RemoteCatalogView,
     settings: RecordingSettingsView,
 }
@@ -226,6 +226,7 @@ fn remote_catalog_fixture() -> RemoteCatalogView {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         }],
@@ -311,6 +312,7 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
         model_catalog: &data.models,
         comparison: &data.comparison,
         model_management: &data.model_management,
+        model_language_filter: data.model_language_filter,
         remote_catalog: &data.remote_catalog,
         recording_settings: &data.settings,
     };
@@ -383,23 +385,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
         ScreenAction::CopyTranscript => {}
-        ScreenAction::OpenComparison => {
-            data.comparison.expanded = true;
-            data.comparison.focus_panel = true;
-            if data.comparison.selected_model_ids.is_empty() {
-                data.comparison.selected_model_ids.extend(
-                    data.models
-                        .iter()
-                        .filter(|model| {
-                            model.installed
-                                && model.ready
-                                && model.compatibility != ModelCompatibility::Incompatible
-                        })
-                        .take(2)
-                        .map(|model| model.id.clone()),
-                );
-            }
-        }
         ScreenAction::ToggleComparison => data.comparison.expanded = !data.comparison.expanded,
         ScreenAction::ToggleComparisonModel(id) => {
             if !data.comparison.selected_model_ids.insert(id.clone()) {
@@ -449,6 +434,13 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.comparison.reference_notice = Some("Reference transcript cleared.".to_owned());
         }
         ScreenAction::SetRemoteCatalogQuery(query) => data.remote_catalog.query = query,
+        ScreenAction::SetModelLanguageFilter(filter) => data.model_language_filter = filter,
+        ScreenAction::ToggleInstalledModels => {
+            data.model_management.installed_expanded = !data.model_management.installed_expanded
+        }
+        ScreenAction::ToggleAvailableModels => {
+            data.model_management.available_expanded = !data.model_management.available_expanded
+        }
         ScreenAction::SetLocalGgufImportPath(path) => data.remote_catalog.local_import.path = path,
         ScreenAction::ValidateAndImportLocalGguf => {
             data.remote_catalog.local_import.in_progress = true;
@@ -458,19 +450,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.remote_catalog.local_import.in_progress = false;
             data.remote_catalog.local_import.import_enabled = true;
         }
-        ScreenAction::SetRemoteCatalogInstalledOnly(selected) => {
-            data.remote_catalog.filters.installed_only = selected
-        }
-        ScreenAction::SetRemoteCatalogRecommendedOnly(selected) => {
-            data.remote_catalog.filters.recommended_only = selected
-        }
-        ScreenAction::SetRemoteCatalogMultilingualOnly(selected) => {
-            data.remote_catalog.filters.multilingual_only = selected
-        }
-        ScreenAction::SetRemoteCatalogSizeTier(size_tier) => {
-            data.remote_catalog.filters.size_tier = size_tier
-        }
-        ScreenAction::SetRemoteCatalogSort(sort) => data.remote_catalog.sort = sort,
         ScreenAction::InstallRemoteCatalogVariant {
             remote_model_id,
             variant_id,
@@ -687,72 +666,6 @@ mod tests {
             data.model_management.restore_after_removal_focus = false;
         }
         (output, action)
-    }
-
-    fn render_catalog_with_input(
-        ctx: &egui::Context,
-        catalog: &RemoteCatalogView,
-        events: Vec<egui::Event>,
-    ) -> (egui::FullOutput, ScreenAction) {
-        let mut action = ScreenAction::None;
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(960.0, 1200.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    render_remote_catalog(ui, catalog, &mut action);
-                });
-            },
-        );
-        (output, action)
-    }
-
-    fn click_catalog_control(
-        ctx: &egui::Context,
-        catalog: &RemoteCatalogView,
-        name: &str,
-    ) -> ScreenAction {
-        let (initial, initial_action) = render_catalog_with_input(ctx, catalog, Vec::new());
-        assert_eq!(initial_action, ScreenAction::None);
-        let bounds = named_node_bounds(&initial, name);
-        let point = egui::pos2(
-            ((bounds.x0 + bounds.x1) / 2.0) as f32,
-            ((bounds.y0 + bounds.y1) / 2.0) as f32,
-        );
-        let (_, press_action) = render_catalog_with_input(
-            ctx,
-            catalog,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(press_action, ScreenAction::None);
-        render_catalog_with_input(
-            ctx,
-            catalog,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        )
-        .1
     }
 
     fn named_node_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {
@@ -1395,10 +1308,7 @@ mod tests {
                 expected_controls.contains(&name),
                 "Tab focus escaped the dialog to {name:?}; expected one of {expected_controls:?}"
             );
-            assert_ne!(
-                name, "Add models",
-                "background Models control received focus"
-            );
+            assert_ne!(name, "Import", "background Models control received focus");
         }
     }
 
@@ -1410,11 +1320,15 @@ mod tests {
         let mut page = Fixture::ModelsInstalled.page();
 
         let mut add = Fixture::ModelsInstalled.data();
-        add.models[0].install_action_enabled = true;
-        add.models[0].download_state = ModelDownloadState::NotInstalled;
         add.model_management.dialog = Some(ModelDialog::Add);
         add.model_management.focus_dialog_initial = true;
-        assert_dialog_focus_cycle(&ctx, &mut add, &mut page, &["Install", "Close"], "Close");
+        assert_dialog_focus_cycle(
+            &ctx,
+            &mut add,
+            &mut page,
+            &["GGUF file path", "Validate and import", "Close"],
+            "GGUF file path",
+        );
         let (output, action) = render_with_input(
             &ctx,
             &mut add,
@@ -1424,7 +1338,7 @@ mod tests {
             vec![tab_event(false)],
         );
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("Install"));
+        assert_eq!(focused_node(&output).name(), Some("Validate and import"));
         let (_, action) = render_with_input(
             &ctx,
             &mut add,
@@ -1439,7 +1353,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        assert_eq!(action, ScreenAction::InstallModel("base.en".into()));
+        assert_eq!(action, ScreenAction::ValidateAndImportLocalGguf);
 
         let mut details = Fixture::ModelsInstalled.data();
         details.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
@@ -1492,10 +1406,15 @@ mod tests {
     fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
         let (width, height) = (1180.0, 815.0);
         for (dialog, background_control, dialog_name, expected_focus) in [
-            (ModelDialog::Add, "Add models", "Add models", "Close"),
+            (
+                ModelDialog::Add,
+                "Import",
+                "Import local GGUF",
+                "GGUF file path",
+            ),
             (
                 ModelDialog::Details("base.en".into()),
-                "Open details for whisper.cpp base.en; variant base.en",
+                "whisper.cpp base.en model",
                 "Model details for whisper.cpp base.en",
                 "Close",
             ),
@@ -1607,7 +1526,7 @@ mod tests {
     fn comparison_dock_layer_stays_above_routes_and_below_active_model_dialogs() {
         let (width, height) = (1180.0, 815.0);
         for (dialog, dialog_name) in [
-            (ModelDialog::Add, "Add models"),
+            (ModelDialog::Add, "Import local GGUF"),
             (
                 ModelDialog::Details("base.en".into()),
                 "Model details for whisper.cpp base.en",
@@ -1829,9 +1748,9 @@ mod tests {
     }
 
     #[test]
-    fn installed_model_rows_are_dense_and_open_details_from_every_input() {
+    fn installed_model_cards_are_fixed_height_and_activate_from_every_input() {
         let (width, height) = (1180.0, 815.0);
-        let row_name = "Open details for whisper.cpp base.en; variant base.en";
+        let row_name = "whisper.cpp tiny.en model";
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1841,13 +1760,13 @@ mod tests {
         let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
         let row = named_node_bounds(&output, row_name);
         assert!(
-            (76.0..=82.0).contains(&(row.y1 - row.y0)),
-            "installed row height should match the 80 px reference, got {}",
+            ((row.y1 - row.y0) - 92.0).abs() <= LAYOUT_TOLERANCE,
+            "installed card height should be 92 px, got {}",
             row.y1 - row.y0
         );
         assert_eq!(
             click_named_control(&ctx, &mut data, &mut page, width, height, row_name),
-            ScreenAction::ShowModelDetails("base.en".into())
+            ScreenAction::SelectModel("tiny.en".into())
         );
 
         let ctx = egui::Context::default();
@@ -1871,7 +1790,7 @@ mod tests {
                 },
             )],
         );
-        assert_eq!(action, ScreenAction::ShowModelDetails("base.en".into()));
+        assert_eq!(action, ScreenAction::SelectModel("tiny.en".into()));
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1908,12 +1827,71 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        assert_eq!(action, ScreenAction::ShowModelDetails("base.en".into()));
+        assert_eq!(action, ScreenAction::SelectModel("tiny.en".into()));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let card = named_node_bounds(&initial, row_name);
+        let details = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button && node.name() == Some("Details"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .find(|bounds| bounds.y0 >= card.y0 && bounds.y1 <= card.y1)
+            .expect("tiny model Details child");
+        let point = egui::pos2(
+            ((details.x0 + details.x1) / 2.0) as f32,
+            ((details.y0 + details.y1) / 2.0) as f32,
+        );
+        let _ = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(action, ScreenAction::ShowModelDetails("tiny.en".into()));
     }
 
     #[test]
     fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
-        let row_name = "Open details for whisper.cpp base.en; variant base.en";
+        let row_name = "whisper.cpp base.en model";
         for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
             let surface = named_node_bounds(&output, "Model comparison surface");
@@ -1942,8 +1920,13 @@ mod tests {
                 })
                 .collect();
             assert!(
-                row_contents.iter().any(|(name, _)| name.contains("RAM")),
-                "installed row should expose its metadata at {width}x{height}"
+                row_contents
+                    .iter()
+                    .any(|(name, _)| name.contains("English"))
+                    && row_contents
+                        .iter()
+                        .any(|(name, _)| name.contains("Balanced")),
+                "installed card should expose language and speed metadata at {width}x{height}"
             );
             for (name, bounds) in row_contents {
                 assert_bounds_within(bounds, row, &format!("installed row content {name:?}"));
@@ -2102,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_model_removal_restores_focus_to_add_models() {
+    fn confirmed_model_removal_restores_focus_to_import() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -2126,7 +2109,7 @@ mod tests {
         assert!(
             focused_node(&output)
                 .name()
-                .is_some_and(|name| name.contains("Add models"))
+                .is_some_and(|name| name.contains("Import"))
         );
         assert!(!data.model_management.restore_after_removal_focus);
         assert!(
@@ -2200,9 +2183,9 @@ mod tests {
             );
             assert_within_tolerance(
                 surface.y1,
-                815.0,
+                815.0 - 24.0,
                 LAYOUT_TOLERANCE,
-                "comparison surface bottom",
+                "comparison surface bottom gap",
             );
             if expanded {
                 assert!(
@@ -2227,7 +2210,21 @@ mod tests {
                 (Fixture::ModelsInstalled, "Expand comparison"),
                 (Fixture::ModelsCompareExpanded, "Collapse comparison"),
             ] {
-                let output = render(fixture, width, height);
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                configure_accessible_style(&ctx);
+                let mut data = fixture.data();
+                let mut page = fixture.page();
+                let output =
+                    render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+                let route_viewport = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "route-viewport",
+                            UiRoute::Models,
+                        )))
+                    })
+                    .expect("Models route viewport diagnostic");
                 let surface_node = node_matching(&output, |node| {
                     node.name() == Some("Model comparison surface")
                 });
@@ -2240,13 +2237,6 @@ mod tests {
                 })
                 .bounds()
                 .expect("Models heading should expose bounds");
-                let add_models_node = node_matching(&output, |node| {
-                    node.name().is_some_and(|name| name.contains("Add models"))
-                });
-                assert_eq!(add_models_node.role(), egui::accesskit::Role::Button);
-                let add_models = add_models_node
-                    .bounds()
-                    .expect("Add models should expose bounds");
                 let chevron = named_node_bounds(&output, toggle_name);
 
                 assert_near(
@@ -2256,7 +2246,7 @@ mod tests {
                 );
                 assert_near(
                     surface.x1,
-                    add_models.x1,
+                    f64::from(route_viewport.right() - 28.0),
                     "surface right should align with the inset Models content",
                 );
                 assert_near(
@@ -2314,20 +2304,15 @@ mod tests {
                 assert_bounds_within(header, surface, "fixed comparison header");
                 assert_within_tolerance(
                     surface.y1,
-                    f64::from(height),
+                    f64::from(height - 24.0),
                     LAYOUT_TOLERANCE,
-                    "bottom-docked comparison surface",
+                    "comparison surface bottom gap",
                 );
-                for name in [
-                    "Add models",
-                    "Compare",
-                    "Open details for whisper.cpp base.en; variant base.en",
-                    "Install",
-                ] {
+                for name in ["Import", "Refresh", "whisper.cpp base.en model", "Details"] {
                     let bounds = node_matching(&output, |node| {
                         node.role() == egui::accesskit::Role::Button
                             && node.name().is_some_and(|actual| {
-                                if name == "Add models" {
+                                if name == "Import" {
                                     actual.contains(name)
                                 } else {
                                     actual == name
@@ -2408,13 +2393,25 @@ mod tests {
     }
 
     #[test]
-    fn models_max_scroll_keeps_the_final_catalog_entry_24_points_above_the_dock() {
+    fn models_max_scroll_keeps_the_final_model_card_24_points_above_the_dock() {
         for fixture in [Fixture::ModelsInstalled, Fixture::ModelsCompareExpanded] {
             let (width, height) = (1180.0, 815.0);
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             configure_accessible_style(&ctx);
             let mut data = fixture.data();
+            data.models.extend((0..24).map(|index| ModelViewModel {
+                id: format!("available-{index:02}"),
+                display_name: format!("Available model {index:02}"),
+                variant_label: format!("available-{index:02}"),
+                install_supported: true,
+                install_action_enabled: true,
+                language_summary: "English".into(),
+                languages: vec!["English".into()],
+                speed_tier: ModelSpeedTier::Balanced,
+                size_tier: ModelSizeTier::Base,
+                ..Default::default()
+            }));
             let mut page = fixture.page();
             let _ = render_with_input_at_time(
                 &ctx,
@@ -2449,10 +2446,8 @@ mod tests {
             .0;
             let surface = named_node_bounds(&settled, "Model comparison surface");
             let final_entry = ctx
-                .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new("remote-catalog-final-entry-rect"))
-                })
-                .expect("remote catalog should expose its final entry rect in tests");
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("models-final-card-rect")))
+                .expect("model list should expose its final card rect in tests");
             let (_, offset, content_size, viewport) = ctx
                 .data(|data| {
                     data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
@@ -2461,17 +2456,35 @@ mod tests {
                 })
                 .expect("Models route should expose its settled scroll state");
             assert_within_tolerance(
+                f64::from(content_size.y),
+                f64::from(initial_content_size.y),
+                1.0,
+                "Models route content height across culling windows",
+            );
+            assert_within_tolerance(
+                f64::from(viewport.height()),
+                f64::from(initial_viewport.height()),
+                1.0,
+                "Models route viewport height across culling windows",
+            );
+            assert_within_tolerance(
                 f64::from(offset.y),
                 (content_size.y - viewport.height()).max(0.0).into(),
                 LAYOUT_TOLERANCE,
                 "Models maximum route offset",
             );
             let visible_entry_bottom = f64::from(final_entry.bottom());
-            assert_within_tolerance(
-                surface.y0 - visible_entry_bottom,
-                24.0,
-                2.0,
-                "final catalog entry clearance above comparison dock",
+            let layout = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, f32, f32)>(egui::Id::new(
+                        "models-layout-diagnostics",
+                    ))
+                })
+                .expect("Models layout diagnostics");
+            let clearance = surface.y0 - visible_entry_bottom;
+            assert!(
+                (clearance - 24.0).abs() <= 2.0,
+                "final model card clearance above comparison dock: got {clearance}; final={final_entry:?}, surface={surface:?}, offset={offset:?}, content={content_size:?}, viewport={viewport:?}, layout={layout:?}",
             );
         }
     }
@@ -2531,46 +2544,6 @@ mod tests {
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).1,
             ScreenAction::None
         );
-    }
-
-    #[test]
-    fn page_compare_action_opens_focuses_and_seeds_two_eligible_models() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.comparison.selected_model_ids.clear();
-
-        let action = click_named_control(&ctx, &mut data, &mut page, width, height, "Compare");
-        assert_eq!(action, ScreenAction::OpenComparison);
-        apply_action(&mut data, &mut page, action);
-        assert!(data.comparison.expanded);
-        assert!(data.comparison.focus_panel);
-        assert_eq!(data.comparison.selected_model_ids.len(), 2);
-
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert_eq!(focused_node(&output).name(), Some("Collapse comparison"));
-        assert!(!data.comparison.focus_panel);
-
-        let start_recording_id = named_node_id(&output, "Start test recording");
-        let next = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Focus,
-                    target: start_recording_id,
-                    data: None,
-                },
-            )],
-        )
-        .0;
-        assert_eq!(focused_node(&next).name(), Some("Start test recording"));
     }
 
     #[test]
@@ -3256,74 +3229,6 @@ mod tests {
         }
     }
     #[test]
-    fn remote_catalog_fixture_emits_typed_actions_and_tracks_lifecycle_state() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = AppPage::Models;
-        let import = click_catalog_control(&ctx, &data.remote_catalog, "Validate and import");
-        assert_eq!(import, ScreenAction::ValidateAndImportLocalGguf);
-        apply_action(&mut data, &mut page, import);
-        assert!(data.remote_catalog.local_import.in_progress);
-        let cancel_import = click_catalog_control(&ctx, &data.remote_catalog, "Cancel import");
-        assert_eq!(cancel_import, ScreenAction::CancelLocalGgufImport);
-        apply_action(&mut data, &mut page, cancel_import);
-        assert!(!data.remote_catalog.local_import.in_progress);
-
-        let expected_install = screen_action_for_remote_catalog_action(
-            &data.remote_catalog.entries[0].variants[0].actions[0].kind,
-        );
-        let install = click_catalog_control(&ctx, &data.remote_catalog, "Install");
-        assert_eq!(
-            install,
-            ScreenAction::InstallRemoteCatalogVariant {
-                remote_model_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
-            }
-        );
-        assert_eq!(install, expected_install);
-        apply_action(&mut data, &mut page, install);
-        let variant = &data.remote_catalog.entries[0].variants[0];
-        assert_eq!(variant.status_label.as_deref(), Some("Downloading"));
-        assert!(matches!(
-            &variant.actions[0].kind,
-            RemoteCatalogActionKind::Cancel { model_id }
-                if model_id == "managed-compact-english"
-        ));
-
-        apply_action(
-            &mut data,
-            &mut page,
-            ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into()),
-        );
-        let variant = &data.remote_catalog.entries[0].variants[0];
-        assert_eq!(variant.status_label.as_deref(), Some("Cancelled"));
-        assert_eq!(variant.actions[0].label, "Resume");
-
-        apply_action(
-            &mut data,
-            &mut page,
-            ScreenAction::SetRemoteCatalogQuery("compact".into()),
-        );
-        apply_action(
-            &mut data,
-            &mut page,
-            ScreenAction::SetRemoteCatalogRecommendedOnly(true),
-        );
-        apply_action(
-            &mut data,
-            &mut page,
-            ScreenAction::SetRemoteCatalogSort(super::super::state::RemoteCatalogSort::Name),
-        );
-        assert_eq!(data.remote_catalog.query, "compact");
-        assert!(data.remote_catalog.filters.recommended_only);
-        assert_eq!(
-            data.remote_catalog.sort,
-            super::super::state::RemoteCatalogSort::Name
-        );
-    }
-    #[test]
     fn harness_actions_mutate_only_visible_fixture_state() {
         let mut data = Fixture::TranscribeReady.data();
         let mut page = AppPage::Transcribe;
@@ -3422,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_requires_two_runtime_ready_models_with_an_accessible_reason() {
+    fn runtime_not_ready_state_is_exposed_as_text() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3437,14 +3342,6 @@ mod tests {
                 .iter()
                 .any(|name| name == "Runtime not ready"),
             "runtime state must be available as text, not color alone"
-        );
-        let compare = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Compare")
-        });
-        assert!(compare.is_disabled());
-        assert_eq!(
-            compare.description(),
-            Some("At least two installed models must be compatible and runtime-ready to compare.")
         );
     }
     #[test]

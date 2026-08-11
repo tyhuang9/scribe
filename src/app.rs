@@ -8071,6 +8071,7 @@ impl LocalTranscriberApp {
                 model_catalog: &[],
                 comparison: &Default::default(),
                 model_management: &Default::default(),
+                model_language_filter: ModelLanguageFilter::default(),
                 remote_catalog: &Default::default(),
                 recording_settings: &settings,
             },
@@ -8136,7 +8137,6 @@ impl LocalTranscriberApp {
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
-            | ScreenAction::OpenComparison
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
@@ -8156,11 +8156,9 @@ impl LocalTranscriberApp {
             | ScreenAction::RepairModelRuntime(_)
             | ScreenAction::MaintainModelRuntime(_)
             | ScreenAction::SetRemoteCatalogQuery(_)
-            | ScreenAction::SetRemoteCatalogInstalledOnly(_)
-            | ScreenAction::SetRemoteCatalogRecommendedOnly(_)
-            | ScreenAction::SetRemoteCatalogMultilingualOnly(_)
-            | ScreenAction::SetRemoteCatalogSizeTier(_)
-            | ScreenAction::SetRemoteCatalogSort(_)
+            | ScreenAction::SetModelLanguageFilter(_)
+            | ScreenAction::ToggleInstalledModels
+            | ScreenAction::ToggleAvailableModels
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -8244,14 +8242,10 @@ impl LocalTranscriberApp {
         self.model_comparison.start_disabled_reason =
             self.comparison_start_block_reason().map(str::to_owned);
         let catalog = Arc::clone(&self.remote_catalog.local_models);
-        let installed = catalog
-            .iter()
-            .filter(|model| model.installed)
-            .cloned()
-            .collect::<Vec<_>>();
         self.model_comparison.selected_model_ids.retain(|id| {
-            installed.iter().any(|model| {
+            catalog.iter().any(|model| {
                 &model.id == id
+                    && model.installed
                     && model.ready
                     && model.compatibility != ModelCompatibility::Incompatible
             })
@@ -8271,10 +8265,11 @@ impl LocalTranscriberApp {
         let view = ScreenView {
             route: UiRoute::Models,
             transcription: &Default::default(),
-            models: &installed,
+            models: &catalog,
             model_catalog: &catalog,
             comparison: &self.model_comparison,
             model_management: &self.model_management,
+            model_language_filter: self.model_language_filter,
             remote_catalog: &remote_catalog,
             recording_settings: &Default::default(),
         };
@@ -8770,6 +8765,7 @@ impl LocalTranscriberApp {
         self.rebuild_model_inventory_projection();
     }
 
+    #[cfg(test)]
     fn model_management_catalog(&self) -> Vec<ModelViewModel> {
         self.remote_catalog.local_models.to_vec()
     }
@@ -9029,15 +9025,6 @@ impl LocalTranscriberApp {
                 }
                 None => {}
             },
-            ScreenAction::OpenComparison => {
-                self.model_comparison.expanded = true;
-                self.model_comparison.focus_panel = true;
-                if self.model_comparison.selected_model_ids.is_empty() {
-                    self.model_comparison.selected_model_ids.extend(
-                        initial_comparison_model_selection(&self.model_management_catalog()),
-                    );
-                }
-            }
             ScreenAction::ToggleComparison => {
                 self.model_comparison.expanded = !self.model_comparison.expanded
             }
@@ -9205,19 +9192,13 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::SetRemoteCatalogQuery(query) => self.model_search = query,
-            ScreenAction::SetRemoteCatalogInstalledOnly(selected) => {
-                self.remote_catalog_filters.installed_only = selected
+            ScreenAction::SetModelLanguageFilter(filter) => self.model_language_filter = filter,
+            ScreenAction::ToggleInstalledModels => {
+                self.model_management.installed_expanded = !self.model_management.installed_expanded
             }
-            ScreenAction::SetRemoteCatalogRecommendedOnly(selected) => {
-                self.remote_catalog_filters.recommended_only = selected
+            ScreenAction::ToggleAvailableModels => {
+                self.model_management.available_expanded = !self.model_management.available_expanded
             }
-            ScreenAction::SetRemoteCatalogMultilingualOnly(selected) => {
-                self.remote_catalog_filters.multilingual_only = selected
-            }
-            ScreenAction::SetRemoteCatalogSizeTier(size_tier) => {
-                self.remote_catalog_filters.size_tier = size_tier
-            }
-            ScreenAction::SetRemoteCatalogSort(sort) => self.remote_catalog_sort = sort,
             ScreenAction::RetryRemoteCatalog => {
                 self.remote_catalog.force_refresh_requested = true;
             }
@@ -9885,6 +9866,7 @@ impl LocalTranscriberApp {
                 model_catalog: &[],
                 comparison: &comparison,
                 model_management: &Default::default(),
+                model_language_filter: ModelLanguageFilter::default(),
                 remote_catalog: &Default::default(),
                 recording_settings: &settings,
             },
@@ -10116,7 +10098,6 @@ impl LocalTranscriberApp {
             | ScreenAction::StopRecording
             | ScreenAction::ClearTranscript
             | ScreenAction::CopyTranscript
-            | ScreenAction::OpenComparison
             | ScreenAction::ToggleComparison
             | ScreenAction::ToggleComparisonModel(_)
             | ScreenAction::StartComparison
@@ -10127,11 +10108,9 @@ impl LocalTranscriberApp {
             | ScreenAction::ApplyComparisonReference
             | ScreenAction::ClearComparisonReference
             | ScreenAction::SetRemoteCatalogQuery(_)
-            | ScreenAction::SetRemoteCatalogInstalledOnly(_)
-            | ScreenAction::SetRemoteCatalogRecommendedOnly(_)
-            | ScreenAction::SetRemoteCatalogMultilingualOnly(_)
-            | ScreenAction::SetRemoteCatalogSizeTier(_)
-            | ScreenAction::SetRemoteCatalogSort(_)
+            | ScreenAction::SetModelLanguageFilter(_)
+            | ScreenAction::ToggleInstalledModels
+            | ScreenAction::ToggleAvailableModels
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -11433,19 +11412,6 @@ fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     compatibility_bridge::model_storage_estimate(model)
 }
 
-fn initial_comparison_model_selection(models: &[ModelViewModel]) -> Vec<String> {
-    models
-        .iter()
-        .filter(|model| {
-            model.installed
-                && model.ready
-                && model.compatibility != ModelCompatibility::Incompatible
-        })
-        .take(2)
-        .map(|model| model.id.clone())
-        .collect()
-}
-
 fn model_ui_labels(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> (String, String) {
     let variant = model_variant_label(model, descriptor);
     let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
@@ -12267,15 +12233,8 @@ mod layout_tests {
                 .any(|(_, node)| node.name() == Some("Runtime maintenance"))
         );
         for (label_name, role) in [
-            (
-                "Search imports and trusted catalog",
-                egui::accesskit::Role::TextInput,
-            ),
-            ("Trusted catalog size tier", egui::accesskit::Role::ComboBox),
-            (
-                "Sort trusted catalog results",
-                egui::accesskit::Role::ComboBox,
-            ),
+            ("Search", egui::accesskit::Role::TextInput),
+            ("Language", egui::accesskit::Role::ComboBox),
         ] {
             let label_id = update
                 .nodes
@@ -12293,15 +12252,12 @@ mod layout_tests {
                 "no {role:?} is programmatically labelled by {label_name:?}"
             );
         }
-        for filter_name in [
-            "Installed trusted catalog models only",
-            "Recommended trusted catalog models only",
-            "Multilingual trusted catalog models only",
-        ] {
-            assert!(update.nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::CheckBox && node.name() == Some(filter_name)
-            }));
-        }
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("trusted catalog models only"))
+        }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
                 && node.name() == Some("Bundled trusted catalog · Showing 1 of 1 models.")
@@ -15280,53 +15236,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn comparison_seed_takes_exactly_two_eligible_models_in_visible_order() {
-        let model = |id: &str, installed, ready, compatibility| ModelViewModel {
-            id: id.to_owned(),
-            installed,
-            ready,
-            compatibility,
-            ..Default::default()
-        };
-        let models = vec![
-            model("missing", false, true, ModelCompatibility::Supported),
-            model("first", true, true, ModelCompatibility::Supported),
-            model("not-ready", true, false, ModelCompatibility::Supported),
-            model("second", true, true, ModelCompatibility::Experimental),
-            model("third", true, true, ModelCompatibility::Supported),
-            model("blocked", true, true, ModelCompatibility::Incompatible),
-        ];
-
-        assert_eq!(
-            initial_comparison_model_selection(&models),
-            ["first".to_owned(), "second".to_owned()]
-        );
-    }
-
-    #[test]
-    fn live_compare_action_opens_focuses_and_preserves_existing_selection() {
-        let mut app = test_app();
-        app.model_comparison.selected_model_ids.clear();
-
-        app.apply_model_management_action(ScreenAction::OpenComparison);
-
-        assert!(app.model_comparison.expanded);
-        assert!(app.model_comparison.focus_panel);
-        assert_eq!(
-            app.model_comparison.selected_model_ids,
-            ["whisper_cpp_tiny_en".to_owned()].into_iter().collect()
-        );
-
-        app.model_comparison.focus_panel = false;
-        app.apply_model_management_action(ScreenAction::OpenComparison);
-        assert!(app.model_comparison.focus_panel);
-        assert_eq!(
-            app.model_comparison.selected_model_ids,
-            ["whisper_cpp_tiny_en".to_owned()].into_iter().collect()
-        );
-    }
-
-    #[test]
     fn live_compare_selection_rejects_a_fifth_model_and_locks_while_busy() {
         let mut app = test_app();
         app.model_comparison
@@ -16501,10 +16410,8 @@ mod layout_tests {
             });
         }
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("tiny".into()));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogRecommendedOnly(true));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogSort(
-            RemoteCatalogSort::Smallest,
-        ));
+        app.remote_catalog_filters.recommended_only = true;
+        app.remote_catalog_sort = RemoteCatalogSort::Smallest;
         let _ = app.remote_catalog_view();
         let _ = app.remote_catalog_view();
 
@@ -16758,7 +16665,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn shared_models_catalog_routes_controls_and_revalidates_lifecycle_tokens() {
+    fn shared_models_catalog_revalidates_import_and_install_lifecycle_tokens() {
         let mut app = test_app();
         app.remote_catalog.snapshot = Some(
             ModelInventorySnapshot::from_trusted_records(
@@ -16776,15 +16683,13 @@ mod layout_tests {
         );
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("action".into()));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogInstalledOnly(true));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogRecommendedOnly(true));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogMultilingualOnly(true));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogSizeTier(
-            RemoteCatalogSizeTier::Compact,
-        ));
-        app.apply_model_management_action(ScreenAction::SetRemoteCatalogSort(
-            RemoteCatalogSort::Largest,
-        ));
+        app.remote_catalog_filters = RemoteCatalogFilters {
+            installed_only: true,
+            recommended_only: true,
+            multilingual_only: true,
+            size_tier: RemoteCatalogSizeTier::Compact,
+        };
+        app.remote_catalog_sort = RemoteCatalogSort::Largest;
         assert_eq!(app.model_search, "action");
         assert_eq!(
             app.remote_catalog_filters,

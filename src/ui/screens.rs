@@ -1,5 +1,7 @@
 //! Shared, backend-neutral egui screen renderers.
 
+use std::collections::HashSet;
+
 use eframe::egui::{
     self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea, Sense,
     Stroke, Vec2,
@@ -7,14 +9,15 @@ use eframe::egui::{
 
 use super::{
     controls::{
-        ButtonTone, Icon, badge, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
+        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelComparisonState, ModelDialog,
-        ModelDownloadState, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-        RecordingMode, RemoteCatalogActionKind, RemoteCatalogFilters, RemoteCatalogSizeTier,
-        RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogView, SettingsSaveState,
-        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
+        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
+        RemoteCatalogVariantView, RemoteCatalogView, SettingsSaveState, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -200,6 +203,7 @@ pub(crate) struct ScreenView<'a> {
     pub model_catalog: &'a [ModelViewModel],
     pub comparison: &'a ModelComparisonState,
     pub model_management: &'a ModelManagementState,
+    pub model_language_filter: ModelLanguageFilter,
     pub remote_catalog: &'a RemoteCatalogView,
     pub recording_settings: &'a RecordingSettingsView,
 }
@@ -215,7 +219,6 @@ pub(crate) enum ScreenAction {
     RetryMicrophone,
     ClearTranscript,
     CopyTranscript,
-    OpenComparison,
     ToggleComparison,
     ToggleComparisonModel(String),
     StartComparison,
@@ -238,11 +241,9 @@ pub(crate) enum ScreenAction {
     ValidateAndImportLocalGguf,
     CancelLocalGgufImport,
     SetRemoteCatalogQuery(String),
-    SetRemoteCatalogInstalledOnly(bool),
-    SetRemoteCatalogRecommendedOnly(bool),
-    SetRemoteCatalogMultilingualOnly(bool),
-    SetRemoteCatalogSizeTier(RemoteCatalogSizeTier),
-    SetRemoteCatalogSort(RemoteCatalogSort),
+    SetModelLanguageFilter(ModelLanguageFilter),
+    ToggleInstalledModels,
+    ToggleAvailableModels,
     RetryRemoteCatalog,
     InstallRemoteCatalogVariant {
         remote_model_id: String,
@@ -294,6 +295,7 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
             view.model_catalog,
             view.comparison,
             view.model_management,
+            view.model_language_filter,
             view.remote_catalog,
         ),
         UiRoute::Settings(tab) => settings(ui, tab, view.transcription, view.recording_settings),
@@ -1335,10 +1337,444 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color3
         });
 }
 
-const MODEL_COMPARISON_DOCK_INSET: f32 = 24.0;
+const MODEL_COMPARISON_BOTTOM_GAP: f32 = 24.0;
+const MODEL_LIST_TO_DOCK_GAP: f32 = 24.0;
 const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
 const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
-const INSTALLED_MODEL_WIDE_ROW_MIN_WIDTH: f32 = 1_280.0;
+const MODEL_CARD_HEIGHT: f32 = 92.0;
+const MODEL_CARD_GAP: f32 = 8.0;
+const MODEL_CARD_OVERSCAN: usize = 2;
+
+#[derive(Clone, Copy)]
+enum ModelCard<'a> {
+    Local(&'a ModelViewModel),
+    Remote(&'a RemoteCatalogEntryView, &'a RemoteCatalogVariantView),
+}
+
+impl ModelCard<'_> {
+    fn display_name(&self) -> &str {
+        match *self {
+            Self::Local(model) => &model.display_name,
+            Self::Remote(entry, _) => &entry.display_name,
+        }
+    }
+}
+
+fn local_model_matches(
+    model: &ModelViewModel,
+    query: &str,
+    language_filter: ModelLanguageFilter,
+) -> bool {
+    language_filter.matches(&model.languages)
+        && (query.is_empty()
+            || model.display_name.to_ascii_lowercase().contains(query)
+            || model.variant_label.to_ascii_lowercase().contains(query)
+            || model.language_summary.to_ascii_lowercase().contains(query)
+            || model
+                .description
+                .as_deref()
+                .is_some_and(|description| description.to_ascii_lowercase().contains(query)))
+}
+
+fn build_model_card_lists<'a>(
+    models: &'a [ModelViewModel],
+    model_catalog: &'a [ModelViewModel],
+    remote_catalog: &'a RemoteCatalogView,
+    language_filter: ModelLanguageFilter,
+) -> (Vec<ModelCard<'a>>, Vec<ModelCard<'a>>) {
+    let query = remote_catalog.query.trim().to_ascii_lowercase();
+    let installed = models
+        .iter()
+        .filter(|model| model.installed && local_model_matches(model, &query, language_filter))
+        .map(ModelCard::Local)
+        .collect();
+    let known_ids = model_catalog
+        .iter()
+        .chain(models.iter())
+        .map(|model| model.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut available = model_catalog
+        .iter()
+        .filter(|model| !model.installed && local_model_matches(model, &query, language_filter))
+        .map(ModelCard::Local)
+        .collect::<Vec<_>>();
+    available.extend(remote_catalog.entries.iter().flat_map(|entry| {
+        entry.variants.iter().filter_map(|variant| {
+            let duplicates_local = variant
+                .normalized_model_id
+                .as_deref()
+                .is_some_and(|id| known_ids.contains(id))
+                || variant
+                    .managed_model_id
+                    .as_deref()
+                    .is_some_and(|id| known_ids.contains(id));
+            (!duplicates_local).then_some(ModelCard::Remote(entry, variant))
+        })
+    }));
+    (installed, available)
+}
+
+fn accuracy_label(tier: ModelSizeTier) -> &'static str {
+    match tier {
+        ModelSizeTier::Tiny => "Basic accuracy",
+        ModelSizeTier::Small | ModelSizeTier::Base => "Balanced accuracy",
+        ModelSizeTier::Medium => "High accuracy",
+        ModelSizeTier::Large => "Highest accuracy",
+        ModelSizeTier::Unknown => "Accuracy varies",
+    }
+}
+
+fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCatalogActionView> {
+    variant.actions.iter().find(|action| {
+        matches!(
+            action.kind,
+            RemoteCatalogActionKind::Install { .. } | RemoteCatalogActionKind::Use { .. }
+        )
+    })
+}
+
+fn render_model_card(ui: &mut egui::Ui, card: ModelCard<'_>) -> (ScreenAction, egui::Rect) {
+    let colors = ui_palette(ui);
+    let width = ui.available_width();
+    let (card_rect, primary_response) =
+        ui.allocate_exact_size(Vec2::new(width, MODEL_CARD_HEIGHT), Sense::click());
+    let (primary_action, primary_enabled, disabled_reason) = match card {
+        ModelCard::Local(model) if model.installed => (
+            Some(if model.primary_action_repairs_runtime {
+                ScreenAction::RepairModelRuntime(model.id.clone())
+            } else {
+                ScreenAction::SelectModel(model.id.clone())
+            }),
+            model.primary_action_enabled,
+            model.primary_action_disabled_reason.as_deref(),
+        ),
+        ModelCard::Local(model) => (
+            Some(ScreenAction::InstallModel(model.id.clone())),
+            model.install_action_enabled,
+            model.primary_action_disabled_reason.as_deref().or_else(|| {
+                (!model.install_supported)
+                    .then_some("This model has no supported managed download in this build.")
+            }),
+        ),
+        ModelCard::Remote(_, variant) => {
+            let remote_action = remote_primary_action(variant);
+            (
+                remote_action.map(|action| screen_action_for_remote_catalog_action(&action.kind)),
+                remote_action.is_some_and(|action| action.enabled),
+                remote_action.and_then(|action| action.disabled_reason.as_deref()),
+            )
+        }
+    };
+    let fill = if primary_enabled && primary_response.hovered() {
+        colors.active_card_bg
+    } else {
+        colors.card_bg
+    };
+    ui.painter().rect(
+        card_rect,
+        Rounding::same(6.0),
+        fill,
+        Stroke::new(1.0, colors.border),
+    );
+    ui.ctx()
+        .accesskit_node_builder(primary_response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name(format!("{} model", card.display_name()));
+            if !primary_enabled {
+                builder.set_disabled();
+            }
+            if let Some(reason) = disabled_reason {
+                builder.set_description(reason);
+            }
+            builder.set_bounds(accesskit_rect(card_rect));
+        });
+    if let Some(reason) = disabled_reason {
+        focus_tooltip(ui, &primary_response, reason);
+        primary_response.clone().on_hover_text(reason);
+    }
+    paint_focus_ring(ui, &primary_response, Rounding::same(6.0));
+
+    let mut child_action = ScreenAction::None;
+    let mut content_ui = ui.child_ui(
+        card_rect.shrink2(Vec2::new(14.0, 10.0)),
+        Layout::top_down(Align::LEFT),
+    );
+    content_ui.set_clip_rect(card_rect.shrink(1.0));
+    content_ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new((ui.available_width() * 0.38).max(210.0), 72.0),
+            Layout::top_down(Align::LEFT),
+            |ui| match card {
+                ModelCard::Local(model) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&model.display_name).strong());
+                        if model.active {
+                            installed_model_badge(ui, "Active", Some(colors.success));
+                        } else if model.installed {
+                            installed_model_badge(ui, "Installed", None);
+                        }
+                        if model.recommended {
+                            installed_model_badge(ui, "Recommended", None);
+                        }
+                        if model.installed && !model.ready {
+                            installed_model_badge(ui, "Runtime not ready", Some(colors.warning));
+                        }
+                        if model.compatibility == super::state::ModelCompatibility::Incompatible {
+                            installed_model_badge(ui, "Unsupported", Some(colors.warning));
+                        }
+                    });
+                    ui.label(
+                        RichText::new(model_download_label(model))
+                            .small()
+                            .color(colors.muted_text),
+                    );
+                }
+                ModelCard::Remote(entry, variant) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&entry.display_name).strong());
+                        if entry.recommended {
+                            installed_model_badge(ui, "Recommended", Some(colors.success));
+                        }
+                        installed_model_badge(ui, &entry.trust_label, None);
+                    });
+                    ui.label(
+                        RichText::new(
+                            variant
+                                .status_label
+                                .as_deref()
+                                .unwrap_or("Available to install"),
+                        )
+                        .small()
+                        .color(colors.muted_text),
+                    );
+                }
+            },
+        );
+        ui.allocate_ui_with_layout(
+            Vec2::new((ui.available_width() * 0.42).max(190.0), 72.0),
+            Layout::top_down(Align::LEFT),
+            |ui| match card {
+                ModelCard::Local(model) => {
+                    metadata(ui, Icon::Globe, &model.language_summary);
+                    metadata(
+                        ui,
+                        Icon::Folder,
+                        model
+                            .total_bytes
+                            .or(model.disk_bytes)
+                            .map_or_else(|| size_label(model.size_tier).to_owned(), format_bytes)
+                            .as_str(),
+                    );
+                }
+                ModelCard::Remote(entry, variant) => {
+                    metadata(ui, Icon::Globe, &entry.language_summary);
+                    metadata(ui, Icon::Folder, &variant.size_label);
+                }
+            },
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| match card {
+            ModelCard::Local(model) => {
+                if model.installed {
+                    let details = button(ui, "Details", ButtonTone::Text);
+                    if details.clicked() {
+                        child_action = ScreenAction::ShowModelDetails(model.id.clone());
+                    }
+                    if model.removal_supported {
+                        let remove = ui
+                            .add_enabled_ui(!model.active, |ui| {
+                                button(ui, "Remove", ButtonTone::Text)
+                            })
+                            .inner;
+                        if model.active {
+                            let reason =
+                                "Select another ready model before removing the active model.";
+                            ui.ctx().accesskit_node_builder(remove.id, |builder| {
+                                builder.set_disabled();
+                                builder.set_description(reason);
+                            });
+                            focus_tooltip(ui, &remove, reason);
+                        }
+                        if remove.clicked() {
+                            child_action = ScreenAction::RequestModelRemoval(model.id.clone());
+                        }
+                    }
+                }
+                if model.cancel_supported {
+                    let cancel = button(ui, "Cancel", ButtonTone::Text);
+                    if cancel.clicked() {
+                        child_action = ScreenAction::CancelModelInstall(model.id.clone());
+                    }
+                }
+                ui.vertical(|ui| {
+                    metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
+                    ui.label(
+                        RichText::new(accuracy_label(model.size_tier))
+                            .small()
+                            .color(colors.muted_text),
+                    );
+                });
+            }
+            ModelCard::Remote(_, variant) => {
+                if let Some(cancel) = variant
+                    .actions
+                    .iter()
+                    .find(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. }))
+                {
+                    let response = ui
+                        .add_enabled_ui(cancel.enabled, |ui| button(ui, "Cancel", ButtonTone::Text))
+                        .inner;
+                    if response.clicked() {
+                        child_action = screen_action_for_remote_catalog_action(&cancel.kind);
+                    }
+                }
+                ui.vertical(|ui| {
+                    metadata(ui, Icon::Gauge, speed_label(variant.speed_tier));
+                    ui.label(
+                        RichText::new(accuracy_label(variant.size_tier))
+                            .small()
+                            .color(colors.muted_text),
+                    );
+                });
+            }
+        });
+    });
+    if let ModelCard::Local(model) = card
+        && model.download_state == ModelDownloadState::Downloading
+    {
+        let value = model
+            .total_bytes
+            .filter(|total| *total > 0)
+            .map_or(0.0, |total| {
+                (model.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
+            });
+        let progress_rect = egui::Rect::from_min_max(
+            egui::pos2(card_rect.left() + 14.0, card_rect.bottom() - 8.0),
+            egui::pos2(card_rect.right() - 14.0, card_rect.bottom() - 4.0),
+        );
+        let progress = content_ui.put(progress_rect, egui::ProgressBar::new(value));
+        content_ui
+            .ctx()
+            .accesskit_node_builder(progress.id, |builder| {
+                builder.set_role(egui::accesskit::Role::ProgressIndicator);
+                builder.set_name(format!("{} installation progress", model.display_name));
+                builder.set_numeric_value(f64::from(value * 100.0));
+                builder.set_min_numeric_value(0.0);
+                builder.set_max_numeric_value(100.0);
+            });
+    }
+
+    let mut action = if primary_enabled && primary_response.clicked() {
+        primary_action.unwrap_or(ScreenAction::None)
+    } else {
+        ScreenAction::None
+    };
+    if child_action != ScreenAction::None {
+        action = child_action;
+    }
+    (action, card_rect)
+}
+
+fn render_model_section(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    cards: &[ModelCard<'_>],
+    expanded: bool,
+    toggle_action: ScreenAction,
+    _terminal: bool,
+) -> ScreenAction {
+    let colors = ui_palette(ui);
+    let (header_rect, header) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
+    if header.hovered() {
+        ui.painter()
+            .rect_filled(header_rect, Rounding::same(5.0), colors.active_card_bg);
+    }
+    ui.allocate_ui_at_rect(header_rect.shrink2(Vec2::new(4.0, 0.0)), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{name} ({})", cards.len())).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(icon_glyph(if expanded {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    }))
+                    .color(colors.text),
+                );
+            });
+        });
+    });
+    ui.ctx().accesskit_node_builder(header.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Button);
+        builder.set_name(format!(
+            "{} {name} models",
+            if expanded { "Collapse" } else { "Expand" }
+        ));
+        builder.set_expanded(expanded);
+        builder.set_bounds(accesskit_rect(header_rect));
+    });
+    paint_focus_ring(ui, &header, Rounding::same(5.0));
+    let mut action = if header.clicked() {
+        toggle_action
+    } else {
+        ScreenAction::None
+    };
+    if !expanded || cards.is_empty() {
+        return action;
+    }
+
+    ui.add_space(MODEL_CARD_GAP);
+    let start_y = ui.cursor().top();
+    let stride = MODEL_CARD_HEIGHT + MODEL_CARD_GAP;
+    let clip = ui.clip_rect();
+    let first_visible = (((clip.top() - start_y) / stride).floor().max(0.0) as usize)
+        .saturating_sub(MODEL_CARD_OVERSCAN)
+        .min(cards.len());
+    let last_visible = (((clip.bottom() - start_y) / stride).ceil().max(0.0) as usize)
+        .saturating_add(MODEL_CARD_OVERSCAN)
+        .min(cards.len())
+        .max(first_visible);
+    let total_height = cards.len() as f32 * stride - MODEL_CARD_GAP;
+    if first_visible > 0 {
+        ui.allocate_space(Vec2::new(0.0, first_visible as f32 * stride));
+    }
+    for (index, card) in cards
+        .iter()
+        .enumerate()
+        .take(last_visible)
+        .skip(first_visible)
+    {
+        let (card_action, _card_rect) = render_model_card(ui, *card);
+        if card_action != ScreenAction::None {
+            action = card_action;
+        }
+        if index + 1 < cards.len() {
+            ui.add_space(MODEL_CARD_GAP);
+        }
+        #[cfg(test)]
+        if _terminal && index + 1 == cards.len() {
+            ui.data_mut(|data| {
+                data.insert_temp(egui::Id::new("models-final-card-rect"), _card_rect);
+            });
+        }
+    }
+    let rendered_end = if last_visible > first_visible {
+        last_visible as f32 * stride - MODEL_CARD_GAP
+    } else {
+        first_visible as f32 * stride
+    };
+    if rendered_end < total_height {
+        ui.allocate_space(Vec2::new(0.0, total_height - rendered_end));
+    }
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(("models-culling", name)),
+            (cards.len(), first_visible, last_visible),
+        );
+    });
+    action
+}
 
 fn models(
     ui: &mut egui::Ui,
@@ -1346,222 +1782,136 @@ fn models(
     model_catalog: &[ModelViewModel],
     comparison: &ModelComparisonState,
     management: &ModelManagementState,
+    language_filter: ModelLanguageFilter,
     remote_catalog: &RemoteCatalogView,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
     let dialog_active = management.dialog.is_some();
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.remove::<egui::Rect>(egui::Id::new("models-final-card-rect"));
+    });
     ui.add_enabled_ui(!dialog_active, |ui| {
-    ui.horizontal(|ui| {
+    let response = ui.label(RichText::new("Models").size(30.0).strong());
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Heading);
+        builder.set_bounds(accesskit_rect(response.rect));
+    });
+    ui.label(
+        RichText::new("Manage the speech models available on this device.")
+            .color(colors.muted_text),
+    );
+    if let Some(notice) = management.removal_notice.as_deref() {
+        let response = ui.label(RichText::new(notice).color(colors.muted_text));
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_live(egui::accesskit::Live::Polite);
+            builder.set_live_atomic();
+        });
+    }
+    ui.add_space(20.0);
+    ui.horizontal_wrapped(|ui| {
         ui.vertical(|ui| {
-            let response = ui.label(RichText::new("Models").size(30.0).strong());
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Heading);
-                builder.set_bounds(accesskit_rect(response.rect));
-            });
-            ui.label(
-                RichText::new("Manage the speech models available on this device.")
-                    .color(colors.muted_text),
+            let label = ui.label(RichText::new("Search").strong());
+            let mut query = remote_catalog.query.clone();
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .id_source("models-search")
+                    .hint_text("Name, language, or variant")
+                    .desired_width(320.0),
             );
-            if let Some(notice) = management.removal_notice.as_deref() {
-                let response = ui.label(RichText::new(notice).color(colors.muted_text));
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
-                });
+            search.clone().labelled_by(label.id);
+            if search.changed() {
+                action = ScreenAction::SetRemoteCatalogQuery(query);
             }
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let add_models = button(
-                ui,
-                format!("{}  Add models", icon_glyph(Icon::Plus)),
-                ButtonTone::Primary,
-            );
-            if management.restore_add_focus {
-                add_models.request_focus();
+        ui.vertical(|ui| {
+            let label = ui.label(RichText::new("Language").strong());
+            let mut selected = language_filter;
+            let combo = ComboBox::from_id_source("models-language")
+                .selected_text(selected.label())
+                .show_ui(ui, |ui| {
+                    for value in ModelLanguageFilter::ALL {
+                        ui.selectable_value(&mut selected, value, value.label());
+                    }
+                });
+            combo.response.clone().labelled_by(label.id);
+            if selected != language_filter {
+                action = ScreenAction::SetModelLanguageFilter(selected);
             }
-            if management.restore_after_removal_focus {
-                add_models.request_focus();
-            }
-            if add_models.clicked() {
-                action = ScreenAction::AddModel;
-            }
-            let eligible_models = models
-                .iter()
-                .filter(|model| {
-                    model.installed
-                        && model.ready
-                        && model.compatibility != super::state::ModelCompatibility::Incompatible
-                })
-                .count();
-            let compare_disabled_reason = if eligible_models < 2 {
-                let installed_count = models.iter().filter(|model| model.installed).count();
-                Some(if installed_count >= 2 {
-                    "At least two installed models must be compatible and runtime-ready to compare."
-                } else {
-                    "Install at least two compatible, runtime-ready models to compare them."
-                })
-            } else {
-                None
-            };
-            let compare = ui
-                .add_enabled_ui(compare_disabled_reason.is_none(), |ui| {
-                    button(ui, "Compare", ButtonTone::Secondary)
+        });
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Catalog").strong());
+            let refresh = ui
+                .add_enabled_ui(remote_catalog.refresh_enabled, |ui| {
+                    button(ui, "Refresh", ButtonTone::Secondary)
                 })
                 .inner;
-            if let Some(reason) = compare_disabled_reason {
-                ui.ctx().accesskit_node_builder(compare.id, |builder| {
-                    builder.set_description(reason);
-                });
-                focus_tooltip(ui, &compare, reason);
-                compare.clone().on_hover_text(reason);
+            if refresh.clicked() {
+                action = ScreenAction::RetryRemoteCatalog;
             }
-            if compare.clicked() {
-                action = ScreenAction::OpenComparison;
+        });
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Local file").strong());
+            let import = button(
+                ui,
+                format!("{}  Import", icon_glyph(Icon::Plus)),
+                ButtonTone::Primary,
+            );
+            if management.restore_add_focus || management.restore_after_removal_focus {
+                import.request_focus();
+            }
+            if import.clicked() {
+                action = ScreenAction::AddModel;
             }
         });
     });
-    ui.add_space(24.0);
-    if models.is_empty() {
-        card(ui, |ui| {
-            ui.label(RichText::new("No installed models").strong());
-            ui.label(
-                RichText::new("Add a curated model to begin local transcription.")
-                    .color(colors.muted_text),
-            );
-        });
-        ui.add_space(8.0);
-    }
-    for model in models {
-        let row_width = ui.available_width();
-        let row = Frame::none()
-            .fill(colors.card_bg)
-            .stroke(Stroke::new(1.0, colors.border))
-            .rounding(Rounding::same(6.0))
-            .inner_margin(Margin::symmetric(16.0, 14.0))
-            .show(ui, |ui| {
-                ui.set_width((row_width - 32.0).max(0.0));
-                ui.set_min_height(50.0);
-                if row_width >= INSTALLED_MODEL_WIDE_ROW_MIN_WIDTH {
-                    ui.horizontal(|ui| {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(190.0, 50.0),
-                            Layout::top_down(Align::LEFT),
-                            |ui| {
-                                ui.label(RichText::new(&model.display_name).strong());
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(205.0, 50.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                installed_model_badge(
-                                    ui,
-                                    if model.active { "Active" } else { "Installed" },
-                                    model.active.then_some(colors.success),
-                                );
-                                if model.recommended {
-                                    installed_model_badge(ui, "Recommended", None);
-                                }
-                                if !model.ready {
-                                    installed_model_badge(
-                                        ui,
-                                        "Runtime not ready",
-                                        Some(colors.warning),
-                                    );
-                                }
-                            },
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(icon_glyph(Icon::ChevronRight))
-                                    .small()
-                                    .color(colors.tertiary_text),
-                            )
-                            .on_hover_text("Open model details and actions");
-                            metadata(ui, Icon::Folder, size_label(model.size_tier));
-                            metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
-                            metadata(ui, Icon::Globe, &model.language_summary);
-                            if let Some(ram) = model.estimated_ram_bytes {
-                                metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
-                            }
-                        });
-                    });
-                } else {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(160.0);
-                            ui.label(RichText::new(&model.display_name).strong());
-                        });
-                        installed_model_badge(
-                            ui,
-                            if model.active { "Active" } else { "Installed" },
-                            model.active.then_some(colors.success),
-                        );
-                        if model.recommended {
-                            installed_model_badge(ui, "Recommended", None);
-                        }
-                        if !model.ready {
-                            installed_model_badge(
-                                ui,
-                                "Runtime not ready",
-                                Some(colors.warning),
-                            );
-                        }
-                        if let Some(ram) = model.estimated_ram_bytes {
-                            metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
-                        }
-                        metadata(ui, Icon::Globe, &model.language_summary);
-                        metadata(ui, Icon::Gauge, speed_label(model.speed_tier));
-                        metadata(ui, Icon::Folder, size_label(model.size_tier));
-                        ui.label(
-                            RichText::new(icon_glyph(Icon::ChevronRight))
-                                .small()
-                                .color(colors.tertiary_text),
-                        );
-                    });
-                }
-            })
-            .response;
-        let row = ui.interact(
-            row.rect,
-            ui.make_persistent_id(("installed-model-row", &model.id)),
-            Sense::click(),
+    ui.add_space(8.0);
+    let status = ui.label(RichText::new(&remote_catalog.status.message).color(
+        match remote_catalog.status.kind {
+            RemoteCatalogStatusKind::Error => colors.error,
+            RemoteCatalogStatusKind::Offline => colors.warning,
+            _ => colors.muted_text,
+        },
+    ));
+    ui.ctx().accesskit_node_builder(status.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Status);
+        builder.set_live(egui::accesskit::Live::Polite);
+        builder.set_live_atomic();
+    });
+    ui.add_space(12.0);
+    let (installed_cards, available_cards) = build_model_card_lists(
+        models,
+        model_catalog,
+        remote_catalog,
+        language_filter,
+    );
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let installed_action = render_model_section(
+            ui,
+            "Installed",
+            &installed_cards,
+            management.installed_expanded,
+            ScreenAction::ToggleInstalledModels,
+            available_cards.is_empty(),
         );
-        ui.ctx().accesskit_node_builder(row.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Button);
-            builder.set_name(format!(
-                "Open details for {}; variant {}",
-                model.display_name, model.variant_label
-            ));
-            builder.set_description("Open model details and actions.");
-            if dialog_active {
-                builder.set_disabled();
-            }
-            builder.set_bounds(egui::accesskit::Rect {
-                x0: row.rect.min.x.into(),
-                y0: row.rect.min.y.into(),
-                x1: row.rect.max.x.into(),
-                y1: row.rect.max.y.into(),
-            });
-        });
-        if management.restore_details_focus.as_deref() == Some(model.id.as_str())
-            || management.restore_remove_focus.as_deref() == Some(model.id.as_str())
-        {
-            row.request_focus();
+        if installed_action != ScreenAction::None {
+            action = installed_action;
         }
-        paint_focus_ring(ui, &row, Rounding::same(6.0));
-        if row.clicked() {
-            action = ScreenAction::ShowModelDetails(model.id.clone());
+        ui.add_space(12.0);
+        let available_action = render_model_section(
+            ui,
+            "Available",
+            &available_cards,
+            management.available_expanded,
+            ScreenAction::ToggleAvailableModels,
+            true,
+        );
+        if available_action != ScreenAction::None {
+            action = available_action;
         }
-        ui.add_space(8.0);
-    }
-    let used_bytes: u64 = models
-        .iter()
-        .map(|model| model.disk_bytes)
-        .collect::<Option<Vec<_>>>()
-        .map(|values| values.into_iter().sum())
-        .unwrap_or_default();
+    });
     let comparison_viewport = ui
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
         .unwrap_or_else(|| ui.clip_rect());
@@ -1587,7 +1937,9 @@ fn models(
         })
         .fixed_pos(egui::pos2(
             comparison_viewport.left() + ROUTE_HORIZONTAL_INSET,
-            comparison_viewport.bottom() - comparison_max_height,
+            comparison_viewport.bottom()
+                - MODEL_COMPARISON_BOTTOM_GAP
+                - comparison_max_height,
         ))
         .movable(false)
         .interactable(!dialog_active)
@@ -1901,27 +2253,30 @@ fn models(
         .accesskit_node_builder(comparison_surface_id, |builder| {
             builder.set_bounds(accesskit_rect(comparison_surface_rect));
         });
-    if used_bytes > 0 {
-        ui.add_space(12.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{}  Storage: {} used",
-                    icon_glyph(Icon::Storage),
-                    format_bytes(used_bytes)
-                ))
-                .small()
-                .color(colors.muted_text)
-                .strong(),
-            );
-        });
-    }
-    ui.add_space(24.0);
-    render_remote_catalog(ui, remote_catalog, &mut action);
-    ui.add_space(
-        comparison_surface_rect.height() + MODEL_COMPARISON_DOCK_INSET
-            - ui.spacing().item_spacing.y,
-    );
+    let terminal_spacer_height = comparison_surface_rect.height()
+        + MODEL_LIST_TO_DOCK_GAP
+        + MODEL_COMPARISON_BOTTOM_GAP
+        - ui.spacing().item_spacing.y;
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("models-layout-diagnostics"),
+            (
+                comparison_viewport,
+                comparison_surface_rect,
+                ui.cursor().top(),
+                terminal_spacer_height,
+            ),
+        );
+    });
+    ui.add_space(terminal_spacer_height);
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("models-comparison-dock-rect"),
+            comparison_surface_rect,
+        );
+    });
     });
     // The disabled scope above is the primary boundary for both pointer and
     // assistive actions. Keep this guard as a defense in depth measure for
@@ -1947,12 +2302,12 @@ fn models(
             let dialog_ctx = ui.ctx().clone();
             dialog_ctx.accesskit_node_builder(dialog_accessibility_id, |builder| {
                 builder.set_role(egui::accesskit::Role::Dialog);
-                builder.set_name("Add models");
+                builder.set_name("Import local GGUF");
                 builder.set_modal();
             });
             let mut dialog = None;
             dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
-                dialog = egui::Window::new("Add models")
+                dialog = egui::Window::new("Import local GGUF")
                     .id(ui.make_persistent_id(("model-dialog", "add")))
                     .collapsible(false)
                     .resizable(false)
@@ -1961,73 +2316,77 @@ fn models(
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ui.ctx(), |ui| {
                     ui.set_enabled(true);
-                    if let Some(reason) = &management.mutation_block_reason {
-                        ui.label(RichText::new(reason).color(colors.warning));
-                        ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "Validate an existing .gguf file in place. Scribe never copies, uploads, or deletes the source file.",
+                        )
+                        .color(colors.muted_text),
+                    );
+                    ui.add_space(10.0);
+                    let label = ui.label(RichText::new("GGUF file path").strong());
+                    let mut path = remote_catalog.local_import.path.clone();
+                    let path_input = ui
+                        .add_enabled_ui(!remote_catalog.local_import.in_progress, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut path)
+                                    .id_source("local-gguf-import-path")
+                                    .hint_text("C:\\Models\\model.gguf")
+                                    .desired_width(440.0),
+                            )
+                        })
+                        .inner;
+                    path_input.clone().labelled_by(label.id);
+                    ui.ctx().accesskit_node_builder(path_input.id, |builder| {
+                        builder.set_name("GGUF file path");
+                    });
+                    if !remote_catalog.local_import.in_progress {
+                        initial_focus = Some(path_input.id);
+                        focusable_controls.push(path_input.id);
+                        mark_accesskit_enabled(ui, &path_input);
                     }
-                    for model in model_catalog {
-                        card(ui, |ui| {
-                            ui.label(RichText::new(&model.display_name).strong());
-                            if let Some(description) = &model.description {
-                                ui.label(description);
-                            }
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(model_download_label(model)).color(colors.muted_text));
-                                if let Some(total) = model.total_bytes {
-                                    ui.label(RichText::new(format_bytes(total)).small().color(colors.muted_text));
-                                }
-                                let can_cancel = model.cancel_supported;
-                                let install = ui.add_enabled(
-                                    model.install_action_enabled,
-                                    egui::Button::new(model_install_action_label(model.download_state)),
-                                );
-                                if model.install_action_enabled {
-                                    focusable_controls.push(install.id);
-                                    mark_accesskit_enabled(ui, &install);
-                                }
-                                let install_reason = if !model.install_supported {
-                                    Some("This model has no supported managed download in this build.")
-                                } else {
-                                    management.mutation_block_reason.as_deref()
-                                };
-                                if let Some(reason) = install_reason {
-                                    ui.ctx().accesskit_node_builder(install.id, |builder| {
-                                        builder.set_description(reason);
-                                    });
-                                    ui.label(RichText::new(reason).small().color(colors.muted_text));
-                                    install.clone().on_hover_text(reason);
-                                }
-                                if model.download_state == ModelDownloadState::Downloading {
-                                    let progress_value = model.total_bytes.filter(|total| *total > 0).map_or(0.0, |total| {
-                                        (model.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0)
-                                    });
-                                    let progress = ui.add(egui::ProgressBar::new(progress_value).text(model_download_label(model)));
-                                    ui.ctx().accesskit_node_builder(progress.id, |builder| {
-                                        builder.set_role(egui::accesskit::Role::ProgressIndicator);
-                                        builder.set_name(format!("{} installation progress", model.display_name));
-                                        builder.set_description(model_download_label(model));
-                                        builder.set_numeric_value(f64::from(progress_value * 100.0));
-                                        builder.set_min_numeric_value(0.0);
-                                        builder.set_max_numeric_value(100.0);
-                                    });
-                                }
-                                if install.clicked() {
-                                    action = ScreenAction::InstallModel(model.id.clone());
-                                }
-                                let cancel = ui.add_enabled(can_cancel, egui::Button::new("Cancel"));
-                                if can_cancel {
-                                    focusable_controls.push(cancel.id);
-                                    mark_accesskit_enabled(ui, &cancel);
-                                }
-                                if cancel.clicked() {
-                                    action = ScreenAction::CancelModelInstall(model.id.clone());
-                                }
+                    if path_input.changed() {
+                        action = ScreenAction::SetLocalGgufImportPath(path);
+                    }
+                    if let Some(reason) = remote_catalog.local_import.disabled_reason.as_deref() {
+                        ui.label(RichText::new(reason).small().color(colors.warning));
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if remote_catalog.local_import.in_progress {
+                            let progress = ui.add(egui::ProgressBar::new(0.0).animate(true).text("Validating local file"));
+                            ui.ctx().accesskit_node_builder(progress.id, |builder| {
+                                builder.set_role(egui::accesskit::Role::ProgressIndicator);
+                                builder.set_name("Local GGUF validation progress");
                             });
-                        });
-                        ui.add_space(6.0);
-                    }
+                            let cancel = button(ui, "Cancel validation", ButtonTone::Secondary);
+                            initial_focus.get_or_insert(cancel.id);
+                            focusable_controls.push(cancel.id);
+                            mark_accesskit_enabled(ui, &cancel);
+                            if cancel.clicked() {
+                                action = ScreenAction::CancelLocalGgufImport;
+                            }
+                        } else {
+                            let import = ui
+                                .add_enabled_ui(remote_catalog.local_import.import_enabled, |ui| {
+                                    button(ui, "Validate and import", ButtonTone::Primary)
+                                })
+                                .inner;
+                            if remote_catalog.local_import.import_enabled {
+                                focusable_controls.push(import.id);
+                                mark_accesskit_enabled(ui, &import);
+                            } else {
+                                ui.ctx().accesskit_node_builder(import.id, |builder| {
+                                    builder.set_disabled();
+                                });
+                            }
+                            if import.clicked() {
+                                action = ScreenAction::ValidateAndImportLocalGguf;
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
                     let close = button(ui, "Close", ButtonTone::Secondary);
-                    initial_focus = Some(close.id);
+                    initial_focus.get_or_insert(close.id);
                     focusable_controls.push(close.id);
                     mark_accesskit_enabled(ui, &close);
                     if close.clicked() {
@@ -2295,298 +2654,6 @@ fn models(
         None => {}
     }
     action
-}
-
-pub(crate) fn render_remote_catalog(
-    ui: &mut egui::Ui,
-    catalog: &RemoteCatalogView,
-    action: &mut ScreenAction,
-) {
-    let colors = ui_palette(ui);
-    ui.separator();
-    ui.add_space(16.0);
-    ui.label(
-        RichText::new("Discover compatible models")
-            .size(20.0)
-            .strong(),
-    );
-    ui.label(
-        RichText::new(
-            "Browse revision-pinned models discovered by Scribe from a trusted public publisher.",
-        )
-        .color(colors.muted_text),
-    );
-    ui.add_space(12.0);
-
-    card(ui, |ui| {
-        ui.label(RichText::new("Import local GGUF").strong());
-        ui.label(
-            RichText::new(
-                "Validate an existing .gguf file in place. Scribe hashes and smoke-tests it locally, but never copies, uploads, or deletes the source file.",
-            )
-            .color(colors.muted_text),
-        );
-        ui.add_space(8.0);
-        let label = ui.label(RichText::new("GGUF file path").strong());
-        ui.ctx().accesskit_node_builder(label.id, |builder| {
-            builder.set_role(egui::accesskit::Role::StaticText)
-        });
-        let mut path = catalog.local_import.path.clone();
-        let path_input = ui
-            .add_enabled_ui(!catalog.local_import.in_progress, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut path)
-                        .id_source("local-gguf-import-path")
-                        .hint_text("C:\\Models\\model.gguf")
-                        .desired_width(f32::INFINITY),
-                )
-            })
-            .inner;
-        path_input.clone().labelled_by(label.id);
-        if path_input.changed() {
-            *action = ScreenAction::SetLocalGgufImportPath(path);
-        }
-
-        ui.add_space(8.0);
-        if catalog.local_import.in_progress {
-            ui.horizontal_wrapped(|ui| {
-                badge(ui, "Validating local file", None);
-                if button(ui, "Cancel import", ButtonTone::Secondary).clicked() {
-                    *action = ScreenAction::CancelLocalGgufImport;
-                }
-            });
-        } else {
-            let import = ui
-                .add_enabled_ui(catalog.local_import.import_enabled, |ui| {
-                    button(ui, "Validate and import", ButtonTone::Secondary)
-                })
-                .inner;
-            if !catalog.local_import.import_enabled {
-                ui.ctx().accesskit_node_builder(import.id, |builder| {
-                    builder.set_disabled();
-                });
-            }
-            if let Some(reason) = catalog.local_import.disabled_reason.as_deref() {
-                ui.ctx().accesskit_node_builder(import.id, |builder| {
-                    builder.set_description(reason);
-                });
-                focus_tooltip(ui, &import, reason);
-                import.clone().on_hover_text(reason);
-            }
-            if import.clicked() {
-                *action = ScreenAction::ValidateAndImportLocalGguf;
-            }
-        }
-    });
-
-    ui.add_space(12.0);
-
-    card(ui, |ui| {
-        let label = ui.label(RichText::new("Search imports and trusted catalog").strong());
-        ui.ctx().accesskit_node_builder(label.id, |builder| {
-            builder.set_role(egui::accesskit::Role::StaticText)
-        });
-        let mut query = catalog.query.clone();
-        let search = ui.add(
-            egui::TextEdit::singleline(&mut query)
-                .id_source("remote-catalog-query")
-                .hint_text("Name, language, or filename")
-                .desired_width(f32::INFINITY),
-        );
-        search.clone().labelled_by(label.id);
-        if search.changed() {
-            *action = ScreenAction::SetRemoteCatalogQuery(query);
-        }
-
-        ui.add_space(8.0);
-        ui.label(RichText::new("Trusted catalog filters").strong());
-        let RemoteCatalogFilters {
-            installed_only,
-            recommended_only,
-            multilingual_only,
-            size_tier,
-        } = catalog.filters;
-        ui.horizontal_wrapped(|ui| {
-            let mut selected = installed_only;
-            if ui
-                .checkbox(&mut selected, "Installed trusted catalog models only")
-                .changed()
-            {
-                *action = ScreenAction::SetRemoteCatalogInstalledOnly(selected);
-            }
-            let mut selected = recommended_only;
-            if ui
-                .checkbox(&mut selected, "Recommended trusted catalog models only")
-                .changed()
-            {
-                *action = ScreenAction::SetRemoteCatalogRecommendedOnly(selected);
-            }
-            let mut selected = multilingual_only;
-            if ui
-                .checkbox(&mut selected, "Multilingual trusted catalog models only")
-                .changed()
-            {
-                *action = ScreenAction::SetRemoteCatalogMultilingualOnly(selected);
-            }
-        });
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.vertical(|ui| {
-                let label = ui.label("Trusted catalog size tier");
-                let mut selected = size_tier;
-                let combo = ComboBox::from_id_source("remote-catalog-size-tier")
-                    .selected_text(selected.label())
-                    .show_ui(ui, |ui| {
-                        for tier in RemoteCatalogSizeTier::ALL {
-                            ui.selectable_value(&mut selected, tier, tier.label());
-                        }
-                    });
-                combo.response.clone().labelled_by(label.id);
-                ui.ctx()
-                    .accesskit_node_builder(combo.response.id, |builder| {
-                        builder.set_description(
-                            "Filters by the smallest available GGUF variant for each catalog model.",
-                        );
-                    });
-                if selected != size_tier {
-                    *action = ScreenAction::SetRemoteCatalogSizeTier(selected);
-                }
-            });
-            ui.vertical(|ui| {
-                let label = ui.label("Sort trusted catalog results");
-                let mut selected = catalog.sort;
-                let combo = ComboBox::from_id_source("remote-catalog-sort")
-                    .selected_text(selected.label())
-                    .show_ui(ui, |ui| {
-                        for sort in RemoteCatalogSort::ALL {
-                            ui.selectable_value(&mut selected, sort, sort.label());
-                        }
-                    });
-                combo.response.clone().labelled_by(label.id);
-                if selected != catalog.sort {
-                    *action = ScreenAction::SetRemoteCatalogSort(selected);
-                }
-            });
-        });
-    });
-
-    ui.add_space(8.0);
-    ui.horizontal_wrapped(|ui| {
-        let status = ui.label(RichText::new(&catalog.status.message).color(
-            match catalog.status.kind {
-                RemoteCatalogStatusKind::Error => colors.error,
-                RemoteCatalogStatusKind::Offline => colors.warning,
-                _ => colors.muted_text,
-            },
-        ));
-        ui.ctx().accesskit_node_builder(status.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Status);
-            builder.set_live(egui::accesskit::Live::Polite);
-            builder.set_live_atomic();
-        });
-        if catalog.status.kind == RemoteCatalogStatusKind::Loading {
-            badge(ui, "Loading", None);
-        } else if catalog.status.kind == RemoteCatalogStatusKind::Offline {
-            badge(ui, "Offline", None);
-        }
-        let retry = ui
-            .add_enabled_ui(catalog.refresh_enabled, |ui| {
-                button(ui, "Refresh catalog", ButtonTone::Text)
-            })
-            .inner;
-        if retry.clicked() {
-            *action = ScreenAction::RetryRemoteCatalog;
-        }
-    });
-
-    if catalog.has_snapshot && catalog.entries.is_empty() {
-        ui.add_space(8.0);
-        card(ui, |ui| {
-            ui.label(RichText::new("No catalog matches").strong());
-            ui.label(
-                RichText::new("No trusted catalog models match the current search or filters.")
-                    .color(colors.muted_text),
-            );
-        });
-        return;
-    }
-
-    for entry in &catalog.entries {
-        ui.add_space(8.0);
-        let _entry_card = card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&entry.display_name).strong());
-                if entry.recommended {
-                    badge(ui, "Recommended", Some(colors.success));
-                }
-                badge(ui, &entry.trust_label, None);
-                badge(ui, "Experimental", Some(colors.warning));
-            });
-            ui.label(RichText::new(&entry.description).color(colors.muted_text));
-            if !entry.languages.is_empty() {
-                ui.label(
-                    RichText::new(format!("Languages: {}", entry.languages.join(", ")))
-                        .small()
-                        .color(colors.muted_text),
-                );
-            }
-            ui.label(
-                RichText::new(&entry.compatibility_detail)
-                    .small()
-                    .color(colors.muted_text),
-            );
-            ui.add_space(6.0);
-            for variant in &entry.variants {
-                ui.push_id((&entry.id, &variant.id), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(&variant.filename);
-                        badge(ui, &variant.size_label, None);
-                        if let Some(status) = variant.status_label.as_deref() {
-                            badge(ui, status, None);
-                        }
-                        for catalog_action in &variant.actions {
-                            let response = ui
-                                .add_enabled_ui(catalog_action.enabled, |ui| {
-                                    button(ui, &catalog_action.label, ButtonTone::Secondary)
-                                })
-                                .inner;
-                            if !catalog_action.enabled {
-                                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                                    builder.set_disabled();
-                                });
-                            }
-                            if let Some(reason) = catalog_action.disabled_reason.as_deref() {
-                                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                                    builder.set_description(reason);
-                                });
-                                focus_tooltip(ui, &response, reason);
-                                response.clone().on_hover_text(reason);
-                            }
-                            if response.clicked() {
-                                *action =
-                                    screen_action_for_remote_catalog_action(&catalog_action.kind);
-                            }
-                        }
-                    });
-                    ui.label(
-                        RichText::new(format!(
-                            "Source: {} @ {} · expected SHA-256 {}",
-                            entry.repository, entry.pinned_revision, variant.expected_sha256
-                        ))
-                        .small()
-                        .color(colors.muted_text),
-                    );
-                });
-            }
-        });
-        #[cfg(test)]
-        ui.data_mut(|data| {
-            data.insert_temp(
-                egui::Id::new("remote-catalog-final-entry-rect"),
-                _entry_card.rect,
-            );
-        });
-    }
 }
 
 fn model_download_label(model: &ModelViewModel) -> String {
@@ -3110,14 +3177,6 @@ fn comparison_accuracy_cell(
                 ScreenAction::None
             }
         }
-    }
-}
-
-fn model_install_action_label(state: ModelDownloadState) -> &'static str {
-    match state {
-        ModelDownloadState::Cancelled => "Resume",
-        ModelDownloadState::Failed => "Retry",
-        _ => "Install",
     }
 }
 
@@ -4208,6 +4267,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
@@ -4235,218 +4295,13 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
                 )
             });
         })
-    }
-
-    fn render_models_catalog(catalog: &RemoteCatalogView) -> egui::FullOutput {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                render_screen(
-                    ui,
-                    &ScreenView {
-                        route: UiRoute::Models,
-                        transcription: &Default::default(),
-                        models: &[],
-                        model_catalog: &[],
-                        comparison: &Default::default(),
-                        model_management: &Default::default(),
-                        remote_catalog: catalog,
-                        recording_settings: &Default::default(),
-                    },
-                )
-            });
-        })
-    }
-
-    #[test]
-    fn remote_catalog_search_filters_status_and_disabled_actions_are_accessible() {
-        let catalog = RemoteCatalogView {
-            local_import: super::super::state::LocalGgufImportView {
-                path: "C:\\Models\\candidate.gguf".into(),
-                in_progress: false,
-                import_enabled: false,
-                disabled_reason: Some("Finish the active model installation first.".into()),
-            },
-            filters: RemoteCatalogFilters {
-                installed_only: true,
-                ..Default::default()
-            },
-            status: super::super::state::RemoteCatalogStatusView {
-                kind: RemoteCatalogStatusKind::Offline,
-                message: "Bundled trusted catalog · Showing 1 of 1 trusted catalog models.".into(),
-            },
-            refresh_enabled: true,
-            has_snapshot: true,
-            entries: vec![super::super::state::RemoteCatalogEntryView {
-                id: "trusted/catalog-entry".into(),
-                display_name: "Catalog entry".into(),
-                description: "A revision-pinned speech model candidate.".into(),
-                languages: vec!["English".into()],
-                trust_label: "Trusted publisher".into(),
-                compatibility_detail: "Cross-platform validation is incomplete.".into(),
-                repository: "trusted/catalog-entry".into(),
-                pinned_revision: "1".repeat(40),
-                variants: vec![super::super::state::RemoteCatalogVariantView {
-                    id: "compact".into(),
-                    filename: "catalog-entry-q5.gguf".into(),
-                    size_label: "82 MB".into(),
-                    status_label: Some("Pinned GGUF".into()),
-                    expected_sha256: "a".repeat(64),
-                    actions: vec![super::super::state::RemoteCatalogActionView {
-                        label: "Install".into(),
-                        kind: RemoteCatalogActionKind::Install {
-                            remote_model_id: "trusted/catalog-entry".into(),
-                            variant_id: "compact".into(),
-                        },
-                        enabled: false,
-                        disabled_reason: Some("Insufficient verified disk space.".into()),
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let output = render_models_catalog(&catalog);
-        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
-        let (import_label_id, import_label) = nodes
-            .iter()
-            .find(|(_, node)| node.name() == Some("GGUF file path"))
-            .expect("local GGUF path label");
-        assert_eq!(import_label.role(), egui::accesskit::Role::StaticText);
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::TextInput
-                && node.labelled_by().contains(import_label_id)
-        }));
-        let import = nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Validate and import")
-            })
-            .map(|(_, node)| node)
-            .expect("disabled local GGUF import action");
-        assert!(import.is_disabled());
-        assert_eq!(
-            import.description(),
-            Some("Finish the active model installation first.")
-        );
-        let (label_id, label) = nodes
-            .iter()
-            .find(|(_, node)| node.name() == Some("Search imports and trusted catalog"))
-            .expect("catalog search label");
-        assert_eq!(label.role(), egui::accesskit::Role::StaticText);
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::TextInput && node.labelled_by().contains(label_id)
-        }));
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::CheckBox
-                && node.name() == Some("Installed trusted catalog models only")
-                && node.checked() == Some(egui::accesskit::Checked::True)
-        }));
-        for name in ["Trusted catalog size tier", "Sort trusted catalog results"] {
-            let label_id = nodes
-                .iter()
-                .find_map(|(id, node)| (node.name() == Some(name)).then_some(id))
-                .expect("catalog combo label");
-            assert!(nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::ComboBox
-                    && node.labelled_by().contains(label_id)
-            }));
-        }
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Status
-                && node.name()
-                    == Some("Bundled trusted catalog · Showing 1 of 1 trusted catalog models.")
-                && node.live() == Some(egui::accesskit::Live::Polite)
-                && node.is_live_atomic()
-        }));
-        let install = nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button && node.name() == Some("Install")
-            })
-            .map(|(_, node)| node)
-            .expect("disabled catalog install action");
-        assert!(
-            install.is_disabled(),
-            "install node was not disabled: {install:?}"
-        );
-        assert_eq!(
-            install.description(),
-            Some("Insufficient verified disk space.")
-        );
-        assert!(
-            nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Experimental"))
-        );
-        assert!(nodes.iter().any(|(_, node)| {
-            node.name()
-                == Some(
-                    "Source: trusted/catalog-entry @ 1111111111111111111111111111111111111111 · expected SHA-256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                )
-        }));
-    }
-
-    #[test]
-    fn remote_catalog_truthfully_renders_loading_error_and_no_results_states() {
-        for (kind, message, expected_marker) in [
-            (
-                RemoteCatalogStatusKind::Loading,
-                "Loading the trusted catalog.",
-                "Loading",
-            ),
-            (
-                RemoteCatalogStatusKind::Error,
-                "Catalog unavailable: network unavailable",
-                "Catalog unavailable",
-            ),
-        ] {
-            let output = render_models_catalog(&RemoteCatalogView {
-                status: super::super::state::RemoteCatalogStatusView {
-                    kind,
-                    message: message.into(),
-                },
-                refresh_enabled: kind != RemoteCatalogStatusKind::Loading,
-                ..Default::default()
-            });
-            let names = output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .into_iter()
-                .filter_map(|(_, node)| node.name().map(str::to_owned))
-                .collect::<Vec<_>>();
-            assert!(names.iter().any(|name| name.contains(expected_marker)));
-        }
-
-        let output = render_models_catalog(&RemoteCatalogView {
-            status: super::super::state::RemoteCatalogStatusView {
-                kind: RemoteCatalogStatusKind::Available,
-                message: "Live trusted catalog · Showing 0 of 2 trusted catalog models.".into(),
-            },
-            refresh_enabled: true,
-            has_snapshot: true,
-            ..Default::default()
-        });
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("No catalog matches"))
-        );
     }
 
     #[test]
@@ -4703,6 +4558,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
@@ -4767,6 +4623,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &settings,
                     },
@@ -4820,65 +4677,94 @@ mod tests {
     }
 
     #[test]
-    fn add_model_dialog_uses_resumable_install_labels_accessibly() {
-        for (state, label) in [
-            (ModelDownloadState::Cancelled, "Resume"),
-            (ModelDownloadState::Failed, "Retry"),
-            (ModelDownloadState::NotInstalled, "Install"),
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let model = ModelViewModel {
-                id: "base.en".into(),
-                display_name: "base.en".into(),
-                install_supported: true,
-                install_action_enabled: true,
-                download_state: state,
+    fn import_dialog_is_modal_labelled_and_excludes_catalog_models() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let catalog_model = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "Catalog model must stay outside import dialog".into(),
+            ..Default::default()
+        };
+        let remote_catalog = RemoteCatalogView {
+            local_import: super::super::state::LocalGgufImportView {
+                path: "C:\\Models\\candidate.gguf".into(),
+                import_enabled: true,
                 ..Default::default()
-            };
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    render_screen(
-                        ui,
-                        &ScreenView {
-                            route: UiRoute::Models,
-                            transcription: &Default::default(),
-                            models: &[],
-                            model_catalog: &[model],
-                            comparison: &Default::default(),
-                            model_management: &ModelManagementState {
-                                dialog: Some(ModelDialog::Add),
-                                ..Default::default()
-                            },
-                            remote_catalog: &Default::default(),
-                            recording_settings: &Default::default(),
+            },
+            ..Default::default()
+        };
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[catalog_model],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Add),
+                            focus_dialog_initial: true,
+                            ..Default::default()
                         },
-                    )
-                });
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &remote_catalog,
+                        recording_settings: &Default::default(),
+                    },
+                )
             });
-            assert!(
-                output
-                    .platform_output
-                    .accesskit_update
-                    .unwrap()
-                    .nodes
-                    .iter()
-                    .any(|(_, node)| node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some(label))
-            );
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        let dialog = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Dialog
+                    && node.name() == Some("Import local GGUF")
+            })
+            .expect("import dialog");
+        assert!(dialog.1.is_modal());
+        let path_label_id = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.name() == Some("GGUF file path")).then_some(id))
+            .expect("path label");
+        let path_input_id = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::TextInput
+                    && node.labelled_by().contains(path_label_id))
+                .then_some(id)
+            })
+            .expect("labelled path input");
+        assert_eq!(update.focus, *path_input_id);
+        for name in ["Validate and import", "Close"] {
+            assert!(update.nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
+            }));
         }
+        let (catalog_id, catalog_node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.name() == Some("Catalog model must stay outside import dialog model")
+            })
+            .expect("disabled catalog card behind modal");
+        assert!(catalog_node.is_disabled());
+        assert!(!dialog.1.children().contains(catalog_id));
     }
 
     #[test]
-    fn model_dialogs_expose_progress_values_and_disclosure_state() {
-        let downloading = ModelViewModel {
-            id: "base.en".into(),
-            display_name: "whisper.cpp base.en".into(),
-            install_supported: true,
-            install_action_enabled: false,
-            download_state: ModelDownloadState::Downloading,
-            downloaded_bytes: 50,
-            total_bytes: Some(100),
+    fn model_dialogs_expose_import_progress_and_runtime_disclosure_state() {
+        let remote_catalog = RemoteCatalogView {
+            local_import: super::super::state::LocalGgufImportView {
+                in_progress: true,
+                path: "C:\\Models\\candidate.gguf".into(),
+                import_enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ctx = egui::Context::default();
@@ -4891,28 +4777,42 @@ mod tests {
                         route: UiRoute::Models,
                         transcription: &Default::default(),
                         models: &[],
-                        model_catalog: &[downloading],
+                        model_catalog: &[],
                         comparison: &Default::default(),
                         model_management: &ModelManagementState {
                             dialog: Some(ModelDialog::Add),
+                            focus_dialog_initial: true,
                             ..Default::default()
                         },
-                        remote_catalog: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &remote_catalog,
                         recording_settings: &Default::default(),
                     },
                 );
             });
         });
-        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Dialog && node.name() == Some("Add models")
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Dialog
+                && node.name() == Some("Import local GGUF")
+                && node.is_modal()
         }));
-        assert!(nodes.iter().any(|(_, node)| {
+        assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ProgressIndicator
-                && node.name() == Some("whisper.cpp base.en installation progress")
-                && node.numeric_value() == Some(50.0)
-                && node.min_numeric_value() == Some(0.0)
-                && node.max_numeric_value() == Some(100.0)
+                && node.name() == Some("Local GGUF validation progress")
+        }));
+        let cancel_id = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Cancel validation"))
+                .then_some(id)
+            })
+            .expect("cancel validation button");
+        assert_eq!(update.focus, *cancel_id);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Close")
         }));
 
         let details = ModelViewModel {
@@ -4935,6 +4835,7 @@ mod tests {
                             dialog: Some(ModelDialog::Details("base.en".into())),
                             ..Default::default()
                         },
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
@@ -4958,12 +4859,17 @@ mod tests {
     }
 
     #[test]
-    fn model_rows_open_details_without_exposing_actions_in_the_list() {
+    fn installed_model_cards_expose_disabled_primary_reason_and_details_child() {
         let model = ModelViewModel {
             id: "base.en".into(),
             display_name: "whisper.cpp base.en".into(),
             variant_label: "base.en".into(),
+            installed: true,
             active: true,
+            ready: true,
+            primary_action_label: "Active".into(),
+            primary_action_disabled_reason: Some("This model is already active.".into()),
+            removal_supported: true,
             ..Default::default()
         };
         let comparison = ModelComparisonState {
@@ -4983,6 +4889,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },
@@ -4992,14 +4899,20 @@ mod tests {
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Open details for whisper.cpp base.en; variant base.en")
-                && node.description() == Some("Open model details and actions.")
+                && node.name() == Some("whisper.cpp base.en model")
+                && node.is_disabled()
+                && node.description() == Some("This model is already active.")
         }));
-        assert!(
-            !nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Remove whisper.cpp base.en"))
-        );
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Details")
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Remove")
+                && node.is_disabled()
+                && node.description()
+                    == Some("Select another ready model before removing the active model.")
+        }));
         assert!(nodes.iter().any(|(_, node)| {
             node.name() == Some("Collapse comparison") && node.is_expanded() == Some(true)
         }));
@@ -5032,6 +4945,7 @@ mod tests {
                         model_catalog: &[],
                         comparison: &comparison,
                         model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
                         remote_catalog: &Default::default(),
                         recording_settings: &Default::default(),
                     },

@@ -154,29 +154,6 @@ pub(crate) fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) -> Response 
     .response
 }
 
-pub(crate) fn badge(ui: &mut Ui, text: &str, dot: Option<Color32>) {
-    let colors = ui_palette(ui);
-    Frame::none()
-        .fill(colors.panel_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(999.0))
-        .inner_margin(Margin::symmetric(8.0, 4.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(dot) = dot {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.0, dot);
-                }
-                ui.label(
-                    egui::RichText::new(text)
-                        .small()
-                        .color(colors.muted_text)
-                        .strong(),
-                );
-            });
-        });
-}
-
 pub(crate) fn keycap(ui: &mut Ui, text: &str) {
     let colors = ui_palette(ui);
     Frame::none()
@@ -247,7 +224,6 @@ pub(crate) enum Icon {
     Copy,
     ChevronDown,
     ChevronUp,
-    ChevronRight,
     Stop,
     MicrophoneOff,
     Keyboard,
@@ -256,7 +232,6 @@ pub(crate) enum Icon {
     Globe,
     Gauge,
     Folder,
-    Storage,
     Plus,
 }
 
@@ -274,7 +249,6 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Copy => regular::COPY,
         Icon::ChevronDown => regular::CARET_DOWN,
         Icon::ChevronUp => regular::CARET_UP,
-        Icon::ChevronRight => regular::CARET_RIGHT,
         Icon::Stop => regular::STOP,
         Icon::MicrophoneOff => regular::MICROPHONE_SLASH,
         Icon::Keyboard => regular::KEYBOARD,
@@ -282,7 +256,6 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Globe => regular::GLOBE,
         Icon::Gauge => regular::GAUGE,
         Icon::Folder => regular::FOLDER,
-        Icon::Storage => regular::HARD_DRIVES,
         Icon::Plus => regular::PLUS,
     }
 }
