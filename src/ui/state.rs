@@ -480,8 +480,8 @@ pub(crate) struct RemoteCatalogView {
     pub sort: RemoteCatalogSort,
     pub status: RemoteCatalogStatusView,
     pub refresh_enabled: bool,
-    /// True only when the backend has a validated snapshot, including an
-    /// offline cache or bundled fallback.
+    /// True only when the backend has a validated in-memory network snapshot
+    /// or the bundled fallback.
     pub has_snapshot: bool,
     pub entries: Vec<RemoteCatalogEntryView>,
 }
