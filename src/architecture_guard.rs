@@ -238,8 +238,8 @@ fn route_shell_has_no_synthetic_models_scroll_surface() {
     assert!(screens.contains("comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0"));
     assert!(app.contains("show_route_scroll(ui, UiRoute::Models"));
     assert!(app.contains("show_route_scroll(ui, UiRoute::History"));
-    assert!(app.contains("show_route_scroll(ui, UiRoute::About"));
-    assert!(app.contains("show_route_scroll(ui, UiRoute::Debug"));
+    assert!(app.contains("SettingsTab::About"));
+    assert!(app.contains("passive_microphone_monitor_needed"));
     assert!(
         !app.contains("page-scroll"),
         "legacy pages must not reintroduce an inner route scroll area"

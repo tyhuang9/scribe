@@ -3676,6 +3676,11 @@ fn settings(
     state: &TranscriptionState,
     settings: &RecordingSettingsView,
 ) -> ScreenAction {
+    let active_tab = if active_tab == SettingsTab::Output {
+        SettingsTab::General
+    } else {
+        active_tab
+    };
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
     ui.horizontal(|ui| {
@@ -3718,8 +3723,8 @@ fn settings(
             for (tab, label) in [
                 (SettingsTab::General, "General"),
                 (SettingsTab::Recording, "Recording"),
-                (SettingsTab::Output, "Output"),
                 (SettingsTab::Advanced, "Advanced"),
+                (SettingsTab::About, "About"),
             ] {
                 let response = tab_control(ui, tab, label, tab == active_tab);
                 tab_ids.push((tab, response.id));
@@ -3755,9 +3760,11 @@ fn settings(
         ui.set_width(ui.available_width());
         match active_tab {
             SettingsTab::Recording => recording_settings_panel(ui, state, settings, &mut action),
-            SettingsTab::General => general_settings_panel(ui, settings, &mut action),
-            SettingsTab::Output => output_settings_panel(ui, settings, &mut action),
+            SettingsTab::General | SettingsTab::Output => {
+                general_settings_panel(ui, settings, &mut action)
+            }
             SettingsTab::Advanced => advanced_settings_panel(ui, settings, &mut action),
+            SettingsTab::About => about_settings_panel(ui, settings),
         }
     });
     ui.ctx()
@@ -3766,8 +3773,8 @@ fn settings(
             builder.set_name(match active_tab {
                 SettingsTab::General => "General settings",
                 SettingsTab::Recording => "Recording settings",
-                SettingsTab::Output => "Output settings",
                 SettingsTab::Advanced => "Advanced settings",
+                SettingsTab::About => "About Scribe",
             });
         });
     let selected_tab_id = tab_ids
@@ -3795,7 +3802,7 @@ fn tab_id(_: &egui::Ui, tab: SettingsTab) -> egui::Id {
 
 fn tab_control(ui: &mut egui::Ui, tab: SettingsTab, label: &str, selected: bool) -> egui::Response {
     let colors = ui_palette(ui);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 40.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 44.0), egui::Sense::hover());
     let response = ui.interact(rect, tab_id(ui, tab), egui::Sense::click());
     let fill = if !selected && response.hovered() {
         colors.panel_bg
@@ -4267,6 +4274,8 @@ fn general_settings_panel(
             ui.label(RichText::new("The overlay is unavailable because focus safety is not verified on this platform.").color(ui_palette(ui).warning));
         }
     });
+    ui.add_space(16.0);
+    output_settings_panel(ui, settings, action);
 }
 
 fn output_settings_panel(
@@ -4308,6 +4317,23 @@ fn output_settings_panel(
                 ui.label(RichText::new(notice).color(ui_palette(ui).muted_text));
             }
         });
+    });
+}
+
+fn about_settings_panel(ui: &mut egui::Ui, settings: &RecordingSettingsView) {
+    settings_section(ui, "About Scribe", |ui| {
+        ui.label("Scribe keeps audio and transcripts on this device.");
+        ui.label(
+            RichText::new("Redacted diagnostics are available from the native Settings view.")
+                .color(ui_palette(ui).muted_text),
+        );
+        if !settings.diagnostics.is_empty() {
+            ui.separator();
+            ui.label(RichText::new("Diagnostics").strong());
+            for line in &settings.diagnostics {
+                ui.label(line);
+            }
+        }
     });
 }
 
@@ -4628,17 +4654,41 @@ fn input_sensitivity_meter_slider(
     response
 }
 
+struct SettingsSection;
+
+impl SettingsSection {
+    fn show(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+        ui.label(RichText::new(title).strong());
+        ui.add_space(6.0);
+        contents(ui);
+    }
+}
+
+fn settings_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    SettingsSection::show(ui, title, contents);
+}
+
 fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui, egui::Id)) {
-    ui.horizontal(|ui| {
-        let label = ui.add_sized(
-            [270.0, 40.0],
-            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-        );
-        contents(ui, label.id);
+    let compact = current_content_width(ui) < 620.0;
+    let row = ui.scope(|ui| {
+        ui.set_min_height(56.0);
+        if compact {
+            ui.vertical(|ui| {
+                let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+                contents(ui, label.id);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let label = ui.add_sized(
+                    [270.0, 44.0],
+                    egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+                );
+                contents(ui, label.id);
+            });
+        }
     });
-    ui.add_space(8.0);
     ui.separator();
-    ui.add_space(8.0);
+    let _ = row;
 }
 
 fn compact_setting_row(
@@ -4647,12 +4697,23 @@ fn compact_setting_row(
     separator_after: bool,
     contents: impl FnOnce(&mut egui::Ui, egui::Id),
 ) {
-    ui.horizontal(|ui| {
-        let label = ui.add_sized(
-            [270.0, 40.0],
-            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-        );
-        contents(ui, label.id);
+    let compact = current_content_width(ui) < 620.0;
+    ui.scope(|ui| {
+        ui.set_min_height(56.0);
+        if compact {
+            ui.vertical(|ui| {
+                let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+                contents(ui, label.id);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let label = ui.add_sized(
+                    [270.0, 44.0],
+                    egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+                );
+                contents(ui, label.id);
+            });
+        }
     });
     if separator_after {
         ui.separator();
@@ -4662,17 +4723,18 @@ fn compact_setting_row(
 fn next_tab(tab: SettingsTab) -> SettingsTab {
     match tab {
         SettingsTab::General => SettingsTab::Recording,
-        SettingsTab::Recording => SettingsTab::Output,
-        SettingsTab::Output => SettingsTab::Advanced,
-        SettingsTab::Advanced => SettingsTab::General,
+        SettingsTab::Recording | SettingsTab::Output => SettingsTab::Advanced,
+        SettingsTab::Advanced => SettingsTab::About,
+        SettingsTab::About => SettingsTab::General,
     }
 }
 fn previous_tab(tab: SettingsTab) -> SettingsTab {
     match tab {
-        SettingsTab::General => SettingsTab::Advanced,
+        SettingsTab::General => SettingsTab::About,
         SettingsTab::Recording => SettingsTab::General,
         SettingsTab::Output => SettingsTab::Recording,
-        SettingsTab::Advanced => SettingsTab::Output,
+        SettingsTab::Advanced => SettingsTab::Recording,
+        SettingsTab::About => SettingsTab::Advanced,
     }
 }
 fn format_bytes(bytes: u64) -> String {
@@ -5651,12 +5713,17 @@ mod tests {
                 "Recording behavior",
                 "Output settings",
             ),
-            (SettingsTab::Output, "Output settings", "Recording behavior"),
+            (
+                SettingsTab::Output,
+                "General settings",
+                "Recording behavior",
+            ),
             (
                 SettingsTab::Advanced,
                 "Advanced settings",
                 "Recording behavior",
             ),
+            (SettingsTab::About, "About Scribe", "Recording behavior"),
         ] {
             let output = render_route(UiRoute::Settings(tab));
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
@@ -5668,8 +5735,9 @@ mod tests {
                             == Some(match tab {
                                 SettingsTab::General => "General settings",
                                 SettingsTab::Recording => "Recording settings",
-                                SettingsTab::Output => "Output settings",
+                                SettingsTab::Output => "General settings",
                                 SettingsTab::Advanced => "Advanced settings",
+                                SettingsTab::About => "About Scribe",
                             }))
             );
             assert!(nodes.iter().any(|(_, node)| node.name() == Some(expected)));
@@ -5827,8 +5895,8 @@ mod tests {
         for tab in [
             SettingsTab::General,
             SettingsTab::Recording,
-            SettingsTab::Output,
             SettingsTab::Advanced,
+            SettingsTab::About,
         ] {
             let output = render_route(UiRoute::Settings(tab));
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
@@ -5978,7 +6046,7 @@ mod tests {
                 });
             },
         );
-        for expected in [SettingsTab::Recording, SettingsTab::Output] {
+        for expected in [SettingsTab::Recording, SettingsTab::Advanced] {
             let mut arrow_action = ScreenAction::None;
             let _ = ctx.run(
                 egui::RawInput {
@@ -6025,8 +6093,9 @@ mod tests {
                                 == Some(match active {
                                     SettingsTab::General => "General",
                                     SettingsTab::Recording => "Recording",
-                                    SettingsTab::Output => "Output",
+                                    SettingsTab::Output => "General",
                                     SettingsTab::Advanced => "Advanced",
+                                    SettingsTab::About => "About",
                                 })
                     })
             );

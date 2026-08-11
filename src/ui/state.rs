@@ -7,8 +7,10 @@ pub(crate) enum SettingsTab {
     #[default]
     General,
     Recording,
+    /// Legacy route retained so saved/deep links can be normalized to General.
     Output,
     Advanced,
+    About,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

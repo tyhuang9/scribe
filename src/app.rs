@@ -3193,11 +3193,8 @@ impl LocalTranscriberApp {
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.capture_is_active() {
+        if self.capture_is_active() || self.microphone_test_is_active() {
             METER_REPAINT_DELAY
-        } else if self.microphone_test_is_active() || self.microphone_level_envelope.is_animating()
-        {
-            INPUT_LEVEL_REPAINT_DELAY
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
@@ -3283,6 +3280,17 @@ impl LocalTranscriberApp {
         !matches!(self.microphone_test, MicrophoneTest::Idle)
     }
 
+    fn passive_microphone_monitor_needed(&self) -> bool {
+        !self.quit_requested
+            && !self.window_hidden_to_tray
+            && self.current_tab == Tab::General
+            && self.settings_tab == SettingsTab::Recording
+            && !self.capture_is_active()
+            && self.deferred_recording_start.is_none()
+            && self.deferred_history_playback.is_none()
+            && self.playing_history_id.is_none()
+    }
+
     fn current_sensitivity_level_sample(&self) -> (LevelSnapshot, Option<u64>, bool) {
         if let Some(active) = self.active_recording.as_ref() {
             return (
@@ -3302,11 +3310,7 @@ impl LocalTranscriberApp {
     }
 
     fn ensure_microphone_monitor(&mut self) {
-        if self.quit_requested
-            || self.capture_is_active()
-            || self.deferred_recording_start.is_some()
-            || self.deferred_history_playback.is_some()
-            || self.playing_history_id.is_some()
+        if !self.passive_microphone_monitor_needed()
             || self.microphone_test_is_active()
             || self.microphone_monitor_retry_required
         {
@@ -7948,14 +7952,22 @@ impl eframe::App for LocalTranscriberApp {
         self.sync_tray_state();
 
         show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
-        if self.current_tab == Tab::Advanced {
-            self.settings_tab = SettingsTab::Advanced;
-            self.current_tab = Tab::General;
+        match self.current_tab {
+            Tab::Advanced => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.current_tab = Tab::General;
+            }
+            Tab::About => {
+                self.settings_tab = SettingsTab::About;
+                self.current_tab = Tab::General;
+            }
+            Tab::Debug if !self.config.developer.debug_mode => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.current_tab = Tab::General;
+            }
+            _ => {}
         }
-        if self.current_tab == Tab::General
-            && self.settings_tab == SettingsTab::Recording
-            && !self.window_hidden_to_tray
-        {
+        if self.passive_microphone_monitor_needed() {
             self.ensure_microphone_monitor();
         } else {
             self.suspend_microphone_monitor();
@@ -7972,14 +7984,11 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
                 Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                Tab::About => show_route_scroll(ui, UiRoute::About, |ui| self.ui_about(ui)),
+                Tab::About => unreachable!("about navigation is routed to Settings"),
                 Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| self.ui_playground(ui)),
             });
 
-        if self.current_tab != Tab::General
-            || self.settings_tab != SettingsTab::Recording
-            || self.window_hidden_to_tray
-        {
+        if !self.passive_microphone_monitor_needed() {
             self.suspend_microphone_monitor();
         }
 

@@ -9,7 +9,7 @@ Scribe should feel like a native utility, not a dashboard. The default Transcrib
 ## Layout
 
 - Canonical shell: 214px labeled sidebar at widths of 1000px and above; 66px icon rail below that breakpoint. The same shell wraps Transcribe, Models, and Settings, with Settings pinned to the bottom.
-- Transcribe and Models are the primary navigation. History, About, Advanced, and debug-only Playground remain secondary destinations.
+- The primary navigation is exactly, in order: Transcribe, Models, History, Settings. About and Advanced live as Settings tabs; the developer Playground is reached from Advanced and is never a sidebar destination.
 - Light cool-gray app canvas with white bordered panels.
 - Compact page headers and dense rows on Models, Playground, and Settings.
 - 28px outer content margins, 12-16px panel spacing, and 4-8px radii.

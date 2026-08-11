@@ -1,4 +1,4 @@
-use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rounding, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, Frame, Margin, Rounding, Sense, Stroke, Vec2};
 
 use super::{
     controls::{Icon, focus_tooltip, icon_glyph, paint_focus_ring},
@@ -50,12 +50,15 @@ impl AppPage {
         }
     }
 
-    pub(crate) fn visible(self, debug_enabled: bool) -> bool {
-        self != Self::Debug || debug_enabled
+    pub(crate) fn visible(self, _debug_enabled: bool) -> bool {
+        matches!(
+            self,
+            Self::Transcribe | Self::Models | Self::History | Self::General
+        )
     }
 
     fn is_settings(self) -> bool {
-        matches!(self, Self::General | Self::Advanced)
+        self == Self::General
     }
 }
 
@@ -114,27 +117,26 @@ pub(crate) fn show_navigation(ctx: &egui::Context, current: &mut AppPage, debug_
                 colors.text,
                 colors.muted_text,
             );
-            ui.add_space(8.0);
-            secondary_navigation(
+            ui.add_space(4.0);
+            nav_button(
                 ui,
                 current,
-                debug_enabled,
+                AppPage::History,
                 mode,
                 colors.active_card_bg,
                 colors.text,
                 colors.muted_text,
             );
-            ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                nav_button(
-                    ui,
-                    current,
-                    AppPage::General,
-                    mode,
-                    colors.active_card_bg,
-                    colors.text,
-                    colors.muted_text,
-                );
-            });
+            ui.add_space(4.0);
+            nav_button(
+                ui,
+                current,
+                AppPage::General,
+                mode,
+                colors.active_card_bg,
+                colors.text,
+                colors.muted_text,
+            );
         });
     ctx.accesskit_node_builder(navigation.response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Navigation);
@@ -169,77 +171,6 @@ fn brand(ui: &mut egui::Ui, mode: NavigationMode, text: Color32, muted: Color32)
             });
         }
     });
-}
-
-fn secondary_navigation(
-    ui: &mut egui::Ui,
-    current: &mut AppPage,
-    debug_enabled: bool,
-    mode: NavigationMode,
-    selected: Color32,
-    text: Color32,
-    muted: Color32,
-) {
-    if mode == NavigationMode::Full {
-        let disclosure = egui::CollapsingHeader::new("More")
-            .id_source("secondary-navigation")
-            .default_open(false)
-            .show(ui, |ui| {
-                nav_button(ui, current, AppPage::History, mode, selected, text, muted);
-                nav_button(ui, current, AppPage::About, mode, selected, text, muted);
-                nav_button(ui, current, AppPage::Advanced, mode, selected, text, muted);
-                if debug_enabled {
-                    nav_button(ui, current, AppPage::Debug, mode, selected, text, muted);
-                }
-            });
-        ui.ctx()
-            .accesskit_node_builder(disclosure.header_response.id, |builder| {
-                builder.set_expanded(disclosure.body_response.is_some());
-            });
-    } else {
-        let more = nav_icon_button(
-            ui,
-            Icon::About,
-            "More navigation",
-            false,
-            selected,
-            text,
-            muted,
-        );
-        if more.clicked() {
-            ui.memory_mut(|memory| memory.toggle_popup(more.id));
-        }
-        let expanded = ui.memory(|memory| memory.is_popup_open(more.id));
-        ui.ctx().accesskit_node_builder(more.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Button);
-            builder.set_name("More navigation");
-            builder.set_expanded(expanded);
-        });
-        egui::popup_below_widget(ui, more.id, &more, |ui| {
-            if menu_item(ui, "History") {
-                select_compact_destination(ui, current, AppPage::History);
-            }
-            if menu_item(ui, "About") {
-                select_compact_destination(ui, current, AppPage::About);
-            }
-            if menu_item(ui, "Advanced") {
-                select_compact_destination(ui, current, AppPage::Advanced);
-            }
-            if debug_enabled && menu_item(ui, "Debug") {
-                select_compact_destination(ui, current, AppPage::Debug);
-            }
-        });
-    }
-}
-
-fn select_compact_destination(ui: &mut egui::Ui, current: &mut AppPage, destination: AppPage) {
-    *current = destination;
-    ui.memory_mut(|memory| memory.close_popup());
-}
-
-fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
-    ui.add_sized([160.0, 44.0], egui::Button::new(label))
-        .clicked()
 }
 
 fn nav_button(
@@ -438,20 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_more_selection_closes_the_popup() {
-        let ctx = egui::Context::default();
-        let popup_id = egui::Id::new("compact-more-close-test");
-        ctx.memory_mut(|memory| memory.open_popup(popup_id));
-        let mut page = AppPage::Transcribe;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                select_compact_destination(ui, &mut page, AppPage::History);
-            });
-        });
-        assert_eq!(page, AppPage::History);
-        assert!(!ctx.memory(|memory| memory.any_popup_open()));
-    }
-
     #[test]
     fn full_and_compact_navigation_expose_named_controls() {
         for width in [1_180.0, 960.0] {
@@ -469,7 +386,7 @@ mod tests {
                 |ctx| show_navigation(ctx, &mut page, false),
             );
             let update = output.platform_output.accesskit_update.unwrap();
-            for expected in ["Transcribe", "Models", "Settings"] {
+            for expected in ["Transcribe", "Models", "History", "Settings"] {
                 assert!(
                     update
                         .nodes
@@ -482,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_more_control_has_name_and_expanded_semantics() {
+    fn navigation_exposes_only_the_four_primary_destinations() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut page = AppPage::Transcribe;
@@ -496,18 +413,23 @@ mod tests {
             },
             |ctx| show_navigation(ctx, &mut page, false),
         );
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| {
-                    node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("More navigation")
-                        && node.is_expanded() == Some(false)
-                })
-        );
+        let names = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button).then(|| node.name())
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&Some("Transcribe")));
+        assert!(names.contains(&Some("Models")));
+        assert!(names.contains(&Some("History")));
+        assert!(names.contains(&Some("Settings")));
+        assert!(!names.contains(&Some("More navigation")));
+        assert!(!names.contains(&Some("About")));
+        assert!(!names.contains(&Some("Advanced")));
+        assert!(!names.contains(&Some("Debug")));
     }
 }

@@ -296,12 +296,12 @@ fn harness_route(page: AppPage, fixture_route: UiRoute) -> UiRoute {
     match page {
         AppPage::Transcribe => UiRoute::Transcribe,
         AppPage::Models => UiRoute::Models,
-        AppPage::General | AppPage::Advanced => match fixture_route {
+        AppPage::General | AppPage::Advanced | AppPage::About => match fixture_route {
+            UiRoute::Settings(SettingsTab::Output) => UiRoute::Settings(SettingsTab::General),
             UiRoute::Settings(tab) => UiRoute::Settings(tab),
             _ => UiRoute::Settings(SettingsTab::Recording),
         },
         AppPage::History => UiRoute::History,
-        AppPage::About => UiRoute::About,
         AppPage::Debug => UiRoute::Debug,
     }
 }
@@ -3745,12 +3745,12 @@ mod tests {
         apply_action(
             &mut data,
             &mut page,
-            ScreenAction::SetSettingsTab(SettingsTab::Output),
+            ScreenAction::SetSettingsTab(SettingsTab::General),
         );
-        assert_eq!(data.route, UiRoute::Settings(SettingsTab::Output));
+        assert_eq!(data.route, UiRoute::Settings(SettingsTab::General));
         assert_eq!(
             harness_route(page, data.route),
-            UiRoute::Settings(SettingsTab::Output)
+            UiRoute::Settings(SettingsTab::General)
         );
     }
 
