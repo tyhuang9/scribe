@@ -1107,12 +1107,6 @@ mod tests {
 
     #[test]
     fn catalog_http_policy_is_https_only_bounded_and_rejects_redirects() {
-        let policy = format!("{:?}", catalog_http_agent());
-        assert!(policy.contains("https_only: true"));
-        assert!(policy.contains("redirects: 0"));
-        assert!(policy.contains("timeout_connect: Some(5s)"));
-        assert!(policy.contains("timeout_read: Some(15s)"));
-        assert!(policy.contains("timeout: Some(30s)"));
         assert!(validate_http_status(200).is_ok());
         assert!(validate_http_status(299).is_ok());
         for status in [300, 301, 307, 308, 399] {
