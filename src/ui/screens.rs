@@ -144,6 +144,10 @@ pub(crate) struct RecordingSettingsView {
     pub audio_retention_days: Option<u32>,
     pub store_application_identity: bool,
     pub diagnostics: Vec<String>,
+    pub about_version: String,
+    pub about_model_directory: String,
+    pub about_settings_path: Option<String>,
+    pub can_export_diagnostics: bool,
     pub save_state: SettingsSaveState,
 }
 
@@ -191,6 +195,10 @@ impl Default for RecordingSettingsView {
             audio_retention_days: None,
             store_application_identity: false,
             diagnostics: Vec::new(),
+            about_version: env!("CARGO_PKG_VERSION").into(),
+            about_model_directory: "Unavailable".into(),
+            about_settings_path: None,
+            can_export_diagnostics: false,
             save_state: SettingsSaveState::Clean,
         }
     }
@@ -4330,6 +4338,19 @@ fn about_settings_panel(
 ) {
     settings_section(ui, "About Scribe", |ui| {
         ui.label("Scribe keeps audio and transcripts on this device.");
+        ui.label(format!("Version {}", settings.about_version));
+        ui.label(
+            RichText::new("Local-first: audio and transcripts remain on this device.")
+                .color(ui_palette(ui).muted_text),
+        );
+        ui.label(format!("Models: {}", settings.about_model_directory));
+        ui.label(format!(
+            "Settings: {}",
+            settings
+                .about_settings_path
+                .as_deref()
+                .unwrap_or("Unavailable")
+        ));
         ui.label(
             RichText::new("Redacted diagnostics are available from the native Settings view.")
                 .color(ui_palette(ui).muted_text),
@@ -4341,13 +4362,14 @@ fn about_settings_panel(
                 ui.label(line);
             }
         }
-        if ui
-            .add_sized(
-                [220.0, 44.0],
-                egui::Button::new("Export redacted diagnostics"),
-            )
-            .clicked()
-        {
+        let export = ui.add_enabled(
+            settings.can_export_diagnostics,
+            egui::Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
+        );
+        if !settings.can_export_diagnostics {
+            ui.label(RichText::new("The platform settings directory is unavailable, so Scribe cannot choose a private export location.").color(ui_palette(ui).muted_text));
+        }
+        if export.clicked() {
             *action = ScreenAction::ExportRedactedDiagnostics;
         }
     });
