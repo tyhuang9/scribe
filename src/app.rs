@@ -78,8 +78,8 @@ use crate::ui::{
     RemoteCatalogSort, RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
     RemoteCatalogView, ScreenAction, ScreenView, SettingsTab, ThemePalette, UiRoute, about_page,
     configure_accessible_style, history_page, minimum_primary_target_height, recording_mode,
-    render_screen, settings_save_state, show_navigation, theme_palette, transcription_state,
-    ui_palette,
+    render_screen, scroll_focused_control_into_view, settings_save_state, show_navigation,
+    show_route_scroll, theme_palette, transcription_state, ui_palette,
 };
 
 #[cfg(test)]
@@ -7897,13 +7897,17 @@ impl eframe::App for LocalTranscriberApp {
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
-                Tab::Transcribe => self.ui_transcribe(ui),
-                Tab::General => self.ui_general_settings(ui),
-                Tab::Models => self.ui_models(ui),
-                Tab::History => self.ui_history(ui),
+                Tab::Transcribe => {
+                    show_route_scroll(ui, UiRoute::Transcribe, |ui| self.ui_transcribe(ui))
+                }
+                Tab::General => show_route_scroll(ui, UiRoute::Settings(self.settings_tab), |ui| {
+                    self.ui_general_settings(ui)
+                }),
+                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
+                Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
                 Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                Tab::About => self.ui_about(ui),
-                Tab::Debug => self.ui_playground(ui),
+                Tab::About => show_route_scroll(ui, UiRoute::About, |ui| self.ui_about(ui)),
+                Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| self.ui_playground(ui)),
             });
 
         if self.current_tab != Tab::General
@@ -8222,10 +8226,7 @@ impl LocalTranscriberApp {
             remote_catalog: &remote_catalog,
             recording_settings: &Default::default(),
         };
-        let action = egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| render_screen(ui, &view))
-            .inner;
+        let action = render_screen(ui, &view);
         if clear_initial_dialog_focus {
             self.model_management.focus_dialog_initial = false;
         }
@@ -10206,12 +10207,11 @@ fn page(
 ) {
     let page_width = usable_width(ui);
     ui.allocate_ui_with_layout(
-        Vec2::new(page_width, ui.available_height()),
+        Vec2::new(page_width, 0.0),
         Layout::top_down(Align::LEFT),
         |ui| {
             set_exact_width(ui, page_width);
-            ui.add_space(24.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 let heading = ui.label(
                     RichText::new(title)
                         .font(FontId::proportional(24.0))
@@ -10220,6 +10220,12 @@ fn page(
                 );
                 ui.ctx().accesskit_node_builder(heading.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Heading);
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: heading.rect.min.x.into(),
+                        y0: heading.rect.min.y.into(),
+                        x1: heading.rect.max.x.into(),
+                        y1: heading.rect.max.y.into(),
+                    });
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     status_badge(ui, status);
@@ -10237,27 +10243,17 @@ fn page(
                 });
             }
             ui.add_space(14.0);
-            let body_width = usable_width(ui);
-            ScrollArea::vertical()
-                .id_source(("page-scroll", title))
-                .max_width(body_width)
-                .min_scrolled_width(body_width)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    with_usable_width_cap(ui, body_width, |ui| {
-                        set_exact_width(ui, body_width);
-                        add_contents(ui);
-                    });
-                });
+            with_usable_width_cap(ui, page_width, |ui| {
+                set_exact_width(ui, page_width);
+                add_contents(ui);
+            });
         },
     );
 }
 
 fn content_panel_frame(ctx: &egui::Context) -> Frame {
     let colors = theme_palette(ctx);
-    Frame::none()
-        .fill(colors.content_bg)
-        .inner_margin(Margin::symmetric(24.0, 0.0))
+    Frame::none().fill(colors.content_bg)
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -10685,7 +10681,9 @@ fn playground_card_ui(
                             offset: 1,
                         });
                     }
-                    if ui.add(small_button(ui, "Clear")).clicked() {
+                    let clear = ui.add(small_button(ui, "Clear"));
+                    scroll_focused_control_into_view(ui, &clear);
+                    if clear.clicked() {
                         actions.push(PlaygroundAction::Clear(
                             card_state.descriptor.id.as_str().to_owned(),
                         ));
@@ -11411,22 +11409,21 @@ fn model_artifact_remains_manageable(
 }
 
 fn model_variant_label(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> String {
-    let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
-    let words = name.split_whitespace().collect::<Vec<_>>();
-    let language = descriptor
-        .and_then(|descriptor| (descriptor.languages.len() == 1).then_some(descriptor.languages[0]))
-        .or_else(|| {
-            words
-                .last()
-                .is_some_and(|word| word.eq_ignore_ascii_case("English"))
-                .then_some("en")
-        });
+    if let Some(descriptor) = descriptor {
+        return descriptor.variant_label.to_owned();
+    }
+
+    let words = model.name.split_whitespace().collect::<Vec<_>>();
+    let language = words
+        .last()
+        .is_some_and(|word| word.eq_ignore_ascii_case("English"))
+        .then_some("en");
     let candidate = words
         .iter()
         .rev()
         .find(|word| !word.eq_ignore_ascii_case("English"))
         .copied()
-        .unwrap_or(name)
+        .unwrap_or(model.name.as_str())
         .to_ascii_lowercase();
     match language {
         Some(language) if !candidate.ends_with(format!(".{language}").as_str()) => {
@@ -12280,6 +12277,116 @@ mod layout_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn production_route_headings_share_the_28_point_top_inset() {
+        for (tab, title) in [
+            (Tab::Transcribe, "Transcribe"),
+            (Tab::General, "Settings"),
+            (Tab::Models, "Models"),
+            (Tab::History, "History"),
+            (Tab::Advanced, "Settings"),
+            (Tab::About, "About"),
+            (Tab::Debug, "Model Playground"),
+        ] {
+            let output = render_app_tab(tab, 840.0);
+            let bounds = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Heading && node.name() == Some(title)
+                })
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("missing production route heading {title}"));
+            assert!(
+                (bounds.y0 - 28.0).abs() <= 6.0,
+                "{title} heading should share the route top inset, got {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_final_playground_control_scrolls_the_outer_production_route() {
+        let width = 840.0;
+        let height = 420.0;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Debug;
+        assert_eq!(app.playground_cards.len(), 1);
+
+        let initial =
+            render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(0.0));
+        let target = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Clear")
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.bounds()
+                    .unwrap()
+                    .y1
+                    .total_cmp(&right.bounds().unwrap().y1)
+            })
+            .map(|(id, _)| *id)
+            .expect("final Playground card should expose a Clear action");
+        let _ = render_debug_route_with_input(
+            &ctx,
+            &mut app,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target,
+                    data: None,
+                },
+            )],
+            Some(0.1),
+        );
+        let _ = render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(0.2));
+        let settled =
+            render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(1.0));
+        let target_bounds = settled
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == target)
+            .and_then(|(_, node)| node.bounds())
+            .expect("focused Playground action should remain accessible");
+        let (_, offset, content_size, viewport) = ctx
+            .data(|data| {
+                data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                    "route-scroll-diagnostics",
+                ))
+            })
+            .expect("production Debug route should expose scroll diagnostics in tests");
+        assert!(
+            content_size.y > viewport.height() && offset.y > 0.0,
+            "final Playground focus must advance the overflowing production route"
+        );
+        let visible_y0 = target_bounds.y0 - f64::from(offset.y);
+        let visible_y1 = target_bounds.y1 - f64::from(offset.y);
+        assert!(
+            visible_y0 >= f64::from(viewport.min.y) - 1.0
+                && visible_y1 <= f64::from(viewport.max.y) + 1.0,
+            "focused Playground action must be visible; bounds={target_bounds:?}, offset={offset:?}, viewport={viewport:?}"
+        );
     }
 
     #[test]
@@ -14916,7 +15023,7 @@ mod layout_tests {
 
         let selected = app.transcribe_screen_models();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].display_name, "English Tiny");
+        assert_eq!(selected[0].display_name, "Whisper Tiny — English");
         assert_eq!(selected[0].variant_label, "tiny.en");
 
         app.config.general.selected_default_model = "not-selected".to_owned();
@@ -14933,7 +15040,7 @@ mod layout_tests {
         assert!(ready.primary_action_enabled);
         assert!(!ready.primary_action_repairs_runtime);
         assert_eq!(ready.primary_action_disabled_reason, None);
-        assert_eq!(ready.display_name, "English Tiny");
+        assert_eq!(ready.display_name, "Whisper Tiny — English");
         assert_eq!(ready.variant_label, "tiny.en");
 
         assert!(
@@ -15759,15 +15866,17 @@ mod layout_tests {
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| {
-                    page(
-                        ui,
-                        "Model Playground",
-                        TranscriptionStatus::Idle,
-                        "Ready",
-                        |ui| {
-                            observed_width = usable_width(ui);
-                        },
-                    );
+                    show_route_scroll(ui, UiRoute::Debug, |ui| {
+                        page(
+                            ui,
+                            "Model Playground",
+                            TranscriptionStatus::Idle,
+                            "Ready",
+                            |ui| {
+                                observed_width = usable_width(ui);
+                            },
+                        );
+                    });
                 });
         });
 
@@ -15838,12 +15947,15 @@ mod layout_tests {
             show_test_navigation(ctx, &mut app.current_tab);
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
-                .show(ctx, |ui| app.ui_models(ui));
+                .show(ctx, |ui| {
+                    show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui))
+                });
         })
     }
 
     fn render_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
 
@@ -15866,15 +15978,53 @@ mod layout_tests {
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| match app.current_tab {
-                    Tab::Transcribe => app.ui_transcribe(ui),
-                    Tab::General => app.ui_general_settings(ui),
-                    Tab::Models => app.ui_models(ui),
-                    Tab::History => app.ui_history(ui),
+                    Tab::Transcribe => {
+                        show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                    }
+                    Tab::General => {
+                        show_route_scroll(ui, UiRoute::Settings(app.settings_tab), |ui| {
+                            app.ui_general_settings(ui)
+                        })
+                    }
+                    Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui)),
+                    Tab::History => {
+                        show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                    }
                     Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                    Tab::About => app.ui_about(ui),
-                    Tab::Debug => app.ui_playground(ui),
+                    Tab::About => show_route_scroll(ui, UiRoute::About, |ui| app.ui_about(ui)),
+                    Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui)),
                 });
         })
+    }
+
+    fn render_debug_route_with_input(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events,
+                time,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui))
+                    });
+            },
+        )
     }
 
     fn selector_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
@@ -15964,13 +16114,25 @@ mod layout_tests {
                 egui::CentralPanel::default()
                     .frame(content_panel_frame(ctx))
                     .show(ctx, |ui| match app.current_tab {
-                        Tab::Transcribe => app.ui_transcribe(ui),
-                        Tab::General => app.ui_general_settings(ui),
-                        Tab::Models => app.ui_models(ui),
-                        Tab::History => app.ui_history(ui),
+                        Tab::Transcribe => {
+                            show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                        }
+                        Tab::General => {
+                            show_route_scroll(ui, UiRoute::Settings(app.settings_tab), |ui| {
+                                app.ui_general_settings(ui)
+                            })
+                        }
+                        Tab::Models => {
+                            show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui))
+                        }
+                        Tab::History => {
+                            show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                        }
                         Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                        Tab::About => app.ui_about(ui),
-                        Tab::Debug => app.ui_playground(ui),
+                        Tab::About => show_route_scroll(ui, UiRoute::About, |ui| app.ui_about(ui)),
+                        Tab::Debug => {
+                            show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui))
+                        }
                     });
             });
             max_x_by_frame.push(max_painted_x(&output));
@@ -17470,7 +17632,7 @@ mod layout_tests {
                 },
             )],
         );
-        let checkbox = accesskit_control_id_with_prefix(&output, "English Tiny;");
+        let checkbox = accesskit_control_id_with_prefix(&output, "Whisper Tiny — English;");
         let apply = accesskit_control_id(&output, "Apply model selection");
         render_playground(
             &ctx,
@@ -18254,7 +18416,7 @@ mod layout_tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].descriptor.id.as_str(), "whisper_cpp_tiny_en");
-        assert_eq!(cards[0].descriptor.display_name, "English Tiny");
+        assert_eq!(cards[0].descriptor.display_name, "Whisper Tiny — English");
         let _ = fs::remove_dir_all(root);
     }
 

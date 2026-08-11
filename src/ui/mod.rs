@@ -13,7 +13,10 @@ pub(crate) use pages::{HistoryPageAction, HistoryPageState, about_page, history_
 pub(crate) use production::{
     ModelReadiness, recording_mode, settings_save_state, transcription_state,
 };
-pub(crate) use screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen};
+pub(crate) use screens::{
+    RecordingSettingsView, ScreenAction, ScreenView, render_screen,
+    scroll_focused_control_into_view, show_route_scroll,
+};
 pub(crate) use shell::{AppPage, show_navigation};
 pub(crate) use state::{
     ComparisonPhase, ComparisonResult, ComparisonResultPhase, LocalGgufImportView,

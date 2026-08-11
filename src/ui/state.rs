@@ -11,7 +11,7 @@ pub(crate) enum SettingsTab {
     Advanced,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum UiRoute {
     #[default]
     Transcribe,

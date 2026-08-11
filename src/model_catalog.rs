@@ -107,6 +107,7 @@ struct CompatibilityReceiptDocument {
 struct ModelManifest {
     id: &'static str,
     display_name: &'static str,
+    variant_label: &'static str,
     description: &'static str,
     storage_guidance: &'static str,
     expected_ram: &'static str,
@@ -196,6 +197,7 @@ pub struct ModelCapabilities {
 pub struct ModelDescriptor {
     pub id: ModelId,
     pub display_name: &'static str,
+    pub variant_label: &'static str,
     pub description: &'static str,
     pub expected_ram: &'static str,
     pub speed_guidance: &'static str,
@@ -272,7 +274,8 @@ const MODELS: &[ModelManifest] = &[
     handy_computer_tiny_en_manifest(),
     whisper_manifest(
         "whisper_cpp_base_en",
-        "English Base",
+        "Whisper Base — English",
+        "base.en",
         ModelGuidance {
             description: "Local English model with a balanced speed and quality profile.",
             storage: "~150 MB",
@@ -288,7 +291,8 @@ const MODELS: &[ModelManifest] = &[
     ),
     whisper_manifest(
         "whisper_cpp_small_en",
-        "English Small",
+        "Whisper Small — English",
+        "small.en",
         ModelGuidance {
             description: "More accurate local English model for longer dictation and clean audio.",
             storage: "~470 MB",
@@ -304,7 +308,8 @@ const MODELS: &[ModelManifest] = &[
     ),
     whisper_manifest(
         "whisper_cpp_medium_en",
-        "English Medium",
+        "Whisper Medium — English",
+        "medium.en",
         ModelGuidance {
             description: "Higher-accuracy local English model for machines with more memory.",
             storage: "~1.5 GB",
@@ -323,7 +328,8 @@ const MODELS: &[ModelManifest] = &[
 const fn handy_computer_tiny_en_manifest() -> ModelManifest {
     ModelManifest {
         id: "whisper_cpp_tiny_en",
-        display_name: "English Tiny",
+        display_name: "Whisper Tiny — English",
+        variant_label: "tiny.en",
         description: "Small English GGUF model for low-resource local dictation.",
         storage_guidance: "~42 MB",
         expected_ram: "1 GB",
@@ -356,6 +362,7 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
 const fn whisper_manifest(
     id: &'static str,
     display_name: &'static str,
+    variant_label: &'static str,
     guidance: ModelGuidance,
     filename: &'static str,
     size_bytes: u64,
@@ -366,6 +373,7 @@ const fn whisper_manifest(
     ModelManifest {
         id,
         display_name,
+        variant_label,
         description: guidance.description,
         storage_guidance: guidance.storage,
         expected_ram: guidance.expected_ram,
@@ -488,6 +496,7 @@ impl ModelManifest {
         ModelDescriptor {
             id: ModelId::new(self.id),
             display_name: self.display_name,
+            variant_label: self.variant_label,
             description: self.description,
             expected_ram: self.expected_ram,
             speed_guidance: self.speed_guidance,
@@ -637,6 +646,9 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
                 manifest.id
             ));
         }
+        if manifest.variant_label.is_empty() {
+            return Err(format!("{} has empty variant label", manifest.id));
+        }
         let (status_evidence, reason) = match manifest.compatibility {
             CompatibilityStatus::Supported { evidence } => (evidence, None),
             CompatibilityStatus::Experimental { evidence, reason }
@@ -779,6 +791,38 @@ mod tests {
         assert_eq!(model_descriptors().len(), 4);
         assert_eq!(normal_model_descriptors().len(), 1);
         assert_eq!(
+            model_descriptors()
+                .into_iter()
+                .map(|descriptor| (
+                    descriptor.id,
+                    descriptor.display_name,
+                    descriptor.variant_label
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ModelId::new("whisper_cpp_tiny_en"),
+                    "Whisper Tiny — English",
+                    "tiny.en",
+                ),
+                (
+                    ModelId::new("whisper_cpp_base_en"),
+                    "Whisper Base — English",
+                    "base.en",
+                ),
+                (
+                    ModelId::new("whisper_cpp_small_en"),
+                    "Whisper Small — English",
+                    "small.en",
+                ),
+                (
+                    ModelId::new("whisper_cpp_medium_en"),
+                    "Whisper Medium — English",
+                    "medium.en",
+                ),
+            ]
+        );
+        assert_eq!(
             normal_model_descriptors()
                 .into_iter()
                 .map(|descriptor| descriptor.id)
@@ -836,6 +880,18 @@ mod tests {
             validate_manifests(&[manifest])
                 .unwrap_err()
                 .contains("malformed artifact")
+        );
+    }
+
+    #[test]
+    fn empty_variant_labels_are_rejected() {
+        let mut manifest = MODELS[0];
+        manifest.variant_label = "";
+
+        assert!(
+            validate_manifests(&[manifest])
+                .unwrap_err()
+                .contains("empty variant label")
         );
     }
 

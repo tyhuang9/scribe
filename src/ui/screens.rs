@@ -1,7 +1,8 @@
 //! Shared, backend-neutral egui screen renderers.
 
 use eframe::egui::{
-    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, Sense, Stroke, Vec2,
+    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea, Sense,
+    Stroke, Vec2,
 };
 
 use super::{
@@ -33,6 +34,47 @@ const TRANSCRIPT_STATUS_CONTENT_HEIGHT: f32 = 54.0;
 const TRANSCRIPT_STATUS_SPINNER_SLOT: f32 = 44.0;
 const TRANSCRIPT_STATUS_SPINNER_SIZE: f32 = 26.0;
 const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.";
+
+const ROUTE_TOP_INSET: f32 = 28.0;
+const ROUTE_HORIZONTAL_INSET: f32 = 28.0;
+const ROUTE_FOCUSED_CONTROL_SCROLL: &str = "route-focused-control-scroll";
+#[cfg(test)]
+const ROUTE_SCROLL_DIAGNOSTICS: &str = "route-scroll-diagnostics";
+const COMPARISON_BODY_FOCUSED_CONTROL_SCROLL: &str = "comparison-body-focused-control-scroll";
+#[cfg(test)]
+const COMPARISON_BODY_SCROLL_DIAGNOSTICS: &str = "comparison-body-scroll-diagnostics";
+
+pub(crate) fn scroll_focused_control_into_view(ui: &egui::Ui, response: &egui::Response) {
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL),
+            (response.id, response.rect),
+        )
+    });
+    if response.has_focus()
+        || ui.input(|input| {
+            input.has_accesskit_action_request(response.id, egui::accesskit::Action::Focus)
+        })
+    {
+        response.scroll_to_me(Some(Align::Center));
+    }
+}
+
+fn scroll_focused_comparison_body_control(ui: &egui::Ui, response: &egui::Response) {
+    if response.has_focus()
+        || ui.input(|input| {
+            input.has_accesskit_action_request(response.id, egui::accesskit::Action::Focus)
+        })
+    {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(COMPARISON_BODY_FOCUSED_CONTROL_SCROLL),
+                (response.id, response.rect),
+            )
+        });
+        response.scroll_to_me(Some(Align::Center));
+    }
+}
 
 fn current_content_width(ui: &egui::Ui) -> f32 {
     let available = ui.available_rect_before_wrap();
@@ -273,6 +315,52 @@ pub(crate) fn render_screen(ui: &mut egui::Ui, view: &ScreenView<'_>) -> ScreenA
     }
 }
 
+/// The central route owns scrolling so the vertical track stays at the edge of
+/// the central viewport rather than the edge of an inset content column.
+pub(crate) fn show_route_scroll<T>(
+    ui: &mut egui::Ui,
+    route: UiRoute,
+    add_contents: impl FnOnce(&mut egui::Ui) -> T,
+) -> T {
+    let route_width = ui.available_width();
+    let viewport_id = egui::Id::new(("route-viewport", route));
+    ui.data_mut(|data| data.insert_temp(viewport_id, ui.max_rect()));
+    let scroll = ScrollArea::vertical()
+        .id_source(("route-scroll", route))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(route_width);
+            ui.add_space(ROUTE_TOP_INSET);
+            let content = Frame::none()
+                .inner_margin(Margin::symmetric(ROUTE_HORIZONTAL_INSET, 0.0))
+                .show(ui, |ui| {
+                    ui.set_width((route_width - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0));
+                    add_contents(ui)
+                })
+                .inner;
+            if let Some((id, rect)) = ui.data(|data| {
+                data.get_temp::<(egui::Id, egui::Rect)>(egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL))
+            }) && ui.ctx().memory(|memory| memory.focused()) == Some(id)
+            {
+                ui.scroll_to_rect(rect, Some(Align::Center));
+            }
+            content
+        });
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(ROUTE_SCROLL_DIAGNOSTICS),
+            (
+                scroll.id,
+                scroll.state.offset,
+                scroll.content_size,
+                scroll.inner_rect,
+            ),
+        );
+    });
+    scroll.inner
+}
+
 pub(crate) fn screen_action_for_remote_catalog_action(
     action: &RemoteCatalogActionKind,
 ) -> ScreenAction {
@@ -299,7 +387,8 @@ pub(crate) fn screen_action_for_remote_catalog_action(
 fn header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     let response = ui.label(RichText::new(title).size(30.0).strong());
     ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Heading)
+        builder.set_role(egui::accesskit::Role::Heading);
+        builder.set_bounds(accesskit_rect(response.rect));
     });
     ui.label(RichText::new(subtitle).color(ui_palette(ui).muted_text));
     ui.add_space(24.0);
@@ -1246,34 +1335,10 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color3
         });
 }
 
-fn model_family_name(model: &ModelViewModel) -> &str {
-    model
-        .display_name
-        .strip_suffix(model.variant_label.as_str())
-        .map(str::trim_end)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(model.display_name.as_str())
-}
-
-fn models_footer_spacer(
-    remaining_height: f32,
-    comparison_expanded: bool,
-    has_storage_footer: bool,
-) -> f32 {
-    let comparison_height = if comparison_expanded { 280.0 } else { 92.0 };
-    let storage_height = if has_storage_footer { 40.0 } else { 0.0 };
-    (remaining_height - comparison_height - storage_height).max(16.0)
-}
-
-fn comparison_surface_width(available_width: f32) -> f32 {
-    available_width.max(0.0)
-}
-
-const MODEL_COMPARISON_BODY_BLEED: f32 = 28.0;
-
-fn comparison_content_min_width(surface_width: f32, inner_margin: f32) -> f32 {
-    (surface_width - inner_margin * 2.0).max(0.0)
-}
+const MODEL_COMPARISON_DOCK_INSET: f32 = 24.0;
+const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
+const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
+const INSTALLED_MODEL_WIDE_ROW_MIN_WIDTH: f32 = 1_280.0;
 
 fn models(
     ui: &mut egui::Ui,
@@ -1291,7 +1356,8 @@ fn models(
         ui.vertical(|ui| {
             let response = ui.label(RichText::new("Models").size(30.0).strong());
             ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Heading)
+                builder.set_role(egui::accesskit::Role::Heading);
+                builder.set_bounds(accesskit_rect(response.rect));
             });
             ui.label(
                 RichText::new("Manage the speech models available on this device.")
@@ -1328,8 +1394,16 @@ fn models(
                         && model.compatibility != super::state::ModelCompatibility::Incompatible
                 })
                 .count();
-            let compare_disabled_reason = (eligible_models < 2)
-                .then_some("Install at least two compatible models to compare them.");
+            let compare_disabled_reason = if eligible_models < 2 {
+                let installed_count = models.iter().filter(|model| model.installed).count();
+                Some(if installed_count >= 2 {
+                    "At least two installed models must be compatible and runtime-ready to compare."
+                } else {
+                    "Install at least two compatible, runtime-ready models to compare them."
+                })
+            } else {
+                None
+            };
             let compare = ui
                 .add_enabled_ui(compare_disabled_reason.is_none(), |ui| {
                     button(ui, "Compare", ButtonTone::Secondary)
@@ -1366,21 +1440,15 @@ fn models(
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::symmetric(16.0, 14.0))
             .show(ui, |ui| {
-                ui.set_min_width((row_width - 32.0).max(0.0));
+                ui.set_width((row_width - 32.0).max(0.0));
                 ui.set_min_height(50.0);
-                if row_width >= 900.0 {
+                if row_width >= INSTALLED_MODEL_WIDE_ROW_MIN_WIDTH {
                     ui.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
                             Vec2::new(190.0, 50.0),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.label(RichText::new(model_family_name(model)).strong());
-                                ui.label(
-                                    RichText::new(&model.variant_label)
-                                        .small()
-                                        .color(colors.muted_text),
-                                );
+                                ui.label(RichText::new(&model.display_name).strong());
                             },
                         );
                         ui.allocate_ui_with_layout(
@@ -1394,6 +1462,13 @@ fn models(
                                 );
                                 if model.recommended {
                                     installed_model_badge(ui, "Recommended", None);
+                                }
+                                if !model.ready {
+                                    installed_model_badge(
+                                        ui,
+                                        "Runtime not ready",
+                                        Some(colors.warning),
+                                    );
                                 }
                             },
                         );
@@ -1415,14 +1490,8 @@ fn models(
                 } else {
                     ui.horizontal_wrapped(|ui| {
                         ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
                             ui.set_min_width(160.0);
-                            ui.label(RichText::new(model_family_name(model)).strong());
-                            ui.label(
-                                RichText::new(&model.variant_label)
-                                    .small()
-                                    .color(colors.muted_text),
-                            );
+                            ui.label(RichText::new(&model.display_name).strong());
                         });
                         installed_model_badge(
                             ui,
@@ -1431,6 +1500,13 @@ fn models(
                         );
                         if model.recommended {
                             installed_model_badge(ui, "Recommended", None);
+                        }
+                        if !model.ready {
+                            installed_model_badge(
+                                ui,
+                                "Runtime not ready",
+                                Some(colors.warning),
+                            );
                         }
                         if let Some(ram) = model.estimated_ram_bytes {
                             metadata(ui, Icon::Cpu, &format!("{}MB RAM", ram / 1_000_000));
@@ -1454,7 +1530,10 @@ fn models(
         );
         ui.ctx().accesskit_node_builder(row.id, |builder| {
             builder.set_role(egui::accesskit::Role::Button);
-            builder.set_name(format!("Open details for {}", model.display_name));
+            builder.set_name(format!(
+                "Open details for {}; variant {}",
+                model.display_name, model.variant_label
+            ));
             builder.set_description("Open model details and actions.");
             if dialog_active {
                 builder.set_disabled();
@@ -1483,26 +1562,16 @@ fn models(
         .collect::<Option<Vec<_>>>()
         .map(|values| values.into_iter().sum())
         .unwrap_or_default();
-    let visible_remaining_height = (ui.clip_rect().bottom() - ui.cursor().top()).max(0.0);
-    ui.add_space(models_footer_spacer(
-        visible_remaining_height,
-        comparison.expanded,
-        used_bytes > 0,
-    ));
-    let comparison_top = ui.cursor().top();
-    let comparison_left =
-        (ui.cursor().left() - MODEL_COMPARISON_BODY_BLEED).max(ui.ctx().screen_rect().left());
-    let comparison_right = (ui.cursor().left()
-        + ui.available_width()
-        + MODEL_COMPARISON_BODY_BLEED)
-        .min(ui.ctx().screen_rect().right());
-    let comparison_rect = egui::Rect::from_min_max(
-        egui::pos2(comparison_left, comparison_top),
-        egui::pos2(comparison_right, comparison_top + 10_000.0),
-    );
-    let mut comparison_ui = ui.child_ui(comparison_rect, Layout::top_down(Align::LEFT));
-    comparison_ui.set_clip_rect(ui.clip_rect());
-    let comparison_width = comparison_surface_width(comparison_ui.available_width());
+    let comparison_viewport = ui
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models))))
+        .unwrap_or_else(|| ui.clip_rect());
+    let comparison_max_height = if comparison.expanded {
+        comparison_viewport.height() * 0.6
+    } else {
+        MODEL_COMPARISON_COLLAPSED_HEIGHT
+    };
+    let comparison_width =
+        (comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0);
     let comparison_surface_id = ui.make_persistent_id("model-comparison-surface");
     let comparison_ctx = ui.ctx().clone();
     comparison_ctx.accesskit_node_builder(comparison_surface_id, |builder| {
@@ -1510,14 +1579,33 @@ fn models(
         builder.set_name("Model comparison surface");
     });
     let mut comparison_surface_rect = None;
-    comparison_ctx.with_accessibility_parent(comparison_surface_id, || {
+    egui::Area::new(ui.make_persistent_id("model-comparison-dock"))
+        .order(if dialog_active {
+            egui::Order::Middle
+        } else {
+            egui::Order::Foreground
+        })
+        .fixed_pos(egui::pos2(
+            comparison_viewport.left() + ROUTE_HORIZONTAL_INSET,
+            comparison_viewport.bottom() - comparison_max_height,
+        ))
+        .movable(false)
+        .interactable(!dialog_active)
+        .show(ui.ctx(), |dock_ui| {
+            dock_ui.set_enabled(!dialog_active);
+            dock_ui.set_width(comparison_width);
+            dock_ui.allocate_ui_with_layout(
+                Vec2::new(comparison_width, comparison_max_height),
+                Layout::top_down(Align::LEFT),
+                |ui| comparison_ctx.with_accessibility_parent(comparison_surface_id, || {
         let comparison_surface = Frame::none()
             .fill(colors.card_bg)
             .stroke(Stroke::new(1.0, colors.border))
             .rounding(Rounding::same(5.0))
             .inner_margin(Margin::same(16.0))
-            .show(&mut comparison_ui, |ui| {
-            ui.set_min_width(comparison_content_min_width(comparison_width, 16.0));
+            .show(ui, |ui| {
+            ui.set_width((comparison_width - 32.0).max(0.0));
+            ui.set_min_height((comparison_max_height - 32.0).max(0.0));
             let toggle_name = if comparison.expanded {
                 "Collapse comparison"
             } else {
@@ -1543,7 +1631,10 @@ fn models(
                 });
             });
             let header = ui.interact(
-                header_content.response.rect,
+                egui::Rect::from_min_max(
+                    header_content.response.rect.min,
+                    egui::pos2(ui.max_rect().right(), header_content.response.rect.max.y),
+                ),
                 ui.make_persistent_id("comparison-header"),
                 Sense::click(),
             );
@@ -1557,15 +1648,27 @@ fn models(
             });
             if comparison.focus_panel {
                 header.request_focus();
-                header.scroll_to_me(Some(Align::Center));
             }
             focus_tooltip(ui, &header, toggle_name);
             paint_focus_ring(ui, &header, Rounding::same(4.0));
-            if header.clicked() {
+            let header_released = ui.input(|input| {
+                input.pointer.any_released()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|position| header.rect.contains(position))
+            });
+            if header.clicked() || header_released {
                 action = ScreenAction::ToggleComparison;
             }
             if comparison.expanded {
                 ui.add_space(12.0);
+                let body_height = ui.available_height().max(0.0);
+                let _body_scroll = ScrollArea::vertical()
+                    .id_source("model-comparison-body")
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 let render_selection = |ui: &mut egui::Ui, action: &mut ScreenAction| {
                     for model in models.iter().filter(|model| {
                         model.installed
@@ -1766,12 +1869,34 @@ fn models(
                 if result_action != ScreenAction::None {
                     action = result_action;
                 }
+                if let Some((id, rect)) = ui.data(|data| {
+                    data.get_temp::<(egui::Id, egui::Rect)>(egui::Id::new(
+                        COMPARISON_BODY_FOCUSED_CONTROL_SCROLL,
+                    ))
+                }) && ui.ctx().memory(|memory| memory.focused()) == Some(id)
+                {
+                    ui.scroll_to_rect(rect, Some(Align::Center));
+                }
+                    });
+                #[cfg(test)]
+                ui.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new(COMPARISON_BODY_SCROLL_DIAGNOSTICS),
+                        (
+                            _body_scroll.id,
+                            _body_scroll.state.offset,
+                            _body_scroll.content_size,
+                            _body_scroll.inner_rect,
+                        ),
+                    );
+                });
             }
         });
         comparison_surface_rect = Some(comparison_surface.response.rect);
-    });
+                }),
+            );
+        });
     let comparison_surface_rect = comparison_surface_rect.expect("comparison surface is rendered");
-    ui.allocate_space(Vec2::new(0.0, comparison_surface_rect.height()));
     ui.ctx()
         .accesskit_node_builder(comparison_surface_id, |builder| {
             builder.set_bounds(accesskit_rect(comparison_surface_rect));
@@ -1793,6 +1918,10 @@ fn models(
     }
     ui.add_space(24.0);
     render_remote_catalog(ui, remote_catalog, &mut action);
+    ui.add_space(
+        comparison_surface_rect.height() + MODEL_COMPARISON_DOCK_INSET
+            - ui.spacing().item_spacing.y,
+    );
     });
     // The disabled scope above is the primary boundary for both pointer and
     // assistive actions. Keep this guard as a defense in depth measure for
@@ -1839,7 +1968,6 @@ fn models(
                     for model in model_catalog {
                         card(ui, |ui| {
                             ui.label(RichText::new(&model.display_name).strong());
-                            ui.label(RichText::new(&model.variant_label).small().color(colors.muted_text));
                             if let Some(description) = &model.description {
                                 ui.label(description);
                             }
@@ -1953,6 +2081,7 @@ fn models(
                         .show(ui.ctx(), |ui| {
                         ui.set_enabled(true);
                         ui.label(RichText::new(&model.display_name).strong());
+                        ui.label(format!("Variant: {}", model.variant_label));
                         if let Some(description) = &model.description {
                             ui.label(description);
                         }
@@ -2384,7 +2513,7 @@ pub(crate) fn render_remote_catalog(
 
     for entry in &catalog.entries {
         ui.add_space(8.0);
-        card(ui, |ui| {
+        let _entry_card = card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&entry.display_name).strong());
                 if entry.recommended {
@@ -2449,6 +2578,13 @@ pub(crate) fn render_remote_catalog(
                     );
                 });
             }
+        });
+        #[cfg(test)]
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("remote-catalog-final-entry-rect"),
+                _entry_card.rect,
+            );
         });
     }
 }
@@ -2579,7 +2715,7 @@ fn render_comparison_results(
     let mut action = ScreenAction::None;
     // Rows follow visible model order, so the first rendered Add action is the stable return target.
     let mut restore_reference_focus = comparison.restore_reference_action_focus;
-    if ui.available_width() < 900.0 {
+    if ui.available_width() < COMPARISON_TABLE_MIN_WIDTH {
         for model in selected {
             let result = comparison
                 .results
@@ -2596,14 +2732,17 @@ fn render_comparison_results(
             let mut group_rect = None;
             group_ctx.with_accessibility_parent(group_id, || {
                 let group = ui.group(|ui| {
-                    ui.set_min_width((group_width - 12.0).max(0.0));
+                    ui.set_width((group_width - 12.0).max(0.0));
+                    ui.spacing_mut().item_spacing.y = 4.0;
                     ui.label(RichText::new(&model.display_name).strong());
-                    ui.label(format!("Status: {}", comparison_result_status(result)));
-                    ui.label(format!("Duration: {}", comparison_duration(comparison)));
-                    ui.label(format!(
-                        "Processing time: {}",
-                        comparison_processing(result)
-                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Status: {}", comparison_result_status(result)));
+                        ui.label(format!("Duration: {}", comparison_duration(comparison)));
+                        ui.label(format!(
+                            "Processing time: {}",
+                            comparison_processing(result)
+                        ));
+                    });
                     ui.label(format!("Output: {}", comparison_output_summary(result)));
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Accuracy:");
@@ -2964,6 +3103,7 @@ fn comparison_accuracy_cell(
                 add_reference.request_focus();
                 *restore_reference_focus = false;
             }
+            scroll_focused_comparison_body_control(ui, &add_reference);
             if add_reference.clicked() {
                 ScreenAction::ShowComparisonReferenceEditor
             } else {
@@ -3009,7 +3149,8 @@ fn settings(
     ui.horizontal(|ui| {
         let heading = ui.label(RichText::new("Settings").size(30.0).strong());
         ui.ctx().accesskit_node_builder(heading.id, |builder| {
-            builder.set_role(egui::accesskit::Role::Heading)
+            builder.set_role(egui::accesskit::Role::Heading);
+            builder.set_bounds(accesskit_rect(heading.rect));
         });
         let status = match settings.save_state {
             SettingsSaveState::Saving => "Saving…",
@@ -3078,16 +3219,15 @@ fn settings(
     }
     ui.separator();
     ui.add_space(16.0);
-    let panel = ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), 0.0),
-        Layout::top_down(Align::LEFT),
-        |ui| match active_tab {
+    let panel = ui.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        match active_tab {
             SettingsTab::Recording => recording_settings_panel(ui, state, settings, &mut action),
             SettingsTab::General => general_settings_panel(ui, settings, &mut action),
             SettingsTab::Output => output_settings_panel(ui, settings, &mut action),
             SettingsTab::Advanced => advanced_settings_panel(ui, settings, &mut action),
-        },
-    );
+        }
+    });
     ui.ctx()
         .accesskit_node_builder(panel.response.id, |builder| {
             builder.set_role(egui::accesskit::Role::TabPanel);
@@ -3757,10 +3897,9 @@ fn advanced_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("Developer").strong());
         let mut enabled = settings.debug_mode;
-        if ui
-            .checkbox(&mut enabled, "Enable local model Playground")
-            .changed()
-        {
+        let playground = ui.checkbox(&mut enabled, "Enable local model Playground");
+        scroll_focused_control_into_view(ui, &playground);
+        if playground.changed() {
             *action = ScreenAction::SetDebugMode(enabled);
         }
     });
@@ -4531,27 +4670,14 @@ mod tests {
     }
 
     #[test]
-    fn model_rows_separate_family_and_variant_labels() {
+    fn dense_model_rows_keep_variant_details_out_of_the_summary() {
         let model = ModelViewModel {
             display_name: "whisper.cpp base.en".into(),
             variant_label: "base.en".into(),
             ..Default::default()
         };
-        assert_eq!(model_family_name(&model), "whisper.cpp");
-
-        let custom = ModelViewModel {
-            display_name: "Local model".into(),
-            variant_label: "custom-v1".into(),
-            ..Default::default()
-        };
-        assert_eq!(model_family_name(&custom), "Local model");
-    }
-
-    #[test]
-    fn model_footer_spacer_uses_remaining_height_and_panel_state() {
-        assert_eq!(models_footer_spacer(500.0, false, true), 368.0);
-        assert_eq!(models_footer_spacer(500.0, true, true), 180.0);
-        assert_eq!(models_footer_spacer(100.0, true, true), 16.0);
+        assert_eq!(model.display_name, "whisper.cpp base.en");
+        assert_eq!(model.variant_label, "base.en");
     }
 
     #[test]
@@ -4792,6 +4918,7 @@ mod tests {
         let details = ModelViewModel {
             id: "base.en".into(),
             display_name: "whisper.cpp base.en".into(),
+            variant_label: "base.en".into(),
             ..Default::default()
         };
         let output = ctx.run(Default::default(), |ctx| {
@@ -4814,16 +4941,19 @@ mod tests {
                 );
             });
         });
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.name() == Some("Runtime maintenance") && node.is_expanded() == Some(false)
+        }));
         assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
+            nodes
                 .iter()
-                .any(|(_, node)| {
-                    node.name() == Some("Runtime maintenance") && node.is_expanded() == Some(false)
-                })
+                .any(|(_, node)| node.name() == Some("Variant: base.en"))
         );
     }
 
@@ -4832,6 +4962,7 @@ mod tests {
         let model = ModelViewModel {
             id: "base.en".into(),
             display_name: "whisper.cpp base.en".into(),
+            variant_label: "base.en".into(),
             active: true,
             ..Default::default()
         };
@@ -4861,7 +4992,7 @@ mod tests {
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Open details for whisper.cpp base.en")
+                && node.name() == Some("Open details for whisper.cpp base.en; variant base.en")
                 && node.description() == Some("Open model details and actions.")
         }));
         assert!(
