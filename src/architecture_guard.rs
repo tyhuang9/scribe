@@ -207,6 +207,47 @@ fn tentative_transcripts_have_no_output_module_path() {
 }
 
 #[test]
+fn route_shell_has_no_synthetic_models_scroll_surface() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let screens = fs::read_to_string(source_root.join("ui").join("screens.rs"))
+        .expect("shared screens source must be readable");
+    let app = fs::read_to_string(source_root.join("app.rs"))
+        .expect("application source must be readable");
+    let harness = fs::read_to_string(source_root.join("ui").join("harness.rs"))
+        .expect("harness source must be readable");
+
+    for forbidden in [
+        "models_footer_spacer",
+        "MODEL_COMPARISON_BODY_BLEED",
+        "comparison_top + 10_000.0",
+        "comparison_top + 10000.0",
+    ] {
+        assert!(
+            !screens.contains(forbidden),
+            "shared models UI must not recreate synthetic scroll artifact {forbidden}"
+        );
+    }
+    assert!(screens.contains("fn show_route_scroll"));
+    assert!(screens.contains("const ROUTE_TOP_INSET: f32 = 28.0"));
+    assert!(screens.contains("const ROUTE_HORIZONTAL_INSET: f32 = 28.0"));
+    assert!(screens.contains("let route_width = ui.available_width()"));
+    assert!(screens.contains("ui.set_width(route_width)"));
+    assert!(
+        screens.contains("ui.set_width((route_width - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0))")
+    );
+    assert!(screens.contains("comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0"));
+    assert!(app.contains("show_route_scroll(ui, UiRoute::Models"));
+    assert!(app.contains("show_route_scroll(ui, UiRoute::History"));
+    assert!(app.contains("show_route_scroll(ui, UiRoute::About"));
+    assert!(app.contains("show_route_scroll(ui, UiRoute::Debug"));
+    assert!(
+        !app.contains("page-scroll"),
+        "legacy pages must not reintroduce an inner route scroll area"
+    );
+    assert!(harness.contains("show_route_scroll(ui, view.route"));
+}
+
+#[test]
 fn no_web_runtime_or_ui_pcm_transport_is_present() {
     let sources = rust_sources();
     for (path, source) in &sources {

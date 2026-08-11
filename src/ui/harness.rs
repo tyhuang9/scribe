@@ -1,10 +1,10 @@
 //! Development-only deterministic fixtures. Actions update only local fixture state.
 
-use eframe::egui::{self, CentralPanel, Frame, ScrollArea};
+use eframe::egui::{self, CentralPanel, Frame};
 
 use super::{
     configure_accessible_style,
-    screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen},
+    screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
         ComparisonPhase, ModelComparisonState, ModelCompatibility, ModelDialog, ModelDownloadState,
@@ -315,16 +315,9 @@ fn show_harness(ctx: &egui::Context, data: &FixtureData, page: &mut AppPage) -> 
         recording_settings: &data.settings,
     };
     CentralPanel::default()
-        .frame(
-            Frame::none()
-                .fill(theme_palette(ctx).content_bg)
-                .inner_margin(egui::Margin::same(28.0)),
-        )
+        .frame(Frame::none().fill(theme_palette(ctx).content_bg))
         .show(ctx, |ui| {
-            ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| render_screen(ui, &view))
-                .inner
+            show_route_scroll(ui, view.route, |ui| render_screen(ui, &view))
         })
         .inner
 }
@@ -643,6 +636,18 @@ mod tests {
         height: f32,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, ScreenAction) {
+        render_with_input_at_time(ctx, data, page, width, height, events, None)
+    }
+
+    fn render_with_input_at_time(
+        ctx: &egui::Context,
+        data: &mut FixtureData,
+        page: &mut AppPage,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> (egui::FullOutput, ScreenAction) {
         let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
@@ -657,6 +662,7 @@ mod tests {
                     egui::Vec2::new(width, height),
                 )),
                 events,
+                time,
                 focused: true,
                 ..Default::default()
             },
@@ -1057,7 +1063,7 @@ mod tests {
             let (panel_top, panel_height, footer_top) = if width <= 960.0 {
                 (254.0, 394.0, 590.0)
             } else {
-                (185.0, 565.0, 694.0)
+                (185.0, 565.0, 695.0)
             };
             assert_within_tolerance(
                 normal_panel.y0,
@@ -1084,8 +1090,8 @@ mod tests {
             if width > 960.0 {
                 assert_bounds_within(helper, viewport, "Silence helper");
                 assert!(
-                    helper.y1 <= viewport.y1 - 16.0,
-                    "Silence helper must remain above the canonical viewport edge: {helper:?}"
+                    helper.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
+                    "Silence helper must remain within the central viewport: {helper:?}"
                 );
             }
         }
@@ -1489,7 +1495,7 @@ mod tests {
             (ModelDialog::Add, "Add models", "Add models", "Close"),
             (
                 ModelDialog::Details("base.en".into()),
-                "Open details for whisper.cpp base.en",
+                "Open details for whisper.cpp base.en; variant base.en",
                 "Model details for whisper.cpp base.en",
                 "Close",
             ),
@@ -1529,6 +1535,15 @@ mod tests {
                         .name()
                         .is_some_and(|name| name.contains(background_control))
             });
+            let dock = node_matching(&initial, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Expand comparison")
+            });
+            assert!(
+                dock.is_disabled(),
+                "comparison dock must be disabled behind {dialog_name}"
+            );
+            let dock_id = named_node_id(&initial, "Expand comparison");
 
             let (focused, action) = render_with_input(
                 &ctx,
@@ -1565,6 +1580,110 @@ mod tests {
                 action,
                 ScreenAction::None,
                 "{background_control} must not act while {dialog_name} is open"
+            );
+            let (_, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: dock_id,
+                        data: None,
+                    },
+                )],
+            );
+            assert_eq!(
+                action,
+                ScreenAction::None,
+                "comparison dock must not act while {dialog_name} is open"
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_dock_layer_stays_above_routes_and_below_active_model_dialogs() {
+        let (width, height) = (1180.0, 815.0);
+        for (dialog, dialog_name) in [
+            (ModelDialog::Add, "Add models"),
+            (
+                ModelDialog::Details("base.en".into()),
+                "Model details for whisper.cpp base.en",
+            ),
+            (
+                ModelDialog::Remove("tiny.en".into()),
+                "Remove whisper.cpp tiny.en",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCompareExpanded.data();
+            let mut page = Fixture::ModelsCompareExpanded.page();
+
+            let (without_dialog, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let surface = named_node_bounds(&without_dialog, "Model comparison surface");
+            let dock_probe = egui::pos2(
+                ((surface.x0 + surface.x1) / 2.0) as f32,
+                ((surface.y0 + surface.y1) / 2.0) as f32,
+            );
+            let foreground_dock_layer = ctx
+                .memory(|memory| memory.layer_id_at(dock_probe))
+                .expect("expanded comparison dock should own its visible surface");
+            assert_eq!(foreground_dock_layer.order, egui::Order::Foreground);
+
+            data.model_management.dialog = Some(dialog);
+            data.model_management.focus_dialog_initial = true;
+            let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            let (with_dialog, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let dialog_node = node_matching(&with_dialog, |node| node.name() == Some(dialog_name));
+            assert!(dialog_node.is_modal(), "{dialog_name} must remain modal");
+            let dialog_bounds = dialog_node
+                .bounds()
+                .expect("model dialog should expose bounds");
+            assert!(
+                dialog_bounds.x0 < surface.x1
+                    && dialog_bounds.x1 > surface.x0
+                    && dialog_bounds.y0 < surface.y1
+                    && dialog_bounds.y1 > surface.y0,
+                "{dialog_name} should overlap the expanded comparison dock in this layer fixture"
+            );
+            let dialog_probe = egui::pos2(
+                ((dialog_bounds.x0 + dialog_bounds.x1) / 2.0) as f32,
+                ((dialog_bounds.y0 + dialog_bounds.y1) / 2.0) as f32,
+            );
+            let dialog_layer = ctx
+                .memory(|memory| memory.layer_id_at(dialog_probe))
+                .expect("active model dialog should own its surface");
+            assert_eq!(dialog_layer.order, egui::Order::Middle);
+
+            let dock_layer = egui::LayerId::new(egui::Order::Middle, foreground_dock_layer.id);
+            let layers = ctx.memory(|memory| memory.layer_ids().collect::<Vec<_>>());
+            let dock_index = layers
+                .iter()
+                .position(|layer| *layer == dock_layer)
+                .expect("modal frame should retain the demoted comparison dock layer");
+            let dialog_index = layers
+                .iter()
+                .position(|layer| *layer == dialog_layer)
+                .expect("modal frame should contain the model dialog layer");
+            assert!(
+                dock_index < dialog_index,
+                "{dialog_name} must be rendered above the disabled comparison dock"
+            );
+            assert!(
+                node_matching(&with_dialog, |node| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Collapse comparison")
+                })
+                .is_disabled(),
+                "comparison dock must remain inert behind {dialog_name}"
             );
         }
     }
@@ -1633,8 +1752,14 @@ mod tests {
                 "{control} must descend from the details dialog"
             );
         }
+        assert!(
+            node_names(&dialog_output)
+                .iter()
+                .any(|name| name == "Variant: tiny.en"),
+            "details must expose the model variant explicitly"
+        );
 
-        let comparison_output = render(Fixture::ModelsCompareExpanded, width, height);
+        let comparison_output = render(Fixture::ModelsCompareExpanded, 1476.0, 1018.0);
         let table_id = node_id_matching(&comparison_output, |node| {
             node.role() == egui::accesskit::Role::Table
                 && node.name() == Some("Model comparison results")
@@ -1706,7 +1831,7 @@ mod tests {
     #[test]
     fn installed_model_rows_are_dense_and_open_details_from_every_input() {
         let (width, height) = (1180.0, 815.0);
-        let row_name = "Open details for whisper.cpp base.en";
+        let row_name = "Open details for whisper.cpp base.en; variant base.en";
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1784,6 +1909,46 @@ mod tests {
             }],
         );
         assert_eq!(action, ScreenAction::ShowModelDetails("base.en".into()));
+    }
+
+    #[test]
+    fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
+        let row_name = "Open details for whisper.cpp base.en; variant base.en";
+        for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsInstalled, width, height);
+            let surface = named_node_bounds(&output, "Model comparison surface");
+            let row = named_node_bounds(&output, row_name);
+            assert!(
+                row.x0 >= surface.x0 - LAYOUT_TOLERANCE && row.x1 <= surface.x1 + LAYOUT_TOLERANCE,
+                "installed model card {row:?} must remain inside route inset {surface:?}"
+            );
+
+            let row_contents: Vec<_> = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("render should expose an AccessKit update")
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| {
+                    let name = node.name()?;
+                    let bounds = node.bounds()?;
+                    (name != row_name
+                        && bounds.y0 >= row.y0 - LAYOUT_TOLERANCE
+                        && bounds.y1 <= row.y1 + LAYOUT_TOLERANCE
+                        && bounds.x0 >= surface.x0 - LAYOUT_TOLERANCE
+                        && bounds.y1 > bounds.y0)
+                        .then_some((name, bounds))
+                })
+                .collect();
+            assert!(
+                row_contents.iter().any(|(name, _)| name.contains("RAM")),
+                "installed row should expose its metadata at {width}x{height}"
+            );
+            for (name, bounds) in row_contents {
+                assert_bounds_within(bounds, row, &format!("installed row content {name:?}"));
+            }
+        }
     }
 
     #[test]
@@ -2021,32 +2186,42 @@ mod tests {
     }
     #[test]
     fn comparison_panel_stays_near_the_bottom_without_infinite_scroll_spacing() {
-        for (fixture, minimum_top) in [
-            (Fixture::ModelsInstalled, 500.0),
-            (Fixture::ModelsCompareExpanded, 390.0),
+        for (fixture, expanded) in [
+            (Fixture::ModelsInstalled, false),
+            (Fixture::ModelsCompareExpanded, true),
         ] {
             let output = render(fixture, 1180.0, 815.0);
-            let bounds = output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .iter()
-                .find_map(|(_, node)| {
-                    (node.name() == Some("Compare installed models"))
-                        .then(|| node.bounds())
-                        .flatten()
-                })
-                .expect("comparison heading should expose finite geometry");
+            let bounds = named_node_bounds(&output, "Compare installed models");
+            let surface = named_node_bounds(&output, "Model comparison surface");
             assert!(
-                bounds.y0 >= minimum_top && bounds.y1 <= 815.0,
-                "{fixture:?} comparison bounds were {bounds:?}"
+                bounds.y0 >= surface.y0 - LAYOUT_TOLERANCE
+                    && bounds.y1 <= surface.y1 + LAYOUT_TOLERANCE,
+                "{fixture:?} comparison heading {bounds:?} escaped its dock surface {surface:?}"
             );
+            assert_within_tolerance(
+                surface.y1,
+                815.0,
+                LAYOUT_TOLERANCE,
+                "comparison surface bottom",
+            );
+            if expanded {
+                assert!(
+                    surface.y1 - surface.y0 <= 815.0 * 0.6 + LAYOUT_TOLERANCE,
+                    "expanded comparison surface exceeded its 60% viewport cap: {surface:?}"
+                );
+            } else {
+                assert_within_tolerance(
+                    surface.y1 - surface.y0,
+                    82.0,
+                    LAYOUT_TOLERANCE,
+                    "collapsed comparison surface height",
+                );
+            }
         }
     }
 
     #[test]
-    fn model_comparison_surface_bleeds_to_the_body_edges_at_supported_sizes() {
+    fn model_comparison_surface_aligns_to_the_route_content_at_supported_sizes() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
             for (fixture, toggle_name) in [
                 (Fixture::ModelsInstalled, "Expand comparison"),
@@ -2076,13 +2251,13 @@ mod tests {
 
                 assert_near(
                     surface.x0,
-                    models.x0 - 28.0,
-                    "surface left should bleed beyond the inset Models content",
+                    models.x0,
+                    "surface left should align with the inset Models content",
                 );
                 assert_near(
                     surface.x1,
-                    add_models.x1 + 28.0,
-                    "surface right should bleed beyond the inset Models content",
+                    add_models.x1,
+                    "surface right should align with the inset Models content",
                 );
                 assert_near(
                     chevron.x1,
@@ -2090,6 +2265,214 @@ mod tests {
                     "chevron should align with the surface inner right edge",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shared_route_shell_keeps_titles_and_docks_inside_all_reference_viewports() {
+        for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
+            let titles = [
+                (Fixture::TranscribeReady, "Transcribe"),
+                (Fixture::ModelsInstalled, "Models"),
+                (Fixture::SettingsRecording, "Settings"),
+            ]
+            .map(|(fixture, title)| {
+                node_matching(&render(fixture, width, height), |node| {
+                    node.role() == egui::accesskit::Role::Heading && node.name() == Some(title)
+                })
+                .bounds()
+                .expect("route heading should expose bounds")
+            });
+            for title in titles {
+                assert_within_tolerance(title.y0, 28.0, 6.0, "shared route title top inset");
+            }
+
+            for (fixture, expanded) in [
+                (Fixture::ModelsInstalled, false),
+                (Fixture::ModelsCompareExpanded, true),
+            ] {
+                let output = render(fixture, width, height);
+                let surface = named_node_bounds(&output, "Model comparison surface");
+                let header = named_node_bounds(
+                    &output,
+                    if expanded {
+                        "Collapse comparison"
+                    } else {
+                        "Expand comparison"
+                    },
+                );
+                assert_bounds_within(
+                    surface,
+                    egui::accesskit::Rect {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: width.into(),
+                        y1: height.into(),
+                    },
+                    "comparison dock",
+                );
+                assert_bounds_within(header, surface, "fixed comparison header");
+                assert_within_tolerance(
+                    surface.y1,
+                    f64::from(height),
+                    LAYOUT_TOLERANCE,
+                    "bottom-docked comparison surface",
+                );
+                for name in [
+                    "Add models",
+                    "Compare",
+                    "Open details for whisper.cpp base.en; variant base.en",
+                    "Install",
+                ] {
+                    let bounds = node_matching(&output, |node| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node.name().is_some_and(|actual| {
+                                if name == "Add models" {
+                                    actual.contains(name)
+                                } else {
+                                    actual == name
+                                }
+                            })
+                    })
+                    .bounds()
+                    .unwrap_or_else(|| panic!("Models action {name:?} should expose bounds"));
+                    assert!(
+                        bounds.x0 >= surface.x0 - LAYOUT_TOLERANCE
+                            && bounds.x1 <= surface.x1 + LAYOUT_TOLERANCE,
+                        "Models control {name:?} must stay within the shared route inset: {bounds:?} vs {surface:?}"
+                    );
+                }
+                if expanded && width >= 1_476.0 {
+                    let table = node_matching(&output, |node| {
+                        node.role() == egui::accesskit::Role::Table
+                            && node.name() == Some("Model comparison results")
+                    })
+                    .bounds()
+                    .expect("wide comparison table should expose bounds");
+                    assert_bounds_within(table, surface, "wide comparison table");
+                    assert!(
+                        surface.y1 - surface.y0 <= f64::from(height) * 0.6 + LAYOUT_TOLERANCE,
+                        "expanded dock must remain below the 60% viewport cap"
+                    );
+                } else if expanded {
+                    for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+                        let group = node_matching(&output, |node| {
+                            node.role() == egui::accesskit::Role::Group
+                                && node.name()
+                                    == Some(format!("Comparison result for {model}").as_str())
+                        })
+                        .bounds()
+                        .expect("compact comparison group should expose bounds");
+                        assert!(
+                            group.x0 >= surface.x0
+                                && group.x1 <= surface.x1
+                                && group.y0 < surface.y1
+                                && group.y1 > surface.y0,
+                            "compact comparison result group must remain horizontally contained and vertically intersect its scrollable surface: {group:?} vs {surface:?}"
+                        );
+                    }
+                }
+                if expanded {
+                    let start = named_node_bounds(&output, "Start test recording");
+                    assert_bounds_within(start, surface, "comparison recording action");
+                    for (_, accuracy) in output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .filter(|(_, node)| {
+                            node.role() == egui::accesskit::Role::Button
+                                && node.name() == Some("Add a reference transcript to measure")
+                        })
+                    {
+                        assert_bounds_within(
+                            accuracy
+                                .bounds()
+                                .expect("accuracy action should expose bounds"),
+                            surface,
+                            "comparison result accuracy action",
+                        );
+                    }
+                } else {
+                    assert_within_tolerance(
+                        surface.y1 - surface.y0,
+                        82.0,
+                        LAYOUT_TOLERANCE,
+                        "collapsed comparison surface height",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn models_max_scroll_keeps_the_final_catalog_entry_24_points_above_the_dock() {
+        for fixture in [Fixture::ModelsInstalled, Fixture::ModelsCompareExpanded] {
+            let (width, height) = (1180.0, 815.0);
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = fixture.data();
+            let mut page = fixture.page();
+            let _ = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                Some(0.0),
+            );
+            let (route_id, _, initial_content_size, initial_viewport) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "route-scroll-diagnostics",
+                    ))
+                })
+                .expect("Models route should expose its scroll state in tests");
+            let mut route_state = egui::scroll_area::State::load(&ctx, route_id)
+                .expect("Models route scroll state should persist");
+            route_state.offset.y = (initial_content_size.y - initial_viewport.height()).max(0.0);
+            route_state.store(&ctx, route_id);
+
+            let settled = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                Some(1.0),
+            )
+            .0;
+            let surface = named_node_bounds(&settled, "Model comparison surface");
+            let final_entry = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("remote-catalog-final-entry-rect"))
+                })
+                .expect("remote catalog should expose its final entry rect in tests");
+            let (_, offset, content_size, viewport) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "route-scroll-diagnostics",
+                    ))
+                })
+                .expect("Models route should expose its settled scroll state");
+            assert_within_tolerance(
+                f64::from(offset.y),
+                (content_size.y - viewport.height()).max(0.0).into(),
+                LAYOUT_TOLERANCE,
+                "Models maximum route offset",
+            );
+            let visible_entry_bottom = f64::from(final_entry.bottom());
+            assert_within_tolerance(
+                surface.y0 - visible_entry_bottom,
+                24.0,
+                2.0,
+                "final catalog entry clearance above comparison dock",
+            );
         }
     }
 
@@ -2527,7 +2910,7 @@ mod tests {
 
     #[test]
     fn comparison_results_expose_wide_table_and_compact_groups() {
-        let wide = render(Fixture::ModelsCompareExpanded, 1180.0, 815.0);
+        let wide = render(Fixture::ModelsCompareExpanded, 1476.0, 1018.0);
         let wide_nodes = &wide
             .platform_output
             .accesskit_update
@@ -2558,43 +2941,45 @@ mod tests {
             "wide comparison action should align to the right edge"
         );
 
-        let compact = render(Fixture::ModelsCompareExpanded, 960.0, 680.0);
-        let compact_nodes = &compact
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .unwrap()
-            .nodes;
-        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
-            assert!(compact_nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::Group
-                    && node.name() == Some(format!("Comparison result for {model}").as_str())
-            }));
-            let group = node_matching(&compact, |node| {
-                node.role() == egui::accesskit::Role::Group
-                    && node.name() == Some(format!("Comparison result for {model}").as_str())
-            })
-            .bounds()
-            .expect("compact result group should expose bounds");
-            let surface = named_node_bounds(&compact, "Model comparison surface");
-            assert!(
-                group.x1 - group.x0 >= surface.x1 - surface.x0 - 40.0,
-                "compact result groups should use the comparison content width"
-            );
-        }
-        assert_eq!(
-            compact_nodes
-                .iter()
-                .filter(|(_, node)| {
-                    node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Add a reference transcript to measure")
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let compact = render(Fixture::ModelsCompareExpanded, width, height);
+            let compact_nodes = &compact
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes;
+            for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
+                assert!(compact_nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Group
+                        && node.name() == Some(format!("Comparison result for {model}").as_str())
+                }));
+                let group = node_matching(&compact, |node| {
+                    node.role() == egui::accesskit::Role::Group
+                        && node.name() == Some(format!("Comparison result for {model}").as_str())
                 })
-                .count(),
-            2
-        );
-        assert!(!compact_nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some("Model")
-        }));
+                .bounds()
+                .expect("compact result group should expose bounds");
+                let surface = named_node_bounds(&compact, "Model comparison surface");
+                assert!(
+                    group.x1 - group.x0 >= surface.x1 - surface.x0 - 40.0,
+                    "compact result groups should use the comparison content width"
+                );
+            }
+            assert_eq!(
+                compact_nodes
+                    .iter()
+                    .filter(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node.name() == Some("Add a reference transcript to measure")
+                    })
+                    .count(),
+                2
+            );
+            assert!(!compact_nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::ColumnHeader && node.name() == Some("Model")
+            }));
+        }
     }
 
     #[test]
@@ -2654,6 +3039,157 @@ mod tests {
     }
 
     #[test]
+    fn focused_final_comparison_action_scrolls_only_the_overfilled_dock_body() {
+        for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCompareExpanded.data();
+            let template = data.models[0].clone();
+            data.models = (0..4)
+                .map(|index| {
+                    let mut model = template.clone();
+                    model.id = format!("overfill-{index}");
+                    model.display_name = format!("whisper.cpp comparison model {index}");
+                    model.variant_label = format!("overfill-{index}");
+                    model.active = index == 0;
+                    model.recommended = false;
+                    model
+                })
+                .collect();
+            data.comparison.selected_model_ids =
+                data.models.iter().map(|model| model.id.clone()).collect();
+            data.comparison.results = data
+                .models
+                .iter()
+                .map(|model| {
+                    (
+                        model.id.clone(),
+                        ComparisonResult {
+                            phase: ComparisonResultPhase::Complete,
+                            output: Some("Comparison output".into()),
+                            processing_ms: Some(800),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            data.comparison.selection_feedback =
+                Some("Comparison selection details remain available. ".repeat(80));
+            let mut page = Fixture::ModelsCompareExpanded.page();
+
+            let initial = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                Some(0.0),
+            )
+            .0;
+            let header_before = named_node_bounds(&initial, "Collapse comparison");
+            let target = initial
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Add a reference transcript to measure")
+                })
+                .max_by(|(_, left), (_, right)| {
+                    left.bounds()
+                        .unwrap()
+                        .y1
+                        .total_cmp(&right.bounds().unwrap().y1)
+                })
+                .map(|(id, _)| *id)
+                .expect("the final comparison result should expose an accuracy action");
+            let _ = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Focus,
+                        target,
+                        data: None,
+                    },
+                )],
+                Some(0.1),
+            );
+            let _ = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                Some(0.2),
+            );
+            let settled = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                Vec::new(),
+                Some(1.0),
+            )
+            .0;
+            let target_bounds = settled
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == target)
+                .and_then(|(_, node)| node.bounds())
+                .expect("the focused final action should remain accessible");
+            let (_, body_offset, body_content, body_viewport) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "comparison-body-scroll-diagnostics",
+                    ))
+                })
+                .expect("comparison body should expose its settled test state");
+            assert!(
+                body_content.y > body_viewport.height() && body_offset.y > 0.0,
+                "final comparison focus must advance the overflowing dock body at {width}x{height}"
+            );
+            let visible_y0 = target_bounds.y0 - f64::from(body_offset.y);
+            let visible_y1 = target_bounds.y1 - f64::from(body_offset.y);
+            assert!(
+                visible_y0 >= f64::from(body_viewport.min.y) - LAYOUT_TOLERANCE
+                    && visible_y1 <= f64::from(body_viewport.max.y) + LAYOUT_TOLERANCE,
+                "focused final action must be visible in the comparison body; bounds={target_bounds:?}, offset={body_offset:?}, viewport={body_viewport:?}"
+            );
+            let header_after = named_node_bounds(&settled, "Collapse comparison");
+            assert_near(header_after.y0, header_before.y0, "fixed dock header y0");
+            assert_near(header_after.y1, header_before.y1, "fixed dock header y1");
+
+            let (_, route_offset, _, _) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                        "route-scroll-diagnostics",
+                    ))
+                })
+                .expect("outer route should expose its settled test state");
+            assert_eq!(
+                route_offset,
+                egui::Vec2::ZERO,
+                "comparison-body focus must not move the outer Models route"
+            );
+        }
+    }
+
+    #[test]
     fn completed_comparison_keeps_the_full_output_accessible_when_visually_truncated() {
         let mut data = Fixture::ModelsCompareExpanded.data();
         let long_output = "This is a realistic multi-sentence comparison transcript. It stays available in full even when the compact table column uses an ellipsis.";
@@ -2669,7 +3205,7 @@ mod tests {
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
         let mut page = Fixture::ModelsCompareExpanded.page();
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1476.0, 1018.0, Vec::new()).0;
 
         assert!(
             output
@@ -2690,7 +3226,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_expanded_comparison_table_fits_the_reference_viewport() {
+    fn initial_expanded_compact_results_fit_the_1180_reference_viewport() {
         let output = render(Fixture::ModelsCompareExpanded, 1180.0, 815.0);
         let update = output.platform_output.accesskit_update.as_ref().unwrap();
         let accuracy_actions: Vec<_> = update
@@ -2708,11 +3244,7 @@ mod tests {
                 .all(|(_, node)| { node.bounds().is_some_and(|bounds| bounds.y1 <= 815.0) })
         );
         for name in [
-            "Model",
-            "Duration",
-            "Processing time",
-            "Output",
-            "Accuracy",
+            "Start test recording",
             "Add a reference transcript to measure",
         ] {
             let bounds = named_node_bounds(&output, name);
@@ -2815,6 +3347,104 @@ mod tests {
         assert_eq!(
             harness_route(page, data.route),
             UiRoute::Settings(SettingsTab::Output)
+        );
+    }
+
+    #[test]
+    fn settings_final_control_is_reachable_through_the_route_scroll_area() {
+        let (width, height) = (960.0, 680.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::SettingsRecording.data();
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = AppPage::General;
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let target = named_node_id(&initial, "Enable local model Playground");
+        let focused = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target,
+                    data: None,
+                },
+            )],
+            Some(0.1),
+        )
+        .0;
+        assert_eq!(
+            focused_node(&focused).name(),
+            Some("Enable local model Playground")
+        );
+        let _ = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            Vec::new(),
+            Some(0.2),
+        );
+        let settled = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            Vec::new(),
+            Some(1.0),
+        )
+        .0;
+        let final_bounds = named_node_bounds(&settled, "Enable local model Playground");
+        let route_scroll = ctx
+            .data(|data| {
+                data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                    "route-scroll-diagnostics",
+                ))
+            })
+            .expect("route scroll area should report its settled test state");
+        let (_, offset, content_size, viewport) = route_scroll;
+        assert!(
+            offset.y > 0.0 && content_size.y > viewport.height(),
+            "focusing the final Settings control must advance the overflowing route scroll area"
+        );
+        let visible_y0 = final_bounds.y0 - f64::from(offset.y);
+        let visible_y1 = final_bounds.y1 - f64::from(offset.y);
+        assert!(
+            visible_y0 >= f64::from(viewport.min.y) && visible_y1 <= f64::from(viewport.max.y),
+            "focusing the final Settings control must scroll it into the compact route viewport; content_bounds={final_bounds:?}, offset={offset:?}, viewport={viewport:?}",
+        );
+    }
+
+    #[test]
+    fn compare_requires_two_runtime_ready_models_with_an_accessible_reason() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models[1].ready = false;
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Runtime not ready"),
+            "runtime state must be available as text, not color alone"
+        );
+        let compare = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Compare")
+        });
+        assert!(compare.is_disabled());
+        assert_eq!(
+            compare.description(),
+            Some("At least two installed models must be compatible and runtime-ready to compare.")
         );
     }
     #[test]
