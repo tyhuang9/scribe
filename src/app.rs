@@ -9906,7 +9906,6 @@ impl LocalTranscriberApp {
             audio_retention_days: self.config.history.audio_retention_days,
             store_application_identity: self.config.history.store_application_identity,
             diagnostics: self.settings_diagnostics(),
-            about_version: env!("CARGO_PKG_VERSION").to_owned(),
             about_model_directory: config::model_storage_dir(&self.config)
                 .display()
                 .to_string(),
@@ -9915,6 +9914,7 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             can_export_diagnostics: self.config_path.is_some(),
+            diagnostic_session_count: self.diagnostics.len(),
             save_state: settings_save_state(
                 self.settings_store
                     .as_ref()

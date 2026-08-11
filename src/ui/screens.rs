@@ -1,6 +1,6 @@
 //! Shared, backend-neutral egui screen renderers.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use eframe::egui::{
     self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea, Sense,
@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 
 use super::{
+    about_page,
     controls::{
         ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
@@ -144,10 +145,10 @@ pub(crate) struct RecordingSettingsView {
     pub audio_retention_days: Option<u32>,
     pub store_application_identity: bool,
     pub diagnostics: Vec<String>,
-    pub about_version: String,
     pub about_model_directory: String,
     pub about_settings_path: Option<String>,
     pub can_export_diagnostics: bool,
+    pub diagnostic_session_count: usize,
     pub save_state: SettingsSaveState,
 }
 
@@ -195,10 +196,10 @@ impl Default for RecordingSettingsView {
             audio_retention_days: None,
             store_application_identity: false,
             diagnostics: Vec::new(),
-            about_version: env!("CARGO_PKG_VERSION").into(),
             about_model_directory: "Unavailable".into(),
             about_settings_path: None,
             can_export_diagnostics: false,
+            diagnostic_session_count: 0,
             save_state: SettingsSaveState::Clean,
         }
     }
@@ -4334,23 +4335,16 @@ fn about_settings_panel(
     action: &mut ScreenAction,
 ) {
     settings_section(ui, "About Scribe", |ui| {
-        ui.label("Scribe keeps audio and transcripts on this device.");
-        ui.label(format!("Version {}", settings.about_version));
-        ui.label(
-            RichText::new("Local-first: audio and transcripts remain on this device.")
-                .color(ui_palette(ui).muted_text),
+        about_page(
+            ui,
+            Path::new(&settings.about_model_directory),
+            settings.about_settings_path.as_deref().map(Path::new),
         );
-        ui.label(format!("Models: {}", settings.about_model_directory));
-        ui.label(format!(
-            "Settings: {}",
-            settings
-                .about_settings_path
-                .as_deref()
-                .unwrap_or("Unavailable")
-        ));
         ui.label(
-            RichText::new("Redacted diagnostics are available from the native Settings view.")
-                .color(ui_palette(ui).muted_text),
+            format!(
+                "{} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors.",
+                settings.diagnostic_session_count
+            ),
         );
         if !settings.diagnostics.is_empty() {
             ui.separator();
