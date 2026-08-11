@@ -953,6 +953,7 @@ struct ComparisonProjectionCacheEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RemoteCatalogProjectionKey {
     revision: u64,
+    inventory_revision: u64,
     search: String,
     filters: RemoteCatalogFilters,
     sort: RemoteCatalogSort,
@@ -8194,21 +8195,31 @@ impl LocalTranscriberApp {
         {
             self.remote_catalog.catalog_io_request_count += 1;
         }
-        self.remote_catalog.refresh_generation =
-            self.remote_catalog.refresh_generation.wrapping_add(1);
+        let Some(next_generation) = self.remote_catalog.refresh_generation.checked_add(1) else {
+            self.remote_catalog.loading = false;
+            self.remote_catalog.active_refresh_generation = None;
+            self.remote_catalog.error = Some(
+                "The trusted catalog refresh counter was exhausted; restart Scribe to refresh."
+                    .to_owned(),
+            );
+            return;
+        };
+        self.remote_catalog.refresh_generation = next_generation;
         let generation = self.remote_catalog.refresh_generation;
+        self.remote_catalog.loading = true;
+        self.remote_catalog.active_refresh_generation = Some(generation);
+        self.remote_catalog.error = None;
         let cache_path = match config::cache_dir() {
             Ok(path) => path.join("huggingface-model-catalog-v1.json"),
             Err(error) => {
+                self.remote_catalog.loading = false;
+                self.remote_catalog.active_refresh_generation = None;
                 self.remote_catalog.error = Some(format!(
                     "Could not determine the local Hugging Face catalog cache path: {error}"
                 ));
                 return;
             }
         };
-        self.remote_catalog.loading = true;
-        self.remote_catalog.active_refresh_generation = Some(generation);
-        self.remote_catalog.error = None;
         let tx = self.tx.clone();
         let spawn = thread::Builder::new()
             .name("scribe-huggingface-catalog".to_owned())
@@ -8309,6 +8320,11 @@ impl LocalTranscriberApp {
         let search = self.model_search.trim().to_ascii_lowercase();
         let projection_key = RemoteCatalogProjectionKey {
             revision: self.remote_catalog.projection_revision,
+            inventory_revision: self
+                .remote_catalog
+                .snapshot
+                .as_ref()
+                .map_or(0, ModelInventorySnapshot::revision),
             search: search.clone(),
             filters: self.remote_catalog_filters,
             sort: self.remote_catalog_sort,
@@ -8369,9 +8385,7 @@ impl LocalTranscriberApp {
         } else if let Some(snapshot) = snapshot {
             let kind = match snapshot.source() {
                 CatalogSource::BundledFallback => RemoteCatalogStatusKind::Offline,
-                CatalogSource::Network | CatalogSource::FreshCache => {
-                    RemoteCatalogStatusKind::Available
-                }
+                CatalogSource::Network => RemoteCatalogStatusKind::Available,
             };
             (
                 kind,
@@ -16619,7 +16633,7 @@ mod layout_tests {
         app.remote_catalog.snapshot = Some(
             ModelInventorySnapshot::from_trusted_records(
                 2,
-                CatalogSource::FreshCache,
+                CatalogSource::Network,
                 0,
                 (0..10_000)
                     .map(|index| {
@@ -16701,7 +16715,7 @@ mod layout_tests {
         app.remote_catalog.snapshot = Some(
             ModelInventorySnapshot::from_trusted_records(
                 2,
-                CatalogSource::FreshCache,
+                CatalogSource::Network,
                 0,
                 vec![remote_catalog_model(
                     "handy-computer/action-fixture",

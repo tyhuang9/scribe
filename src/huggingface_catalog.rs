@@ -7,6 +7,7 @@
 //! runtime compatibility gate has enough release evidence to promote one.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -105,7 +106,6 @@ impl RemoteModel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogSource {
     Network,
-    FreshCache,
     BundledFallback,
 }
 
@@ -113,7 +113,6 @@ impl CatalogSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Network => "Live Hugging Face catalog",
-            Self::FreshCache => "Cached Hugging Face catalog",
             Self::BundledFallback => "Bundled offline catalog fallback",
         }
     }
