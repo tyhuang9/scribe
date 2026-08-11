@@ -3907,9 +3907,8 @@ fn recording_settings_panel(
         state.phase,
         TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
     );
-    card(ui, |ui| {
-        ui.label(RichText::new("Recording behavior").strong());
-        ui.add_space(12.0);
+    settings_section(ui, "Recording behavior", |ui| {
+        ui.add_space(6.0);
         if recording_locked {
             let notice = ui.label(
                 RichText::new("Finish recording before changing recording settings.")
@@ -4189,9 +4188,7 @@ fn general_settings_panel(
     settings: &RecordingSettingsView,
     action: &mut ScreenAction,
 ) {
-    card(ui, |ui| {
-        ui.label(RichText::new("General settings").strong());
-        ui.add_space(8.0);
+    settings_section(ui, "General settings", |ui| {
         let mut close_to_tray = settings.close_to_tray;
         if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
             *action = ScreenAction::SetCloseToTray(close_to_tray);
@@ -4250,7 +4247,7 @@ fn general_settings_panel(
     card(ui, |ui| {
         ui.label(RichText::new("Appearance").strong());
         let mut theme = settings.theme_label.clone();
-        setting_row(ui, "Theme", |ui, label_id| {
+        setting_row_with_separator(ui, "Theme", true, |ui, label_id| {
             ComboBox::from_id_source("theme-mode")
                 .selected_text(&theme)
                 .show_ui(ui, |ui| {
@@ -4265,7 +4262,7 @@ fn general_settings_panel(
             *action = ScreenAction::SetTheme(theme);
         }
         let mut overlay = settings.overlay_label.clone();
-        setting_row(ui, "Dictation overlay", |ui, label_id| {
+        setting_row_with_separator(ui, "Dictation overlay", false, |ui, label_id| {
             ui.add_enabled_ui(settings.overlay_available, |ui| {
                 ComboBox::from_id_source("overlay-mode")
                     .selected_text(&overlay)
@@ -4380,9 +4377,7 @@ fn advanced_settings_panel(
     settings: &RecordingSettingsView,
     action: &mut ScreenAction,
 ) {
-    card(ui, |ui| {
-        ui.label(RichText::new("Advanced settings").strong());
-        ui.add_space(8.0);
+    settings_section(ui, "Advanced settings", |ui| {
         let mut preview = settings.provisional_feedback;
         if ui
             .checkbox(&mut preview, "Use live provisional preview")
@@ -4703,9 +4698,45 @@ struct SettingsSection;
 
 impl SettingsSection {
     fn show(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
-        ui.label(RichText::new(title).strong());
-        ui.add_space(6.0);
-        contents(ui);
+        card(ui, |ui| {
+            ui.label(RichText::new(title).strong());
+            ui.add_space(6.0);
+            contents(ui);
+        });
+    }
+}
+
+struct SettingsRow;
+
+impl SettingsRow {
+    fn show(
+        ui: &mut egui::Ui,
+        label: &str,
+        separator_after: bool,
+        contents: impl FnOnce(&mut egui::Ui, egui::Id),
+    ) -> egui::Response {
+        let compact = current_content_width(ui) < 620.0;
+        let row = ui.scope(|ui| {
+            ui.set_min_height(56.0);
+            if compact {
+                ui.vertical(|ui| {
+                    let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+                    contents(ui, label.id);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let label = ui.add_sized(
+                        [270.0, 44.0],
+                        egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
+                    );
+                    contents(ui, label.id);
+                });
+            }
+        });
+        if separator_after {
+            ui.separator();
+        }
+        row.response
     }
 }
 
@@ -4714,25 +4745,16 @@ fn settings_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut e
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui, egui::Id)) {
-    let compact = current_content_width(ui) < 620.0;
-    let row = ui.scope(|ui| {
-        ui.set_min_height(56.0);
-        if compact {
-            ui.vertical(|ui| {
-                let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
-                contents(ui, label.id);
-            });
-        } else {
-            ui.horizontal(|ui| {
-                let label = ui.add_sized(
-                    [270.0, 44.0],
-                    egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-                );
-                contents(ui, label.id);
-            });
-        }
-    });
-    let _ = row;
+    setting_row_with_separator(ui, label, false, contents);
+}
+
+fn setting_row_with_separator(
+    ui: &mut egui::Ui,
+    label: &str,
+    separator_after: bool,
+    contents: impl FnOnce(&mut egui::Ui, egui::Id),
+) {
+    let _ = SettingsRow::show(ui, label, separator_after, contents);
 }
 
 fn compact_setting_row(
@@ -4741,27 +4763,7 @@ fn compact_setting_row(
     separator_after: bool,
     contents: impl FnOnce(&mut egui::Ui, egui::Id),
 ) {
-    let compact = current_content_width(ui) < 620.0;
-    ui.scope(|ui| {
-        ui.set_min_height(56.0);
-        if compact {
-            ui.vertical(|ui| {
-                let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
-                contents(ui, label.id);
-            });
-        } else {
-            ui.horizontal(|ui| {
-                let label = ui.add_sized(
-                    [270.0, 44.0],
-                    egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-                );
-                contents(ui, label.id);
-            });
-        }
-    });
-    if separator_after {
-        ui.separator();
-    }
+    let _ = SettingsRow::show(ui, label, separator_after, contents);
 }
 
 fn next_tab(tab: SettingsTab) -> SettingsTab {
@@ -6143,6 +6145,55 @@ mod tests {
                                 })
                     })
             );
+        }
+    }
+
+    #[test]
+    fn dense_settings_rows_stack_compactly_and_only_paint_requested_separators() {
+        for (width, compact) in [(900.0, false), (480.0, true)] {
+            let ctx = egui::Context::default();
+            let mut row_rect = egui::Rect::NOTHING;
+            let mut control_rect = egui::Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        row_rect = SettingsRow::show(ui, "Dense row", true, |ui, label_id| {
+                            control_rect = ui
+                                .add_sized([120.0, 44.0], egui::Button::new("Control"))
+                                .labelled_by(label_id)
+                                .rect;
+                        })
+                        .rect;
+                        let _ = SettingsRow::show(ui, "Second row", false, |ui, label_id| {
+                            ui.add_sized([120.0, 44.0], egui::Button::new("Second control"))
+                                .labelled_by(label_id);
+                        });
+                    });
+                },
+            );
+            assert!(row_rect.height() >= 56.0);
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(shape.shape, egui::epaint::Shape::LineSegment { .. }))
+                    .count()
+                    == 1,
+                "two rendered rows must paint exactly one separator"
+            );
+            assert!(control_rect.width() >= 44.0 && control_rect.height() >= 44.0);
+            if compact {
+                assert!(control_rect.center().y > row_rect.center().y);
+            } else {
+                assert!((control_rect.center().y - row_rect.center().y).abs() < 8.0);
+            }
         }
     }
 }

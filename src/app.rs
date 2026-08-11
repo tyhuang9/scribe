@@ -77,7 +77,7 @@ use crate::ui::{
     RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
     RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
     RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
-    SettingsTab, ThemePalette, UiRoute, about_page, configure_accessible_style, history_page,
+    SettingsTab, ThemePalette, UiRoute, configure_accessible_style, history_page,
     minimum_primary_target_height, recording_mode, render_screen, scroll_focused_control_into_view,
     settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
     ui_palette,
@@ -10252,56 +10252,6 @@ impl LocalTranscriberApp {
             self.apply_history_action(action);
         }
     }
-
-    #[allow(dead_code)]
-    fn ui_about(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        let model_dir = config::model_storage_dir(&self.config);
-        let config_path = self.config_path.clone();
-        let export_dir = config_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|parent| parent.join("diagnostics"));
-        let session_count = self.diagnostics.len();
-        let mut export_requested = false;
-        page(ui, "About", status, &status_message, |ui| {
-            about_page(ui, &model_dir, config_path.as_deref());
-            ui.add_space(12.0);
-            ui.group(|ui| {
-                semantic_heading(ui, section_heading("Redacted diagnostics"));
-                ui.label(format!(
-                    "{session_count} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors."
-                ));
-                let unavailable_reason = export_dir.is_none().then_some(
-                    "The platform settings directory is unavailable, so Scribe cannot choose a private export location.",
-                );
-                let button = ui.add_enabled(
-                    export_dir.is_some(),
-                    Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
-                );
-                if let Some(reason) = unavailable_reason {
-                    ui.ctx().accesskit_node_builder(button.id, |builder| {
-                        builder.set_description(reason);
-                    });
-                    ui.label(mut_text(reason));
-                }
-                export_requested = button.clicked();
-            });
-        });
-        if export_requested && let Some(directory) = export_dir {
-            match diagnostics::export_redacted(&directory, &self.diagnostics) {
-                Ok(path) => {
-                    self.status_message =
-                        format!("Redacted diagnostics exported to {}", path.display());
-                }
-                Err(error) => {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not export redacted diagnostics: {error}");
-                }
-            }
-        }
-    }
 }
 
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
@@ -16050,7 +16000,11 @@ mod layout_tests {
                         show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
                     }
                     Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                    Tab::About => show_route_scroll(ui, UiRoute::About, |ui| app.ui_about(ui)),
+                    Tab::About => {
+                        show_route_scroll(ui, UiRoute::Settings(SettingsTab::About), |ui| {
+                            app.ui_general_settings(ui)
+                        })
+                    }
                     Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui)),
                 });
         })
@@ -16188,7 +16142,11 @@ mod layout_tests {
                             show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
                         }
                         Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
-                        Tab::About => show_route_scroll(ui, UiRoute::About, |ui| app.ui_about(ui)),
+                        Tab::About => {
+                            show_route_scroll(ui, UiRoute::Settings(SettingsTab::About), |ui| {
+                                app.ui_general_settings(ui)
+                            })
+                        }
                         Tab::Debug => {
                             show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui))
                         }
