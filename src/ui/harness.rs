@@ -133,6 +133,7 @@ impl Fixture {
             model_language_filter: ModelLanguageFilter::default(),
             remote_catalog: remote_catalog_fixture(),
             settings,
+            settings_playground_open: false,
         }
     }
 }
@@ -186,6 +187,7 @@ struct FixtureData {
     model_language_filter: ModelLanguageFilter,
     remote_catalog: RemoteCatalogView,
     settings: RecordingSettingsView,
+    settings_playground_open: bool,
 }
 
 fn remote_catalog_fixture() -> RemoteCatalogView {
@@ -520,7 +522,10 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.remote_catalog.status.message = format!("Removed catalog model {model_id}.");
         }
         ScreenAction::SetSettingsTab(tab) => {
-            data.route = UiRoute::Settings(tab);
+            data.route = UiRoute::Settings(match tab {
+                SettingsTab::Output => SettingsTab::General,
+                tab => tab,
+            });
             *page = AppPage::General;
         }
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
@@ -565,7 +570,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetOverlayPosition(value) => data.settings.overlay_position_label = value,
         ScreenAction::SetDebugMode(value) => data.settings.debug_mode = value,
         ScreenAction::OpenDeveloperPlayground if data.settings.debug_mode => {
-            data.route = UiRoute::Settings(SettingsTab::Advanced)
+            data.route = UiRoute::Settings(SettingsTab::Advanced);
+            data.settings_playground_open = true;
+            *page = AppPage::General;
         }
         ScreenAction::OpenDeveloperPlayground => {}
         ScreenAction::ExportRedactedDiagnostics => {}
@@ -579,6 +586,13 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.settings.store_application_identity = value
         }
     }
+}
+
+#[cfg(test)]
+fn close_settings_playground(data: &mut FixtureData, page: &mut AppPage) {
+    data.route = UiRoute::Settings(SettingsTab::Advanced);
+    data.settings_playground_open = false;
+    *page = AppPage::General;
 }
 
 #[cfg(test)]
@@ -3750,13 +3764,31 @@ mod tests {
         apply_action(
             &mut data,
             &mut page,
-            ScreenAction::SetSettingsTab(SettingsTab::General),
+            ScreenAction::SetSettingsTab(SettingsTab::Output),
         );
         assert_eq!(data.route, UiRoute::Settings(SettingsTab::General));
         assert_eq!(
             harness_route(page, data.route),
             UiRoute::Settings(SettingsTab::General)
         );
+    }
+
+    #[test]
+    fn playground_actions_remain_inside_settings_and_back_returns_to_advanced() {
+        let mut data = Fixture::SettingsRecording.data();
+        data.settings.debug_mode = true;
+        data.route = UiRoute::Settings(SettingsTab::Advanced);
+        let mut page = AppPage::General;
+
+        apply_action(&mut data, &mut page, ScreenAction::OpenDeveloperPlayground);
+        assert_eq!(page, AppPage::General);
+        assert_eq!(data.route, UiRoute::Settings(SettingsTab::Advanced));
+        assert!(data.settings_playground_open);
+
+        close_settings_playground(&mut data, &mut page);
+        assert_eq!(page, AppPage::General);
+        assert_eq!(data.route, UiRoute::Settings(SettingsTab::Advanced));
+        assert!(!data.settings_playground_open);
     }
 
     #[test]

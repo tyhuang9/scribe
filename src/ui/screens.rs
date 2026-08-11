@@ -4191,13 +4191,17 @@ fn general_settings_panel(
 ) {
     settings_section(ui, "General settings", |ui| {
         let mut close_to_tray = settings.close_to_tray;
-        if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
-            *action = ScreenAction::SetCloseToTray(close_to_tray);
-        }
-        ui.label(
-            RichText::new("Scribe keeps audio and transcripts on this device.")
-                .color(ui_palette(ui).muted_text),
-        );
+        let _ = SettingsRow::show(ui, "Window behavior", false, |ui, _| {
+            ui.vertical(|ui| {
+                if settings_checkbox(ui, &mut close_to_tray, "Close to tray").changed() {
+                    *action = ScreenAction::SetCloseToTray(close_to_tray);
+                }
+                ui.label(
+                    RichText::new("Scribe keeps audio and transcripts on this device.")
+                        .color(ui_palette(ui).muted_text),
+                );
+            });
+        });
     });
     ui.add_space(16.0);
     card(ui, |ui| {
@@ -4292,40 +4296,44 @@ fn output_settings_panel(
     settings: &RecordingSettingsView,
     action: &mut ScreenAction,
 ) {
-    card(ui, |ui| {
-        ui.label(RichText::new("Output settings").strong());
-        ui.add_space(8.0);
+    settings_section(ui, "Output settings", |ui| {
         let mut auto_insert = settings.auto_insert_transcript;
-        if ui
-            .checkbox(&mut auto_insert, &settings.output_label)
-            .changed()
-        {
-            *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
-        }
-        ui.add_enabled_ui(auto_insert, |ui| {
+        let has_following_row =
+            auto_insert && (settings.show_restore_clipboard || settings.output_notice.is_some());
+        let _ = SettingsRow::show(ui, "Transcript delivery", has_following_row, |ui, _| {
+            if settings_checkbox(ui, &mut auto_insert, &settings.output_label).changed() {
+                *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
+            }
+        });
+        if auto_insert {
             if settings.show_restore_clipboard {
                 let mut restore = settings.restore_clipboard_after_insert;
-                if ui
-                    .checkbox(&mut restore, "Restore clipboard after insert")
-                    .changed()
-                {
-                    *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
-                }
-                ui.horizontal(|ui| {
-                    let label = ui.label("Paste delay ms");
+                let _ = SettingsRow::show(ui, "Clipboard", true, |ui, _| {
+                    if settings_checkbox(ui, &mut restore, "Restore clipboard after insert")
+                        .changed()
+                    {
+                        *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
+                    }
+                });
+                let _ = SettingsRow::show(ui, "Paste delay ms", false, |ui, label_id| {
                     let mut delay = settings.paste_delay_ms as i64;
                     if ui
-                        .add(egui::DragValue::new(&mut delay).clamp_range(1..=1_000))
-                        .labelled_by(label.id)
+                        .add_sized(
+                            [96.0, 44.0],
+                            egui::DragValue::new(&mut delay).clamp_range(1..=1_000),
+                        )
+                        .labelled_by(label_id)
                         .changed()
                     {
                         *action = ScreenAction::SetPasteDelayMs(delay as u64);
                     }
                 });
             } else if let Some(notice) = &settings.output_notice {
-                ui.label(RichText::new(notice).color(ui_palette(ui).muted_text));
+                let _ = SettingsRow::show(ui, "Platform behavior", false, |ui, _| {
+                    ui.label(RichText::new(notice).color(ui_palette(ui).muted_text));
+                });
             }
-        });
+        }
     });
 }
 
@@ -4373,18 +4381,19 @@ fn advanced_settings_panel(
 ) {
     settings_section(ui, "Advanced settings", |ui| {
         let mut preview = settings.provisional_feedback;
-        if ui
-            .checkbox(&mut preview, "Use live provisional preview")
-            .changed()
-        {
-            *action = ScreenAction::ToggleProvisionalFeedback;
-        }
-        ui.label(
-            RichText::new(
-                "Preview text remains inside Scribe until final transcription completes.",
-            )
-            .color(ui_palette(ui).muted_text),
-        );
+        let _ = SettingsRow::show(ui, "Transcription preview", false, |ui, _| {
+            ui.vertical(|ui| {
+                if settings_checkbox(ui, &mut preview, "Use live provisional preview").changed() {
+                    *action = ScreenAction::ToggleProvisionalFeedback;
+                }
+                ui.label(
+                    RichText::new(
+                        "Preview text remains inside Scribe until final transcription completes.",
+                    )
+                    .color(ui_palette(ui).muted_text),
+                );
+            });
+        });
     });
     ui.add_space(16.0);
     card(ui, |ui| {
@@ -4479,16 +4488,28 @@ fn advanced_settings_panel(
         });
     });
     ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Developer").strong());
+    settings_section(ui, "Developer", |ui| {
         let mut enabled = settings.debug_mode;
-        let playground = ui.checkbox(&mut enabled, "Enable local model Playground");
+        let mut playground = None;
+        let _ = SettingsRow::show(ui, "Developer tools", settings.debug_mode, |ui, _| {
+            playground = Some(settings_checkbox(
+                ui,
+                &mut enabled,
+                "Enable local model Playground",
+            ));
+        });
+        let playground = playground.expect("developer row always renders its checkbox");
         scroll_focused_control_into_view(ui, &playground);
         if playground.changed() {
             *action = ScreenAction::SetDebugMode(enabled);
         }
         if settings.debug_mode {
-            let open = ui.add_sized([176.0, 44.0], egui::Button::new("Open model Playground"));
+            let mut open = None;
+            let _ = SettingsRow::show(ui, "Playground", false, |ui, _| {
+                open =
+                    Some(ui.add_sized([176.0, 44.0], egui::Button::new("Open model Playground")));
+            });
+            let open = open.expect("enabled developer row always renders its action");
             scroll_focused_control_into_view(ui, &open);
             if open.clicked() {
                 *action = ScreenAction::OpenDeveloperPlayground;
@@ -4732,6 +4753,13 @@ impl SettingsRow {
         }
         row.response
     }
+}
+
+fn settings_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width().max(44.0), 44.0],
+        egui::Checkbox::new(value, label),
+    )
 }
 
 fn settings_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
@@ -6187,6 +6215,92 @@ mod tests {
                 assert!(control_rect.center().y > row_rect.center().y);
             } else {
                 assert!((control_rect.center().y - row_rect.center().y).abs() < 8.0);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_settings_actions_have_full_targets_and_compact_rows_stack() {
+        let settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            show_restore_clipboard: true,
+            debug_mode: true,
+            ..Default::default()
+        };
+        for (width, compact) in [(900.0, false), (480.0, true)] {
+            for (tab, controls) in [
+                (
+                    SettingsTab::General,
+                    &[
+                        "Close to tray",
+                        "Automatically insert final transcript",
+                        "Restore clipboard after insert",
+                    ][..],
+                ),
+                (
+                    SettingsTab::Advanced,
+                    &[
+                        "Use live provisional preview",
+                        "Enable local model Playground",
+                        "Open model Playground",
+                    ][..],
+                ),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width, 3_000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let _ =
+                                settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                        });
+                    },
+                );
+                let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+                for name in controls {
+                    let bounds = nodes
+                        .iter()
+                        .find_map(|(_, node)| {
+                            (node.name() == Some(*name))
+                                .then(|| node.bounds())
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| panic!("missing {name} at {width}px"));
+                    assert!(
+                        bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0,
+                        "{name} target is too small at {width}px: {bounds:?}"
+                    );
+                }
+                if tab == SettingsTab::General {
+                    let label = nodes
+                        .iter()
+                        .find_map(|(_, node)| {
+                            (node.name() == Some("Window behavior"))
+                                .then(|| node.bounds())
+                                .flatten()
+                        })
+                        .expect("window row label has bounds");
+                    let control = nodes
+                        .iter()
+                        .find_map(|(_, node)| {
+                            (node.name() == Some("Close to tray"))
+                                .then(|| node.bounds())
+                                .flatten()
+                        })
+                        .expect("close control has bounds");
+                    if compact {
+                        assert!(control.y0 >= label.y1);
+                    } else {
+                        assert!((control.y0 + control.y1 - label.y0 - label.y1).abs() < 16.0);
+                    }
+                }
             }
         }
     }

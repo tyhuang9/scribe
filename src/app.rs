@@ -3319,6 +3319,14 @@ impl LocalTranscriberApp {
         self.start_microphone_test();
     }
 
+    fn sync_passive_microphone_monitor(&mut self) {
+        if self.passive_microphone_monitor_needed() {
+            self.ensure_microphone_monitor();
+        } else {
+            self.suspend_microphone_monitor();
+        }
+    }
+
     fn start_microphone_test(&mut self) {
         if self.quit_requested
             || self.microphone_test_is_active()
@@ -7968,11 +7976,7 @@ impl eframe::App for LocalTranscriberApp {
             _ => {}
         }
         show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
-        if self.passive_microphone_monitor_needed() {
-            self.ensure_microphone_monitor();
-        } else {
-            self.suspend_microphone_monitor();
-        }
+        self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
@@ -7993,9 +7997,7 @@ impl eframe::App for LocalTranscriberApp {
                 Tab::Debug => unreachable!("debug navigation is routed to Settings"),
             });
 
-        if !self.passive_microphone_monitor_needed() {
-            self.suspend_microphone_monitor();
-        }
+        self.sync_passive_microphone_monitor();
 
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
@@ -9366,9 +9368,7 @@ impl LocalTranscriberApp {
                     .add_sized([176.0, 44.0], Button::new("Back to Advanced"))
                     .clicked()
             {
-                self.settings_tab = SettingsTab::Advanced;
-                self.current_tab = Tab::General;
-                self.settings_playground_open = false;
+                self.close_settings_playground();
                 return;
             }
             if self.current_tab == Tab::Models {
@@ -9625,6 +9625,12 @@ impl LocalTranscriberApp {
             });
         });
         self.ui_playground_model_selector(ui.ctx());
+    }
+
+    fn close_settings_playground(&mut self) {
+        self.settings_tab = SettingsTab::Advanced;
+        self.current_tab = Tab::General;
+        self.settings_playground_open = false;
     }
 
     fn ui_playground_model_selector(&mut self, ctx: &egui::Context) {
@@ -9956,7 +9962,12 @@ impl LocalTranscriberApp {
 
     fn apply_settings_screen_action(&mut self, action: ScreenAction) {
         match action {
-            ScreenAction::SetSettingsTab(tab) => self.settings_tab = tab,
+            ScreenAction::SetSettingsTab(tab) => {
+                self.settings_tab = match tab {
+                    SettingsTab::Output => SettingsTab::General,
+                    tab => tab,
+                };
+            }
             ScreenAction::SetCloseToTray(value) => {
                 self.config.general.close_to_tray = value;
                 self.save_config();
@@ -12896,6 +12907,179 @@ mod layout_tests {
             base + INPUT_LEVEL_STALE_AFTER + Duration::from_secs(3),
         );
         assert_eq!(settled, 0.0);
+    }
+
+    fn passive_monitor_test_app() -> LocalTranscriberApp {
+        let mut app = test_app();
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Recording;
+        app.window_hidden_to_tray = false;
+        app.quit_requested = false;
+        app
+    }
+
+    fn set_fake_starting_monitor(app: &mut LocalTranscriberApp, request_id: u64) {
+        app.microphone_test_sequence = request_id;
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+    }
+
+    fn assert_fake_monitor_stops(mut app: LocalTranscriberApp) {
+        set_fake_starting_monitor(&mut app, 41);
+        app.sync_passive_microphone_monitor();
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 41,
+                stop_requested: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn passive_monitor_predicate_requires_visible_recording_settings_without_an_owner() {
+        let mut app = passive_monitor_test_app();
+        assert!(app.passive_microphone_monitor_needed());
+
+        app.current_tab = Tab::Models;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.settings_tab = SettingsTab::Recording;
+        app.window_hidden_to_tray = true;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.window_hidden_to_tray = false;
+        app.quit_requested = true;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.quit_requested = false;
+        app.deferred_recording_start = Some(DeferredRecordingStart {
+            source: RecordingSource::Transcribe,
+            activation_at: Instant::now(),
+            trigger_observation: TriggerObservation::AppAction,
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+        app.deferred_recording_start = None;
+        app.deferred_history_playback = Some(7);
+        assert!(!app.passive_microphone_monitor_needed());
+        app.deferred_history_playback = None;
+        app.playing_history_id = Some(7);
+        assert!(!app.passive_microphone_monitor_needed());
+        app.playing_history_id = None;
+
+        app.pending_recording = Some(PendingRecording {
+            session_id: SessionId(70),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+        app.pending_recording = None;
+        app.active_recording = Some(ActiveRecording {
+            session_id: SessionId(71),
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+    }
+
+    #[test]
+    fn passive_monitor_sync_is_idempotent_and_never_duplicates_starting_sessions() {
+        let mut app = passive_monitor_test_app();
+        set_fake_starting_monitor(&mut app, 17);
+
+        app.sync_passive_microphone_monitor();
+        app.sync_passive_microphone_monitor();
+
+        assert_eq!(app.microphone_test_sequence, 17);
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 17,
+                stop_requested: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn passive_monitor_tears_down_for_every_competing_owner_and_visibility_exit() {
+        let mut route_exit = passive_monitor_test_app();
+        route_exit.settings_tab = SettingsTab::Advanced;
+        assert_fake_monitor_stops(route_exit);
+
+        let mut hidden = passive_monitor_test_app();
+        hidden.window_hidden_to_tray = true;
+        assert_fake_monitor_stops(hidden);
+
+        let mut quitting = passive_monitor_test_app();
+        quitting.quit_requested = true;
+        assert_fake_monitor_stops(quitting);
+
+        let mut deferred_capture = passive_monitor_test_app();
+        deferred_capture.deferred_recording_start = Some(DeferredRecordingStart {
+            source: RecordingSource::Transcribe,
+            activation_at: Instant::now(),
+            trigger_observation: TriggerObservation::AppAction,
+        });
+        assert_fake_monitor_stops(deferred_capture);
+
+        let mut deferred_playback = passive_monitor_test_app();
+        deferred_playback.deferred_history_playback = Some(7);
+        assert_fake_monitor_stops(deferred_playback);
+
+        let mut playback = passive_monitor_test_app();
+        playback.playing_history_id = Some(7);
+        assert_fake_monitor_stops(playback);
+
+        let mut capture = passive_monitor_test_app();
+        capture.pending_recording = Some(PendingRecording {
+            session_id: SessionId(72),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        assert_fake_monitor_stops(capture);
+    }
+
+    #[test]
+    fn passive_monitor_repaints_at_twenty_hz_only_while_its_session_exists() {
+        let mut app = passive_monitor_test_app();
+        let now = Instant::now();
+        app.microphone_level_envelope
+            .update(0.2, Some(1), true, now);
+        assert_eq!(app.next_repaint_delay(), IDLE_REPAINT_DELAY);
+
+        set_fake_starting_monitor(&mut app, 23);
+        assert_eq!(app.next_repaint_delay(), PASSIVE_MONITOR_REPAINT_DELAY);
+        assert_eq!(PASSIVE_MONITOR_REPAINT_DELAY, Duration::from_millis(50));
+
+        app.microphone_test = MicrophoneTest::Idle;
+        app.pending_recording = Some(PendingRecording {
+            session_id: SessionId(73),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
     }
 
     #[test]
@@ -16963,6 +17147,36 @@ mod layout_tests {
         assert!(!app.config.developer.debug_mode);
         assert_eq!(app.current_tab, Tab::General);
         assert_eq!(app.settings_tab, SettingsTab::Advanced);
+    }
+
+    #[test]
+    fn legacy_output_settings_action_stores_general() {
+        let mut app = test_app();
+        app.settings_tab = SettingsTab::Recording;
+
+        app.apply_settings_screen_action(ScreenAction::SetSettingsTab(SettingsTab::Output));
+
+        assert_eq!(app.settings_tab, SettingsTab::General);
+    }
+
+    #[test]
+    fn advanced_playground_actions_remain_inside_settings() {
+        let mut app = test_app();
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+
+        app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+        assert!(app.settings_playground_open);
+
+        app.close_settings_playground();
+
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+        assert!(!app.settings_playground_open);
     }
 
     #[test]
