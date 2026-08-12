@@ -1448,42 +1448,47 @@ fn run_verified_install(
                 total_bytes: model.size_bytes,
                 bytes_per_second: None,
             });
-            service
-                .verify_installation_candidate(
-                    InstallationCandidate::normalized(
-                        model_id.clone(),
-                        model.path.clone(),
-                        Some(root.clone()),
-                    )
-                    .ok()?,
-                    &cancellation,
-                )
+            InstallationCandidate::normalized(
+                model_id.clone(),
+                model.path.clone(),
+                Some(root.clone()),
+            )
+            .ok()
+            .and_then(|candidate| {
+                verify_candidate_handoff(&cancellation, || {
+                    service
+                        .verify_installation_candidate(candidate, &cancellation)
+                        .map_err(|error| error.to_string())
+                })
                 .ok()
+            })
         });
     let current_runtime_known_good = smoke_current.is_some()
         && candidate_root
             .as_ref()
             .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
 
-    let smoke = if model_uses_embedded_runtime {
+    let verified_smoke = if model_uses_embedded_runtime {
         progress(InstallProgress {
             stage: InstallStage::HealthChecking,
             completed_bytes: model.size_bytes,
             total_bytes: model.size_bytes,
             bytes_per_second: None,
         });
-        service
-            .verify_installation_candidate(
-                InstallationCandidate::pinned(
-                    model_id.clone(),
-                    model.path.clone(),
-                    None,
-                    manifest_source.expected_size_bytes,
-                    manifest_source.expected_sha256.clone(),
-                ),
-                &cancellation,
-            )
-            .map_err(|error| error.to_string())?
+        verify_candidate_handoff(&cancellation, || {
+            service
+                .verify_installation_candidate(
+                    InstallationCandidate::pinned(
+                        model_id.clone(),
+                        model.path.clone(),
+                        None,
+                        manifest_source.expected_size_bytes,
+                        manifest_source.expected_sha256.clone(),
+                    ),
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())
+        })?
     } else if !force_runtime_package && let Some(smoke) = smoke_current {
         smoke
     } else {
@@ -1501,21 +1506,23 @@ fn run_verified_install(
             total_bytes: model.size_bytes,
             bytes_per_second: None,
         });
-        let smoke = service
-            .verify_installation_candidate(
-                InstallationCandidate::normalized(
-                    model_id.clone(),
-                    model.path.clone(),
-                    Some(
-                        candidate_root
-                            .clone()
-                            .ok_or_else(|| "staged runtime root was lost".to_owned())?,
-                    ),
+        let smoke = verify_candidate_handoff(&cancellation, || {
+            service
+                .verify_installation_candidate(
+                    InstallationCandidate::normalized(
+                        model_id.clone(),
+                        model.path.clone(),
+                        Some(
+                            candidate_root
+                                .clone()
+                                .ok_or_else(|| "staged runtime root was lost".to_owned())?,
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?,
+                    &cancellation,
                 )
-                .map_err(|error| error.to_string())?,
-                &cancellation,
-            )
-            .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+        })?;
         staged_runtime = Some(prepared.staged);
         smoke
     };
@@ -1580,8 +1587,8 @@ fn run_verified_install(
     };
 
     let model_sha256 = model.sha256.clone();
-    let model = match model.activate() {
-        Ok(replacement) => replacement,
+    let (smoke, model) = match commit_verified_candidate(verified_smoke, || model.activate()) {
+        Ok(committed) => committed,
         Err(error) => {
             let rollback = runtime.and_then(|replacement| replacement.rollback().err());
             if rollback.is_none() && !error.requires_recovery() {
@@ -1691,6 +1698,39 @@ fn run_verified_install(
         journal,
         remote_install,
     })
+}
+
+/// Evidence that only the candidate verifier can produce for activation.
+pub(crate) struct VerifiedCandidate<T>(T);
+
+/// Runs the immutable candidate check before handing its result to activation.
+/// The worker and UI transaction keep their existing responsibilities.
+pub(crate) fn verify_candidate_handoff<T, E>(
+    cancellation: &InstallCancellation,
+    verify: impl FnOnce() -> Result<T, E>,
+) -> Result<VerifiedCandidate<T>, E>
+where
+    E: From<String>,
+{
+    if cancellation.is_cancelled() {
+        return Err(E::from(
+            "installation verification was cancelled".to_owned(),
+        ));
+    }
+    let verified = verify()?;
+    if cancellation.is_cancelled() {
+        return Err(E::from(
+            "installation verification was cancelled".to_owned(),
+        ));
+    }
+    Ok(VerifiedCandidate(verified))
+}
+
+pub(crate) fn commit_verified_candidate<T, U, E>(
+    verified: VerifiedCandidate<T>,
+    commit: impl FnOnce() -> Result<U, E>,
+) -> Result<(T, U), E> {
+    commit().map(|committed| (verified.0, committed))
 }
 
 fn validate_local_gguf_import(
@@ -17678,6 +17718,72 @@ mod layout_tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn candidate_verification_switches_the_stable_model_path_only_after_success() {
+        use std::cell::Cell;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-candidate-coordinator-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy = root.join("ggml-base.en.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&legacy, b"legacy").unwrap();
+
+        for outcome in ["success", "cancelled", "hash failure", "smoke failure"] {
+            let mut config = AppConfig::default();
+            config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+            config
+                .general
+                .model_paths
+                .insert("whisper_cpp_base_en".to_owned(), legacy.clone());
+            let previous = serde_json::to_value(&config).unwrap();
+            let cancellation = InstallCancellation::default();
+            let verifier_called = Cell::new(false);
+            let q8 = root.join("whisper-base.en-Q8_0.gguf");
+
+            let result = verify_candidate_handoff(&cancellation, || -> Result<(), String> {
+                verifier_called.set(true);
+                match outcome {
+                    "cancelled" => {
+                        cancellation.cancel();
+                        Ok(())
+                    }
+                    "hash failure" => Err("checksum mismatch".to_owned()),
+                    "smoke failure" => Err("known-WAV smoke failure".to_owned()),
+                    _ => Ok(()),
+                }
+            });
+
+            assert!(verifier_called.get(), "{outcome}");
+            assert!(legacy.is_file(), "{outcome}");
+            if outcome == "success" {
+                commit_verified_candidate(result.unwrap(), || {
+                    config
+                        .general
+                        .model_paths
+                        .insert("whisper_cpp_base_en".to_owned(), q8.clone());
+                    Ok::<_, String>(())
+                })
+                .unwrap();
+                assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+                assert_eq!(
+                    config.general.model_paths.get("whisper_cpp_base_en"),
+                    Some(&q8)
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&config).unwrap(),
+                    previous,
+                    "{outcome}"
+                );
+                assert!(result.is_err(), "{outcome}");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

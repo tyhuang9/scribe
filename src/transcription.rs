@@ -2337,6 +2337,87 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual: requires local GGUF, WAV, and retained legacy GGML paths"]
+    fn manual_known_wav_gguf_migration_smoke_uses_the_pinned_candidate_handoff() {
+        let gguf = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_GGUF")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_GGUF to the exact pinned base Q8 GGUF"),
+        );
+        let wav = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_AUDIO")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_AUDIO to a known spoken WAV"),
+        );
+        let legacy = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_LEGACY")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_LEGACY to the retained ggml-base.en.bin"),
+        );
+        assert!(legacy.is_file(), "the retained legacy GGML file must exist");
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let candidate = InstallationCandidate::normalized(model_id.clone(), gguf.clone(), None)
+            .expect("the supplied GGUF filename must match the catalog-pinned base Q8 artifact");
+        let audio = Arc::new(PreparedAudio::from_wav_path(&wav).expect("load the supplied WAV"));
+        assert!(
+            !audio.samples.is_empty(),
+            "the supplied WAV must contain audio"
+        );
+
+        let mut config = AppConfig::default();
+        config.general.selected_default_model = model_id.as_str().to_owned();
+        config
+            .general
+            .model_paths
+            .insert(model_id.as_str().to_owned(), legacy.clone());
+        let prior = serde_json::to_value(&config).unwrap();
+        let service = TranscriptionService::new(config.clone());
+        let verified = crate::app::verify_candidate_handoff(
+            &InstallCancellation::default(),
+            || -> Result<(), String> {
+                service
+                    .verify_installation_candidate(candidate, &InstallCancellation::default())
+                    .map_err(|error| error.to_string())?;
+                let mut request = TranscriptionRequest::new(
+                    SessionId(1),
+                    RequestId(1),
+                    Arc::clone(&audio),
+                    model_id.clone(),
+                );
+                request.model_path = Some(gguf.clone());
+                let transcript = service
+                    .transcribe(request)
+                    .map_err(|error| error.to_string())?
+                    .transcript
+                    .text;
+                assert!(
+                    !transcript.trim().is_empty(),
+                    "known-WAV smoke must produce a non-empty transcript"
+                );
+                if let Ok(expected) = std::env::var("SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT") {
+                    assert!(
+                        transcript.contains(&expected),
+                        "transcript did not contain SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .expect("the local GGUF must pass its catalog pin and known-WAV smoke");
+        crate::app::commit_verified_candidate(verified, || {
+            config
+                .general
+                .model_paths
+                .insert(model_id.as_str().to_owned(), gguf);
+            Ok::<_, anyhow::Error>(())
+        })
+        .expect("only a verified candidate may switch the configured path");
+        assert_eq!(config.general.selected_default_model, model_id.as_str());
+        assert_ne!(serde_json::to_value(&config).unwrap(), prior);
+        assert!(
+            legacy.is_file(),
+            "the migration smoke must not remove legacy GGML"
+        );
+    }
+
+    #[test]
     fn preview_hypothesis_preserves_and_offsets_native_segment_timing() {
         let identity = StreamIdentity {
             session_id: SessionId(1),
