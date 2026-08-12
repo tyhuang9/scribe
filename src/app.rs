@@ -18514,7 +18514,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Recording;
+        app.settings_tab = SettingsTab::Advanced;
         app.config.recording.vad_enabled = true;
         let output = ctx.run(
             egui::RawInput {
@@ -18586,9 +18586,12 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Audio input")
-        }));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording input"))
+        );
 
         let microphone_label_id = update
             .nodes

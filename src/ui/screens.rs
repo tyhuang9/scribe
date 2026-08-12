@@ -3679,6 +3679,17 @@ fn comparison_start_disabled_reason(comparison: &ModelComparisonState) -> Option
     }
 }
 
+const SETTINGS_TAB_AUTO_ID_STRIDE: usize = 10_000;
+
+fn settings_tab_auto_id_offset(tab: SettingsTab) -> usize {
+    match tab {
+        SettingsTab::General | SettingsTab::Output => 0,
+        SettingsTab::Recording => SETTINGS_TAB_AUTO_ID_STRIDE,
+        SettingsTab::Advanced => SETTINGS_TAB_AUTO_ID_STRIDE * 2,
+        SettingsTab::About => SETTINGS_TAB_AUTO_ID_STRIDE * 3,
+    }
+}
+
 fn settings(
     ui: &mut egui::Ui,
     active_tab: SettingsTab,
@@ -3765,44 +3776,50 @@ fn settings(
     }
     ui.separator();
     ui.add_space(16.0);
-    let panel = ui.vertical(|ui| {
-        ui.set_width(ui.available_width());
-        match active_tab {
-            SettingsTab::Recording => recording_settings_panel(ui, state, settings, &mut action),
-            SettingsTab::General | SettingsTab::Output => {
-                general_settings_panel(ui, settings, &mut action)
-            }
-            SettingsTab::Advanced => advanced_settings_panel(ui, state, settings, &mut action),
-            SettingsTab::About => about_settings_panel(ui, settings),
-        }
-    });
-    ui.ctx()
-        .accesskit_node_builder(panel.response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::TabPanel);
-            builder.set_name(match active_tab {
-                SettingsTab::General => "General settings",
-                SettingsTab::Recording => "Recording settings",
-                SettingsTab::Output => "General settings",
-                SettingsTab::Advanced => "Advanced settings",
-                SettingsTab::About => "About Scribe",
-            });
-        });
     let selected_tab_id = tab_ids
         .iter()
         .copied()
         .find_map(|(tab, id)| (tab == active_tab).then_some(id))
         .expect("selected settings tab is rendered");
+    let panel_id = ui.make_persistent_id(("settings-tab-panel", active_tab));
+    ui.ctx().accesskit_node_builder(panel_id, |builder| {
+        builder.set_role(egui::accesskit::Role::TabPanel);
+        builder.set_name(match active_tab {
+            SettingsTab::General => "General settings",
+            SettingsTab::Recording => "Recording settings",
+            SettingsTab::Output => "General settings",
+            SettingsTab::Advanced => "Advanced settings",
+            SettingsTab::About => "About Scribe",
+        });
+        builder.push_labelled_by(selected_tab_id.value().into());
+    });
+    let ctx = ui.ctx().clone();
+    ctx.with_accessibility_parent(panel_id, || {
+        // egui 0.27 `push_id` does not salt automatically allocated widget IDs.
+        // Reserve a disjoint range so switching tabs cannot update nodes that the
+        // AccessKit consumer is simultaneously removing with the old panel.
+        ui.skip_ahead_auto_ids(settings_tab_auto_id_offset(active_tab));
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            match active_tab {
+                SettingsTab::Recording => {
+                    recording_settings_panel(ui, state, settings, &mut action)
+                }
+                SettingsTab::General | SettingsTab::Output => {
+                    general_settings_panel(ui, settings, &mut action)
+                }
+                SettingsTab::Advanced => advanced_settings_panel(ui, state, settings, &mut action),
+                SettingsTab::About => about_settings_panel(ui, settings),
+            }
+        });
+    });
     for (tab, tab_id) in tab_ids {
         if tab == active_tab {
             ui.ctx().accesskit_node_builder(tab_id, |builder| {
-                builder.push_controlled(panel.response.id.value().into());
+                builder.push_controlled(panel_id.value().into());
             });
         }
     }
-    ui.ctx()
-        .accesskit_node_builder(panel.response.id, |builder| {
-            builder.push_labelled_by(selected_tab_id.value().into());
-        });
     action
 }
 
@@ -4409,9 +4426,9 @@ fn advanced_settings_panel(
                         *action = ScreenAction::SetMaxHistoryEntries(maximum as u32);
                     }
                 });
-                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, true, action, ScreenAction::SetTranscriptRetentionDays);
+                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, action, ScreenAction::SetTranscriptRetentionDays);
                 if mode == "Transcript and audio" {
-                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, true, action, ScreenAction::SetAudioRetentionDays);
+                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, action, ScreenAction::SetAudioRetentionDays);
                 }
                 let mut identity = settings.store_application_identity;
                 let _ = SettingsRow::show(ui, "Application identity", false, |ui, _| {
@@ -4491,7 +4508,6 @@ fn optional_retention_control(
     unlimited_label: &str,
     configured_days: Option<u32>,
     history_locked: bool,
-    separator_after: bool,
     action: &mut ScreenAction,
     update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
 ) {
@@ -4508,9 +4524,7 @@ fn optional_retention_control(
             }
         });
     });
-    if limited || separator_after {
-        ui.separator();
-    }
+    ui.separator();
     if limited {
         let mut days = configured_days.unwrap_or(30) as i64;
         let _ = SettingsRow::show(ui, "Days", false, |ui, label_id| {
@@ -4525,9 +4539,7 @@ fn optional_retention_control(
                 *action = update(Some(days as u32));
             }
         });
-        if separator_after {
-            ui.separator();
-        }
+        ui.separator();
     }
 }
 
@@ -5950,6 +5962,235 @@ mod tests {
                     .iter()
                     .all(|(_, names)| !names.iter().any(|name| name == removed_duplicate))
             );
+        }
+    }
+
+    #[test]
+    fn recording_to_advanced_accesskit_update_keeps_updated_nodes_attached() {
+        type AccessKitNodes =
+            std::collections::HashMap<egui::accesskit::NodeId, egui::accesskit::Node>;
+        type IncrementalUpdateResult = (
+            AccessKitNodes,
+            egui::accesskit::NodeId,
+            Vec<(egui::accesskit::NodeId, Option<String>)>,
+        );
+
+        fn apply_incremental_update(
+            initial: &egui::accesskit::TreeUpdate,
+            update: &egui::accesskit::TreeUpdate,
+        ) -> IncrementalUpdateResult {
+            let mut nodes = initial
+                .nodes
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut orphans = std::collections::HashSet::new();
+            let mut updated = std::collections::HashSet::new();
+            let old_root = initial
+                .tree
+                .as_ref()
+                .expect("initial AccessKit update should define the tree")
+                .root;
+            if update
+                .tree
+                .as_ref()
+                .is_some_and(|tree| tree.root != old_root)
+            {
+                orphans.insert(old_root);
+            }
+            for (id, data) in &update.nodes {
+                orphans.remove(id);
+                for child in data.children() {
+                    orphans.remove(child);
+                }
+                if let Some(old) = nodes.insert(*id, data.clone()) {
+                    updated.insert(*id);
+                    for child in old.children() {
+                        if !data.children().contains(child) {
+                            orphans.insert(*child);
+                        }
+                    }
+                }
+            }
+
+            let mut removed = std::collections::HashSet::new();
+            let mut pending = orphans.into_iter().collect::<Vec<_>>();
+            while let Some(id) = pending.pop() {
+                if removed.insert(id)
+                    && let Some(node) = nodes.get(&id)
+                {
+                    pending.extend(node.children());
+                }
+            }
+            let orphaned_updated = updated
+                .intersection(&removed)
+                .map(|id| {
+                    (
+                        *id,
+                        nodes
+                            .get(id)
+                            .and_then(|node| node.name())
+                            .map(str::to_owned),
+                    )
+                })
+                .collect();
+            for id in removed {
+                nodes.remove(&id);
+            }
+            let root = update.tree.as_ref().map_or(old_root, |tree| tree.root);
+            (nodes, root, orphaned_updated)
+        }
+
+        fn is_descendant(
+            nodes: &AccessKitNodes,
+            ancestor: egui::accesskit::NodeId,
+            target: egui::accesskit::NodeId,
+        ) -> bool {
+            nodes.get(&ancestor).is_some_and(|node| {
+                node.children()
+                    .iter()
+                    .any(|child| *child == target || is_descendant(nodes, *child, target))
+            })
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state = TranscriptionState::default();
+        let settings_view = RecordingSettingsView {
+            debug_mode: true,
+            history_mode_label: "Transcript and audio".into(),
+            transcript_retention_days: Some(30),
+            audio_retention_days: Some(14),
+            ..Default::default()
+        };
+        let render = |tab| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 815.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, tab, &state, &settings_view);
+                    });
+                },
+            )
+            .platform_output
+            .accesskit_update
+            .expect("settings should expose AccessKit")
+        };
+
+        let recording = render(SettingsTab::Recording);
+        let advanced = render(SettingsTab::Advanced);
+        let (nodes, root, orphaned_updated) = apply_incremental_update(&recording, &advanced);
+        assert_eq!(orphaned_updated, Vec::new());
+        let panel = nodes
+            .iter()
+            .find_map(|(id, node)| {
+                (node.role() == egui::accesskit::Role::TabPanel
+                    && node.name() == Some("Advanced settings"))
+                .then_some(*id)
+            })
+            .expect("Advanced should expose one TabPanel");
+        let automatic_stop = nodes
+            .iter()
+            .find_map(|(id, node)| (node.name() == Some("Automatic stop")).then_some(*id))
+            .expect("Advanced should expose the Automatic stop row");
+        assert!(is_descendant(&nodes, panel, automatic_stop));
+        assert!(
+            !nodes
+                .get(&root)
+                .expect("AccessKit root should remain attached")
+                .children()
+                .contains(&automatic_stop)
+        );
+    }
+
+    #[test]
+    fn settings_tab_auto_id_ranges_are_disjoint_and_have_headroom() {
+        fn collect_descendants(
+            update: &egui::accesskit::TreeUpdate,
+            parent: egui::accesskit::NodeId,
+            descendants: &mut std::collections::HashSet<egui::accesskit::NodeId>,
+        ) {
+            let Some(node) = update
+                .nodes
+                .iter()
+                .find_map(|(id, node)| (*id == parent).then_some(node))
+            else {
+                return;
+            };
+            for child in node.children() {
+                if descendants.insert(*child) {
+                    collect_descendants(update, *child, descendants);
+                }
+            }
+        }
+
+        let settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            show_restore_clipboard: true,
+            debug_mode: true,
+            history_mode_label: "Transcript and audio".into(),
+            transcript_retention_days: Some(30),
+            audio_retention_days: Some(14),
+            ..Default::default()
+        };
+        let rendered = [
+            SettingsTab::General,
+            SettingsTab::Recording,
+            SettingsTab::Advanced,
+            SettingsTab::About,
+        ]
+        .map(|tab| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 3_000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                    });
+                },
+            );
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("settings should expose AccessKit");
+            let panel = update
+                .nodes
+                .iter()
+                .find_map(|(id, node)| {
+                    (node.role() == egui::accesskit::Role::TabPanel).then_some(*id)
+                })
+                .expect("settings should expose one TabPanel");
+            let mut descendants = std::collections::HashSet::new();
+            collect_descendants(&update, panel, &mut descendants);
+            assert!(
+                descendants.len() < SETTINGS_TAB_AUTO_ID_STRIDE / 10,
+                "{tab:?} rendered {} panel nodes, exhausting its reserved auto-ID range",
+                descendants.len()
+            );
+            (tab, descendants)
+        });
+
+        for (index, (tab, ids)) in rendered.iter().enumerate() {
+            for (other_tab, other_ids) in rendered.iter().skip(index + 1) {
+                assert!(
+                    ids.is_disjoint(other_ids),
+                    "{tab:?} and {other_tab:?} Settings panel IDs must be disjoint"
+                );
+            }
         }
     }
 
