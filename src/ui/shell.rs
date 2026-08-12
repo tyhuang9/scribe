@@ -416,9 +416,8 @@ mod tests {
         let names = update
             .nodes
             .iter()
-            .filter_map(|(_, node)| {
-                (node.role() == egui::accesskit::Role::Button).then(|| node.name())
-            })
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+            .map(|(_, node)| node.name())
             .collect::<Vec<_>>();
         assert!(names.contains(&Some("Transcribe")));
         assert!(names.contains(&Some("Models")));

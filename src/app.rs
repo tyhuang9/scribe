@@ -8126,7 +8126,7 @@ impl LocalTranscriberApp {
         let Some(model) = selected_model else {
             return (None, ModelReadiness::Error);
         };
-        let readiness = match runtime_status_for_model(&self.config, &model) {
+        let readiness = match runtime_status_for_model(&self.config, model) {
             ModelRuntimeStatus::Ready => ModelReadiness::Ready,
             ModelRuntimeStatus::Downloading | ModelRuntimeStatus::Running => {
                 ModelReadiness::Loading
@@ -9846,7 +9846,7 @@ impl LocalTranscriberApp {
             .transcription_service
             .model_descriptor(&ModelId::new(&model.id))
             .ok();
-        model_ui_labels(&model, descriptor.as_ref()).0
+        model_ui_labels(model, descriptor.as_ref()).0
     }
 
     fn ui_general_settings(&mut self, ui: &mut Ui) {
@@ -10157,7 +10157,7 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetDebugMode(value) => {
                 self.config.developer.debug_mode = value;
-                if !value && self.settings_playground_open {
+                if !value && (self.settings_playground_open || self.current_tab == Tab::Debug) {
                     self.settings_tab = SettingsTab::Advanced;
                     self.current_tab = Tab::General;
                     self.settings_playground_open = false;
@@ -12387,7 +12387,7 @@ mod layout_tests {
             (Tab::Models, "Models"),
             (Tab::History, "History"),
             (Tab::Advanced, "Settings"),
-            (Tab::About, "About"),
+            (Tab::About, "Settings"),
             (Tab::Debug, "Model Playground"),
         ] {
             let output = render_app_tab(tab, 840.0);
@@ -16223,9 +16223,23 @@ mod layout_tests {
         };
         let mut app = test_app();
         app.current_tab = tab;
-        if tab == Tab::Advanced {
-            app.settings_tab = SettingsTab::Advanced;
-            app.current_tab = Tab::General;
+        match tab {
+            Tab::Advanced => {
+                app.settings_tab = SettingsTab::Advanced;
+                app.current_tab = Tab::General;
+            }
+            Tab::About => {
+                app.settings_tab = SettingsTab::About;
+                app.current_tab = Tab::General;
+            }
+            Tab::Debug => {
+                app.config.developer.debug_mode = true;
+                app.settings_tab = SettingsTab::Advanced;
+                app.current_tab = Tab::General;
+                app.settings_playground_open = true;
+                app.settings_playground_needs_initial_focus = true;
+            }
+            _ => {}
         }
 
         ctx.run(raw_input, |ctx| {
@@ -16238,7 +16252,11 @@ mod layout_tests {
                     }
                     Tab::General => {
                         show_route_scroll(ui, UiRoute::Settings(app.settings_tab), |ui| {
-                            app.ui_general_settings(ui)
+                            if app.settings_playground_open {
+                                app.ui_playground(ui)
+                            } else {
+                                app.ui_general_settings(ui)
+                            }
                         })
                     }
                     Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui)),

@@ -6160,30 +6160,30 @@ mod tests {
         let state = TranscriptionState::default();
         let settings_view = RecordingSettingsView::default();
         let mut active = SettingsTab::General;
-        let _ = ctx.run(
-            egui::RawInput {
-                focused: true,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = settings(ui, active, &state, &settings_view);
-                    ui.memory_mut(|memory| memory.request_focus(tab_id(ui, active)));
-                });
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                focused: true,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = settings(ui, active, &state, &settings_view);
-                });
-            },
-        );
         for expected in [SettingsTab::Recording, SettingsTab::Advanced] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, active, &state, &settings_view);
+                        ui.memory_mut(|memory| memory.request_focus(tab_id(ui, active)));
+                    });
+                },
+            );
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, active, &state, &settings_view);
+                    });
+                },
+            );
             let mut arrow_action = ScreenAction::None;
             let _ = ctx.run(
                 egui::RawInput {
