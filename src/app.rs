@@ -17571,6 +17571,42 @@ mod layout_tests {
     }
 
     #[test]
+    fn cancelled_or_rejected_verified_install_keeps_legacy_selection_and_config_unchanged() {
+        for message in [
+            "Installation cancelled after smoke testing; no artifacts were activated.",
+            "The staged GGUF checksum did not match the pinned digest.",
+            "The staged GGUF failed the known-WAV smoke test.",
+        ] {
+            let mut app = test_app();
+            app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+            let previous_config = serde_json::to_value(&app.config).unwrap();
+            let cancellation = InstallCancellation::default();
+            app.artifact_installations
+                .insert("whisper_cpp_base_en".to_owned(), (42, cancellation));
+
+            app.tx
+                .send(AppEvent::VerifiedInstallFailed {
+                    job_id: 42,
+                    model_id: "whisper_cpp_base_en".to_owned(),
+                    message: message.to_owned(),
+                    recovery_required: false,
+                })
+                .unwrap();
+            app.poll_events();
+
+            assert_eq!(
+                serde_json::to_value(&app.config).unwrap(),
+                previous_config,
+                "{message}"
+            );
+            assert_eq!(
+                app.config.general.selected_default_model, "whisper_cpp_base_en",
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_jobs_dedupe_queued_models_and_failure_message_explains_packaging() {
         let mut job = RuntimeInstallJob::default();
         assert!(queue_runtime_model(
