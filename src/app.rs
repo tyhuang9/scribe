@@ -12587,26 +12587,15 @@ mod layout_tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Runtime maintenance"))
         );
-        for (label_name, role) in [
-            ("Search", egui::accesskit::Role::TextInput),
-            ("Language", egui::accesskit::Role::ComboBox),
+        for (name, role) in [
+            ("Search models", egui::accesskit::Role::TextInput),
+            ("Filter model languages", egui::accesskit::Role::ComboBox),
         ] {
-            let label_id = update
-                .nodes
-                .iter()
-                .find(|(_, node)| {
-                    node.role() == egui::accesskit::Role::StaticText
-                        && node
-                            .name()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
-                })
-                .map(|(id, _)| *id)
-                .unwrap_or_else(|| panic!("missing Models-page label {label_name:?}"));
             assert!(
                 update.nodes.iter().any(|(_, node)| {
-                    node.role() == role && node.labelled_by().contains(&label_id)
+                    node.role() == role && node.name().is_some_and(|actual| actual == name)
                 }),
-                "no {role:?} is programmatically labelled by {label_name:?}"
+                "missing named Models-page {role:?} {name:?}"
             );
         }
         assert!(!update.nodes.iter().any(|(_, node)| {
