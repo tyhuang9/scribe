@@ -239,7 +239,7 @@ fn model(
         total_bytes: Some(ram_mb * 1_000_000),
         estimated_ram_bytes: Some(ram_mb * 1_000_000),
         languages: vec!["en".into()],
-        language_summary: "English only".into(),
+        language_summary: "English".into(),
         speed_tier: if active {
             ModelSpeedTier::Balanced
         } else {
@@ -2189,9 +2189,15 @@ mod tests {
 
     #[test]
     fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
-        let row_name = "Active whisper.cpp base.en";
+        let row_name = "whisper.cpp base.en model";
         for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
+            for header in ["MODEL", "LANGUAGES", "SPEED", "ACCURACY", "SIZE"] {
+                assert!(
+                    node_names(&output).iter().any(|name| name == header),
+                    "{header} header should render at {width}x{height}"
+                );
+            }
             let surface = named_node_bounds(&output, "Model comparison surface");
             let row = named_node_bounds(&output, row_name);
             assert!(
@@ -2730,20 +2736,13 @@ mod tests {
                     "comparison surface bottom gap",
                 );
                 for name in [
-                    "Import",
-                    "Refresh",
-                    "Active whisper.cpp base.en",
+                    "Import local GGUF",
+                    "Refresh trusted model catalog",
+                    "Remove whisper.cpp base.en from device",
                     "Details for whisper.cpp base.en",
                 ] {
                     let bounds = node_matching(&output, |node| {
-                        node.role() == egui::accesskit::Role::Button
-                            && node.name().is_some_and(|actual| {
-                                if name == "Import" {
-                                    actual.contains(name)
-                                } else {
-                                    actual == name
-                                }
-                            })
+                        node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
                     })
                     .bounds()
                     .unwrap_or_else(|| panic!("Models action {name:?} should expose bounds"));

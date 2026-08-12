@@ -1407,8 +1407,120 @@ const MODEL_CARD_HEIGHT: f32 = 76.0;
 const MODEL_CARD_NARROW_HEIGHT: f32 = 104.0;
 const MODEL_CARD_VERY_NARROW_HEIGHT: f32 = 124.0;
 const MODEL_CARD_GAP: f32 = 8.0;
+const MODEL_CARD_HORIZONTAL_INSET: f32 = 16.0;
+const MODEL_CARD_VERTICAL_INSET: f32 = 8.0;
+const MODEL_DETAILS_COLUMN_WIDTH: f32 = 44.0;
+const MODEL_ACTION_COLUMN_WIDTH: f32 = 44.0;
 const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
 const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
+
+/// The medium and wide list layouts use the same physical track sizes for
+/// every row and its heading. Keeping this as one projection prevents a long
+/// model name, language label, or rating label from shifting any column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModelCardColumnLayout {
+    identity: f32,
+    languages: f32,
+    speed: f32,
+    accuracy: f32,
+    size: f32,
+    details: f32,
+    action: f32,
+}
+
+#[cfg(test)]
+impl ModelCardColumnLayout {
+    fn total_width(self) -> f32 {
+        self.identity
+            + self.languages
+            + self.speed
+            + self.accuracy
+            + self.size
+            + self.details
+            + self.action
+    }
+}
+
+fn model_card_column_layout(row_width: f32) -> Option<ModelCardColumnLayout> {
+    if row_width < 760.0 {
+        return None;
+    }
+
+    let wide = row_width >= 1_100.0;
+    let languages = if wide { 190.0 } else { 128.0 };
+    let metric = if wide { 175.0 } else { 92.0 };
+    let size = if wide { 100.0 } else { 72.0 };
+    let content_width = row_width - MODEL_CARD_HORIZONTAL_INSET * 2.0;
+    let fixed_width =
+        languages + metric * 2.0 + size + MODEL_DETAILS_COLUMN_WIDTH + MODEL_ACTION_COLUMN_WIDTH;
+    let identity = content_width - fixed_width;
+
+    (identity >= 0.0).then_some(ModelCardColumnLayout {
+        identity,
+        languages,
+        speed: metric,
+        accuracy: metric,
+        size,
+        details: MODEL_DETAILS_COLUMN_WIDTH,
+        action: MODEL_ACTION_COLUMN_WIDTH,
+    })
+}
+
+fn model_card_content_rect(card_rect: egui::Rect) -> egui::Rect {
+    card_rect.shrink2(Vec2::new(
+        MODEL_CARD_HORIZONTAL_INSET,
+        MODEL_CARD_VERTICAL_INSET,
+    ))
+}
+
+fn model_row_width(ui: &egui::Ui) -> f32 {
+    ui.available_width()
+        .min((ui.ctx().screen_rect().right() - ui.cursor().left()).max(0.0))
+}
+
+fn render_model_column_header_cell(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    alignment: Align,
+) {
+    let colors = ui_palette(ui);
+    let mut cell_ui = ui.child_ui(rect, Layout::top_down(alignment));
+    cell_ui.set_clip_rect(rect);
+    cell_ui.add(
+        egui::Label::new(
+            RichText::new(label)
+                .small()
+                .color(colors.muted_text)
+                .strong(),
+        )
+        .truncate(true),
+    );
+}
+
+fn render_model_column_headers(ui: &mut egui::Ui) {
+    let row_width = model_row_width(ui);
+    let Some(columns) = model_card_column_layout(row_width) else {
+        return;
+    };
+    let (header_rect, _) = ui.allocate_exact_size(Vec2::new(row_width, 16.0), Sense::hover());
+    let content_rect = header_rect.shrink2(Vec2::new(MODEL_CARD_HORIZONTAL_INSET, 0.0));
+    let mut left = content_rect.left();
+    for (width, label, alignment) in [
+        (columns.identity, "MODEL", Align::LEFT),
+        (columns.languages, "LANGUAGES", Align::Center),
+        (columns.speed, "SPEED", Align::Center),
+        (columns.accuracy, "ACCURACY", Align::Center),
+        (columns.size, "SIZE", Align::Center),
+    ] {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, content_rect.top()),
+            Vec2::new(width, content_rect.height()),
+        );
+        render_model_column_header_cell(ui, rect, label, alignment);
+        left += width;
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ModelCard<'a> {
@@ -1550,12 +1662,8 @@ fn formatted_language_summary(languages: &[String]) -> String {
     let languages = normalized_languages(languages);
     match languages.as_slice() {
         [] => "Language unavailable".to_owned(),
-        [language] => format!("{language} only"),
-        [first, second] => format!("{first} + {second}"),
-        [first, second, rest @ ..] if languages.len() <= 5 => {
-            format!("{first}, {second} + {}", rest.len())
-        }
-        _ => format!("Multilingual \u{00b7} {}", languages.len()),
+        [language] => language.clone(),
+        _ => "Multilingual".to_owned(),
     }
 }
 
@@ -1635,6 +1743,7 @@ fn rating_meter(
 ) {
     let colors = ui_palette(ui);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         let (rect, response) = ui.allocate_exact_size(Vec2::new(62.0, 18.0), Sense::hover());
         let filled = rating.map_or(0, |(value, _)| value.min(5));
         for index in 0..5 {
@@ -1791,6 +1900,7 @@ fn compact_model_icon_action(
 fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &str) {
     let colors = ui_palette(ui);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
         ui.painter()
             .rect_filled(icon_rect, Rounding::same(8.0), colors.active_card_bg);
@@ -1835,9 +1945,7 @@ fn render_model_card(
     // eframe can report the scroll content's unconstrained width while a
     // narrow native viewport is still clipping it. Bound every row to the
     // actual screen edge so trailing Details/action targets remain reachable.
-    let width = ui
-        .available_width()
-        .min((ui.ctx().screen_rect().right() - ui.cursor().left()).max(0.0));
+    let width = model_row_width(ui);
     let narrow = width < 760.0;
     let card_height = if width < 440.0 {
         MODEL_CARD_VERY_NARROW_HEIGHT
@@ -1869,7 +1977,7 @@ fn render_model_card(
     let mut restored_control = None;
     let primary_has_focus;
     let mut content_ui = ui.child_ui(
-        card_rect.shrink2(Vec2::new(16.0, 8.0)),
+        model_card_content_rect(card_rect),
         Layout::left_to_right(Align::Center),
     );
     content_ui.set_clip_rect(card_rect.shrink(1.0));
@@ -1987,27 +2095,18 @@ fn render_model_card(
     };
 
     let wide = width >= 1_100.0;
-    let medium = width >= 760.0;
-    if wide || medium {
-        let action_width = 88.0;
-        let details_width = 44.0;
-        let size_width = if wide { 100.0 } else { 72.0 };
-        let metric_width = if wide { 175.0 } else { 92.0 };
-        let language_width = if wide { 190.0 } else { 128.0 };
-        let identity_width = (content_ui.available_width()
-            - action_width
-            - details_width
-            - size_width
-            - language_width
-            - metric_width * 2.0)
-            .max(170.0);
+    if let Some(columns) = model_card_column_layout(width) {
+        // Each track is explicitly allocated with no inter-item gap. The same
+        // layout is used for the column header, so card content cannot move a
+        // subsequent column horizontally.
+        content_ui.spacing_mut().item_spacing.x = 0.0;
         content_ui.allocate_ui_with_layout(
-            Vec2::new(identity_width, 56.0),
+            Vec2::new(columns.identity, 56.0),
             Layout::top_down(Align::LEFT),
             |ui| render_model_identity(ui, card, &description),
         );
         content_ui.allocate_ui_with_layout(
-            Vec2::new(language_width, 56.0),
+            Vec2::new(columns.languages, 56.0),
             Layout::top_down(Align::Center),
             |ui| {
                 let languages = match card {
@@ -2023,7 +2122,7 @@ fn render_model_card(
             },
         );
         content_ui.allocate_ui_with_layout(
-            Vec2::new(metric_width, 56.0),
+            Vec2::new(columns.speed, 56.0),
             Layout::top_down(Align::Center),
             |ui| {
                 ui.add_space(17.0);
@@ -2035,7 +2134,7 @@ fn render_model_card(
             },
         );
         content_ui.allocate_ui_with_layout(
-            Vec2::new(metric_width, 56.0),
+            Vec2::new(columns.accuracy, 56.0),
             Layout::top_down(Align::Center),
             |ui| {
                 ui.add_space(17.0);
@@ -2047,7 +2146,7 @@ fn render_model_card(
             },
         );
         content_ui.allocate_ui_with_layout(
-            Vec2::new(size_width, 56.0),
+            Vec2::new(columns.size, 56.0),
             Layout::top_down(Align::Center),
             |ui| {
                 ui.add_space(18.0);
@@ -2061,22 +2160,38 @@ fn render_model_card(
                 ui.label(RichText::new(size).small().color(colors.muted_text));
             },
         );
-        let details = compact_model_icon_action(
-            &mut content_ui,
-            Icon::ChevronRight,
-            &details_name,
-            true,
-            None,
-            None,
-        );
-        let row = compact_model_icon_action(
-            &mut content_ui,
-            row_icon,
-            &row_name,
-            row_enabled,
-            row_reason,
-            row_progress,
-        );
+        let details = content_ui
+            .allocate_ui_with_layout(
+                Vec2::new(columns.details, 44.0),
+                Layout::top_down(Align::Center),
+                |ui| {
+                    compact_model_icon_action(
+                        ui,
+                        Icon::ChevronRight,
+                        &details_name,
+                        true,
+                        None,
+                        None,
+                    )
+                },
+            )
+            .inner;
+        let row = content_ui
+            .allocate_ui_with_layout(
+                Vec2::new(columns.action, 44.0),
+                Layout::top_down(Align::Center),
+                |ui| {
+                    compact_model_icon_action(
+                        ui,
+                        row_icon,
+                        &row_name,
+                        row_enabled,
+                        row_reason,
+                        row_progress,
+                    )
+                },
+            )
+            .inner;
         if details.clicked() {
             action = details_action;
         }
@@ -2114,7 +2229,7 @@ fn render_model_card(
             });
         }
     } else {
-        let content_rect = card_rect.shrink2(Vec2::new(16.0, 8.0));
+        let content_rect = model_card_content_rect(card_rect);
         let actions_rect = egui::Rect::from_min_size(
             egui::pos2(content_rect.right() - 88.0, content_rect.top()),
             Vec2::new(88.0, 44.0),
@@ -2668,32 +2783,8 @@ fn models(
             builder.set_live_atomic();
         });
     ui.add_space(12.0);
-    if ui.available_width() >= 1_100.0 {
-        ui.horizontal(|ui| {
-            let metric_width = 175.0;
-            let language_width = 190.0;
-            let fixed_width = 88.0 + 44.0 + 100.0 + language_width + metric_width * 2.0;
-            let identity_width = (ui.available_width() - fixed_width).max(170.0);
-            for (width, label) in [
-                (identity_width, "MODEL"),
-                (language_width, "LANGUAGES"),
-                (metric_width, "SPEED"),
-                (metric_width, "ACCURACY"),
-                (100.0, "SIZE"),
-            ] {
-                ui.add_sized(
-                    [width, 16.0],
-                    egui::Label::new(
-                        RichText::new(label)
-                            .small()
-                            .color(colors.muted_text)
-                            .strong(),
-                    ),
-                );
-            }
-            ui.allocate_space(Vec2::new(44.0, 16.0));
-            ui.allocate_space(Vec2::new(44.0, 16.0));
-        });
+    if model_card_column_layout(model_row_width(ui)).is_some() {
+        render_model_column_headers(ui);
         ui.add_space(4.0);
     }
     ui.scope(|ui| {
@@ -5950,24 +6041,49 @@ mod tests {
         assert_eq!(formatted_language_summary(&[]), "Language unavailable");
         assert_eq!(
             formatted_language_summary(&languages(&["en", "English"])),
-            "English only"
+            "English"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es"])),
-            "English + Spanish"
+            "Multilingual"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es", "ja", "ko"])),
-            "English, Spanish + 2"
+            "Multilingual"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es", "ja", "ko", "zh", "fr"])),
-            "Multilingual · 6"
+            "Multilingual"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["x-klingon"])),
-            "x-klingon only"
+            "x-klingon"
         );
+    }
+
+    #[test]
+    fn model_card_columns_fill_the_same_fixed_tracks_as_the_header() {
+        for width in [760.0, 960.0, 1_180.0, 1_476.0] {
+            let columns = model_card_column_layout(width).expect("desktop grid width");
+            assert!(columns.identity > 0.0);
+            assert!(
+                (columns.total_width() + MODEL_CARD_HORIZONTAL_INSET * 2.0 - width).abs()
+                    < f32::EPSILON
+            );
+        }
+
+        let medium = model_card_column_layout(960.0).expect("medium grid width");
+        assert_eq!(medium.languages, 128.0);
+        assert_eq!(medium.speed, 92.0);
+        assert_eq!(medium.accuracy, 92.0);
+        assert_eq!(medium.size, 72.0);
+
+        let wide = model_card_column_layout(1_180.0).expect("wide grid width");
+        assert_eq!(wide.languages, 190.0);
+        assert_eq!(wide.speed, 175.0);
+        assert_eq!(wide.accuracy, 175.0);
+        assert_eq!(wide.size, 100.0);
+        assert!(model_card_column_layout(759.0).is_none());
     }
 
     #[test]
@@ -6046,7 +6162,7 @@ mod tests {
                 description: Some("A concise local speech model.".into()),
                 install_supported: true,
                 install_action_enabled: true,
-                language_summary: "English only".into(),
+                language_summary: "English".into(),
                 languages: vec!["English".into()],
                 capabilities: super::super::state::ModelCapabilities {
                     timestamps: true,
@@ -6101,7 +6217,7 @@ mod tests {
         for visible_text in [
             "Download Catalog model",
             "A concise local speech model.",
-            "English only",
+            "English",
             "Speed: Not rated",
         ] {
             assert!(
