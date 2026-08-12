@@ -50,17 +50,17 @@ const COMPARISON_BODY_FOCUSED_CONTROL_SCROLL: &str = "comparison-body-focused-co
 const COMPARISON_BODY_SCROLL_DIAGNOSTICS: &str = "comparison-body-scroll-diagnostics";
 
 pub(crate) fn scroll_focused_control_into_view(ui: &egui::Ui, response: &egui::Response) {
-    ui.data_mut(|data| {
-        data.insert_temp(
-            egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL),
-            (response.id, response.rect),
-        )
-    });
-    if response.has_focus()
+    let requested = response.has_focus()
         || ui.input(|input| {
             input.has_accesskit_action_request(response.id, egui::accesskit::Action::Focus)
-        })
-    {
+        });
+    if requested {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(ROUTE_FOCUSED_CONTROL_SCROLL),
+                (response.id, response.rect),
+            )
+        });
         response.scroll_to_me(Some(Align::Center));
     }
 }
@@ -1405,6 +1405,7 @@ const MODEL_CARD_HEIGHT: f32 = 76.0;
 // The compact phone composition preserves the two 44px action targets and gives
 // the identity, language/size, and metric lines room to remain legible.
 const MODEL_CARD_NARROW_HEIGHT: f32 = 104.0;
+const MODEL_CARD_VERY_NARROW_HEIGHT: f32 = 124.0;
 const MODEL_CARD_GAP: f32 = 8.0;
 const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
 const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
@@ -1830,9 +1831,16 @@ fn render_model_card(
     can_replace_active: bool,
 ) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
-    let width = ui.available_width();
+    // eframe can report the scroll content's unconstrained width while a
+    // narrow native viewport is still clipping it. Bound every row to the
+    // actual screen edge so trailing Details/action targets remain reachable.
+    let width = ui
+        .available_width()
+        .min((ui.ctx().screen_rect().right() - ui.cursor().left()).max(0.0));
     let narrow = width < 760.0;
-    let card_height = if narrow {
+    let card_height = if width < 440.0 {
+        MODEL_CARD_VERY_NARROW_HEIGHT
+    } else if narrow {
         MODEL_CARD_NARROW_HEIGHT
     } else {
         MODEL_CARD_HEIGHT
@@ -1858,7 +1866,7 @@ fn render_model_card(
     let requested_focus = focus_card.is_some_and(|key| card.matches_key(key));
     let mut action = ScreenAction::None;
     let mut restored_control = None;
-    let mut primary_has_focus = false;
+    let primary_has_focus;
     let mut content_ui = ui.child_ui(
         card_rect.shrink2(Vec2::new(16.0, 8.0)),
         Layout::left_to_right(Align::Center),
@@ -2105,74 +2113,94 @@ fn render_model_card(
             });
         }
     } else {
-        content_ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                let action_space = 88.0;
-                ui.allocate_ui_with_layout(
-                    Vec2::new((ui.available_width() - action_space).max(130.0), 44.0),
-                    Layout::top_down(Align::LEFT),
-                    |ui| render_model_identity(ui, card, &description),
-                );
-                let details = compact_model_icon_action(
-                    ui,
-                    Icon::ChevronRight,
-                    &details_name,
-                    true,
-                    None,
-                    None,
-                );
-                let row = compact_model_icon_action(
-                    ui,
-                    row_icon,
-                    &row_name,
-                    row_enabled,
-                    row_reason,
-                    row_progress,
-                );
-                if details.clicked() {
-                    action = details_action.clone();
-                }
-                if row_enabled && row.clicked() {
-                    action = row_action.clone();
-                }
-                if requested_focus {
-                    details.request_focus();
-                    scroll_focused_control_into_view(ui, &details);
-                }
-                primary_has_focus = details.has_focus() || row.has_focus();
-            });
-            ui.horizontal_wrapped(|ui| {
-                let languages = match card {
-                    ModelCard::Local(model) => &model.languages,
-                    ModelCard::Remote(entry, _) => &entry.languages,
-                };
-                ui.label(
-                    RichText::new(formatted_language_summary(languages))
-                        .small()
-                        .color(colors.muted_text),
-                );
-                let size = match card {
-                    ModelCard::Local(model) => model
-                        .total_bytes
-                        .or(model.disk_bytes)
-                        .map_or_else(|| "Size unavailable".to_owned(), format_bytes),
-                    ModelCard::Remote(_, variant) => variant.size_label.clone(),
-                };
-                ui.label(RichText::new(size).small().color(colors.muted_text));
-            });
-            ui.horizontal_wrapped(|ui| {
-                let speed = match card {
-                    ModelCard::Local(model) => speed_rating(model.speed_tier),
-                    ModelCard::Remote(_, _) => None,
-                };
-                rating_meter(ui, "Speed", speed, false);
-                let accuracy = match card {
-                    ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
-                    ModelCard::Remote(_, _) => None,
-                };
-                rating_meter(ui, "Accuracy", accuracy, false);
-            });
+        let content_rect = card_rect.shrink2(Vec2::new(16.0, 8.0));
+        let actions_rect = egui::Rect::from_min_size(
+            egui::pos2(content_rect.right() - 88.0, content_rect.top()),
+            Vec2::new(88.0, 44.0),
+        );
+        let identity_rect = egui::Rect::from_min_max(
+            content_rect.left_top(),
+            egui::pos2(actions_rect.left() - 8.0, content_rect.top() + 44.0),
+        );
+        let mut identity_ui = ui.child_ui(identity_rect, Layout::top_down(Align::LEFT));
+        identity_ui.set_clip_rect(card_rect.shrink(1.0));
+        render_model_identity(&mut identity_ui, card, &description);
+
+        let mut actions_ui = ui.child_ui(actions_rect, Layout::left_to_right(Align::Center));
+        actions_ui.set_clip_rect(card_rect.shrink(1.0));
+        actions_ui.spacing_mut().item_spacing.x = 0.0;
+        let details = compact_model_icon_action(
+            &mut actions_ui,
+            Icon::ChevronRight,
+            &details_name,
+            true,
+            None,
+            None,
+        );
+        let row = compact_model_icon_action(
+            &mut actions_ui,
+            row_icon,
+            &row_name,
+            row_enabled,
+            row_reason,
+            row_progress,
+        );
+        if details.clicked() {
+            action = details_action.clone();
+        }
+        if row_enabled && row.clicked() {
+            action = row_action.clone();
+        }
+        if requested_focus {
+            details.request_focus();
+            scroll_focused_control_into_view(&actions_ui, &details);
+        }
+        primary_has_focus = details.has_focus() || row.has_focus();
+
+        let metadata_rect = egui::Rect::from_min_max(
+            egui::pos2(content_rect.left(), content_rect.top() + 48.0),
+            content_rect.right_bottom(),
+        );
+        let mut metadata_ui = ui.child_ui(metadata_rect, Layout::top_down(Align::LEFT));
+        metadata_ui.set_clip_rect(card_rect.shrink(1.0));
+        metadata_ui.spacing_mut().item_spacing.y = 2.0;
+        metadata_ui.horizontal_wrapped(|ui| {
+            let languages = match card {
+                ModelCard::Local(model) => &model.languages,
+                ModelCard::Remote(entry, _) => &entry.languages,
+            };
+            ui.label(
+                RichText::new(formatted_language_summary(languages))
+                    .small()
+                    .color(colors.muted_text),
+            );
+            let size = match card {
+                ModelCard::Local(model) => model
+                    .total_bytes
+                    .or(model.disk_bytes)
+                    .map_or_else(|| "Size unavailable".to_owned(), format_bytes),
+                ModelCard::Remote(_, variant) => variant.size_label.clone(),
+            };
+            ui.label(RichText::new(size).small().color(colors.muted_text));
         });
+        let metrics_vertical = width < 440.0;
+        let metrics = |ui: &mut egui::Ui| {
+            let speed = match card {
+                ModelCard::Local(model) => speed_rating(model.speed_tier),
+                ModelCard::Remote(_, _) => None,
+            };
+            rating_meter(ui, "Speed", speed, false);
+            let accuracy = match card {
+                ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
+                ModelCard::Remote(_, _) => None,
+            };
+            rating_meter(ui, "Accuracy", accuracy, false);
+        };
+        if metrics_vertical {
+            metadata_ui.vertical(|ui| metrics(ui));
+        } else {
+            metadata_ui.horizontal_wrapped(|ui| metrics(ui));
+        }
     }
 
     if let ModelCard::Local(model) = card
@@ -2362,7 +2390,9 @@ fn render_model_section(
 
     ui.add_space(MODEL_CARD_GAP);
     let start_y = ui.cursor().top();
-    let card_height = if ui.available_width() < 760.0 {
+    let card_height = if ui.available_width() < 440.0 {
+        MODEL_CARD_VERY_NARROW_HEIGHT
+    } else if ui.available_width() < 760.0 {
         MODEL_CARD_NARROW_HEIGHT
     } else {
         MODEL_CARD_HEIGHT
@@ -2531,13 +2561,6 @@ fn models(
         RichText::new("Manage the speech models available on this device.")
             .color(colors.muted_text),
     );
-    if let Some(notice) = management.removal_notice.as_deref() {
-        let response = ui.label(RichText::new(notice).color(colors.muted_text));
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.set_live(egui::accesskit::Live::Polite);
-            builder.set_live_atomic();
-        });
-    }
     ui.add_space(18.0);
     let mut query = remote_catalog.query.clone();
     let search = ui.add_sized(
@@ -3589,7 +3612,7 @@ fn show_local_model_details_drawer(
                             if close.clicked() { action = ScreenAction::CloseModelDialog; }
                         });
                         drawer_ui.separator();
-                        let body_height = (screen.height() - 170.0).max(180.0);
+                        let body_height = (screen.height() - 170.0).max(0.0);
                         ScrollArea::vertical()
                             .id_source(("model-details-body", &model.id))
                             .max_height(body_height)
@@ -3849,7 +3872,7 @@ fn show_remote_model_details_drawer(
                     drawer_ui.separator();
                     ScrollArea::vertical()
                         .id_source(("remote-model-details-body", &entry.id, &variant.id))
-                        .max_height((screen.height() - 170.0).max(180.0))
+                        .max_height((screen.height() - 170.0).max(0.0))
                         .show(drawer_ui, |ui| {
                             drawer_section(ui, "Language support", |ui| {
                                 let languages = normalized_languages(&entry.languages);

@@ -356,8 +356,6 @@ pub(crate) struct ModelManagementState {
     pub restore_details_focus: Option<String>,
     pub restore_remove_focus: Option<String>,
     pub focus_model_card: Option<ModelCardKey>,
-    /// One-frame polite confirmation after a synchronous model removal attempt.
-    pub removal_notice: Option<String>,
     /// The deterministic ready replacement named in an active-model removal confirmation.
     pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
@@ -375,7 +373,6 @@ impl Default for ModelManagementState {
             restore_details_focus: None,
             restore_remove_focus: None,
             focus_model_card: None,
-            removal_notice: None,
             removal_replacement: None,
             mutation_block_reason: None,
             installed_expanded: true,

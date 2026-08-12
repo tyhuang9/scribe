@@ -2322,7 +2322,7 @@ mod tests {
         for row in rows {
             assert_within_tolerance(
                 row.y1 - row.y0,
-                104.0,
+                124.0,
                 LAYOUT_TOLERANCE,
                 "narrow model row height",
             );
@@ -2342,9 +2342,16 @@ mod tests {
                 })
         }) {
             let bounds = node.bounds().expect("model action should expose bounds");
+            let parent_row = nodes.iter().find_map(|(_, candidate)| {
+                (candidate.role() == egui::accesskit::Role::Group
+                    && candidate.name() == Some("whisper.cpp base.en model"))
+                .then(|| candidate.bounds())
+                .flatten()
+            });
             assert!(
                 bounds.x0 >= 0.0 && bounds.x1 <= 375.0 && bounds.y1 > bounds.y0,
-                "narrow model action escaped viewport: {bounds:?}"
+                "narrow model action {:?} escaped viewport: {bounds:?}; base row={parent_row:?}",
+                node.name(),
             );
             assert!(
                 bounds.x1 - bounds.x0 >= 44.0 - LAYOUT_TOLERANCE
@@ -2353,7 +2360,9 @@ mod tests {
             );
         }
         assert!(
-            nodes.iter().any(|(_, node)| node.name() == Some("190 MB")),
+            nodes
+                .iter()
+                .any(|(_, node)| { node.name().is_some_and(|name| name.contains("MB")) }),
             "narrow rows must preserve the model size metadata"
         );
     }
