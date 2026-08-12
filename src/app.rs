@@ -1455,12 +1455,9 @@ fn run_verified_install(
             )
             .ok()
             .and_then(|candidate| {
-                verify_candidate_handoff(&cancellation, || {
-                    service
-                        .verify_installation_candidate(candidate, &cancellation)
-                        .map_err(|error| error.to_string())
-                })
-                .ok()
+                service
+                    .verify_installation_candidate_for_activation(candidate, &cancellation)
+                    .ok()
             })
         });
     let current_runtime_known_good = smoke_current.is_some()
@@ -1475,20 +1472,18 @@ fn run_verified_install(
             total_bytes: model.size_bytes,
             bytes_per_second: None,
         });
-        verify_candidate_handoff(&cancellation, || {
-            service
-                .verify_installation_candidate(
-                    InstallationCandidate::pinned(
-                        model_id.clone(),
-                        model.path.clone(),
-                        None,
-                        manifest_source.expected_size_bytes,
-                        manifest_source.expected_sha256.clone(),
-                    ),
-                    &cancellation,
-                )
-                .map_err(|error| error.to_string())
-        })?
+        service
+            .verify_installation_candidate_for_activation(
+                InstallationCandidate::pinned(
+                    model_id.clone(),
+                    model.path.clone(),
+                    None,
+                    manifest_source.expected_size_bytes,
+                    manifest_source.expected_sha256.clone(),
+                ),
+                &cancellation,
+            )
+            .map_err(|error| InstallJobFailure::normal(error.to_string()))?
     } else if !force_runtime_package && let Some(smoke) = smoke_current {
         smoke
     } else {
@@ -1506,23 +1501,21 @@ fn run_verified_install(
             total_bytes: model.size_bytes,
             bytes_per_second: None,
         });
-        let smoke = verify_candidate_handoff(&cancellation, || {
-            service
-                .verify_installation_candidate(
-                    InstallationCandidate::normalized(
-                        model_id.clone(),
-                        model.path.clone(),
-                        Some(
-                            candidate_root
-                                .clone()
-                                .ok_or_else(|| "staged runtime root was lost".to_owned())?,
-                        ),
-                    )
-                    .map_err(|error| error.to_string())?,
-                    &cancellation,
+        let smoke = service
+            .verify_installation_candidate_for_activation(
+                InstallationCandidate::normalized(
+                    model_id.clone(),
+                    model.path.clone(),
+                    Some(
+                        candidate_root
+                            .clone()
+                            .ok_or_else(|| "staged runtime root was lost".to_owned())?,
+                    ),
                 )
-                .map_err(|error| error.to_string())
-        })?;
+                .map_err(|error| error.to_string())?,
+                &cancellation,
+            )
+            .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
         staged_runtime = Some(prepared.staged);
         smoke
     };
@@ -1542,6 +1535,20 @@ fn run_verified_install(
     let runtime_target = staged_runtime.as_ref().map(|_| target_root.clone());
     let prior_config_fingerprint = config::settings::artifact_config_fingerprint(&config)
         .map_err(|error| format!("could not fingerprint pre-install artifact settings: {error}"))?;
+    let smoke = verified_smoke
+        .authorize_activation(
+            &model_id,
+            &model.path,
+            model.size_bytes,
+            &model.sha256,
+            &cancellation,
+        )
+        .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
+    if cancellation.is_cancelled() {
+        return Err(InstallJobFailure::normal(
+            "Installation cancelled after smoke testing; no artifacts were activated.",
+        ));
+    }
     let mut journal = ActivationJournal::begin(
         activation_journal_path(),
         model.destination.clone(),
@@ -1587,7 +1594,14 @@ fn run_verified_install(
     };
 
     let model_sha256 = model.sha256.clone();
-    let (smoke, model) = match commit_verified_candidate(verified_smoke, || model.activate()) {
+    if cancellation.is_cancelled() {
+        return Err(failure_after_safe_rollback(
+            journal,
+            "Installation cancelled before model activation; no model artifact was activated."
+                .to_owned(),
+        ));
+    }
+    let model = match model.activate() {
         Ok(committed) => committed,
         Err(error) => {
             let rollback = runtime.and_then(|replacement| replacement.rollback().err());
@@ -1698,39 +1712,6 @@ fn run_verified_install(
         journal,
         remote_install,
     })
-}
-
-/// Evidence that only the candidate verifier can produce for activation.
-pub(crate) struct VerifiedCandidate<T>(T);
-
-/// Runs the immutable candidate check before handing its result to activation.
-/// The worker and UI transaction keep their existing responsibilities.
-pub(crate) fn verify_candidate_handoff<T, E>(
-    cancellation: &InstallCancellation,
-    verify: impl FnOnce() -> Result<T, E>,
-) -> Result<VerifiedCandidate<T>, E>
-where
-    E: From<String>,
-{
-    if cancellation.is_cancelled() {
-        return Err(E::from(
-            "installation verification was cancelled".to_owned(),
-        ));
-    }
-    let verified = verify()?;
-    if cancellation.is_cancelled() {
-        return Err(E::from(
-            "installation verification was cancelled".to_owned(),
-        ));
-    }
-    Ok(VerifiedCandidate(verified))
-}
-
-pub(crate) fn commit_verified_candidate<T, U, E>(
-    verified: VerifiedCandidate<T>,
-    commit: impl FnOnce() -> Result<U, E>,
-) -> Result<(T, U), E> {
-    commit().map(|committed| (verified.0, committed))
 }
 
 fn validate_local_gguf_import(
@@ -16582,6 +16563,22 @@ mod layout_tests {
         }
     }
 
+    fn test_install_smoke() -> InstallSmoke {
+        InstallSmoke {
+            resolved_acceleration: crate::transcription::ResolvedAcceleration {
+                requested: AccelerationPreference::Cpu,
+                resolved: crate::transcription::ComputeDevice::Cpu,
+                diagnostic: None,
+            },
+            detected_architecture: "whisper".to_owned(),
+            capabilities: crate::transcription::RuntimeCapabilities::default(),
+            health_duration_ms: 0,
+            load_duration_ms: 0,
+            decode_duration_ms: 0,
+            reload_duration_ms: 0,
+        }
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         // Keep Playground event tests independent from whichever legacy model
@@ -17733,7 +17730,15 @@ mod layout_tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&legacy, b"legacy").unwrap();
 
-        for outcome in ["success", "cancelled", "hash failure", "smoke failure"] {
+        for outcome in [
+            "success",
+            "cancelled during verification",
+            "cancelled after verification",
+            "hash failure",
+            "smoke failure",
+            "identity mismatch",
+            "different cancellation handle",
+        ] {
             let mut config = AppConfig::default();
             config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
             config
@@ -17743,45 +17748,98 @@ mod layout_tests {
             let previous = serde_json::to_value(&config).unwrap();
             let cancellation = InstallCancellation::default();
             let verifier_called = Cell::new(false);
+            let mutation_started = Cell::new(false);
             let q8 = root.join("whisper-base.en-Q8_0.gguf");
-
-            let result = verify_candidate_handoff(&cancellation, || -> Result<(), String> {
-                verifier_called.set(true);
-                match outcome {
-                    "cancelled" => {
-                        cancellation.cancel();
-                        Ok(())
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            let candidate =
+                InstallationCandidate::normalized(model_id.clone(), q8.clone(), None).unwrap();
+            let expected_size_bytes = candidate.expected_size_bytes;
+            let expected_sha256 = candidate.expected_sha256.clone();
+            let service = TranscriptionService::new(config.clone());
+            let result = service.verify_installation_candidate_for_activation_with(
+                candidate,
+                &cancellation,
+                |_| {
+                    verifier_called.set(true);
+                    match outcome {
+                        "cancelled during verification" => {
+                            cancellation.cancel();
+                            Ok(test_install_smoke())
+                        }
+                        "hash failure" => Err(anyhow::anyhow!("checksum mismatch")),
+                        "smoke failure" => Err(anyhow::anyhow!("known-WAV smoke failure")),
+                        _ => Ok(test_install_smoke()),
                     }
-                    "hash failure" => Err("checksum mismatch".to_owned()),
-                    "smoke failure" => Err("known-WAV smoke failure".to_owned()),
-                    _ => Ok(()),
-                }
-            });
+                },
+            );
+
+            if outcome == "cancelled after verification" {
+                assert!(
+                    result.is_ok(),
+                    "verification must finish before cancellation"
+                );
+                cancellation.cancel();
+            }
 
             assert!(verifier_called.get(), "{outcome}");
             assert!(legacy.is_file(), "{outcome}");
             if outcome == "success" {
-                commit_verified_candidate(result.unwrap(), || {
-                    config
-                        .general
-                        .model_paths
-                        .insert("whisper_cpp_base_en".to_owned(), q8.clone());
-                    Ok::<_, String>(())
-                })
-                .unwrap();
+                result
+                    .unwrap()
+                    .authorize_activation(
+                        &model_id,
+                        &q8,
+                        expected_size_bytes,
+                        &expected_sha256,
+                        &cancellation,
+                    )
+                    .unwrap();
+                mutation_started.set(true);
+                config
+                    .general
+                    .model_paths
+                    .insert("whisper_cpp_base_en".to_owned(), q8.clone());
+                assert!(mutation_started.get());
                 assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
                 assert_eq!(
                     config.general.model_paths.get("whisper_cpp_base_en"),
                     Some(&q8)
                 );
             } else {
+                if let Ok(verified) = result {
+                    let presented_path = if outcome == "identity mismatch" {
+                        root.join("whisper-small.en-Q8_0.gguf")
+                    } else {
+                        q8.clone()
+                    };
+                    let presented_cancellation = if outcome == "different cancellation handle" {
+                        InstallCancellation::default()
+                    } else {
+                        cancellation.clone()
+                    };
+                    let activation = verified.authorize_activation(
+                        &model_id,
+                        &presented_path,
+                        expected_size_bytes,
+                        &expected_sha256,
+                        &presented_cancellation,
+                    );
+                    assert!(activation.is_err(), "{outcome}");
+                }
+                assert!(!mutation_started.get(), "{outcome}");
                 assert_eq!(
                     serde_json::to_value(&config).unwrap(),
                     previous,
                     "{outcome}"
                 );
-                assert!(result.is_err(), "{outcome}");
+                assert_eq!(config.general.selected_default_model, model_id.as_str());
+                assert_eq!(
+                    config.general.model_paths.get(model_id.as_str()),
+                    Some(&legacy),
+                    "{outcome}"
+                );
             }
+            assert!(legacy.is_file(), "{outcome}");
         }
         let _ = fs::remove_dir_all(root);
     }

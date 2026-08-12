@@ -338,6 +338,45 @@ pub(crate) struct InstallSmoke {
     pub(crate) reload_duration_ms: u128,
 }
 
+/// Single-use installation evidence sealed by the isolated verifier and bound
+/// to the exact staged artifact and cancellation handle it checked.
+pub(crate) struct VerifiedInstallationCandidate {
+    candidate: InstallationCandidate,
+    cancellation: InstallCancellation,
+    smoke: InstallSmoke,
+}
+
+impl VerifiedInstallationCandidate {
+    pub(crate) fn authorize_activation(
+        self,
+        model_id: &ModelId,
+        model_path: &Path,
+        expected_size_bytes: u64,
+        expected_sha256: &str,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        if !self.cancellation.same_handle(cancellation) {
+            return Err(anyhow!(
+                "verified installation candidate was presented with a different cancellation handle"
+            ));
+        }
+        ensure_install_not_cancelled(cancellation)?;
+        if self.candidate.model_id != *model_id
+            || self.candidate.model_path != model_path
+            || self.candidate.expected_size_bytes != expected_size_bytes
+            || !self
+                .candidate
+                .expected_sha256
+                .eq_ignore_ascii_case(expected_sha256)
+        {
+            return Err(anyhow!(
+                "verified installation candidate no longer matches the staged artifact"
+            ));
+        }
+        Ok(self.smoke)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallationBinding {
     pub(crate) managed_runtime_id: String,
@@ -1284,6 +1323,40 @@ impl TranscriptionService {
                 }
             }
         }
+    }
+
+    /// Issues activation evidence only after the real isolated verifier has
+    /// accepted the exact candidate under the retained cancellation handle.
+    pub(crate) fn verify_installation_candidate_for_activation(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+    ) -> Result<VerifiedInstallationCandidate> {
+        let verified_candidate = candidate.clone();
+        let smoke = self.verify_installation_candidate(candidate, cancellation)?;
+        ensure_install_not_cancelled(cancellation)?;
+        Ok(VerifiedInstallationCandidate {
+            candidate: verified_candidate,
+            cancellation: cancellation.clone(),
+            smoke,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_installation_candidate_for_activation_with(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+        verify: impl FnOnce(&InstallationCandidate) -> Result<InstallSmoke>,
+    ) -> Result<VerifiedInstallationCandidate> {
+        ensure_install_not_cancelled(cancellation)?;
+        let smoke = verify(&candidate)?;
+        ensure_install_not_cancelled(cancellation)?;
+        Ok(VerifiedInstallationCandidate {
+            candidate,
+            cancellation: cancellation.clone(),
+            smoke,
+        })
     }
 
     fn verify_installation_candidate_blocking(
@@ -2355,6 +2428,8 @@ mod tests {
         let model_id = ModelId::new("whisper_cpp_base_en");
         let candidate = InstallationCandidate::normalized(model_id.clone(), gguf.clone(), None)
             .expect("the supplied GGUF filename must match the catalog-pinned base Q8 artifact");
+        let expected_size_bytes = candidate.expected_size_bytes;
+        let expected_sha256 = candidate.expected_sha256.clone();
         let audio = Arc::new(PreparedAudio::from_wav_path(&wav).expect("load the supplied WAV"));
         assert!(
             !audio.samples.is_empty(),
@@ -2369,46 +2444,50 @@ mod tests {
             .insert(model_id.as_str().to_owned(), legacy.clone());
         let prior = serde_json::to_value(&config).unwrap();
         let service = TranscriptionService::new(config.clone());
-        let verified = crate::app::verify_candidate_handoff(
-            &InstallCancellation::default(),
-            || -> Result<(), String> {
-                service
-                    .verify_installation_candidate(candidate, &InstallCancellation::default())
-                    .map_err(|error| error.to_string())?;
-                let mut request = TranscriptionRequest::new(
-                    SessionId(1),
-                    RequestId(1),
-                    Arc::clone(&audio),
-                    model_id.clone(),
-                );
-                request.model_path = Some(gguf.clone());
-                let transcript = service
-                    .transcribe(request)
-                    .map_err(|error| error.to_string())?
-                    .transcript
-                    .text;
-                assert!(
-                    !transcript.trim().is_empty(),
-                    "known-WAV smoke must produce a non-empty transcript"
-                );
-                if let Ok(expected) = std::env::var("SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT") {
-                    assert!(
-                        transcript.contains(&expected),
-                        "transcript did not contain SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT"
+        let cancellation = InstallCancellation::default();
+        let verified = service
+            .verify_installation_candidate_for_activation_with(
+                candidate,
+                &cancellation,
+                |candidate| {
+                    let smoke =
+                        service.verify_installation_candidate(candidate.clone(), &cancellation)?;
+                    let mut request = TranscriptionRequest::new(
+                        SessionId(1),
+                        RequestId(1),
+                        Arc::clone(&audio),
+                        model_id.clone(),
                     );
-                }
-                Ok(())
-            },
-        )
-        .expect("the local GGUF must pass its catalog pin and known-WAV smoke");
-        crate::app::commit_verified_candidate(verified, || {
-            config
-                .general
-                .model_paths
-                .insert(model_id.as_str().to_owned(), gguf);
-            Ok::<_, anyhow::Error>(())
-        })
-        .expect("only a verified candidate may switch the configured path");
+                    request.model_path = Some(gguf.clone());
+                    let transcript = service.transcribe(request)?.transcript.text;
+                    assert!(
+                        !transcript.trim().is_empty(),
+                        "known-WAV smoke must produce a non-empty transcript"
+                    );
+                    if let Ok(expected) = std::env::var("SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT")
+                    {
+                        assert!(
+                            transcript.contains(&expected),
+                            "transcript did not contain SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT"
+                        );
+                    }
+                    Ok(smoke)
+                },
+            )
+            .expect("the local GGUF must pass its catalog pin and known-WAV smoke");
+        verified
+            .authorize_activation(
+                &model_id,
+                &gguf,
+                expected_size_bytes,
+                &expected_sha256,
+                &cancellation,
+            )
+            .expect("only a verified candidate may switch the configured path");
+        config
+            .general
+            .model_paths
+            .insert(model_id.as_str().to_owned(), gguf);
         assert_eq!(config.general.selected_default_model, model_id.as_str());
         assert_ne!(serde_json::to_value(&config).unwrap(), prior);
         assert!(
