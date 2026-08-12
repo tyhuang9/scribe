@@ -138,6 +138,7 @@ pub(crate) struct RecordingSettingsView {
     pub gpu_available: bool,
     pub overlay_position_label: String,
     pub debug_mode: bool,
+    pub focus_playground_open: bool,
     pub history_mode_label: String,
     pub history_locked: bool,
     pub max_history_entries: u32,
@@ -189,6 +190,7 @@ impl Default for RecordingSettingsView {
             gpu_available: false,
             overlay_position_label: "Bottom".into(),
             debug_mode: false,
+            focus_playground_open: false,
             history_mode_label: "Off".into(),
             history_locked: false,
             max_history_entries: 100,
@@ -3746,14 +3748,14 @@ fn settings(
             }
         });
     });
-    if tab_responses
+    if let Some(focused_tab) = tab_responses
         .iter()
-        .any(|(_, response)| response.has_focus())
+        .find_map(|(tab, response)| response.has_focus().then_some(*tab))
     {
         if ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
-            focus_tab = Some(next_tab(active_tab));
+            focus_tab = Some(next_tab(focused_tab));
         } else if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
-            focus_tab = Some(previous_tab(active_tab));
+            focus_tab = Some(previous_tab(focused_tab));
         }
     }
     if let Some(target) = focus_tab {
@@ -3858,7 +3860,7 @@ fn radio_control(
     checked: bool,
 ) -> egui::Response {
     let colors = ui_palette(ui);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(88.0, 36.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(88.0, 44.0), egui::Sense::hover());
     let response = ui.interact(
         rect,
         ui.make_persistent_id(("recording-mode", mode)),
@@ -4008,8 +4010,11 @@ fn recording_settings_panel(
                 let mut enabled = settings.provisional_feedback;
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let response =
-                        ui.checkbox(&mut enabled, "Show provisional words while recording");
+                    let response = settings_checkbox(
+                        ui,
+                        &mut enabled,
+                        "Show provisional words while recording",
+                    );
                     if response.clicked() {
                         *action = ScreenAction::ToggleProvisionalFeedback;
                     }
@@ -4128,21 +4133,22 @@ fn recording_settings_panel(
         });
     });
     ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Advanced voice detection").strong());
-        ui.add_space(12.0);
+    settings_section(ui, "Advanced voice detection", |ui| {
         ui.add_enabled_ui(!recording_locked, |ui| {
             let mut vad_enabled = settings.vad_enabled;
-            if ui
-                .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
+            let _ = SettingsRow::show(ui, "Voice detection", false, |ui, _| {
+                if settings_checkbox(
+                    ui,
+                    &mut vad_enabled,
+                    "Stop after speech ends in Toggle mode",
+                )
                 .changed()
-            {
-                *action = ScreenAction::SetVadEnabled(vad_enabled);
-            }
+                {
+                    *action = ScreenAction::SetVadEnabled(vad_enabled);
+                }
+            });
             if vad_enabled {
-                ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(8.0);
                 for (index, (label, value, action_for)) in [
                     ("Speech confirmation ms", settings.speech_confirmation_ms, 0),
                     ("Internal pause ms", settings.internal_pause_ms, 1),
@@ -4153,15 +4159,14 @@ fn recording_settings_panel(
                 .into_iter()
                 .enumerate()
                 {
-                    ui.horizontal(|ui| {
-                        let label_response = ui.add_sized(
-                            [270.0, 40.0],
-                            egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
-                        );
+                    let _ = SettingsRow::show(ui, label, index < 4, |ui, label_id| {
                         let mut edited = value as i64;
                         if ui
-                            .add(egui::DragValue::new(&mut edited).clamp_range(0..=5_000))
-                            .labelled_by(label_response.id)
+                            .add_sized(
+                                [96.0, 44.0],
+                                egui::DragValue::new(&mut edited).clamp_range(0..=5_000),
+                            )
+                            .labelled_by(label_id)
                             .changed()
                         {
                             *action = match action_for {
@@ -4173,11 +4178,6 @@ fn recording_settings_panel(
                             };
                         }
                     });
-                    if index < 4 {
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                    }
                 }
             }
         });
@@ -4367,6 +4367,12 @@ fn about_settings_panel(
             egui::Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
         );
         if !settings.can_export_diagnostics {
+            ui.ctx().accesskit_node_builder(export.id, |builder| {
+                builder.set_disabled();
+                builder.set_description(
+                    "Unavailable because the platform settings directory cannot provide a private export location.",
+                );
+            });
             ui.label(RichText::new("The platform settings directory is unavailable, so Scribe cannot choose a private export location.").color(ui_palette(ui).muted_text));
         }
         if export.clicked() {
@@ -4476,15 +4482,17 @@ fn advanced_settings_panel(
             if mode != settings.history_mode_label { *action = ScreenAction::SetHistoryMode(mode.clone()); }
             if mode != "Off" {
                 let mut maximum = settings.max_history_entries as i64;
-                setting_row(ui, "Maximum unpinned entries", |ui, label_id| { let response = ui.add(egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); if response.changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
+                setting_row(ui, "Maximum unpinned entries", |ui, label_id| { let response = ui.add_sized([96.0, 44.0], egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); if response.changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
                 optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, action, ScreenAction::SetTranscriptRetentionDays);
                 if mode == "Transcript and audio" {
                     optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, action, ScreenAction::SetAudioRetentionDays);
                 }
                 let mut identity = settings.store_application_identity;
-                let identity_control = ui.checkbox(&mut identity, "Store coarse application identity with new entries").on_hover_text("Stores only a coarse local application label, never a window title or document name.");
-                describe_history_lock(ui, &identity_control, settings.history_locked);
-                if identity_control.changed() { *action = ScreenAction::SetStoreApplicationIdentity(identity); }
+                let _ = SettingsRow::show(ui, "Application identity", false, |ui, _| {
+                    let identity_control = settings_checkbox(ui, &mut identity, "Store coarse application identity with new entries").on_hover_text("Stores only a coarse local application label, never a window title or document name.");
+                    describe_history_lock(ui, &identity_control, settings.history_locked);
+                    if identity_control.changed() { *action = ScreenAction::SetStoreApplicationIdentity(identity); }
+                });
             }
         });
     });
@@ -4511,6 +4519,9 @@ fn advanced_settings_panel(
                     Some(ui.add_sized([176.0, 44.0], egui::Button::new("Open model Playground")));
             });
             let open = open.expect("enabled developer row always renders its action");
+            if settings.focus_playground_open {
+                open.request_focus();
+            }
             scroll_focused_control_into_view(ui, &open);
             if open.clicked() {
                 *action = ScreenAction::OpenDeveloperPlayground;
@@ -4538,7 +4549,7 @@ fn optional_retention_control(
     update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
 ) {
     let mut limited = configured_days.is_some();
-    let limit = ui.checkbox(&mut limited, label);
+    let limit = settings_checkbox(ui, &mut limited, label);
     describe_history_lock(ui, &limit, history_locked);
     if limit.changed() {
         *action = update(limited.then_some(configured_days.unwrap_or(30)));
@@ -4547,7 +4558,10 @@ fn optional_retention_control(
         let mut days = configured_days.unwrap_or(30) as i64;
         setting_row(ui, "Days", |ui, label_id| {
             let response = ui
-                .add(egui::DragValue::new(&mut days).clamp_range(1..=3_650))
+                .add_sized(
+                    [96.0, 44.0],
+                    egui::DragValue::new(&mut days).clamp_range(1..=3_650),
+                )
                 .labelled_by(label_id);
             describe_history_lock(ui, &response, history_locked);
             if response.changed() {
@@ -4575,7 +4589,7 @@ fn input_sensitivity_meter_slider(
 ) -> egui::Response {
     use egui::accesskit::{Action, ActionData};
 
-    let desired = Vec2::new(320.0, 40.0);
+    let desired = Vec2::new(320.0, 44.0);
     let (rect, mut response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
     let previous = *threshold_percent;
     let mut value = f32::from(*threshold_percent).clamp(0.0, 100.0);
@@ -4733,6 +4747,8 @@ impl SettingsRow {
     ) -> egui::Response {
         let compact = current_content_width(ui) < 620.0;
         let row = ui.scope(|ui| {
+            let interaction_height = ui.spacing().interact_size.y.max(44.0);
+            ui.spacing_mut().interact_size.y = interaction_height;
             ui.set_min_height(56.0);
             if compact {
                 ui.vertical(|ui| {
@@ -6197,6 +6213,82 @@ mod tests {
     }
 
     #[test]
+    fn settings_tab_arrow_uses_the_focused_tab_instead_of_the_active_tab() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let state = TranscriptionState::default();
+        let settings_view = RecordingSettingsView::default();
+        let active = SettingsTab::General;
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, active, &state, &settings_view);
+                    ui.memory_mut(|memory| memory.request_focus(tab_id(ui, SettingsTab::Advanced)));
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, active, &state, &settings_view);
+                });
+            },
+        );
+
+        let mut action = ScreenAction::None;
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = settings(ui, active, &state, &settings_view);
+                });
+            },
+        );
+
+        assert_eq!(action, ScreenAction::SetSettingsTab(SettingsTab::About));
+    }
+
+    #[test]
+    fn disabled_diagnostics_export_describes_the_missing_private_path() {
+        let output = render_route(UiRoute::Settings(SettingsTab::About));
+        let export = output
+            .platform_output
+            .accesskit_update
+            .expect("About settings should expose AccessKit")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Export redacted diagnostics")).then_some(node)
+            })
+            .expect("About settings should expose diagnostics export");
+        assert!(export.is_disabled());
+        assert_eq!(
+            export.description(),
+            Some(
+                "Unavailable because the platform settings directory cannot provide a private export location."
+            )
+        );
+    }
+
+    #[test]
     fn dense_settings_rows_stack_compactly_and_only_paint_requested_separators() {
         for (width, compact) in [(900.0, false), (480.0, true)] {
             let ctx = egui::Context::default();
@@ -6251,6 +6343,9 @@ mod tests {
             auto_insert_transcript: true,
             show_restore_clipboard: true,
             debug_mode: true,
+            history_mode_label: "Transcript and audio".into(),
+            transcript_retention_days: Some(30),
+            audio_retention_days: Some(14),
             ..Default::default()
         };
         for (width, compact) in [(900.0, false), (480.0, true)] {
@@ -6261,16 +6356,34 @@ mod tests {
                         "Close to tray",
                         "Automatically insert final transcript",
                         "Restore clipboard after insert",
+                        "Manage models",
+                        "Apply",
+                        "Capture hotkey",
+                    ][..],
+                ),
+                (
+                    SettingsTab::Recording,
+                    &[
+                        "Press once",
+                        "Hold",
+                        "Show provisional words while recording",
+                        "Refresh devices",
+                        "Change shortcut",
+                        "Stop after speech ends in Toggle mode",
                     ][..],
                 ),
                 (
                     SettingsTab::Advanced,
                     &[
                         "Use live provisional preview",
+                        "Transcript age limit",
+                        "Audio age limit",
+                        "Store coarse application identity with new entries",
                         "Enable local model Playground",
                         "Open model Playground",
                     ][..],
                 ),
+                (SettingsTab::About, &["Export redacted diagnostics"][..]),
             ] {
                 let ctx = egui::Context::default();
                 ctx.enable_accesskit();
@@ -6302,6 +6415,51 @@ mod tests {
                     assert!(
                         bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0,
                         "{name} target is too small at {width}px: {bounds:?}"
+                    );
+                }
+                let labelled_controls: &[(&str, egui::accesskit::Role)] = match tab {
+                    SettingsTab::General => &[
+                        ("Theme", egui::accesskit::Role::ComboBox),
+                        ("Paste delay ms", egui::accesskit::Role::SpinButton),
+                    ],
+                    SettingsTab::Recording => &[
+                        ("Duration limit", egui::accesskit::Role::ComboBox),
+                        ("Device", egui::accesskit::Role::ComboBox),
+                        ("Input level", egui::accesskit::Role::Slider),
+                        ("Speech confirmation ms", egui::accesskit::Role::SpinButton),
+                    ],
+                    SettingsTab::Advanced => &[
+                        ("Mode", egui::accesskit::Role::ComboBox),
+                        ("Transcription device", egui::accesskit::Role::ComboBox),
+                        ("Overlay position", egui::accesskit::Role::ComboBox),
+                        ("History storage", egui::accesskit::Role::ComboBox),
+                        (
+                            "Maximum unpinned entries",
+                            egui::accesskit::Role::SpinButton,
+                        ),
+                    ],
+                    SettingsTab::About | SettingsTab::Output => &[],
+                };
+                for (label, role) in labelled_controls {
+                    let bounds = nodes
+                        .iter()
+                        .find_map(|(label_id, node)| {
+                            (node.name() == Some(*label)).then(|| {
+                                nodes.iter().find_map(|(_, control)| {
+                                    (control.role() == *role
+                                        && control.labelled_by().contains(label_id))
+                                    .then(|| control.bounds())
+                                    .flatten()
+                                })
+                            })
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            panic!("missing {role:?} labelled by {label} at {width}px")
+                        });
+                    assert!(
+                        bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0,
+                        "{role:?} labelled by {label} is too small at {width}px: {bounds:?}"
                     );
                 }
                 if tab == SettingsTab::General {

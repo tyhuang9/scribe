@@ -71,7 +71,7 @@ pub(crate) fn button(
             .fill(fill)
             .stroke(stroke)
             .rounding(Rounding::same(5.0))
-            .min_size(Vec2::new(0.0, PRIMARY_TARGET_HEIGHT)),
+            .min_size(Vec2::splat(PRIMARY_TARGET_HEIGHT)),
     );
     if !response.enabled() {
         ui.ctx().accesskit_node_builder(response.id, |builder| {

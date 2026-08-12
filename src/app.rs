@@ -2374,6 +2374,8 @@ pub struct LocalTranscriberApp {
     current_tab: Tab,
     settings_tab: SettingsTab,
     settings_playground_open: bool,
+    settings_playground_needs_initial_focus: bool,
+    settings_restore_playground_focus: bool,
     models_show_comparison: bool,
     model_comparison: ModelComparisonState,
     comparison_run_model_ids: Option<Vec<String>>,
@@ -2554,6 +2556,8 @@ impl LocalTranscriberApp {
             current_tab: initial_tab(),
             settings_tab: SettingsTab::General,
             settings_playground_open: false,
+            settings_playground_needs_initial_focus: false,
+            settings_restore_playground_focus: false,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,
@@ -7972,6 +7976,8 @@ impl eframe::App for LocalTranscriberApp {
                 self.settings_tab = SettingsTab::Advanced;
                 self.current_tab = Tab::General;
                 self.settings_playground_open = self.config.developer.debug_mode;
+                self.settings_playground_needs_initial_focus = self.settings_playground_open;
+                self.settings_restore_playground_focus = false;
             }
             _ => {}
         }
@@ -9363,13 +9369,16 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
-            if self.settings_playground_open
-                && ui
-                    .add_sized([176.0, 44.0], Button::new("Back to Advanced"))
-                    .clicked()
-            {
-                self.close_settings_playground();
-                return;
+            if self.settings_playground_open {
+                let back = ui.add_sized([176.0, 44.0], Button::new("Back to Advanced"));
+                if self.settings_playground_needs_initial_focus {
+                    back.request_focus();
+                    self.settings_playground_needs_initial_focus = false;
+                }
+                if back.clicked() {
+                    self.close_settings_playground();
+                    return;
+                }
             }
             if self.current_tab == Tab::Models {
                 if ui.add(small_button(ui, "Back to models")).clicked() {
@@ -9631,6 +9640,8 @@ impl LocalTranscriberApp {
         self.settings_tab = SettingsTab::Advanced;
         self.current_tab = Tab::General;
         self.settings_playground_open = false;
+        self.settings_playground_needs_initial_focus = false;
+        self.settings_restore_playground_focus = true;
     }
 
     fn ui_playground_model_selector(&mut self, ctx: &egui::Context) {
@@ -9905,6 +9916,7 @@ impl LocalTranscriberApp {
                 .is_ok_and(|descriptor| descriptor.capabilities.gpu),
             overlay_position_label: self.config.overlay.position.label().to_owned(),
             debug_mode: self.config.developer.debug_mode,
+            focus_playground_open: self.settings_restore_playground_focus,
             history_mode_label: self.config.history.mode.label().to_owned(),
             history_locked: self.history_retry_is_active(),
             max_history_entries: self.config.history.max_unpinned_entries,
@@ -9945,6 +9957,7 @@ impl LocalTranscriberApp {
             },
         );
         self.apply_settings_screen_action(action);
+        self.settings_restore_playground_focus = false;
     }
 
     fn open_system_audio_settings(&mut self) {
@@ -10122,12 +10135,16 @@ impl LocalTranscriberApp {
                     self.settings_tab = SettingsTab::Advanced;
                     self.current_tab = Tab::General;
                     self.settings_playground_open = false;
+                    self.settings_playground_needs_initial_focus = false;
+                    self.settings_restore_playground_focus = false;
                 }
                 self.save_config();
             }
             ScreenAction::OpenDeveloperPlayground if self.config.developer.debug_mode => {
                 self.settings_tab = SettingsTab::Advanced;
                 self.settings_playground_open = true;
+                self.settings_playground_needs_initial_focus = true;
+                self.settings_restore_playground_focus = false;
             }
             ScreenAction::OpenDeveloperPlayground => {}
             ScreenAction::ExportRedactedDiagnostics => {
@@ -16452,6 +16469,8 @@ mod layout_tests {
             current_tab: Tab::Models,
             settings_tab: SettingsTab::General,
             settings_playground_open: false,
+            settings_playground_needs_initial_focus: false,
+            settings_restore_playground_focus: false,
             models_show_comparison: false,
             model_comparison: ModelComparisonState::default(),
             comparison_run_model_ids: None,
@@ -17177,6 +17196,63 @@ mod layout_tests {
         assert_eq!(app.current_tab, Tab::General);
         assert_eq!(app.settings_tab, SettingsTab::Advanced);
         assert!(!app.settings_playground_open);
+    }
+
+    #[test]
+    fn settings_playground_focus_moves_to_back_and_restores_open_action() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+
+        app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+        let playground = render_playground(&ctx, &mut app, Vec::new());
+        let back = accesskit_control_id(&playground, "Back to Advanced");
+        assert_eq!(
+            playground
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("Playground should expose AccessKit")
+                .focus,
+            back
+        );
+        assert!(!app.settings_playground_needs_initial_focus);
+
+        app.close_settings_playground();
+        let advanced = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 3_000.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::Settings(SettingsTab::Advanced), |ui| {
+                            app.ui_general_settings(ui)
+                        })
+                    });
+            },
+        );
+        let open = accesskit_control_id(&advanced, "Open model Playground");
+        assert_eq!(
+            advanced
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("Advanced settings should expose AccessKit")
+                .focus,
+            open
+        );
+        assert!(!app.settings_restore_playground_focus);
     }
 
     #[test]
