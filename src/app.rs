@@ -8114,7 +8114,15 @@ impl LocalTranscriberApp {
     }
 
     fn selected_model_screen_state(&self) -> (Option<String>, ModelReadiness) {
-        let Some(model) = self.selected_model() else {
+        let selected_model = self.selected_model();
+        self.selected_model_screen_state_from(selected_model.as_ref())
+    }
+
+    fn selected_model_screen_state_from(
+        &self,
+        selected_model: Option<&SttModelInfo>,
+    ) -> (Option<String>, ModelReadiness) {
+        let Some(model) = selected_model else {
             return (None, ModelReadiness::Error);
         };
         let readiness = match runtime_status_for_model(&self.config, &model) {
@@ -8127,7 +8135,7 @@ impl LocalTranscriberApp {
             | ModelRuntimeStatus::NotImplemented
             | ModelRuntimeStatus::Error(_) => ModelReadiness::Error,
         };
-        (Some(model.id), readiness)
+        (Some(model.id.clone()), readiness)
     }
 
     fn microphone_permission(&self) -> MicrophonePermission {
@@ -9815,8 +9823,14 @@ impl LocalTranscriberApp {
         diagnostics
     }
 
+    #[cfg(test)]
     fn selected_model_ui_label(&self) -> String {
-        let Some(model) = self.selected_model() else {
+        let selected_model = self.selected_model();
+        self.selected_model_ui_label_from(selected_model.as_ref())
+    }
+
+    fn selected_model_ui_label_from(&self, selected_model: Option<&SttModelInfo>) -> String {
+        let Some(model) = selected_model else {
             return "No model selected".to_owned();
         };
         let descriptor = self
@@ -9827,7 +9841,10 @@ impl LocalTranscriberApp {
     }
 
     fn ui_general_settings(&mut self, ui: &mut Ui) {
-        let (selected_model_id, model_readiness) = self.selected_model_screen_state();
+        let selected_model = self.selected_model();
+        let (selected_model_id, model_readiness) =
+            self.selected_model_screen_state_from(selected_model.as_ref());
+        let active_model_label = self.selected_model_ui_label_from(selected_model.as_ref());
         let (levels, level_revision, level_source_active) = self.current_sensitivity_level_sample();
         let input_level_percent = (self.microphone_level_envelope.update(
             levels.rms,
@@ -9890,7 +9907,7 @@ impl LocalTranscriberApp {
                 .map(str::to_owned),
             restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
             paste_delay_ms: self.config.output.paste_delay_ms,
-            active_model_label: self.selected_model_ui_label(),
+            active_model_label,
             hotkey_input: self.hotkey_input.clone(),
             hotkey_capture_active: self.capturing_hotkey,
             hotkey_capture_status: self.capturing_hotkey.then(|| self.status_message.clone()),
@@ -15427,6 +15444,25 @@ mod layout_tests {
         assert_eq!(selected[0].id, id);
         assert_eq!(selected[0].display_name, "Vosk small English");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_model_projection_reuses_one_resolved_model_value() {
+        let mut app = test_app();
+        let resolved = app.selected_model().expect("test app has a selected model");
+        let expected_state = app.selected_model_screen_state();
+        let expected_label = app.selected_model_ui_label();
+
+        app.config.general.selected_default_model = "missing-after-resolution".to_owned();
+
+        assert_eq!(
+            app.selected_model_screen_state_from(Some(&resolved)),
+            expected_state
+        );
+        assert_eq!(
+            app.selected_model_ui_label_from(Some(&resolved)),
+            expected_label
+        );
     }
 
     #[test]
