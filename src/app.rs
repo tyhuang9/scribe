@@ -1544,11 +1544,6 @@ fn run_verified_install(
             &cancellation,
         )
         .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
-    if cancellation.is_cancelled() {
-        return Err(InstallJobFailure::normal(
-            "Installation cancelled after smoke testing; no artifacts were activated.",
-        ));
-    }
     let mut journal = ActivationJournal::begin(
         activation_journal_path(),
         model.destination.clone(),
@@ -1594,13 +1589,6 @@ fn run_verified_install(
     };
 
     let model_sha256 = model.sha256.clone();
-    if cancellation.is_cancelled() {
-        return Err(failure_after_safe_rollback(
-            journal,
-            "Installation cancelled before model activation; no model artifact was activated."
-                .to_owned(),
-        ));
-    }
     let model = match model.activate() {
         Ok(committed) => committed,
         Err(error) => {

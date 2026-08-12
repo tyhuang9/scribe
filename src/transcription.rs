@@ -360,7 +360,6 @@ impl VerifiedInstallationCandidate {
                 "verified installation candidate was presented with a different cancellation handle"
             ));
         }
-        ensure_install_not_cancelled(cancellation)?;
         if self.candidate.model_id != *model_id
             || self.candidate.model_path != model_path
             || self.candidate.expected_size_bytes != expected_size_bytes
@@ -373,6 +372,16 @@ impl VerifiedInstallationCandidate {
                 "verified installation candidate no longer matches the staged artifact"
             ));
         }
+        cancellation
+            .try_commit_activation()
+            .map_err(|state| match state {
+                crate::installations::ActivationCommitError::Cancelled => {
+                    anyhow!("installation verification was cancelled before activation committed")
+                }
+                crate::installations::ActivationCommitError::AlreadyCommitted => {
+                    anyhow!("verified installation candidate was already consumed for activation")
+                }
+            })?;
         Ok(self.smoke)
     }
 }
