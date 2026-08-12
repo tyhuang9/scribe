@@ -61,6 +61,35 @@ The deterministic harness and state tests do not open a real microphone, so oper
 
 Status: **automated design evidence passed; native screenshot review pending**.
 
+## Current refinement — `e01bdd4`
+
+Final result: **blocked** for the revised-model-manager native visual gate.
+
+The current implementation replaces the row flow layout with one physical
+header/row cell splitter, clips long Model identity content to its own cell,
+uses compact 32 px visual buttons with 44 px interaction targets, and gives
+Recording Mode a contrast-checked purple pill. The Details drawer now has a
+stable two-column stat grid, keyboard containment, Escape/outside dismissal,
+and tested open/close behavior.
+
+Automated evidence on this commit: `cargo fmt --all -- --check`, `cargo check
+--all-targets --all-features`, `cargo clippy --all-targets --all-features --
+-D warnings`, `cargo test --all-targets --all-features -- --test-threads=1`
+(776 passed, 11 ignored), debug/release builds, and `git diff --check` all
+passed. Focused coverage proves header/row grid tracks, clipped long identity
+content, drawer Tab containment, Escape dismissal, and light/dark segmented
+control contrast.
+
+Native capture was attempted with the deterministic `models/details-drawer`
+fixture at 1180×815 in an isolated local-data directory. The Scribe process
+created a responsive native window and remained alive while the drawer was
+open, but the available desktop screenshot path captured the host browser
+rather than the GPU-composited Scribe window. `PrintWindow` returned only a
+black frame, and the bundled Windows Computer Use runtime is unavailable in
+this session. Direct visual comparison against the supplied model-list and
+drawer references is therefore still required before this visual gate can be
+called passed.
+
 ## Implemented reference requirements
 
 - The Models route uses compact 76 px desktop rows (124 px at very narrow
