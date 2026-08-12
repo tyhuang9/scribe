@@ -28,13 +28,16 @@ pub(crate) enum Fixture {
     TranscribeNoSpeech,
     TranscribeMicrophoneError,
     ModelsInstalled,
+    ModelsLifecycle,
+    ModelsDetailsDrawer,
     ModelsCompareExpanded,
+    History,
     SettingsRecording,
 }
 
 impl Fixture {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::TranscribeNoModel,
         Self::TranscribeReady,
         Self::TranscribeListening,
@@ -42,7 +45,10 @@ impl Fixture {
         Self::TranscribeNoSpeech,
         Self::TranscribeMicrophoneError,
         Self::ModelsInstalled,
+        Self::ModelsLifecycle,
+        Self::ModelsDetailsDrawer,
         Self::ModelsCompareExpanded,
+        Self::History,
         Self::SettingsRecording,
     ];
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -54,14 +60,21 @@ impl Fixture {
             "transcribe/no-speech" => Self::TranscribeNoSpeech,
             "transcribe/microphone-error" => Self::TranscribeMicrophoneError,
             "models/installed" => Self::ModelsInstalled,
+            "models/lifecycle" => Self::ModelsLifecycle,
+            "models/details-drawer" => Self::ModelsDetailsDrawer,
             "models/compare-expanded" => Self::ModelsCompareExpanded,
+            "history" => Self::History,
             "settings/recording" => Self::SettingsRecording,
             _ => return None,
         })
     }
     fn page(self) -> AppPage {
         match self {
-            Self::ModelsInstalled | Self::ModelsCompareExpanded => AppPage::Models,
+            Self::ModelsInstalled
+            | Self::ModelsLifecycle
+            | Self::ModelsDetailsDrawer
+            | Self::ModelsCompareExpanded => AppPage::Models,
+            Self::History => AppPage::History,
             Self::SettingsRecording => AppPage::General,
             _ => AppPage::Transcribe,
         }
@@ -79,6 +92,7 @@ impl Fixture {
             model("whisper.cpp base.en", "base.en", true, true, 400),
             model("whisper.cpp tiny.en", "tiny.en", false, false, 75),
         ];
+        let mut model_catalog = Vec::new();
         let mut comparison = ModelComparisonState::default();
         let settings = RecordingSettingsView {
             duration_label: "30 seconds".into(),
@@ -89,7 +103,11 @@ impl Fixture {
             ..Default::default()
         };
         let route = match self {
-            Self::ModelsInstalled | Self::ModelsCompareExpanded => UiRoute::Models,
+            Self::ModelsInstalled
+            | Self::ModelsLifecycle
+            | Self::ModelsDetailsDrawer
+            | Self::ModelsCompareExpanded => UiRoute::Models,
+            Self::History => UiRoute::History,
             Self::SettingsRecording => UiRoute::Settings(SettingsTab::Recording),
             _ => UiRoute::Transcribe,
         };
@@ -114,8 +132,49 @@ impl Fixture {
                 transcription.phase = TranscriptionPhase::MicrophoneError;
                 transcription.notice = Some("Scribe couldn’t access your microphone".into());
             }
-            Self::ModelsInstalled | Self::SettingsRecording => {
+            Self::ModelsInstalled | Self::SettingsRecording | Self::History => {
                 transcription.phase = TranscriptionPhase::Ready
+            }
+            Self::ModelsLifecycle | Self::ModelsDetailsDrawer => {
+                transcription.phase = TranscriptionPhase::Ready;
+                let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
+                partial.installed = false;
+                partial.download_state = ModelDownloadState::Cancelled;
+                partial.downloaded_bytes = 129_000_000;
+                partial.total_bytes = Some(190_000_000);
+                partial.description = Some("Resumable local transcription model.".into());
+                partial.languages = vec!["en".into()];
+
+                let mut downloading = model("Whisper Parakeet", "parakeet.tdt", false, false, 600);
+                downloading.installed = false;
+                downloading.download_state = ModelDownloadState::Downloading;
+                downloading.downloaded_bytes = 82_000_000;
+                downloading.total_bytes = Some(600_000_000);
+                downloading.cancel_supported = true;
+                downloading.description = Some("Fast local transcription model.".into());
+                downloading.languages = vec!["en".into(), "es".into()];
+
+                let mut failed = model("Whisper Medium", "medium.en", false, false, 466);
+                failed.installed = false;
+                failed.download_state = ModelDownloadState::Failed;
+                failed.error_message = Some("Network connection was interrupted.".into());
+                failed.description = Some("High-accuracy local transcription model.".into());
+                failed.languages = vec!["en".into()];
+
+                let mut available = model("Whisper Large", "large-v3", false, false, 1_550);
+                available.installed = false;
+                available.download_state = ModelDownloadState::NotInstalled;
+                available.description = Some("Highest-accuracy local transcription model.".into());
+                available.languages = vec![
+                    "en".into(),
+                    "es".into(),
+                    "ja".into(),
+                    "ko".into(),
+                    "zh".into(),
+                    "fr".into(),
+                ];
+
+                model_catalog = vec![partial, downloading, failed, available];
             }
             Self::ModelsCompareExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
@@ -129,7 +188,16 @@ impl Fixture {
             transcription,
             models,
             comparison,
-            model_management: ModelManagementState::default(),
+            model_management: if self == Self::ModelsDetailsDrawer {
+                ModelManagementState {
+                    dialog: Some(ModelDialog::Details("tiny.en".into())),
+                    focus_dialog_initial: true,
+                    ..Default::default()
+                }
+            } else {
+                ModelManagementState::default()
+            },
+            model_catalog,
             model_language_filter: ModelLanguageFilter::default(),
             remote_catalog: remote_catalog_fixture(),
             settings,
@@ -159,9 +227,19 @@ fn model(
         removal_supported: true,
         runtime_status_label: "Ready".into(),
         download_state: ModelDownloadState::Installed,
+        description: Some(
+            if active {
+                "Balanced for everyday dictation."
+            } else {
+                "More accurate for longer recordings."
+            }
+            .into(),
+        ),
         disk_bytes: Some(ram_mb * 1_000_000),
+        total_bytes: Some(ram_mb * 1_000_000),
         estimated_ram_bytes: Some(ram_mb * 1_000_000),
-        language_summary: "English".into(),
+        languages: vec!["en".into()],
+        language_summary: "English only".into(),
         speed_tier: if active {
             ModelSpeedTier::Balanced
         } else {
@@ -182,6 +260,7 @@ struct FixtureData {
     route: UiRoute,
     transcription: TranscriptionState,
     models: Vec<ModelViewModel>,
+    model_catalog: Vec<ModelViewModel>,
     comparison: ModelComparisonState,
     model_management: ModelManagementState,
     model_language_filter: ModelLanguageFilter,
@@ -333,7 +412,7 @@ fn show_harness(ctx: &egui::Context, data: &mut FixtureData, page: &mut AppPage)
         route: harness_route(*page, data.route),
         transcription: &data.transcription,
         models: &data.models,
-        model_catalog: &data.models,
+        model_catalog: &data.model_catalog,
         comparison: &data.comparison,
         model_management: &data.model_management,
         model_language_filter: data.model_language_filter,
@@ -389,6 +468,16 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.dialog = Some(ModelDialog::Details(id));
             data.model_management.focus_dialog_initial = true;
         }
+        ScreenAction::ShowRemoteModelDetails {
+            entry_id,
+            variant_id,
+        } => {
+            data.model_management.dialog = Some(ModelDialog::RemoteDetails {
+                entry_id,
+                variant_id,
+            });
+            data.model_management.focus_dialog_initial = true;
+        }
         ScreenAction::RequestModelRemoval(id) => {
             data.model_management.dialog = Some(ModelDialog::Remove(id));
             data.model_management.focus_dialog_initial = true;
@@ -398,6 +487,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             Some(ModelDialog::Details(id)) => {
                 data.model_management.restore_details_focus = Some(id)
             }
+            Some(ModelDialog::RemoteDetails { .. }) => {}
             Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
             None => {}
         },
@@ -1776,14 +1866,13 @@ mod tests {
             let dialog_layer = ctx
                 .memory(|memory| memory.layer_id_at(dialog_probe))
                 .expect("active model dialog should own its surface");
-            assert_eq!(dialog_layer.order, egui::Order::Middle);
+            assert_eq!(dialog_layer.order, egui::Order::Foreground);
 
-            let dock_layer = egui::LayerId::new(egui::Order::Middle, foreground_dock_layer.id);
             let layers = ctx.memory(|memory| memory.layer_ids().collect::<Vec<_>>());
             let dock_index = layers
                 .iter()
-                .position(|layer| *layer == dock_layer)
-                .expect("modal frame should retain the demoted comparison dock layer");
+                .position(|layer| *layer == foreground_dock_layer)
+                .expect("comparison dock should retain its foreground layer");
             let dialog_index = layers
                 .iter()
                 .position(|layer| *layer == dialog_layer)

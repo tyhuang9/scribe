@@ -221,6 +221,8 @@ pub(crate) struct ModelCapabilities {
     pub translation: bool,
     pub timestamps: bool,
     pub language_detection: bool,
+    pub cpu: bool,
+    pub gpu: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -262,6 +264,11 @@ pub(crate) struct ModelViewModel {
     pub description: Option<String>,
     pub runtime_group: String,
     pub architecture: Option<String>,
+    /// These are copied from the verified local manifest only when known.
+    pub artifact_repository: Option<String>,
+    pub artifact_revision: Option<String>,
+    pub artifact_filename: Option<String>,
+    pub artifact_path: Option<String>,
     pub installed: bool,
     pub active: bool,
     pub ready: bool,
@@ -316,6 +323,10 @@ impl ModelViewModel {
 pub(crate) enum ModelDialog {
     Add,
     Details(String),
+    RemoteDetails {
+        entry_id: String,
+        variant_id: String,
+    },
     Remove(String),
 }
 
@@ -347,6 +358,8 @@ pub(crate) struct ModelManagementState {
     pub focus_model_card: Option<ModelCardKey>,
     /// One-frame polite confirmation after a synchronous model removal attempt.
     pub removal_notice: Option<String>,
+    /// The deterministic ready replacement named in an active-model removal confirmation.
+    pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
     pub installed_expanded: bool,
     pub available_expanded: bool,
@@ -363,6 +376,7 @@ impl Default for ModelManagementState {
             restore_remove_focus: None,
             focus_model_card: None,
             removal_notice: None,
+            removal_replacement: None,
             mutation_block_reason: None,
             installed_expanded: true,
             available_expanded: true,
