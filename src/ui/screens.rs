@@ -29,6 +29,7 @@ const MODEL_REQUIRED_CONTENT_HEIGHT: f32 = 176.0;
 const COMPACT_SELECTOR_BREAKPOINT: f32 = 880.0;
 const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 0.0;
 const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
+const SELECTOR_VISUAL_HEIGHT: f32 = 36.0;
 const SELECTOR_ACTION_WIDTH: f32 = 72.0;
 const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
 const TRANSCRIPT_BODY_PADDING: f32 = 26.0;
@@ -499,31 +500,40 @@ fn selector_row(
             let card_height = SELECTOR_CONTROL_HEIGHT + SELECTOR_CARD_VERTICAL_MARGIN * 2.0;
             let (model_card_rect, _) =
                 ui.allocate_exact_size(Vec2::new(model_width, card_height), egui::Sense::hover());
+            let model_card_visual_rect = egui::Rect::from_center_size(
+                model_card_rect.center(),
+                Vec2::new(model_card_rect.width(), SELECTOR_VISUAL_HEIGHT),
+            );
             let model_card_frame = Frame::none()
                 .fill(ui_palette(ui).card_bg)
                 .stroke(Stroke::new(1.0, ui_palette(ui).border))
                 .rounding(Rounding::same(5.0));
-            ui.painter().add(model_card_frame.paint(model_card_rect));
+            ui.painter()
+                .add(model_card_frame.paint(model_card_visual_rect));
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(
-                    model_card_rect.min.x + 16.0,
-                    model_card_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                    model_card_visual_rect.min.x + 16.0,
+                    model_card_visual_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
                 ),
                 egui::pos2(
-                    model_card_rect.max.x - 16.0,
-                    model_card_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                    model_card_visual_rect.max.x - 16.0,
+                    model_card_visual_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
                 ),
             );
-            let action_rect = egui::Rect::from_min_max(
+            let action_visual_slot = egui::Rect::from_min_max(
                 egui::pos2(
                     (content_rect.max.x - SELECTOR_ACTION_WIDTH).max(content_rect.min.x),
                     content_rect.min.y,
                 ),
                 content_rect.max,
             );
+            let action_rect = egui::Rect::from_min_max(
+                egui::pos2(action_visual_slot.left(), model_card_rect.top()),
+                egui::pos2(action_visual_slot.right(), model_card_rect.bottom()),
+            );
             let label_rect = egui::Rect::from_min_max(
                 content_rect.min,
-                egui::pos2(action_rect.min.x, content_rect.max.y),
+                egui::pos2(action_visual_slot.min.x, content_rect.max.y),
             );
             let mut label_ui = ui.child_ui(label_rect, Layout::left_to_right(Align::Center));
             label_ui.label(
@@ -545,7 +555,7 @@ fn selector_row(
             let hovered = response.enabled() && response.hovered();
             let action_visual_rect = egui::Rect::from_center_size(
                 action_rect.center(),
-                Vec2::new(SELECTOR_ACTION_WIDTH, 36.0),
+                Vec2::new(SELECTOR_ACTION_WIDTH, 32.0),
             );
             ui.painter().rect(
                 action_visual_rect,
@@ -625,6 +635,10 @@ fn selector_row(
             let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
             let (hotkey_card_rect, _) =
                 ui.allocate_exact_size(Vec2::new(hotkey_width, card_height), egui::Sense::hover());
+            let hotkey_card_visual_rect = egui::Rect::from_center_size(
+                hotkey_card_rect.center(),
+                Vec2::new(hotkey_card_rect.width(), SELECTOR_VISUAL_HEIGHT),
+            );
             let hotkey_card_frame = Frame::none()
                 .fill(if no_model {
                     ui_palette(ui).disabled_bg
@@ -633,15 +647,16 @@ fn selector_row(
                 })
                 .stroke(Stroke::new(1.0, ui_palette(ui).border))
                 .rounding(Rounding::same(5.0));
-            ui.painter().add(hotkey_card_frame.paint(hotkey_card_rect));
+            ui.painter()
+                .add(hotkey_card_frame.paint(hotkey_card_visual_rect));
             let hotkey_content_rect = egui::Rect::from_min_max(
                 egui::pos2(
-                    hotkey_card_rect.min.x + 16.0,
-                    hotkey_card_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                    hotkey_card_visual_rect.min.x + 16.0,
+                    hotkey_card_visual_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
                 ),
                 egui::pos2(
-                    hotkey_card_rect.max.x - 16.0,
-                    hotkey_card_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                    hotkey_card_visual_rect.max.x - 16.0,
+                    hotkey_card_visual_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
                 ),
             );
             let mut hotkey_content_ui =
@@ -1422,6 +1437,7 @@ const DETAILS_DRAWER_INSET: f32 = 8.0;
 const DETAILS_DRAWER_MARGIN: f32 = 16.0;
 const DETAILS_DRAWER_HEADER_HEIGHT: f32 = 52.0;
 const DETAILS_DRAWER_FOOTER_HEIGHT: f32 = 44.0;
+const DETAILS_DRAWER_STAT_HEIGHT: f32 = 70.0;
 const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
 const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
 
@@ -1437,6 +1453,21 @@ struct ModelCardColumnLayout {
     size: f32,
     details: f32,
     action: f32,
+}
+
+/// The physical cell rectangles for a desktop model row. Headers and row
+/// contents deliberately derive from this one splitter rather than a flow
+/// layout: a label or meter may be wider than its ideal content, but it can
+/// never push a following column out of alignment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModelCardColumnRects {
+    identity: egui::Rect,
+    languages: egui::Rect,
+    speed: egui::Rect,
+    accuracy: egui::Rect,
+    size: egui::Rect,
+    details: egui::Rect,
+    action: egui::Rect,
 }
 
 #[cfg(test)]
@@ -1482,6 +1513,34 @@ fn model_card_content_rect(card_rect: egui::Rect) -> egui::Rect {
         MODEL_CARD_HORIZONTAL_INSET,
         MODEL_CARD_VERTICAL_INSET,
     ))
+}
+
+fn model_card_column_rects(
+    content_rect: egui::Rect,
+    columns: ModelCardColumnLayout,
+) -> ModelCardColumnRects {
+    let mut left = content_rect.left();
+    let mut next = |width| {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(left, content_rect.top()),
+            Vec2::new(width, content_rect.height()),
+        );
+        left += width;
+        rect
+    };
+    ModelCardColumnRects {
+        identity: next(columns.identity),
+        languages: next(columns.languages),
+        speed: next(columns.speed),
+        accuracy: next(columns.accuracy),
+        size: next(columns.size),
+        details: next(columns.details),
+        action: next(columns.action),
+    }
+}
+
+fn model_card_cell_clip_rect(card_rect: egui::Rect, cell_rect: egui::Rect) -> egui::Rect {
+    cell_rect.intersect(card_rect.shrink(1.0))
 }
 
 fn model_row_width(ui: &egui::Ui) -> f32 {
@@ -1549,20 +1608,15 @@ fn render_model_column_headers(ui: &mut egui::Ui) {
     };
     let (header_rect, _) = ui.allocate_exact_size(Vec2::new(row_width, 16.0), Sense::hover());
     let content_rect = header_rect.shrink2(Vec2::new(MODEL_CARD_HORIZONTAL_INSET, 0.0));
-    let mut left = content_rect.left();
-    for (width, label, alignment) in [
-        (columns.identity, "MODEL", Align::LEFT),
-        (columns.languages, "LANGUAGES", Align::Center),
-        (columns.speed, "SPEED", Align::Center),
-        (columns.accuracy, "ACCURACY", Align::Center),
-        (columns.size, "SIZE", Align::Center),
+    let cells = model_card_column_rects(content_rect, columns);
+    for (rect, label, alignment) in [
+        (cells.identity, "MODEL", Align::LEFT),
+        (cells.languages, "LANGUAGES", Align::Center),
+        (cells.speed, "SPEED", Align::Center),
+        (cells.accuracy, "ACCURACY", Align::Center),
+        (cells.size, "SIZE", Align::Center),
     ] {
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(left, content_rect.top()),
-            Vec2::new(width, content_rect.height()),
-        );
         render_model_column_header_cell(ui, rect, label, alignment);
-        left += width;
     }
 }
 
@@ -1840,6 +1894,89 @@ fn rating_meter(
     );
 }
 
+/// Paint a rating inside an already allocated model-grid cell. The row grid is
+/// absolute, so the meter must not allocate from a parent flow layout: doing
+/// so lets its label consume width intended for the next logical column.
+fn rating_meter_in_rect(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    name: &str,
+    rating: Option<(u8, &'static str)>,
+    show_label: bool,
+) {
+    let colors = ui_palette(ui);
+    let label = rating.map_or("Not rated", |(_, label)| label);
+    let content_width = MODEL_RATING_METER_WIDTH
+        + if show_label {
+            MODEL_RATING_GAP + MODEL_RATING_LABEL_WIDTH
+        } else {
+            0.0
+        };
+    let meter_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - content_width / 2.0, rect.center().y - 9.0),
+        Vec2::new(MODEL_RATING_METER_WIDTH, 18.0),
+    );
+    let response = ui.interact(rect, id, Sense::hover());
+    let painter = ui.painter().with_clip_rect(rect);
+    let filled = rating.map_or(0, |(value, _)| value.min(5));
+    for index in 0..5 {
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(
+                meter_rect.left() + index as f32 * 12.0,
+                meter_rect.center().y - 3.5,
+            ),
+            Vec2::new(9.0, 7.0),
+        );
+        painter.rect_filled(
+            segment,
+            Rounding::same(3.5),
+            if index < filled as usize {
+                colors.primary
+            } else {
+                colors.disabled_bg
+            },
+        );
+    }
+    if show_label {
+        let label_rect = egui::Rect::from_min_max(
+            egui::pos2(meter_rect.right() + MODEL_RATING_GAP, rect.top()),
+            rect.right_bottom(),
+        );
+        painter.text(
+            label_rect.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            colors.muted_text,
+        );
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("{name}: {label}"))
+    });
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name(format!("{name}: {label}"));
+        builder.set_bounds(accesskit_rect(rect));
+    });
+}
+
+fn render_model_grid_label(ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id, text: &str) {
+    let colors = ui_palette(ui);
+    let response = ui.interact(rect, id, Sense::hover());
+    ui.painter().with_clip_rect(rect).text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(12.0),
+        colors.muted_text,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, text));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name(text);
+        builder.set_bounds(accesskit_rect(rect));
+    });
+}
+
 fn model_row_description(card: ModelCard<'_>) -> String {
     match card {
         ModelCard::Local(model)
@@ -2042,12 +2179,6 @@ fn render_model_card(
     let requested_focus = focus_card.is_some_and(|key| card.matches_key(key));
     let mut action = ScreenAction::None;
     let primary_has_focus;
-    let mut content_ui = ui.child_ui(
-        model_card_content_rect(card_rect),
-        Layout::left_to_right(Align::Center),
-    );
-    content_ui.set_clip_rect(card_rect.shrink(1.0));
-
     let details_name = match card {
         ModelCard::Local(model) => format!("Details for {}", model.display_name),
         ModelCard::Remote(entry, _) => format!("Details for {}", entry.display_name),
@@ -2162,106 +2293,83 @@ fn render_model_card(
 
     let wide = width >= 1_100.0;
     if let Some(columns) = model_card_column_layout(width) {
-        // Each track is explicitly allocated with no inter-item gap. The same
-        // layout is used for the column header, so card content cannot move a
-        // subsequent column horizontally.
-        content_ui.spacing_mut().item_spacing.x = 0.0;
-        content_ui.allocate_ui_with_layout(
-            Vec2::new(columns.identity, 56.0),
-            Layout::top_down(Align::LEFT),
-            |ui| render_model_identity(ui, card, &description),
+        // Render into fixed physical cells rather than flowing child widgets.
+        // This is deliberately shared with the header splitter above: neither
+        // a long language summary nor a rating label can shift any later cell.
+        let cells = model_card_column_rects(model_card_content_rect(card_rect), columns);
+        let mut identity_ui = ui.child_ui(cells.identity, Layout::top_down(Align::LEFT));
+        identity_ui.set_clip_rect(model_card_cell_clip_rect(card_rect, cells.identity));
+        render_model_identity(&mut identity_ui, card, &description);
+
+        let languages = match card {
+            ModelCard::Local(model) => &model.languages,
+            ModelCard::Remote(entry, _) => &entry.languages,
+        };
+        render_model_grid_label(
+            ui,
+            cells.languages,
+            ui.make_persistent_id(("model-card-language", &card_key)),
+            &formatted_language_summary(languages),
         );
-        content_ui.allocate_ui_with_layout(
-            Vec2::new(columns.languages, 56.0),
-            Layout::top_down(Align::Center),
-            |ui| {
-                let languages = match card {
-                    ModelCard::Local(model) => &model.languages,
-                    ModelCard::Remote(entry, _) => &entry.languages,
-                };
-                ui.add_space(17.0);
-                ui.label(
-                    RichText::new(formatted_language_summary(languages))
-                        .small()
-                        .color(colors.muted_text),
-                );
-            },
+        let speed = match card {
+            ModelCard::Local(model) => speed_rating(model.speed_tier),
+            ModelCard::Remote(_, _) => None,
+        };
+        rating_meter_in_rect(
+            ui,
+            ui.make_persistent_id(("model-card-speed", &card_key)),
+            cells.speed,
+            "Speed",
+            speed,
+            wide,
         );
-        content_ui.allocate_ui_with_layout(
-            Vec2::new(columns.speed, 56.0),
-            Layout::top_down(Align::Center),
-            |ui| {
-                ui.add_space(17.0);
-                let rating = match card {
-                    ModelCard::Local(model) => speed_rating(model.speed_tier),
-                    ModelCard::Remote(_, _) => None,
-                };
-                rating_meter(ui, "Speed", rating, wide);
-            },
+        let accuracy = match card {
+            ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
+            ModelCard::Remote(_, _) => None,
+        };
+        rating_meter_in_rect(
+            ui,
+            ui.make_persistent_id(("model-card-accuracy", &card_key)),
+            cells.accuracy,
+            "Accuracy",
+            accuracy,
+            wide,
         );
-        content_ui.allocate_ui_with_layout(
-            Vec2::new(columns.accuracy, 56.0),
-            Layout::top_down(Align::Center),
-            |ui| {
-                ui.add_space(17.0);
-                let rating = match card {
-                    ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
-                    ModelCard::Remote(_, _) => None,
-                };
-                rating_meter(ui, "Accuracy", rating, wide);
-            },
+        let size = match card {
+            ModelCard::Local(model) => model
+                .total_bytes
+                .or(model.disk_bytes)
+                .map_or_else(|| "Unknown".to_owned(), format_bytes),
+            ModelCard::Remote(_, variant) => variant.size_label.clone(),
+        };
+        render_model_grid_label(
+            ui,
+            cells.size,
+            ui.make_persistent_id(("model-card-size", &card_key)),
+            &size,
         );
-        content_ui.allocate_ui_with_layout(
-            Vec2::new(columns.size, 56.0),
-            Layout::top_down(Align::Center),
-            |ui| {
-                ui.add_space(18.0);
-                let size = match card {
-                    ModelCard::Local(model) => model
-                        .total_bytes
-                        .or(model.disk_bytes)
-                        .map_or_else(|| "Unknown".to_owned(), format_bytes),
-                    ModelCard::Remote(_, variant) => variant.size_label.clone(),
-                };
-                ui.label(RichText::new(size).small().color(colors.muted_text));
-            },
-        );
-        let details = content_ui
+
+        let mut details_ui = ui.child_ui(cells.details, Layout::top_down(Align::Center));
+        details_ui.set_clip_rect(model_card_cell_clip_rect(card_rect, cells.details));
+        details_ui.add_space((cells.details.height() - 44.0).max(0.0) / 2.0);
+        let details = details_ui
             .push_id(("model-card-details", &card_key), |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(columns.details, 44.0),
-                    Layout::top_down(Align::Center),
-                    |ui| {
-                        compact_model_icon_action(
-                            ui,
-                            Icon::ChevronRight,
-                            &details_name,
-                            true,
-                            None,
-                            None,
-                        )
-                    },
-                )
-                .inner
+                compact_model_icon_action(ui, Icon::ChevronRight, &details_name, true, None, None)
             })
             .inner;
-        let row = content_ui
+        let mut action_ui = ui.child_ui(cells.action, Layout::top_down(Align::Center));
+        action_ui.set_clip_rect(model_card_cell_clip_rect(card_rect, cells.action));
+        action_ui.add_space((cells.action.height() - 44.0).max(0.0) / 2.0);
+        let row = action_ui
             .push_id(("model-card-action", &card_key), |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(columns.action, 44.0),
-                    Layout::top_down(Align::Center),
-                    |ui| {
-                        compact_model_icon_action(
-                            ui,
-                            row_icon,
-                            &row_name,
-                            row_enabled,
-                            row_reason,
-                            row_progress,
-                        )
-                    },
+                compact_model_icon_action(
+                    ui,
+                    row_icon,
+                    &row_name,
+                    row_enabled,
+                    row_reason,
+                    row_progress,
                 )
-                .inner
             })
             .inner;
         if details.clicked() {
@@ -2272,7 +2380,7 @@ fn render_model_card(
         }
         if requested_focus {
             details.request_focus();
-            scroll_focused_control_into_view(&content_ui, &details);
+            scroll_focused_control_into_view(&details_ui, &details);
         }
         primary_has_focus = details.has_focus() || row.has_focus();
         if primary_has_focus {
@@ -3694,21 +3802,88 @@ fn drawer_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egu
     ui.add_space(14.0);
 }
 
+fn drawer_model_icon(ui: &mut egui::Ui) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+    let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(40.0));
+    let colors = ui_palette(ui);
+    ui.painter()
+        .rect_filled(visual, Rounding::same(10.0), colors.panel_bg);
+    ui.painter().text(
+        visual.center(),
+        Align2::CENTER_CENTER,
+        icon_glyph(Icon::Waveform),
+        egui::FontId::proportional(22.0),
+        colors.primary,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, "Model"));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name("Model");
+        builder.set_bounds(accesskit_rect(rect));
+    });
+}
+
 fn drawer_stat(ui: &mut egui::Ui, label: &str, value: &str, success: bool) {
     let colors = ui_palette(ui);
-    Frame::none()
-        .fill(colors.panel_bg)
-        .stroke(Stroke::new(1.0, colors.border))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::same(10.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(label).small().color(colors.muted_text));
-            ui.label(RichText::new(value).small().strong().color(if success {
-                colors.success_text
-            } else {
-                colors.text
-            }));
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), DETAILS_DRAWER_STAT_HEIGHT),
+        Sense::hover(),
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect(
+        rect,
+        Rounding::same(8.0),
+        colors.panel_bg,
+        Stroke::new(1.0, colors.border),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 12.0, rect.top() + 18.0),
+        Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        colors.muted_text,
+    );
+    painter.text(
+        egui::pos2(rect.left() + 12.0, rect.bottom() - 20.0),
+        Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(13.0),
+        if success {
+            colors.success_text
+        } else {
+            colors.text
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("{label}: {value}"))
+    });
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_name(format!("{label}: {value}"));
+        builder.set_bounds(accesskit_rect(rect));
+    });
+}
+
+fn drawer_stat_row(
+    ui: &mut egui::Ui,
+    first: (&str, &str, bool),
+    second: Option<(&str, &str, bool)>,
+) {
+    if let Some(second) = second {
+        let width = ((ui.available_width() - ui.spacing().item_spacing.x).max(0.0) / 2.0).floor();
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, DETAILS_DRAWER_STAT_HEIGHT),
+                Layout::top_down(Align::LEFT),
+                |ui| drawer_stat(ui, first.0, first.1, first.2),
+            );
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, DETAILS_DRAWER_STAT_HEIGHT),
+                Layout::top_down(Align::LEFT),
+                |ui| drawer_stat(ui, second.0, second.1, second.2),
+            );
         });
+    } else {
+        drawer_stat(ui, first.0, first.1, first.2);
+    }
 }
 
 fn show_local_model_details_drawer(
@@ -3748,7 +3923,9 @@ fn show_local_model_details_drawer(
                         drawer_ui.set_width(layout.content_width);
                         drawer_ui.set_min_height(layout.content_height);
                         drawer_ui.horizontal(|ui| {
-                            let text_width = (ui.available_width() - 44.0).max(0.0);
+                            drawer_model_icon(ui);
+                            let text_width =
+                                (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(0.0);
                             ui.allocate_ui_with_layout(
                                 Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
                                 Layout::top_down(Align::LEFT),
@@ -3793,52 +3970,89 @@ fn show_local_model_details_drawer(
                                 });
                                 ui.separator();
                                 drawer_section(ui, "Performance & requirements", |ui| {
+                                    let speed = speed_rating(model.speed_tier)
+                                        .map_or("Not rated", |(_, label)| label);
+                                    let accuracy = accuracy_rating(&model.accuracy_guidance)
+                                        .map_or("Not rated", |(_, label)| label);
+                                    drawer_stat_row(
+                                        ui,
+                                        ("Speed", speed, false),
+                                        (!compact_stats).then_some(("Accuracy", accuracy, false)),
+                                    );
                                     if compact_stats {
-                                        ui.vertical(|ui| {
-                                            drawer_stat(ui, "Speed", speed_rating(model.speed_tier).map_or("Not rated", |(_, label)| label), false);
-                                            drawer_stat(ui, "Accuracy", accuracy_rating(&model.accuracy_guidance).map_or("Not rated", |(_, label)| label), false);
-                                        });
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            drawer_stat(ui, "Speed", speed_rating(model.speed_tier).map_or("Not rated", |(_, label)| label), false);
-                                            drawer_stat(ui, "Accuracy", accuracy_rating(&model.accuracy_guidance).map_or("Not rated", |(_, label)| label), false);
-                                        });
+                                        drawer_stat_row(ui, ("Accuracy", accuracy, false), None);
                                     }
-                                    if model.total_bytes.is_some() || model.disk_bytes.is_some() || model.estimated_ram_bytes.is_some() {
-                                        if compact_stats {
-                                            ui.vertical(|ui| {
-                                                if let Some(size) = model.total_bytes.or(model.disk_bytes) {
-                                                    drawer_stat(ui, "Download size", &format_bytes(size), false);
-                                                }
-                                                if let Some(memory) = model.estimated_ram_bytes {
-                                                    drawer_stat(ui, "Estimated memory", &format_bytes(memory), false);
-                                                }
-                                            });
-                                        } else {
-                                            ui.horizontal(|ui| {
-                                                if let Some(size) = model.total_bytes.or(model.disk_bytes) {
-                                                    drawer_stat(ui, "Download size", &format_bytes(size), false);
-                                                }
-                                                if let Some(memory) = model.estimated_ram_bytes {
-                                                    drawer_stat(ui, "Estimated memory", &format_bytes(memory), false);
-                                                }
-                                            });
+
+                                    let size = model
+                                        .total_bytes
+                                        .or(model.disk_bytes)
+                                        .map(format_bytes);
+                                    let memory = model.estimated_ram_bytes.map(format_bytes);
+                                    match (size.as_deref(), memory.as_deref()) {
+                                        (Some(size), Some(memory)) if !compact_stats => {
+                                            drawer_stat_row(
+                                                ui,
+                                                ("Download size", size, false),
+                                                Some(("Estimated memory", memory, false)),
+                                            );
                                         }
+                                        (Some(size), _) => {
+                                            drawer_stat_row(ui, ("Download size", size, false), None);
+                                            if let Some(memory) = memory.as_deref() {
+                                                drawer_stat_row(
+                                                    ui,
+                                                    ("Estimated memory", memory, false),
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        (None, Some(memory)) => drawer_stat_row(
+                                            ui,
+                                            ("Estimated memory", memory, false),
+                                            None,
+                                        ),
+                                        (None, None) => {}
                                     }
+
+                                    let acceleration = acceleration_label(model.capabilities);
                                     if compact_stats {
-                                        ui.vertical(|ui| {
-                                            if let Some(acceleration) = acceleration_label(model.capabilities) {
-                                                drawer_stat(ui, "Acceleration", acceleration, false);
-                                            }
-                                            drawer_stat(ui, "Compatibility", &model.runtime_status_label, model.ready);
-                                        });
+                                        if let Some(acceleration) = acceleration {
+                                            drawer_stat_row(
+                                                ui,
+                                                ("Acceleration", acceleration, false),
+                                                None,
+                                            );
+                                        }
+                                        drawer_stat_row(
+                                            ui,
+                                            (
+                                                "Compatibility",
+                                                &model.runtime_status_label,
+                                                model.ready,
+                                            ),
+                                            None,
+                                        );
                                     } else {
-                                        ui.horizontal(|ui| {
-                                            if let Some(acceleration) = acceleration_label(model.capabilities) {
-                                                drawer_stat(ui, "Acceleration", acceleration, false);
-                                            }
-                                            drawer_stat(ui, "Compatibility", &model.runtime_status_label, model.ready);
-                                        });
+                                        match acceleration {
+                                            Some(acceleration) => drawer_stat_row(
+                                                ui,
+                                                ("Acceleration", acceleration, false),
+                                                Some((
+                                                    "Compatibility",
+                                                    &model.runtime_status_label,
+                                                    model.ready,
+                                                )),
+                                            ),
+                                            None => drawer_stat_row(
+                                                ui,
+                                                (
+                                                    "Compatibility",
+                                                    &model.runtime_status_label,
+                                                    model.ready,
+                                                ),
+                                                None,
+                                            ),
+                                        }
                                     }
                                 });
                                 ui.separator();
@@ -3995,7 +4209,9 @@ fn show_remote_model_details_drawer(
                     drawer_ui.set_width(layout.content_width);
                     drawer_ui.set_min_height(layout.content_height);
                     drawer_ui.horizontal(|ui| {
-                        let text_width = (ui.available_width() - 44.0).max(0.0);
+                        drawer_model_icon(ui);
+                        let text_width =
+                            (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(0.0);
                         ui.allocate_ui_with_layout(
                             Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
                             Layout::top_down(Align::LEFT),
@@ -4047,32 +4263,25 @@ fn show_remote_model_details_drawer(
                             });
                             ui.separator();
                             drawer_section(ui, "Performance & requirements", |ui| {
+                                drawer_stat_row(
+                                    ui,
+                                    ("Speed", "Not rated", false),
+                                    (!compact_stats).then_some(("Accuracy", "Not rated", false)),
+                                );
                                 if compact_stats {
-                                    ui.vertical(|ui| {
-                                        drawer_stat(ui, "Speed", "Not rated", false);
-                                        drawer_stat(ui, "Accuracy", "Not rated", false);
-                                        drawer_stat(
-                                            ui,
-                                            "Download size",
-                                            &variant.size_label,
-                                            false,
-                                        );
-                                    });
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        drawer_stat(ui, "Speed", "Not rated", false);
-                                        drawer_stat(ui, "Accuracy", "Not rated", false);
-                                    });
-                                    drawer_stat(ui, "Download size", &variant.size_label, false);
+                                    drawer_stat_row(ui, ("Accuracy", "Not rated", false), None);
                                 }
+                                drawer_stat_row(
+                                    ui,
+                                    ("Download size", &variant.size_label, false),
+                                    None,
+                                );
                                 if !entry.compatibility_detail.trim().is_empty() {
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new("Compatibility")
-                                            .small()
-                                            .color(ui_palette(ui).muted_text),
+                                    drawer_stat_row(
+                                        ui,
+                                        ("Compatibility", &entry.compatibility_detail, false),
+                                        None,
                                     );
-                                    ui.label(RichText::new(&entry.compatibility_detail).small());
                                 }
                             });
                             ui.separator();
@@ -4778,6 +4987,7 @@ fn radio_control(
     label: &str,
     checked: bool,
     width: f32,
+    selected_text: egui::Color32,
 ) -> egui::Response {
     let colors = ui_palette(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 44.0), egui::Sense::hover());
@@ -4786,7 +4996,7 @@ fn radio_control(
         ui.make_persistent_id(("recording-mode", mode)),
         egui::Sense::click(),
     );
-    let visual = rect.shrink2(Vec2::new(3.0, 4.0));
+    let visual = rect.shrink2(Vec2::new(4.0, 6.0));
     if checked {
         ui.painter()
             .rect_filled(visual, Rounding::same(18.0), colors.card_bg);
@@ -4803,7 +5013,7 @@ fn radio_control(
         label,
         egui::FontId::proportional(14.0),
         if checked {
-            colors.accent
+            selected_text
         } else {
             colors.primary_button_text
         },
@@ -4818,7 +5028,7 @@ fn radio_control(
             egui::accesskit::Checked::False
         });
     });
-    paint_focus_ring(ui, &response, Rounding::same(20.0));
+    paint_focus_ring(ui, &response, Rounding::same(18.0));
     response
 }
 
@@ -4828,12 +5038,20 @@ fn recording_mode_toggle(
 ) -> Vec<(RecordingMode, egui::Response)> {
     const TOGGLE_WIDTH: f32 = 232.0;
     const TOGGLE_HEIGHT: f32 = 44.0;
+    const TOGGLE_VISUAL_HEIGHT: f32 = 36.0;
 
-    let colors = ui_palette(ui);
     let (track_rect, _) =
         ui.allocate_exact_size(Vec2::new(TOGGLE_WIDTH, TOGGLE_HEIGHT), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(track_rect, Rounding::same(22.0), colors.accent);
+    let track_visual_rect = egui::Rect::from_center_size(
+        track_rect.center(),
+        Vec2::new(TOGGLE_WIDTH, TOGGLE_VISUAL_HEIGHT),
+    );
+    let colors = ui_palette(ui);
+    ui.painter().rect_filled(
+        track_visual_rect,
+        Rounding::same(18.0),
+        colors.segmented_control_bg,
+    );
     let mut toggle_ui = ui.child_ui(track_rect, Layout::left_to_right(Align::Center));
     toggle_ui.spacing_mut().item_spacing.x = 0.0;
     [
@@ -4850,6 +5068,7 @@ fn recording_mode_toggle(
                 label,
                 selected == mode,
                 TOGGLE_WIDTH / 2.0,
+                colors.segmented_control_selected_text,
             ),
         )
     })
@@ -6184,6 +6403,84 @@ mod tests {
         assert_eq!(wide.accuracy, 175.0);
         assert_eq!(wide.size, 100.0);
         assert!(model_card_column_layout(759.0).is_none());
+    }
+
+    #[test]
+    fn model_card_cell_rects_share_the_header_column_centers() {
+        for width in [760.0, 960.0, 1_180.0, 1_476.0] {
+            let columns = model_card_column_layout(width).expect("desktop grid width");
+            let header = model_card_column_rects(
+                egui::Rect::from_min_size(
+                    egui::pos2(MODEL_CARD_HORIZONTAL_INSET, 0.0),
+                    Vec2::new(width - MODEL_CARD_HORIZONTAL_INSET * 2.0, 16.0),
+                ),
+                columns,
+            );
+            let row = model_card_column_rects(
+                model_card_content_rect(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, MODEL_CARD_HEIGHT),
+                )),
+                columns,
+            );
+            for (header_cell, row_cell) in [
+                (header.identity, row.identity),
+                (header.languages, row.languages),
+                (header.speed, row.speed),
+                (header.accuracy, row.accuracy),
+                (header.size, row.size),
+                (header.details, row.details),
+                (header.action, row.action),
+            ] {
+                assert!((header_cell.left() - row_cell.left()).abs() < f32::EPSILON);
+                assert!((header_cell.right() - row_cell.right()).abs() < f32::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn long_model_identity_content_is_clipped_to_its_fixed_column() {
+        let width = 1_180.0;
+        let card_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, MODEL_CARD_HEIGHT));
+        let columns = model_card_column_layout(width).expect("desktop grid width");
+        let identity =
+            model_card_column_rects(model_card_content_rect(card_rect), columns).identity;
+        let expected_clip = model_card_cell_clip_rect(card_rect, identity);
+        let model = ModelViewModel {
+            display_name: "Whisper model with a deliberately very long identity that must not draw over Languages".into(),
+            description: Some("A deliberately long purpose description that must remain inside the Model cell.".into()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 160.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut identity_ui = ui.child_ui(identity, Layout::top_down(Align::LEFT));
+                    identity_ui.set_clip_rect(expected_clip);
+                    render_model_identity(
+                        &mut identity_ui,
+                        ModelCard::Local(&model),
+                        model.description.as_deref().unwrap_or_default(),
+                    );
+                });
+            },
+        );
+        assert!(output.shapes.iter().any(|shape| {
+            shape.clip_rect == expected_clip
+                && shape.shape.visual_bounding_rect().intersects(expected_clip)
+        }));
+        assert!(output.shapes.iter().all(|shape| {
+            shape.clip_rect != expected_clip
+                || shape.clip_rect.right() <= identity.right() + f32::EPSILON
+        }));
     }
 
     #[test]

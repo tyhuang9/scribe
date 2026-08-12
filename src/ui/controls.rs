@@ -6,7 +6,7 @@ use eframe::egui::{
 use super::theme::ui_palette;
 
 const PRIMARY_TARGET_HEIGHT: f32 = 44.0;
-const COMPACT_BUTTON_HEIGHT: f32 = 36.0;
+const COMPACT_BUTTON_HEIGHT: f32 = 32.0;
 const KEYCAP_VERTICAL_PADDING: f32 = 7.0;
 
 pub(crate) fn minimum_primary_target_height() -> f32 {
