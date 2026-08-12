@@ -21,12 +21,6 @@ enum ModelArchitecture {
     EncoderDecoder,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelFormat {
-    Ggml,
-    Gguf,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeVersion {
     pub(crate) major: u16,
@@ -116,7 +110,6 @@ struct ModelManifest {
     recommended: bool,
     runtime: RuntimeRequirement,
     architecture: ModelArchitecture,
-    format: ModelFormat,
     minimum_runtime_version: RuntimeVersion,
     artifact: ArtifactManifest,
     legacy_ggml_artifact: Option<ArtifactManifest>,
@@ -372,7 +365,6 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
         accuracy_guidance: "Basic",
         runtime: RuntimeRequirement::PrimaryNative,
         architecture: ModelArchitecture::EncoderDecoder,
-        format: ModelFormat::Gguf,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
         artifact: ArtifactManifest {
             repository: "handy-computer/whisper-tiny.en-gguf",
@@ -417,7 +409,6 @@ const fn whisper_manifest(
         recommended,
         runtime: RuntimeRequirement::PrimaryNative,
         architecture: ModelArchitecture::EncoderDecoder,
-        format: ModelFormat::Gguf,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
         artifact,
         legacy_ggml_artifact: Some(legacy_ggml_artifact),
@@ -441,11 +432,7 @@ pub fn model_descriptors() -> Vec<ModelDescriptor> {
 /// are retained only to resolve existing installations, never as new installs.
 pub fn normal_model_descriptors() -> Vec<ModelDescriptor> {
     assert_catalog_valid();
-    MODELS
-        .iter()
-        .filter(|manifest| manifest.format == ModelFormat::Gguf)
-        .map(ModelManifest::descriptor)
-        .collect()
+    MODELS.iter().map(ModelManifest::descriptor).collect()
 }
 
 pub fn model_descriptor(id: &ModelId) -> Option<ModelDescriptor> {
@@ -477,14 +464,10 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
         })
 }
 
-/// Keeps the file-format-to-runtime routing decision inside catalog
-/// validation, rather than leaking it into application or installer code.
+/// Every normalized catalog artifact is loaded by the embedded runtime.
 pub(crate) fn model_uses_embedded_runtime(id: &ModelId) -> bool {
     assert_catalog_valid();
-    MODELS
-        .iter()
-        .find(|manifest| manifest.id == id.as_str())
-        .is_some_and(|manifest| manifest.format == ModelFormat::Gguf)
+    MODELS.iter().any(|manifest| manifest.id == id.as_str())
 }
 
 /// Resolves a remote artifact to an existing normalized catalog entry only

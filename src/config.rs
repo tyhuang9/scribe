@@ -359,12 +359,18 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             let configured_path = config.general.model_paths.get(&model.id).cloned();
             let managed_path = managed_model_path(config, &model);
             let downloaded_path = downloaded_model_path(config, &model);
+            let legacy_downloaded_path = legacy_downloaded_model_path(config, &model);
             let explicit_path =
                 first_non_empty_path([managed_path.clone(), configured_path.clone()]);
-            let mut candidate_paths = [downloaded_path, managed_path, configured_path]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let mut candidate_paths = [
+                downloaded_path,
+                managed_path,
+                configured_path,
+                legacy_downloaded_path,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
             dedup_paths_preserving_order(&mut candidate_paths);
 
             let installed_path = first_valid_model_path(&model, candidate_paths.iter().cloned());
@@ -696,6 +702,31 @@ pub fn downloaded_model_path(config: &AppConfig, model: &SttModelInfo) -> Option
         })
 }
 
+/// Legacy GGML files remain readable for the same logical model ID. New
+/// installs never target this path; it is a fallback until a verified GGUF
+/// activation commits the primary destination.
+pub(crate) fn legacy_downloaded_model_path(
+    config: &AppConfig,
+    model: &SttModelInfo,
+) -> Option<PathBuf> {
+    crate::model_catalog::runtime_model_manifest(&crate::transcription::ModelId::new(&model.id))
+        .and_then(|manifest| manifest.legacy_ggml_filename)
+        .map(|filename| model_storage_dir(config).join("whisper.cpp").join(filename))
+}
+
+/// Reports whether a stable catalog ID still resolves to its retained GGML
+/// compatibility artifact instead of the pinned GGUF destination. Callers use
+/// this as a migration contract only; it does not alter settings or files.
+pub(crate) fn model_needs_pinned_gguf_migration(config: &AppConfig, model: &SttModelInfo) -> bool {
+    let Some(primary) = downloaded_model_path(config, model) else {
+        return false;
+    };
+    let Some(legacy) = legacy_downloaded_model_path(config, model) else {
+        return false;
+    };
+    model.local_path.as_deref() == Some(legacy.as_path()) && legacy != primary
+}
+
 pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
     config
         .general
@@ -840,18 +871,28 @@ fn apply_managed_model_metadata(config: &mut AppConfig) {
     let expected_paths = default_model_catalog()
         .into_iter()
         .filter_map(|model| {
-            downloaded_model_path(config, &model).map(|path| (model.id.clone(), path))
+            downloaded_model_path(config, &model).map(|path| {
+                let mut paths = vec![path];
+                if let Some(legacy_path) = legacy_downloaded_model_path(config, &model) {
+                    paths.push(legacy_path);
+                }
+                (model.id.clone(), paths)
+            })
         })
         .collect::<HashMap<_, _>>();
     let storage_dir = model_storage_dir(config);
     config.general.managed_models.retain(|id, install| {
-        expected_paths.get(id) == Some(&install.path)
+        expected_paths
+            .get(id)
+            .is_some_and(|paths| paths.contains(&install.path))
             && safe_managed_model_path(&storage_dir, &install.path)
     });
 
     for (id, path) in &config.general.model_paths {
         if path.exists()
-            && expected_paths.get(id) == Some(path)
+            && expected_paths
+                .get(id)
+                .is_some_and(|paths| paths.contains(path))
             && safe_managed_model_path(&storage_dir, path)
         {
             config
@@ -1483,6 +1524,10 @@ mod tests {
 
         assert_eq!(
             downloaded_model_path(&config, &model).unwrap(),
+            PathBuf::from("/tmp/scribe-models/gguf/whisper-base.en-Q8_0.gguf")
+        );
+        assert_eq!(
+            legacy_downloaded_model_path(&config, &model).unwrap(),
             PathBuf::from("/tmp/scribe-models/whisper.cpp/ggml-base.en.bin")
         );
 
@@ -1495,6 +1540,103 @@ mod tests {
             downloaded_model_path(&config, &faster_model).unwrap(),
             PathBuf::from("/tmp/scribe-models/faster-whisper/faster_whisper_tiny_en")
         );
+    }
+
+    #[test]
+    fn legacy_ggml_falls_back_until_the_pinned_gguf_is_activated() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-gguf-migration-paths-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut config = AppConfig {
+            general: GeneralSettings {
+                model_storage_dir: root.clone(),
+                selected_default_model: "whisper_cpp_base_en".to_owned(),
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let model = default_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .unwrap();
+        let legacy = legacy_downloaded_model_path(&config, &model).unwrap();
+        let primary = downloaded_model_path(&config, &model).unwrap();
+        let staged = primary.with_extension("gguf.part");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        fs::write(&staged, b"unactivated GGUF partial").unwrap();
+
+        normalize_config(&mut config);
+        let before_activation = selected_model(&config).unwrap();
+        assert_eq!(before_activation.id, "whisper_cpp_base_en");
+        assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+        assert_eq!(
+            before_activation.local_path.as_deref(),
+            Some(legacy.as_path())
+        );
+        assert!(model_needs_pinned_gguf_migration(
+            &config,
+            &before_activation
+        ));
+
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::rename(&staged, &primary).unwrap();
+        normalize_config(&mut config);
+        let after_activation = selected_model(&config).unwrap();
+        assert_eq!(after_activation.id, "whisper_cpp_base_en");
+        assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+        assert_eq!(
+            after_activation.local_path.as_deref(),
+            Some(primary.as_path())
+        );
+        assert!(!model_needs_pinned_gguf_migration(
+            &config,
+            &after_activation
+        ));
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy GGML");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_ggml_managed_path_is_retained_without_becoming_a_new_install_destination() {
+        let root =
+            std::env::temp_dir().join(format!("scribe-gguf-legacy-managed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let legacy = root.join("whisper.cpp").join("ggml-small.en.bin");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        let mut config = AppConfig {
+            general: GeneralSettings {
+                model_storage_dir: root.clone(),
+                selected_default_model: "whisper_cpp_small_en".to_owned(),
+                managed_models: HashMap::from([(
+                    "whisper_cpp_small_en".to_owned(),
+                    ManagedModelInstall::app_managed(legacy.clone(), "legacy-ggml"),
+                )]),
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+
+        normalize_config(&mut config);
+        let model = selected_model(&config).unwrap();
+        assert_eq!(model.id, "whisper_cpp_small_en");
+        assert_eq!(model.local_path.as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            downloaded_model_path(&config, &model).unwrap(),
+            root.join("gguf").join("whisper-small.en-Q8_0.gguf")
+        );
+        assert_eq!(
+            managed_model_path(&config, &model).as_deref(),
+            Some(legacy.as_path())
+        );
+        assert!(legacy.is_file());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
