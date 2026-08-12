@@ -10,10 +10,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::model_catalog::runtime_model_manifest;
 use crate::models::{ModelInstallStatus, SttModelInfo, default_model_catalog};
 use crate::runtime_catalog;
 #[cfg(test)]
 use crate::transcription::AccelerationPreference;
+use crate::transcription::ModelId;
 
 #[path = "settings/mod.rs"]
 pub mod settings;
@@ -362,15 +364,14 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
             let legacy_downloaded_path = legacy_downloaded_model_path(config, &model);
             let explicit_path =
                 first_non_empty_path([managed_path.clone(), configured_path.clone()]);
-            let mut candidate_paths = [
+            let mut candidate_paths = built_in_model_candidate_paths(
+                config,
+                &model,
                 downloaded_path,
                 managed_path,
                 configured_path,
                 legacy_downloaded_path,
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+            );
             dedup_paths_preserving_order(&mut candidate_paths);
 
             let installed_path = first_valid_model_path(&model, candidate_paths.iter().cloned());
@@ -409,6 +410,87 @@ pub fn configured_models(config: &AppConfig) -> Vec<SttModelInfo> {
     imported_gguf_models.sort_by(|left, right| left.id.cmp(&right.id));
     models.extend(imported_gguf_models);
     models
+}
+
+fn built_in_model_candidate_paths(
+    config: &AppConfig,
+    model: &SttModelInfo,
+    primary: Option<PathBuf>,
+    managed: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    legacy: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let Some(manifest) = runtime_model_manifest(&ModelId::new(model.id.clone())) else {
+        return [primary, managed, configured, legacy]
+            .into_iter()
+            .flatten()
+            .collect();
+    };
+    let Some(legacy_artifact) = manifest.legacy_ggml_artifact else {
+        return [primary, managed, configured, legacy]
+            .into_iter()
+            .flatten()
+            .collect();
+    };
+    let is_primary = |path: &Path| {
+        path.file_name().and_then(|name| name.to_str()) == Some(manifest.artifact_filename)
+    };
+    let is_legacy = |path: &Path| {
+        path.file_name().and_then(|name| name.to_str()) == Some(legacy_artifact.filename)
+    };
+    let valid_legacy_exists = [managed.as_ref(), configured.as_ref(), legacy.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|path| is_legacy(path) && is_valid_model_install_path(model, path));
+    if !valid_legacy_exists {
+        return [primary, managed, configured, legacy]
+            .into_iter()
+            .flatten()
+            .collect();
+    }
+
+    // An explicit persisted primary path remains authoritative for external
+    // configurations; runtime loading still verifies its pinned size/SHA.
+    if configured.as_deref().is_some_and(is_primary) {
+        return [configured, managed, primary, legacy]
+            .into_iter()
+            .flatten()
+            .collect();
+    }
+
+    // Normalized installs persist this record only after the activation
+    // journal has activated the verified artifact and prepared the atomic
+    // settings commit. Mere primary-file existence must not displace legacy.
+    let verified_managed_primary =
+        config
+            .general
+            .managed_models
+            .get(&model.id)
+            .is_some_and(|install| {
+                managed.as_ref().is_some_and(|path| is_primary(path))
+                    && install.source.as_deref() == Some("verified-manifest-download")
+                    && install
+                        .sha256
+                        .as_deref()
+                        .is_some_and(|sha256| sha256.eq_ignore_ascii_case(manifest.artifact_sha256))
+            });
+    if verified_managed_primary {
+        [managed, primary, configured, legacy]
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        let candidates = [managed, configured, legacy, primary]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        candidates
+            .iter()
+            .filter(|path| !is_primary(path))
+            .chain(candidates.iter().filter(|path| is_primary(path)))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Stable opaque IDs ensure a catalog display name or filename cannot be used
@@ -1572,11 +1654,14 @@ mod tests {
             .unwrap();
         let legacy = legacy_downloaded_model_path(&config, &model).unwrap();
         let primary = downloaded_model_path(&config, &model).unwrap();
-        let staged = primary.with_extension("gguf.part");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
         fs::write(&legacy, b"legacy GGML").unwrap();
-        fs::write(&staged, b"unactivated GGUF partial").unwrap();
+        fs::write(&primary, b"unactivated or corrupt GGUF").unwrap();
+        config
+            .general
+            .model_paths
+            .insert(model.id.clone(), legacy.clone());
 
         normalize_config(&mut config);
         let before_activation = selected_model(&config).unwrap();
@@ -1591,8 +1676,31 @@ mod tests {
             &before_activation
         ));
 
-        fs::create_dir_all(primary.parent().unwrap()).unwrap();
-        fs::rename(&staged, &primary).unwrap();
+        let manifest = runtime_model_manifest(&ModelId::new(model.id.clone())).unwrap();
+        let mut untrusted_primary =
+            ManagedModelInstall::app_managed(primary.clone(), "verified-manifest-download");
+        untrusted_primary.sha256 = Some("0".repeat(64));
+        config
+            .general
+            .managed_models
+            .insert(model.id.clone(), untrusted_primary);
+        let mismatched_receipt = selected_model(&config).unwrap();
+        assert_eq!(
+            mismatched_receipt.local_path.as_deref(),
+            Some(legacy.as_path())
+        );
+        assert!(model_needs_pinned_gguf_migration(
+            &config,
+            &mismatched_receipt
+        ));
+
+        let mut verified_primary =
+            ManagedModelInstall::app_managed(primary.clone(), "verified-manifest-download");
+        verified_primary.sha256 = Some(manifest.artifact_sha256.to_owned());
+        config
+            .general
+            .managed_models
+            .insert(model.id.clone(), verified_primary);
         normalize_config(&mut config);
         let after_activation = selected_model(&config).unwrap();
         assert_eq!(after_activation.id, "whisper_cpp_base_en");
