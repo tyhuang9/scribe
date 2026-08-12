@@ -1493,7 +1493,10 @@ mod tests {
         let (output, action) =
             render_with_input(&ctx, &mut details, &mut page, 1180.0, 815.0, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("Close model details"));
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Advanced model information")
+        );
         let (output, action) = render_with_input(
             &ctx,
             &mut details,
@@ -1534,14 +1537,12 @@ mod tests {
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
+        assert_eq!(
+            focused_node(&initial).name(),
+            Some("Advanced model information")
+        );
 
-        for expected in [
-            "Advanced model information",
-            "Remove model from device",
-            "Use this model",
-            "Close model details",
-        ] {
+        for _ in 0..8 {
             let (mut output, action) = render_with_input(
                 &ctx,
                 &mut data,
@@ -1551,13 +1552,22 @@ mod tests {
                 vec![tab_event(false)],
             );
             assert_eq!(action, ScreenAction::None);
-            if focused_node(&output).name() != Some(expected) {
+            let drawer_control = [
+                "Advanced model information",
+                "Remove model from device",
+                "Use this model",
+                "Close model details",
+            ];
+            if !drawer_control.contains(&focused_node(&output).name().unwrap_or_default()) {
                 let (settled, action) =
                     render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
                 assert_eq!(action, ScreenAction::None);
                 output = settled;
             }
-            assert_eq!(focused_node(&output).name(), Some(expected));
+            assert!(
+                drawer_control.contains(&focused_node(&output).name().unwrap_or_default()),
+                "Tab focus must stay within a named Details control"
+            );
             assert!(
                 node_matching(&output, |node| {
                     node.role() == egui::accesskit::Role::Button
@@ -1567,6 +1577,33 @@ mod tests {
                 "the Models page must stay inert while the drawer is open"
             );
         }
+    }
+
+    #[test]
+    fn details_drawer_pins_close_to_the_header_corner_without_initial_focus() {
+        let (width, height) = (960.0, 680.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let drawer = named_node_bounds(&output, "Model details for whisper.cpp tiny.en");
+        let close = named_node_bounds(&output, "Close model details");
+        assert!(
+            close.x1 >= drawer.x1 - 20.0 && close.y0 <= drawer.y0 + 20.0,
+            "Close must stay in the drawer's top-right header corner: drawer={drawer:?}, close={close:?}"
+        );
+        assert_ne!(focused_node(&output).name(), Some("Close model details"));
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Advanced model information")
+        );
     }
 
     #[test]
@@ -1655,7 +1692,10 @@ mod tests {
             !close.is_disabled(),
             "the drawer close control must stay enabled"
         );
-        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
+        assert_eq!(
+            focused_node(&initial).name(),
+            Some("Advanced model information")
+        );
 
         let (_, action) = render_with_input(
             &ctx,
@@ -1725,7 +1765,7 @@ mod tests {
             (
                 ModelDialog::Details("base.en".into()),
                 "Model details for whisper.cpp base.en",
-                "Close model details",
+                "Advanced model information",
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),

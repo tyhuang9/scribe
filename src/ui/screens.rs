@@ -1398,7 +1398,7 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color3
     Frame::none()
         .fill(colors.disabled_bg)
         .rounding(Rounding::same(999.0))
-        .inner_margin(Margin::symmetric(8.0, 3.0))
+        .inner_margin(Margin::symmetric(8.0, 2.0))
         .show(ui, |ui| {
             ui.spacing_mut().interact_size.y = 0.0;
             ui.horizontal(|ui| {
@@ -1409,7 +1409,11 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color3
                 ui.label(
                     RichText::new(text)
                         .small()
-                        .color(colors.muted_text)
+                        .color(if dot.is_some() {
+                            colors.success_text
+                        } else {
+                            colors.muted_text
+                        })
                         .strong(),
                 );
             });
@@ -2115,18 +2119,25 @@ fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &s
             colors.primary,
         );
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                let name = match card {
-                    ModelCard::Local(model) => &model.display_name,
-                    ModelCard::Remote(entry, _) => &entry.display_name,
-                };
-                ui.label(RichText::new(name).strong());
-                if let ModelCard::Local(model) = card
-                    && model.active
-                {
-                    installed_model_badge(ui, "Active", Some(colors.primary));
-                }
-            });
+            // Reserve the title's visual line, then center both the text and
+            // badge within it. This keeps the active state aligned to the
+            // model name instead of the description below it.
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 22.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    let name = match card {
+                        ModelCard::Local(model) => &model.display_name,
+                        ModelCard::Remote(entry, _) => &entry.display_name,
+                    };
+                    ui.label(RichText::new(name).strong());
+                    if let ModelCard::Local(model) = card
+                        && model.active
+                    {
+                        installed_model_badge(ui, "Active", Some(colors.success));
+                    }
+                },
+            );
             ui.add(
                 egui::Label::new(RichText::new(description).small().color(colors.muted_text))
                     .truncate(true),
@@ -3822,6 +3833,62 @@ fn drawer_model_icon(ui: &mut egui::Ui) {
     });
 }
 
+/// Render the drawer header against fixed tracks so the close target remains
+/// anchored to the top-right corner even when a model name is long.
+fn model_details_drawer_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: Option<&str>,
+) -> egui::Response {
+    let (header_rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), DETAILS_DRAWER_HEADER_HEIGHT),
+        Sense::hover(),
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(header_rect.left() + 22.0, header_rect.center().y),
+        Vec2::splat(44.0),
+    );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(header_rect.right() - 22.0, header_rect.center().y),
+        Vec2::splat(44.0),
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right() + 8.0, header_rect.top()),
+        egui::pos2(
+            (close_rect.left() - 8.0).max(icon_rect.right() + 8.0),
+            header_rect.bottom(),
+        ),
+    );
+
+    let mut icon_ui = ui.child_ui(icon_rect, Layout::left_to_right(Align::Center));
+    drawer_model_icon(&mut icon_ui);
+
+    let mut text_ui = ui.child_ui(text_rect, Layout::top_down(Align::LEFT));
+    text_ui.set_clip_rect(text_rect);
+    text_ui.add_space(4.0);
+    text_ui.label(RichText::new(title).size(20.0).strong());
+    if let Some(description) = description.filter(|description| !description.trim().is_empty()) {
+        text_ui.add(
+            egui::Label::new(
+                RichText::new(description)
+                    .small()
+                    .color(ui_palette(&text_ui).muted_text),
+            )
+            .truncate(true),
+        );
+    }
+
+    let mut close_ui = ui.child_ui(close_rect, Layout::left_to_right(Align::Center));
+    compact_model_icon_action(
+        &mut close_ui,
+        Icon::Close,
+        "Close model details",
+        true,
+        None,
+        None,
+    )
+}
+
 fn drawer_stat(ui: &mut egui::Ui, label: &str, value: &str, success: bool) {
     let colors = ui_palette(ui);
     let (rect, response) = ui.allocate_exact_size(
@@ -3922,29 +3989,16 @@ fn show_local_model_details_drawer(
                     .show(drawer_ui, |drawer_ui| {
                         drawer_ui.set_width(layout.content_width);
                         drawer_ui.set_min_height(layout.content_height);
-                        drawer_ui.horizontal(|ui| {
-                            drawer_model_icon(ui);
-                            let text_width =
-                                (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(0.0);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
-                                Layout::top_down(Align::LEFT),
-                                |ui| {
-                                    ui.label(RichText::new(&model.display_name).size(20.0).strong());
-                                    if let Some(description) = &model.description {
-                                        ui.add(egui::Label::new(RichText::new(description).small().color(ui_palette(ui).muted_text)).truncate(true));
-                                    }
-                                },
-                            );
-                            let close = compact_model_icon_action(ui, Icon::Close, "Close model details", true, None, None);
-                            mark_accesskit_enabled(ui, &close);
-                            initial_focus = Some(close.id);
-                            focusable_controls.push(close.id);
-                            if management.focus_dialog_initial {
-                                close.request_focus();
-                            }
-                            if close.clicked() { action = ScreenAction::CloseModelDialog; }
-                        });
+                        let close = model_details_drawer_header(
+                            drawer_ui,
+                            &model.display_name,
+                            model.description.as_deref(),
+                        );
+                        mark_accesskit_enabled(drawer_ui, &close);
+                        focusable_controls.push(close.id);
+                        if close.clicked() {
+                            action = ScreenAction::CloseModelDialog;
+                        }
                         drawer_ui.separator();
                         ScrollArea::vertical()
                             .id_source(("model-details-body", &model.id))
@@ -4109,9 +4163,10 @@ fn show_local_model_details_drawer(
                                             }
                                             if runtime.clicked() { action = ScreenAction::MaintainModelRuntime(model.id.clone()); }
                                         }
-                                    });
+                                });
                                 mark_accesskit_enabled(ui, &advanced.header_response);
                                 focusable_controls.push(advanced.header_response.id);
+                                initial_focus.get_or_insert(advanced.header_response.id);
                         });
                         drawer_ui.separator();
                         drawer_ui.allocate_ui_with_layout(
@@ -4208,43 +4263,16 @@ fn show_remote_model_details_drawer(
                 .show(drawer_ui, |drawer_ui| {
                     drawer_ui.set_width(layout.content_width);
                     drawer_ui.set_min_height(layout.content_height);
-                    drawer_ui.horizontal(|ui| {
-                        drawer_model_icon(ui);
-                        let text_width =
-                            (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(0.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
-                            Layout::top_down(Align::LEFT),
-                            |ui| {
-                                ui.label(RichText::new(&entry.display_name).size(20.0).strong());
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&entry.description)
-                                            .small()
-                                            .color(ui_palette(ui).muted_text),
-                                    )
-                                    .truncate(true),
-                                );
-                            },
-                        );
-                        let close = compact_model_icon_action(
-                            ui,
-                            Icon::Close,
-                            "Close model details",
-                            true,
-                            None,
-                            None,
-                        );
-                        mark_accesskit_enabled(ui, &close);
-                        initial_focus = Some(close.id);
-                        focusable_controls.push(close.id);
-                        if management.focus_dialog_initial {
-                            close.request_focus();
-                        }
-                        if close.clicked() {
-                            action = ScreenAction::CloseModelDialog;
-                        }
-                    });
+                    let close = model_details_drawer_header(
+                        drawer_ui,
+                        &entry.display_name,
+                        Some(&entry.description),
+                    );
+                    mark_accesskit_enabled(drawer_ui, &close);
+                    focusable_controls.push(close.id);
+                    if close.clicked() {
+                        action = ScreenAction::CloseModelDialog;
+                    }
                     drawer_ui.separator();
                     ScrollArea::vertical()
                         .id_source(("remote-model-details-body", &entry.id, &variant.id))
@@ -4305,6 +4333,7 @@ fn show_remote_model_details_drawer(
                             });
                             mark_accesskit_enabled(ui, &advanced.header_response);
                             focusable_controls.push(advanced.header_response.id);
+                            initial_focus.get_or_insert(advanced.header_response.id);
                         });
                     drawer_ui.separator();
                     drawer_ui.allocate_ui_with_layout(
