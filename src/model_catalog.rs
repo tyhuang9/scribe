@@ -119,6 +119,7 @@ struct ModelManifest {
     format: ModelFormat,
     minimum_runtime_version: RuntimeVersion,
     artifact: ArtifactManifest,
+    legacy_ggml_artifact: Option<ArtifactManifest>,
     languages: &'static [&'static str],
     capabilities: ModelCapabilities,
     roles: &'static [ModelRole],
@@ -223,6 +224,7 @@ pub(crate) struct RuntimeModelManifest {
     pub(crate) artifact_size_bytes: u64,
     pub(crate) artifact_storage_estimate: &'static str,
     pub(crate) artifact_sha256: &'static str,
+    pub(crate) legacy_ggml_filename: Option<&'static str>,
 }
 
 const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
@@ -278,14 +280,25 @@ const MODELS: &[ModelManifest] = &[
         "base.en",
         ModelGuidance {
             description: "Local English model with a balanced speed and quality profile.",
-            storage: "~150 MB",
+            storage: "~81 MB",
             expected_ram: "1 GB",
             speed: "Fast",
             accuracy: "Good",
         },
-        "ggml-base.en.bin",
-        147_964_211,
-        "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        ArtifactManifest {
+            repository: "handy-computer/whisper-base.en-gguf",
+            revision: "cf0804db15fb341d00c9274b90da9cbb4fe2e5c6",
+            filename: "whisper-base.en-Q8_0.gguf",
+            size_bytes: 84_886_208,
+            sha256: "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652",
+        },
+        ArtifactManifest {
+            repository: "ggerganov/whisper.cpp",
+            revision: WHISPER_CPP_REVISION,
+            filename: "ggml-base.en.bin",
+            size_bytes: 147_964_211,
+            sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        },
         true,
         PHASE_TWO_BASE_SMOKE,
     ),
@@ -295,14 +308,25 @@ const MODELS: &[ModelManifest] = &[
         "small.en",
         ModelGuidance {
             description: "More accurate local English model for longer dictation and clean audio.",
-            storage: "~470 MB",
+            storage: "~257 MB",
             expected_ram: "2 GB",
             speed: "Medium",
             accuracy: "Better",
         },
-        "ggml-small.en.bin",
-        487_614_201,
-        "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        ArtifactManifest {
+            repository: "handy-computer/whisper-small.en-gguf",
+            revision: "41b0f75fd44415ba127a5356c5ba9ed450c1debd",
+            filename: "whisper-small.en-Q8_0.gguf",
+            size_bytes: 269_674_144,
+            sha256: "9614e6b7fda2d26018e4f268aece8ca25a83296ea0b534169a585b740bfd71ef",
+        },
+        ArtifactManifest {
+            repository: "ggerganov/whisper.cpp",
+            revision: WHISPER_CPP_REVISION,
+            filename: "ggml-small.en.bin",
+            size_bytes: 487_614_201,
+            sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        },
         false,
         PHASE_ZERO_SMOKE,
     ),
@@ -312,14 +336,25 @@ const MODELS: &[ModelManifest] = &[
         "medium.en",
         ModelGuidance {
             description: "Higher-accuracy local English model for machines with more memory.",
-            storage: "~1.5 GB",
+            storage: "~793 MB",
             expected_ram: "5 GB",
             speed: "Slower",
             accuracy: "High",
         },
-        "ggml-medium.en.bin",
-        1_533_774_781,
-        "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+        ArtifactManifest {
+            repository: "handy-computer/whisper-medium.en-gguf",
+            revision: "f25c70d9095dcfdad187ebb3b113d157b414aee8",
+            filename: "whisper-medium.en-Q8_0.gguf",
+            size_bytes: 831_460_928,
+            sha256: "03d7257fef498750ce272631bc6a34de322fc2b438aab5c268ff49dfd1b64c49",
+        },
+        ArtifactManifest {
+            repository: "ggerganov/whisper.cpp",
+            revision: WHISPER_CPP_REVISION,
+            filename: "ggml-medium.en.bin",
+            size_bytes: 1_533_774_781,
+            sha256: "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+        },
         false,
         PHASE_ZERO_SMOKE,
     ),
@@ -346,6 +381,7 @@ const fn handy_computer_tiny_en_manifest() -> ModelManifest {
             size_bytes: 43_545_248,
             sha256: "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b",
         },
+        legacy_ggml_artifact: None,
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
         recommended: false,
@@ -364,9 +400,8 @@ const fn whisper_manifest(
     display_name: &'static str,
     variant_label: &'static str,
     guidance: ModelGuidance,
-    filename: &'static str,
-    size_bytes: u64,
-    sha256: &'static str,
+    artifact: ArtifactManifest,
+    legacy_ggml_artifact: ArtifactManifest,
     recommended: bool,
     evidence: CompatibilityEvidence,
 ) -> ModelManifest {
@@ -382,15 +417,10 @@ const fn whisper_manifest(
         recommended,
         runtime: RuntimeRequirement::PrimaryNative,
         architecture: ModelArchitecture::EncoderDecoder,
-        format: ModelFormat::Ggml,
+        format: ModelFormat::Gguf,
         minimum_runtime_version: TRANSCRIBE_CPP_VERSION,
-        artifact: ArtifactManifest {
-            repository: "ggerganov/whisper.cpp",
-            revision: WHISPER_CPP_REVISION,
-            filename,
-            size_bytes,
-            sha256,
-        },
+        artifact,
+        legacy_ggml_artifact: Some(legacy_ggml_artifact),
         languages: &["en"],
         capabilities: BATCH_ENGLISH_CAPABILITIES,
         roles: NO_ROLES,
@@ -407,10 +437,8 @@ pub fn model_descriptors() -> Vec<ModelDescriptor> {
     MODELS.iter().map(ModelManifest::descriptor).collect()
 }
 
-/// Models available in Scribe's normal user-facing flow. GGML artifacts are
-/// deliberately excluded because they require the retained compatibility
-/// native package; their descriptors remain available to migrate existing
-/// configurations without advertising a second installation architecture.
+/// Models available in Scribe's normal user-facing flow. Legacy GGML artifacts
+/// are retained only to resolve existing installations, never as new installs.
 pub fn normal_model_descriptors() -> Vec<ModelDescriptor> {
     assert_catalog_valid();
     MODELS
@@ -443,6 +471,9 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
             artifact_size_bytes: manifest.artifact.size_bytes,
             artifact_storage_estimate: manifest.storage_guidance,
             artifact_sha256: manifest.artifact.sha256,
+            legacy_ggml_filename: manifest
+                .legacy_ggml_artifact
+                .map(|artifact| artifact.filename),
         })
 }
 
@@ -632,6 +663,15 @@ fn validate_manifests(manifests: &[ModelManifest]) -> Result<(), String> {
             return Err(format!("{} has no minimum runtime version", manifest.id));
         }
         validate_artifact(manifest.artifact)?;
+        if let Some(legacy_ggml_artifact) = manifest.legacy_ggml_artifact {
+            validate_artifact(legacy_ggml_artifact)?;
+            if !legacy_ggml_artifact.filename.ends_with(".bin") {
+                return Err(format!(
+                    "{} has a non-GGML legacy compatibility artifact",
+                    manifest.id
+                ));
+            }
+        }
         if manifest.languages.is_empty()
             || manifest
                 .languages
@@ -789,7 +829,7 @@ mod tests {
     fn production_catalog_is_valid_and_has_unique_ids() {
         assert_eq!(validate_catalog(), Ok(()));
         assert_eq!(model_descriptors().len(), 4);
-        assert_eq!(normal_model_descriptors().len(), 1);
+        assert_eq!(normal_model_descriptors().len(), 4);
         assert_eq!(
             model_descriptors()
                 .into_iter()
@@ -827,7 +867,12 @@ mod tests {
                 .into_iter()
                 .map(|descriptor| descriptor.id)
                 .collect::<Vec<_>>(),
-            vec![ModelId::new("whisper_cpp_tiny_en")]
+            vec![
+                ModelId::new("whisper_cpp_tiny_en"),
+                ModelId::new("whisper_cpp_base_en"),
+                ModelId::new("whisper_cpp_small_en"),
+                ModelId::new("whisper_cpp_medium_en"),
+            ]
         );
     }
 
@@ -1049,30 +1094,90 @@ mod tests {
     }
 
     #[test]
-    fn runtime_manifest_exposes_exact_pins_without_family_metadata() {
-        let manifest = runtime_model_manifest(&ModelId::new("whisper_cpp_base_en")).unwrap();
+    fn runtime_manifests_pin_q8_gguf_artifacts_and_retain_legacy_ggml_aliases() {
+        let expected = [
+            (
+                "whisper_cpp_base_en",
+                "handy-computer/whisper-base.en-gguf",
+                "cf0804db15fb341d00c9274b90da9cbb4fe2e5c6",
+                "whisper-base.en-Q8_0.gguf",
+                84_886_208,
+                "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652",
+                "ggml-base.en.bin",
+            ),
+            (
+                "whisper_cpp_small_en",
+                "handy-computer/whisper-small.en-gguf",
+                "41b0f75fd44415ba127a5356c5ba9ed450c1debd",
+                "whisper-small.en-Q8_0.gguf",
+                269_674_144,
+                "9614e6b7fda2d26018e4f268aece8ca25a83296ea0b534169a585b740bfd71ef",
+                "ggml-small.en.bin",
+            ),
+            (
+                "whisper_cpp_medium_en",
+                "handy-computer/whisper-medium.en-gguf",
+                "f25c70d9095dcfdad187ebb3b113d157b414aee8",
+                "whisper-medium.en-Q8_0.gguf",
+                831_460_928,
+                "03d7257fef498750ce272631bc6a34de322fc2b438aab5c268ff49dfd1b64c49",
+                "ggml-medium.en.bin",
+            ),
+        ];
 
-        assert_eq!(manifest.id, "whisper_cpp_base_en");
-        assert_eq!(manifest.runtime, RuntimeRequirement::PrimaryNative);
-        assert_eq!(manifest.minimum_runtime_version, TRANSCRIBE_CPP_VERSION);
-        assert_eq!(manifest.artifact_repository, "ggerganov/whisper.cpp");
-        assert_eq!(manifest.artifact_revision, WHISPER_CPP_REVISION);
-        assert_eq!(manifest.artifact_filename, "ggml-base.en.bin");
-        assert_eq!(manifest.artifact_size_bytes, 147_964_211);
+        for (id, repository, revision, filename, size_bytes, sha256, legacy_filename) in expected {
+            let manifest = runtime_model_manifest(&ModelId::new(id)).unwrap();
+            assert_eq!(manifest.id, id);
+            assert!(model_uses_embedded_runtime(&ModelId::new(id)));
+            assert_eq!(manifest.runtime, RuntimeRequirement::PrimaryNative);
+            assert_eq!(manifest.minimum_runtime_version, TRANSCRIBE_CPP_VERSION);
+            assert_eq!(manifest.artifact_repository, repository);
+            assert_eq!(manifest.artifact_revision, revision);
+            assert_eq!(manifest.artifact_filename, filename);
+            assert_eq!(manifest.artifact_size_bytes, size_bytes);
+            assert_eq!(manifest.artifact_sha256, sha256);
+            assert_eq!(manifest.legacy_ggml_filename, Some(legacy_filename));
+        }
+    }
+
+    #[test]
+    fn q8_gguf_download_urls_are_derived_from_the_authoritative_manifests() {
         assert_eq!(
-            manifest.artifact_sha256,
-            "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+            runtime_model_download_url(&ModelId::new("whisper_cpp_base_en")).as_deref(),
+            Some(
+                "https://huggingface.co/handy-computer/whisper-base.en-gguf/resolve/cf0804db15fb341d00c9274b90da9cbb4fe2e5c6/whisper-base.en-Q8_0.gguf"
+            ),
+        );
+        assert_eq!(
+            runtime_model_download_url(&ModelId::new("whisper_cpp_small_en")).as_deref(),
+            Some(
+                "https://huggingface.co/handy-computer/whisper-small.en-gguf/resolve/41b0f75fd44415ba127a5356c5ba9ed450c1debd/whisper-small.en-Q8_0.gguf"
+            ),
+        );
+        assert_eq!(
+            runtime_model_download_url(&ModelId::new("whisper_cpp_medium_en")).as_deref(),
+            Some(
+                "https://huggingface.co/handy-computer/whisper-medium.en-gguf/resolve/f25c70d9095dcfdad187ebb3b113d157b414aee8/whisper-medium.en-Q8_0.gguf"
+            ),
         );
     }
 
     #[test]
-    fn primary_download_url_is_derived_from_the_authoritative_manifest() {
+    fn tiny_embedded_gguf_manifest_is_unchanged() {
+        let manifest = runtime_model_manifest(&ModelId::new("whisper_cpp_tiny_en")).unwrap();
+
         assert_eq!(
-            runtime_model_download_url(&ModelId::new("whisper_cpp_base_en")).as_deref(),
-            Some(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin"
-            )
+            manifest.artifact_repository,
+            "handy-computer/whisper-tiny.en-gguf"
         );
+        assert_eq!(manifest.artifact_revision, HANDY_COMPUTER_TINY_EN_REVISION);
+        assert_eq!(manifest.artifact_filename, "whisper-tiny.en-Q4_K_M.gguf");
+        assert_eq!(manifest.artifact_size_bytes, 43_545_248);
+        assert_eq!(
+            manifest.artifact_sha256,
+            "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b"
+        );
+        assert_eq!(manifest.legacy_ggml_filename, None);
     }
 
     #[test]
