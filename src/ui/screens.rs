@@ -4343,7 +4343,7 @@ fn about_settings_panel(
     settings: &RecordingSettingsView,
     action: &mut ScreenAction,
 ) {
-    settings_section(ui, "About Scribe", |ui| {
+    settings_section(ui, "Application", |ui| {
         about_page(
             ui,
             Path::new(&settings.about_model_directory),
@@ -5833,7 +5833,7 @@ mod tests {
                 "Advanced settings",
                 "Recording behavior",
             ),
-            (SettingsTab::About, "About Scribe", "Recording behavior"),
+            (SettingsTab::About, "Application", "Recording behavior"),
         ] {
             let output = render_route(UiRoute::Settings(tab));
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
@@ -5852,6 +5852,33 @@ mod tests {
             );
             assert!(nodes.iter().any(|(_, node)| node.name() == Some(expected)));
             assert!(!nodes.iter().any(|(_, node)| node.name() == Some(absent)));
+        }
+    }
+
+    #[test]
+    fn about_settings_uses_one_nonredundant_heading_hierarchy() {
+        let output = render_route(UiRoute::Settings(SettingsTab::About));
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .expect("About settings should expose AccessKit")
+            .nodes;
+        let headings = nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Heading)
+                    .then(|| node.name())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headings.iter().filter(|name| **name == "Settings").count(),
+            1
+        );
+        assert_eq!(headings.iter().filter(|name| **name == "Scribe").count(), 1);
+        assert!(!headings.contains(&"About Scribe"));
+        for label in ["Application", "Local-first privacy", "Local paths"] {
+            assert!(nodes.iter().any(|(_, node)| node.name() == Some(label)));
         }
     }
 

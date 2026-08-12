@@ -7982,6 +7982,7 @@ impl eframe::App for LocalTranscriberApp {
             _ => {}
         }
         show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        self.sync_settings_playground_route();
         self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
@@ -9650,6 +9651,14 @@ impl LocalTranscriberApp {
         self.settings_playground_open = false;
         self.settings_playground_needs_initial_focus = false;
         self.settings_restore_playground_focus = true;
+    }
+
+    fn sync_settings_playground_route(&mut self) {
+        if self.current_tab != Tab::General {
+            self.settings_playground_open = false;
+            self.settings_playground_needs_initial_focus = false;
+            self.settings_restore_playground_focus = false;
+        }
     }
 
     fn ui_playground_model_selector(&mut self, ctx: &egui::Context) {
@@ -17289,6 +17298,70 @@ mod layout_tests {
             open
         );
         assert!(!app.settings_restore_playground_focus);
+    }
+
+    #[test]
+    fn settings_playground_closes_before_rendering_primary_route_departures() {
+        for destination in [Tab::Models, Tab::History, Tab::Transcribe] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_stitch_style(&ctx);
+            let mut app = test_app();
+            app.config.developer.debug_mode = true;
+            app.current_tab = Tab::General;
+            app.settings_tab = SettingsTab::Advanced;
+            app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+            assert!(app.settings_playground_open);
+            assert!(app.settings_playground_needs_initial_focus);
+
+            app.current_tab = destination;
+            app.sync_settings_playground_route();
+
+            assert_eq!(app.current_tab, destination);
+            assert!(!app.settings_playground_open);
+            assert!(!app.settings_playground_needs_initial_focus);
+            assert!(!app.settings_restore_playground_focus);
+
+            app.current_tab = Tab::General;
+            let settings = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 3_000.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| {
+                            show_route_scroll(ui, UiRoute::Settings(SettingsTab::Advanced), |ui| {
+                                if app.settings_playground_open {
+                                    app.ui_playground(ui)
+                                } else {
+                                    app.ui_general_settings(ui)
+                                }
+                            })
+                        });
+                },
+            );
+            let nodes = &settings
+                .platform_output
+                .accesskit_update
+                .expect("Settings should expose AccessKit")
+                .nodes;
+            for tab in ["General", "Recording", "Advanced", "About"] {
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Tab && node.name() == Some(tab)
+                }));
+            }
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Back to Advanced"))
+            );
+        }
     }
 
     #[test]
