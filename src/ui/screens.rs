@@ -27,7 +27,7 @@ const TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT: f32 = 565.0;
 const TRANSCRIPT_PANEL_MIN_HEIGHT: f32 = 272.0;
 const MODEL_REQUIRED_CONTENT_HEIGHT: f32 = 176.0;
 const COMPACT_SELECTOR_BREAKPOINT: f32 = 880.0;
-const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 3.0;
+const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 0.0;
 const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
 const SELECTOR_ACTION_WIDTH: f32 = 72.0;
 const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
@@ -543,8 +543,12 @@ fn selector_row(
             ui.set_enabled(was_enabled);
             let colors = ui_palette(ui);
             let hovered = response.enabled() && response.hovered();
+            let action_visual_rect = egui::Rect::from_center_size(
+                action_rect.center(),
+                Vec2::new(SELECTOR_ACTION_WIDTH, 36.0),
+            );
             ui.painter().rect(
-                action_rect,
+                action_visual_rect,
                 Rounding::same(5.0),
                 if hovered {
                     colors.panel_bg
@@ -558,7 +562,7 @@ fn selector_row(
                 },
             );
             ui.painter().text(
-                action_rect.center(),
+                action_visual_rect.center(),
                 Align2::CENTER_CENTER,
                 action_label,
                 egui::FontId::proportional(13.0),
@@ -1411,6 +1415,13 @@ const MODEL_CARD_HORIZONTAL_INSET: f32 = 16.0;
 const MODEL_CARD_VERTICAL_INSET: f32 = 8.0;
 const MODEL_DETAILS_COLUMN_WIDTH: f32 = 44.0;
 const MODEL_ACTION_COLUMN_WIDTH: f32 = 44.0;
+const MODEL_RATING_METER_WIDTH: f32 = 62.0;
+const MODEL_RATING_LABEL_WIDTH: f32 = 72.0;
+const MODEL_RATING_GAP: f32 = 6.0;
+const DETAILS_DRAWER_INSET: f32 = 8.0;
+const DETAILS_DRAWER_MARGIN: f32 = 16.0;
+const DETAILS_DRAWER_HEADER_HEIGHT: f32 = 52.0;
+const DETAILS_DRAWER_FOOTER_HEIGHT: f32 = 44.0;
 const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
 const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
 
@@ -1476,6 +1487,39 @@ fn model_card_content_rect(card_rect: egui::Rect) -> egui::Rect {
 fn model_row_width(ui: &egui::Ui) -> f32 {
     ui.available_width()
         .min((ui.ctx().screen_rect().right() - ui.cursor().left()).max(0.0))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DetailsDrawerLayout {
+    content_width: f32,
+    content_height: f32,
+    body_height: f32,
+    position: egui::Pos2,
+}
+
+fn details_drawer_layout(screen: egui::Rect) -> DetailsDrawerLayout {
+    let outer_width = if screen.width() < 720.0 {
+        (screen.width() - DETAILS_DRAWER_INSET * 2.0).max(0.0)
+    } else {
+        (screen.width() * 0.42)
+            .clamp(420.0, 580.0)
+            .min((screen.width() - DETAILS_DRAWER_INSET * 2.0).max(0.0))
+    };
+    let outer_height = (screen.height() - DETAILS_DRAWER_INSET * 2.0).max(0.0);
+    let content_width = (outer_width - DETAILS_DRAWER_MARGIN * 2.0).max(0.0);
+    let content_height = (outer_height - DETAILS_DRAWER_MARGIN * 2.0).max(0.0);
+    let body_height =
+        (content_height - DETAILS_DRAWER_HEADER_HEIGHT - DETAILS_DRAWER_FOOTER_HEIGHT - 20.0)
+            .max(0.0);
+    DetailsDrawerLayout {
+        content_width,
+        content_height,
+        body_height,
+        position: egui::pos2(
+            screen.right() - outer_width - DETAILS_DRAWER_INSET,
+            screen.top() + DETAILS_DRAWER_INSET,
+        ),
+    }
 }
 
 fn render_model_column_header_cell(
@@ -1660,10 +1704,17 @@ fn build_model_card_lists<'a>(
 
 fn formatted_language_summary(languages: &[String]) -> String {
     let languages = normalized_languages(languages);
-    match languages.as_slice() {
-        [] => "Language unavailable".to_owned(),
-        [language] => language.clone(),
-        _ => "Multilingual".to_owned(),
+    match languages.len() {
+        0 => "Language unavailable".to_owned(),
+        1 => format!("{} only", languages[0]),
+        2 => format!("{} + {}", languages[0], languages[1]),
+        3..=5 => format!(
+            "{}, {} + {}",
+            languages[0],
+            languages[1],
+            languages.len() - 2
+        ),
+        count => format!("Multilingual · {count}"),
     }
 }
 
@@ -1742,36 +1793,51 @@ fn rating_meter(
     show_label: bool,
 ) {
     let colors = ui_palette(ui);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(62.0, 18.0), Sense::hover());
-        let filled = rating.map_or(0, |(value, _)| value.min(5));
-        for index in 0..5 {
-            let segment = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + index as f32 * 12.0, rect.center().y - 3.5),
-                Vec2::new(9.0, 7.0),
-            );
-            ui.painter().rect_filled(
-                segment,
-                Rounding::same(3.5),
-                if index < filled as usize {
-                    colors.primary
-                } else {
-                    colors.disabled_bg
-                },
-            );
-        }
-        let label = rating.map_or("Not rated", |(_, label)| label);
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("{name}: {label}"))
-        });
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.set_name(format!("{name}: {label}"))
-        });
-        if show_label || rating.is_none() {
-            ui.label(RichText::new(label).small().color(colors.muted_text));
-        }
-    });
+    let label = rating.map_or("Not rated", |(_, label)| label);
+    let content_width = MODEL_RATING_METER_WIDTH
+        + if show_label {
+            MODEL_RATING_GAP + MODEL_RATING_LABEL_WIDTH
+        } else {
+            0.0
+        };
+    ui.allocate_ui_with_layout(
+        Vec2::new(content_width, 18.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = MODEL_RATING_GAP;
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(MODEL_RATING_METER_WIDTH, 18.0), Sense::hover());
+            let filled = rating.map_or(0, |(value, _)| value.min(5));
+            for index in 0..5 {
+                let segment = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + index as f32 * 12.0, rect.center().y - 3.5),
+                    Vec2::new(9.0, 7.0),
+                );
+                ui.painter().rect_filled(
+                    segment,
+                    Rounding::same(3.5),
+                    if index < filled as usize {
+                        colors.primary
+                    } else {
+                        colors.disabled_bg
+                    },
+                );
+            }
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("{name}: {label}"))
+            });
+            ui.ctx().accesskit_node_builder(response.id, |builder| {
+                builder.set_name(format!("{name}: {label}"))
+            });
+            if show_label {
+                ui.add_sized(
+                    Vec2::new(MODEL_RATING_LABEL_WIDTH, 18.0),
+                    egui::Label::new(RichText::new(label).small().color(colors.muted_text))
+                        .truncate(true),
+                );
+            }
+        },
+    );
 }
 
 fn model_row_description(card: ModelCard<'_>) -> String {
@@ -1936,8 +2002,8 @@ fn render_model_card(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
     focus_card: Option<&ModelCardKey>,
-    restore_details_focus: Option<&str>,
-    restore_remove_focus: Option<&str>,
+    _restore_details_focus: Option<&str>,
+    _restore_remove_focus: Option<&str>,
     focus_visible_rect: egui::Rect,
     can_replace_active: bool,
 ) -> ModelCardRenderResult {
@@ -1972,9 +2038,9 @@ fn render_model_card(
     });
 
     let description = model_row_description(card);
+    let card_key = card.key();
     let requested_focus = focus_card.is_some_and(|key| card.matches_key(key));
     let mut action = ScreenAction::None;
-    let mut restored_control = None;
     let primary_has_focus;
     let mut content_ui = ui.child_ui(
         model_card_content_rect(card_rect),
@@ -2161,52 +2227,48 @@ fn render_model_card(
             },
         );
         let details = content_ui
-            .allocate_ui_with_layout(
-                Vec2::new(columns.details, 44.0),
-                Layout::top_down(Align::Center),
-                |ui| {
-                    compact_model_icon_action(
-                        ui,
-                        Icon::ChevronRight,
-                        &details_name,
-                        true,
-                        None,
-                        None,
-                    )
-                },
-            )
+            .push_id(("model-card-details", &card_key), |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(columns.details, 44.0),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        compact_model_icon_action(
+                            ui,
+                            Icon::ChevronRight,
+                            &details_name,
+                            true,
+                            None,
+                            None,
+                        )
+                    },
+                )
+                .inner
+            })
             .inner;
         let row = content_ui
-            .allocate_ui_with_layout(
-                Vec2::new(columns.action, 44.0),
-                Layout::top_down(Align::Center),
-                |ui| {
-                    compact_model_icon_action(
-                        ui,
-                        row_icon,
-                        &row_name,
-                        row_enabled,
-                        row_reason,
-                        row_progress,
-                    )
-                },
-            )
+            .push_id(("model-card-action", &card_key), |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(columns.action, 44.0),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        compact_model_icon_action(
+                            ui,
+                            row_icon,
+                            &row_name,
+                            row_enabled,
+                            row_reason,
+                            row_progress,
+                        )
+                    },
+                )
+                .inner
+            })
             .inner;
         if details.clicked() {
             action = details_action;
         }
         if row_enabled && row.clicked() {
             action = row_action;
-        }
-        if let ModelCard::Local(model) = card {
-            if restore_details_focus == Some(model.id.as_str()) {
-                details.request_focus();
-                restored_control = Some(ModelCardControl::Details);
-            }
-            if restore_remove_focus == Some(model.id.as_str()) {
-                row.request_focus();
-                restored_control = Some(ModelCardControl::Remove);
-            }
         }
         if requested_focus {
             details.request_focus();
@@ -2245,22 +2307,23 @@ fn render_model_card(
         let mut actions_ui = ui.child_ui(actions_rect, Layout::left_to_right(Align::Center));
         actions_ui.set_clip_rect(card_rect.shrink(1.0));
         actions_ui.spacing_mut().item_spacing.x = 0.0;
-        let details = compact_model_icon_action(
-            &mut actions_ui,
-            Icon::ChevronRight,
-            &details_name,
-            true,
-            None,
-            None,
-        );
-        let row = compact_model_icon_action(
-            &mut actions_ui,
-            row_icon,
-            &row_name,
-            row_enabled,
-            row_reason,
-            row_progress,
-        );
+        let details = actions_ui
+            .push_id(("model-card-details", &card_key), |ui| {
+                compact_model_icon_action(ui, Icon::ChevronRight, &details_name, true, None, None)
+            })
+            .inner;
+        let row = actions_ui
+            .push_id(("model-card-action", &card_key), |ui| {
+                compact_model_icon_action(
+                    ui,
+                    row_icon,
+                    &row_name,
+                    row_enabled,
+                    row_reason,
+                    row_progress,
+                )
+            })
+            .inner;
         if details.clicked() {
             action = details_action.clone();
         }
@@ -2336,22 +2399,14 @@ fn render_model_card(
             .rect_filled(progress_rect, Rounding::same(1.0), colors.primary);
     }
 
-    if action == ScreenAction::None {
-        if let ModelCard::Local(model) = card
-            && let Some(control) = restored_control
-        {
-            action = ScreenAction::AcknowledgeModelControlFocus {
-                model_id: model.id.clone(),
-                control,
-            };
-        } else if requested_focus
-            && card_rect.left() >= focus_visible_rect.left() - MODEL_FOCUS_VISIBILITY_TOLERANCE
-            && card_rect.right() <= focus_visible_rect.right() + MODEL_FOCUS_VISIBILITY_TOLERANCE
-            && card_rect.top() >= focus_visible_rect.top() - MODEL_FOCUS_VISIBILITY_TOLERANCE
-            && card_rect.bottom() <= focus_visible_rect.bottom() + MODEL_FOCUS_VISIBILITY_TOLERANCE
-        {
-            action = ScreenAction::AcknowledgeModelCardFocus(card.key());
-        }
+    if action == ScreenAction::None
+        && requested_focus
+        && card_rect.left() >= focus_visible_rect.left() - MODEL_FOCUS_VISIBILITY_TOLERANCE
+        && card_rect.right() <= focus_visible_rect.right() + MODEL_FOCUS_VISIBILITY_TOLERANCE
+        && card_rect.top() >= focus_visible_rect.top() - MODEL_FOCUS_VISIBILITY_TOLERANCE
+        && card_rect.bottom() <= focus_visible_rect.bottom() + MODEL_FOCUS_VISIBILITY_TOLERANCE
+    {
+        action = ScreenAction::AcknowledgeModelCardFocus(card.key());
     }
     ModelCardRenderResult {
         action,
@@ -2837,6 +2892,11 @@ fn models(
                     .map(|id| (id, ModelCardControl::Remove))
             });
         if let Some((model_id, control)) = pending_control {
+            // The drawer disables its invoking row while it is mounted. On
+            // Windows, immediately restoring native AccessKit focus to that
+            // unmounted/remounted row can freeze the host. Return to the
+            // stable Models toolbar instead, while retaining the pending
+            // control acknowledgement for the state machine.
             import.request_focus();
             import.scroll_to_me(Some(Align::Center));
             action = ScreenAction::AcknowledgeModelControlFocus {
@@ -3613,6 +3673,16 @@ fn model_dialog_dismiss_action(
     }
 }
 
+fn drawer_outside_was_clicked(ctx: &egui::Context, drawer_rect: egui::Rect) -> bool {
+    ctx.input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|position| !drawer_rect.contains(position))
+    })
+}
+
 fn drawer_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
     let heading = ui.label(RichText::new(title).small().strong());
     ui.ctx().accesskit_node_builder(heading.id, |builder| {
@@ -3650,14 +3720,7 @@ fn show_local_model_details_drawer(
 ) -> ScreenAction {
     let ctx = ui.ctx().clone();
     let screen = ctx.screen_rect();
-    let width = if screen.width() < 720.0 {
-        (screen.width() - 16.0).max(0.0)
-    } else {
-        (screen.width() * 0.42)
-            .clamp(420.0, 580.0)
-            .min((screen.width() - 16.0).max(0.0))
-    };
-    let position = egui::pos2(screen.right() - width - 8.0, screen.top() + 8.0);
+    let layout = details_drawer_layout(screen);
     let drawer_id = ui.make_persistent_id(("model-details-drawer", &model.id));
     let accessibility_id = ui.make_persistent_id(("model-details-drawer-accessibility", &model.id));
     ctx.accesskit_node_builder(accessibility_id, |builder| {
@@ -3665,48 +3728,50 @@ fn show_local_model_details_drawer(
         builder.set_name(format!("Model details for {}", model.display_name));
         builder.set_modal();
     });
-    let mut focusable = Vec::new();
-    let mut initial_focus = None;
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
+    let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(drawer_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(position)
+            .fixed_pos(layout.position)
             .movable(false)
             .show(&ctx, |drawer_ui| {
                 Frame::none()
                     .fill(ui_palette(drawer_ui).card_bg)
                     .stroke(Stroke::new(1.0, ui_palette(drawer_ui).border))
                     .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::same(DETAILS_DRAWER_MARGIN))
                     .show(drawer_ui, |drawer_ui| {
-                        drawer_ui.set_width(width);
-                        drawer_ui.set_min_height((screen.height() - 16.0).max(0.0));
+                        drawer_ui.set_width(layout.content_width);
+                        drawer_ui.set_min_height(layout.content_height);
                         drawer_ui.horizontal(|ui| {
                             let text_width = (ui.available_width() - 44.0).max(0.0);
                             ui.allocate_ui_with_layout(
-                                Vec2::new(text_width, 60.0),
+                                Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
                                 Layout::top_down(Align::LEFT),
                                 |ui| {
-                                    ui.label(RichText::new(&model.display_name).size(22.0).strong());
+                                    ui.label(RichText::new(&model.display_name).size(20.0).strong());
                                     if let Some(description) = &model.description {
                                         ui.add(egui::Label::new(RichText::new(description).small().color(ui_palette(ui).muted_text)).truncate(true));
                                     }
                                 },
                             );
                             let close = compact_model_icon_action(ui, Icon::Close, "Close model details", true, None, None);
-                            initial_focus = Some(close.id);
-                            focusable.push(close.id);
                             mark_accesskit_enabled(ui, &close);
+                            initial_focus = Some(close.id);
+                            focusable_controls.push(close.id);
+                            if management.focus_dialog_initial {
+                                close.request_focus();
+                            }
                             if close.clicked() { action = ScreenAction::CloseModelDialog; }
                         });
                         drawer_ui.separator();
-                        let body_height = (screen.height() - 170.0).max(0.0);
                         ScrollArea::vertical()
                             .id_source(("model-details-body", &model.id))
-                            .max_height(body_height)
-                            .auto_shrink([false, false])
+                            .max_height(layout.body_height)
                             .show(drawer_ui, |ui| {
                                 drawer_section(ui, "Language support", |ui| {
                                     let languages = normalized_languages(&model.languages);
@@ -3801,8 +3866,8 @@ fn show_local_model_details_drawer(
                                                 button(ui, &model.primary_action_label, ButtonTone::Secondary)
                                             }).inner;
                                             if model.primary_action_enabled {
-                                                focusable.push(maintenance.id);
                                                 mark_accesskit_enabled(ui, &maintenance);
+                                                focusable_controls.push(maintenance.id);
                                             } else {
                                                 describe_disabled_control(
                                                     ui,
@@ -3818,8 +3883,8 @@ fn show_local_model_details_drawer(
                                         if let Some(label) = &model.runtime_action_label {
                                             let runtime = ui.add_enabled_ui(model.runtime_action_enabled, |ui| button(ui, label, ButtonTone::Secondary)).inner;
                                             if model.runtime_action_enabled {
-                                                focusable.push(runtime.id);
                                                 mark_accesskit_enabled(ui, &runtime);
+                                                focusable_controls.push(runtime.id);
                                             } else {
                                                 describe_disabled_control(
                                                     ui,
@@ -3831,47 +3896,53 @@ fn show_local_model_details_drawer(
                                             if runtime.clicked() { action = ScreenAction::MaintainModelRuntime(model.id.clone()); }
                                         }
                                     });
-                                focusable.push(advanced.header_response.id);
                                 mark_accesskit_enabled(ui, &advanced.header_response);
-                            });
+                                focusable_controls.push(advanced.header_response.id);
+                        });
                         drawer_ui.separator();
-                        drawer_ui.horizontal(|ui| {
+                        drawer_ui.allocate_ui_with_layout(
+                            Vec2::new(drawer_ui.available_width(), DETAILS_DRAWER_FOOTER_HEIGHT),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
                             let remove_reason = (!model.removal_supported).then_some("This model is not an app-managed download and cannot be removed here.")
                                 .or_else(|| (model.active && !can_replace_active).then_some("Install another ready model before removing the active model."));
                             let remove = compact_model_icon_action(ui, Icon::Trash, "Remove model from device", remove_reason.is_none(), remove_reason, None);
-                            if remove_reason.is_none() { focusable.push(remove.id); mark_accesskit_enabled(ui, &remove); }
+                            if remove_reason.is_none() {
+                                mark_accesskit_enabled(ui, &remove);
+                                focusable_controls.push(remove.id);
+                            }
                             if remove.clicked() && remove_reason.is_none() { action = ScreenAction::RequestModelRemoval(model.id.clone()); }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if model.installed && model.ready && !model.active {
                                     let use_model = button(ui, "Use this model", ButtonTone::Primary);
-                                    focusable.push(use_model.id);
                                     mark_accesskit_enabled(ui, &use_model);
+                                    focusable_controls.push(use_model.id);
                                     if use_model.clicked() { action = ScreenAction::SelectModel(model.id.clone()); }
                                 } else {
                                     ui.label(RichText::new(if model.active { "Active model" } else { &model.runtime_status_label }).small().color(ui_palette(ui).muted_text));
                                 }
-                                let close = button(ui, "Close", ButtonTone::Secondary);
-                                focusable.push(close.id);
-                                mark_accesskit_enabled(ui, &close);
-                                if close.clicked() { action = ScreenAction::CloseModelDialog; }
                             });
-                        });
+                            },
+                        );
                     });
             });
         drawer_rect = Some(drawer.response.rect);
     });
-    contain_model_dialog_focus(
-        &ctx,
-        tab_direction,
-        &focusable,
-        initial_focus,
-        management.focus_dialog_initial,
-    );
     if let Some(rect) = drawer_rect {
         ctx.accesskit_node_builder(accessibility_id, |builder| {
             builder.set_bounds(accesskit_rect(rect));
         });
+        if action == ScreenAction::None && drawer_outside_was_clicked(&ctx, rect) {
+            action = ScreenAction::CloseModelDialog;
+        }
     }
+    contain_model_dialog_focus(
+        &ctx,
+        tab_direction,
+        &focusable_controls,
+        initial_focus,
+        management.focus_dialog_initial,
+    );
     action
 }
 
@@ -3884,14 +3955,7 @@ fn show_remote_model_details_drawer(
 ) -> ScreenAction {
     let ctx = ui.ctx().clone();
     let screen = ctx.screen_rect();
-    let width = if screen.width() < 720.0 {
-        (screen.width() - 16.0).max(0.0)
-    } else {
-        (screen.width() * 0.42)
-            .clamp(420.0, 580.0)
-            .min((screen.width() - 16.0).max(0.0))
-    };
-    let position = egui::pos2(screen.right() - width - 8.0, screen.top() + 8.0);
+    let layout = details_drawer_layout(screen);
     let accessibility_id = ui.make_persistent_id((
         "remote-model-details-drawer-accessibility",
         &entry.id,
@@ -3902,9 +3966,10 @@ fn show_remote_model_details_drawer(
         builder.set_name(format!("Model details for {}", entry.display_name));
         builder.set_modal();
     });
-    let mut focusable = Vec::new();
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
+    let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     let drawer_action = variant
         .actions
@@ -3918,23 +3983,24 @@ fn show_remote_model_details_drawer(
             &variant.id,
         )))
         .order(egui::Order::Foreground)
-        .fixed_pos(position)
+        .fixed_pos(layout.position)
         .movable(false)
         .show(&ctx, |drawer_ui| {
             Frame::none()
                 .fill(ui_palette(drawer_ui).card_bg)
                 .stroke(Stroke::new(1.0, ui_palette(drawer_ui).border))
                 .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::same(DETAILS_DRAWER_MARGIN))
                 .show(drawer_ui, |drawer_ui| {
-                    drawer_ui.set_width(width);
-                    drawer_ui.set_min_height((screen.height() - 16.0).max(0.0));
+                    drawer_ui.set_width(layout.content_width);
+                    drawer_ui.set_min_height(layout.content_height);
                     drawer_ui.horizontal(|ui| {
                         let text_width = (ui.available_width() - 44.0).max(0.0);
                         ui.allocate_ui_with_layout(
-                            Vec2::new(text_width, 60.0),
+                            Vec2::new(text_width, DETAILS_DRAWER_HEADER_HEIGHT),
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                ui.label(RichText::new(&entry.display_name).size(22.0).strong());
+                                ui.label(RichText::new(&entry.display_name).size(20.0).strong());
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&entry.description)
@@ -3953,8 +4019,12 @@ fn show_remote_model_details_drawer(
                             None,
                             None,
                         );
-                        focusable.push(close.id);
                         mark_accesskit_enabled(ui, &close);
+                        initial_focus = Some(close.id);
+                        focusable_controls.push(close.id);
+                        if management.focus_dialog_initial {
+                            close.request_focus();
+                        }
                         if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
@@ -3962,7 +4032,7 @@ fn show_remote_model_details_drawer(
                     drawer_ui.separator();
                     ScrollArea::vertical()
                         .id_source(("remote-model-details-body", &entry.id, &variant.id))
-                        .max_height((screen.height() - 170.0).max(0.0))
+                        .max_height(layout.body_height)
                         .show(drawer_ui, |ui| {
                             drawer_section(ui, "Language support", |ui| {
                                 let languages = normalized_languages(&entry.languages);
@@ -4006,72 +4076,76 @@ fn show_remote_model_details_drawer(
                                 }
                             });
                             ui.separator();
-                            egui::CollapsingHeader::new("Advanced model information").show(
-                                ui,
-                                |ui| {
-                                    for (label, value) in [
-                                        ("Repository", entry.repository.as_str()),
-                                        ("Revision", entry.pinned_revision.as_str()),
-                                        ("Filename", variant.filename.as_str()),
-                                    ] {
-                                        if !value.trim().is_empty() {
-                                            ui.label(
-                                                RichText::new(format!("{label}: {value}"))
-                                                    .small()
-                                                    .color(ui_palette(ui).muted_text),
-                                            );
-                                        }
+                            let advanced = egui::CollapsingHeader::new(
+                                "Advanced model information",
+                            )
+                            .show(ui, |ui| {
+                                for (label, value) in [
+                                    ("Repository", entry.repository.as_str()),
+                                    ("Revision", entry.pinned_revision.as_str()),
+                                    ("Filename", variant.filename.as_str()),
+                                ] {
+                                    if !value.trim().is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("{label}: {value}"))
+                                                .small()
+                                                .color(ui_palette(ui).muted_text),
+                                        );
                                     }
-                                },
-                            );
+                                }
+                            });
+                            mark_accesskit_enabled(ui, &advanced.header_response);
+                            focusable_controls.push(advanced.header_response.id);
                         });
                     drawer_ui.separator();
-                    drawer_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(remote_action) = drawer_action {
-                            let control = ui
-                                .add_enabled_ui(remote_action.enabled, |ui| {
-                                    button(ui, &remote_action.label, ButtonTone::Primary)
-                                })
-                                .inner;
-                            if remote_action.enabled {
-                                focusable.push(control.id);
-                                mark_accesskit_enabled(ui, &control);
-                            } else {
-                                describe_disabled_control(
-                                    ui,
-                                    &control,
-                                    &remote_action.label,
-                                    remote_action.disabled_reason.as_deref(),
-                                );
+                    drawer_ui.allocate_ui_with_layout(
+                        Vec2::new(drawer_ui.available_width(), DETAILS_DRAWER_FOOTER_HEIGHT),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            if let Some(remote_action) = drawer_action {
+                                let control = ui
+                                    .add_enabled_ui(remote_action.enabled, |ui| {
+                                        button(ui, &remote_action.label, ButtonTone::Primary)
+                                    })
+                                    .inner;
+                                if remote_action.enabled {
+                                    mark_accesskit_enabled(ui, &control);
+                                    focusable_controls.push(control.id);
+                                } else {
+                                    describe_disabled_control(
+                                        ui,
+                                        &control,
+                                        &remote_action.label,
+                                        remote_action.disabled_reason.as_deref(),
+                                    );
+                                }
+                                if remote_action.enabled && control.clicked() {
+                                    action = screen_action_for_remote_catalog_action(
+                                        &remote_action.kind,
+                                    );
+                                }
                             }
-                            if remote_action.enabled && control.clicked() {
-                                action =
-                                    screen_action_for_remote_catalog_action(&remote_action.kind);
-                            }
-                        }
-                        let close = button(ui, "Close", ButtonTone::Secondary);
-                        focusable.push(close.id);
-                        mark_accesskit_enabled(ui, &close);
-                        if close.clicked() {
-                            action = ScreenAction::CloseModelDialog;
-                        }
-                    });
+                        },
+                    );
                 });
         });
         drawer_rect = Some(drawer.response.rect);
     });
-    contain_model_dialog_focus(
-        &ctx,
-        tab_direction,
-        &focusable,
-        focusable.first().copied(),
-        management.focus_dialog_initial,
-    );
     if let Some(rect) = drawer_rect {
         ctx.accesskit_node_builder(accessibility_id, |builder| {
             builder.set_bounds(accesskit_rect(rect));
         });
+        if action == ScreenAction::None && drawer_outside_was_clicked(&ctx, rect) {
+            action = ScreenAction::CloseModelDialog;
+        }
     }
+    contain_model_dialog_focus(
+        &ctx,
+        tab_direction,
+        &focusable_controls,
+        initial_focus,
+        management.focus_dialog_initial,
+    );
     action
 }
 
@@ -4703,32 +4777,36 @@ fn radio_control(
     mode: RecordingMode,
     label: &str,
     checked: bool,
+    width: f32,
 ) -> egui::Response {
     let colors = ui_palette(ui);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(88.0, 44.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 44.0), egui::Sense::hover());
     let response = ui.interact(
         rect,
         ui.make_persistent_id(("recording-mode", mode)),
         egui::Sense::click(),
     );
-    let fill = if checked {
-        colors.card_bg
-    } else if response.hovered() {
-        colors.active_card_bg
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, Rounding::same(3.0), fill);
+    let visual = rect.shrink2(Vec2::new(3.0, 4.0));
     if checked {
         ui.painter()
-            .rect_stroke(rect, Rounding::same(3.0), Stroke::new(2.0, colors.accent));
+            .rect_filled(visual, Rounding::same(18.0), colors.card_bg);
+    } else if response.hovered() {
+        ui.painter().rect_stroke(
+            visual,
+            Rounding::same(18.0),
+            Stroke::new(1.0, colors.border_strong),
+        );
     }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(14.0),
-        colors.text,
+        if checked {
+            colors.accent
+        } else {
+            colors.primary_button_text
+        },
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, label));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
@@ -4740,8 +4818,42 @@ fn radio_control(
             egui::accesskit::Checked::False
         });
     });
-    paint_focus_ring(ui, &response, Rounding::same(4.0));
+    paint_focus_ring(ui, &response, Rounding::same(20.0));
     response
+}
+
+fn recording_mode_toggle(
+    ui: &mut egui::Ui,
+    selected: RecordingMode,
+) -> Vec<(RecordingMode, egui::Response)> {
+    const TOGGLE_WIDTH: f32 = 232.0;
+    const TOGGLE_HEIGHT: f32 = 44.0;
+
+    let colors = ui_palette(ui);
+    let (track_rect, _) =
+        ui.allocate_exact_size(Vec2::new(TOGGLE_WIDTH, TOGGLE_HEIGHT), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(track_rect, Rounding::same(22.0), colors.accent);
+    let mut toggle_ui = ui.child_ui(track_rect, Layout::left_to_right(Align::Center));
+    toggle_ui.spacing_mut().item_spacing.x = 0.0;
+    [
+        (RecordingMode::PressOnce, "Press once"),
+        (RecordingMode::Hold, "Hold"),
+    ]
+    .into_iter()
+    .map(|(mode, label)| {
+        (
+            mode,
+            radio_control(
+                &mut toggle_ui,
+                mode,
+                label,
+                selected == mode,
+                TOGGLE_WIDTH / 2.0,
+            ),
+        )
+    })
+    .collect()
 }
 
 fn recording_settings_panel(
@@ -4777,49 +4889,29 @@ fn recording_settings_panel(
             });
             ctx.with_accessibility_parent(radio_group_id, || {
                 compact_setting_row(ui, "Mode", true, |ui, _| {
-                    Frame::none()
-                        .fill(colors.panel_bg)
-                        .stroke(Stroke::new(1.0, colors.border))
-                        .rounding(Rounding::same(4.0))
-                        .inner_margin(Margin::same(4.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                for (mode, label) in [
-                                    (RecordingMode::PressOnce, "Press once"),
-                                    (RecordingMode::Hold, "Hold"),
-                                ] {
-                                    let response = radio_control(
-                                        ui,
-                                        mode,
-                                        label,
-                                        state.recording_mode == mode,
-                                    );
-                                    radio_ids.push(response.id);
-                                    if response.clicked() {
-                                        *action = ScreenAction::SetRecordingMode(mode);
-                                    }
-                                    if response.has_focus()
-                                        && ui.input(|input| {
-                                            input.key_pressed(egui::Key::ArrowRight)
-                                                || input.key_pressed(egui::Key::ArrowLeft)
-                                        })
-                                    {
-                                        let next = if mode == RecordingMode::PressOnce {
-                                            RecordingMode::Hold
-                                        } else {
-                                            RecordingMode::PressOnce
-                                        };
-                                        ui.memory_mut(|memory| {
-                                            memory.request_focus(
-                                                ui.make_persistent_id(("recording-mode", next)),
-                                            )
-                                        });
-                                        *action = ScreenAction::SetRecordingMode(next);
-                                    }
-                                }
+                    for (mode, response) in recording_mode_toggle(ui, state.recording_mode) {
+                        radio_ids.push(response.id);
+                        if response.clicked() {
+                            *action = ScreenAction::SetRecordingMode(mode);
+                        }
+                        if response.has_focus()
+                            && ui.input(|input| {
+                                input.key_pressed(egui::Key::ArrowRight)
+                                    || input.key_pressed(egui::Key::ArrowLeft)
+                            })
+                        {
+                            let next = if mode == RecordingMode::PressOnce {
+                                RecordingMode::Hold
+                            } else {
+                                RecordingMode::PressOnce
+                            };
+                            ui.memory_mut(|memory| {
+                                memory
+                                    .request_focus(ui.make_persistent_id(("recording-mode", next)))
                             });
-                        });
+                            *action = ScreenAction::SetRecordingMode(next);
+                        }
+                    }
                 });
             });
             let radio_group = radio_ids
@@ -5551,7 +5643,7 @@ impl SettingsRow {
         let row = ui.scope(|ui| {
             let interaction_height = ui.spacing().interact_size.y.max(44.0);
             ui.spacing_mut().interact_size.y = interaction_height;
-            ui.set_min_height(56.0);
+            ui.set_min_height(interaction_height);
             if compact {
                 ui.vertical(|ui| {
                     let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
@@ -6041,23 +6133,31 @@ mod tests {
         assert_eq!(formatted_language_summary(&[]), "Language unavailable");
         assert_eq!(
             formatted_language_summary(&languages(&["en", "English"])),
-            "English"
+            "English only"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es"])),
-            "Multilingual"
+            "English + Spanish"
+        );
+        assert_eq!(
+            formatted_language_summary(&languages(&["en", "es", "ja"])),
+            "English, Spanish + 1"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es", "ja", "ko"])),
-            "Multilingual"
+            "English, Spanish + 2"
+        );
+        assert_eq!(
+            formatted_language_summary(&languages(&["en", "es", "ja", "ko", "zh"])),
+            "English, Spanish + 3"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["en", "es", "ja", "ko", "zh", "fr"])),
-            "Multilingual"
+            "Multilingual · 6"
         );
         assert_eq!(
             formatted_language_summary(&languages(&["x-klingon"])),
-            "x-klingon"
+            "x-klingon only"
         );
     }
 
@@ -6084,6 +6184,25 @@ mod tests {
         assert_eq!(wide.accuracy, 175.0);
         assert_eq!(wide.size, 100.0);
         assert!(model_card_column_layout(759.0).is_none());
+    }
+
+    #[test]
+    fn details_drawer_geometry_is_bounded_at_desktop_and_narrow_widths() {
+        let desktop = details_drawer_layout(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1_180.0, 815.0),
+        ));
+        assert!((desktop.content_width - 463.6).abs() < 0.1);
+        assert_eq!(desktop.position, egui::pos2(676.4, DETAILS_DRAWER_INSET));
+        assert!(desktop.body_height > 600.0);
+
+        let narrow = details_drawer_layout(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(375.0, 680.0),
+        ));
+        assert!((narrow.content_width - 327.0).abs() < f32::EPSILON);
+        assert_eq!(narrow.position, egui::pos2(8.0, DETAILS_DRAWER_INSET));
+        assert!(narrow.body_height > 0.0);
     }
 
     #[test]
@@ -7637,7 +7756,7 @@ mod tests {
                     });
                 },
             );
-            assert!(row_rect.height() >= 56.0);
+            assert!(row_rect.height() >= 44.0);
             assert!(
                 output
                     .shapes

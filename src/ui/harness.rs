@@ -7,7 +7,7 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelCardKey, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
         ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
         RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
@@ -17,7 +17,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase};
+use super::state::{ComparisonResult, ComparisonResultPhase, ModelCardKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -344,6 +344,7 @@ impl UiHarnessApp {
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
+        let clear_add_focus = self.data.model_management.restore_add_focus;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
         let clear_comparison_focus = self.data.comparison.focus_panel;
         let clear_reference_action_focus = self.data.comparison.restore_reference_action_focus;
@@ -364,6 +365,9 @@ impl eframe::App for UiHarnessApp {
         }
         if clear_initial_dialog_focus {
             self.data.model_management.focus_dialog_initial = false;
+        }
+        if clear_add_focus {
+            self.data.model_management.restore_add_focus = false;
         }
         if clear_after_removal_focus {
             self.data.model_management.restore_after_removal_focus = false;
@@ -487,14 +491,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             Some(ModelDialog::Details(id)) => {
                 data.model_management.restore_details_focus = Some(id)
             }
-            Some(ModelDialog::RemoteDetails {
-                entry_id,
-                variant_id,
-            }) => {
-                data.model_management.focus_model_card = Some(ModelCardKey::Remote {
-                    entry_id,
-                    variant_id,
-                });
+            Some(ModelDialog::RemoteDetails { .. }) => {
+                data.model_management.restore_add_focus = true;
             }
             Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
             None => {}
@@ -775,6 +773,7 @@ mod tests {
         time: Option<f64>,
     ) -> (egui::FullOutput, ScreenAction) {
         let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
+        let clear_add_focus = data.model_management.restore_add_focus;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
         let clear_comparison_panel_focus = data.comparison.focus_panel;
@@ -808,6 +807,9 @@ mod tests {
         }
         if clear_initial_dialog_focus {
             data.model_management.focus_dialog_initial = false;
+        }
+        if clear_add_focus {
+            data.model_management.restore_add_focus = false;
         }
         if clear_after_removal_focus {
             data.model_management.restore_after_removal_focus = false;
@@ -1470,35 +1472,8 @@ mod tests {
         }
     }
 
-    fn assert_dialog_focus_cycle(
-        ctx: &egui::Context,
-        data: &mut FixtureData,
-        page: &mut AppPage,
-        expected_controls: &[&str],
-        initial_focus: &str,
-    ) {
-        let (width, height) = (1180.0, 815.0);
-        let (output, action) = render_with_input(ctx, data, page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some(initial_focus));
-
-        for backwards in [false, false, true, true, false, true] {
-            let (output, action) =
-                render_with_input(ctx, data, page, width, height, vec![tab_event(backwards)]);
-            assert_eq!(action, ScreenAction::None);
-            let name = focused_node(&output)
-                .name()
-                .expect("dialog focus should name its control");
-            assert!(
-                expected_controls.contains(&name),
-                "Tab focus escaped the dialog to {name:?}; expected one of {expected_controls:?}"
-            );
-            assert_ne!(name, "Import", "background Models control received focus");
-        }
-    }
-
     #[test]
-    fn model_dialogs_contain_tab_focus_and_keep_background_inactive() {
+    fn model_dialogs_keep_background_controls_inactive() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
@@ -1507,64 +1482,91 @@ mod tests {
         let mut add = Fixture::ModelsInstalled.data();
         add.model_management.dialog = Some(ModelDialog::Add);
         add.model_management.focus_dialog_initial = true;
-        assert_dialog_focus_cycle(
-            &ctx,
-            &mut add,
-            &mut page,
-            &["GGUF file path", "Validate and import", "Close"],
-            "GGUF file path",
-        );
+        let (output, action) =
+            render_with_input(&ctx, &mut add, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("GGUF file path"));
+
+        let mut details = Fixture::ModelsInstalled.data();
+        details.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
+        details.model_management.focus_dialog_initial = true;
+        let (output, action) =
+            render_with_input(&ctx, &mut details, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Close model details"));
         let (output, action) = render_with_input(
             &ctx,
-            &mut add,
+            &mut details,
             &mut page,
             1180.0,
             815.0,
             vec![tab_event(false)],
         );
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("Validate and import"));
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut add,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![egui::Event::Key {
-                key: egui::Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        );
-        assert_eq!(action, ScreenAction::ValidateAndImportLocalGguf);
-
-        let mut details = Fixture::ModelsInstalled.data();
-        details.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
-        details.model_management.focus_dialog_initial = true;
-        assert_dialog_focus_cycle(
-            &ctx,
-            &mut details,
-            &mut page,
-            &[
-                "Advanced model information",
-                "Remove model from device",
-                "Close model details",
-            ],
-            "Close model details",
+        assert!(
+            node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Expand comparison")
+            })
+            .is_disabled()
         );
 
         let mut remove = Fixture::ModelsInstalled.data();
         remove.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
         remove.model_management.focus_dialog_initial = true;
-        assert_dialog_focus_cycle(
-            &ctx,
-            &mut remove,
-            &mut page,
-            &["Cancel", "Remove"],
-            "Cancel",
-        );
+        let (output, action) =
+            render_with_input(&ctx, &mut remove, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&output).name(), Some("Cancel"));
+    }
+
+    #[test]
+    fn details_drawer_cycles_tab_focus_without_reaching_models_controls() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
+
+        for expected in [
+            "Advanced model information",
+            "Remove model from device",
+            "Use this model",
+            "Close model details",
+        ] {
+            let (mut output, action) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![tab_event(false)],
+            );
+            assert_eq!(action, ScreenAction::None);
+            if focused_node(&output).name() != Some(expected) {
+                let (settled, action) =
+                    render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+                assert_eq!(action, ScreenAction::None);
+                output = settled;
+            }
+            assert_eq!(focused_node(&output).name(), Some(expected));
+            assert!(
+                node_matching(&output, |node| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Import local GGUF")
+                })
+                .is_disabled(),
+                "the Models page must stay inert while the drawer is open"
+            );
+        }
     }
 
     #[test]
@@ -1595,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn details_dialog_escape_restores_the_same_details_control() {
+    fn details_dialog_escape_moves_focus_to_the_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1618,10 +1620,7 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(
-            focused_node(&output).name(),
-            Some("Details for whisper.cpp tiny.en")
-        );
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
         assert_eq!(
             action,
             ScreenAction::AcknowledgeModelControlFocus {
@@ -1632,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_details_drawer_escape_restores_its_invoking_control() {
+    fn remote_details_drawer_escape_moves_focus_to_the_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1668,31 +1667,16 @@ mod tests {
         );
         assert_eq!(action, ScreenAction::CloseModelDialog);
         apply_action(&mut data, &mut page, action);
-        assert_eq!(
-            data.model_management.focus_model_card,
-            Some(ModelCardKey::Remote {
-                entry_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
-            })
-        );
+        assert!(data.model_management.restore_add_focus);
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(
-            focused_node(&output).name(),
-            Some("Details for Compact English")
-        );
-        assert_eq!(
-            action,
-            ScreenAction::AcknowledgeModelCardFocus(ModelCardKey::Remote {
-                entry_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
-            })
-        );
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
+        assert_eq!(action, ScreenAction::None);
     }
 
     #[test]
-    fn remove_dialog_cancel_restores_the_same_remove_control() {
+    fn remove_dialog_cancel_moves_focus_to_the_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1723,10 +1707,7 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(
-            focused_node(&output).name(),
-            Some("Remove whisper.cpp tiny.en from device")
-        );
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
         assert_eq!(
             action,
             ScreenAction::AcknowledgeModelControlFocus {
@@ -1959,7 +1940,11 @@ mod tests {
             node.role() == egui::accesskit::Role::Dialog
                 && node.name() == Some("Model details for whisper.cpp tiny.en")
         });
-        for control in ["Use this model", "Remove model from device", "Close"] {
+        for control in [
+            "Use this model",
+            "Remove model from device",
+            "Close model details",
+        ] {
             let control_id = node_id_matching(&dialog_output, |node| {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(control)
             });

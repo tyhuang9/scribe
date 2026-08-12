@@ -71,7 +71,7 @@ use crate::transcription::{
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
     AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
-    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelCardKey, ModelComparisonState,
+    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
     ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
     ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
     RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
@@ -9249,14 +9249,8 @@ impl LocalTranscriberApp {
                 Some(ModelDialog::Details(id)) => {
                     self.model_management.restore_details_focus = Some(id)
                 }
-                Some(ModelDialog::RemoteDetails {
-                    entry_id,
-                    variant_id,
-                }) => {
-                    self.model_management.focus_model_card = Some(ModelCardKey::Remote {
-                        entry_id,
-                        variant_id,
-                    });
+                Some(ModelDialog::RemoteDetails { .. }) => {
+                    self.model_management.restore_add_focus = true;
                 }
                 Some(ModelDialog::Remove(id)) => {
                     self.model_management.restore_remove_focus = Some(id);
