@@ -7,7 +7,7 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ComparisonPhase, ModelCardKey, ModelComparisonState, ModelDialog, ModelDownloadState,
         ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
         RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
@@ -17,7 +17,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase, ModelCardKey};
+use super::state::{ComparisonResult, ComparisonResultPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -487,7 +487,15 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             Some(ModelDialog::Details(id)) => {
                 data.model_management.restore_details_focus = Some(id)
             }
-            Some(ModelDialog::RemoteDetails { .. }) => {}
+            Some(ModelDialog::RemoteDetails {
+                entry_id,
+                variant_id,
+            }) => {
+                data.model_management.focus_model_card = Some(ModelCardKey::Remote {
+                    entry_id,
+                    variant_id,
+                });
+            }
             Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
             None => {}
         },
@@ -1644,6 +1652,66 @@ mod tests {
     }
 
     #[test]
+    fn remote_details_drawer_escape_restores_its_invoking_control() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::RemoteDetails {
+            entry_id: "trusted-speech/compact-english".into(),
+            variant_id: "compact-english-q5".into(),
+        });
+        data.model_management.focus_dialog_initial = true;
+
+        let (initial, initial_action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(initial_action, ScreenAction::None);
+        let close = node_matching(&initial, |node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Close model details")
+        });
+        assert!(
+            !close.is_disabled(),
+            "the drawer close control must stay enabled"
+        );
+        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
+
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![page_event(egui::Key::Escape)],
+        );
+        assert_eq!(action, ScreenAction::CloseModelDialog);
+        apply_action(&mut data, &mut page, action);
+        assert_eq!(
+            data.model_management.focus_model_card,
+            Some(ModelCardKey::Remote {
+                entry_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            })
+        );
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Details for Compact English")
+        );
+        assert_eq!(
+            action,
+            ScreenAction::AcknowledgeModelCardFocus(ModelCardKey::Remote {
+                entry_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            })
+        );
+    }
+
+    #[test]
     fn remove_dialog_cancel_restores_the_same_remove_control() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
@@ -2230,6 +2298,64 @@ mod tests {
                 assert_bounds_within(bounds, row, &format!("installed row content {name:?}"));
             }
         }
+    }
+
+    #[test]
+    fn narrow_model_rows_keep_actions_and_metadata_inside_the_viewport() {
+        let output = render(Fixture::ModelsLifecycle, 375.0, 680.0);
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("render should expose an AccessKit update")
+            .nodes;
+        let rows = nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Group
+                    && node.name().is_some_and(|name| name.ends_with(" model")))
+                .then(|| node.bounds())
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert!(!rows.is_empty(), "narrow fixture should render model rows");
+        for row in rows {
+            assert_within_tolerance(
+                row.y1 - row.y0,
+                104.0,
+                LAYOUT_TOLERANCE,
+                "narrow model row height",
+            );
+            assert!(
+                row.x0 >= 0.0 && row.x1 <= 375.0,
+                "row escaped narrow viewport: {row:?}"
+            );
+        }
+        for (_, node) in nodes.iter().filter(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name().is_some_and(|name| {
+                    name.starts_with("Details for ")
+                        || name.starts_with("Download ")
+                        || name.starts_with("Resume ")
+                        || name.starts_with("Retry ")
+                        || name.starts_with("Cancel ")
+                })
+        }) {
+            let bounds = node.bounds().expect("model action should expose bounds");
+            assert!(
+                bounds.x0 >= 0.0 && bounds.x1 <= 375.0 && bounds.y1 > bounds.y0,
+                "narrow model action escaped viewport: {bounds:?}"
+            );
+            assert!(
+                bounds.x1 - bounds.x0 >= 44.0 - LAYOUT_TOLERANCE
+                    && bounds.y1 - bounds.y0 >= 44.0 - LAYOUT_TOLERANCE,
+                "model action must retain a 44px target: {bounds:?}"
+            );
+        }
+        assert!(
+            nodes.iter().any(|(_, node)| node.name() == Some("190 MB")),
+            "narrow rows must preserve the model size metadata"
+        );
     }
 
     #[test]

@@ -1402,6 +1402,9 @@ const MODEL_LIST_TO_DOCK_GAP: f32 = 24.0;
 const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
 const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
 const MODEL_CARD_HEIGHT: f32 = 76.0;
+// The compact phone composition preserves the two 44px action targets and gives
+// the identity, language/size, and metric lines room to remain legible.
+const MODEL_CARD_NARROW_HEIGHT: f32 = 104.0;
 const MODEL_CARD_GAP: f32 = 8.0;
 const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
 const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
@@ -1655,7 +1658,7 @@ fn rating_meter(
         ui.ctx().accesskit_node_builder(response.id, |builder| {
             builder.set_name(format!("{name}: {label}"))
         });
-        if show_label {
+        if show_label || rating.is_none() {
             ui.label(RichText::new(label).small().color(colors.muted_text));
         }
     });
@@ -1828,8 +1831,14 @@ fn render_model_card(
 ) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
     let width = ui.available_width();
+    let narrow = width < 760.0;
+    let card_height = if narrow {
+        MODEL_CARD_NARROW_HEIGHT
+    } else {
+        MODEL_CARD_HEIGHT
+    };
     let (card_rect, row_response) =
-        ui.allocate_exact_size(Vec2::new(width, MODEL_CARD_HEIGHT), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(width, card_height), Sense::hover());
     ui.painter().rect(
         card_rect,
         Rounding::same(9.0),
@@ -2100,7 +2109,7 @@ fn render_model_card(
             ui.horizontal(|ui| {
                 let action_space = 88.0;
                 ui.allocate_ui_with_layout(
-                    Vec2::new((ui.available_width() - action_space).max(130.0), 28.0),
+                    Vec2::new((ui.available_width() - action_space).max(130.0), 44.0),
                     Layout::top_down(Align::LEFT),
                     |ui| render_model_identity(ui, card, &description),
                 );
@@ -2132,7 +2141,7 @@ fn render_model_card(
                 }
                 primary_has_focus = details.has_focus() || row.has_focus();
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let languages = match card {
                     ModelCard::Local(model) => &model.languages,
                     ModelCard::Remote(entry, _) => &entry.languages,
@@ -2142,6 +2151,16 @@ fn render_model_card(
                         .small()
                         .color(colors.muted_text),
                 );
+                let size = match card {
+                    ModelCard::Local(model) => model
+                        .total_bytes
+                        .or(model.disk_bytes)
+                        .map_or_else(|| "Size unavailable".to_owned(), format_bytes),
+                    ModelCard::Remote(_, variant) => variant.size_label.clone(),
+                };
+                ui.label(RichText::new(size).small().color(colors.muted_text));
+            });
+            ui.horizontal_wrapped(|ui| {
                 let speed = match card {
                     ModelCard::Local(model) => speed_rating(model.speed_tier),
                     ModelCard::Remote(_, _) => None,
@@ -2220,11 +2239,10 @@ fn render_model_page_sentinel(
     section: &str,
     next: bool,
     target: ModelCard<'_>,
+    height: f32,
 ) -> ModelCardRenderResult {
-    let (slot_rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), MODEL_CARD_HEIGHT),
-        Sense::hover(),
-    );
+    let (slot_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let content_ui = ui.child_ui_with_id_source(
         slot_rect,
         Layout::top_down(Align::Center),
@@ -2344,7 +2362,12 @@ fn render_model_section(
 
     ui.add_space(MODEL_CARD_GAP);
     let start_y = ui.cursor().top();
-    let stride = MODEL_CARD_HEIGHT + MODEL_CARD_GAP;
+    let card_height = if ui.available_width() < 760.0 {
+        MODEL_CARD_NARROW_HEIGHT
+    } else {
+        MODEL_CARD_HEIGHT
+    };
+    let stride = card_height + MODEL_CARD_GAP;
     let clip = ui.clip_rect();
     let mut first_visible = ((clip.top() - start_y) / stride).floor().max(0.0) as usize;
     first_visible = first_visible.min(cards.len());
@@ -2403,13 +2426,25 @@ fn render_model_section(
         let terminal_card_rect = (_terminal && index + 1 == cards.len()).then(|| {
             egui::Rect::from_min_size(
                 egui::pos2(ui.cursor().min.x, ui.cursor().top()),
-                Vec2::new(ui.available_width(), MODEL_CARD_HEIGHT),
+                Vec2::new(ui.available_width(), card_height),
             )
         });
         let rendered = if top_sentinel == Some(index) {
-            render_model_page_sentinel(ui, name, false, cards[first_visible.saturating_sub(1)])
+            render_model_page_sentinel(
+                ui,
+                name,
+                false,
+                cards[first_visible.saturating_sub(1)],
+                card_height,
+            )
         } else if bottom_sentinel == Some(index) {
-            render_model_page_sentinel(ui, name, true, cards[last_visible.min(cards.len() - 1)])
+            render_model_page_sentinel(
+                ui,
+                name,
+                true,
+                cards[last_visible.min(cards.len() - 1)],
+                card_height,
+            )
         } else {
             let card = cards[index];
             ui.push_id(("model-card", card.key()), |ui| {
@@ -3373,6 +3408,26 @@ fn mark_accesskit_enabled(ui: &egui::Ui, response: &egui::Response) {
     });
 }
 
+fn describe_disabled_control(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    accessible_name: &str,
+    reason: Option<&str>,
+) {
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Button);
+        builder.set_name(accessible_name);
+        builder.set_disabled();
+        if let Some(reason) = reason {
+            builder.set_description(reason);
+        }
+    });
+    if let Some(reason) = reason {
+        focus_tooltip(ui, response, reason);
+        response.clone().on_hover_text(reason);
+    }
+}
+
 /// Keep keyboard focus in a model dialog, including wraparound at either end.
 /// `controls` is assembled from the controls that are visible and enabled in
 /// the current frame, so conditional install, cancel, and maintenance actions
@@ -3446,7 +3501,11 @@ fn model_dialog_dismiss_action(
 }
 
 fn drawer_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).small().strong());
+    let heading = ui.label(RichText::new(title).small().strong());
+    ui.ctx().accesskit_node_builder(heading.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Heading);
+        builder.set_name(title);
+    });
     ui.add_space(6.0);
     contents(ui);
     ui.add_space(14.0);
@@ -3462,7 +3521,7 @@ fn drawer_stat(ui: &mut egui::Ui, label: &str, value: &str, success: bool) {
         .show(ui, |ui| {
             ui.label(RichText::new(label).small().color(colors.muted_text));
             ui.label(RichText::new(value).small().strong().color(if success {
-                colors.success
+                colors.success_text
             } else {
                 colors.text
             }));
@@ -3497,6 +3556,7 @@ fn show_local_model_details_drawer(
     let mut initial_focus = None;
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
+    let compact_stats = screen.width() < 440.0;
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(drawer_id)
             .order(egui::Order::Foreground)
@@ -3511,19 +3571,22 @@ fn show_local_model_details_drawer(
                         drawer_ui.set_width(width);
                         drawer_ui.set_min_height((screen.height() - 16.0).max(0.0));
                         drawer_ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(&model.display_name).size(22.0).strong());
-                                if let Some(description) = &model.description {
-                                    ui.label(RichText::new(description).small().color(ui_palette(ui).muted_text));
-                                }
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let close = compact_model_icon_action(ui, Icon::Close, "Close model details", true, None, None);
-                                initial_focus = Some(close.id);
-                                focusable.push(close.id);
-                                mark_accesskit_enabled(ui, &close);
-                                if close.clicked() { action = ScreenAction::CloseModelDialog; }
-                            });
+                            let text_width = (ui.available_width() - 44.0).max(0.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(text_width, 60.0),
+                                Layout::top_down(Align::LEFT),
+                                |ui| {
+                                    ui.label(RichText::new(&model.display_name).size(22.0).strong());
+                                    if let Some(description) = &model.description {
+                                        ui.add(egui::Label::new(RichText::new(description).small().color(ui_palette(ui).muted_text)).truncate(true));
+                                    }
+                                },
+                            );
+                            let close = compact_model_icon_action(ui, Icon::Close, "Close model details", true, None, None);
+                            initial_focus = Some(close.id);
+                            focusable.push(close.id);
+                            mark_accesskit_enabled(ui, &close);
+                            if close.clicked() { action = ScreenAction::CloseModelDialog; }
                         });
                         drawer_ui.separator();
                         let body_height = (screen.height() - 170.0).max(180.0);
@@ -3536,7 +3599,7 @@ fn show_local_model_details_drawer(
                                     let languages = normalized_languages(&model.languages);
                                     ui.label(RichText::new(if languages.is_empty() { "Language unavailable".to_owned() } else { languages.join(" \u{00b7} ") }).strong());
                                     if model.capabilities.language_detection {
-                                        ui.label(RichText::new("Automatic detection supported").small().color(ui_palette(ui).success));
+                                        ui.label(RichText::new("Automatic detection supported").small().color(ui_palette(ui).success_text));
                                     }
                                 });
                                 ui.separator();
@@ -3547,31 +3610,58 @@ fn show_local_model_details_drawer(
                                         (model.capabilities.translation, "Translate to English"),
                                         (model.capabilities.language_detection, "Language detection"),
                                     ] {
-                                        ui.label(RichText::new(format!("{}  {label}", if available { "\u{2713}" } else { "\u{2014}" })).small().color(if available { ui_palette(ui).success } else { ui_palette(ui).muted_text }));
+                                        ui.label(RichText::new(format!("{}  {label}", if available { "\u{2713}" } else { "\u{2014}" })).small().color(if available { ui_palette(ui).success_text } else { ui_palette(ui).muted_text }));
                                     }
                                 });
                                 ui.separator();
                                 drawer_section(ui, "Performance & requirements", |ui| {
-                                    ui.horizontal(|ui| {
-                                        drawer_stat(ui, "Speed", speed_rating(model.speed_tier).map_or("Not rated", |(_, label)| label), false);
-                                        drawer_stat(ui, "Accuracy", accuracy_rating(&model.accuracy_guidance).map_or("Not rated", |(_, label)| label), false);
-                                    });
-                                    if model.total_bytes.is_some() || model.disk_bytes.is_some() || model.estimated_ram_bytes.is_some() {
+                                    if compact_stats {
+                                        ui.vertical(|ui| {
+                                            drawer_stat(ui, "Speed", speed_rating(model.speed_tier).map_or("Not rated", |(_, label)| label), false);
+                                            drawer_stat(ui, "Accuracy", accuracy_rating(&model.accuracy_guidance).map_or("Not rated", |(_, label)| label), false);
+                                        });
+                                    } else {
                                         ui.horizontal(|ui| {
-                                            if let Some(size) = model.total_bytes.or(model.disk_bytes) {
-                                                drawer_stat(ui, "Download size", &format_bytes(size), false);
-                                            }
-                                            if let Some(memory) = model.estimated_ram_bytes {
-                                                drawer_stat(ui, "Estimated memory", &format_bytes(memory), false);
-                                            }
+                                            drawer_stat(ui, "Speed", speed_rating(model.speed_tier).map_or("Not rated", |(_, label)| label), false);
+                                            drawer_stat(ui, "Accuracy", accuracy_rating(&model.accuracy_guidance).map_or("Not rated", |(_, label)| label), false);
                                         });
                                     }
-                                    ui.horizontal(|ui| {
-                                        if let Some(acceleration) = acceleration_label(model.capabilities) {
-                                            drawer_stat(ui, "Acceleration", acceleration, false);
+                                    if model.total_bytes.is_some() || model.disk_bytes.is_some() || model.estimated_ram_bytes.is_some() {
+                                        if compact_stats {
+                                            ui.vertical(|ui| {
+                                                if let Some(size) = model.total_bytes.or(model.disk_bytes) {
+                                                    drawer_stat(ui, "Download size", &format_bytes(size), false);
+                                                }
+                                                if let Some(memory) = model.estimated_ram_bytes {
+                                                    drawer_stat(ui, "Estimated memory", &format_bytes(memory), false);
+                                                }
+                                            });
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                if let Some(size) = model.total_bytes.or(model.disk_bytes) {
+                                                    drawer_stat(ui, "Download size", &format_bytes(size), false);
+                                                }
+                                                if let Some(memory) = model.estimated_ram_bytes {
+                                                    drawer_stat(ui, "Estimated memory", &format_bytes(memory), false);
+                                                }
+                                            });
                                         }
-                                        drawer_stat(ui, "Compatibility", &model.runtime_status_label, model.ready);
-                                    });
+                                    }
+                                    if compact_stats {
+                                        ui.vertical(|ui| {
+                                            if let Some(acceleration) = acceleration_label(model.capabilities) {
+                                                drawer_stat(ui, "Acceleration", acceleration, false);
+                                            }
+                                            drawer_stat(ui, "Compatibility", &model.runtime_status_label, model.ready);
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            if let Some(acceleration) = acceleration_label(model.capabilities) {
+                                                drawer_stat(ui, "Acceleration", acceleration, false);
+                                            }
+                                            drawer_stat(ui, "Compatibility", &model.runtime_status_label, model.ready);
+                                        });
+                                    }
                                 });
                                 ui.separator();
                                 let advanced = egui::CollapsingHeader::new("Advanced model information")
@@ -3600,6 +3690,13 @@ fn show_local_model_details_drawer(
                                             if model.primary_action_enabled {
                                                 focusable.push(maintenance.id);
                                                 mark_accesskit_enabled(ui, &maintenance);
+                                            } else {
+                                                describe_disabled_control(
+                                                    ui,
+                                                    &maintenance,
+                                                    &model.primary_action_label,
+                                                    model.primary_action_disabled_reason.as_deref(),
+                                                );
                                             }
                                             if maintenance.clicked() {
                                                 action = local_model_primary_action(model);
@@ -3607,7 +3704,17 @@ fn show_local_model_details_drawer(
                                         }
                                         if let Some(label) = &model.runtime_action_label {
                                             let runtime = ui.add_enabled_ui(model.runtime_action_enabled, |ui| button(ui, label, ButtonTone::Secondary)).inner;
-                                            if model.runtime_action_enabled { focusable.push(runtime.id); mark_accesskit_enabled(ui, &runtime); }
+                                            if model.runtime_action_enabled {
+                                                focusable.push(runtime.id);
+                                                mark_accesskit_enabled(ui, &runtime);
+                                            } else {
+                                                describe_disabled_control(
+                                                    ui,
+                                                    &runtime,
+                                                    label,
+                                                    model.runtime_action_disabled_reason.as_deref(),
+                                                );
+                                            }
                                             if runtime.clicked() { action = ScreenAction::MaintainModelRuntime(model.id.clone()); }
                                         }
                                     });
@@ -3615,23 +3722,28 @@ fn show_local_model_details_drawer(
                                 mark_accesskit_enabled(ui, &advanced.header_response);
                             });
                         drawer_ui.separator();
-                        drawer_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        drawer_ui.horizontal(|ui| {
                             let remove_reason = (!model.removal_supported).then_some("This model is not an app-managed download and cannot be removed here.")
                                 .or_else(|| (model.active && !can_replace_active).then_some("Install another ready model before removing the active model."));
                             let remove = compact_model_icon_action(ui, Icon::Trash, "Remove model from device", remove_reason.is_none(), remove_reason, None);
                             if remove_reason.is_none() { focusable.push(remove.id); mark_accesskit_enabled(ui, &remove); }
                             if remove.clicked() && remove_reason.is_none() { action = ScreenAction::RequestModelRemoval(model.id.clone()); }
-                            if model.installed && model.ready && !model.active {
-                                let use_model = button(ui, "Use this model", ButtonTone::Primary);
-                                focusable.push(use_model.id);
-                                mark_accesskit_enabled(ui, &use_model);
-                                if use_model.clicked() { action = ScreenAction::SelectModel(model.id.clone()); }
-                            } else {
-                                ui.label(RichText::new(if model.active { "Active model" } else { &model.runtime_status_label }).small().color(ui_palette(ui).muted_text));
-                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if model.installed && model.ready && !model.active {
+                                    let use_model = button(ui, "Use this model", ButtonTone::Primary);
+                                    focusable.push(use_model.id);
+                                    mark_accesskit_enabled(ui, &use_model);
+                                    if use_model.clicked() { action = ScreenAction::SelectModel(model.id.clone()); }
+                                } else {
+                                    ui.label(RichText::new(if model.active { "Active model" } else { &model.runtime_status_label }).small().color(ui_palette(ui).muted_text));
+                                }
+                                let close = button(ui, "Close", ButtonTone::Secondary);
+                                focusable.push(close.id);
+                                mark_accesskit_enabled(ui, &close);
+                                if close.clicked() { action = ScreenAction::CloseModelDialog; }
+                            });
                         });
-                    })
-                    .response;
+                    });
             });
         drawer_rect = Some(drawer.response.rect);
     });
@@ -3680,6 +3792,12 @@ fn show_remote_model_details_drawer(
     let mut focusable = Vec::new();
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
+    let compact_stats = screen.width() < 440.0;
+    let drawer_action = variant
+        .actions
+        .iter()
+        .find(|candidate| matches!(candidate.kind, RemoteCatalogActionKind::Cancel { .. }))
+        .or_else(|| variant.actions.first());
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(ui.make_persistent_id((
             "remote-model-details-drawer",
@@ -3698,28 +3816,35 @@ fn show_remote_model_details_drawer(
                     drawer_ui.set_width(width);
                     drawer_ui.set_min_height((screen.height() - 16.0).max(0.0));
                     drawer_ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&entry.display_name).size(22.0).strong());
-                            ui.label(
-                                RichText::new(&entry.description)
-                                    .small()
-                                    .color(ui_palette(ui).muted_text),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let close = compact_model_icon_action(
-                                ui,
-                                Icon::Close,
-                                "Close model details",
-                                true,
-                                None,
-                                None,
-                            );
-                            focusable.push(close.id);
-                            if close.clicked() {
-                                action = ScreenAction::CloseModelDialog;
-                            }
-                        });
+                        let text_width = (ui.available_width() - 44.0).max(0.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_width, 60.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.label(RichText::new(&entry.display_name).size(22.0).strong());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&entry.description)
+                                            .small()
+                                            .color(ui_palette(ui).muted_text),
+                                    )
+                                    .truncate(true),
+                                );
+                            },
+                        );
+                        let close = compact_model_icon_action(
+                            ui,
+                            Icon::Close,
+                            "Close model details",
+                            true,
+                            None,
+                            None,
+                        );
+                        focusable.push(close.id);
+                        mark_accesskit_enabled(ui, &close);
+                        if close.clicked() {
+                            action = ScreenAction::CloseModelDialog;
+                        }
                     });
                     drawer_ui.separator();
                     ScrollArea::vertical()
@@ -3739,19 +3864,33 @@ fn show_remote_model_details_drawer(
                             });
                             ui.separator();
                             drawer_section(ui, "Performance & requirements", |ui| {
-                                ui.horizontal(|ui| {
-                                    drawer_stat(ui, "Speed", "Not rated", false);
-                                    drawer_stat(ui, "Accuracy", "Not rated", false);
-                                });
-                                ui.horizontal(|ui| {
+                                if compact_stats {
+                                    ui.vertical(|ui| {
+                                        drawer_stat(ui, "Speed", "Not rated", false);
+                                        drawer_stat(ui, "Accuracy", "Not rated", false);
+                                        drawer_stat(
+                                            ui,
+                                            "Download size",
+                                            &variant.size_label,
+                                            false,
+                                        );
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        drawer_stat(ui, "Speed", "Not rated", false);
+                                        drawer_stat(ui, "Accuracy", "Not rated", false);
+                                    });
                                     drawer_stat(ui, "Download size", &variant.size_label, false);
-                                    drawer_stat(
-                                        ui,
-                                        "Compatibility",
-                                        &entry.compatibility_detail,
-                                        false,
+                                }
+                                if !entry.compatibility_detail.trim().is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("Compatibility")
+                                            .small()
+                                            .color(ui_palette(ui).muted_text),
                                     );
-                                });
+                                    ui.label(RichText::new(&entry.compatibility_detail).small());
+                                }
                             });
                             ui.separator();
                             egui::CollapsingHeader::new("Advanced model information").show(
@@ -3773,8 +3912,38 @@ fn show_remote_model_details_drawer(
                                 },
                             );
                         });
-                })
-                .response
+                    drawer_ui.separator();
+                    drawer_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(remote_action) = drawer_action {
+                            let control = ui
+                                .add_enabled_ui(remote_action.enabled, |ui| {
+                                    button(ui, &remote_action.label, ButtonTone::Primary)
+                                })
+                                .inner;
+                            if remote_action.enabled {
+                                focusable.push(control.id);
+                                mark_accesskit_enabled(ui, &control);
+                            } else {
+                                describe_disabled_control(
+                                    ui,
+                                    &control,
+                                    &remote_action.label,
+                                    remote_action.disabled_reason.as_deref(),
+                                );
+                            }
+                            if remote_action.enabled && control.clicked() {
+                                action =
+                                    screen_action_for_remote_catalog_action(&remote_action.kind);
+                            }
+                        }
+                        let close = button(ui, "Close", ButtonTone::Secondary);
+                        focusable.push(close.id);
+                        mark_accesskit_enabled(ui, &close);
+                        if close.clicked() {
+                            action = ScreenAction::CloseModelDialog;
+                        }
+                    });
+                });
         });
         drawer_rect = Some(drawer.response.rect);
     });
