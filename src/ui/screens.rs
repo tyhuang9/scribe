@@ -41,6 +41,7 @@ const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.
 
 const ROUTE_TOP_INSET: f32 = 28.0;
 const ROUTE_HORIZONTAL_INSET: f32 = 28.0;
+const ROUTE_BOTTOM_INSET: f32 = 16.0;
 const ROUTE_FOCUSED_CONTROL_SCROLL: &str = "route-focused-control-scroll";
 #[cfg(test)]
 const ROUTE_SCROLL_DIAGNOSTICS: &str = "route-scroll-diagnostics";
@@ -353,7 +354,9 @@ pub(crate) fn show_route_scroll<T>(
                 .inner_margin(Margin::symmetric(ROUTE_HORIZONTAL_INSET, 0.0))
                 .show(ui, |ui| {
                     ui.set_width((route_width - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0));
-                    add_contents(ui)
+                    let content = add_contents(ui);
+                    ui.add_space(ROUTE_BOTTOM_INSET);
+                    content
                 })
                 .inner;
             if route != UiRoute::Models
@@ -4029,7 +4032,7 @@ fn recording_settings_panel(
         ui.add_enabled_ui(!recording_locked, |ui| {
             compact_setting_row(ui, "Global record hotkey", true, |ui, _| {
                 ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
                         for (index, key) in state
                             .hotkey
                             .split('+')
@@ -4730,11 +4733,17 @@ impl SettingsRow {
                 });
             } else {
                 ui.horizontal(|ui| {
+                    let available_width = ui.available_width();
+                    let label_width = (available_width * 0.32).clamp(180.0, 270.0);
                     let label = ui.add_sized(
-                        [270.0, 44.0],
+                        [label_width, 44.0],
                         egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
                     );
-                    contents(ui, label.id);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            contents(ui, label.id);
+                        });
+                    });
                 });
             }
         });
