@@ -12137,7 +12137,12 @@ fn cards_for_models(
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
     if config::remote_gguf_artifact(config, &model.id).is_some()
         || config::imported_gguf_artifact(config, &model.id).is_some()
-        || crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+        || (crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+            && model.local_path.as_ref().is_none_or(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            }))
     {
         return match model.install_status {
             ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
@@ -18430,11 +18435,14 @@ mod layout_tests {
                 .is_some_and(|message| message.contains("Choose models"))
         );
 
-        let base_path = std::env::temp_dir().join(format!(
-            "scribe-playground-not-ready-{}-{}.bin",
-            std::process::id(),
-            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let base_path = std::env::temp_dir()
+            .join(format!(
+                "scribe-playground-not-ready-{}-{}",
+                std::process::id(),
+                NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("ggml-base.en.bin");
+        fs::create_dir_all(base_path.parent().unwrap()).unwrap();
         fs::write(&base_path, b"test-only installed model").unwrap();
         app.config
             .general

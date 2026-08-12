@@ -870,9 +870,7 @@ impl TranscriptionService {
         self.config.performance.acceleration_preference
     }
 
-    /// Returns normal user-facing, runtime-neutral descriptors. Retained
-    /// compatibility descriptors remain resolvable individually for existing
-    /// configurations, but are deliberately absent from the default flow.
+    /// Returns normal user-facing, runtime-neutral descriptors.
     pub fn model_descriptors(&self) -> Vec<ModelDescriptor> {
         normal_model_descriptors()
             .into_iter()
@@ -2583,7 +2581,7 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors.len(), 4);
         for descriptor in descriptors {
             assert!(matches!(
                 descriptor.compatibility,
@@ -2644,14 +2642,14 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_descriptor_is_resolvable_but_absent_from_the_normal_catalog() {
+    fn normalized_base_descriptor_is_present_in_the_normal_catalog() {
         let service = TranscriptionService::new(AppConfig::default());
         let singular = service
             .model_descriptor(&ModelId::new("whisper_cpp_base_en"))
             .unwrap();
 
         assert!(
-            !service
+            service
                 .model_descriptors()
                 .into_iter()
                 .any(|descriptor| descriptor.id == singular.id)
@@ -2682,7 +2680,7 @@ mod tests {
         assert!(model_uses_embedded_gguf(&ModelId::new(
             "whisper_cpp_tiny_en"
         )));
-        assert!(!model_uses_embedded_gguf(&ModelId::new(
+        assert!(model_uses_embedded_gguf(&ModelId::new(
             "whisper_cpp_base_en"
         )));
     }
