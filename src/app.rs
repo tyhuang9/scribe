@@ -8175,6 +8175,7 @@ impl LocalTranscriberApp {
             ScreenAction::None
             | ScreenAction::SelectModel(_)
             | ScreenAction::InstallModel(_)
+            | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::ShowModelDetails(_)
             | ScreenAction::RequestModelRemoval(_)
@@ -8877,14 +8878,32 @@ impl LocalTranscriberApp {
         let mutation_blocked = mutation_block_reason.is_some();
         let active =
             installed && runtime_ready && self.config.general.selected_default_model == model.id;
+        let migration_pending =
+            installed && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
             primary_action_label,
             primary_action_enabled,
+            primary_action_installs_upgrade,
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
-        ) = if active {
+        ) = if migration_pending {
+            let installing = matches!(
+                install_status,
+                ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
+            );
+            (
+                "Upgrade model".to_owned(),
+                !mutation_blocked && !installing && supports_managed_install(model),
+                true,
+                false,
+                mutation_block_reason.clone().or_else(|| {
+                    installing.then(|| "This model upgrade is already in progress.".to_owned())
+                }),
+            )
+        } else if active {
             (
                 "Active".to_owned(),
+                false,
                 false,
                 false,
                 Some("This model is already active.".to_owned()),
@@ -8893,6 +8912,7 @@ impl LocalTranscriberApp {
             (
                 "Use this model".to_owned(),
                 !mutation_blocked,
+                false,
                 false,
                 mutation_block_reason.clone(),
             )
@@ -8920,6 +8940,7 @@ impl LocalTranscriberApp {
                 }
                 .to_owned(),
                 repairable && runtime_action.enabled && !mutation_blocked,
+                false,
                 repairable,
                 mutation_block_reason
                     .clone()
@@ -8932,6 +8953,7 @@ impl LocalTranscriberApp {
         } else {
             (
                 "Not installed".to_owned(),
+                false,
                 false,
                 false,
                 Some("Install this model before using it.".to_owned()),
@@ -8961,6 +8983,7 @@ impl LocalTranscriberApp {
                 && supports_managed_install(model),
             primary_action_label,
             primary_action_enabled,
+            primary_action_installs_upgrade,
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
             cancel_supported: self.artifact_installations.contains_key(&model.id),
@@ -9166,6 +9189,15 @@ impl LocalTranscriberApp {
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
+                {
+                    self.start_model_download(&model);
+                }
+            }
+            ScreenAction::UpgradeModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    && config::model_needs_pinned_gguf_migration(&self.config, &model)
                 {
                     self.start_model_download(&model);
                 }
@@ -10226,6 +10258,7 @@ impl LocalTranscriberApp {
             ScreenAction::None
             | ScreenAction::SelectModel(_)
             | ScreenAction::InstallModel(_)
+            | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::ShowModelDetails(_)
             | ScreenAction::RequestModelRemoval(_)
@@ -15336,6 +15369,42 @@ mod layout_tests {
             Some("This model is already active.")
         );
         let _ = fs::remove_file(base_fixture);
+    }
+
+    #[test]
+    fn legacy_model_projection_exposes_upgrade_without_changing_its_stable_id() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-upgrade-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy = root.join("external").join("ggml-small.en.bin");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_small_en".to_owned();
+        app.config
+            .general
+            .model_paths
+            .insert("whisper_cpp_small_en".to_owned(), legacy.clone());
+        config::normalize_config(&mut app.config);
+        let model = config::selected_model(&app.config).unwrap();
+
+        let projected = app.model_management_view_model(&model, None);
+
+        assert_eq!(projected.id, "whisper_cpp_small_en");
+        assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.primary_action_enabled);
+        assert!(projected.primary_action_installs_upgrade);
+        assert!(!projected.primary_action_repairs_runtime);
+        assert!(legacy.is_file());
+        assert_eq!(
+            app.config.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

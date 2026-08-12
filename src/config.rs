@@ -725,10 +725,15 @@ pub(crate) fn model_needs_pinned_gguf_migration(config: &AppConfig, model: &SttM
     let Some(primary) = downloaded_model_path(config, model) else {
         return false;
     };
-    let Some(legacy) = legacy_downloaded_model_path(config, model) else {
+    let Some(legacy) = crate::model_catalog::runtime_model_manifest(
+        &crate::transcription::ModelId::new(&model.id),
+    )
+    .and_then(|manifest| manifest.legacy_ggml_artifact) else {
         return false;
     };
-    model.local_path.as_deref() == Some(legacy.as_path()) && legacy != primary
+    model.local_path.as_ref().is_some_and(|path| {
+        path != &primary && path.file_name().is_some_and(|name| name == legacy.filename)
+    })
 }
 
 pub fn managed_runtime_path(config: &AppConfig, backend: &str) -> Option<PathBuf> {
@@ -1638,6 +1643,7 @@ mod tests {
             managed_model_path(&config, &model).as_deref(),
             Some(legacy.as_path())
         );
+        assert!(model_needs_pinned_gguf_migration(&config, &model));
         assert!(legacy.is_file());
 
         let _ = fs::remove_dir_all(root);

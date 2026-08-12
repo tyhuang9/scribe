@@ -358,6 +358,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
     match action {
         ScreenAction::None
         | ScreenAction::InstallModel(_)
+        | ScreenAction::UpgradeModel(_)
         | ScreenAction::CancelModelInstall(_)
         | ScreenAction::RepairModelRuntime(_)
         | ScreenAction::MaintainModelRuntime(_)

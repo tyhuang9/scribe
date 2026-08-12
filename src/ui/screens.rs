@@ -239,6 +239,7 @@ pub(crate) enum ScreenAction {
     ClearComparisonReference,
     SelectModel(String),
     InstallModel(String),
+    UpgradeModel(String),
     CancelModelInstall(String),
     RepairModelRuntime(String),
     MaintainModelRuntime(String),
@@ -1557,6 +1558,16 @@ fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCa
     })
 }
 
+fn local_model_primary_action(model: &ModelViewModel) -> ScreenAction {
+    if model.primary_action_installs_upgrade {
+        ScreenAction::UpgradeModel(model.id.clone())
+    } else if model.primary_action_repairs_runtime {
+        ScreenAction::RepairModelRuntime(model.id.clone())
+    } else {
+        ScreenAction::SelectModel(model.id.clone())
+    }
+}
+
 fn render_model_card(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
@@ -1576,11 +1587,7 @@ fn render_model_card(
     );
     let (primary_action, primary_enabled, disabled_reason) = match card {
         ModelCard::Local(model) if model.installed => (
-            Some(if model.primary_action_repairs_runtime {
-                ScreenAction::RepairModelRuntime(model.id.clone())
-            } else {
-                ScreenAction::SelectModel(model.id.clone())
-            }),
+            Some(local_model_primary_action(model)),
             model.primary_action_enabled,
             model.primary_action_disabled_reason.as_deref(),
         ),
@@ -2947,11 +2954,7 @@ fn models(
                             primary.clone().on_hover_text(reason);
                         }
                         if primary.clicked() {
-                            action = if model.primary_action_repairs_runtime {
-                                ScreenAction::RepairModelRuntime(model.id.clone())
-                            } else {
-                                ScreenAction::SelectModel(model.id.clone())
-                            };
+                            action = local_model_primary_action(model);
                         }
                         let remove_reason = if model.active {
                             Some("Select another ready model before removing the active model.")
@@ -5762,6 +5765,23 @@ mod tests {
         assert_eq!(
             ModelCard::Local(&runtime_unavailable).primary_verb(),
             "Runtime unavailable"
+        );
+    }
+
+    #[test]
+    fn legacy_model_upgrade_primary_dispatches_upgrade_action() {
+        let model = ModelViewModel {
+            id: "whisper_cpp_small_en".into(),
+            installed: true,
+            primary_action_label: "Upgrade model".into(),
+            primary_action_enabled: true,
+            primary_action_installs_upgrade: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            local_model_primary_action(&model),
+            ScreenAction::UpgradeModel("whisper_cpp_small_en".into())
         );
     }
 

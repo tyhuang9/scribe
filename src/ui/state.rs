@@ -271,6 +271,7 @@ pub(crate) struct ModelViewModel {
     pub install_action_enabled: bool,
     pub primary_action_label: String,
     pub primary_action_enabled: bool,
+    pub primary_action_installs_upgrade: bool,
     pub primary_action_repairs_runtime: bool,
     pub primary_action_disabled_reason: Option<String>,
     pub cancel_supported: bool,
