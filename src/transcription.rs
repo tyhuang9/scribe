@@ -33,7 +33,10 @@ use crate::installations::{
 pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
-use crate::model_catalog::{model_descriptor, normal_model_descriptors, runtime_model_manifest};
+use crate::model_catalog::{
+    model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
+    runtime_model_manifest,
+};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
@@ -288,15 +291,19 @@ impl InstallationCandidate {
         model_path: PathBuf,
         runtime_package_root: Option<PathBuf>,
     ) -> Result<Self> {
-        let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
-            anyhow!("model {model_id} has no normalized pinned artifact manifest")
-        })?;
+        let manifest =
+            runtime_artifact_manifest_for_path(&model_id, &model_path).ok_or_else(|| {
+                anyhow!(
+                    "model {model_id} has no pinned artifact manifest for {}",
+                    model_path.display()
+                )
+            })?;
         Ok(Self {
             model_id,
             model_path,
             runtime_package_root,
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256.to_owned(),
+            expected_size_bytes: manifest.size_bytes,
+            expected_sha256: manifest.sha256.to_owned(),
         })
     }
 
@@ -1088,18 +1095,19 @@ impl TranscriptionService {
         let path = model
             .local_path
             .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
-        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
+        let manifest = runtime_artifact_manifest_for_path(model_id, &path).ok_or_else(|| {
             anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for verification",
-                model.name
+                "model {} has no pinned size and SHA-256 evidence for {}",
+                model.name,
+                path.display()
             )
         })?;
         let runtime_model = RuntimeModel {
             id: model_id.clone(),
             path,
             package_root: Some(package_root),
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256.to_owned(),
+            expected_size_bytes: manifest.size_bytes,
+            expected_sha256: manifest.sha256.to_owned(),
         };
         if let Some(package_root) = runtime_model.package_root.as_deref() {
             verify_primary_runtime_package_tree(package_root)?;
@@ -1134,20 +1142,18 @@ impl TranscriptionService {
             .local_path
             .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
         let imported_artifact = config::imported_gguf_artifact(&self.config, model_id.as_str());
-        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
-            anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for verification",
-                model.name
-            )
-        });
         let (expected_size_bytes, expected_sha256) = if let Some(artifact) = imported_artifact {
             (artifact.expected_size_bytes, artifact.expected_sha256)
         } else {
-            let manifest = manifest?;
-            (
-                manifest.artifact_size_bytes,
-                manifest.artifact_sha256.to_owned(),
-            )
+            let artifact =
+                runtime_artifact_manifest_for_path(model_id, &path).ok_or_else(|| {
+                    anyhow!(
+                        "model {} has no pinned artifact for {}",
+                        model.name,
+                        path.display()
+                    )
+                })?;
+            (artifact.size_bytes, artifact.sha256.to_owned())
         };
         crate::installations::verify_file(&path, expected_size_bytes, &expected_sha256)
             .map_err(|error| anyhow!("model integrity verification failed: {error}"))
@@ -1640,16 +1646,15 @@ impl TranscriptionService {
         } else if let Some(artifact) = imported_artifact {
             (artifact.expected_size_bytes, artifact.expected_sha256)
         } else {
-            let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
-                anyhow!(
-                    "model {} has no pinned size and SHA-256 evidence for in-process native loading",
-                    model.name
-                )
-            })?;
-            (
-                manifest.artifact_size_bytes,
-                manifest.artifact_sha256.to_owned(),
-            )
+            let artifact =
+                runtime_artifact_manifest_for_path(&model_id, &path).ok_or_else(|| {
+                    anyhow!(
+                        "model {} has no pinned size and SHA-256 evidence for {}",
+                        model.name,
+                        path.display()
+                    )
+                })?;
+            (artifact.size_bytes, artifact.sha256.to_owned())
         };
         Ok(RuntimeModel {
             id: model.id.into(),

@@ -710,8 +710,12 @@ pub(crate) fn legacy_downloaded_model_path(
     model: &SttModelInfo,
 ) -> Option<PathBuf> {
     crate::model_catalog::runtime_model_manifest(&crate::transcription::ModelId::new(&model.id))
-        .and_then(|manifest| manifest.legacy_ggml_filename)
-        .map(|filename| model_storage_dir(config).join("whisper.cpp").join(filename))
+        .and_then(|manifest| manifest.legacy_ggml_artifact)
+        .map(|artifact| {
+            model_storage_dir(config)
+                .join("whisper.cpp")
+                .join(artifact.filename)
+        })
 }
 
 /// Reports whether a stable catalog ID still resolves to its retained GGML

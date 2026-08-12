@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -217,7 +217,17 @@ pub(crate) struct RuntimeModelManifest {
     pub(crate) artifact_size_bytes: u64,
     pub(crate) artifact_storage_estimate: &'static str,
     pub(crate) artifact_sha256: &'static str,
-    pub(crate) legacy_ggml_filename: Option<&'static str>,
+    pub(crate) legacy_ggml_artifact: Option<RuntimeArtifactManifest>,
+}
+
+/// Immutable integrity facts for an artifact the runtime may resolve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeArtifactManifest {
+    pub(crate) repository: &'static str,
+    pub(crate) revision: &'static str,
+    pub(crate) filename: &'static str,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: &'static str,
 }
 
 const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
@@ -458,10 +468,38 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
             artifact_size_bytes: manifest.artifact.size_bytes,
             artifact_storage_estimate: manifest.storage_guidance,
             artifact_sha256: manifest.artifact.sha256,
-            legacy_ggml_filename: manifest
-                .legacy_ggml_artifact
-                .map(|artifact| artifact.filename),
+            legacy_ggml_artifact: manifest.legacy_ggml_artifact.map(runtime_artifact),
         })
+}
+
+pub(crate) fn runtime_artifact_manifest_for_path(
+    id: &ModelId,
+    path: &Path,
+) -> Option<RuntimeArtifactManifest> {
+    let manifest = runtime_model_manifest(id)?;
+    let filename = path.file_name()?.to_str()?;
+    if filename == manifest.artifact_filename {
+        return Some(RuntimeArtifactManifest {
+            repository: manifest.artifact_repository,
+            revision: manifest.artifact_revision,
+            filename: manifest.artifact_filename,
+            size_bytes: manifest.artifact_size_bytes,
+            sha256: manifest.artifact_sha256,
+        });
+    }
+    manifest
+        .legacy_ggml_artifact
+        .filter(|artifact| artifact.filename == filename)
+}
+
+const fn runtime_artifact(artifact: ArtifactManifest) -> RuntimeArtifactManifest {
+    RuntimeArtifactManifest {
+        repository: artifact.repository,
+        revision: artifact.revision,
+        filename: artifact.filename,
+        size_bytes: artifact.size_bytes,
+        sha256: artifact.sha256,
+    }
 }
 
 /// Every normalized catalog artifact is loaded by the embedded runtime.
@@ -881,6 +919,57 @@ mod tests {
     }
 
     #[test]
+    fn resolved_artifact_path_selects_the_exact_q8_or_legacy_integrity_pin() {
+        for (id, filename, size_bytes, sha256) in [
+            (
+                "whisper_cpp_base_en",
+                "ggml-base.en.bin",
+                147_964_211,
+                "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+            ),
+            (
+                "whisper_cpp_small_en",
+                "ggml-small.en.bin",
+                487_614_201,
+                "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+            ),
+            (
+                "whisper_cpp_medium_en",
+                "ggml-medium.en.bin",
+                1_533_774_781,
+                "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+            ),
+        ] {
+            let artifact =
+                runtime_artifact_manifest_for_path(&ModelId::new(id), Path::new(filename)).unwrap();
+            assert_eq!(
+                (artifact.filename, artifact.size_bytes, artifact.sha256),
+                (filename, size_bytes, sha256)
+            );
+            assert_eq!(artifact.repository, "ggerganov/whisper.cpp");
+            assert_eq!(artifact.revision, WHISPER_CPP_REVISION);
+        }
+
+        let artifact = runtime_artifact_manifest_for_path(
+            &ModelId::new("whisper_cpp_base_en"),
+            Path::new("whisper-base.en-Q8_0.gguf"),
+        )
+        .unwrap();
+        assert_eq!(artifact.size_bytes, 84_886_208);
+        assert_eq!(
+            artifact.sha256,
+            "3b46ca40bccbf7609c68d88a36d96077a04ca7c87f2060ede06f129fac3e7652"
+        );
+        assert!(
+            runtime_artifact_manifest_for_path(
+                &ModelId::new("whisper_cpp_base_en"),
+                Path::new("untrusted.bin"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn descriptor_exposes_the_catalog_recommendation() {
         let base = model_descriptor(&ModelId::new("whisper_cpp_base_en")).unwrap();
         let tiny = model_descriptor(&ModelId::new("whisper_cpp_tiny_en")).unwrap();
@@ -1119,7 +1208,12 @@ mod tests {
             assert_eq!(manifest.artifact_filename, filename);
             assert_eq!(manifest.artifact_size_bytes, size_bytes);
             assert_eq!(manifest.artifact_sha256, sha256);
-            assert_eq!(manifest.legacy_ggml_filename, Some(legacy_filename));
+            assert_eq!(
+                manifest
+                    .legacy_ggml_artifact
+                    .map(|artifact| artifact.filename),
+                Some(legacy_filename)
+            );
         }
     }
 
@@ -1160,7 +1254,7 @@ mod tests {
             manifest.artifact_sha256,
             "3bfa6200aa12a21409445401f7871b5c733546dc45a29eb4871fcb3c7954e08b"
         );
-        assert_eq!(manifest.legacy_ggml_filename, None);
+        assert_eq!(manifest.legacy_ggml_artifact, None);
     }
 
     #[test]
