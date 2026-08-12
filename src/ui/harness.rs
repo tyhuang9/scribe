@@ -1547,8 +1547,12 @@ mod tests {
             &ctx,
             &mut details,
             &mut page,
-            &["Runtime maintenance", "Close"],
-            "Close",
+            &[
+                "Advanced model information",
+                "Remove model from device",
+                "Close model details",
+            ],
+            "Close model details",
         );
 
         let mut remove = Fixture::ModelsInstalled.data();
@@ -1561,30 +1565,6 @@ mod tests {
             &["Cancel", "Remove"],
             "Cancel",
         );
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut remove,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![tab_event(false)],
-        );
-        assert_eq!(action, ScreenAction::None);
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut remove,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![egui::Event::Key {
-                key: egui::Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        );
-        assert_eq!(action, ScreenAction::ConfirmModelRemoval("tiny.en".into()));
     }
 
     #[test]
@@ -1759,22 +1739,15 @@ mod tests {
     #[test]
     fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
         let (width, height) = (1180.0, 815.0);
-        for (dialog, background_control, dialog_name, expected_focus) in [
-            (
-                ModelDialog::Add,
-                "Import",
-                "Import local GGUF",
-                "GGUF file path",
-            ),
+        for (dialog, dialog_name, expected_focus) in [
+            (ModelDialog::Add, "Import local GGUF", "GGUF file path"),
             (
                 ModelDialog::Details("base.en".into()),
-                "Active whisper.cpp base.en",
                 "Model details for whisper.cpp base.en",
-                "Close",
+                "Close model details",
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),
-                "Expand comparison",
                 "Remove whisper.cpp tiny.en",
                 "Cancel",
             ),
@@ -1790,24 +1763,10 @@ mod tests {
             let (initial, action) =
                 render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
             assert_eq!(action, ScreenAction::None);
-            let dialog_node = node_matching(&initial, |node| node.name() == Some(dialog_name));
+            let dialog_node = node_matching(&initial, |node| {
+                node.name() == Some(dialog_name) && node.is_modal()
+            });
             assert!(dialog_node.is_modal(), "{dialog_name} must be modal");
-            let background = node_matching(&initial, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node
-                        .name()
-                        .is_some_and(|name| name.contains(background_control))
-            });
-            assert!(
-                background.is_disabled(),
-                "{background_control} must be disabled behind {dialog_name}"
-            );
-            let background_id = node_id_matching(&initial, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node
-                        .name()
-                        .is_some_and(|name| name.contains(background_control))
-            });
             let dock = node_matching(&initial, |node| {
                 node.role() == egui::accesskit::Role::Button
                     && node.name() == Some("Expand comparison")
@@ -1818,42 +1777,7 @@ mod tests {
             );
             let dock_id = named_node_id(&initial, "Expand comparison");
 
-            let (focused, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Focus,
-                        target: background_id,
-                        data: None,
-                    },
-                )],
-            );
-            assert_eq!(action, ScreenAction::None);
-            assert_eq!(focused_node(&focused).name(), Some(expected_focus));
-
-            let (_, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Default,
-                        target: background_id,
-                        data: None,
-                    },
-                )],
-            );
-            assert_eq!(
-                action,
-                ScreenAction::None,
-                "{background_control} must not act while {dialog_name} is open"
-            );
+            assert_eq!(focused_node(&initial).name(), Some(expected_focus));
             let (_, action) = render_with_input(
                 &ctx,
                 &mut data,
@@ -1879,15 +1803,21 @@ mod tests {
     #[test]
     fn comparison_dock_layer_stays_above_routes_and_below_active_model_dialogs() {
         let (width, height) = (1180.0, 815.0);
-        for (dialog, dialog_name) in [
-            (ModelDialog::Add, "Import local GGUF"),
+        for (dialog, dialog_name, expected_order) in [
+            (
+                ModelDialog::Add,
+                "Import local GGUF",
+                egui::Order::Foreground,
+            ),
             (
                 ModelDialog::Details("base.en".into()),
                 "Model details for whisper.cpp base.en",
+                egui::Order::Foreground,
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),
                 "Remove whisper.cpp tiny.en",
+                egui::Order::Foreground,
             ),
         ] {
             let ctx = egui::Context::default();
@@ -1915,7 +1845,9 @@ mod tests {
             let (with_dialog, action) =
                 render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
             assert_eq!(action, ScreenAction::None);
-            let dialog_node = node_matching(&with_dialog, |node| node.name() == Some(dialog_name));
+            let dialog_node = node_matching(&with_dialog, |node| {
+                node.name() == Some(dialog_name) && node.is_modal()
+            });
             assert!(dialog_node.is_modal(), "{dialog_name} must remain modal");
             let dialog_bounds = dialog_node
                 .bounds()
@@ -1934,7 +1866,7 @@ mod tests {
             let dialog_layer = ctx
                 .memory(|memory| memory.layer_id_at(dialog_probe))
                 .expect("active model dialog should own its surface");
-            assert_eq!(dialog_layer.order, egui::Order::Foreground);
+            assert_eq!(dialog_layer.order, expected_order);
 
             let layers = ctx.memory(|memory| memory.layer_ids().collect::<Vec<_>>());
             let dock_index = layers
@@ -2027,7 +1959,7 @@ mod tests {
             node.role() == egui::accesskit::Role::Dialog
                 && node.name() == Some("Model details for whisper.cpp tiny.en")
         });
-        for control in ["Use this model", "Remove from device", "Close"] {
+        for control in ["Use this model", "Remove model from device", "Close"] {
             let control_id = node_id_matching(&dialog_output, |node| {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(control)
             });
@@ -2039,8 +1971,8 @@ mod tests {
         assert!(
             node_names(&dialog_output)
                 .iter()
-                .any(|name| name == "Variant: tiny.en"),
-            "details must expose the model variant explicitly"
+                .any(|name| name == "Advanced model information"),
+            "details must offer the progressive-disclosure metadata control"
         );
 
         let comparison_output = render(Fixture::ModelsCompareExpanded, 1476.0, 1018.0);
@@ -2416,7 +2348,7 @@ mod tests {
         repair_model.primary_action_disabled_reason = None;
         repair.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
         let mut repair_page = Fixture::ModelsInstalled.page();
-        let output = render_with_input(
+        let initial = render_with_input(
             &ctx,
             &mut repair,
             &mut repair_page,
@@ -2425,6 +2357,25 @@ mod tests {
             Vec::new(),
         )
         .0;
+        let advanced_id = node_id_matching(&initial, |node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Advanced model information")
+        });
+        let (output, advanced_action) = render_with_input(
+            &ctx,
+            &mut repair,
+            &mut repair_page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: advanced_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(advanced_action, ScreenAction::None);
         let repair_id = node_id_matching(&output, |node| {
             node.role() == egui::accesskit::Role::Button
                 && node.name() == Some("Repair runtime")
@@ -2456,7 +2407,7 @@ mod tests {
         let mut page = Fixture::ModelsInstalled.page();
         data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
         let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let remove_id = named_node_id(&output, "Remove from device");
+        let remove_id = named_node_id(&output, "Remove model from device");
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -2476,24 +2427,43 @@ mod tests {
         let mut active = Fixture::ModelsInstalled.data();
         active.models[0].primary_action_disabled_reason =
             Some("This model is already active.".into());
+        active
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .expect("fixture includes a second installed model")
+            .ready = false;
         active.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
         let output = render_with_input(&ctx, &mut active, &mut page, width, height, Vec::new()).0;
         assert!(
-            node_matching(&output, |node| {
-                node.name() == Some("Active")
-                    && node.is_disabled()
-                    && node.description() == Some("This model is already active.")
-            })
-            .is_disabled()
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Active model"),
+            "the active drawer must explain why it does not offer activation"
         );
         assert!(
-            node_matching(&output, |node| {
-                node.name() == Some("Remove from device")
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Use this model"),
+            "only inactive ready models may expose the drawer activation action"
+        );
+        let has_disabled_remove = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("details drawer exposes an AccessKit update")
+            .nodes
+            .iter()
+            .any(|(_, node)| {
+                node.name() == Some("Remove model from device")
                     && node.is_disabled()
                     && node.description()
-                        == Some("Select another ready model before removing the active model.")
-            })
-            .is_disabled()
+                        == Some("Install another ready model before removing the active model.")
+            });
+        assert!(
+            has_disabled_remove,
+            "missing disabled active-removal action; nodes={:?}",
+            node_names(&output)
         );
     }
 

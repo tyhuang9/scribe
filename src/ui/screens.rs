@@ -1733,6 +1733,7 @@ fn compact_model_icon_action(
     progress: Option<f32>,
 ) -> egui::Response {
     let colors = ui_palette(ui);
+    let enabled = enabled && ui.is_enabled();
     let (target, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let visual = egui::Rect::from_center_size(target.center(), Vec2::splat(36.0));
     let hovered = response.hovered() && enabled;
@@ -3127,7 +3128,6 @@ fn models(
     }
     match &management.dialog {
         Some(ModelDialog::Add) => {
-            let mut open = true;
             let mut focusable_controls = Vec::new();
             let mut initial_focus = None;
             let dialog_accessibility_id =
@@ -3140,14 +3140,16 @@ fn models(
             });
             let mut dialog = None;
             dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
-                dialog = egui::Window::new("Import local GGUF")
-                    .id(ui.make_persistent_id(("model-dialog", "add")))
-                    .collapsible(false)
-                    .resizable(false)
+                dialog = Some(egui::Area::new(ui.make_persistent_id(("model-dialog", "add")))
+                    .order(egui::Order::Foreground)
                     .enabled(true)
-                    .open(&mut open)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .movable(false)
                     .show(ui.ctx(), |ui| {
+                    Frame::window(ui.style()).show(ui, |ui| {
+                    ui.set_width(480.0);
+                    ui.label(RichText::new("Import local GGUF").heading());
+                    ui.add_space(8.0);
                     ui.set_enabled(true);
                     ui.label(
                         RichText::new(
@@ -3247,6 +3249,7 @@ fn models(
                         action = model_dialog_dismiss_action(management, remote_catalog);
                     }
                     });
+                    }));
             });
             contain_model_dialog_focus(
                 ui.ctx(),
@@ -3260,9 +3263,6 @@ fn models(
                     .accesskit_node_builder(dialog_accessibility_id, |builder| {
                         builder.set_bounds(accesskit_rect(dialog.response.rect));
                     });
-            }
-            if !open {
-                action = model_dialog_dismiss_action(management, remote_catalog);
             }
         }
         Some(ModelDialog::Details(id)) => {
@@ -3312,7 +3312,6 @@ fn models(
         }
         Some(ModelDialog::Remove(id)) => {
             if let Some(model) = models.iter().find(|model| &model.id == id) {
-                let mut open = true;
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
                 let dialog_accessibility_id =
@@ -3325,14 +3324,16 @@ fn models(
                 });
                 let mut dialog = None;
                 dialog_ctx.with_accessibility_parent(dialog_accessibility_id, || {
-                    dialog = egui::Window::new("Remove model?")
-                        .id(ui.make_persistent_id(("model-dialog", "remove", id)))
-                        .collapsible(false)
-                        .resizable(false)
+                    dialog = Some(egui::Area::new(ui.make_persistent_id(("model-dialog", "remove", id)))
+                        .order(egui::Order::Foreground)
                         .enabled(true)
-                        .open(&mut open)
                         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                        .movable(false)
                         .show(ui.ctx(), |ui| {
+                        Frame::window(ui.style()).show(ui, |ui| {
+                        ui.set_width(440.0);
+                        ui.label(RichText::new("Remove model?").heading());
+                        ui.add_space(8.0);
                         ui.set_enabled(true);
                         ui.label(format!("Remove {} from Scribe?", model.display_name));
                         if let Some(replacement_id) = management.removal_replacement.as_deref()
@@ -3361,6 +3362,7 @@ fn models(
                             if remove.clicked() { action = ScreenAction::ConfirmModelRemoval(model.id.clone()); }
                         });
                         });
+                        }));
                 });
                 contain_model_dialog_focus(
                     ui.ctx(),
@@ -3374,9 +3376,6 @@ fn models(
                         .accesskit_node_builder(dialog_accessibility_id, |builder| {
                             builder.set_bounds(accesskit_rect(dialog.response.rect));
                         });
-                }
-                if !open {
-                    action = ScreenAction::CloseModelDialog;
                 }
             }
         }
