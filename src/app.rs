@@ -8219,8 +8219,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetRestoreClipboardAfterInsert(_)
             | ScreenAction::SetPasteDelayMs(_)
             | ScreenAction::OpenModelSettings
-            | ScreenAction::SetHotkeyInput(_)
-            | ScreenAction::ApplyHotkey
             | ScreenAction::SetTheme(_)
             | ScreenAction::SetOverlayMode(_)
             | ScreenAction::SetVadEnabled(_)
@@ -9917,7 +9915,6 @@ impl LocalTranscriberApp {
             restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
             paste_delay_ms: self.config.output.paste_delay_ms,
             active_model_label,
-            hotkey_input: self.hotkey_input.clone(),
             hotkey_capture_active: self.capturing_hotkey,
             hotkey_capture_status: self.capturing_hotkey.then(|| self.status_message.clone()),
             theme_label: self.config.general.theme_mode.label().to_owned(),
@@ -10012,8 +10009,6 @@ impl LocalTranscriberApp {
                 self.save_config();
             }
             ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
-            ScreenAction::SetHotkeyInput(value) => self.hotkey_input = value,
-            ScreenAction::ApplyHotkey => self.apply_hotkey(),
             ScreenAction::SetTheme(value) => {
                 self.config.general.theme_mode = match value.as_str() {
                     "Light" => ThemeMode::Light,

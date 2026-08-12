@@ -557,8 +557,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::SetCloseToTray(value) => data.settings.close_to_tray = value,
         ScreenAction::OpenModelSettings => *page = AppPage::Models,
-        ScreenAction::SetHotkeyInput(value) => data.transcription.hotkey = value,
-        ScreenAction::ApplyHotkey => {}
         ScreenAction::SetTheme(value) => data.settings.theme_label = value,
         ScreenAction::SetOverlayMode(value) => data.settings.overlay_label = value,
         ScreenAction::SetRecordingMode(mode) => data.transcription.recording_mode = mode,
@@ -3845,7 +3843,7 @@ mod tests {
 
         let advanced = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
         let visible = node_names(&advanced);
-        assert!(visible.iter().any(|name| name == "Advanced settings"));
+        assert!(visible.iter().any(|name| name == "Voice detection"));
         assert!(visible.iter().any(|name| name == "Open model Playground"));
         assert!(!visible.iter().any(|name| name == "Back to Advanced"));
     }

@@ -121,7 +121,6 @@ pub(crate) struct RecordingSettingsView {
     pub restore_clipboard_after_insert: bool,
     pub paste_delay_ms: u64,
     pub active_model_label: String,
-    pub hotkey_input: String,
     pub hotkey_capture_active: bool,
     pub hotkey_capture_status: Option<String>,
     pub theme_label: String,
@@ -173,7 +172,6 @@ impl Default for RecordingSettingsView {
             restore_clipboard_after_insert: true,
             paste_delay_ms: 60,
             active_model_label: "No model selected".into(),
-            hotkey_input: "Ctrl+Shift+Space".into(),
             hotkey_capture_active: false,
             hotkey_capture_status: None,
             theme_label: "Light".into(),
@@ -272,8 +270,6 @@ pub(crate) enum ScreenAction {
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
     OpenModelSettings,
-    SetHotkeyInput(String),
-    ApplyHotkey,
     SetTheme(String),
     SetOverlayMode(String),
     SetRecordingMode(RecordingMode),
@@ -3776,8 +3772,8 @@ fn settings(
             SettingsTab::General | SettingsTab::Output => {
                 general_settings_panel(ui, settings, &mut action)
             }
-            SettingsTab::Advanced => advanced_settings_panel(ui, settings, &mut action),
-            SettingsTab::About => about_settings_panel(ui, settings, &mut action),
+            SettingsTab::Advanced => advanced_settings_panel(ui, state, settings, &mut action),
+            SettingsTab::About => about_settings_panel(ui, settings),
         }
     });
     ui.ctx()
@@ -3986,7 +3982,7 @@ fn recording_settings_panel(
                     builder.set_radio_group(radio_group.clone());
                 });
             }
-            compact_setting_row(ui, "Duration limit", true, |ui, label_id| {
+            compact_setting_row(ui, "Duration limit", false, |ui, label_id| {
                 let mut duration = settings.duration_seconds;
                 ComboBox::from_id_source("duration-limit")
                     .selected_text(&settings.duration_label)
@@ -4006,36 +4002,49 @@ fn recording_settings_panel(
                     *action = ScreenAction::SetDurationSeconds(duration);
                 }
             });
-            compact_setting_row(ui, "Visual feedback", false, |ui, _| {
-                let mut enabled = settings.provisional_feedback;
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    let response = settings_checkbox(
-                        ui,
-                        &mut enabled,
-                        "Show provisional words while recording",
-                    );
-                    if response.clicked() {
-                        *action = ScreenAction::ToggleProvisionalFeedback;
-                    }
-                    ui.label(
-                        RichText::new("Improves visual feedback but may use more CPU.")
-                            .small()
-                            .color(colors.muted_text),
-                    );
-                });
-            });
         });
     });
     ui.add_space(16.0);
-    card(ui, |ui| {
-        let audio_heading = ui.label(RichText::new("Audio input").strong());
-        ui.ctx()
-            .accesskit_node_builder(audio_heading.id, |builder| {
-                builder.set_role(egui::accesskit::Role::Heading);
-            });
-        ui.add_space(12.0);
+    settings_section(ui, "Recording input", |ui| {
         ui.add_enabled_ui(!recording_locked, |ui| {
+            compact_setting_row(ui, "Global record hotkey", true, |ui, _| {
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, key) in state
+                            .hotkey
+                            .split('+')
+                            .map(str::trim)
+                            .filter(|key| !key.is_empty())
+                            .enumerate()
+                        {
+                            if index > 0 {
+                                ui.label(RichText::new("+").color(colors.muted_text));
+                            }
+                            keycap(ui, key);
+                        }
+                        let capture_name = if settings.hotkey_capture_active {
+                            "Cancel hotkey capture"
+                        } else {
+                            "Change shortcut"
+                        };
+                        let capture = button(ui, capture_name, ButtonTone::Secondary);
+                        ui.ctx().accesskit_node_builder(capture.id, |builder| {
+                            builder.set_name(capture_name);
+                            builder.set_selected(settings.hotkey_capture_active);
+                        });
+                        if capture.clicked() {
+                            *action = ScreenAction::ChangeShortcut;
+                        }
+                    });
+                    if let Some(status) = &settings.hotkey_capture_status {
+                        let response = ui.label(status);
+                        ui.ctx().accesskit_node_builder(response.id, |builder| {
+                            builder.set_live(egui::accesskit::Live::Polite);
+                            builder.set_live_atomic();
+                        });
+                    }
+                });
+            });
             compact_setting_row(ui, "Device", true, |ui, label_id| {
                 let mut selected = settings.selected_audio_device.clone();
                 ComboBox::from_id_source("audio-device")
@@ -4092,51 +4101,73 @@ fn recording_settings_panel(
         }
     });
     ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Shortcut").strong());
-        ui.add_space(12.0);
+    settings_section(ui, "Transcription", |ui| {
         ui.add_enabled_ui(!recording_locked, |ui| {
-            compact_setting_row(ui, "Global record hotkey", false, |ui, _| {
-                for (index, key) in state
-                    .hotkey
-                    .split('+')
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .enumerate()
-                {
-                    if index > 0 {
-                        ui.label(RichText::new("+").color(colors.muted_text));
+            let mut preview = settings.provisional_feedback;
+            let _ = SettingsRow::show(ui, "Provisional transcription", true, |ui, _| {
+                ui.vertical(|ui| {
+                    if settings_checkbox(ui, &mut preview, "Use live provisional preview").changed()
+                    {
+                        *action = ScreenAction::ToggleProvisionalFeedback;
                     }
-                    keycap(ui, key);
-                }
-                let capture_name = if settings.hotkey_capture_active {
-                    "Cancel hotkey capture"
-                } else {
-                    "Change shortcut"
-                };
-                let capture = button(ui, capture_name, ButtonTone::Secondary);
-                ui.ctx().accesskit_node_builder(capture.id, |builder| {
-                    builder.set_name(capture_name);
-                    builder.set_selected(settings.hotkey_capture_active);
+                    ui.label(
+                        RichText::new(
+                            "Preview text remains inside Scribe until final transcription completes.",
+                        )
+                        .color(colors.muted_text),
+                    );
                 });
-                if capture.clicked() {
-                    *action = ScreenAction::ChangeShortcut;
-                }
             });
-            if let Some(status) = &settings.hotkey_capture_status {
-                let response = ui.label(status);
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
-                });
+            let mut streaming = settings.streaming_label.clone();
+            setting_row_with_separator(ui, "Streaming mode", true, |ui, label_id| {
+                ComboBox::from_id_source("streaming-mode")
+                    .selected_text(&streaming)
+                    .show_ui(ui, |ui| {
+                        for value in ["Auto", "Rolling preview", "Final text only"] {
+                            ui.selectable_value(&mut streaming, value.to_owned(), value);
+                        }
+                    })
+                    .response
+                    .labelled_by(label_id);
+            });
+            if streaming != settings.streaming_label {
+                *action = ScreenAction::SetStreamingMode(streaming);
+            }
+            let mut acceleration = settings.acceleration_label.clone();
+            setting_row(ui, "Transcription device", |ui, label_id| {
+                ComboBox::from_id_source("advanced-transcription-device-mode")
+                    .selected_text(&acceleration)
+                    .show_ui(ui, |ui| {
+                        for value in ["Auto", "GPU", "CPU only"] {
+                            ui.add_enabled_ui(value != "GPU" || settings.gpu_available, |ui| {
+                                ui.selectable_value(&mut acceleration, value.to_owned(), value);
+                            });
+                        }
+                    })
+                    .response
+                    .labelled_by(label_id);
+            });
+            if acceleration != settings.acceleration_label {
+                *action = ScreenAction::SetAcceleration(acceleration);
             }
         });
     });
-    ui.add_space(16.0);
-    settings_section(ui, "Advanced voice detection", |ui| {
+}
+
+fn voice_detection_settings_section(
+    ui: &mut egui::Ui,
+    state: &TranscriptionState,
+    settings: &RecordingSettingsView,
+    action: &mut ScreenAction,
+) {
+    let recording_locked = matches!(
+        state.phase,
+        TranscriptionPhase::Listening | TranscriptionPhase::Finalizing
+    );
+    settings_section(ui, "Voice detection", |ui| {
         ui.add_enabled_ui(!recording_locked, |ui| {
             let mut vad_enabled = settings.vad_enabled;
-            let _ = SettingsRow::show(ui, "Voice detection", false, |ui, _| {
+            let _ = SettingsRow::show(ui, "Automatic stop", false, |ui, _| {
                 if settings_checkbox(
                     ui,
                     &mut vad_enabled,
@@ -4191,7 +4222,7 @@ fn general_settings_panel(
 ) {
     settings_section(ui, "General settings", |ui| {
         let mut close_to_tray = settings.close_to_tray;
-        let _ = SettingsRow::show(ui, "Window behavior", false, |ui, _| {
+        let _ = SettingsRow::show(ui, "Window behavior", true, |ui, _| {
             ui.vertical(|ui| {
                 if settings_checkbox(ui, &mut close_to_tray, "Close to tray").changed() {
                     *action = ScreenAction::SetCloseToTray(close_to_tray);
@@ -4202,11 +4233,7 @@ fn general_settings_panel(
                 );
             });
         });
-    });
-    ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Active model").strong());
-        ui.horizontal(|ui| {
+        let _ = SettingsRow::show(ui, "Active model", false, |ui, _| {
             ui.label(&settings.active_model_label);
             if button(ui, "Manage models", ButtonTone::Secondary).clicked() {
                 *action = ScreenAction::OpenModelSettings;
@@ -4214,43 +4241,7 @@ fn general_settings_panel(
         });
     });
     ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Shortcuts").strong());
-        let mut hotkey = settings.hotkey_input.clone();
-        ui.horizontal(|ui| {
-            let label = ui.label("Record toggle");
-            ui.add(egui::TextEdit::singleline(&mut hotkey).desired_width(240.0))
-                .labelled_by(label.id);
-            if button(ui, "Apply", ButtonTone::Secondary).clicked() {
-                *action = ScreenAction::ApplyHotkey;
-            } else if hotkey != settings.hotkey_input {
-                *action = ScreenAction::SetHotkeyInput(hotkey);
-            }
-            let capture_name = if settings.hotkey_capture_active {
-                "Cancel hotkey capture"
-            } else {
-                "Capture hotkey"
-            };
-            let capture = button(ui, capture_name, ButtonTone::Secondary);
-            ui.ctx().accesskit_node_builder(capture.id, |builder| {
-                builder.set_name(capture_name);
-                builder.set_selected(settings.hotkey_capture_active);
-            });
-            if capture.clicked() {
-                *action = ScreenAction::ChangeShortcut;
-            }
-        });
-        if let Some(status) = &settings.hotkey_capture_status {
-            let response = ui.label(status);
-            ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_live(egui::accesskit::Live::Polite);
-                builder.set_live_atomic();
-            });
-        }
-    });
-    ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Appearance").strong());
+    settings_section(ui, "Appearance", |ui| {
         let mut theme = settings.theme_label.clone();
         setting_row_with_separator(ui, "Theme", true, |ui, label_id| {
             ComboBox::from_id_source("theme-mode")
@@ -4267,24 +4258,41 @@ fn general_settings_panel(
             *action = ScreenAction::SetTheme(theme);
         }
         let mut overlay = settings.overlay_label.clone();
-        setting_row_with_separator(ui, "Dictation overlay", false, |ui, label_id| {
-            ui.add_enabled_ui(settings.overlay_available, |ui| {
-                ComboBox::from_id_source("overlay-mode")
-                    .selected_text(&overlay)
-                    .show_ui(ui, |ui| {
-                        for value in ["Live", "Minimal", "Off"] {
-                            ui.selectable_value(&mut overlay, value.to_owned(), value);
-                        }
-                    })
-                    .response
-                    .labelled_by(label_id);
+        setting_row_with_separator(ui, "Dictation overlay", true, |ui, label_id| {
+            ui.vertical(|ui| {
+                ui.add_enabled_ui(settings.overlay_available, |ui| {
+                    ComboBox::from_id_source("overlay-mode")
+                        .selected_text(&overlay)
+                        .show_ui(ui, |ui| {
+                            for value in ["Live", "Minimal", "Off"] {
+                                ui.selectable_value(&mut overlay, value.to_owned(), value);
+                            }
+                        })
+                        .response
+                        .labelled_by(label_id);
+                });
+                if !settings.overlay_available {
+                    ui.label(RichText::new("The overlay is unavailable because focus safety is not verified on this platform.").color(ui_palette(ui).warning));
+                }
             });
         });
         if overlay != settings.overlay_label {
             *action = ScreenAction::SetOverlayMode(overlay);
         }
-        if !settings.overlay_available {
-            ui.label(RichText::new("The overlay is unavailable because focus safety is not verified on this platform.").color(ui_palette(ui).warning));
+        let mut position = settings.overlay_position_label.clone();
+        setting_row(ui, "Overlay position", |ui, label_id| {
+            ComboBox::from_id_source("overlay-position")
+                .selected_text(&position)
+                .show_ui(ui, |ui| {
+                    for value in ["Top", "Bottom"] {
+                        ui.selectable_value(&mut position, value.to_owned(), value);
+                    }
+                })
+                .response
+                .labelled_by(label_id);
+        });
+        if position != settings.overlay_position_label {
+            *action = ScreenAction::SetOverlayPosition(position);
         }
     });
     ui.add_space(16.0);
@@ -4338,132 +4346,25 @@ fn output_settings_panel(
     });
 }
 
-fn about_settings_panel(
-    ui: &mut egui::Ui,
-    settings: &RecordingSettingsView,
-    action: &mut ScreenAction,
-) {
+fn about_settings_panel(ui: &mut egui::Ui, settings: &RecordingSettingsView) {
     settings_section(ui, "Application", |ui| {
         about_page(
             ui,
             Path::new(&settings.about_model_directory),
             settings.about_settings_path.as_deref().map(Path::new),
         );
-        ui.label(
-            format!(
-                "{} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors.",
-                settings.diagnostic_session_count
-            ),
-        );
-        if !settings.diagnostics.is_empty() {
-            ui.separator();
-            ui.label(RichText::new("Diagnostics").strong());
-            for line in &settings.diagnostics {
-                ui.label(line);
-            }
-        }
-        let export = ui.add_enabled(
-            settings.can_export_diagnostics,
-            egui::Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
-        );
-        if !settings.can_export_diagnostics {
-            ui.ctx().accesskit_node_builder(export.id, |builder| {
-                builder.set_disabled();
-                builder.set_description(
-                    "Unavailable because the platform settings directory cannot provide a private export location.",
-                );
-            });
-            ui.label(RichText::new("The platform settings directory is unavailable, so Scribe cannot choose a private export location.").color(ui_palette(ui).muted_text));
-        }
-        if export.clicked() {
-            *action = ScreenAction::ExportRedactedDiagnostics;
-        }
     });
 }
 
 fn advanced_settings_panel(
     ui: &mut egui::Ui,
+    state: &TranscriptionState,
     settings: &RecordingSettingsView,
     action: &mut ScreenAction,
 ) {
-    settings_section(ui, "Advanced settings", |ui| {
-        let mut preview = settings.provisional_feedback;
-        let _ = SettingsRow::show(ui, "Transcription preview", false, |ui, _| {
-            ui.vertical(|ui| {
-                if settings_checkbox(ui, &mut preview, "Use live provisional preview").changed() {
-                    *action = ScreenAction::ToggleProvisionalFeedback;
-                }
-                ui.label(
-                    RichText::new(
-                        "Preview text remains inside Scribe until final transcription completes.",
-                    )
-                    .color(ui_palette(ui).muted_text),
-                );
-            });
-        });
-    });
+    voice_detection_settings_section(ui, state, settings, action);
     ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Live transcription").strong());
-        let mut streaming = settings.streaming_label.clone();
-        setting_row(ui, "Mode", |ui, label_id| {
-            ComboBox::from_id_source("streaming-mode")
-                .selected_text(&streaming)
-                .show_ui(ui, |ui| {
-                    for value in ["Auto", "Rolling preview", "Final text only"] {
-                        ui.selectable_value(&mut streaming, value.to_owned(), value);
-                    }
-                })
-                .response
-                .labelled_by(label_id);
-        });
-        if streaming != settings.streaming_label {
-            *action = ScreenAction::SetStreamingMode(streaming);
-        }
-    });
-    ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Performance").strong());
-        let mut acceleration = settings.acceleration_label.clone();
-        setting_row(ui, "Transcription device", |ui, label_id| {
-            ComboBox::from_id_source("advanced-transcription-device-mode")
-                .selected_text(&acceleration)
-                .show_ui(ui, |ui| {
-                    for value in ["Auto", "GPU", "CPU only"] {
-                        ui.add_enabled_ui(value != "GPU" || settings.gpu_available, |ui| {
-                            ui.selectable_value(&mut acceleration, value.to_owned(), value);
-                        });
-                    }
-                })
-                .response
-                .labelled_by(label_id);
-        });
-        if acceleration != settings.acceleration_label {
-            *action = ScreenAction::SetAcceleration(acceleration);
-        }
-    });
-    ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("Overlay").strong());
-        let mut position = settings.overlay_position_label.clone();
-        setting_row(ui, "Overlay position", |ui, label_id| {
-            ComboBox::from_id_source("overlay-position")
-                .selected_text(&position)
-                .show_ui(ui, |ui| {
-                    for value in ["Top", "Bottom"] {
-                        ui.selectable_value(&mut position, value.to_owned(), value);
-                    }
-                })
-                .response
-                .labelled_by(label_id);
-        });
-        if position != settings.overlay_position_label {
-            *action = ScreenAction::SetOverlayPosition(position);
-        }
-    });
-    ui.add_space(16.0);
-    card(ui, |ui| {
-        ui.label(RichText::new("History and privacy").strong());
+    settings_section(ui, "History and privacy", |ui| {
         if settings.history_locked {
             let notice = ui.label(
                 RichText::new(
@@ -4478,14 +4379,39 @@ fn advanced_settings_panel(
         }
         ui.add_enabled_ui(!settings.history_locked, |ui| {
             let mut mode = settings.history_mode_label.clone();
-            setting_row(ui, "History storage", |ui, label_id| { let response = ComboBox::from_id_source("history-storage-mode").selected_text(&mode).show_ui(ui, |ui| { for value in ["Off", "Transcript only", "Transcript and audio"] { ui.selectable_value(&mut mode, value.to_owned(), value); } }).response.labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); });
-            if mode != settings.history_mode_label { *action = ScreenAction::SetHistoryMode(mode.clone()); }
+            let _ = SettingsRow::show(ui, "History storage", false, |ui, label_id| {
+                let response = ComboBox::from_id_source("history-storage-mode")
+                    .selected_text(&mode)
+                    .show_ui(ui, |ui| {
+                        for value in ["Off", "Transcript only", "Transcript and audio"] {
+                            ui.selectable_value(&mut mode, value.to_owned(), value);
+                        }
+                    })
+                    .response
+                    .labelled_by(label_id);
+                describe_history_lock(ui, &response, settings.history_locked);
+            });
+            if mode != settings.history_mode_label {
+                *action = ScreenAction::SetHistoryMode(mode.clone());
+            }
             if mode != "Off" {
+                ui.separator();
                 let mut maximum = settings.max_history_entries as i64;
-                setting_row(ui, "Maximum unpinned entries", |ui, label_id| { let response = ui.add_sized([96.0, 44.0], egui::DragValue::new(&mut maximum).clamp_range(1..=1_000)).labelled_by(label_id); describe_history_lock(ui, &response, settings.history_locked); if response.changed() { *action = ScreenAction::SetMaxHistoryEntries(maximum as u32); } });
-                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, action, ScreenAction::SetTranscriptRetentionDays);
+                let _ = SettingsRow::show(ui, "Maximum unpinned entries", true, |ui, label_id| {
+                    let response = ui
+                        .add_sized(
+                            [96.0, 44.0],
+                            egui::DragValue::new(&mut maximum).clamp_range(1..=1_000),
+                        )
+                        .labelled_by(label_id);
+                    describe_history_lock(ui, &response, settings.history_locked);
+                    if response.changed() {
+                        *action = ScreenAction::SetMaxHistoryEntries(maximum as u32);
+                    }
+                });
+                optional_retention_control(ui, "Transcript age limit", "Keep transcripts until deleted", settings.transcript_retention_days, settings.history_locked, true, action, ScreenAction::SetTranscriptRetentionDays);
                 if mode == "Transcript and audio" {
-                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, action, ScreenAction::SetAudioRetentionDays);
+                    optional_retention_control(ui, "Audio age limit", "Keep retained audio until its entry is deleted", settings.audio_retention_days, settings.history_locked, true, action, ScreenAction::SetAudioRetentionDays);
                 }
                 let mut identity = settings.store_application_identity;
                 let _ = SettingsRow::show(ui, "Application identity", false, |ui, _| {
@@ -4497,10 +4423,10 @@ fn advanced_settings_panel(
         });
     });
     ui.add_space(16.0);
-    settings_section(ui, "Developer", |ui| {
+    settings_section(ui, "Developer and diagnostics", |ui| {
         let mut enabled = settings.debug_mode;
         let mut playground = None;
-        let _ = SettingsRow::show(ui, "Developer tools", settings.debug_mode, |ui, _| {
+        let _ = SettingsRow::show(ui, "Developer tools", false, |ui, _| {
             playground = Some(settings_checkbox(
                 ui,
                 &mut enabled,
@@ -4512,9 +4438,10 @@ fn advanced_settings_panel(
         if playground.changed() {
             *action = ScreenAction::SetDebugMode(enabled);
         }
-        if settings.debug_mode {
+        ui.separator();
+        if enabled {
             let mut open = None;
-            let _ = SettingsRow::show(ui, "Playground", false, |ui, _| {
+            let _ = SettingsRow::show(ui, "Playground", true, |ui, _| {
                 open =
                     Some(ui.add_sized([176.0, 44.0], egui::Button::new("Open model Playground")));
             });
@@ -4527,16 +4454,35 @@ fn advanced_settings_panel(
                 *action = ScreenAction::OpenDeveloperPlayground;
             }
         }
-    });
-    if !settings.diagnostics.is_empty() {
-        ui.add_space(16.0);
-        card(ui, |ui| {
-            ui.label(RichText::new("Diagnostics").strong());
+        let _ = SettingsRow::show(ui, "Diagnostics", false, |ui, _| {
+            ui.vertical(|ui| {
+                ui.label(format!(
+                    "{} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors.",
+                    settings.diagnostic_session_count
+                ));
             for line in &settings.diagnostics {
                 ui.label(line);
             }
+                let export = ui.add_enabled(
+                    settings.can_export_diagnostics,
+                    egui::Button::new("Export redacted diagnostics")
+                        .min_size(Vec2::new(220.0, 44.0)),
+                );
+                if !settings.can_export_diagnostics {
+                    ui.ctx().accesskit_node_builder(export.id, |builder| {
+                        builder.set_disabled();
+                        builder.set_description(
+                            "Unavailable because the platform settings directory cannot provide a private export location.",
+                        );
+                    });
+                    ui.label(RichText::new("The platform settings directory is unavailable, so Scribe cannot choose a private export location.").color(ui_palette(ui).muted_text));
+                }
+                if export.clicked() {
+                    *action = ScreenAction::ExportRedactedDiagnostics;
+                }
+            });
         });
-    }
+    });
 }
 
 fn optional_retention_control(
@@ -4545,18 +4491,29 @@ fn optional_retention_control(
     unlimited_label: &str,
     configured_days: Option<u32>,
     history_locked: bool,
+    separator_after: bool,
     action: &mut ScreenAction,
     update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
 ) {
     let mut limited = configured_days.is_some();
-    let limit = settings_checkbox(ui, &mut limited, label);
-    describe_history_lock(ui, &limit, history_locked);
-    if limit.changed() {
-        *action = update(limited.then_some(configured_days.unwrap_or(30)));
+    let _ = SettingsRow::show(ui, "Retention", false, |ui, _| {
+        ui.vertical(|ui| {
+            let limit = settings_checkbox(ui, &mut limited, label);
+            describe_history_lock(ui, &limit, history_locked);
+            if limit.changed() {
+                *action = update(limited.then_some(configured_days.unwrap_or(30)));
+            }
+            if !limited {
+                ui.label(RichText::new(unlimited_label).color(ui_palette(ui).muted_text));
+            }
+        });
+    });
+    if limited || separator_after {
+        ui.separator();
     }
     if limited {
         let mut days = configured_days.unwrap_or(30) as i64;
-        setting_row(ui, "Days", |ui, label_id| {
+        let _ = SettingsRow::show(ui, "Days", false, |ui, label_id| {
             let response = ui
                 .add_sized(
                     [96.0, 44.0],
@@ -4568,8 +4525,9 @@ fn optional_retention_control(
                 *action = update(Some(days as u32));
             }
         });
-    } else {
-        ui.label(RichText::new(unlimited_label).color(ui_palette(ui).muted_text));
+        if separator_after {
+            ui.separator();
+        }
     }
 }
 
@@ -4915,6 +4873,36 @@ mod tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     output_settings_panel(ui, settings, &mut action);
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn render_voice_detection_with_input(
+        ctx: &egui::Context,
+        settings: &RecordingSettingsView,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 600.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    voice_detection_settings_section(
+                        ui,
+                        &TranscriptionState::default(),
+                        settings,
+                        &mut action,
+                    );
                 });
             },
         );
@@ -5830,7 +5818,7 @@ mod tests {
             ),
             (
                 SettingsTab::Advanced,
-                "Advanced settings",
+                "Voice detection",
                 "Recording behavior",
             ),
             (SettingsTab::About, "Application", "Recording behavior"),
@@ -5852,6 +5840,116 @@ mod tests {
             );
             assert!(nodes.iter().any(|(_, node)| node.name() == Some(expected)));
             assert!(!nodes.iter().any(|(_, node)| node.name() == Some(absent)));
+        }
+    }
+
+    #[test]
+    fn settings_tabs_own_exact_sections_and_controls() {
+        let settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            show_restore_clipboard: true,
+            debug_mode: true,
+            history_mode_label: "Transcript and audio".into(),
+            transcript_retention_days: Some(30),
+            audio_retention_days: Some(14),
+            ..Default::default()
+        };
+        let rendered = [
+            SettingsTab::General,
+            SettingsTab::Recording,
+            SettingsTab::Advanced,
+            SettingsTab::About,
+        ]
+        .map(|tab| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, tab, &TranscriptionState::default(), &settings_view);
+                });
+            });
+            let names = output
+                .platform_output
+                .accesskit_update
+                .expect("settings should expose AccessKit")
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.name().map(str::to_owned))
+                .collect::<Vec<_>>();
+            (tab, names)
+        });
+
+        for (owner, owned_names) in [
+            (
+                SettingsTab::General,
+                &[
+                    "General settings",
+                    "Appearance",
+                    "Output settings",
+                    "Close to tray",
+                    "Manage models",
+                    "Theme",
+                    "Dictation overlay",
+                    "Overlay position",
+                    "Automatically insert final transcript",
+                ][..],
+            ),
+            (
+                SettingsTab::Recording,
+                &[
+                    "Recording behavior",
+                    "Recording input",
+                    "Transcription",
+                    "Recording mode",
+                    "Global record hotkey",
+                    "Change shortcut",
+                    "Input level",
+                    "Use live provisional preview",
+                    "Streaming mode",
+                    "Transcription device",
+                ][..],
+            ),
+            (
+                SettingsTab::Advanced,
+                &[
+                    "Voice detection",
+                    "History and privacy",
+                    "Developer and diagnostics",
+                    "Stop after speech ends in Toggle mode",
+                    "Speech confirmation ms",
+                    "History storage",
+                    "Enable local model Playground",
+                    "Open model Playground",
+                    "Export redacted diagnostics",
+                ][..],
+            ),
+            (
+                SettingsTab::About,
+                &[
+                    "Application",
+                    "Scribe",
+                    "Local-first privacy",
+                    "Local paths",
+                ][..],
+            ),
+        ] {
+            for name in owned_names {
+                for (tab, rendered_names) in &rendered {
+                    assert_eq!(
+                        rendered_names.iter().any(|rendered| rendered == name),
+                        *tab == owner,
+                        "{name} must render only on {owner:?}, not {tab:?}"
+                    );
+                }
+            }
+        }
+
+        for removed_duplicate in ["Capture hotkey", "Apply"] {
+            assert!(
+                rendered
+                    .iter()
+                    .all(|(_, names)| !names.iter().any(|name| name == removed_duplicate))
+            );
         }
     }
 
@@ -5879,6 +5977,13 @@ mod tests {
         assert!(!headings.contains(&"About Scribe"));
         for label in ["Application", "Local-first privacy", "Local paths"] {
             assert!(nodes.iter().any(|(_, node)| node.name() == Some(label)));
+        }
+        for moved_control in ["Diagnostics", "Export redacted diagnostics"] {
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(moved_control))
+            );
         }
     }
 
@@ -5933,6 +6038,7 @@ mod tests {
         });
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
         for name in [
+            "Voice detection",
             "History and privacy",
             "History storage",
             "Maximum unpinned entries",
@@ -5941,6 +6047,7 @@ mod tests {
             "Store coarse application identity with new entries",
             "Enable local model Playground",
             "Diagnostics",
+            "Export redacted diagnostics",
         ] {
             assert!(
                 nodes.iter().any(|(_, node)| node.name() == Some(name)),
@@ -6098,9 +6205,11 @@ mod tests {
                 .description()
                 .is_some_and(|description| description.contains("Input detected"))
         );
-        assert!(nodes.iter().any(|(_, node)| {
-            node.role() == Role::Heading && node.name() == Some("Audio input")
-        }));
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording input"))
+        );
         assert!(
             !nodes
                 .iter()
@@ -6120,7 +6229,7 @@ mod tests {
             history_mode_label: "Transcript and audio".into(),
             ..Default::default()
         };
-        for tab in [SettingsTab::General, SettingsTab::Advanced] {
+        for tab in [SettingsTab::Recording, SettingsTab::Advanced] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             let output = ctx.run(Default::default(), |ctx| {
@@ -6129,7 +6238,7 @@ mod tests {
                 });
             });
             let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
-            if tab == SettingsTab::General {
+            if tab == SettingsTab::Recording {
                 assert!(nodes.iter().any(|(_, node)| {
                     node.name() == Some("Cancel hotkey capture") && node.is_selected() == Some(true)
                 }));
@@ -6295,17 +6404,17 @@ mod tests {
 
     #[test]
     fn disabled_diagnostics_export_describes_the_missing_private_path() {
-        let output = render_route(UiRoute::Settings(SettingsTab::About));
+        let output = render_route(UiRoute::Settings(SettingsTab::Advanced));
         let export = output
             .platform_output
             .accesskit_update
-            .expect("About settings should expose AccessKit")
+            .expect("Advanced settings should expose AccessKit")
             .nodes
             .into_iter()
             .find_map(|(_, node)| {
                 (node.name() == Some("Export redacted diagnostics")).then_some(node)
             })
-            .expect("About settings should expose diagnostics export");
+            .expect("Advanced settings should expose diagnostics export");
         assert!(export.is_disabled());
         assert_eq!(
             export.description(),
@@ -6384,8 +6493,6 @@ mod tests {
                         "Automatically insert final transcript",
                         "Restore clipboard after insert",
                         "Manage models",
-                        "Apply",
-                        "Capture hotkey",
                     ][..],
                 ),
                 (
@@ -6393,24 +6500,24 @@ mod tests {
                     &[
                         "Press once",
                         "Hold",
-                        "Show provisional words while recording",
+                        "Use live provisional preview",
                         "Refresh devices",
                         "Change shortcut",
-                        "Stop after speech ends in Toggle mode",
                     ][..],
                 ),
                 (
                     SettingsTab::Advanced,
                     &[
-                        "Use live provisional preview",
+                        "Stop after speech ends in Toggle mode",
                         "Transcript age limit",
                         "Audio age limit",
                         "Store coarse application identity with new entries",
                         "Enable local model Playground",
                         "Open model Playground",
+                        "Export redacted diagnostics",
                     ][..],
                 ),
-                (SettingsTab::About, &["Export redacted diagnostics"][..]),
+                (SettingsTab::About, &[][..]),
             ] {
                 let ctx = egui::Context::default();
                 ctx.enable_accesskit();
@@ -6447,18 +6554,19 @@ mod tests {
                 let labelled_controls: &[(&str, egui::accesskit::Role)] = match tab {
                     SettingsTab::General => &[
                         ("Theme", egui::accesskit::Role::ComboBox),
+                        ("Dictation overlay", egui::accesskit::Role::ComboBox),
+                        ("Overlay position", egui::accesskit::Role::ComboBox),
                         ("Paste delay ms", egui::accesskit::Role::SpinButton),
                     ],
                     SettingsTab::Recording => &[
                         ("Duration limit", egui::accesskit::Role::ComboBox),
                         ("Device", egui::accesskit::Role::ComboBox),
                         ("Input level", egui::accesskit::Role::Slider),
-                        ("Speech confirmation ms", egui::accesskit::Role::SpinButton),
+                        ("Streaming mode", egui::accesskit::Role::ComboBox),
+                        ("Transcription device", egui::accesskit::Role::ComboBox),
                     ],
                     SettingsTab::Advanced => &[
-                        ("Mode", egui::accesskit::Role::ComboBox),
-                        ("Transcription device", egui::accesskit::Role::ComboBox),
-                        ("Overlay position", egui::accesskit::Role::ComboBox),
+                        ("Speech confirmation ms", egui::accesskit::Role::SpinButton),
                         ("History storage", egui::accesskit::Role::ComboBox),
                         (
                             "Maximum unpinned entries",
@@ -6577,6 +6685,83 @@ mod tests {
                 ],
             );
             assert_eq!(action, expected_action);
+            let separator_count = released
+                .shapes
+                .iter()
+                .filter(|shape| matches!(shape.shape, egui::epaint::Shape::LineSegment { .. }))
+                .count();
+            assert_eq!(separator_count, expected_separators);
+        }
+    }
+
+    #[test]
+    fn voice_detection_rows_and_separators_follow_post_click_state() {
+        for (initially_enabled, expected_action, expected_separators) in [
+            (false, ScreenAction::SetVadEnabled(true), 5),
+            (true, ScreenAction::SetVadEnabled(false), 0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let settings = RecordingSettingsView {
+                vad_enabled: initially_enabled,
+                ..Default::default()
+            };
+            let (initial, action) = render_voice_detection_with_input(&ctx, &settings, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let bounds = initial
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("voice detection settings should expose AccessKit")
+                .nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.name() == Some("Stop after speech ends in Toggle mode"))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .expect("voice detection checkbox should have bounds");
+            let point = egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let (_, press_action) = render_voice_detection_with_input(
+                &ctx,
+                &settings,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(press_action, ScreenAction::None);
+            let (released, action) = render_voice_detection_with_input(
+                &ctx,
+                &settings,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(action, expected_action);
+            let nodes = &released
+                .platform_output
+                .accesskit_update
+                .expect("updated voice detection settings should expose AccessKit")
+                .nodes;
+            let timing_rows_rendered = nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Speech confirmation ms"));
+            assert_eq!(timing_rows_rendered, !initially_enabled);
             let separator_count = released
                 .shapes
                 .iter()
