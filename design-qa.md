@@ -54,3 +54,47 @@ Focused regression coverage includes the exact navigation/tab inventory and owne
 ## Remaining limitation and deliberate non-goals
 
 The deterministic harness and state tests do not open a real microphone, so operating-system-level device release during native monitor teardown was not directly observed. Model downloads, live catalog access, transcription runtime smoke, audio capture, and GPU/CUDA smoke were deliberately excluded by branch scope; the corresponding ignored tests were not run.
+
+---
+
+# Revised STT model manager v2 — implementation evidence
+
+Status: **automated design evidence passed; native screenshot review pending**.
+
+## Implemented reference requirements
+
+- The Models route uses compact 76 px desktop rows (124 px at very narrow
+  widths), a single Active badge beside only the selected model name, separate
+  Installed and Available sections, five-segment Speed and Accuracy meters,
+  and exactly one lifecycle-dependent row action.
+- The toolbar is a full-width search field with compact Refresh, Import local
+  GGUF, and language-filter controls. Download state uses the installer’s
+  actual byte counts for both the circular cancel control and a 2 px row line.
+- Local and trusted-remote Details use an accessible right drawer with a
+  fixed header/footer, responsive full-width presentation, keyboard trap,
+  Escape/outside close when safe, and focus restoration. Only a ready inactive
+  local model exposes **Use this model** in the drawer footer.
+- Settings use leading labels/trailing values, responsive stacking, compact
+  shared button/keycap visuals with 44 px interaction targets, vertically
+  centered hotkeys, a 30 px History title, and a 16 px route bottom inset.
+
+## Automated evidence at `9145447`
+
+- `cargo test --all-targets --all-features ui::screens::tests -- --test-threads=1`: 43 passed.
+- `cargo test --all-targets --all-features app::layout_tests:: -- --test-threads=1`: 191 passed.
+- Focused harness regression for 375 px model rows: passed.
+- Focused active-removal replacement/blocking regressions: passed.
+- `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff
+  --check`: passed.
+
+## Native visual gate limitation
+
+The required light/dark native captures at 1476×1018, 1180×815, and 960×680
+could not be captured in this session because no native desktop-control or
+screenshot interface was available. The running debug executable also locks
+the normal debug output path. As a result, direct pixel comparison against
+`02-final-list-states.png` and `03-details-drawer.png` remains pending; this
+is an evidence gap, not a claim that the visual gate passed. The deterministic
+harness provides `models/lifecycle`, `models/details-drawer`, `history`, and
+`settings/recording` fixtures for the follow-up capture.
