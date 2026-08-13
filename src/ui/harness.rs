@@ -2759,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn model_title_is_a_named_button_and_removal_focus_is_acknowledged() {
+    fn model_title_interaction_exists_only_for_ready_inactive_installed_models() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -2791,6 +2791,103 @@ mod tests {
             .1,
             ScreenAction::SelectModel("tiny.en".into())
         );
+
+        let active = node_matching(&output, |node| {
+            node.name() == Some("whisper.cpp base.en")
+                && node.role() == egui::accesskit::Role::StaticText
+        });
+        assert!(active.bounds().is_some());
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Use whisper.cpp base.en for future transcriptions")
+        );
+
+        for (display_name, model) in [
+            (
+                "Available title",
+                ModelViewModel {
+                    id: "available-title".into(),
+                    display_name: "Available title".into(),
+                    install_supported: true,
+                    install_action_enabled: true,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "Upgrade title",
+                ModelViewModel {
+                    id: "upgrade-title".into(),
+                    display_name: "Upgrade title".into(),
+                    installed: true,
+                    primary_action_enabled: true,
+                    primary_action_installs_upgrade: true,
+                    download_state: ModelDownloadState::Installed,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "Repair title",
+                ModelViewModel {
+                    id: "repair-title".into(),
+                    display_name: "Repair title".into(),
+                    installed: true,
+                    primary_action_enabled: true,
+                    primary_action_repairs_runtime: true,
+                    download_state: ModelDownloadState::Installed,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut fixture = Fixture::ModelsInstalled.data();
+            if model.installed {
+                fixture.models = vec![model];
+                fixture.model_catalog.clear();
+            } else {
+                fixture.models.clear();
+                fixture.model_catalog = vec![model];
+            }
+            let rendered =
+                render_with_input(&ctx, &mut fixture, &mut page, width, height, Vec::new()).0;
+            assert_eq!(
+                node_matching(&rendered, |node| node.name() == Some(display_name)).role(),
+                egui::accesskit::Role::StaticText,
+            );
+            assert!(
+                !node_names(&rendered)
+                    .iter()
+                    .any(|name| name == &format!("Use {display_name} for future transcriptions"))
+            );
+        }
+    }
+
+    #[test]
+    fn removal_focus_restores_to_surviving_uninstall_then_clears() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+        apply_action(&mut data, &mut page, ScreenAction::CloseModelDialog);
+        assert_eq!(
+            data.model_management.restore_remove_focus.as_deref(),
+            Some("tiny.en")
+        );
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::AcknowledgeModelRemovalFocus);
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Uninstall whisper.cpp tiny.en")
+        );
+        apply_action(&mut data, &mut page, action);
+        assert!(data.model_management.restore_remove_focus.is_none());
 
         data.model_management.restore_remove_focus = Some("missing".into());
         let (output, action) =
@@ -2908,14 +3005,38 @@ mod tests {
             render_with_input(&ctx, &mut data, &mut page, 375.0, 680.0, Vec::new());
         assert_eq!(action, ScreenAction::None);
         let card = named_node_bounds(&output, &format!("{long_name} model"));
+        assert_bounds_within(
+            named_node_bounds(&output, long_name),
+            card,
+            "long-name compact model title",
+        );
         for name in [
-            format!("Use {long_name} for future transcriptions"),
             format!("Uninstall {long_name}"),
             format!("Expand details for {long_name}"),
         ] {
             let bounds = named_node_bounds(&output, &name);
             assert_bounds_within(bounds, card, "long-name compact model control");
             assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+        }
+    }
+
+    #[test]
+    fn model_card_controls_keep_trailing_chevron_order_without_decorative_nodes() {
+        for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
+            let output = render(Fixture::ModelsInstalled, width, height);
+            let title =
+                named_node_bounds(&output, "Use whisper.cpp tiny.en for future transcriptions");
+            let lifecycle = named_node_bounds(&output, "Uninstall whisper.cpp tiny.en");
+            let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
+            assert!(title.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+            if width > 430.0 {
+                let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+                assert!(title.x1 <= speed.x0 + LAYOUT_TOLERANCE);
+                assert!(speed.x1 <= lifecycle.x0 + LAYOUT_TOLERANCE);
+                assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+            } else {
+                assert!(title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
+            }
         }
     }
 
