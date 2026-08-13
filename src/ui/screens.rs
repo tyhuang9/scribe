@@ -253,6 +253,7 @@ pub(crate) enum ScreenAction {
     RequestModelRemoval(String),
     ConfirmModelRemoval(String),
     CloseModelDialog,
+    AcknowledgeModelRemovalFocus,
     SetLocalGgufImportPath(String),
     ValidateAndImportLocalGguf,
     CancelLocalGgufImport,
@@ -1821,26 +1822,16 @@ fn compact_model_icon_action(
     let colors = ui_palette(ui);
     let enabled = enabled && ui.is_enabled();
     let (target, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
-    // A 76px row needs clear breathing room around its actions. The invisible
-    // target remains 44px for keyboard/pointer accessibility, but the painted
-    // square stays compact instead of reading like a second card.
-    let visual = egui::Rect::from_center_size(target.center(), Vec2::splat(32.0));
     let hovered = response.hovered() && enabled;
-    ui.painter().rect(
-        visual,
-        Rounding::same(7.0),
-        if hovered {
-            colors.active_card_bg
-        } else {
-            colors.card_bg
-        },
-        Stroke::new(1.0, colors.border),
-    );
+    if hovered || response.has_focus() {
+        ui.painter()
+            .rect_filled(target, Rounding::same(7.0), colors.active_card_bg);
+    }
     if let Some(progress) = progress {
         ui.painter()
-            .circle_stroke(visual.center(), 12.0, Stroke::new(2.0, colors.primary));
+            .circle_stroke(target.center(), 12.0, Stroke::new(2.0, colors.primary));
         ui.painter().text(
-            visual.center(),
+            target.center(),
             Align2::CENTER_CENTER,
             format!("{:.0}", (progress * 100.0).clamp(0.0, 100.0)),
             egui::FontId::proportional(10.0),
@@ -1848,7 +1839,7 @@ fn compact_model_icon_action(
         );
     } else {
         ui.painter().text(
-            visual.center(),
+            target.center(),
             Align2::CENTER_CENTER,
             icon_glyph(icon),
             egui::FontId::proportional(18.0),
@@ -1962,26 +1953,46 @@ fn render_unified_model_card(
             )
         }
         ModelCard::Local(model) if model.installed => {
-            let reason = (!model.removal_supported)
-                .then_some("This model is not an app-managed download and cannot be removed here.")
-                .or_else(|| {
-                    (model.selected && !can_replace_active).then_some(
-                        "Install another ready model before removing the selected model.",
+            let (row_action, row_name, enabled, reason, lifecycle_label) =
+                if model.primary_action_installs_upgrade || model.primary_action_repairs_runtime {
+                    (
+                        local_model_primary_action(model),
+                        format!(
+                            "{} {}",
+                            if model.primary_action_installs_upgrade {
+                                "Upgrade"
+                            } else {
+                                "Repair"
+                            },
+                            model.display_name
+                        ),
+                        model.primary_action_enabled,
+                        model.primary_action_disabled_reason.as_deref(),
+                        if model.primary_action_installs_upgrade {
+                            "Upgrade"
+                        } else {
+                            "Repair"
+                        },
                     )
-                });
-            (
-                ScreenAction::RequestModelRemoval(model.id.clone()),
-                format!("Uninstall {}", model.display_name),
-                reason.is_none(),
-                reason,
-                if model.primary_action_installs_upgrade {
-                    "Upgrade"
-                } else if model.primary_action_repairs_runtime {
-                    "Repair"
                 } else {
-                    "Uninstall"
-                },
-            )
+                    let reason = (!model.removal_supported)
+                        .then_some(
+                            "This model is not an app-managed download and cannot be removed here.",
+                        )
+                        .or_else(|| {
+                            (model.selected && !can_replace_active).then_some(
+                                "Install another ready model before removing the selected model.",
+                            )
+                        });
+                    (
+                        ScreenAction::RequestModelRemoval(model.id.clone()),
+                        format!("Uninstall {}", model.display_name),
+                        reason.is_none(),
+                        reason,
+                        "Uninstall",
+                    )
+                };
+            (row_action, row_name, enabled, reason, lifecycle_label)
         }
         ModelCard::Local(model) => {
             let label = match model.download_state {
@@ -2045,6 +2056,7 @@ fn render_unified_model_card(
             MODEL_CARD_VERTICAL_INSET,
         ))
         .show(ui, |ui| {
+            let compact = ui.available_width() < 430.0;
             ui.horizontal_top(|ui| {
                 let details_name = format!(
                     "{} details for {name}",
@@ -2067,48 +2079,86 @@ fn render_unified_model_card(
                 if details.clicked() {
                     action = ScreenAction::ToggleModelCardDetails(card_key.clone());
                 }
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(icon_glyph(if active {
-                                Icon::CheckCircle
-                            } else {
-                                Icon::Waveform
-                            }))
-                            .color(if active {
-                                colors.success
-                            } else {
-                                colors.muted_text
-                            }),
-                        );
-                        let summary = ui.add(
-                            egui::Label::new(RichText::new(name).strong()).sense(Sense::click()),
-                        );
-                        if summary.clicked() {
-                            action = summary_action.clone();
-                        }
-                        if active {
-                            installed_model_badge(
-                                ui,
-                                "Active",
-                                ui.cursor().top(),
-                                colors.success,
-                                colors.success_text,
+                let lifecycle_track = if compact { 0.0 } else { 108.0 };
+                let identity_width = (ui.available_width() - lifecycle_track - 8.0)
+                    .max(44.0)
+                    .min(360.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(identity_width, 0.0),
+                    Layout::top_down(Align::LEFT),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(icon_glyph(if active {
+                                    Icon::CheckCircle
+                                } else {
+                                    Icon::Waveform
+                                }))
+                                .color(if active {
+                                    colors.success
+                                } else {
+                                    colors.muted_text
+                                }),
                             );
+                            let summary_name = format!("Use {name} for future transcriptions");
+                            let summary = ui.add_sized(
+                                Vec2::new(
+                                    (ui.available_width() - if active { 58.0 } else { 0.0 })
+                                        .max(44.0),
+                                    44.0,
+                                ),
+                                egui::Button::new(RichText::new(name).strong()).wrap(true),
+                            );
+                            summary.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, &summary_name)
+                            });
+                            ui.ctx().accesskit_node_builder(summary.id, |builder| {
+                                builder.set_role(egui::accesskit::Role::Button);
+                                builder.set_name(summary_name.as_str());
+                                builder.set_bounds(accesskit_rect(summary.rect));
+                            });
+                            if summary.clicked() {
+                                action = summary_action.clone();
+                            }
+                            if active {
+                                installed_model_badge(
+                                    ui,
+                                    "Active",
+                                    ui.cursor().top(),
+                                    colors.success,
+                                    colors.success_text,
+                                );
+                            }
+                        });
+                        if !expanded {
+                            let width = ui.available_width();
+                            let overflow = description_overflows(ui, &description, width);
+                            let preview = ui.add(
+                                egui::Label::new(
+                                    RichText::new(&description).small().color(colors.muted_text),
+                                )
+                                .truncate(true),
+                            );
+                            paint_description_fade(ui, preview.rect, overflow);
+                        }
+                    },
+                );
+                if !compact {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let lifecycle = model_lifecycle_button(
+                            ui,
+                            lifecycle_label,
+                            &row_name,
+                            row_enabled,
+                            row_reason,
+                        );
+                        if lifecycle.clicked() && row_enabled {
+                            action = row_action.clone();
                         }
                     });
-                    if !expanded {
-                        let width = ui.available_width();
-                        let overflow = description_overflows(ui, &description, width);
-                        let preview = ui.add(
-                            egui::Label::new(
-                                RichText::new(&description).small().color(colors.muted_text),
-                            )
-                            .truncate(true),
-                        );
-                        paint_description_fade(ui, preview.rect, overflow);
-                    }
-                });
+                }
+            });
+            if compact {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let lifecycle = model_lifecycle_button(
                         ui,
@@ -2121,7 +2171,7 @@ fn render_unified_model_card(
                         action = row_action.clone();
                     }
                 });
-            });
+            }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let (language_name, language_summary) = model_language_summary(languages);
@@ -2175,118 +2225,132 @@ fn render_inline_model_details(
     can_replace_active: bool,
     action: &mut ScreenAction,
 ) {
-    Frame::none()
-        .inner_margin(Margin::same(16.0))
-        .show(ui, |ui| {
-            ui.separator();
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| match card {
-                ModelCard::Local(model) => {
-                    ui.label(format!(
-                        "GPU acceleration: {}",
-                        acceleration_label(model.capabilities).unwrap_or("Not available")
-                    ));
-                    ui.label(format!(
-                        "Estimated RAM: {}",
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| match card {
+            ModelCard::Local(model) => {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("GPU ACCELERATION").small());
+                    ui.label(acceleration_label(model.capabilities).unwrap_or("Not available"));
+                });
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("RAM USAGE").small());
+                    ui.label(
                         model
                             .estimated_ram_bytes
                             .map(format_bytes)
-                            .unwrap_or_else(|| "Not available".into())
-                    ));
-                    ui.label(format!(
-                        "File size: {}",
+                            .unwrap_or_else(|| "Not available".into()),
+                    );
+                });
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("FILE SIZE").small());
+                    ui.label(
                         model
                             .total_bytes
                             .or(model.disk_bytes)
                             .map(format_bytes)
-                            .unwrap_or_else(|| "Not available".into())
-                    ));
-                }
-                ModelCard::Remote(_, variant) => {
-                    ui.label("GPU acceleration: Not available");
-                    ui.label("Estimated RAM: Not available");
-                    ui.label(format!("File size: {}", variant.size_label));
-                }
-            });
-            ui.add_space(10.0);
-            let description = match card {
-                ModelCard::Local(model) => model
-                    .description
-                    .as_deref()
-                    .unwrap_or("Local speech-to-text model."),
-                ModelCard::Remote(entry, _) => &entry.description,
-            };
-            ui.label(description);
-            ui.add_space(8.0);
-            let languages = match card {
-                ModelCard::Local(model) => &model.languages,
-                ModelCard::Remote(entry, _) => &entry.languages,
-            };
-            ui.label(format!(
-                "Languages: {}",
-                normalized_languages(languages).join(", ")
-            ));
-            match card {
-                ModelCard::Local(model) => {
-                    ui.add_space(8.0);
-                    for (label, value) in [
-                        ("Runtime", model.runtime_status_label.as_str()),
-                        (
-                            "Architecture",
-                            model.architecture.as_deref().unwrap_or("Not available"),
-                        ),
-                        (
-                            "Artifact",
-                            model
-                                .artifact_filename
-                                .as_deref()
-                                .unwrap_or("Not available"),
-                        ),
-                        (
-                            "Revision",
-                            model
-                                .artifact_revision
-                                .as_deref()
-                                .unwrap_or("Not available"),
-                        ),
-                    ] {
-                        ui.label(format!("{label}: {value}"));
-                    }
-                    if let Some(label) = model.runtime_action_label.as_deref() {
-                        let response = ui.add_enabled(
-                            model.runtime_action_enabled,
-                            egui::Button::new(label).min_size(Vec2::new(44.0, 44.0)),
-                        );
-                        response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                format!("{label} runtime for {}", model.display_name),
-                            )
-                        });
-                        if response.clicked() && model.runtime_action_enabled {
-                            *action = ScreenAction::MaintainModelRuntime(model.id.clone());
-                        }
-                    }
-                    if model.installed && model.removal_supported {
-                        let enabled = !model.selected || can_replace_active;
-                        let response = ui.add_enabled(
-                            enabled,
-                            egui::Button::new("Uninstall").min_size(Vec2::new(44.0, 44.0)),
-                        );
-                        if response.clicked() && enabled {
-                            *action = ScreenAction::RequestModelRemoval(model.id.clone());
-                        }
-                    }
-                }
-                ModelCard::Remote(entry, variant) => {
-                    ui.add_space(8.0);
-                    ui.label(format!("Repository: {}", entry.repository));
-                    ui.label(format!("Revision: {}", entry.pinned_revision));
-                    ui.label(format!("Artifact: {}", variant.filename));
-                    ui.label(format!("SHA-256: {}", variant.expected_sha256));
+                            .unwrap_or_else(|| "Not available".into()),
+                    );
+                });
+            }
+            ModelCard::Remote(_, variant) => {
+                for (label, value) in [
+                    ("GPU ACCELERATION", "Not available".to_owned()),
+                    ("RAM USAGE", "Not available".to_owned()),
+                    ("FILE SIZE", variant.size_label.clone()),
+                ] {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(label).small());
+                        ui.label(value);
+                    });
                 }
             }
         });
+        ui.add_space(10.0);
+        let description = match card {
+            ModelCard::Local(model) => model
+                .description
+                .as_deref()
+                .unwrap_or("Local speech-to-text model."),
+            ModelCard::Remote(entry, _) => &entry.description,
+        };
+        ui.label(description);
+        ui.add_space(8.0);
+        let languages = match card {
+            ModelCard::Local(model) => &model.languages,
+            ModelCard::Remote(entry, _) => &entry.languages,
+        };
+        let language_summary = normalized_languages(languages).join(", ");
+        ui.label(RichText::new("LANGUAGES").small());
+        ui.label(if language_summary.is_empty() {
+            "Languages unavailable".to_owned()
+        } else {
+            language_summary
+        });
+        match card {
+            ModelCard::Local(model) => {
+                ui.add_space(8.0);
+                for (label, value) in [
+                    ("Runtime", model.runtime_status_label.as_str()),
+                    (
+                        "Architecture",
+                        model.architecture.as_deref().unwrap_or("Not available"),
+                    ),
+                    (
+                        "Artifact",
+                        model
+                            .artifact_filename
+                            .as_deref()
+                            .unwrap_or("Not available"),
+                    ),
+                    (
+                        "Revision",
+                        model
+                            .artifact_revision
+                            .as_deref()
+                            .unwrap_or("Not available"),
+                    ),
+                ] {
+                    ui.label(format!("{label}: {value}"));
+                }
+                if let Some(label) = model.runtime_action_label.as_deref() {
+                    let runtime_name = format!("{label} runtime for {}", model.display_name);
+                    let response = model_lifecycle_button(
+                        ui,
+                        label,
+                        &runtime_name,
+                        model.runtime_action_enabled,
+                        model.runtime_action_disabled_reason.as_deref(),
+                    );
+                    if response.clicked() && model.runtime_action_enabled {
+                        *action = ScreenAction::MaintainModelRuntime(model.id.clone());
+                    }
+                }
+                if model.installed && model.removal_supported {
+                    let enabled = !model.selected || can_replace_active;
+                    let reason = (!enabled).then_some(
+                        "Install another ready model before removing the selected model.",
+                    );
+                    let response = model_lifecycle_button(
+                        ui,
+                        "Uninstall",
+                        &format!("Uninstall {}", model.display_name),
+                        enabled,
+                        reason,
+                    );
+                    if response.clicked() && enabled {
+                        *action = ScreenAction::RequestModelRemoval(model.id.clone());
+                    }
+                }
+            }
+            ModelCard::Remote(entry, variant) => {
+                ui.add_space(8.0);
+                ui.label(format!("Repository: {}", entry.repository));
+                ui.label(format!("Revision: {}", entry.pinned_revision));
+                ui.label(format!("Artifact: {}", variant.filename));
+                ui.label(format!("SHA-256: {}", variant.expected_sha256));
+            }
+        }
+    });
 }
 
 fn merge_model_action(action: &mut ScreenAction, candidate: ScreenAction) {
@@ -2432,7 +2496,10 @@ fn models(
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let import = compact_model_icon_action(ui, Icon::Plus, "Import local GGUF", true, None, None);
-            if management.restore_add_focus || management.restore_after_removal_focus {
+            if management.restore_add_focus
+                || management.restore_after_removal_focus
+                || management.restore_remove_focus.is_some()
+            {
                 import.request_focus();
             }
             import_control = Some(import.clone());
@@ -2890,6 +2957,9 @@ fn models(
         );
     });
     });
+    if management.restore_remove_focus.is_some() && action == ScreenAction::None {
+        action = ScreenAction::AcknowledgeModelRemovalFocus;
+    }
     // The disabled scope above is the primary boundary for both pointer and
     // assistive actions. Keep this guard as a defense in depth measure for
     // custom controls or future widgets that might still report a response.

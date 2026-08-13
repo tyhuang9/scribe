@@ -8262,6 +8262,7 @@ impl LocalTranscriberApp {
             ScreenAction::ClearTranscript => self.clear_transcript_history(),
             ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
             ScreenAction::None
+            | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
@@ -9245,6 +9246,9 @@ impl LocalTranscriberApp {
                     self.model_management.dialog = Some(ModelDialog::Remove(id));
                     self.model_management.focus_dialog_initial = true;
                 }
+            }
+            ScreenAction::AcknowledgeModelRemovalFocus => {
+                self.model_management.restore_remove_focus = None;
             }
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
@@ -10462,6 +10466,7 @@ impl LocalTranscriberApp {
                 }
             }
             ScreenAction::None
+            | ScreenAction::AcknowledgeModelRemovalFocus
             | ScreenAction::SelectModel(_)
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
@@ -20204,8 +20209,25 @@ mod layout_tests {
             app.status_message
                 .contains("replacement model is no longer ready")
         );
+        app.apply_model_management_action(ScreenAction::AcknowledgeModelRemovalFocus);
+        assert!(app.model_management.restore_remove_focus.is_none());
 
         let _ = fs::remove_file(active_path);
+    }
+
+    #[test]
+    fn cancelling_model_removal_focus_request_is_acknowledged_after_render() {
+        let mut app = test_app();
+        let id = app.config.general.selected_default_model.clone();
+        app.model_management.dialog = Some(ModelDialog::Remove(id.clone()));
+
+        app.apply_model_management_action(ScreenAction::CloseModelDialog);
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(id.as_str())
+        );
+        app.apply_model_management_action(ScreenAction::AcknowledgeModelRemovalFocus);
+        assert!(app.model_management.restore_remove_focus.is_none());
     }
 
     #[test]
