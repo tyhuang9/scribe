@@ -19,7 +19,7 @@ Valid state names are:
 - `transcribe/microphone-error`
 - `models/installed`
 - `models/lifecycle` — active, installed, uninstalled, partial, downloading, and failed row states
-- `models/card-expanded` â€” inline local-model details expanded; use it to inspect the accordion at wide, medium, and 375 px viewports
+- `models/card-expanded` â€” inline local-model details expanded; inspect the single card surface, 44 px controls, and 375 px containment
 - `models/compare-expanded`
 - `history`
 - `settings/recording`

@@ -15834,25 +15834,6 @@ mod layout_tests {
     }
 
     #[test]
-    #[cfg(any())]
-    fn blocked_model_selection_keeps_the_details_dialog_open() {
-        let mut app = test_app();
-        let selected = app.config.general.selected_default_model.clone();
-        app.model_management.dialog = Some(ModelDialog::Details("whisper_cpp_tiny_en".into()));
-        app.artifact_recovery_error = Some("Resolve artifact recovery first.".into());
-
-        app.apply_model_management_action(ScreenAction::SelectModel("whisper_cpp_tiny_en".into()));
-
-        assert_eq!(app.config.general.selected_default_model, selected);
-        assert_eq!(
-            app.model_management.dialog,
-            Some(ModelDialog::Details("whisper_cpp_tiny_en".into()))
-        );
-        assert_eq!(app.status_message, "Resolve artifact recovery first.");
-        assert_eq!(app.model_management.restore_details_focus, None);
-    }
-
-    #[test]
     fn live_compare_selection_rejects_a_fifth_model_and_locks_while_busy() {
         let mut app = test_app();
         app.model_comparison
