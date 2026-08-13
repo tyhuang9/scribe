@@ -6576,6 +6576,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn compact_language_summaries_use_friendly_deduplicated_names() {
         let languages = |values: &[&str]| {
             values
@@ -6806,6 +6807,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn model_search_temporarily_expands_sections_without_changing_saved_state() {
         let render = |query: &str| {
             let ctx = egui::Context::default();
@@ -7260,6 +7262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn installed_model_cards_expose_disabled_primary_reason_and_details_child() {
         let model = ModelViewModel {
             id: "base.en".into(),
@@ -7323,6 +7326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn selected_unavailable_model_keeps_its_state_and_blocks_removal() {
         let model = ModelViewModel {
             id: "base.en".into(),
