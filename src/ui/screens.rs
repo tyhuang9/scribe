@@ -247,6 +247,7 @@ pub(crate) enum ScreenAction {
     InstallModel(String),
     UpgradeModel(String),
     CancelModelInstall(String),
+    DiscardModelPartial(String),
     RepairModelRuntime(String),
     MaintainModelRuntime(String),
     ShowModelDetails(String),
@@ -278,6 +279,10 @@ pub(crate) enum ScreenAction {
     CancelRemoteCatalogInstall(String),
     UseRemoteCatalogModel(String),
     RemoveRemoteCatalogModel(String),
+    DiscardRemoteCatalogPartial {
+        remote_model_id: String,
+        variant_id: String,
+    },
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
     OpenModelSettings,
@@ -447,6 +452,13 @@ pub(crate) fn screen_action_for_remote_catalog_action(
         RemoteCatalogActionKind::Remove { model_id } => {
             ScreenAction::RemoveRemoteCatalogModel(model_id.clone())
         }
+        RemoteCatalogActionKind::DiscardPartial {
+            remote_model_id,
+            variant_id,
+        } => ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: remote_model_id.clone(),
+            variant_id: variant_id.clone(),
+        },
     }
 }
 
@@ -4327,6 +4339,25 @@ fn show_local_model_details_drawer(
                                 }
                             }
                             if remove.clicked() && remove_reason.is_none() { action = ScreenAction::RequestModelRemoval(model.id.clone()); }
+                            if model.partial_cleanup_available {
+                                let discard = ui.add_enabled_ui(model.partial_cleanup_enabled, |ui| {
+                                    button(ui, "Discard partial", ButtonTone::Secondary)
+                                }).inner;
+                                if model.partial_cleanup_enabled {
+                                    mark_accesskit_enabled(ui, &discard);
+                                    focusable_controls.push(discard.id);
+                                } else {
+                                    describe_disabled_control(
+                                        ui,
+                                        &discard,
+                                        "Discard partial",
+                                        model.partial_cleanup_disabled_reason.as_deref(),
+                                    );
+                                }
+                                if model.partial_cleanup_enabled && discard.clicked() {
+                                    action = ScreenAction::DiscardModelPartial(model.id.clone());
+                                }
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if model.installed && model.ready && !model.active {
                                     let use_model = button(ui, "Use this model", ButtonTone::Primary);
@@ -4390,7 +4421,13 @@ fn show_remote_model_details_drawer(
         .actions
         .iter()
         .find(|candidate| matches!(candidate.kind, RemoteCatalogActionKind::Cancel { .. }))
-        .or_else(|| variant.actions.first());
+        .or_else(|| remote_primary_action(variant));
+    let discard_action = variant.actions.iter().find(|candidate| {
+        matches!(
+            candidate.kind,
+            RemoteCatalogActionKind::DiscardPartial { .. }
+        )
+    });
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(ui.make_persistent_id((
             "remote-model-details-drawer",
@@ -4507,6 +4544,29 @@ fn show_remote_model_details_drawer(
                                 if remote_action.enabled && control.clicked() {
                                     action = screen_action_for_remote_catalog_action(
                                         &remote_action.kind,
+                                    );
+                                }
+                            }
+                            if let Some(discard_action) = discard_action {
+                                let control = ui
+                                    .add_enabled_ui(discard_action.enabled, |ui| {
+                                        button(ui, &discard_action.label, ButtonTone::Secondary)
+                                    })
+                                    .inner;
+                                if discard_action.enabled {
+                                    mark_accesskit_enabled(ui, &control);
+                                    focusable_controls.push(control.id);
+                                } else {
+                                    describe_disabled_control(
+                                        ui,
+                                        &control,
+                                        &discard_action.label,
+                                        discard_action.disabled_reason.as_deref(),
+                                    );
+                                }
+                                if discard_action.enabled && control.clicked() {
+                                    action = screen_action_for_remote_catalog_action(
+                                        &discard_action.kind,
                                     );
                                 }
                             }
@@ -6739,6 +6799,22 @@ mod tests {
             !ModelCard::Remote(&entry, &small)
                 .accessible_name()
                 .contains("technical-q5")
+        );
+    }
+
+    #[test]
+    fn remote_partial_cleanup_action_maps_only_catalog_ids() {
+        let kind = RemoteCatalogActionKind::DiscardPartial {
+            remote_model_id: "handy-computer/compact-english".into(),
+            variant_id: "q5".into(),
+        };
+
+        assert_eq!(
+            screen_action_for_remote_catalog_action(&kind),
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id: "handy-computer/compact-english".into(),
+                variant_id: "q5".into(),
+            }
         );
     }
 

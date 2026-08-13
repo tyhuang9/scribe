@@ -288,6 +288,9 @@ pub(crate) struct ModelViewModel {
     pub primary_action_disabled_reason: Option<String>,
     pub cancel_supported: bool,
     pub removal_supported: bool,
+    pub partial_cleanup_available: bool,
+    pub partial_cleanup_enabled: bool,
+    pub partial_cleanup_disabled_reason: Option<String>,
     pub runtime_status_label: String,
     pub runtime_detail: Option<String>,
     pub runtime_version_label: Option<String>,
@@ -533,6 +536,10 @@ pub(crate) enum RemoteCatalogActionKind {
     },
     Remove {
         model_id: String,
+    },
+    DiscardPartial {
+        remote_model_id: String,
+        variant_id: String,
     },
 }
 
