@@ -127,3 +127,68 @@ the normal debug output path. As a result, direct pixel comparison against
 is an evidence gap, not a claim that the visual gate passed. The deterministic
 harness provides `models/lifecycle`, `models/details-drawer`, `history`, and
 `settings/recording` fixtures for the follow-up capture.
+
+---
+
+# Settings design QA
+
+## Evidence
+
+- Source visual truth:
+  - `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-1.png`
+  - `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-2.png`
+  - The follow-up Advanced screenshot was also reviewed from the conversation, but it did not have a workspace file path.
+- Implementation screenshots:
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\recording-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\recording-help-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\advanced-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\general-light.png`
+- Combined comparison: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\comparison-recording.png`
+- Source pixels: 1082 x 696 and 870 x 174; source density was not declared.
+- Implementation viewport request: 1180 x 1200 CSS pixels. Native Windows capture: 1493 x 1487 pixels, including window chrome and display scaling.
+- Combined comparison pixels: 2200 x 1500. The implementation was proportionally scaled for the comparison; source pixels were not resampled.
+- State: Settings / Recording, General, and Advanced; light theme; default fixture data. The source Recording image is dark while the mode-selector reference is light, so exact palette matching across the two source images was not treated as a requirement.
+
+## Full-view comparison evidence
+
+The file-backed source and final Recording capture were placed together in `comparison-recording.png` and reviewed as one comparison input. The final screen preserves the existing Scribe structure and typography while applying the requested changes: every desktop settings label begins at one fixed left edge, controls begin in one fixed control column, boolean settings use switches, and the mode selector uses the product's blue semantic accent rather than the unrelated purple reference color.
+
+General and Advanced native captures show the same 270-point left-aligned label track. No overlap, clipping, broken card rhythm, or inconsistent control start position was found at the captured desktop viewport. Compact layout behavior is covered by the automated 480-pixel layout test.
+
+## Focused-region comparison evidence
+
+Focused review was necessary because alignment, switch state, and help behavior are too small to judge reliably from the full-screen comparison alone.
+
+- The Recording transcription region replaces the source checkbox with a switch and adjacent 44 x 44 help button.
+- `recording-help-light.png` confirms that activating the help button opens readable persistent content below the trigger without obscuring the setting name or switch.
+- The Advanced capture confirms that “Stop after speech ends” and all timing-row labels share the same left edge and that timing inputs share the control column.
+- The General capture confirms the same label track across switch, button, and combo-box rows.
+
+## Required fidelity surfaces
+
+- Fonts and typography: existing Scribe font family, hierarchy, weight, and wrapping are preserved. The clearer setting names fit without truncation at the desktop reference viewport.
+- Spacing and layout rhythm: settings cards, separators, row heights, and section gaps remain consistent. Desktop labels use a fixed 270-point column and left alignment; compact rows stack below the breakpoint.
+- Colors and visual tokens: switches and the recording-mode selector use semantic theme tokens. Automated contrast tests cover light and dark selector and inactive-switch states.
+- Image quality and asset fidelity: no source imagery or decorative assets are involved. Existing product icons remain unchanged and sharp in the native captures.
+- Copy and content: checkbox-era phrases were replaced with concise setting names; supporting detail moved into accessible help disclosures. Locked voice-detection state includes a visible reason.
+- Interaction and accessibility: switches expose stable Switch roles, names, descriptions, checked states, and 44-point targets. Help controls expose a keyboard-focusable Toggle pattern, persistent expanded state, and Escape dismissal. Locked switches remain disabled while their help remains available.
+
+## Findings
+
+No actionable P0, P1, or P2 visual or interaction differences remain.
+
+The dark source and light implementation are different theme states, and the implementation capture includes the full application shell while the source is cropped to settings cards. Those are expected evidence differences, not product defects. Dark-theme visual behavior is additionally protected by semantic-token contrast tests; a native dark harness capture is not available because the current harness fixes light visuals.
+
+## Comparison history
+
+1. Initial reference issue: settings labels were centered and boolean settings used checkboxes. Fix: added a fixed 270-point desktop label track, left-aligned label painting, shared switches, clearer labels, and help controls. Post-fix evidence: `recording-light.png`, `advanced-light.png`, and `general-light.png`.
+2. Accessibility review issue: the first help affordance was hover-only and locked help could not be opened. Fix: replaced transient tooltips with persistent 44 x 44 disclosure buttons, kept help available beside disabled switches, and added an explicit voice-detection lock reason. Post-fix evidence: `recording-help-light.png` and AccessKit interaction tests.
+3. Interaction review issue: a switch could report its pre-click state during the activation frame. Fix: the shared switch now paints and exposes its effective post-click state immediately. Post-fix evidence: bidirectional action and AccessKit checked-state tests.
+
+## Residual manual checks
+
+- Narrator or NVDA announcement wording for the disclosure's expanded state.
+- High-contrast mode and display scaling above the captured configuration.
+- Touch input on a physical Windows touch device.
+
+final result: passed
