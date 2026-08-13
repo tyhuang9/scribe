@@ -1469,42 +1469,6 @@ impl ModelCard<'_> {
             _ => false,
         }
     }
-
-    fn primary_verb(&self) -> &str {
-        match *self {
-            Self::Local(model) if model.download_state == ModelDownloadState::Downloading => {
-                "Cancel"
-            }
-            Self::Local(model)
-                if matches!(
-                    model.download_state,
-                    ModelDownloadState::Verifying | ModelDownloadState::Extracting
-                ) =>
-            {
-                "Verifying"
-            }
-            Self::Local(model) if model.installed => "Remove",
-            Self::Local(model) if model.download_state == ModelDownloadState::Failed => "Retry",
-            Self::Local(model) if model.download_state == ModelDownloadState::Cancelled => "Resume",
-            Self::Local(_) => "Download",
-            Self::Remote(_, variant) => {
-                remote_primary_action(variant).map_or("Unavailable", |action| action.label.as_str())
-            }
-        }
-    }
-
-    fn accessible_name(&self) -> String {
-        match *self {
-            Self::Local(model) => format!("{} {}", self.primary_verb(), model.display_name),
-            Self::Remote(entry, variant) if !variant.size_label.trim().is_empty() => format!(
-                "{} {}, {}",
-                self.primary_verb(),
-                entry.display_name,
-                variant.size_label
-            ),
-            Self::Remote(entry, _) => format!("{} {}", self.primary_verb(), entry.display_name),
-        }
-    }
 }
 
 struct ModelCardRenderResult {
@@ -5497,44 +5461,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_model_card_actions_use_visible_size_without_technical_variants() {
-        let entry = RemoteCatalogEntryView {
-            display_name: "Compact English".into(),
-            ..Default::default()
-        };
-        let variant = |id: &str, size_label: &str| RemoteCatalogVariantView {
-            id: id.into(),
-            size_label: size_label.into(),
-            actions: vec![RemoteCatalogActionView {
-                label: "Install".into(),
-                kind: RemoteCatalogActionKind::Install {
-                    remote_model_id: "compact-english".into(),
-                    variant_id: id.into(),
-                },
-                enabled: true,
-                disabled_reason: None,
-            }],
-            ..Default::default()
-        };
-        let small = variant("technical-q5", "82 MB");
-        let large = variant("technical-q8", "128 MB");
-
-        assert_eq!(
-            ModelCard::Remote(&entry, &small).accessible_name(),
-            "Install Compact English, 82 MB"
-        );
-        assert_eq!(
-            ModelCard::Remote(&entry, &large).accessible_name(),
-            "Install Compact English, 128 MB"
-        );
-        assert!(
-            !ModelCard::Remote(&entry, &small)
-                .accessible_name()
-                .contains("technical-q5")
-        );
-    }
-
-    #[test]
     fn microphone_error_alert_groups_message_and_recovery_actions() {
         let mut state = TranscriptionState {
             phase: TranscriptionPhase::MicrophoneError,
@@ -5771,31 +5697,6 @@ mod tests {
             })
             .expect("catalog row group behind modal");
         assert!(!dialog.1.children().contains(catalog_id));
-    }
-
-    #[test]
-    fn model_card_primary_words_follow_authoritative_state() {
-        let downloading = ModelViewModel {
-            download_state: ModelDownloadState::Downloading,
-            ..Default::default()
-        };
-        let failed = ModelViewModel {
-            download_state: ModelDownloadState::Failed,
-            ..Default::default()
-        };
-        let cancelled = ModelViewModel {
-            download_state: ModelDownloadState::Cancelled,
-            ..Default::default()
-        };
-        let installed = ModelViewModel {
-            installed: true,
-            ..Default::default()
-        };
-
-        assert_eq!(ModelCard::Local(&downloading).primary_verb(), "Cancel");
-        assert_eq!(ModelCard::Local(&failed).primary_verb(), "Retry");
-        assert_eq!(ModelCard::Local(&cancelled).primary_verb(), "Resume");
-        assert_eq!(ModelCard::Local(&installed).primary_verb(), "Remove");
     }
 
     #[test]
