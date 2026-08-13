@@ -1740,10 +1740,60 @@ mod tests {
         .expect("Active badge should expose visual bounds");
         assert_within_tolerance(
             (badge.y0 + badge.y1) / 2.0,
-            (title.y0 + title.y1) / 2.0,
+            (title.y0 + title.y1) / 2.0 - 3.0,
             0.5,
-            "Active badge vertical center",
+            "Active badge optical vertical center",
         );
+    }
+
+    #[test]
+    fn clicking_an_inactive_installed_card_selects_the_real_model() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
+        let point = egui::pos2(card.x0 as f32 + 96.0, ((card.y0 + card.y1) / 2.0) as f32);
+        let (_, press_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, release_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(release_action, ScreenAction::SelectModel("tiny.en".into()));
     }
 
     #[test]

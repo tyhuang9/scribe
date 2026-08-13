@@ -1403,7 +1403,9 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, center_y: f32) {
         .x;
     let size = Vec2::new(8.0 + 6.0 + 6.0 + text_width + 8.0, 22.0);
     let (slot, response) = ui.allocate_exact_size(size, Sense::hover());
-    let visual = egui::Rect::from_center_size(egui::pos2(slot.center().x, center_y), size);
+    // `Label::rect` includes extra ascent/descent space. Offset the capsule
+    // to the text ink's optical center rather than its full line box.
+    let visual = egui::Rect::from_center_size(egui::pos2(slot.center().x, center_y - 3.0), size);
     ui.painter()
         .rect_filled(visual, Rounding::same(999.0), colors.disabled_bg);
     ui.painter().circle_filled(
@@ -2207,6 +2209,12 @@ fn render_model_card(
             variant_id: variant.id.clone(),
         },
     };
+    let card_click_action = match card {
+        ModelCard::Local(model) if model.installed && model.ready && !model.active => {
+            ScreenAction::SelectModel(model.id.clone())
+        }
+        _ => details_action.clone(),
+    };
 
     let (row_action, row_icon, row_name, row_enabled, row_reason, row_progress) = match card {
         ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => {
@@ -2309,6 +2317,7 @@ fn render_model_card(
     };
 
     let wide = width >= 1_100.0;
+    let action_control_hovered;
     if let Some(columns) = model_card_column_layout(width) {
         // Render into fixed physical cells rather than flowing child widgets.
         // This is deliberately shared with the header splitter above: neither
@@ -2395,6 +2404,7 @@ fn render_model_card(
         if row_enabled && row.clicked() {
             action = row_action;
         }
+        action_control_hovered = details.hovered() || row.hovered();
         if requested_focus {
             details.request_focus();
             scroll_focused_control_into_view(&details_ui, &details);
@@ -2455,6 +2465,7 @@ fn render_model_card(
         if row_enabled && row.clicked() {
             action = row_action.clone();
         }
+        action_control_hovered = details.hovered() || row.hovered();
         if requested_focus {
             details.request_focus();
             scroll_focused_control_into_view(&actions_ui, &details);
@@ -2522,6 +2533,17 @@ fn render_model_card(
         );
         ui.painter()
             .rect_filled(progress_rect, Rounding::same(1.0), colors.primary);
+    }
+
+    let card_click = ui
+        .interact(
+            card_rect,
+            ui.make_persistent_id(("model-card-select", &card_key)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if action == ScreenAction::None && card_click.clicked() && !action_control_hovered {
+        action = card_click_action;
     }
 
     if action == ScreenAction::None
