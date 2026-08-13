@@ -217,10 +217,16 @@ impl ModelDownloadState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ModelCapabilities {
-    pub streaming_preview: bool,
-    pub translation: bool,
+    /// False means unsupported only when `capabilities_known` is true.
+    pub capabilities_known: bool,
+    pub batch_transcription: bool,
+    pub native_streaming: bool,
+    pub cancellation: bool,
     pub timestamps: bool,
+    pub translation: bool,
     pub language_detection: bool,
+    pub confidence_scores: bool,
+    pub custom_vocabulary: bool,
     pub cpu: bool,
     pub gpu: bool,
 }
@@ -539,6 +545,9 @@ pub(crate) struct RemoteCatalogVariantView {
     pub size_bytes: u64,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
+    pub accuracy_guidance: String,
+    pub expected_ram_bytes: Option<u64>,
+    pub capabilities: ModelCapabilities,
     pub actions: Vec<RemoteCatalogActionView>,
 }
 

@@ -8826,6 +8826,9 @@ impl LocalTranscriberApp {
                         &artifact.filename,
                     )
                 });
+                let descriptor = normalized_model_id.as_ref().and_then(|model_id| {
+                    self.transcription_service.model_descriptor(model_id).ok()
+                });
                 let remote_id = artifact.as_ref().and_then(|artifact| {
                     config::managed_remote_model_id(
                         &artifact.model_id,
@@ -8983,7 +8986,15 @@ impl LocalTranscriberApp {
                     managed_model_id: remote_id,
                     size_bytes: variant.size_bytes,
                     size_tier: size_tier_for_bytes(variant.size_bytes),
-                    speed_tier: ModelSpeedTier::Unknown,
+                    speed_tier: descriptor
+                        .as_ref()
+                        .map_or(ModelSpeedTier::Unknown, model_speed_tier),
+                    accuracy_guidance: descriptor
+                        .as_ref()
+                        .map_or("Not rated", |descriptor| descriptor.accuracy_guidance)
+                        .to_owned(),
+                    expected_ram_bytes: descriptor.as_ref().and_then(expected_ram_bytes),
+                    capabilities: ui_model_capabilities(descriptor.as_ref()),
                     actions,
                 }
             })
@@ -9523,13 +9534,8 @@ impl LocalTranscriberApp {
                 })
                 .flatten(),
             estimated_ram_bytes: descriptor
-                .map_or(model.expected_ram.as_str(), |descriptor| {
-                    descriptor.expected_ram
-                })
-                .trim_end_matches(" GB")
-                .parse::<u64>()
-                .ok()
-                .map(|gigabytes| gigabytes * 1_000_000_000),
+                .and_then(expected_ram_bytes)
+                .or_else(|| expected_ram_bytes_label(&model.expected_ram)),
             languages: descriptor.map_or_else(Vec::new, |descriptor| {
                 descriptor
                     .languages
@@ -9541,15 +9547,10 @@ impl LocalTranscriberApp {
                 || "Not specified".to_owned(),
                 |descriptor| descriptor.languages.join(", "),
             ),
-            speed_tier: match descriptor.map_or(model.speed_tier.as_str(), |descriptor| {
-                descriptor.speed_guidance
-            }) {
-                "Fastest" => ModelSpeedTier::VeryFast,
-                "Fast" => ModelSpeedTier::Fast,
-                "Medium" => ModelSpeedTier::Balanced,
-                "Slower" => ModelSpeedTier::AccurateSlow,
-                _ => ModelSpeedTier::Unknown,
-            },
+            speed_tier: descriptor.map_or_else(
+                || model_speed_tier_label(&model.speed_tier),
+                model_speed_tier,
+            ),
             accuracy_guidance: descriptor
                 .map_or("Not rated", |descriptor| descriptor.accuracy_guidance)
                 .to_owned(),
@@ -9562,16 +9563,7 @@ impl LocalTranscriberApp {
                     _ => ModelSizeTier::Large,
                 }
             }),
-            capabilities: descriptor.map_or_else(ModelCapabilities::default, |descriptor| {
-                ModelCapabilities {
-                    streaming_preview: descriptor.capabilities.native_streaming,
-                    translation: descriptor.capabilities.translation,
-                    timestamps: descriptor.capabilities.timestamps,
-                    language_detection: descriptor.capabilities.language_detection,
-                    cpu: descriptor.capabilities.cpu,
-                    gpu: descriptor.capabilities.gpu,
-                }
-            }),
+            capabilities: ui_model_capabilities(descriptor),
             compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
                 match descriptor.compatibility {
                     CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
@@ -11291,6 +11283,52 @@ fn size_tier_for_bytes(size_bytes: u64) -> ModelSizeTier {
         513..=1024 => ModelSizeTier::Base,
         1025..=2048 => ModelSizeTier::Medium,
         _ => ModelSizeTier::Large,
+    }
+}
+
+fn expected_ram_bytes(descriptor: &ModelDescriptor) -> Option<u64> {
+    expected_ram_bytes_label(descriptor.expected_ram)
+}
+
+fn expected_ram_bytes_label(label: &str) -> Option<u64> {
+    label
+        .trim_end_matches(" GB")
+        .parse::<u64>()
+        .ok()
+        .map(|gigabytes| gigabytes * 1_000_000_000)
+}
+
+fn model_speed_tier(descriptor: &ModelDescriptor) -> ModelSpeedTier {
+    model_speed_tier_label(descriptor.speed_guidance)
+}
+
+fn model_speed_tier_label(guidance: &str) -> ModelSpeedTier {
+    match guidance {
+        "Fastest" => ModelSpeedTier::VeryFast,
+        "Fast" => ModelSpeedTier::Fast,
+        "Medium" => ModelSpeedTier::Balanced,
+        "Slower" => ModelSpeedTier::AccurateSlow,
+        _ => ModelSpeedTier::Unknown,
+    }
+}
+
+fn ui_model_capabilities(descriptor: Option<&ModelDescriptor>) -> ModelCapabilities {
+    let Some(descriptor) = descriptor else {
+        return ModelCapabilities::default();
+    };
+    let capabilities = descriptor.capabilities;
+    ModelCapabilities {
+        capabilities_known: true,
+        batch_transcription: capabilities.batch_transcription,
+        native_streaming: capabilities.native_streaming,
+        cancellation: capabilities.cancellation,
+        timestamps: capabilities.timestamps,
+        translation: capabilities.translation,
+        language_detection: capabilities.language_detection,
+        confidence_scores: capabilities.confidence_scores,
+        custom_vocabulary: capabilities.custom_vocabulary,
+        cpu: capabilities.cpu,
+        gpu: capabilities.gpu,
     }
 }
 
@@ -16379,6 +16417,11 @@ mod layout_tests {
         assert_eq!(projected.primary_action_label, "Repair runtime");
         assert!(projected.primary_action_repairs_runtime);
         assert!(!projected.primary_action_enabled);
+        assert!(projected.capabilities.capabilities_known);
+        assert_eq!(
+            projected.capabilities,
+            ui_model_capabilities(Some(&descriptor))
+        );
         assert_eq!(
             projected.primary_action_disabled_reason.as_deref(),
             Some("This model has no compatible local provider.")
@@ -16436,6 +16479,7 @@ mod layout_tests {
         assert_eq!(projected.display_name, "Vosk small English");
         assert_eq!(projected.variant_label, "small.en");
         assert_eq!(projected.compatibility, ModelCompatibility::Incompatible);
+        assert!(!projected.capabilities.capabilities_known);
 
         app.model_downloads
             .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
@@ -18237,6 +18281,65 @@ mod layout_tests {
         assert!(app.artifact_mutation_block_reason().is_some());
         assert_eq!(app.status, TranscriptionStatus::Error);
         assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
+    #[test]
+    fn remote_projection_enriches_only_exact_normalized_artifacts() {
+        let app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&model_id)
+            .unwrap();
+        let manifest = crate::model_catalog::runtime_model_manifest(&model_id).unwrap();
+        let exact = RemoteModel {
+            id: manifest.artifact_repository.to_owned(),
+            revision: manifest.artifact_revision.to_owned(),
+            display_name: "Exact normalized remote".to_owned(),
+            description: "fixture".to_owned(),
+            languages: vec!["en".to_owned()],
+            recommended: false,
+            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
+            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
+                "fixture".to_owned(),
+            ),
+            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
+                id: "exact".to_owned(),
+                filename: manifest.artifact_filename.to_owned(),
+                size_bytes: manifest.artifact_size_bytes,
+                expected_sha256: manifest.artifact_sha256.to_owned(),
+            }],
+        };
+
+        let mut exact_view = app.remote_catalog_entry_view(&exact);
+        let enriched = exact_view.variants.remove(0);
+        assert_eq!(
+            enriched.normalized_model_id.as_deref(),
+            Some(model_id.as_str())
+        );
+        assert_eq!(enriched.speed_tier, ModelSpeedTier::VeryFast);
+        assert_eq!(enriched.accuracy_guidance, descriptor.accuracy_guidance);
+        assert_eq!(enriched.expected_ram_bytes, Some(1_000_000_000));
+        assert!(enriched.capabilities.capabilities_known);
+        assert_eq!(
+            enriched.capabilities,
+            ui_model_capabilities(Some(&descriptor))
+        );
+
+        let arbitrary = remote_catalog_model(
+            "handy-computer/arbitrary-remote",
+            "Arbitrary remote",
+            &["en"],
+            false,
+            1,
+        );
+        let mut arbitrary_view = app.remote_catalog_entry_view(&arbitrary);
+        let unknown = arbitrary_view.variants.remove(0);
+        assert!(unknown.normalized_model_id.is_none());
+        assert_eq!(unknown.speed_tier, ModelSpeedTier::Unknown);
+        assert_eq!(unknown.accuracy_guidance, "Not rated");
+        assert_eq!(unknown.expected_ram_bytes, None);
+        assert!(!unknown.capabilities.capabilities_known);
     }
 
     #[test]

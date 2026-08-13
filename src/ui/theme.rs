@@ -19,6 +19,10 @@ pub(crate) struct ThemePalette {
     pub slider_remainder_fill: Color32,
     pub slider_live_below: Color32,
     pub slider_live_above: Color32,
+    /// Short model-card meter colors. `meter_track` is intentionally neutral.
+    pub meter_track: Color32,
+    pub speed_meter: Color32,
+    pub accuracy_meter: Color32,
     pub primary: Color32,
     pub accent: Color32,
     /// Theme-coherent blue/neutral track for the compact recording-mode selector.
@@ -71,6 +75,9 @@ impl ThemePalette {
             slider_remainder_fill: Color32::from_rgb(226, 232, 240),
             slider_live_below: Color32::from_rgb(29, 78, 216),
             slider_live_above: Color32::from_rgb(6, 118, 71),
+            meter_track: Color32::from_rgb(226, 232, 240),
+            speed_meter: Color32::from_rgb(6, 118, 71),
+            accuracy_meter: Color32::from_rgb(180, 83, 9),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
             segmented_control_bg: Color32::from_rgb(37, 99, 235),
@@ -109,6 +116,9 @@ impl ThemePalette {
             slider_remainder_fill: Color32::from_rgb(53, 61, 76),
             slider_live_below: Color32::from_rgb(96, 165, 250),
             slider_live_above: Color32::from_rgb(74, 222, 128),
+            meter_track: Color32::from_rgb(53, 61, 76),
+            speed_meter: Color32::from_rgb(74, 222, 128),
+            accuracy_meter: Color32::from_rgb(251, 191, 36),
             primary: Color32::from_rgb(247, 250, 252),
             accent: Color32::from_rgb(96, 165, 250),
             segmented_control_bg: Color32::from_rgb(96, 115, 140),
@@ -197,6 +207,14 @@ mod tests {
             assert!(
                 contrast_ratio(palette.slider_live_above, palette.slider_remainder_fill) >= 3.0
             );
+        }
+    }
+
+    #[test]
+    fn model_card_meter_tokens_contrast_with_their_neutral_track() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(contrast_ratio(palette.speed_meter, palette.meter_track) >= 3.0);
+            assert!(contrast_ratio(palette.accuracy_meter, palette.meter_track) >= 3.0);
         }
     }
 

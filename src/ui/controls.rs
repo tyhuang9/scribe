@@ -258,6 +258,11 @@ pub(crate) enum Icon {
     Close,
     ChevronRight,
     Spinner,
+    Streaming,
+    WordTimestamps,
+    Translation,
+    LanguageDetection,
+    BatchTranscription,
 }
 
 pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
@@ -288,12 +293,18 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Close => regular::X,
         Icon::ChevronRight => regular::CARET_RIGHT,
         Icon::Spinner => regular::CIRCLE_NOTCH,
+        Icon::Streaming => regular::WAVEFORM,
+        Icon::WordTimestamps => regular::SUBTITLES,
+        Icon::Translation => regular::TRANSLATE,
+        Icon::LanguageDetection => regular::GLOBE,
+        Icon::BatchTranscription => regular::LIST_BULLETS,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_phosphor::regular;
 
     #[test]
     fn primary_targets_meet_wcag_pointer_size() {
@@ -301,6 +312,15 @@ mod tests {
         let ctx = egui::Context::default();
         configure_accessible_style(&ctx);
         assert!(ctx.style().spacing.interact_size.y >= 44.0);
+    }
+
+    #[test]
+    fn model_feature_icons_have_stable_glyph_contracts() {
+        assert_eq!(icon_glyph(Icon::Streaming), regular::WAVEFORM);
+        assert_eq!(icon_glyph(Icon::WordTimestamps), regular::SUBTITLES);
+        assert_eq!(icon_glyph(Icon::Translation), regular::TRANSLATE);
+        assert_eq!(icon_glyph(Icon::LanguageDetection), regular::GLOBE);
+        assert_eq!(icon_glyph(Icon::BatchTranscription), regular::LIST_BULLETS);
     }
 
     #[test]
