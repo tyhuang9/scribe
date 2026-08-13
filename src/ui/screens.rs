@@ -1393,31 +1393,36 @@ fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
     );
 }
 
-fn installed_model_badge(ui: &mut egui::Ui, text: &str, dot: Option<egui::Color32>) {
+fn installed_model_badge(ui: &mut egui::Ui, text: &str, center_y: f32) {
     let colors = ui_palette(ui);
-    Frame::none()
-        .fill(colors.disabled_bg)
-        .rounding(Rounding::same(999.0))
-        .inner_margin(Margin::symmetric(8.0, 2.0))
-        .show(ui, |ui| {
-            ui.spacing_mut().interact_size.y = 0.0;
-            ui.horizontal(|ui| {
-                if let Some(dot) = dot {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.0, dot);
-                }
-                ui.label(
-                    RichText::new(text)
-                        .small()
-                        .color(if dot.is_some() {
-                            colors.success_text
-                        } else {
-                            colors.muted_text
-                        })
-                        .strong(),
-                );
-            });
-        });
+    let font = egui::FontId::proportional(12.0);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), colors.success_text)
+        .size()
+        .x;
+    let size = Vec2::new(8.0 + 6.0 + 6.0 + text_width + 8.0, 22.0);
+    let (slot, response) = ui.allocate_exact_size(size, Sense::hover());
+    let visual = egui::Rect::from_center_size(egui::pos2(slot.center().x, center_y), size);
+    ui.painter()
+        .rect_filled(visual, Rounding::same(999.0), colors.disabled_bg);
+    ui.painter().circle_filled(
+        egui::pos2(visual.left() + 11.0, visual.center().y),
+        3.0,
+        colors.success,
+    );
+    ui.painter().text(
+        egui::pos2(visual.left() + 20.0, visual.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        colors.success_text,
+    );
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::StaticText);
+        builder.set_name(text);
+        builder.set_bounds(accesskit_rect(visual));
+    });
 }
 
 const MODEL_COMPARISON_BOTTOM_GAP: f32 = 24.0;
@@ -2086,6 +2091,7 @@ fn compact_model_icon_action(
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(accessible_name);
+        builder.set_bounds(accesskit_rect(target));
         if !enabled {
             builder.set_disabled();
         }
@@ -2130,11 +2136,11 @@ fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &s
                         ModelCard::Local(model) => &model.display_name,
                         ModelCard::Remote(entry, _) => &entry.display_name,
                     };
-                    ui.label(RichText::new(name).strong());
+                    let name = ui.label(RichText::new(name).strong());
                     if let ModelCard::Local(model) = card
                         && model.active
                     {
-                        installed_model_badge(ui, "Active", Some(colors.success));
+                        installed_model_badge(ui, "Active", name.rect.center().y);
                     }
                 },
             );
@@ -3757,6 +3763,38 @@ fn contain_model_dialog_focus(
     ctx.memory_mut(|memory| memory.request_focus(target));
 }
 
+/// Details is primarily a pointer-invoked inspection surface. Do not move
+/// focus to a visible button when it opens or closes; the first Tab press
+/// starts a normal, contained drawer focus sequence instead.
+fn contain_details_drawer_focus(
+    ctx: &egui::Context,
+    tab_backwards: Option<bool>,
+    controls: &[egui::Id],
+    clear_initial_focus: bool,
+) {
+    if clear_initial_focus {
+        ctx.memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+        return;
+    }
+
+    let Some(first) = controls.first().copied() else {
+        return;
+    };
+    let Some(backwards) = tab_backwards else {
+        return;
+    };
+    let target = if backwards {
+        controls.last().copied().unwrap_or(first)
+    } else {
+        first
+    };
+    ctx.memory_mut(|memory| memory.request_focus(target));
+}
+
 /// Keep pointer input intended for the Models page below the dialog layer.
 /// Keyboard focus is contained separately by `contain_model_dialog_focus`.
 /// This mirrors the established
@@ -3973,13 +4011,13 @@ fn show_local_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
-    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(drawer_id)
             .order(egui::Order::Foreground)
             .fixed_pos(layout.position)
             .movable(false)
+            .enabled(true)
             .show(&ctx, |drawer_ui| {
                 Frame::none()
                     .fill(ui_palette(drawer_ui).card_bg)
@@ -4166,7 +4204,6 @@ fn show_local_model_details_drawer(
                                 });
                                 mark_accesskit_enabled(ui, &advanced.header_response);
                                 focusable_controls.push(advanced.header_response.id);
-                                initial_focus.get_or_insert(advanced.header_response.id);
                         });
                         drawer_ui.separator();
                         drawer_ui.allocate_ui_with_layout(
@@ -4205,11 +4242,10 @@ fn show_local_model_details_drawer(
             action = ScreenAction::CloseModelDialog;
         }
     }
-    contain_model_dialog_focus(
+    contain_details_drawer_focus(
         &ctx,
         tab_direction,
         &focusable_controls,
-        initial_focus,
         management.focus_dialog_initial,
     );
     action
@@ -4238,7 +4274,6 @@ fn show_remote_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
-    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     let drawer_action = variant
         .actions
@@ -4254,6 +4289,7 @@ fn show_remote_model_details_drawer(
         .order(egui::Order::Foreground)
         .fixed_pos(layout.position)
         .movable(false)
+        .enabled(true)
         .show(&ctx, |drawer_ui| {
             Frame::none()
                 .fill(ui_palette(drawer_ui).card_bg)
@@ -4333,7 +4369,6 @@ fn show_remote_model_details_drawer(
                             });
                             mark_accesskit_enabled(ui, &advanced.header_response);
                             focusable_controls.push(advanced.header_response.id);
-                            initial_focus.get_or_insert(advanced.header_response.id);
                         });
                     drawer_ui.separator();
                     drawer_ui.allocate_ui_with_layout(
@@ -4377,11 +4412,10 @@ fn show_remote_model_details_drawer(
             action = ScreenAction::CloseModelDialog;
         }
     }
-    contain_model_dialog_focus(
+    contain_details_drawer_focus(
         &ctx,
         tab_direction,
         &focusable_controls,
-        initial_focus,
         management.focus_dialog_initial,
     );
     action

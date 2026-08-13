@@ -9246,12 +9246,7 @@ impl LocalTranscriberApp {
             }
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
-                Some(ModelDialog::Details(id)) => {
-                    self.model_management.restore_details_focus = Some(id)
-                }
-                Some(ModelDialog::RemoteDetails { .. }) => {
-                    self.model_management.restore_add_focus = true;
-                }
+                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
                 Some(ModelDialog::Remove(id)) => {
                     self.model_management.restore_remove_focus = Some(id);
                     self.model_management.removal_replacement = None;
@@ -9381,7 +9376,6 @@ impl LocalTranscriberApp {
                     && self.select_model_as_default(&model)
                 {
                     self.model_management.dialog = None;
-                    self.model_management.restore_details_focus = Some(id);
                 }
             }
             ScreenAction::ConfirmModelRemoval(id) => {

@@ -462,7 +462,6 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
                     .then(|| "This model is already active.".to_owned());
             }
             data.model_management.dialog = None;
-            data.model_management.restore_details_focus = Some(id);
         }
         ScreenAction::AddModel => {
             data.model_management.dialog = Some(ModelDialog::Add);
@@ -488,12 +487,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
             Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
-            Some(ModelDialog::Details(id)) => {
-                data.model_management.restore_details_focus = Some(id)
-            }
-            Some(ModelDialog::RemoteDetails { .. }) => {
-                data.model_management.restore_add_focus = true;
-            }
+            Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
             Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
             None => {}
         },
@@ -1493,10 +1487,7 @@ mod tests {
         let (output, action) =
             render_with_input(&ctx, &mut details, &mut page, 1180.0, 815.0, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(
-            focused_node(&output).name(),
-            Some("Advanced model information")
-        );
+        assert_eq!(focused_node(&output).name(), None);
         let (output, action) = render_with_input(
             &ctx,
             &mut details,
@@ -1537,10 +1528,7 @@ mod tests {
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(
-            focused_node(&initial).name(),
-            Some("Advanced model information")
-        );
+        assert_eq!(focused_node(&initial).name(), None);
 
         for _ in 0..8 {
             let (mut output, action) = render_with_input(
@@ -1599,11 +1587,7 @@ mod tests {
             close.x1 >= drawer.x1 - 20.0 && close.y0 <= drawer.y0 + 20.0,
             "Close must stay in the drawer's top-right header corner: drawer={drawer:?}, close={close:?}"
         );
-        assert_ne!(focused_node(&output).name(), Some("Close model details"));
-        assert_eq!(
-            focused_node(&output).name(),
-            Some("Advanced model information")
-        );
+        assert_eq!(focused_node(&output).name(), None);
     }
 
     #[test]
@@ -1634,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn details_dialog_escape_moves_focus_to_the_models_toolbar() {
+    fn details_dialog_escape_leaves_no_button_focused() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1657,18 +1641,12 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
-        assert_eq!(
-            action,
-            ScreenAction::AcknowledgeModelControlFocus {
-                model_id: "tiny.en".into(),
-                control: super::super::state::ModelCardControl::Details,
-            }
-        );
+        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(action, ScreenAction::None);
     }
 
     #[test]
-    fn remote_details_drawer_escape_moves_focus_to_the_models_toolbar() {
+    fn remote_details_drawer_escape_leaves_no_button_focused() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1692,10 +1670,7 @@ mod tests {
             !close.is_disabled(),
             "the drawer close control must stay enabled"
         );
-        assert_eq!(
-            focused_node(&initial).name(),
-            Some("Advanced model information")
-        );
+        assert_eq!(focused_node(&initial).name(), None);
 
         let (_, action) = render_with_input(
             &ctx,
@@ -1707,12 +1682,68 @@ mod tests {
         );
         assert_eq!(action, ScreenAction::CloseModelDialog);
         apply_action(&mut data, &mut page, action);
-        assert!(data.model_management.restore_add_focus);
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(action, ScreenAction::None);
+    }
+
+    #[test]
+    fn details_drawer_close_leaves_no_button_focused() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
+        data.model_management.focus_dialog_initial = true;
+
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let close = named_node_id(&output, "Close model details");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: close,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::CloseModelDialog);
+        apply_action(&mut data, &mut page, action);
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
+        assert_eq!(focused_node(&output).name(), None);
         assert_eq!(action, ScreenAction::None);
+    }
+
+    #[test]
+    fn active_badge_is_centered_on_the_model_name() {
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let title = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::StaticText
+                && node.name() == Some("whisper.cpp base.en")
+        })
+        .bounds()
+        .expect("model title should expose visual bounds");
+        let badge = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::StaticText && node.name() == Some("Active")
+        })
+        .bounds()
+        .expect("Active badge should expose visual bounds");
+        assert_within_tolerance(
+            (badge.y0 + badge.y1) / 2.0,
+            (title.y0 + title.y1) / 2.0,
+            0.5,
+            "Active badge vertical center",
+        );
     }
 
     #[test]
@@ -1761,16 +1792,20 @@ mod tests {
     fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
         let (width, height) = (1180.0, 815.0);
         for (dialog, dialog_name, expected_focus) in [
-            (ModelDialog::Add, "Import local GGUF", "GGUF file path"),
+            (
+                ModelDialog::Add,
+                "Import local GGUF",
+                Some("GGUF file path"),
+            ),
             (
                 ModelDialog::Details("base.en".into()),
                 "Model details for whisper.cpp base.en",
-                "Advanced model information",
+                None,
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),
                 "Remove whisper.cpp tiny.en",
-                "Cancel",
+                Some("Cancel"),
             ),
         ] {
             let ctx = egui::Context::default();
@@ -1798,7 +1833,7 @@ mod tests {
             );
             let dock_id = named_node_id(&initial, "Expand comparison");
 
-            assert_eq!(focused_node(&initial).name(), Some(expected_focus));
+            assert_eq!(focused_node(&initial).name(), expected_focus);
             let (_, action) = render_with_input(
                 &ctx,
                 &mut data,
