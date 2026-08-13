@@ -1445,7 +1445,6 @@ enum ModelCard<'a> {
     Remote(&'a RemoteCatalogEntryView, &'a RemoteCatalogVariantView),
 }
 
-#[allow(dead_code)]
 impl ModelCard<'_> {
     fn key(&self) -> ModelCardKey {
         match *self {
@@ -1717,7 +1716,6 @@ fn acceleration_label(capabilities: ModelCapabilities) -> Option<&'static str> {
     }
 }
 
-#[allow(dead_code)]
 fn rating_meter(
     ui: &mut egui::Ui,
     name: &str,
@@ -1804,7 +1802,6 @@ fn model_row_description(card: ModelCard<'_>) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn remote_primary_action(variant: &RemoteCatalogVariantView) -> Option<&RemoteCatalogActionView> {
     variant.actions.iter().find(|action| {
         matches!(
