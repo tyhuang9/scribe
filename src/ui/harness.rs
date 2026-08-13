@@ -7,7 +7,7 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
+        ComparisonPhase, ModelCardKey, ModelComparisonState, ModelDialog, ModelDownloadState,
         ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
         RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
@@ -17,7 +17,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase, ModelCardKey};
+use super::state::{ComparisonResult, ComparisonResultPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -29,7 +29,7 @@ pub(crate) enum Fixture {
     TranscribeMicrophoneError,
     ModelsInstalled,
     ModelsLifecycle,
-    ModelsDetailsDrawer,
+    ModelsCardExpanded,
     ModelsCompareExpanded,
     History,
     SettingsRecording,
@@ -46,7 +46,7 @@ impl Fixture {
         Self::TranscribeMicrophoneError,
         Self::ModelsInstalled,
         Self::ModelsLifecycle,
-        Self::ModelsDetailsDrawer,
+        Self::ModelsCardExpanded,
         Self::ModelsCompareExpanded,
         Self::History,
         Self::SettingsRecording,
@@ -61,7 +61,7 @@ impl Fixture {
             "transcribe/microphone-error" => Self::TranscribeMicrophoneError,
             "models/installed" => Self::ModelsInstalled,
             "models/lifecycle" => Self::ModelsLifecycle,
-            "models/details-drawer" => Self::ModelsDetailsDrawer,
+            "models/card-expanded" => Self::ModelsCardExpanded,
             "models/compare-expanded" => Self::ModelsCompareExpanded,
             "history" => Self::History,
             "settings/recording" => Self::SettingsRecording,
@@ -72,7 +72,7 @@ impl Fixture {
         match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
-            | Self::ModelsDetailsDrawer
+            | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => AppPage::Models,
             Self::History => AppPage::History,
             Self::SettingsRecording => AppPage::General,
@@ -105,7 +105,7 @@ impl Fixture {
         let route = match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
-            | Self::ModelsDetailsDrawer
+            | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => UiRoute::Models,
             Self::History => UiRoute::History,
             Self::SettingsRecording => UiRoute::Settings(SettingsTab::Recording),
@@ -135,7 +135,7 @@ impl Fixture {
             Self::ModelsInstalled | Self::SettingsRecording | Self::History => {
                 transcription.phase = TranscriptionPhase::Ready
             }
-            Self::ModelsLifecycle | Self::ModelsDetailsDrawer => {
+            Self::ModelsLifecycle | Self::ModelsCardExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
                 let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
                 partial.installed = false;
@@ -188,10 +188,9 @@ impl Fixture {
             transcription,
             models,
             comparison,
-            model_management: if self == Self::ModelsDetailsDrawer {
+            model_management: if self == Self::ModelsCardExpanded {
                 ModelManagementState {
-                    dialog: Some(ModelDialog::Details("tiny.en".into())),
-                    focus_dialog_initial: true,
+                    expanded_model_card: Some(ModelCardKey::Local("tiny.en".into())),
                     ..Default::default()
                 }
             } else {
@@ -468,19 +467,12 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.dialog = Some(ModelDialog::Add);
             data.model_management.focus_dialog_initial = true;
         }
-        ScreenAction::ShowModelDetails(id) => {
-            data.model_management.dialog = Some(ModelDialog::Details(id));
-            data.model_management.focus_dialog_initial = true;
-        }
-        ScreenAction::ShowRemoteModelDetails {
-            entry_id,
-            variant_id,
-        } => {
-            data.model_management.dialog = Some(ModelDialog::RemoteDetails {
-                entry_id,
-                variant_id,
-            });
-            data.model_management.focus_dialog_initial = true;
+        ScreenAction::ToggleModelCardDetails(key) => {
+            if data.model_management.expanded_model_card.as_ref() == Some(&key) {
+                data.model_management.expanded_model_card = None;
+            } else {
+                data.model_management.expanded_model_card = Some(key);
+            }
         }
         ScreenAction::RequestModelRemoval(id) => {
             data.model_management.dialog = Some(ModelDialog::Remove(id));
@@ -558,10 +550,16 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetRemoteCatalogQuery(query) => data.remote_catalog.query = query,
         ScreenAction::SetModelLanguageFilter(filter) => data.model_language_filter = filter,
         ScreenAction::ToggleInstalledModels => {
-            data.model_management.installed_expanded = !data.model_management.installed_expanded
+            data.model_management.installed_expanded = !data.model_management.installed_expanded;
+            if !data.model_management.installed_expanded {
+                data.model_management.expanded_model_card = None;
+            }
         }
         ScreenAction::ToggleAvailableModels => {
-            data.model_management.available_expanded = !data.model_management.available_expanded
+            data.model_management.available_expanded = !data.model_management.available_expanded;
+            if !data.model_management.available_expanded {
+                data.model_management.expanded_model_card = None;
+            }
         }
         ScreenAction::FocusModelCard(key) => data.model_management.focus_model_card = Some(key),
         ScreenAction::AcknowledgeModelCardFocus(key) => {
@@ -1849,7 +1847,7 @@ mod tests {
         );
         assert_eq!(
             details_action,
-            ScreenAction::ShowModelDetails("base.en".into())
+            ScreenAction::ToggleModelCardDetails(ModelCardKey::Local("base.en".into()))
         );
 
         let remove = named_node_bounds(&initial, "Remove whisper.cpp tiny.en from device");

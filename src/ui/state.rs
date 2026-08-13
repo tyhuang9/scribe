@@ -351,6 +351,8 @@ pub(crate) enum ModelCardControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
+    /// The one model card whose inline details are expanded, if any.
+    pub expanded_model_card: Option<ModelCardKey>,
     /// One-frame focus request when a dialog first appears.
     pub focus_dialog_initial: bool,
     pub restore_add_focus: bool,
@@ -370,6 +372,7 @@ impl Default for ModelManagementState {
     fn default() -> Self {
         Self {
             dialog: None,
+            expanded_model_card: None,
             focus_dialog_initial: false,
             restore_add_focus: false,
             restore_after_removal_focus: false,

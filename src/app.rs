@@ -71,7 +71,7 @@ use crate::transcription::{
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
     AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
-    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
+    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelCardKey, ModelComparisonState,
     ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
     ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
     RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
@@ -8266,8 +8266,7 @@ impl LocalTranscriberApp {
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
-            | ScreenAction::ShowModelDetails(_)
-            | ScreenAction::ShowRemoteModelDetails { .. }
+            | ScreenAction::ToggleModelCardDetails(_)
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
@@ -9228,19 +9227,12 @@ impl LocalTranscriberApp {
                 self.model_management.dialog = Some(ModelDialog::Add);
                 self.model_management.focus_dialog_initial = true;
             }
-            ScreenAction::ShowModelDetails(id) => {
-                self.model_management.dialog = Some(ModelDialog::Details(id));
-                self.model_management.focus_dialog_initial = true;
-            }
-            ScreenAction::ShowRemoteModelDetails {
-                entry_id,
-                variant_id,
-            } => {
-                self.model_management.dialog = Some(ModelDialog::RemoteDetails {
-                    entry_id,
-                    variant_id,
-                });
-                self.model_management.focus_dialog_initial = true;
+            ScreenAction::ToggleModelCardDetails(key) => {
+                if self.model_management.expanded_model_card.as_ref() == Some(&key) {
+                    self.model_management.expanded_model_card = None;
+                } else {
+                    self.model_management.expanded_model_card = Some(key);
+                }
             }
             ScreenAction::RequestModelRemoval(id) => {
                 let active = self.config.general.selected_default_model == id;
@@ -9393,6 +9385,11 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
+                if self.model_management.expanded_model_card.as_ref()
+                    == Some(&ModelCardKey::Local(id.clone()))
+                {
+                    self.model_management.expanded_model_card = None;
+                }
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
                 let mut replacement_name = None;
@@ -9485,13 +9482,27 @@ impl LocalTranscriberApp {
                     );
                 }
             }
-            ScreenAction::SetRemoteCatalogQuery(query) => self.model_search = query,
-            ScreenAction::SetModelLanguageFilter(filter) => self.model_language_filter = filter,
+            ScreenAction::SetRemoteCatalogQuery(query) => {
+                self.model_search = query;
+                self.model_management.expanded_model_card = None;
+            }
+            ScreenAction::SetModelLanguageFilter(filter) => {
+                self.model_language_filter = filter;
+                self.model_management.expanded_model_card = None;
+            }
             ScreenAction::ToggleInstalledModels => {
-                self.model_management.installed_expanded = !self.model_management.installed_expanded
+                self.model_management.installed_expanded =
+                    !self.model_management.installed_expanded;
+                if !self.model_management.installed_expanded {
+                    self.model_management.expanded_model_card = None;
+                }
             }
             ScreenAction::ToggleAvailableModels => {
-                self.model_management.available_expanded = !self.model_management.available_expanded
+                self.model_management.available_expanded =
+                    !self.model_management.available_expanded;
+                if !self.model_management.available_expanded {
+                    self.model_management.expanded_model_card = None;
+                }
             }
             ScreenAction::FocusModelCard(key) => {
                 self.model_management.focus_model_card = Some(key);
@@ -10471,8 +10482,7 @@ impl LocalTranscriberApp {
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
-            | ScreenAction::ShowModelDetails(_)
-            | ScreenAction::ShowRemoteModelDetails { .. }
+            | ScreenAction::ToggleModelCardDetails(_)
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog

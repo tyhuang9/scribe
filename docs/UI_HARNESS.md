@@ -19,7 +19,7 @@ Valid state names are:
 - `transcribe/microphone-error`
 - `models/installed`
 - `models/lifecycle` — active, installed, uninstalled, partial, downloading, and failed row states
-- `models/details-drawer`
+- `models/card-expanded`
 - `models/compare-expanded`
 - `history`
 - `settings/recording`

@@ -249,11 +249,7 @@ pub(crate) enum ScreenAction {
     CancelModelInstall(String),
     RepairModelRuntime(String),
     MaintainModelRuntime(String),
-    ShowModelDetails(String),
-    ShowRemoteModelDetails {
-        entry_id: String,
-        variant_id: String,
-    },
+    ToggleModelCardDetails(ModelCardKey),
     RequestModelRemoval(String),
     ConfirmModelRemoval(String),
     CloseModelDialog,
@@ -2228,13 +2224,7 @@ fn render_model_card(
         ModelCard::Local(model) => format!("Details for {}", model.display_name),
         ModelCard::Remote(entry, _) => format!("Details for {}", entry.display_name),
     };
-    let details_action = match card {
-        ModelCard::Local(model) => ScreenAction::ShowModelDetails(model.id.clone()),
-        ModelCard::Remote(entry, variant) => ScreenAction::ShowRemoteModelDetails {
-            entry_id: entry.id.clone(),
-            variant_id: variant.id.clone(),
-        },
-    };
+    let details_action = ScreenAction::ToggleModelCardDetails(card_key.clone());
     let card_click_action = match card {
         ModelCard::Local(model) if model.installed && model.ready && !model.active => {
             ScreenAction::SelectModel(model.id.clone())
