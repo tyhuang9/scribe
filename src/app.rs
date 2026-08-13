@@ -52,6 +52,7 @@ use crate::installations::{
 };
 use crate::installed_manifest;
 use crate::managed_downloads;
+use crate::model_catalog::ArtifactFormat;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
 };
@@ -1477,6 +1478,7 @@ fn run_verified_install(
                 InstallationCandidate::pinned(
                     model_id.clone(),
                     model.path.clone(),
+                    ArtifactFormat::Gguf,
                     None,
                     manifest_source.expected_size_bytes,
                     manifest_source.expected_sha256.clone(),
@@ -1738,6 +1740,7 @@ fn validate_local_gguf_import(
             InstallationCandidate::pinned(
                 model_id.clone(),
                 fingerprint.canonical_path.clone(),
+                ArtifactFormat::Gguf,
                 None,
                 fingerprint.size_bytes,
                 fingerprint.sha256.clone(),
