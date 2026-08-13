@@ -2656,29 +2656,42 @@ mod tests {
         );
 
         let compact = render(Fixture::ModelsCardExpanded, 375.0, 680.0);
-        for node in compact
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .unwrap()
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-        {
-            if node.role() == egui::accesskit::Role::Button
-                && node.name().is_some_and(|name| {
-                    name.contains("details")
-                        || name.starts_with("Install")
-                        || name.starts_with("Uninstall")
-                })
-            {
-                let bounds = node.bounds().expect("model control bounds");
-                assert!(
-                    bounds.x0 >= 0.0 && bounds.x1 <= 400.0,
-                    "compact model control must not create horizontal overflow: {bounds:?}"
-                );
-                assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
-            }
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        for name in [
+            "Collapse details for whisper.cpp tiny.en",
+            "Uninstall whisper.cpp tiny.en",
+        ] {
+            let bounds = named_node_bounds(&compact, name);
+            assert_bounds_within(bounds, card, "compact model control");
+            assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
+        }
+    }
+
+    #[test]
+    fn expanded_remote_card_exposes_fallback_details_inline() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let entry = &data.remote_catalog.entries[0];
+        let variant = &entry.variants[0];
+        data.model_management.expanded_model_card = Some(ModelCardKey::Remote {
+            entry_id: entry.id.clone(),
+            variant_id: variant.id.clone(),
+        });
+        let mut page = Fixture::ModelsInstalled.page();
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let names = node_names(&output);
+        for detail in [
+            "GPU acceleration: Not available",
+            "Estimated RAM: Not available",
+            "File size: 82 MB",
+            "Languages: English",
+            "Repository: trusted-speech/compact-english",
+        ] {
+            assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
     }
 
