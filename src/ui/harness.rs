@@ -478,6 +478,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.dialog = Some(ModelDialog::Remove(id));
             data.model_management.focus_dialog_initial = true;
         }
+        ScreenAction::AcknowledgeModelRemovalFocus => {
+            data.model_management.restore_remove_focus = None;
+        }
         ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
             Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
             Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
@@ -2621,12 +2624,227 @@ mod tests {
             "expanded cards expose the full description exactly once"
         );
         for detail in [
-            "Languages: English",
+            "LANGUAGES",
+            "English",
             "Runtime: Ready",
             "Architecture: Not available",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
+    }
+
+    #[test]
+    fn model_card_lifecycle_controls_dispatch_matching_actions() {
+        let (width, height) = (1180.0, 815.0);
+        let cases = [
+            (
+                "Install",
+                ModelDownloadState::NotInstalled,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Retry",
+                ModelDownloadState::Failed,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Resume",
+                ModelDownloadState::Cancelled,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Cancel Lifecycle download",
+                ModelDownloadState::Downloading,
+                false,
+                false,
+                false,
+                ScreenAction::CancelModelInstall("lifecycle".into()),
+            ),
+            (
+                "Uninstall",
+                ModelDownloadState::Installed,
+                true,
+                false,
+                false,
+                ScreenAction::RequestModelRemoval("lifecycle".into()),
+            ),
+            (
+                "Upgrade",
+                ModelDownloadState::Installed,
+                true,
+                true,
+                false,
+                ScreenAction::UpgradeModel("lifecycle".into()),
+            ),
+            (
+                "Repair",
+                ModelDownloadState::Installed,
+                true,
+                false,
+                true,
+                ScreenAction::RepairModelRuntime("lifecycle".into()),
+            ),
+        ];
+
+        for (label, download_state, installed, upgrade, repair, expected) in cases {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut model = ModelViewModel {
+                id: "lifecycle".into(),
+                display_name: "Lifecycle".into(),
+                installed,
+                ready: installed && !upgrade && !repair,
+                install_supported: true,
+                install_action_enabled: true,
+                cancel_supported: true,
+                removal_supported: true,
+                primary_action_enabled: true,
+                primary_action_installs_upgrade: upgrade,
+                primary_action_repairs_runtime: repair,
+                download_state,
+                languages: vec!["en".into()],
+                ..Default::default()
+            };
+            if label == "Install" {
+                model.download_state = ModelDownloadState::NotInstalled;
+            }
+            data.models = installed.then_some(model.clone()).into_iter().collect();
+            data.model_catalog = (!installed).then_some(model).into_iter().collect();
+            let mut page = AppPage::Models;
+            let name = if label == "Cancel Lifecycle download" {
+                label.to_owned()
+            } else {
+                format!("{label} Lifecycle")
+            };
+            assert_eq!(
+                click_named_control(&ctx, &mut data, &mut page, width, height, &name),
+                expected,
+                "{label}"
+            );
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog = vec![ModelViewModel {
+            id: "lifecycle".into(),
+            display_name: "Lifecycle".into(),
+            download_state: ModelDownloadState::Verifying,
+            install_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let installing = node_matching(&output, |node| node.name() == Some("Installing Lifecycle"));
+        assert!(installing.is_disabled());
+        assert!(
+            installing
+                .description()
+                .is_some_and(|text| text.contains("cannot cancel"))
+        );
+    }
+
+    #[test]
+    fn model_title_is_a_named_button_and_removal_focus_is_acknowledged() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let title = node_matching(&output, |node| {
+            node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
+        });
+        assert_eq!(title.role(), egui::accesskit::Role::Button);
+        assert!(title.bounds().is_some_and(|bounds| bounds.height() >= 44.0));
+        let title_id = named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
+        assert_eq!(
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: title_id,
+                        data: None,
+                    }
+                )],
+            )
+            .1,
+            ScreenAction::SelectModel("tiny.en".into())
+        );
+
+        data.model_management.restore_remove_focus = Some("missing".into());
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::AcknowledgeModelRemovalFocus);
+        assert!(
+            focused_node(&output)
+                .name()
+                .is_some_and(|name| name.contains("Import"))
+        );
+        apply_action(&mut data, &mut page, action);
+        assert!(data.model_management.restore_remove_focus.is_none());
+    }
+
+    #[test]
+    fn inline_runtime_and_active_uninstall_reasons_are_exposed() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut active = data.models.remove(0);
+        active.runtime_action_label = Some("Repair".into());
+        active.runtime_action_enabled = false;
+        active.runtime_action_disabled_reason =
+            Some("Runtime maintenance is already running.".into());
+        data.models = vec![active.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(active.id.clone()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let runtime = node_matching(&output, |node| {
+            node.name() == Some(format!("Repair runtime for {}", active.display_name).as_str())
+        });
+        assert!(runtime.is_disabled());
+        assert_eq!(
+            runtime.description(),
+            Some("Runtime maintenance is already running.")
+        );
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some(format!("Uninstall {}", active.display_name).as_str())
+                        && node.description()
+                            == Some(
+                                "Install another ready model before removing the selected model.",
+                            )
+                })
+        );
     }
 
     #[test]
@@ -2665,6 +2883,40 @@ mod tests {
             assert_bounds_within(bounds, card, "compact model control");
             assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
         }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let long_name =
+            "A deliberately long local speech model name that wraps without covering controls";
+        data.models = vec![ModelViewModel {
+            id: "long-active".into(),
+            display_name: long_name.into(),
+            installed: true,
+            active: true,
+            selected: true,
+            ready: true,
+            removal_supported: true,
+            download_state: ModelDownloadState::Installed,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 375.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let card = named_node_bounds(&output, &format!("{long_name} model"));
+        for name in [
+            format!("Use {long_name} for future transcriptions"),
+            format!("Uninstall {long_name}"),
+            format!("Expand details for {long_name}"),
+        ] {
+            let bounds = named_node_bounds(&output, &name);
+            assert_bounds_within(bounds, card, "long-name compact model control");
+            assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+        }
     }
 
     #[test]
@@ -2685,10 +2937,12 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let names = node_names(&output);
         for detail in [
-            "GPU acceleration: Not available",
-            "Estimated RAM: Not available",
-            "File size: 82 MB",
-            "Languages: English",
+            "GPU ACCELERATION",
+            "RAM USAGE",
+            "FILE SIZE",
+            "82 MB",
+            "LANGUAGES",
+            "English",
             "Repository: trusted-speech/compact-english",
         ] {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
