@@ -5465,20 +5465,27 @@ fn recording_settings_panel(
     });
     ui.add_space(16.0);
     settings_section(ui, "Transcription", |ui| {
-        let _ = SettingsRow::show(ui, "Live transcription preview", true, |ui, _| {
-            if settings_switch_with_help(
-                ui,
-                LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID,
-                settings.provisional_feedback,
-                "Live transcription preview",
-                LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION,
-                !recording_locked,
-            )
-            .clicked()
-            {
-                *action = ScreenAction::ToggleProvisionalFeedback;
-            }
-        });
+        let _ = SettingsRow::show_with_help(
+            ui,
+            "Live transcription preview",
+            LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID,
+            LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION,
+            true,
+            |ui, _| {
+                if settings_switch(
+                    ui,
+                    LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID,
+                    settings.provisional_feedback,
+                    "Live transcription preview",
+                    LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION,
+                    !recording_locked,
+                )
+                .clicked()
+                {
+                    *action = ScreenAction::ToggleProvisionalFeedback;
+                }
+            },
+        );
         ui.add_enabled_ui(!recording_locked, |ui| {
             let mut streaming = settings.streaming_label.clone();
             setting_row_with_separator(ui, "Streaming mode", true, |ui, label_id| {
@@ -5537,28 +5544,36 @@ fn voice_detection_settings_section(
             });
         }
         let mut vad_enabled = settings.vad_enabled;
-        let _ = SettingsRow::show(ui, "Stop after speech ends", false, |ui, _| {
-            let response = settings_switch_with_help(
-                ui,
-                STOP_AFTER_SPEECH_SWITCH_ID,
-                vad_enabled,
-                "Stop after speech ends",
-                STOP_AFTER_SPEECH_DESCRIPTION,
-                !recording_locked,
-            );
-            if recording_locked {
-                let description =
-                    format!("{STOP_AFTER_SPEECH_DESCRIPTION} {VOICE_DETECTION_LOCKED_DESCRIPTION}");
-                ui.ctx().accesskit_node_builder(response.id, |builder| {
-                    builder.set_disabled();
-                    builder.set_description(description);
-                });
-            }
-            if response.clicked() {
-                vad_enabled = !vad_enabled;
-                *action = ScreenAction::SetVadEnabled(vad_enabled);
-            }
-        });
+        let _ = SettingsRow::show_with_help(
+            ui,
+            "Stop after speech ends",
+            STOP_AFTER_SPEECH_SWITCH_ID,
+            STOP_AFTER_SPEECH_DESCRIPTION,
+            false,
+            |ui, _| {
+                let response = settings_switch(
+                    ui,
+                    STOP_AFTER_SPEECH_SWITCH_ID,
+                    vad_enabled,
+                    "Stop after speech ends",
+                    STOP_AFTER_SPEECH_DESCRIPTION,
+                    !recording_locked,
+                );
+                if recording_locked {
+                    let description = format!(
+                        "{STOP_AFTER_SPEECH_DESCRIPTION} {VOICE_DETECTION_LOCKED_DESCRIPTION}"
+                    );
+                    ui.ctx().accesskit_node_builder(response.id, |builder| {
+                        builder.set_disabled();
+                        builder.set_description(description);
+                    });
+                }
+                if response.clicked() {
+                    vad_enabled = !vad_enabled;
+                    *action = ScreenAction::SetVadEnabled(vad_enabled);
+                }
+            },
+        );
         ui.add_enabled_ui(!recording_locked, |ui| {
             if vad_enabled {
                 ui.separator();
@@ -5604,21 +5619,28 @@ fn general_settings_panel(
 ) {
     settings_section(ui, "General settings", |ui| {
         let mut close_to_tray = settings.close_to_tray;
-        let _ = SettingsRow::show(ui, "Close to tray", true, |ui, _| {
-            if settings_switch_with_help(
-                ui,
-                CLOSE_TO_TRAY_SWITCH_ID,
-                close_to_tray,
-                "Close to tray",
-                CLOSE_TO_TRAY_DESCRIPTION,
-                true,
-            )
-            .clicked()
-            {
-                close_to_tray = !close_to_tray;
-                *action = ScreenAction::SetCloseToTray(close_to_tray);
-            }
-        });
+        let _ = SettingsRow::show_with_help(
+            ui,
+            "Close to tray",
+            CLOSE_TO_TRAY_SWITCH_ID,
+            CLOSE_TO_TRAY_DESCRIPTION,
+            true,
+            |ui, _| {
+                if settings_switch(
+                    ui,
+                    CLOSE_TO_TRAY_SWITCH_ID,
+                    close_to_tray,
+                    "Close to tray",
+                    CLOSE_TO_TRAY_DESCRIPTION,
+                    true,
+                )
+                .clicked()
+                {
+                    close_to_tray = !close_to_tray;
+                    *action = ScreenAction::SetCloseToTray(close_to_tray);
+                }
+            },
+        );
         let _ = SettingsRow::show(ui, "Active model", false, |ui, _| {
             ui.label(&settings.active_model_label);
             if button(ui, "Manage models", ButtonTone::Secondary).clicked() {
@@ -5694,42 +5716,56 @@ fn output_settings_panel(
         let mut auto_insert = settings.auto_insert_transcript;
         let (output_label, output_description) =
             transcript_delivery_copy(settings.show_restore_clipboard);
-        let _ = SettingsRow::show(ui, output_label, false, |ui, _| {
-            if settings_switch_with_help(
-                ui,
-                AUTO_INSERT_TRANSCRIPT_SWITCH_ID,
-                auto_insert,
-                output_label,
-                output_description,
-                true,
-            )
-            .clicked()
-            {
-                auto_insert = !auto_insert;
-                *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
-            }
-        });
+        let _ = SettingsRow::show_with_help(
+            ui,
+            output_label,
+            AUTO_INSERT_TRANSCRIPT_SWITCH_ID,
+            output_description,
+            false,
+            |ui, _| {
+                if settings_switch(
+                    ui,
+                    AUTO_INSERT_TRANSCRIPT_SWITCH_ID,
+                    auto_insert,
+                    output_label,
+                    output_description,
+                    true,
+                )
+                .clicked()
+                {
+                    auto_insert = !auto_insert;
+                    *action = ScreenAction::SetAutoInsertTranscript(auto_insert);
+                }
+            },
+        );
         if auto_insert {
             if settings.show_restore_clipboard || settings.output_notice.is_some() {
                 ui.separator();
             }
             if settings.show_restore_clipboard {
                 let mut restore = settings.restore_clipboard_after_insert;
-                let _ = SettingsRow::show(ui, "Restore clipboard after insert", true, |ui, _| {
-                    if settings_switch_with_help(
-                        ui,
-                        RESTORE_CLIPBOARD_SWITCH_ID,
-                        restore,
-                        "Restore clipboard after insert",
-                        RESTORE_CLIPBOARD_DESCRIPTION,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        restore = !restore;
-                        *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
-                    }
-                });
+                let _ = SettingsRow::show_with_help(
+                    ui,
+                    "Restore clipboard after insert",
+                    RESTORE_CLIPBOARD_SWITCH_ID,
+                    RESTORE_CLIPBOARD_DESCRIPTION,
+                    true,
+                    |ui, _| {
+                        if settings_switch(
+                            ui,
+                            RESTORE_CLIPBOARD_SWITCH_ID,
+                            restore,
+                            "Restore clipboard after insert",
+                            RESTORE_CLIPBOARD_DESCRIPTION,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            restore = !restore;
+                            *action = ScreenAction::SetRestoreClipboardAfterInsert(restore);
+                        }
+                    },
+                );
                 let _ = SettingsRow::show(ui, "Paste delay ms", false, |ui, label_id| {
                     let mut delay = settings.paste_delay_ms as i64;
                     if ui
@@ -5851,26 +5887,33 @@ fn advanced_settings_panel(
                     );
                 }
                 let mut identity = settings.store_application_identity;
-                let _ = SettingsRow::show(ui, "Store application identity", false, |ui, _| {
-                    let identity_control = settings_switch_with_help(
-                        ui,
-                        STORE_APPLICATION_IDENTITY_SWITCH_ID,
-                        identity,
-                        "Store application identity",
-                        STORE_APPLICATION_IDENTITY_DESCRIPTION,
-                        !settings.history_locked,
-                    );
-                    describe_history_lock(
-                        ui,
-                        &identity_control,
-                        settings.history_locked,
-                        Some(STORE_APPLICATION_IDENTITY_DESCRIPTION),
-                    );
-                    if identity_control.clicked() {
-                        identity = !identity;
-                        *action = ScreenAction::SetStoreApplicationIdentity(identity);
-                    }
-                });
+                let _ = SettingsRow::show_with_help(
+                    ui,
+                    "Store application identity",
+                    STORE_APPLICATION_IDENTITY_SWITCH_ID,
+                    STORE_APPLICATION_IDENTITY_DESCRIPTION,
+                    false,
+                    |ui, _| {
+                        let identity_control = settings_switch(
+                            ui,
+                            STORE_APPLICATION_IDENTITY_SWITCH_ID,
+                            identity,
+                            "Store application identity",
+                            STORE_APPLICATION_IDENTITY_DESCRIPTION,
+                            !settings.history_locked,
+                        );
+                        describe_history_lock(
+                            ui,
+                            &identity_control,
+                            settings.history_locked,
+                            Some(STORE_APPLICATION_IDENTITY_DESCRIPTION),
+                        );
+                        if identity_control.clicked() {
+                            identity = !identity;
+                            *action = ScreenAction::SetStoreApplicationIdentity(identity);
+                        }
+                    },
+                );
             }
         }
     });
@@ -5878,16 +5921,23 @@ fn advanced_settings_panel(
     settings_section(ui, "Developer and diagnostics", |ui| {
         let mut enabled = settings.debug_mode;
         let mut playground = None;
-        let _ = SettingsRow::show(ui, "Enable model Playground", false, |ui, _| {
-            playground = Some(settings_switch_with_help(
-                ui,
-                ENABLE_MODEL_PLAYGROUND_SWITCH_ID,
-                enabled,
-                "Enable model Playground",
-                ENABLE_MODEL_PLAYGROUND_DESCRIPTION,
-                true,
-            ));
-        });
+        let _ = SettingsRow::show_with_help(
+            ui,
+            "Enable model Playground",
+            ENABLE_MODEL_PLAYGROUND_SWITCH_ID,
+            ENABLE_MODEL_PLAYGROUND_DESCRIPTION,
+            false,
+            |ui, _| {
+                playground = Some(settings_switch(
+                    ui,
+                    ENABLE_MODEL_PLAYGROUND_SWITCH_ID,
+                    enabled,
+                    "Enable model Playground",
+                    ENABLE_MODEL_PLAYGROUND_DESCRIPTION,
+                    true,
+                ));
+            },
+        );
         let playground = playground.expect("developer row always renders its switch");
         scroll_focused_control_into_view(ui, &playground);
         if playground.clicked() {
@@ -5957,26 +6007,35 @@ fn optional_retention_control(
     update: impl FnOnce(Option<u32>) -> ScreenAction + Copy,
 ) {
     let mut limited = setting.configured_days.is_some();
-    let _ = SettingsRow::show(ui, setting.label, false, |ui, _| {
-        ui.vertical(|ui| {
-            let limit = settings_switch_with_help(
-                ui,
-                setting.switch_id,
-                limited,
-                setting.label,
-                setting.description,
-                !history_locked,
-            );
-            describe_history_lock(ui, &limit, history_locked, Some(setting.description));
-            if limit.clicked() {
-                limited = !limited;
-                *action = update(limited.then_some(setting.configured_days.unwrap_or(30)));
-            }
-            if !limited {
-                ui.label(RichText::new(setting.unlimited_label).color(ui_palette(ui).muted_text));
-            }
-        });
-    });
+    let _ = SettingsRow::show_with_help(
+        ui,
+        setting.label,
+        setting.switch_id,
+        setting.description,
+        false,
+        |ui, _| {
+            ui.vertical(|ui| {
+                let limit = settings_switch(
+                    ui,
+                    setting.switch_id,
+                    limited,
+                    setting.label,
+                    setting.description,
+                    !history_locked,
+                );
+                describe_history_lock(ui, &limit, history_locked, Some(setting.description));
+                if limit.clicked() {
+                    limited = !limited;
+                    *action = update(limited.then_some(setting.configured_days.unwrap_or(30)));
+                }
+                if !limited {
+                    ui.label(
+                        RichText::new(setting.unlimited_label).color(ui_palette(ui).muted_text),
+                    );
+                }
+            });
+        },
+    );
     ui.separator();
     if limited {
         let mut days = setting.configured_days.unwrap_or(30) as i64;
@@ -6179,6 +6238,33 @@ impl SettingsRow {
         separator_after: bool,
         contents: impl FnOnce(&mut egui::Ui, egui::Id),
     ) -> egui::Response {
+        Self::show_with_optional_help(ui, label, None, separator_after, contents)
+    }
+
+    fn show_with_help(
+        ui: &mut egui::Ui,
+        label: &str,
+        id_source: &str,
+        description: &str,
+        separator_after: bool,
+        contents: impl FnOnce(&mut egui::Ui, egui::Id),
+    ) -> egui::Response {
+        Self::show_with_optional_help(
+            ui,
+            label,
+            Some((id_source, description)),
+            separator_after,
+            contents,
+        )
+    }
+
+    fn show_with_optional_help(
+        ui: &mut egui::Ui,
+        label: &str,
+        help: Option<(&str, &str)>,
+        separator_after: bool,
+        contents: impl FnOnce(&mut egui::Ui, egui::Id),
+    ) -> egui::Response {
         let compact = current_content_width(ui) < SETTINGS_COMPACT_BREAKPOINT;
         let row = ui.scope(|ui| {
             let interaction_height = ui.spacing().interact_size.y.max(44.0);
@@ -6186,7 +6272,7 @@ impl SettingsRow {
             ui.set_min_height(interaction_height);
             if compact {
                 ui.vertical(|ui| {
-                    let label = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+                    let label = settings_row_label(ui, label, help);
                     contents(ui, label.id);
                 });
             } else {
@@ -6199,8 +6285,7 @@ impl SettingsRow {
                         label_rect,
                         Layout::left_to_right(Align::Center).with_main_align(Align::LEFT),
                     );
-                    let label =
-                        label_ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+                    let label = settings_row_label(&mut label_ui, label, help);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         contents(ui, label.id);
                     });
@@ -6212,6 +6297,21 @@ impl SettingsRow {
         }
         row.response
     }
+}
+
+fn settings_row_label(
+    ui: &mut egui::Ui,
+    label: &str,
+    help: Option<(&str, &str)>,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let label_response = ui.label(RichText::new(label).color(ui_palette(ui).muted_text));
+        if let Some((id_source, description)) = help {
+            settings_help_affordance(ui, id_source, label, description);
+        }
+        label_response
+    })
+    .inner
 }
 
 fn settings_switch(
@@ -6276,46 +6376,107 @@ fn settings_switch(
     .inner
 }
 
-fn settings_switch_with_help(
-    ui: &mut egui::Ui,
-    id_source: &str,
-    checked: bool,
-    accessible_name: &str,
-    description: &str,
-    enabled: bool,
-) -> egui::Response {
-    ui.horizontal(|ui| {
-        let response = settings_switch(
-            ui,
-            id_source,
-            checked,
-            accessible_name,
-            description,
-            enabled,
-        );
-        settings_help_affordance(ui, id_source, accessible_name, description);
-        response
-    })
-    .inner
-}
-
 fn settings_help_affordance(
     ui: &mut egui::Ui,
     id_source: &str,
     accessible_name: &str,
     description: &str,
 ) {
+    const HOVER_DELAY_SECONDS: f64 = 0.3;
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
     let response = ui.interact(
         rect,
         egui::Id::new(("settings-help-affordance", id_source)),
         Sense::click(),
     );
-    let popup_id = ui.make_persistent_id(("settings-help-popup", id_source));
-    if response.clicked() {
-        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    let popup_id = egui::Id::new(("settings-help-popup", id_source));
+    let state_id = egui::Id::new("settings-help-state");
+    let mut state = ui.data(|data| {
+        data.get_temp::<SettingsHelpState>(state_id)
+            .unwrap_or_default()
+    });
+    let now = ui.input(|input| input.time);
+    let pointer_over_last_popup = state.dismissed == Some(response.id)
+        && ui
+            .input(|input| input.pointer.hover_pos())
+            .zip(state.popup_rect)
+            .is_some_and(|(pointer, popup)| popup.contains(pointer));
+    if state.dismissed == Some(response.id)
+        && !response.hovered()
+        && !response.has_focus()
+        && !pointer_over_last_popup
+    {
+        state.dismissed = None;
+        state.popup_rect = None;
     }
-    let expanded = ui.memory(|memory| memory.is_popup_open(popup_id));
+    let keyboard_activated = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let activated = response.clicked() || keyboard_activated;
+    if activated {
+        if state.active == Some(response.id) && state.pinned {
+            state.active = None;
+            state.pinned = false;
+            state.dismissed = Some(response.id);
+        } else {
+            state.active = Some(response.id);
+            state.pinned = true;
+            state.dismissed = None;
+        }
+        state.hover_candidate = None;
+    } else if state.dismissed != Some(response.id) && !state.pinned {
+        if response.has_focus() && state.active != Some(response.id) {
+            state.active = Some(response.id);
+            state.pinned = false;
+        } else if response.hovered() {
+            let hover_started_at = if state.hover_candidate == Some(response.id) {
+                state.hover_started_at
+            } else {
+                state.hover_candidate = Some(response.id);
+                state.hover_started_at = now;
+                now
+            };
+            let hover_elapsed = now - hover_started_at;
+            if hover_elapsed >= HOVER_DELAY_SECONDS && state.active != Some(response.id) {
+                state.active = Some(response.id);
+                state.pinned = false;
+            } else if hover_elapsed < HOVER_DELAY_SECONDS {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        HOVER_DELAY_SECONDS - hover_elapsed,
+                    ));
+            }
+        } else if state.hover_candidate == Some(response.id) {
+            state.hover_candidate = None;
+        }
+    }
+    if state.active == Some(response.id) && !activated {
+        let pointer_over_popup = ui
+            .input(|input| input.pointer.hover_pos())
+            .zip(state.popup_rect)
+            .is_some_and(|(pointer, popup)| popup.contains(pointer));
+        let outside_click = state.pinned
+            && ui.input(|input| input.pointer.any_click())
+            && !response.hovered()
+            && !pointer_over_popup;
+        let left_transient_help =
+            !state.pinned && !response.hovered() && !response.has_focus() && !pointer_over_popup;
+        if outside_click || left_transient_help {
+            state.active = None;
+            state.pinned = false;
+            state.dismissed = outside_click.then_some(response.id);
+            state.hover_candidate = None;
+        }
+    }
+    let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    if state.active == Some(response.id) && escape_pressed {
+        state.active = None;
+        state.pinned = false;
+        state.dismissed = Some(response.id);
+        state.hover_candidate = None;
+    }
+    let expanded = state.active == Some(response.id);
     let colors = ui_palette(ui);
     let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0));
     ui.painter()
@@ -6338,11 +6499,6 @@ fn settings_help_affordance(
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(help_name);
         builder.set_description(description);
-        builder.set_checked(if expanded {
-            egui::accesskit::Checked::True
-        } else {
-            egui::accesskit::Checked::False
-        });
         builder.set_expanded(expanded);
         builder.set_bounds(accesskit_rect(rect));
         builder.set_default_action_verb(egui::accesskit::DefaultActionVerb::Click);
@@ -6352,11 +6508,55 @@ fn settings_help_affordance(
         }
     });
     paint_focus_ring(ui, &response, Rounding::same(10.0));
-    egui::popup::popup_below_widget(ui, popup_id, &response, |ui| {
-        ui.set_min_width(280.0);
-        ui.set_max_width(320.0);
-        ui.label(description);
+    let popup_response = expanded.then(|| {
+        egui::Area::new(popup_id)
+            .order(egui::Order::Foreground)
+            .constrain(true)
+            .fixed_pos(response.rect.left_bottom())
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(280.0);
+                        ui.set_max_width(320.0);
+                        ui.label(description);
+                    })
+                    .response
+            })
+            .inner
     });
+    if let Some(popup) = popup_response {
+        state.popup_rect = Some(popup.rect);
+        let pointer_over_popup = ui
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pointer| popup.rect.contains(pointer));
+        let clicked_outside = !activated
+            && (popup.clicked_elsewhere()
+                || (ui.input(|input| input.pointer.any_click())
+                    && !response.hovered()
+                    && !pointer_over_popup));
+        if (state.pinned && clicked_outside)
+            || (!state.pinned
+                && !response.hovered()
+                && !response.has_focus()
+                && !pointer_over_popup)
+        {
+            state.active = None;
+            state.pinned = false;
+            state.dismissed = clicked_outside.then_some(response.id);
+            state.hover_candidate = None;
+        }
+    }
+    ui.data_mut(|data| data.insert_temp(state_id, state));
+}
+
+#[derive(Clone, Copy, Default)]
+struct SettingsHelpState {
+    active: Option<egui::Id>,
+    pinned: bool,
+    hover_candidate: Option<egui::Id>,
+    hover_started_at: f64,
+    dismissed: Option<egui::Id>,
+    popup_rect: Option<egui::Rect>,
 }
 
 fn transcript_delivery_copy(direct_insertion_available: bool) -> (&'static str, &'static str) {
@@ -6568,14 +6768,27 @@ mod tests {
         settings_view: &RecordingSettingsView,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, ScreenAction) {
+        render_settings_with_input_at(ctx, tab, state, settings_view, events, None, 900.0)
+    }
+
+    fn render_settings_with_input_at(
+        ctx: &egui::Context,
+        tab: SettingsTab,
+        state: &TranscriptionState,
+        settings_view: &RecordingSettingsView,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+        width: f32,
+    ) -> (egui::FullOutput, ScreenAction) {
         let mut action = ScreenAction::None;
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    Vec2::new(900.0, 3_000.0),
+                    Vec2::new(width, 3_000.0),
                 )),
                 events,
+                time,
                 focused: true,
                 ..Default::default()
             },
@@ -8567,13 +8780,17 @@ mod tests {
                     })
                     .unwrap_or_else(|| panic!("missing {name} help affordance"));
                 assert_eq!(help.description(), Some(*description));
-                assert_eq!(help.checked(), Some(egui::accesskit::Checked::False));
+                assert_eq!(help.checked(), None);
                 assert_eq!(help.is_expanded(), Some(false));
                 assert!(help.supports_action(egui::accesskit::Action::Default));
                 let help_bounds = help.bounds().expect("help bounds");
                 assert!(
                     help_bounds.x1 - help_bounds.x0 >= 44.0
                         && help_bounds.y1 - help_bounds.y0 >= 44.0
+                );
+                assert!(
+                    help_bounds.x1 <= bounds.x0,
+                    "{name} help must stay in the label column before its switch"
                 );
             }
         }
@@ -8692,6 +8909,622 @@ mod tests {
                         && node.is_expanded() == Some(false)
                 })
         );
+    }
+
+    #[test]
+    fn settings_help_keyboard_activation_pins_toggles_and_escape_stays_closed() {
+        let help_id = egui::Id::new((
+            "settings-help-affordance",
+            LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID,
+        ));
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let settings_view = RecordingSettingsView::default();
+            let state = TranscriptionState::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = settings(ui, SettingsTab::Recording, &state, &settings_view);
+                        ui.memory_mut(|memory| memory.request_focus(help_id));
+                    });
+                },
+            );
+            let (focused, _) = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                Vec::new(),
+            );
+            assert!(help_expanded(
+                &focused,
+                "Live transcription preview information"
+            ));
+
+            let _ = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            ctx.memory_mut(|memory| memory.surrender_focus(help_id));
+            let (pinned, _) = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                Vec::new(),
+            );
+            assert!(help_expanded(
+                &pinned,
+                "Live transcription preview information"
+            ));
+
+            let _ = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                Vec::new(),
+            );
+            ctx.memory_mut(|memory| memory.request_focus(help_id));
+            let _ = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let _ = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let (closed, _) = render_settings_with_input(
+                &ctx,
+                SettingsTab::Recording,
+                &state,
+                &settings_view,
+                Vec::new(),
+            );
+            assert!(!help_expanded(
+                &closed,
+                "Live transcription preview information"
+            ));
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView::default();
+        let state = TranscriptionState::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(ui, SettingsTab::Recording, &state, &settings_view);
+                    ui.memory_mut(|memory| memory.request_focus(help_id));
+                });
+            },
+        );
+        let _ = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let (closed, _) = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+        );
+        assert!(!help_expanded(
+            &closed,
+            "Live transcription preview information"
+        ));
+    }
+
+    #[test]
+    fn settings_help_mouse_toggles_and_outside_click_dismisses_pin() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView::default();
+        let state = TranscriptionState::default();
+        let (initial, _) = render_settings_with_input(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            Vec::new(),
+        );
+        let bounds = help_bounds(&initial, "Close to tray information");
+        let point = accesskit_rect_center(bounds);
+        let opened = click_settings_help(&ctx, SettingsTab::General, &state, &settings_view, point);
+        assert!(help_expanded(&opened, "Close to tray information"));
+
+        let closed = click_settings_help(&ctx, SettingsTab::General, &state, &settings_view, point);
+        assert!(!help_expanded(&closed, "Close to tray information"));
+
+        let _ = render_settings_with_input(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(egui::pos2(850.0, 2_900.0))],
+        );
+        let opened = click_settings_help(&ctx, SettingsTab::General, &state, &settings_view, point);
+        assert!(help_expanded(&opened, "Close to tray information"));
+        let outside = egui::pos2(850.0, 2_900.0);
+        let _ = render_settings_with_input(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (outside_closed, _) = render_settings_with_input(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(!help_expanded(&outside_closed, "Close to tray information"));
+    }
+
+    #[test]
+    fn settings_help_keeps_exactly_one_active_row() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView {
+            auto_insert_transcript: true,
+            show_restore_clipboard: true,
+            ..Default::default()
+        };
+        let state = TranscriptionState::default();
+        let (initial, _) = render_settings_with_input(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            Vec::new(),
+        );
+        let later = accesskit_rect_center(help_bounds(
+            &initial,
+            "Restore clipboard after insert information",
+        ));
+        let earlier = accesskit_rect_center(help_bounds(&initial, "Close to tray information"));
+        let later_open =
+            click_settings_help(&ctx, SettingsTab::General, &state, &settings_view, later);
+        assert_eq!(expanded_settings_help_count(&later_open), 1);
+        assert!(help_expanded(
+            &later_open,
+            "Restore clipboard after insert information"
+        ));
+
+        let earlier_id = egui::Id::new(("settings-help-affordance", CLOSE_TO_TRAY_SWITCH_ID));
+        ctx.memory_mut(|memory| memory.request_focus(earlier_id));
+        let _ = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(earlier)],
+            Some(1.0),
+            900.0,
+        );
+        let (still_later, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::General,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(1.5),
+            900.0,
+        );
+        assert_eq!(expanded_settings_help_count(&still_later), 1);
+        assert!(help_expanded(
+            &still_later,
+            "Restore clipboard after insert information"
+        ));
+
+        let earlier_open =
+            click_settings_help(&ctx, SettingsTab::General, &state, &settings_view, earlier);
+        assert_eq!(expanded_settings_help_count(&earlier_open), 1);
+        assert!(help_expanded(&earlier_open, "Close to tray information"));
+        assert!(!help_expanded(
+            &earlier_open,
+            "Restore clipboard after insert information"
+        ));
+    }
+
+    #[test]
+    fn settings_help_hover_is_delayed_transfers_to_popup_and_escape_rearms_after_leave() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView::default();
+        let state = TranscriptionState::default();
+        let (initial, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(0.0),
+            900.0,
+        );
+        let help_point = accesskit_rect_center(help_bounds(
+            &initial,
+            "Live transcription preview information",
+        ));
+        let (before_delay, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(help_point)],
+            Some(1.0),
+            900.0,
+        );
+        assert!(!help_expanded(
+            &before_delay,
+            "Live transcription preview information"
+        ));
+        let (still_before_delay, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(1.29),
+            900.0,
+        );
+        assert!(!help_expanded(
+            &still_before_delay,
+            "Live transcription preview information"
+        ));
+        let (opened, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(1.31),
+            900.0,
+        );
+        assert!(help_expanded(
+            &opened,
+            "Live transcription preview information"
+        ));
+        let popup_point =
+            accesskit_rect_center(help_bounds(&opened, LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION));
+        let popup_rect = ctx.data(|data| {
+            data.get_temp::<SettingsHelpState>(egui::Id::new("settings-help-state"))
+                .and_then(|state| state.popup_rect)
+                .expect("open help should retain popup geometry")
+        });
+        assert!(
+            popup_rect.contains(popup_point),
+            "popup {popup_rect:?} should contain description point {popup_point:?}"
+        );
+        let (over_popup, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(popup_point)],
+            Some(1.32),
+            900.0,
+        );
+        assert!(help_expanded(
+            &over_popup,
+            "Live transcription preview information"
+        ));
+
+        let (escaped, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            Some(1.33),
+            900.0,
+        );
+        assert!(!help_expanded(
+            &escaped,
+            "Live transcription preview information"
+        ));
+        let (still_dismissed, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(1.7),
+            900.0,
+        );
+        assert!(!help_expanded(
+            &still_dismissed,
+            "Live transcription preview information"
+        ));
+        let outside = egui::pos2(850.0, 2_900.0);
+        let _ = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(outside)],
+            Some(1.71),
+            900.0,
+        );
+        let _ = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(help_point)],
+            Some(1.72),
+            900.0,
+        );
+        let (reopened, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            Vec::new(),
+            Some(2.03),
+            900.0,
+        );
+        assert!(help_expanded(
+            &reopened,
+            "Live transcription preview information"
+        ));
+        let (left_both, _) = render_settings_with_input_at(
+            &ctx,
+            SettingsTab::Recording,
+            &state,
+            &settings_view,
+            vec![egui::Event::PointerMoved(outside)],
+            Some(2.04),
+            900.0,
+        );
+        assert!(!help_expanded(
+            &left_both,
+            "Live transcription preview information"
+        ));
+    }
+
+    #[test]
+    fn settings_help_uses_label_geometry_and_stays_enabled_for_disabled_switches() {
+        let settings_view = RecordingSettingsView::default();
+        let state = TranscriptionState::default();
+        for (width, compact) in [(900.0, false), (480.0, true)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let (output, _) = render_settings_with_input_at(
+                &ctx,
+                SettingsTab::General,
+                &state,
+                &settings_view,
+                Vec::new(),
+                None,
+                width,
+            );
+            let label =
+                named_role_bounds(&output, "Close to tray", egui::accesskit::Role::StaticText);
+            let help = help_bounds(&output, "Close to tray information");
+            let switch = named_role_bounds(&output, "Close to tray", egui::accesskit::Role::Switch);
+            if compact {
+                assert!(help.x0 >= label.x1);
+                assert!(switch.y0 >= help.y1);
+            } else {
+                assert!(help.x0 >= label.x0);
+                assert!(help.x1 <= label.x0 + f64::from(SETTINGS_LABEL_COLUMN_WIDTH));
+                assert!(switch.x0 >= label.x0 + f64::from(SETTINGS_LABEL_COLUMN_WIDTH));
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let locked_state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            ..Default::default()
+        };
+        let (locked, _) = render_settings_with_input(
+            &ctx,
+            SettingsTab::Recording,
+            &locked_state,
+            &settings_view,
+            Vec::new(),
+        );
+        let nodes = &locked
+            .platform_output
+            .accesskit_update
+            .expect("locked recording settings should expose AccessKit")
+            .nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Switch
+                && node.name() == Some("Live transcription preview")
+                && node.is_disabled()
+        }));
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.name() == Some("Live transcription preview information")
+                && !node.is_disabled()
+        }));
+    }
+
+    fn help_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.name() == Some(name)).then(|| node.bounds()).flatten()
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name} help bounds"))
+    }
+
+    fn help_expanded(output: &egui::FullOutput, name: &str) -> bool {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .is_some_and(|update| {
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(name) && node.is_expanded() == Some(true))
+            })
+    }
+
+    fn expanded_settings_help_count(output: &egui::FullOutput) -> usize {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .map_or(0, |update| {
+                update
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Button
+                            && node
+                                .name()
+                                .is_some_and(|name| name.ends_with(" information"))
+                            && node.is_expanded() == Some(true)
+                    })
+                    .count()
+            })
+    }
+
+    fn named_role_bounds(
+        output: &egui::FullOutput,
+        name: &str,
+        role: egui::accesskit::Role,
+    ) -> egui::accesskit::Rect {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.name() == Some(name) && node.role() == role)
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name} {role:?} bounds"))
+    }
+
+    fn accesskit_rect_center(rect: egui::accesskit::Rect) -> egui::Pos2 {
+        egui::pos2(
+            ((rect.x0 + rect.x1) / 2.0) as f32,
+            ((rect.y0 + rect.y1) / 2.0) as f32,
+        )
+    }
+
+    fn click_settings_help(
+        ctx: &egui::Context,
+        tab: SettingsTab,
+        state: &TranscriptionState,
+        settings_view: &RecordingSettingsView,
+        point: egui::Pos2,
+    ) -> egui::FullOutput {
+        let (_, press_action) = render_settings_with_input(
+            ctx,
+            tab,
+            state,
+            settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (output, release_action) = render_settings_with_input(
+            ctx,
+            tab,
+            state,
+            settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(release_action, ScreenAction::None);
+        output
     }
 
     #[test]
