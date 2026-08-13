@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use eframe::egui::{
     self, Align, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
     ScrollArea, Stroke, TextEdit, Ui, Vec2, ViewportCommand,
@@ -43,7 +43,7 @@ use crate::history::{
 use crate::history_playback::{PlaybackEvent, PlaybackService};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::huggingface_catalog::{
-    CatalogSnapshot, HuggingFaceCatalogService, RemoteModel, TrustedArtifact,
+    CatalogSource, HuggingFaceCatalogService, ModelInventorySnapshot, RemoteModel, TrustedArtifact,
 };
 use crate::installations::{
     ActivationJournal, ActivationPhase, DirectoryReplacement, FileReplacement, InstallCancellation,
@@ -70,26 +70,36 @@ use crate::transcription::{
 };
 use crate::tray::{TrayCommand, TrayService};
 use crate::ui::{
-    AppPage, HistoryPageAction, HistoryPageState, ThemePalette, about_page,
-    configure_accessible_style, history_page, minimum_primary_target_height, show_navigation,
-    theme_palette, ui_palette,
+    AppPage, ComparisonPhase, ComparisonResult, ComparisonResultPhase, HistoryPageAction,
+    HistoryPageState, MicrophonePermission, ModelCapabilities, ModelComparisonState,
+    ModelCompatibility, ModelDialog, ModelDownloadState, ModelLanguageFilter, ModelManagementState,
+    ModelReadiness, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
+    RecordingSettingsView, RemoteCatalogActionKind, RemoteCatalogActionView,
+    RemoteCatalogEntryView, RemoteCatalogFilters, RemoteCatalogSort, RemoteCatalogStatusKind,
+    RemoteCatalogStatusView, RemoteCatalogVariantView, RemoteCatalogView, ScreenAction, ScreenView,
+    SettingsTab, ThemePalette, UiRoute, configure_accessible_style, history_page,
+    minimum_primary_target_height, recording_mode, render_screen, scroll_focused_control_into_view,
+    settings_save_state, show_navigation, show_route_scroll, theme_palette, transcription_state,
+    ui_palette,
 };
+
+#[cfg(test)]
+use crate::ui::RemoteCatalogSizeTier;
 
 const ACTIVE_REPAINT_DELAY: Duration = Duration::from_millis(100);
 const METER_REPAINT_DELAY: Duration = Duration::from_millis(40);
+const PASSIVE_MONITOR_REPAINT_DELAY: Duration = Duration::from_millis(50);
 const IDLE_REPAINT_DELAY: Duration = Duration::from_millis(500);
-const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
-const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
-const INPUT_LEVEL_KEYBOARD_STEP_DB: f32 = 1.0;
 const INPUT_LEVEL_ATTACK: Duration = Duration::from_millis(30);
 const INPUT_LEVEL_RELEASE: Duration = Duration::from_millis(240);
 const INPUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(160);
-const INPUT_SENSITIVITY_TRACK_HEIGHT: f32 = 10.0;
-const INPUT_SENSITIVITY_LIVE_FILL_HEIGHT: f32 = 8.0;
-const MICROPHONE_MONITOR_RETRY_DELAY: Duration = Duration::from_secs(2);
+const INPUT_LEVEL_MIN_DBFS: f32 = -72.0;
+const INPUT_LEVEL_MAX_DBFS: f32 = 0.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 const PREVIEW_FINISH_GRACE: Duration = Duration::from_secs(2);
 const PREVIEW_CANCEL_ACK_WARNING: Duration = Duration::from_secs(2);
+const LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const REMOTE_CATALOG_VISIBLE_LIMIT: usize = 100;
 const RETRY_RELEASE_ATTEMPTS: usize = 4;
 static INSTALL_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -155,13 +165,6 @@ fn dbfs_to_slider_position(dbfs: f32) -> f32 {
 
 fn slider_position_to_dbfs(position: f32) -> f32 {
     INPUT_LEVEL_MIN_DBFS + position.clamp(0.0, 1.0) * (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS)
-}
-
-fn input_sensitivity_db_label(dbfs: f32) -> String {
-    format!(
-        "{:.0} dB",
-        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
-    )
 }
 
 fn rms_to_slider_position(rms: f32) -> f32 {
@@ -231,194 +234,8 @@ impl MicrophoneLevelEnvelope {
         if target == 0.0 && self.position < 0.001 {
             self.position = 0.0;
         }
-        self.position
+        self.position.clamp(0.0, 1.0)
     }
-
-    fn is_animating(&self) -> bool {
-        self.position > 0.0
-    }
-}
-
-fn microphone_sensitivity_slider(
-    ui: &mut Ui,
-    live_level_position: f32,
-    threshold_rms: &mut f32,
-) -> egui::Response {
-    use egui::accesskit::{Action, ActionData};
-
-    let desired = Vec2::new(usable_width(ui), minimum_primary_target_height());
-    let (rect, mut response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
-    let previous = *threshold_rms;
-    let mut threshold_dbfs = rms_to_dbfs(*threshold_rms);
-
-    if response.clicked() {
-        response.request_focus();
-    }
-    if (response.clicked() || response.dragged())
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        let position = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        threshold_dbfs = slider_position_to_dbfs(position);
-    }
-
-    let mut decrement = 0usize;
-    let mut increment = 0usize;
-    if response.has_focus() {
-        ui.ctx().memory_mut(|memory| {
-            memory.set_focus_lock_filter(
-                response.id,
-                egui::EventFilter {
-                    horizontal_arrows: true,
-                    ..Default::default()
-                },
-            );
-        });
-        ui.input(|input| {
-            decrement += input.num_presses(egui::Key::ArrowLeft);
-            increment += input.num_presses(egui::Key::ArrowRight);
-        });
-    }
-    ui.input(|input| {
-        decrement += input.num_accesskit_action_requests(response.id, Action::Decrement);
-        increment += input.num_accesskit_action_requests(response.id, Action::Increment);
-        for request in input.accesskit_action_requests(response.id, Action::SetValue) {
-            if let Some(ActionData::NumericValue(value)) = request.data {
-                threshold_dbfs = slider_position_to_dbfs((value as f32 / 100.0).clamp(0.0, 1.0));
-            }
-        }
-    });
-    threshold_dbfs += (increment as f32 - decrement as f32) * INPUT_LEVEL_KEYBOARD_STEP_DB;
-    *threshold_rms = dbfs_to_rms(threshold_dbfs);
-    if *threshold_rms != previous {
-        response.mark_changed();
-    }
-
-    let threshold_position = rms_to_slider_position(*threshold_rms);
-    response.widget_info(|| {
-        egui::WidgetInfo::slider(f64::from(threshold_position * 100.0), "Input sensitivity")
-    });
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_description(format!(
-            "Minimum microphone level treated as speech. Current threshold {}. Use Left and Right arrow keys to adjust.",
-            input_sensitivity_db_label(threshold_dbfs)
-        ));
-        builder.set_min_numeric_value(0.0);
-        builder.set_max_numeric_value(100.0);
-        builder.set_numeric_value_step(f64::from(
-            100.0 * INPUT_LEVEL_KEYBOARD_STEP_DB / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS),
-        ));
-        builder.add_action(Action::SetValue);
-        if threshold_position < 1.0 {
-            builder.add_action(Action::Increment);
-        }
-        if threshold_position > 0.0 {
-            builder.add_action(Action::Decrement);
-        }
-    });
-
-    let colors = ui_palette(ui);
-    let track = egui::Rect::from_center_size(
-        rect.center(),
-        Vec2::new(rect.width(), INPUT_SENSITIVITY_TRACK_HEIGHT),
-    );
-    let rounding = Rounding::same(5.0);
-    ui.painter()
-        .rect_filled(track, rounding, colors.slider_remainder_fill);
-    let threshold_x = track.left() + track.width() * threshold_position;
-    let threshold_region = egui::Rect::from_min_max(
-        track.min,
-        egui::pos2(
-            threshold_x.clamp(track.left(), track.right()),
-            track.bottom(),
-        ),
-    );
-    if threshold_region.width() > 0.0 {
-        ui.painter()
-            .rect_filled(threshold_region, rounding, colors.slider_threshold_fill);
-    }
-    ui.painter().rect_stroke(
-        track,
-        rounding,
-        Stroke::new(1.0, colors.slider_track_border),
-    );
-    let crossed = live_level_position >= threshold_position && live_level_position > 0.0;
-    let fill_width = track.width() * live_level_position.clamp(0.0, 1.0);
-    if fill_width > 0.0 {
-        let fill = egui::Rect::from_min_size(
-            egui::pos2(
-                track.left(),
-                track.center().y - INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0,
-            ),
-            Vec2::new(fill_width, INPUT_SENSITIVITY_LIVE_FILL_HEIGHT),
-        );
-        let fill_color = if crossed {
-            colors.success
-        } else {
-            colors.slider_live_below
-        };
-        ui.painter().rect_filled(
-            fill,
-            Rounding::same(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT / 2.0),
-            fill_color,
-        );
-    }
-
-    let thumb_center = egui::pos2(
-        track.left() + track.width() * threshold_position,
-        track.center().y,
-    );
-    let thumb_radius = if response.dragged() { 9.0 } else { 8.0 };
-    ui.painter()
-        .circle_filled(thumb_center, thumb_radius, colors.card_bg);
-    let thumb_stroke_width = if response.has_focus() { 3.0 } else { 2.0 };
-    ui.painter().circle_stroke(
-        thumb_center,
-        thumb_radius,
-        Stroke::new(thumb_stroke_width, colors.primary),
-    );
-    if response.has_focus() {
-        ui.painter()
-            .circle_filled(thumb_center, 2.0, colors.primary);
-    } else if response.hovered() {
-        ui.painter().circle_stroke(
-            thumb_center,
-            thumb_radius + 2.0,
-            Stroke::new(1.0, colors.border_strong),
-        );
-    }
-    if response.dragged() || response.has_focus() {
-        let label = input_sensitivity_db_label(threshold_dbfs);
-        let font = FontId::proportional(13.0);
-        let text_width = ui
-            .painter()
-            .layout_no_wrap(label.clone(), font.clone(), colors.text)
-            .size()
-            .x;
-        let bubble_size = Vec2::new(text_width + 18.0, 28.0);
-        let bubble_center_x = thumb_center.x.clamp(
-            rect.left() + bubble_size.x / 2.0,
-            rect.right() - bubble_size.x / 2.0,
-        );
-        let bubble_rect = egui::Rect::from_center_size(
-            egui::pos2(bubble_center_x, track.top() - bubble_size.y / 2.0 - 6.0),
-            bubble_size,
-        );
-        ui.painter()
-            .rect_filled(bubble_rect, Rounding::same(8.0), colors.card_bg);
-        ui.painter().rect_stroke(
-            bubble_rect,
-            Rounding::same(8.0),
-            Stroke::new(1.0, colors.border_strong),
-        );
-        ui.painter().text(
-            bubble_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font,
-            colors.text,
-        );
-    }
-    response
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -660,30 +477,6 @@ struct PendingRecording {
     abandon: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct CaptureDiagnosticContext {
-    activation_floor: f32,
-    input_device_name: Option<String>,
-}
-
-impl CaptureDiagnosticContext {
-    fn from_config(config: &AppConfig) -> Self {
-        Self {
-            activation_floor: diagnostic_activation_floor(config),
-            input_device_name: config.recording.audio_input_device_name.clone(),
-        }
-    }
-}
-
-impl Default for CaptureDiagnosticContext {
-    fn default() -> Self {
-        Self {
-            activation_floor: audio::MIN_SPEECH_ACTIVATION_RMS,
-            input_device_name: None,
-        }
-    }
-}
-
 #[derive(Default)]
 enum MicrophoneTest {
     #[default]
@@ -706,6 +499,30 @@ impl MicrophoneTest {
         match self {
             Self::Active { session } | Self::Stopping { session } => Some(session),
             Self::Idle | Self::Starting { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CaptureDiagnosticContext {
+    activation_floor: f32,
+    input_device_name: Option<String>,
+}
+
+impl CaptureDiagnosticContext {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            activation_floor: diagnostic_activation_floor(config),
+            input_device_name: config.recording.audio_input_device_name.clone(),
+        }
+    }
+}
+
+impl Default for CaptureDiagnosticContext {
+    fn default() -> Self {
+        Self {
+            activation_floor: audio::MIN_SPEECH_ACTIVATION_RMS,
+            input_device_name: None,
         }
     }
 }
@@ -1104,18 +921,6 @@ fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool
     source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
 }
 
-fn streaming_mode_selector(ui: &mut Ui, mode: &mut StreamingMode) -> bool {
-    let before = *mode;
-    ComboBox::new("advanced-streaming-mode", "Preview mode")
-        .selected_text(mode.label())
-        .show_ui(ui, |ui| {
-            for candidate in StreamingMode::ALL {
-                ui.selectable_value(mode, candidate, candidate.label());
-            }
-        });
-    *mode != before
-}
-
 fn native_overlay_position(position: OverlayPosition) -> NativeOverlayPosition {
     match position {
         OverlayPosition::Top => NativeOverlayPosition::TopCenter,
@@ -1135,79 +940,127 @@ struct PlaygroundCardState {
     peak_vram_mb: Option<f64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug)]
+struct ComparisonProjectionCacheEntry {
+    reference_revision: u64,
+    output_revision: u64,
+    word_error_rate: Option<f32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteCatalogProjectionKey {
+    revision: u64,
+    inventory_revision: u64,
+    search: String,
+    language_filter: ModelLanguageFilter,
+    filters: RemoteCatalogFilters,
+    sort: RemoteCatalogSort,
+    mutation_block_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteCatalogProjection {
+    key: RemoteCatalogProjectionKey,
+    matching_count: usize,
+    total_count: usize,
+    entries: Vec<RemoteCatalogEntryView>,
+}
+
 struct RemoteCatalogState {
-    snapshot: Option<CatalogSnapshot>,
+    snapshot: Option<ModelInventorySnapshot>,
+    local_models: Arc<[ModelViewModel]>,
+    local_models_dirty: bool,
     loading: bool,
-    attempted: bool,
+    force_refresh_requested: bool,
+    refresh_generation: u64,
+    active_refresh_generation: Option<u64>,
     error: Option<String>,
+    projection_revision: u64,
+    projection: Option<RemoteCatalogProjection>,
+    #[cfg(test)]
+    projection_build_count: usize,
+    #[cfg(test)]
+    disk_probe_count: usize,
+    #[cfg(test)]
+    local_models_build_count: usize,
+    #[cfg(test)]
+    catalog_io_request_count: usize,
 }
 
-/// Ephemeral Models-page controls. They deliberately are not persisted: they
-/// change what the user is browsing, not the installed-model configuration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RemoteCatalogFilters {
-    installed_only: bool,
-    recommended_only: bool,
-    multilingual_only: bool,
-    size_tier: RemoteCatalogSizeTier,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum RemoteCatalogSizeTier {
-    #[default]
-    Any,
-    Compact,
-    Standard,
-    Large,
-}
-
-impl RemoteCatalogSizeTier {
-    const ALL: [Self; 4] = [Self::Any, Self::Compact, Self::Standard, Self::Large];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any size",
-            Self::Compact => "Compact (up to 512 MiB)",
-            Self::Standard => "Standard (512 MiB to 1 GiB)",
-            Self::Large => "Large (over 1 GiB)",
-        }
-    }
-
-    fn matches(self, size_bytes: Option<u64>) -> bool {
-        const MIB: u64 = 1024 * 1024;
-        const COMPACT_MAX: u64 = 512 * MIB;
-        const STANDARD_MAX: u64 = 1024 * MIB;
-
-        match self {
-            Self::Any => true,
-            Self::Compact => size_bytes.is_some_and(|size| size <= COMPACT_MAX),
-            Self::Standard => {
-                size_bytes.is_some_and(|size| size > COMPACT_MAX && size <= STANDARD_MAX)
-            }
-            Self::Large => size_bytes.is_some_and(|size| size > STANDARD_MAX),
+impl Default for RemoteCatalogState {
+    fn default() -> Self {
+        Self {
+            snapshot: Some(ModelInventorySnapshot::bundled()),
+            local_models: Arc::default(),
+            local_models_dirty: true,
+            loading: false,
+            force_refresh_requested: false,
+            refresh_generation: 1,
+            active_refresh_generation: None,
+            error: None,
+            projection_revision: 0,
+            projection: None,
+            #[cfg(test)]
+            projection_build_count: 0,
+            #[cfg(test)]
+            disk_probe_count: 0,
+            #[cfg(test)]
+            local_models_build_count: 0,
+            #[cfg(test)]
+            catalog_io_request_count: 0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum RemoteCatalogSort {
-    #[default]
-    Recommended,
-    Smallest,
-    Largest,
-    Name,
+impl RemoteCatalogState {
+    fn invalidate_projection(&mut self) {
+        self.projection_revision = self.projection_revision.wrapping_add(1);
+        self.projection = None;
+    }
+
+    fn invalidate_local_models(&mut self) {
+        self.local_models_dirty = true;
+        self.invalidate_projection();
+    }
 }
 
-impl RemoteCatalogSort {
-    const ALL: [Self; 4] = [Self::Recommended, Self::Smallest, Self::Largest, Self::Name];
+struct LocalGgufImportJob {
+    job_id: u64,
+    cancellation: InstallCancellation,
+    completion: Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Recommended => "Recommended first",
-            Self::Smallest => "Smallest first",
-            Self::Largest => "Largest first",
-            Self::Name => "Name",
+impl LocalGgufImportJob {
+    fn cancel_and_wait(&mut self, timeout: Duration) -> bool {
+        self.cancel_and_wait_with(timeout, |completion, timeout| {
+            matches!(
+                completion.recv_timeout(timeout),
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            )
+        })
+    }
+
+    fn cancel_and_wait_with(
+        &mut self,
+        timeout: Duration,
+        wait: impl FnOnce(&Receiver<()>, Duration) -> bool,
+    ) -> bool {
+        self.cancellation.cancel();
+        if !wait(&self.completion, timeout) {
+            return false;
+        }
+        self.worker
+            .take()
+            .is_none_or(|worker| worker.join().is_ok())
+    }
+
+    fn reap_completed(&mut self) {
+        if matches!(
+            self.completion.try_recv(),
+            Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected)
+        ) {
+            let _ = self.worker.take().map(thread::JoinHandle::join);
         }
     }
 }
@@ -1249,6 +1102,11 @@ enum AppEvent {
         request_id: RequestId,
         result: Box<TranscriptionOutcome>,
         latency: Option<LatencyTrace>,
+    },
+    PlaygroundModelStarted {
+        session_id: SessionId,
+        request_id: RequestId,
+        model_id: String,
     },
     TranscriptionFailed {
         source: RecordingSource,
@@ -1294,7 +1152,8 @@ enum AppEvent {
         result: Result<(), String>,
     },
     RemoteCatalogLoaded {
-        result: Result<CatalogSnapshot, String>,
+        generation: u64,
+        result: Result<ModelInventorySnapshot, String>,
     },
     ModelDownloadProgress {
         job_id: u64,
@@ -1313,6 +1172,7 @@ enum AppEvent {
         recovery_required: bool,
     },
     LocalGgufImportFinished {
+        job_id: u64,
         result: Result<Box<ValidatedLocalGgufImport>, String>,
     },
     RuntimeInstallDone {
@@ -1588,24 +1448,24 @@ fn run_verified_install(
                 total_bytes: model.size_bytes,
                 bytes_per_second: None,
             });
-            service
-                .verify_installation_candidate(
-                    InstallationCandidate::normalized(
-                        model_id.clone(),
-                        model.path.clone(),
-                        Some(root.clone()),
-                    )
-                    .ok()?,
-                    &cancellation,
-                )
-                .ok()
+            InstallationCandidate::normalized(
+                model_id.clone(),
+                model.path.clone(),
+                Some(root.clone()),
+            )
+            .ok()
+            .and_then(|candidate| {
+                service
+                    .verify_installation_candidate_for_activation(candidate, &cancellation)
+                    .ok()
+            })
         });
     let current_runtime_known_good = smoke_current.is_some()
         && candidate_root
             .as_ref()
             .is_some_and(|root| fs::canonicalize(root).ok() == fs::canonicalize(&target_root).ok());
 
-    let smoke = if model_uses_embedded_runtime {
+    let verified_smoke = if model_uses_embedded_runtime {
         progress(InstallProgress {
             stage: InstallStage::HealthChecking,
             completed_bytes: model.size_bytes,
@@ -1613,7 +1473,7 @@ fn run_verified_install(
             bytes_per_second: None,
         });
         service
-            .verify_installation_candidate(
+            .verify_installation_candidate_for_activation(
                 InstallationCandidate::pinned(
                     model_id.clone(),
                     model.path.clone(),
@@ -1623,7 +1483,7 @@ fn run_verified_install(
                 ),
                 &cancellation,
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|error| InstallJobFailure::normal(error.to_string()))?
     } else if !force_runtime_package && let Some(smoke) = smoke_current {
         smoke
     } else {
@@ -1642,7 +1502,7 @@ fn run_verified_install(
             bytes_per_second: None,
         });
         let smoke = service
-            .verify_installation_candidate(
+            .verify_installation_candidate_for_activation(
                 InstallationCandidate::normalized(
                     model_id.clone(),
                     model.path.clone(),
@@ -1655,7 +1515,7 @@ fn run_verified_install(
                 .map_err(|error| error.to_string())?,
                 &cancellation,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
         staged_runtime = Some(prepared.staged);
         smoke
     };
@@ -1675,6 +1535,15 @@ fn run_verified_install(
     let runtime_target = staged_runtime.as_ref().map(|_| target_root.clone());
     let prior_config_fingerprint = config::settings::artifact_config_fingerprint(&config)
         .map_err(|error| format!("could not fingerprint pre-install artifact settings: {error}"))?;
+    let smoke = verified_smoke
+        .authorize_activation(
+            &model_id,
+            &model.path,
+            model.size_bytes,
+            &model.sha256,
+            &cancellation,
+        )
+        .map_err(|error| InstallJobFailure::normal(error.to_string()))?;
     let mut journal = ActivationJournal::begin(
         activation_journal_path(),
         model.destination.clone(),
@@ -1721,7 +1590,7 @@ fn run_verified_install(
 
     let model_sha256 = model.sha256.clone();
     let model = match model.activate() {
-        Ok(replacement) => replacement,
+        Ok(committed) => committed,
         Err(error) => {
             let rollback = runtime.and_then(|replacement| replacement.rollback().err());
             if rollback.is_none() && !error.requires_recovery() {
@@ -1878,12 +1747,7 @@ fn validate_local_gguf_import(
         .map_err(local_gguf_import_error)?;
     let after_smoke = fingerprint_file_cancellable(&fingerprint.canonical_path, &cancellation)
         .map_err(local_gguf_import_install_error)?;
-    if after_smoke != fingerprint {
-        return Err(
-            "The local GGUF changed during validation. It was not imported; choose it again to revalidate its current bytes."
-                .to_owned(),
-        );
-    }
+    ensure_local_gguf_fingerprint_unchanged(&fingerprint, &after_smoke)?;
     let install = config::ImportedGgufModelInstall::validated(
         fingerprint.canonical_path.clone(),
         fingerprint.size_bytes,
@@ -1934,13 +1798,18 @@ fn reject_import_source_in_model_storage(
     Ok(())
 }
 
-fn local_gguf_import_fingerprint_matches(
-    install: &config::ImportedGgufModelInstall,
-    fingerprint: &crate::installations::FileFingerprint,
-) -> bool {
-    fingerprint.canonical_path == install.path
-        && fingerprint.size_bytes == install.size_bytes
-        && fingerprint.sha256 == install.sha256
+fn ensure_local_gguf_fingerprint_unchanged(
+    before: &crate::installations::FileFingerprint,
+    after_smoke: &crate::installations::FileFingerprint,
+) -> Result<(), String> {
+    if before == after_smoke {
+        Ok(())
+    } else {
+        Err(
+            "The local GGUF changed during validation. It was not imported; choose it again to revalidate its current bytes."
+                .to_owned(),
+        )
+    }
 }
 
 fn local_gguf_import_install_error(error: InstallError) -> String {
@@ -1964,78 +1833,10 @@ fn local_gguf_import_error(error: anyhow::Error) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelPrimaryAction {
-    Install,
-    Retry,
-    Installing,
-    Repair,
-    Select,
-    Active,
-}
-
-impl ModelPrimaryAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Install => "Install",
-            Self::Retry => "Retry",
-            Self::Installing => "Installing",
-            Self::Repair => "Repair",
-            Self::Select => "Select",
-            Self::Active => "Active",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeActionKind {
     Install,
     Update,
     Uninstall,
-}
-
-fn runtime_action_label(kind: RuntimeActionKind, runtime_label: &str, busy: bool) -> String {
-    if busy {
-        return format!("Preparing {runtime_label} runtime");
-    }
-    let action = match kind {
-        RuntimeActionKind::Install => "Install",
-        RuntimeActionKind::Update => "Update",
-        RuntimeActionKind::Uninstall => "Remove",
-    };
-    format!("{action} {runtime_label} runtime")
-}
-
-fn model_primary_action_label(
-    action: ModelPrimaryAction,
-    _model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-) -> String {
-    match action {
-        ModelPrimaryAction::Repair => "Repair runtime".to_owned(),
-        ModelPrimaryAction::Retry
-            if matches!(
-                install_status,
-                ModelInstallStatus::Error(message)
-                    if message.contains("resumable partial retained")
-                        || message.contains("Installation cancelled")
-            ) =>
-        {
-            "Resume".to_owned()
-        }
-        ModelPrimaryAction::Installing
-            if matches!(install_status, ModelInstallStatus::InstallingRuntime) =>
-        {
-            "Installing".to_owned()
-        }
-        _ => action.label().to_owned(),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ModelActionState {
-    primary: ModelPrimaryAction,
-    primary_enabled: bool,
-    show_uninstall: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2191,96 +1992,6 @@ struct RuntimeManifestMetadata {
     version: Option<String>,
     sha256: Option<String>,
     checksum: Option<String>,
-}
-
-#[cfg(test)]
-fn model_action_state(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-) -> ModelActionState {
-    model_action_state_with_runtime(model, install_status, selected, true)
-}
-
-fn model_action_state_with_runtime(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    runtime_ready: bool,
-) -> ModelActionState {
-    match install_status {
-        ModelInstallStatus::Installed => ModelActionState {
-            primary: if !runtime_ready {
-                ModelPrimaryAction::Repair
-            } else if selected {
-                ModelPrimaryAction::Active
-            } else {
-                ModelPrimaryAction::Select
-            },
-            primary_enabled: !selected || !runtime_ready,
-            show_uninstall: supports_managed_uninstall(model, install_status),
-        },
-        ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime => {
-            ModelActionState {
-                primary: ModelPrimaryAction::Installing,
-                primary_enabled: false,
-                show_uninstall: false,
-            }
-        }
-        ModelInstallStatus::Error(_) => ModelActionState {
-            primary: ModelPrimaryAction::Retry,
-            primary_enabled: supports_managed_install(model),
-            show_uninstall: false,
-        },
-        ModelInstallStatus::RuntimeError(_) => ModelActionState {
-            primary: ModelPrimaryAction::Repair,
-            primary_enabled: true,
-            show_uninstall: true,
-        },
-        ModelInstallStatus::Missing | ModelInstallStatus::NotInstalled => ModelActionState {
-            primary: ModelPrimaryAction::Install,
-            primary_enabled: supports_managed_install(model),
-            show_uninstall: false,
-        },
-    }
-}
-
-fn model_primary_disabled_tooltip(
-    model: &SttModelInfo,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    action_state: &ModelActionState,
-) -> Option<String> {
-    if action_state.primary_enabled {
-        return None;
-    }
-
-    match action_state.primary {
-        ModelPrimaryAction::Active if selected => {
-            Some("This model is already the active transcription model.".to_owned())
-        }
-        ModelPrimaryAction::Installing => Some("This model is still being installed.".to_owned()),
-        ModelPrimaryAction::Install | ModelPrimaryAction::Retry
-            if !supports_managed_install(model) =>
-        {
-            Some("Managed downloads are not available for this model in this build.".to_owned())
-        }
-        ModelPrimaryAction::Retry => match install_status {
-            ModelInstallStatus::Error(message) => Some(format!("Install failed: {message}")),
-            _ => Some("Retry is not available for this model.".to_owned()),
-        },
-        ModelPrimaryAction::Select => Some("Install this model before selecting it.".to_owned()),
-        ModelPrimaryAction::Repair => match install_status {
-            ModelInstallStatus::RuntimeError(message) => {
-                Some(format!("Runtime repair failed: {message}"))
-            }
-            _ => Some("The local runtime is not ready for this installed model.".to_owned()),
-        },
-        ModelPrimaryAction::Install => {
-            Some("This model does not have a managed installer.".to_owned())
-        }
-        ModelPrimaryAction::Active => Some("This model cannot be selected right now.".to_owned()),
-    }
 }
 
 #[cfg(test)]
@@ -2670,13 +2381,29 @@ pub struct LocalTranscriberApp {
     config_path: Option<PathBuf>,
     settings_store: Option<SettingsStore>,
     current_tab: Tab,
+    settings_tab: SettingsTab,
+    settings_playground_open: bool,
+    settings_playground_needs_initial_focus: bool,
+    settings_restore_playground_focus: bool,
     models_show_comparison: bool,
+    model_comparison: ModelComparisonState,
+    comparison_run_model_ids: Option<Vec<String>>,
+    comparison_started_at: Option<Instant>,
+    comparison_reference_revision: u64,
+    comparison_output_revisions: HashMap<String, u64>,
+    comparison_projection_cache: HashMap<String, ComparisonProjectionCacheEntry>,
+    #[cfg(test)]
+    comparison_wer_compute_count: usize,
+    #[cfg(test)]
+    comparison_output_replacement_count: usize,
+    model_management: ModelManagementState,
     status: TranscriptionStatus,
     transcript: String,
     raw_transcript: String,
     status_message: String,
     hotkey_input: String,
     model_search: String,
+    model_language_filter: ModelLanguageFilter,
     remote_catalog_filters: RemoteCatalogFilters,
     remote_catalog_sort: RemoteCatalogSort,
     model_import_path: String,
@@ -2685,7 +2412,7 @@ pub struct LocalTranscriberApp {
     microphone_test: MicrophoneTest,
     microphone_test_sequence: u64,
     microphone_test_error: Option<String>,
-    microphone_monitor_retry_at: Option<Instant>,
+    microphone_monitor_retry_required: bool,
     microphone_level_envelope: MicrophoneLevelEnvelope,
     deferred_recording_start: Option<DeferredRecordingStart>,
     deferred_history_playback: Option<i64>,
@@ -2693,7 +2420,8 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: HashMap<String, (u64, InstallCancellation)>,
-    local_gguf_import: Option<InstallCancellation>,
+    local_gguf_import: Option<LocalGgufImportJob>,
+    local_gguf_import_status: Option<String>,
     artifact_recovery_error: Option<String>,
     active_recording: Option<ActiveRecording>,
     pending_recording: Option<PendingRecording>,
@@ -2802,6 +2530,7 @@ impl LocalTranscriberApp {
         let mut app = Self {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            model_language_filter: ModelLanguageFilter::default(),
             remote_catalog_filters: RemoteCatalogFilters::default(),
             remote_catalog_sort: RemoteCatalogSort::default(),
             model_import_path: String::new(),
@@ -2810,7 +2539,7 @@ impl LocalTranscriberApp {
             microphone_test: MicrophoneTest::Idle,
             microphone_test_sequence: 0,
             microphone_test_error: None,
-            microphone_monitor_retry_at: None,
+            microphone_monitor_retry_required: false,
             microphone_level_envelope: MicrophoneLevelEnvelope::default(),
             deferred_recording_start: None,
             deferred_history_playback: None,
@@ -2819,6 +2548,7 @@ impl LocalTranscriberApp {
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
             local_gguf_import: None,
+            local_gguf_import_status: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -2833,7 +2563,22 @@ impl LocalTranscriberApp {
             config_path,
             settings_store,
             current_tab: initial_tab(),
+            settings_tab: SettingsTab::General,
+            settings_playground_open: false,
+            settings_playground_needs_initial_focus: false,
+            settings_restore_playground_focus: false,
             models_show_comparison: false,
+            model_comparison: ModelComparisonState::default(),
+            comparison_run_model_ids: None,
+            comparison_started_at: None,
+            comparison_reference_revision: 0,
+            comparison_output_revisions: HashMap::new(),
+            comparison_projection_cache: HashMap::new(),
+            #[cfg(test)]
+            comparison_wer_compute_count: 0,
+            #[cfg(test)]
+            comparison_output_replacement_count: 0,
+            model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -3048,6 +2793,7 @@ impl LocalTranscriberApp {
             app.status_message = format!("Hotkey unavailable: {err}");
         }
 
+        app.rebuild_model_inventory_projection();
         app.request_history_page(false);
 
         app
@@ -3255,7 +3001,19 @@ impl LocalTranscriberApp {
     }
 
     fn playground_selected_models(&self) -> Vec<SttModelInfo> {
-        config::playground_selected_installed_models(&self.config)
+        let Some(selected_ids) = self.comparison_run_model_ids.as_ref() else {
+            return config::playground_selected_installed_models(&self.config);
+        };
+        let configured = config::configured_models(&self.config);
+        selected_ids
+            .iter()
+            .filter_map(|id| {
+                configured
+                    .iter()
+                    .find(|model| &model.id == id && model.install_status.is_runnable())
+                    .cloned()
+            })
+            .collect()
     }
 
     fn save_config(&mut self) {
@@ -3436,14 +3194,20 @@ impl LocalTranscriberApp {
                 }
             })
             .collect();
+        let removed_outputs = existing_by_id
+            .into_iter()
+            .filter_map(|(model_id, card)| (!card.transcript.is_empty()).then_some(model_id))
+            .collect::<Vec<_>>();
+        for model_id in removed_outputs {
+            self.mark_comparison_output_changed(&model_id);
+        }
     }
 
     fn next_repaint_delay(&self) -> Duration {
-        if self.capture_is_active()
-            || self.microphone_test_is_active()
-            || self.microphone_level_envelope.is_animating()
-        {
+        if self.capture_is_active() {
             METER_REPAINT_DELAY
+        } else if self.microphone_test_is_active() {
+            PASSIVE_MONITOR_REPAINT_DELAY
         } else if self.has_active_work() {
             ACTIVE_REPAINT_DELAY
         } else {
@@ -3484,9 +3248,10 @@ impl LocalTranscriberApp {
     }
 
     fn recording_source(&self) -> Option<RecordingSource> {
-        self.active_recording
+        self.deferred_recording_start
             .as_ref()
-            .map(|active| active.source)
+            .map(|pending| pending.source)
+            .or_else(|| self.active_recording.as_ref().map(|active| active.source))
             .or_else(|| {
                 self.pending_recording
                     .as_ref()
@@ -3500,7 +3265,6 @@ impl LocalTranscriberApp {
                         _ => None,
                     })
             })
-            .or_else(|| self.deferred_recording_start.map(|pending| pending.source))
     }
 
     fn current_audio_levels(&self) -> LevelSnapshot {
@@ -3529,6 +3293,17 @@ impl LocalTranscriberApp {
         !matches!(self.microphone_test, MicrophoneTest::Idle)
     }
 
+    fn passive_microphone_monitor_needed(&self) -> bool {
+        !self.quit_requested
+            && !self.window_hidden_to_tray
+            && self.current_tab == Tab::General
+            && self.settings_tab == SettingsTab::Recording
+            && !self.capture_is_active()
+            && self.deferred_recording_start.is_none()
+            && self.deferred_history_playback.is_none()
+            && self.playing_history_id.is_none()
+    }
+
     fn current_sensitivity_level_sample(&self) -> (LevelSnapshot, Option<u64>, bool) {
         if let Some(active) = self.active_recording.as_ref() {
             return (
@@ -3548,25 +3323,29 @@ impl LocalTranscriberApp {
     }
 
     fn ensure_microphone_monitor(&mut self) {
-        if self.capture_is_active()
-            || self.deferred_recording_start.is_some()
-            || self.deferred_history_playback.is_some()
-            || self.playing_history_id.is_some()
+        if !self.passive_microphone_monitor_needed()
             || self.microphone_test_is_active()
-            || self
-                .microphone_monitor_retry_at
-                .is_some_and(|retry_at| Instant::now() < retry_at)
+            || self.microphone_monitor_retry_required
         {
             return;
         }
         self.start_microphone_test();
     }
 
-    fn start_microphone_test(&mut self) {
-        if self.microphone_test_is_active() {
-            return;
+    fn sync_passive_microphone_monitor(&mut self) {
+        if self.passive_microphone_monitor_needed() {
+            self.ensure_microphone_monitor();
+        } else {
+            self.suspend_microphone_monitor();
         }
-        if self.capture_is_active() || self.playing_history_id.is_some() {
+    }
+
+    fn start_microphone_test(&mut self) {
+        if self.quit_requested
+            || self.microphone_test_is_active()
+            || self.capture_is_active()
+            || self.playing_history_id.is_some()
+        {
             return;
         }
 
@@ -3585,7 +3364,7 @@ impl LocalTranscriberApp {
             cancellation: cancellation.clone(),
         };
         self.microphone_test_error = None;
-        self.microphone_monitor_retry_at = None;
+        self.microphone_monitor_retry_required = false;
         let tx = self.tx.clone();
         thread::spawn(move || {
             let result = audio::start_recording(
@@ -3636,10 +3415,14 @@ impl LocalTranscriberApp {
             self.microphone_level_envelope.reset_source();
             self.microphone_test_error = result.err().map(|error| error.to_string());
             if let Some(error) = self.microphone_test_error.as_ref() {
-                self.microphone_monitor_retry_at =
-                    Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
+                self.microphone_monitor_retry_required = true;
                 self.status_message = format!("Microphone monitoring unavailable: {error}");
             }
+        }
+        if self.quit_requested {
+            self.deferred_recording_start = None;
+            self.deferred_history_playback = None;
+            return;
         }
         if matches!(self.microphone_test, MicrophoneTest::Idle)
             && let Some(pending) = self.deferred_recording_start.take()
@@ -4057,16 +3840,21 @@ impl LocalTranscriberApp {
         match action {
             PlaygroundAction::Clear(model_id) => {
                 let clearing_active_model = model_id == self.config.general.selected_default_model;
+                let mut output_changed = false;
                 if let Some(card) = self
                     .playground_cards
                     .iter_mut()
                     .find(|card| card.descriptor.id.as_str() == model_id)
                 {
+                    output_changed = !card.transcript.is_empty();
                     card.transcript.clear();
                     card.latency_ms = None;
                     card.audio_duration_ms = None;
                     card.peak_ram_mb = None;
                     card.peak_vram_mb = None;
+                }
+                if output_changed {
+                    self.mark_comparison_output_changed(&model_id);
                 }
                 if clearing_active_model && !self.playground_reference_user_edited {
                     self.playground_reference_transcript.clear();
@@ -4876,14 +4664,17 @@ impl LocalTranscriberApp {
             TrayCommand::ToggleRecording => self.toggle_recording(),
             TrayCommand::CopyLastTranscript => self.copy_transcript_to_clipboard(),
             TrayCommand::Quit => {
+                self.quit_requested = true;
                 self.window_hidden_to_tray = false;
+                self.deferred_recording_start = None;
+                self.deferred_history_playback = None;
                 if let Some(tray_service) = &self.tray_service {
                     tray_service.cancel_hidden_repaint();
                 }
+                self.stop_microphone_test();
                 self.shutdown_transcription_for_exit();
                 let _ = self.session_coordinator.cancel_active();
                 self.flush_settings();
-                self.quit_requested = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
@@ -4910,6 +4701,7 @@ impl LocalTranscriberApp {
             );
             return;
         }
+        self.suspend_microphone_monitor();
         self.window_hidden_to_tray = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.status_message = "Scribe is running in the tray".to_owned();
@@ -5489,15 +5281,20 @@ impl LocalTranscriberApp {
             let expected_model_id = self
                 .expected_playground_model_id(session_id, request_id)
                 .map(str::to_owned);
-            if let Some(expected_model_id) = expected_model_id
+            let mut output_changed = false;
+            if let Some(expected_model_id) = expected_model_id.as_deref()
                 && let Some(card) = self
                     .playground_cards
                     .iter_mut()
                     .find(|card| card.descriptor.id.as_str() == expected_model_id)
             {
                 card.status = ModelRuntimeStatus::Error(message.to_owned());
+                output_changed = !card.transcript.is_empty();
                 card.transcript.clear();
                 card.latency_ms = None;
+            }
+            if output_changed && let Some(expected_model_id) = expected_model_id {
+                self.mark_comparison_output_changed(&expected_model_id);
             }
         }
     }
@@ -5532,8 +5329,7 @@ impl LocalTranscriberApp {
                                 self.microphone_level_envelope.reset_source();
                                 if !stop_requested {
                                     self.microphone_test_error = Some(error.to_string());
-                                    self.microphone_monitor_retry_at =
-                                        Some(Instant::now() + MICROPHONE_MONITOR_RETRY_DELAY);
+                                    self.microphone_monitor_retry_required = true;
                                     self.status_message =
                                         format!("Microphone monitoring unavailable: {error}");
                                 }
@@ -5858,20 +5654,25 @@ impl LocalTranscriberApp {
                         }
                     }
                 }
-                AppEvent::RemoteCatalogLoaded { result } => {
+                AppEvent::RemoteCatalogLoaded { generation, result } => {
+                    if self.remote_catalog.active_refresh_generation != Some(generation) {
+                        continue;
+                    }
                     self.remote_catalog.loading = false;
+                    self.remote_catalog.active_refresh_generation = None;
                     match result {
                         Ok(snapshot) => {
                             self.remote_catalog.snapshot = Some(snapshot);
                             self.remote_catalog.error = None;
+                            self.remote_catalog.invalidate_projection();
                         }
                         Err(error) => {
                             self.remote_catalog.error = Some(error);
                         }
                     }
                 }
-                AppEvent::LocalGgufImportFinished { result } => {
-                    self.finish_local_gguf_import(result);
+                AppEvent::LocalGgufImportFinished { job_id, result } => {
+                    self.finish_local_gguf_import(job_id, result);
                 }
                 AppEvent::TranscriptionDone {
                     source,
@@ -6184,6 +5985,28 @@ impl LocalTranscriberApp {
                     }
                     self.cleanup_after_job(source, session_id, request_id);
                 }
+                AppEvent::PlaygroundModelStarted {
+                    session_id,
+                    request_id,
+                    model_id,
+                } => {
+                    if !self.transcription_event_is_current(
+                        RecordingSource::Playground,
+                        session_id,
+                        request_id,
+                    ) || self.expected_playground_model_id(session_id, request_id)
+                        != Some(model_id.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(card) = self
+                        .playground_cards
+                        .iter_mut()
+                        .find(|card| card.descriptor.id.as_str() == model_id)
+                    {
+                        card.status = ModelRuntimeStatus::Running;
+                    }
+                }
                 AppEvent::TranscriptionFailed {
                     source,
                     session_id,
@@ -6255,14 +6078,19 @@ impl LocalTranscriberApp {
                         }
                         RecordingSource::Playground => {
                             self.status = TranscriptionStatus::Error;
+                            let mut output_changed = false;
                             if let Some(card) = self
                                 .playground_cards
                                 .iter_mut()
                                 .find(|card| card.descriptor.id.as_str() == model_id)
                             {
                                 card.status = ModelRuntimeStatus::Error(message.clone());
+                                output_changed = !card.transcript.is_empty();
                                 card.transcript.clear();
                                 card.latency_ms = None;
+                            }
+                            if output_changed {
+                                self.mark_comparison_output_changed(&model_id);
                             }
                             self.status_message = message;
                             if all_requests_completed {
@@ -6305,6 +6133,7 @@ impl LocalTranscriberApp {
                             ModelInstallStatus::InstallingRuntime
                         },
                     );
+                    self.update_model_download_progress_projection(&model_id);
                     self.status_message = format!("{stage_label} for {model_id}...");
                 }
                 AppEvent::VerifiedInstallDone {
@@ -6343,6 +6172,7 @@ impl LocalTranscriberApp {
                         }
                         continue;
                     }
+                    self.remote_catalog.invalidate_local_models();
                     self.artifact_installations.remove(&model_id);
                     let previous_config = self.config.clone();
                     self.model_downloads
@@ -6553,6 +6383,7 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
+                    self.remote_catalog.invalidate_local_models();
                     self.artifact_installations.remove(&model_id);
                     if recovery_required {
                         self.artifact_recovery_error = Some(message.clone());
@@ -6568,6 +6399,7 @@ impl LocalTranscriberApp {
                     replacement,
                     source_label,
                 } => {
+                    self.remote_catalog.invalidate_local_models();
                     let installed_path = replacement.installed_path.clone();
                     let new_runtime = managed_runtime_install_record(installed_path, source_label);
                     let job = self.runtime_jobs.remove(&runtime_id).unwrap_or_default();
@@ -6641,6 +6473,7 @@ impl LocalTranscriberApp {
                 } => self.fail_runtime_job(&runtime_id, message),
             }
         }
+        self.rebuild_model_inventory_projection();
     }
 
     fn cleanup_after_job(
@@ -6866,36 +6699,30 @@ impl LocalTranscriberApp {
                     return;
                 }
             };
-            let task = match service.begin_transcription_task() {
-                Ok(task) => task,
-                Err(err) => {
-                    let _ = self.session_coordinator.fail(session_id);
-                    self.playground_pending = 0;
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not dispatch model comparison: {err}");
-                    return;
-                }
-            };
-            requests.push((request_id, model, task));
+            requests.push((request_id, model));
         }
         self.playground_runs.insert(
             session_id,
             PlaygroundRunState {
                 pending_requests: requests
                     .iter()
-                    .map(|(request_id, model, _)| (*request_id, model.id.clone()))
+                    .map(|(request_id, model)| (*request_id, model.id.clone()))
                     .collect(),
                 _audio: Arc::clone(&audio),
             },
         );
 
-        for (_, model, _) in &requests {
+        let mut changed_outputs = Vec::new();
+        for (_, model) in &requests {
             if let Some(card) = self
                 .playground_cards
                 .iter_mut()
                 .find(|card| card.descriptor.id.as_str() == model.id)
             {
-                card.status = ModelRuntimeStatus::Running;
+                card.status = ModelRuntimeStatus::Ready;
+                if !card.transcript.is_empty() {
+                    changed_outputs.push(model.id.clone());
+                }
                 card.transcript.clear();
                 card.latency_ms = None;
                 card.audio_duration_ms = audio_duration_ms;
@@ -6903,14 +6730,38 @@ impl LocalTranscriberApp {
                 card.peak_vram_mb = None;
             }
         }
+        for model_id in changed_outputs {
+            self.mark_comparison_output_changed(&model_id);
+        }
 
-        for (request_id, model, task) in requests {
-            let tx = self.tx.clone();
-            let service = service.clone();
-            let audio = Arc::clone(&audio);
-            thread::spawn(move || {
-                let mut request =
-                    TranscriptionRequest::new(session_id, request_id, audio, model.id.clone());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            for (request_id, model) in requests {
+                let _ = tx.send(AppEvent::PlaygroundModelStarted {
+                    session_id,
+                    request_id,
+                    model_id: model.id.clone(),
+                });
+                let task = match service.begin_transcription_task() {
+                    Ok(task) => task,
+                    Err(err) => {
+                        let _ = tx.send(AppEvent::TranscriptionFailed {
+                            source: RecordingSource::Playground,
+                            session_id,
+                            request_id,
+                            model_id: model.id,
+                            message: err.to_string(),
+                            latency: None,
+                        });
+                        continue;
+                    }
+                };
+                let mut request = TranscriptionRequest::new(
+                    session_id,
+                    request_id,
+                    Arc::clone(&audio),
+                    model.id.clone(),
+                );
                 request.model_path = model.local_path.clone();
                 request.options = TranscriptionOptions::default();
                 match service.transcribe_task(request, task) {
@@ -6934,14 +6785,17 @@ impl LocalTranscriberApp {
                         });
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     fn reset_playground_for_run(&mut self) {
-        self.playground_cards = cards_from_config(&self.config, &self.transcription_service)
-            .into_iter()
-            .collect();
+        self.reset_comparison_output_projection();
+        self.playground_cards = cards_for_models(
+            &self.config,
+            &self.transcription_service,
+            self.playground_selected_models(),
+        );
         for card in &mut self.playground_cards {
             card.status = runtime_status_for_id(&self.config, card.descriptor.id.as_str());
             card.transcript.clear();
@@ -6961,14 +6815,19 @@ impl LocalTranscriberApp {
             result.model_id.as_str() == self.config.general.selected_default_model;
         let duration_ms = result.processing_duration_ms;
         let transcript = result.transcript.text;
+        let mut output_changed = false;
         if let Some(card) = self
             .playground_cards
             .iter_mut()
             .find(|card| card.descriptor.id == result.model_id)
         {
             card.status = ModelRuntimeStatus::Ready;
+            output_changed = card.transcript != transcript;
             card.transcript = transcript.clone();
             card.latency_ms = duration_ms;
+        }
+        if output_changed {
+            self.mark_comparison_output_changed(result.model_id.as_str());
         }
         if is_active_model && !self.playground_reference_user_edited {
             self.playground_reference_transcript = transcript;
@@ -6976,6 +6835,7 @@ impl LocalTranscriberApp {
     }
 
     fn clear_playground_results(&mut self, clear_reference: bool) {
+        self.reset_comparison_output_projection();
         for card in &mut self.playground_cards {
             card.transcript.clear();
             card.latency_ms = None;
@@ -7031,9 +6891,16 @@ impl LocalTranscriberApp {
     }
 
     fn playground_run_block_reason(&self) -> Option<String> {
-        if self.playground_cards.is_empty() {
+        let models = self.playground_selected_models();
+        if models.is_empty() {
             return Some(
-                if self.config.general.playground_selected_models.is_empty() {
+                if self
+                    .comparison_run_model_ids
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                    || (self.comparison_run_model_ids.is_none()
+                        && self.config.general.playground_selected_models.is_empty())
+                {
                     "Choose models to test before starting a test recording.".to_owned()
                 } else {
                     "Install the selected Playground models before starting a test recording."
@@ -7041,13 +6908,13 @@ impl LocalTranscriberApp {
                 },
             );
         }
-        self.playground_cards
+        models
             .iter()
-            .find(|card| card.status != ModelRuntimeStatus::Ready)
-            .map(|card| {
+            .find(|model| runtime_status_for_model(&self.config, model) != ModelRuntimeStatus::Ready)
+            .map(|model| {
                 format!(
                     "{} is not ready. Repair or install its runtime from Models before running the Playground.",
-                    card.descriptor.display_name
+                    model.name
                 )
             })
     }
@@ -7147,20 +7014,94 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn select_model_as_default(&mut self, model: &SttModelInfo) {
+    fn select_model_as_default(&mut self, model: &SttModelInfo) -> bool {
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
-            return;
+            return false;
         }
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status = TranscriptionStatus::Error;
             self.status_message =
                 format!("Could not unload the warm model before switching: {error}");
-            return;
+            return false;
         }
         self.config.general.selected_default_model = model.id.clone();
         compatibility_bridge::record_selected_provider(&mut self.config, model);
         self.save_config();
+        self.remote_catalog.invalidate_local_models();
+        true
+    }
+
+    fn active_model_removal_replacement(&self, removed_id: &str) -> Option<SttModelInfo> {
+        let built_in_rank = crate::model_catalog::normal_model_descriptors()
+            .into_iter()
+            .enumerate()
+            .map(|(index, descriptor)| (descriptor.id.as_str().to_owned(), index))
+            .collect::<HashMap<_, _>>();
+        let mut candidates = config::configured_models(&self.config)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.id != removed_id
+                    && self.effective_install_status(candidate).is_runnable()
+                    && runtime_status_for_model(&self.config, candidate)
+                        == ModelRuntimeStatus::Ready
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_recommended = self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&left.id))
+                .ok()
+                .is_some_and(|descriptor| descriptor.recommended);
+            let right_recommended = self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&right.id))
+                .ok()
+                .is_some_and(|descriptor| descriptor.recommended);
+            compare_active_model_replacements(
+                left,
+                left_recommended,
+                built_in_rank.get(&left.id).copied(),
+                right,
+                right_recommended,
+                built_in_rank.get(&right.id).copied(),
+            )
+        });
+        candidates.into_iter().next()
+    }
+
+    fn persist_active_model_replacement(&mut self, replacement: &SttModelInfo) -> bool {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return false;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                format!("Could not unload the active model before replacement: {error}");
+            return false;
+        }
+        let previous = self.config.clone();
+        self.config.general.selected_default_model = replacement.id.clone();
+        compatibility_bridge::record_selected_provider(&mut self.config, replacement);
+        config::normalize_config(&mut self.config);
+        if let Err(error) = config::save_config(&self.config) {
+            self.config = previous;
+            self.transcription_service =
+                self.transcription_service.with_config(self.config.clone());
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "Could not persist the replacement model before removal: {error}. The active model and its files were left unchanged."
+            );
+            return false;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.refresh_playground_cards_from_config();
+        self.remote_catalog.invalidate_local_models();
+        true
     }
 
     fn effective_install_status(&self, model: &SttModelInfo) -> ModelInstallStatus {
@@ -7184,6 +7125,16 @@ impl LocalTranscriberApp {
     }
 
     fn start_model_download(&mut self, model: &SttModelInfo) {
+        if self.artifact_installations.contains_key(&model.id)
+            || self.runtime_jobs.values().any(|job| {
+                job.download_model_ids
+                    .iter()
+                    .any(|queued_model_id| queued_model_id == &model.id)
+            })
+        {
+            self.status_message = format!("{} is already being installed.", model.name);
+            return;
+        }
         if self
             .transcription_service
             .installation_binding(&ModelId::new(&model.id))
@@ -7270,6 +7221,7 @@ impl LocalTranscriberApp {
                 bytes_per_second: None,
             },
         );
+        self.remote_catalog.invalidate_local_models();
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", model.name);
 
@@ -7344,6 +7296,7 @@ impl LocalTranscriberApp {
                 bytes_per_second: None,
             },
         );
+        self.remote_catalog.invalidate_local_models();
         self.status = TranscriptionStatus::Idle;
         self.status_message = format!("Downloading {}...", request.display_name);
 
@@ -7377,73 +7330,106 @@ impl LocalTranscriberApp {
     /// Validates a user-chosen GGUF in place. This is deliberately separate
     /// from the downloader: no remote source, app-managed path, or model
     /// replacement is created for an imported file.
+    fn set_local_gguf_import_message(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status_message = message.clone();
+        self.local_gguf_import_status = Some(message);
+    }
+
     fn start_local_gguf_import(&mut self) {
         if self.local_gguf_import.is_some() {
-            self.status_message = "A local GGUF import is already being validated.".to_owned();
+            self.set_local_gguf_import_message("A local GGUF import is already being validated.");
             return;
         }
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status = TranscriptionStatus::Error;
-            self.status_message = reason;
+            self.set_local_gguf_import_message(reason);
             return;
         }
         let source = self.model_import_path.trim();
         if source.is_empty() {
             self.status = TranscriptionStatus::Error;
-            self.status_message = "Enter the path to a local .gguf file to import.".to_owned();
+            self.set_local_gguf_import_message("Enter the path to a local .gguf file to import.");
             return;
         }
         let source_path = PathBuf::from(source);
         let cancellation = InstallCancellation::default();
         let thread_cancellation = cancellation.clone();
-        self.local_gguf_import = Some(cancellation);
         self.status = TranscriptionStatus::Idle;
-        self.status_message = "Hashing and validating the local GGUF...".to_owned();
+        self.set_local_gguf_import_message("Hashing and validating the local GGUF...");
         let tx = self.tx.clone();
         let service = self.transcription_service.with_config(self.config.clone());
         let model_storage_dir = config::model_storage_dir(&self.config);
-        thread::spawn(move || {
-            let result = validate_local_gguf_import(
-                source_path,
-                model_storage_dir,
-                service,
-                thread_cancellation,
-            )
-            .map(Box::new);
-            let _ = tx.send(AppEvent::LocalGgufImportFinished { result });
-        });
+        let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let (completion_tx, completion) = bounded(1);
+        let worker = thread::Builder::new()
+            .name("scribe-local-gguf-import".to_owned())
+            .spawn(move || {
+                let result = validate_local_gguf_import(
+                    source_path,
+                    model_storage_dir,
+                    service,
+                    thread_cancellation,
+                )
+                .map(Box::new);
+                // Signal only after the final post-smoke fingerprint witness is
+                // complete. The following unbounded event send cannot block.
+                let _ = completion_tx.send(());
+                let _ = tx.send(AppEvent::LocalGgufImportFinished { job_id, result });
+            });
+        match worker {
+            Ok(worker) => {
+                self.local_gguf_import = Some(LocalGgufImportJob {
+                    job_id,
+                    cancellation,
+                    completion,
+                    worker: Some(worker),
+                });
+            }
+            Err(error) => {
+                self.status = TranscriptionStatus::Error;
+                self.set_local_gguf_import_message(format!(
+                    "Could not start local GGUF validation: {error}"
+                ));
+            }
+        }
     }
 
-    fn finish_local_gguf_import(&mut self, result: Result<Box<ValidatedLocalGgufImport>, String>) {
-        self.local_gguf_import = None;
+    fn finish_local_gguf_import(
+        &mut self,
+        job_id: u64,
+        result: Result<Box<ValidatedLocalGgufImport>, String>,
+    ) {
+        if self
+            .local_gguf_import
+            .as_ref()
+            .is_none_or(|job| job.job_id != job_id)
+        {
+            return;
+        }
+        let mut job = self
+            .local_gguf_import
+            .take()
+            .expect("the matching local GGUF job must still be active");
+        job.reap_completed();
+        if job.cancellation.is_cancelled() {
+            self.status = TranscriptionStatus::Idle;
+            self.set_local_gguf_import_message(
+                "Local GGUF import was cancelled. The source file was left unchanged.",
+            );
+            return;
+        }
         let imported = match result {
             Ok(imported) => *imported,
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
-                self.status_message = format!("Local GGUF import failed: {error}");
+                self.set_local_gguf_import_message(format!("Local GGUF import failed: {error}"));
                 return;
             }
         };
-        let current_fingerprint = match fingerprint_file_cancellable(
-            &imported.install.path,
-            &InstallCancellation::default(),
-        ) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.status = TranscriptionStatus::Error;
-                self.status_message = format!(
-                    "Could not recheck local GGUF before persistence: {}",
-                    local_gguf_import_install_error(error)
-                );
-                return;
-            }
-        };
-        if !local_gguf_import_fingerprint_matches(&imported.install, &current_fingerprint) {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = "The local GGUF changed after validation and was not imported. Choose it again to validate its current bytes."
-                .to_owned();
-            return;
-        }
+        // The worker supplied the final post-smoke fingerprint witness.
+        // Completion deliberately performs no source file metadata/read/hash
+        // work on the UI thread.
         let previous_config = self.config.clone();
         self.config.general.imported_gguf_models.insert(
             imported.model_id.as_str().to_owned(),
@@ -7458,8 +7444,7 @@ impl LocalTranscriberApp {
         {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
-            self.status_message = "The local GGUF changed before Scribe could persist its import receipt. Revalidate it before importing."
-                .to_owned();
+            self.set_local_gguf_import_message("The local GGUF changed before Scribe could persist its import receipt. Revalidate it before importing.");
             return;
         }
         let receipt_path = installed_manifest::imported_manifest_path_for(
@@ -7469,7 +7454,9 @@ impl LocalTranscriberApp {
         if let Err(error) = config::save_config(&self.config) {
             self.config = previous_config;
             self.status = TranscriptionStatus::Error;
-            self.status_message = format!("Could not save the local import record: {error}.");
+            self.set_local_gguf_import_message(format!(
+                "Could not save the local import record: {error}."
+            ));
             return;
         }
         if let Err(error) =
@@ -7488,7 +7475,7 @@ impl LocalTranscriberApp {
                 self.artifact_recovery_error = Some(message.clone());
             }
             self.status = TranscriptionStatus::Error;
-            self.status_message = message;
+            self.set_local_gguf_import_message(message);
             return;
         }
         if let Some(store) = self.settings_store.as_mut() {
@@ -7496,24 +7483,28 @@ impl LocalTranscriberApp {
         }
         self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_cards_from_config();
+        self.rebuild_local_models_after_committed_change();
         let model_name = imported.install.display_name;
         self.status = TranscriptionStatus::Idle;
-        self.status_message = format!(
+        self.set_local_gguf_import_message(format!(
             "Imported and smoke-tested {model_name} in place (health {} ms, load {} ms, decode {} ms).",
             imported.smoke.health_duration_ms,
             imported.smoke.load_duration_ms,
             imported.smoke.decode_duration_ms,
-        );
+        ));
     }
 
-    fn uninstall_model(&mut self, model: &SttModelInfo) {
+    /// Returns true after removal settings are durably committed. Cleanup can
+    /// still require recovery after that point, so callers must not undo the
+    /// newly persisted active-model selection on a committed removal.
+    fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
-            return;
+            return false;
         }
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status_message = format!("Could not unload the selected model: {error}");
-            return;
+            return false;
         }
         let static_managed_target = self
             .config
@@ -7525,6 +7516,9 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
+            .then(|| model.local_path.clone())
+            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -7547,14 +7541,15 @@ impl LocalTranscriberApp {
         let imported_local = imported_receipt_target.is_some();
         let managed_target = static_managed_target
             .or(remote_managed_target)
-            .or(imported_receipt_target);
+            .or(imported_receipt_target)
+            .or(legacy_catalog_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     format!("Could not prepare model removal settings witness: {error}");
-                return;
+                return false;
             }
         };
         let mut staged_removal = match managed_target.as_ref() {
@@ -7568,7 +7563,7 @@ impl LocalTranscriberApp {
                         }
                         self.status = TranscriptionStatus::Error;
                         self.status_message = format!("Could not stage model removal: {error}");
-                        return;
+                        return false;
                     }
                 }
             }
@@ -7578,6 +7573,7 @@ impl LocalTranscriberApp {
             .as_ref()
             .is_some_and(ManagedRemoval::removed_files);
         let previous_config = self.config.clone();
+        self.remote_catalog.invalidate_local_models();
         self.model_downloads.remove(&model.id);
         self.config.general.managed_models.remove(&model.id);
         self.config.general.managed_remote_models.remove(&model.id);
@@ -7613,7 +7609,7 @@ impl LocalTranscriberApp {
             }
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return false;
         }
         if let Err(error) = config::save_config(&self.config) {
             self.config = previous_config;
@@ -7625,7 +7621,7 @@ impl LocalTranscriberApp {
             }
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return false;
         }
         let cleanup = staged_removal.and_then(|removal| removal.commit().err());
         if let Some(store) = self.settings_store.as_mut() {
@@ -7641,7 +7637,7 @@ impl LocalTranscriberApp {
             self.artifact_recovery_error = Some(message.clone());
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return true;
         }
         self.status = TranscriptionStatus::Idle;
         self.status_message = if imported_local {
@@ -7655,9 +7651,11 @@ impl LocalTranscriberApp {
                 false => format!("Removed {} from Scribe.", model.name),
             }
         };
+        true
     }
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
+        self.remote_catalog.invalidate_local_models();
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
             return;
@@ -7788,6 +7786,7 @@ impl LocalTranscriberApp {
     }
 
     fn fail_model_install(&mut self, model_id: &str, message: String) {
+        self.remote_catalog.invalidate_local_models();
         self.model_downloads.insert(
             model_id.to_owned(),
             ModelInstallStatus::Error(message.clone()),
@@ -7797,6 +7796,7 @@ impl LocalTranscriberApp {
     }
 
     fn fail_runtime_job(&mut self, runtime_id: &str, message: String) {
+        self.remote_catalog.invalidate_local_models();
         if let Some(job) = self.runtime_jobs.remove(runtime_id) {
             for model_id in job.download_model_ids {
                 self.model_downloads
@@ -7923,6 +7923,7 @@ impl LocalTranscriberApp {
             self.transcription_service =
                 self.transcription_service.with_config(self.config.clone());
             self.refresh_playground_runtime_statuses();
+            self.rebuild_local_models_after_committed_change();
             if let Some(error) = cleanup {
                 let message = format!(
                     "Runtime was removed, but cleanup is incomplete; restart Scribe before changing artifacts again: {error}"
@@ -7962,6 +7963,7 @@ impl LocalTranscriberApp {
         }
         self.transcription_service = self.transcription_service.with_config(self.config.clone());
         self.refresh_playground_runtime_statuses();
+        self.rebuild_local_models_after_committed_change();
         self.status = TranscriptionStatus::Idle;
         self.status_message = "Removed the legacy runtime from Scribe settings. Its files were preserved because they are not governed by the normalized manifest transaction.".to_owned();
     }
@@ -7983,10 +7985,26 @@ impl LocalTranscriberApp {
             Some("Wait for final transcription and output to finish before changing speech artifacts.".to_owned())
         } else if self.playground_pending > 0 {
             Some("Wait for Playground jobs to finish before changing speech artifacts.".to_owned())
-        } else if !self.artifact_installations.is_empty() || !self.runtime_jobs.is_empty() {
+        } else if !self.artifact_installations.is_empty()
+            || !self.runtime_jobs.is_empty()
+            || self.local_gguf_import.is_some()
+        {
             Some("Wait for the active installation to finish or cancel it first.".to_owned())
         } else {
             None
+        }
+    }
+
+    fn cancel_installations_for_shutdown(&mut self) {
+        for (_, cancellation) in self.artifact_installations.values() {
+            cancellation.cancel();
+        }
+        if let Some(mut job) = self.local_gguf_import.take()
+            && !job.cancel_and_wait(LOCAL_GGUF_IMPORT_SHUTDOWN_TIMEOUT)
+        {
+            eprintln!(
+                "local GGUF import exceeded the shutdown deadline; detaching cancelled worker"
+            );
         }
     }
 }
@@ -8034,27 +8052,48 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_settings_save();
         self.sync_tray_state();
 
-        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
-        if self.current_tab != Tab::General {
-            self.suspend_microphone_monitor();
+        match self.current_tab {
+            Tab::Advanced => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.current_tab = Tab::General;
+            }
+            Tab::About => {
+                self.settings_tab = SettingsTab::About;
+                self.current_tab = Tab::General;
+            }
+            Tab::Debug => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.current_tab = Tab::General;
+                self.settings_playground_open = self.config.developer.debug_mode;
+                self.settings_playground_needs_initial_focus = self.settings_playground_open;
+                self.settings_restore_playground_focus = false;
+            }
+            _ => {}
         }
-
+        show_navigation(ctx, &mut self.current_tab, self.config.developer.debug_mode);
+        self.sync_settings_playground_route();
+        self.sync_passive_microphone_monitor();
         egui::CentralPanel::default()
             .frame(content_panel_frame(ctx))
             .show(ctx, |ui| match self.current_tab {
-                Tab::Transcribe => self.ui_transcribe(ui),
-                Tab::General => self.ui_general_settings(ui),
-                Tab::Models if self.models_show_comparison => self.ui_playground(ui),
-                Tab::Models => self.ui_models(ui),
-                Tab::History => self.ui_history(ui),
-                Tab::Advanced => self.ui_advanced_settings(ui),
-                Tab::About => self.ui_about(ui),
-                Tab::Debug => self.ui_playground(ui),
+                Tab::Transcribe => {
+                    show_route_scroll(ui, UiRoute::Transcribe, |ui| self.ui_transcribe(ui))
+                }
+                Tab::General => show_route_scroll(ui, UiRoute::Settings(self.settings_tab), |ui| {
+                    if self.settings_playground_open {
+                        self.ui_playground(ui);
+                    } else {
+                        self.ui_general_settings(ui);
+                    }
+                }),
+                Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| self.ui_models(ui)),
+                Tab::History => show_route_scroll(ui, UiRoute::History, |ui| self.ui_history(ui)),
+                Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
+                Tab::About => unreachable!("about navigation is routed to Settings"),
+                Tab::Debug => unreachable!("debug navigation is routed to Settings"),
             });
 
-        if self.current_tab != Tab::General {
-            self.suspend_microphone_monitor();
-        }
+        self.sync_passive_microphone_monitor();
 
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
@@ -8083,10 +8122,11 @@ impl eframe::App for LocalTranscriberApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.quit_requested = true;
+        self.deferred_recording_start = None;
+        self.deferred_history_playback = None;
         self.stop_microphone_test();
-        for (_, cancellation) in self.artifact_installations.values() {
-            cancellation.cancel();
-        }
+        self.cancel_installations_for_shutdown();
         self.shutdown_transcription_for_exit();
         let _ = self.session_coordinator.cancel_active();
         self.flush_settings();
@@ -8095,248 +8135,235 @@ impl eframe::App for LocalTranscriberApp {
 
 impl LocalTranscriberApp {
     fn ui_transcribe(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Transcribe", status, &status_message, |ui| {
-            let selected_model = self.selected_model();
-            let runtime_status = selected_model
-                .as_ref()
-                .map(|model| runtime_status_for_model(&self.config, model));
-            let ready = runtime_status == Some(ModelRuntimeStatus::Ready);
-            let selected_model_summary = selected_model.as_ref().and_then(|model| {
-                let remote = self
-                    .config
-                    .general
-                    .managed_remote_models
-                    .contains_key(&model.id);
-                self.transcription_service
-                    .model_descriptor(&crate::transcription::ModelId::new(&model.id))
-                    .ok()
-                    .map(|descriptor| {
-                        (
-                            descriptor.display_name,
-                            descriptor.compatibility.label(),
-                            self.effective_install_status(model),
-                        )
-                    })
-                    .or_else(|| {
-                        remote.then(|| {
-                            (
-                                model.name.as_str(),
-                                "Experimental",
-                                self.effective_install_status(model),
-                            )
-                        })
-                    })
-            });
-            let hotkey = self.config.recording.hotkey.clone();
-            let mut requested_tab = None;
-
-            ui.columns(2, |columns| {
-                summary_card(
-                    &mut columns[0],
-                    "Current Model",
-                    |ui| {
-                        if let Some((name, compatibility, install_status)) = &selected_model_summary
-                        {
-                            ui.label(body_strong(name));
-                            ui.horizontal_wrapped(|ui| {
-                                badge(ui, compatibility, ChipTone::Warning);
-                                badge(
-                                    ui,
-                                    &install_status.label(),
-                                    install_chip_tone(install_status),
-                                );
-                            });
-                        } else {
-                            ui.label(body_strong("No model selected"));
-                        }
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Change")).clicked() {
-                            requested_tab = Some(Tab::Models);
-                        }
-                    },
-                );
-
-                summary_card(
-                    &mut columns[1],
-                    "Hotkey",
-                    |ui| {
-                        ui.label(body_strong(&hotkey));
-                    },
-                    |ui| {
-                        if ui.add(small_button(ui, "Edit")).clicked() {
-                            requested_tab = Some(Tab::General);
-                        }
-                    },
-                );
-            });
-            if let Some(tab) = requested_tab {
-                self.current_tab = tab;
-            }
-
-            if !ready && !self.capture_is_active() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    let setup_message = runtime_status
-                        .as_ref()
-                        .map(setup_message_for_status)
-                        .unwrap_or_else(|| {
-                            "Choose an installed local model to start transcribing.".to_owned()
-                        });
-                    ui.label(section_heading("Setup required"));
-                    ui.label(mut_text(setup_message));
-                    ui.add_space(10.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(small_button(ui, "Manage models")).clicked() {
-                            self.current_tab = Tab::Models;
-                        }
-                    });
-                });
-            }
-
-            ui.add_space(12.0);
-            recessed_panel(ui, 110.0, |ui| {
-                ui.vertical_centered(|ui| {
-                    let listening = self.capture_is_active();
-                    let button_text = if listening {
-                        "Stop Listening"
-                    } else {
-                        "Start Listening"
-                    };
-                    let disabled_tooltip = if listening || ready {
-                        None
-                    } else {
-                        Some(
-                            runtime_status
-                                .as_ref()
-                                .map(setup_message_for_status)
-                                .unwrap_or_else(|| {
-                                    "Choose or install a local model before transcribing."
-                                        .to_owned()
-                                }),
-                        )
-                    };
-                    let record_button = primary_button(ui, button_text);
-                    if add_enabled_button(
-                        ui,
-                        listening || ready,
-                        record_button,
-                        disabled_tooltip.as_deref(),
-                    )
-                    .clicked()
-                    {
-                        self.toggle_recording();
-                    }
-                    ui.add_space(8.0);
-                    if let Some(active) = &self.active_recording {
-                        let elapsed = active.started_at.elapsed().as_secs_f32();
-                        let total = active.max_duration_seconds.max(1) as f32;
-                        ui.add(
-                            egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
-                                .desired_width(220.0)
-                                .text(recording_timer_text(active)),
-                        );
-                    } else if self.pending_recording.is_some() {
-                        ui.label(RichText::new("Preparing microphone").small().weak());
-                    } else if ready {
-                        ui.label(
-                            RichText::new("System audio & microphone active")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            transcript_panel(ui, status, |ui| {
-                let transcript_label = ui
-                    .horizontal(|ui| {
-                        let heading = semantic_heading(ui, section_heading("Transcript"));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ready_dot(ui, self.effective_status());
-                        });
-                        heading
-                    })
-                    .inner;
-                ui.add_space(10.0);
-                let output_is_queued = self.pending_output.is_some()
-                    || self.session_coordinator.phase() == DictationPhase::Output;
-                let editor = ui
-                    .add_enabled(
-                        !output_is_queued,
-                        TextEdit::multiline(&mut self.transcript)
-                            .desired_rows(14)
-                            .desired_width(usable_width(ui))
-                            .hint_text("Your transcription appears here..."),
-                    )
-                    .labelled_by(transcript_label.id);
-                if output_is_queued {
-                    let lock_message =
-                        "Transcript editing is temporarily locked while final output is sent.";
-                    ui.ctx().accesskit_node_builder(editor.id, |builder| {
-                        builder.set_description(lock_message);
-                        builder.set_disabled();
-                    });
-                    ui.add_space(6.0);
-                    ui.label(mut_text(lock_message));
-                }
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clear_label = if output_is_queued {
-                        "Cancel pending output and clear transcript"
-                    } else {
-                        "Clear transcript"
-                    };
-                    let clear = ui.add(small_button(ui, clear_label));
-                    if output_is_queued && editor.has_focus() {
-                        clear.request_focus();
-                    }
-                    if clear.clicked() {
-                        self.clear_transcript_history();
-                    }
-                    if ui.add(small_button(ui, "Copy transcript")).clicked() {
-                        self.copy_transcript_to_clipboard();
-                    }
-                });
-            });
+        let models = self.transcribe_screen_models();
+        let (selected_model_id, model_readiness) = self.selected_model_screen_state();
+        let microphone_permission = self.microphone_permission();
+        let no_speech = self.status_message == "No speech detected; nothing was pasted.";
+        let provisional_transcript = self.capture_is_active().then(|| {
+            let preview = &self.overlay_controller.state().transcript;
+            [preview.committed.as_str(), preview.tentative.as_str()]
+                .into_iter()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
         });
+        let state = transcription_state(
+            self.effective_status(),
+            selected_model_id,
+            model_readiness,
+            self.pending_recording.is_some(),
+            no_speech,
+            self.active_recording
+                .as_ref()
+                .map(|recording| recording.started_at.elapsed().as_millis() as u64)
+                .unwrap_or_default(),
+            self.transcript.clone(),
+            provisional_transcript.unwrap_or_default(),
+            if no_speech {
+                Some("No speech detected — nothing was added.".to_owned())
+            } else {
+                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+            },
+            self.config.recording.hotkey.clone(),
+            recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
+            microphone_permission,
+        );
+        let settings = RecordingSettingsView {
+            duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
+            provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
+            device_label: self
+                .config
+                .recording
+                .audio_input_device_name
+                .clone()
+                .unwrap_or_else(|| "OS default".to_owned()),
+            save_state: settings_save_state(
+                self.settings_store
+                    .as_ref()
+                    .is_some_and(SettingsStore::has_pending),
+                self.effective_status() == TranscriptionStatus::Error
+                    && self.status_message.starts_with("Failed to save settings:"),
+            ),
+            ..Default::default()
+        };
+        let action = render_screen(
+            ui,
+            &ScreenView {
+                route: UiRoute::Transcribe,
+                transcription: &state,
+                models: &models,
+                model_catalog: &[],
+                comparison: &Default::default(),
+                model_management: &Default::default(),
+                model_language_filter: ModelLanguageFilter::default(),
+                remote_catalog: &Default::default(),
+                recording_settings: &settings,
+            },
+        );
+        self.apply_transcribe_screen_action(action);
     }
 
-    fn request_remote_catalog(&mut self, force: bool) {
-        if self.remote_catalog.loading {
-            return;
-        }
-        let cache_path = match config::cache_dir() {
-            Ok(path) => path.join("huggingface-model-catalog-v1.json"),
-            Err(error) => {
-                self.remote_catalog.attempted = true;
-                self.remote_catalog.error = Some(format!(
-                    "Could not determine the local Hugging Face catalog cache path: {error}"
-                ));
-                return;
-            }
+    fn selected_model_screen_state(&self) -> (Option<String>, ModelReadiness) {
+        let selected_model = self.selected_model();
+        self.selected_model_screen_state_from(selected_model.as_ref())
+    }
+
+    fn selected_model_screen_state_from(
+        &self,
+        selected_model: Option<&SttModelInfo>,
+    ) -> (Option<String>, ModelReadiness) {
+        let Some(model) = selected_model else {
+            return (None, ModelReadiness::Error);
         };
+        let readiness = match runtime_status_for_model(&self.config, model) {
+            ModelRuntimeStatus::Ready => ModelReadiness::Ready,
+            ModelRuntimeStatus::Downloading | ModelRuntimeStatus::Running => {
+                ModelReadiness::Loading
+            }
+            ModelRuntimeStatus::MissingConfiguration
+            | ModelRuntimeStatus::NotInstalled
+            | ModelRuntimeStatus::NotImplemented
+            | ModelRuntimeStatus::Error(_) => ModelReadiness::Error,
+        };
+        (Some(model.id.clone()), readiness)
+    }
+
+    fn microphone_permission(&self) -> MicrophonePermission {
+        if self.effective_status() == TranscriptionStatus::Listening {
+            MicrophonePermission::Granted
+        } else if self.effective_status() == TranscriptionStatus::Error
+            && self.status_message.starts_with("Microphone failed:")
+        {
+            MicrophonePermission::Denied
+        } else {
+            MicrophonePermission::Unknown
+        }
+    }
+
+    fn transcribe_screen_models(&self) -> Vec<ModelViewModel> {
+        let Some(model) = self.selected_model() else {
+            return Vec::new();
+        };
+        let descriptor = self
+            .transcription_service
+            .model_descriptor(&ModelId::new(&model.id))
+            .ok();
+        vec![self.model_management_view_model(&model, descriptor.as_ref())]
+    }
+
+    fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::AddModel | ScreenAction::ChangeModel => self.current_tab = Tab::Models,
+            ScreenAction::StartRecording | ScreenAction::RetryMicrophone => {
+                self.start_recording(RecordingSource::Transcribe)
+            }
+            ScreenAction::StopRecording => self.stop_recording(),
+            ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
+            ScreenAction::ClearTranscript => self.clear_transcript_history(),
+            ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
+            ScreenAction::None
+            | ScreenAction::SelectModel(_)
+            | ScreenAction::InstallModel(_)
+            | ScreenAction::UpgradeModel(_)
+            | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::ShowRemoteModelDetails { .. }
+            | ScreenAction::RequestModelRemoval(_)
+            | ScreenAction::ConfirmModelRemoval(_)
+            | ScreenAction::CloseModelDialog
+            | ScreenAction::ToggleComparison
+            | ScreenAction::ToggleComparisonModel(_)
+            | ScreenAction::StartComparison
+            | ScreenAction::StopComparison
+            | ScreenAction::ShowComparisonReferenceEditor
+            | ScreenAction::HideComparisonReferenceEditor
+            | ScreenAction::EditComparisonReference(_)
+            | ScreenAction::ApplyComparisonReference
+            | ScreenAction::ClearComparisonReference
+            | ScreenAction::SetSettingsTab(_)
+            | ScreenAction::SetCloseToTray(_)
+            | ScreenAction::SetRecordingMode(_)
+            | ScreenAction::SetDurationSeconds(_)
+            | ScreenAction::ToggleProvisionalFeedback
+            | ScreenAction::SetAudioDevice(_)
+            | ScreenAction::SetInputSensitivity(_)
+            | ScreenAction::RepairModelRuntime(_)
+            | ScreenAction::MaintainModelRuntime(_)
+            | ScreenAction::SetRemoteCatalogQuery(_)
+            | ScreenAction::SetModelLanguageFilter(_)
+            | ScreenAction::ToggleInstalledModels
+            | ScreenAction::ToggleAvailableModels
+            | ScreenAction::FocusModelCard(_)
+            | ScreenAction::AcknowledgeModelCardFocus(_)
+            | ScreenAction::AcknowledgeModelControlFocus { .. }
+            | ScreenAction::RetryRemoteCatalog
+            | ScreenAction::InstallRemoteCatalogVariant { .. }
+            | ScreenAction::CancelRemoteCatalogInstall(_)
+            | ScreenAction::UseRemoteCatalogModel(_)
+            | ScreenAction::RemoveRemoteCatalogModel(_)
+            | ScreenAction::SetLocalGgufImportPath(_)
+            | ScreenAction::ValidateAndImportLocalGguf
+            | ScreenAction::CancelLocalGgufImport
+            | ScreenAction::RefreshDevices
+            | ScreenAction::ChangeShortcut
+            | ScreenAction::SetAutoInsertTranscript(_)
+            | ScreenAction::SetRestoreClipboardAfterInsert(_)
+            | ScreenAction::SetPasteDelayMs(_)
+            | ScreenAction::OpenModelSettings
+            | ScreenAction::SetTheme(_)
+            | ScreenAction::SetOverlayMode(_)
+            | ScreenAction::SetVadEnabled(_)
+            | ScreenAction::SetSpeechConfirmationMs(_)
+            | ScreenAction::SetInternalPauseMs(_)
+            | ScreenAction::SetEndpointSilenceMs(_)
+            | ScreenAction::SetPreRollMs(_)
+            | ScreenAction::SetPostRollMs(_)
+            | ScreenAction::SetStreamingMode(_)
+            | ScreenAction::SetAcceleration(_)
+            | ScreenAction::SetOverlayPosition(_)
+            | ScreenAction::SetDebugMode(_)
+            | ScreenAction::SetHistoryMode(_)
+            | ScreenAction::SetMaxHistoryEntries(_)
+            | ScreenAction::SetTranscriptRetentionDays(_)
+            | ScreenAction::SetAudioRetentionDays(_)
+            | ScreenAction::SetStoreApplicationIdentity(_)
+            | ScreenAction::OpenDeveloperPlayground
+            | ScreenAction::ExportRedactedDiagnostics => {}
+        }
+    }
+
+    fn request_remote_catalog(&mut self) {
+        #[cfg(test)]
+        {
+            self.remote_catalog.catalog_io_request_count += 1;
+        }
+        let Some(next_generation) = self.remote_catalog.refresh_generation.checked_add(1) else {
+            self.remote_catalog.loading = false;
+            self.remote_catalog.active_refresh_generation = None;
+            self.remote_catalog.error = Some(
+                "The trusted catalog refresh counter was exhausted; restart Scribe to refresh."
+                    .to_owned(),
+            );
+            return;
+        };
+        self.remote_catalog.refresh_generation = next_generation;
+        let generation = self.remote_catalog.refresh_generation;
         self.remote_catalog.loading = true;
-        self.remote_catalog.attempted = true;
+        self.remote_catalog.active_refresh_generation = Some(generation);
         self.remote_catalog.error = None;
         let tx = self.tx.clone();
         let spawn = thread::Builder::new()
             .name("scribe-huggingface-catalog".to_owned())
             .spawn(move || {
-                let service = HuggingFaceCatalogService::for_cache_path(cache_path);
-                let result = if force {
-                    service.refresh()
-                } else {
-                    service.list()
-                }
-                .map_err(|error| error.to_string());
-                let _ = tx.send(AppEvent::RemoteCatalogLoaded { result });
+                let service = HuggingFaceCatalogService::online();
+                let result = service
+                    .refresh(generation)
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(AppEvent::RemoteCatalogLoaded { generation, result });
             });
         if let Err(error) = spawn {
             self.remote_catalog.loading = false;
+            self.remote_catalog.active_refresh_generation = None;
             self.remote_catalog.error = Some(format!(
                 "Could not start trusted catalog discovery: {error}"
             ));
@@ -8344,688 +8371,1247 @@ impl LocalTranscriberApp {
     }
 
     fn ui_models(&mut self, ui: &mut Ui) {
-        if !cfg!(test) && !self.remote_catalog.attempted {
-            self.request_remote_catalog(false);
+        if self.remote_catalog.force_refresh_requested {
+            self.remote_catalog.force_refresh_requested = false;
+            self.request_remote_catalog();
         }
-        let descriptors = self.transcription_service.model_descriptors();
-        let descriptors_by_id = descriptors
-            .iter()
-            .map(|descriptor| (descriptor.id.as_str(), descriptor))
-            .collect::<HashMap<_, _>>();
-        let remote_catalog = self.remote_catalog.snapshot.clone();
-        let remote_catalog_loading = self.remote_catalog.loading;
-        let remote_catalog_error = self.remote_catalog.error.clone();
-        let mut refresh_remote_catalog = false;
-        let mut remote_model_action = None;
-        let mut start_local_import = false;
-        let local_import_in_progress = self.local_gguf_import.is_some();
-        let local_import_cancellation = self.local_gguf_import.clone();
+        self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        self.model_comparison.start_disabled_reason =
+            self.comparison_start_block_reason().map(str::to_owned);
+        let catalog = Arc::clone(&self.remote_catalog.local_models);
+        self.model_comparison.selected_model_ids.retain(|id| {
+            catalog.iter().any(|model| {
+                &model.id == id
+                    && model.installed
+                    && model.ready
+                    && model.compatibility != ModelCompatibility::Incompatible
+            })
+        });
+        self.sync_model_comparison_state();
+        let remote_catalog = self.remote_catalog_view();
+        let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
+        let clear_add_focus = self.model_management.restore_add_focus;
+        let clear_after_removal_focus = self.model_management.restore_after_removal_focus;
+        let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
+        let clear_comparison_focus = self.model_comparison.focus_panel;
+        let clear_reference_action_focus = self.model_comparison.restore_reference_action_focus;
+        let clear_reference_notice = self.model_comparison.reference_notice.is_some();
+        let view = ScreenView {
+            route: UiRoute::Models,
+            transcription: &Default::default(),
+            models: &catalog,
+            model_catalog: &catalog,
+            comparison: &self.model_comparison,
+            model_management: &self.model_management,
+            model_language_filter: self.model_language_filter,
+            remote_catalog: &remote_catalog,
+            recording_settings: &Default::default(),
+        };
+        let action = render_screen(ui, &view);
+        if clear_initial_dialog_focus {
+            self.model_management.focus_dialog_initial = false;
+        }
+        if clear_add_focus {
+            self.model_management.restore_add_focus = false;
+        }
+        if clear_after_removal_focus {
+            self.model_management.restore_after_removal_focus = false;
+        }
+        if clear_reference_editor_focus {
+            self.model_comparison.focus_reference_editor = false;
+        }
+        if clear_comparison_focus {
+            self.model_comparison.focus_panel = false;
+        }
+        if clear_reference_action_focus {
+            self.model_comparison.restore_reference_action_focus = false;
+        }
+        if clear_reference_notice {
+            self.model_comparison.reference_notice = None;
+        }
+        self.apply_model_management_action(action);
+    }
 
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Models Catalog", status, &status_message, |ui| {
-            panel(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(section_heading("Compare installed models"));
-                        ui.label(mut_text(
-                            "Record one local sample and compare the selected installed models.",
-                        ));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(primary_small_button(ui, "Open comparison"))
-                            .clicked()
-                        {
-                            self.models_show_comparison = true;
-                        }
-                    });
-                });
-            });
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                remote_catalog_filter_controls(
-                    ui,
-                    &mut self.model_search,
-                    &mut self.remote_catalog_filters,
-                    &mut self.remote_catalog_sort,
-                );
-                ui.add_space(6.0);
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Size uses each model's smallest available GGUF variant. The trusted catalog does not currently publish download counts, update timestamps, or native-streaming capability.",
-                    ),
-                );
-            });
-
-            let remote_search = self.model_search.trim().to_ascii_lowercase();
-            if let Some(snapshot) = remote_catalog.as_ref() {
-                let matching_count = filtered_remote_models(
-                    &snapshot.models,
-                    &self.config,
-                    &remote_search,
-                    self.remote_catalog_filters,
-                    self.remote_catalog_sort,
-                )
-                .len();
-                catalog_status_label(
-                    ui,
+    fn remote_catalog_view(&mut self) -> RemoteCatalogView {
+        let search = self.model_search.trim().to_ascii_lowercase();
+        let projection_key = RemoteCatalogProjectionKey {
+            revision: self.remote_catalog.projection_revision,
+            inventory_revision: self
+                .remote_catalog
+                .snapshot
+                .as_ref()
+                .map_or(0, ModelInventorySnapshot::revision),
+            search: search.clone(),
+            language_filter: self.model_language_filter,
+            filters: self.remote_catalog_filters,
+            sort: self.remote_catalog_sort,
+            mutation_block_reason: self.artifact_mutation_block_reason(),
+        };
+        if self
+            .remote_catalog
+            .projection
+            .as_ref()
+            .is_none_or(|projection| projection.key != projection_key)
+        {
+            let projection = self.build_remote_catalog_projection(projection_key);
+            self.remote_catalog.projection = Some(projection);
+            #[cfg(test)]
+            {
+                self.remote_catalog.projection_build_count += 1;
+            }
+        }
+        let projection = self
+            .remote_catalog
+            .projection
+            .as_ref()
+            .expect("catalog projection was populated above");
+        let entries = projection.entries.clone();
+        let shown_count = entries.len();
+        let matching_count = projection.matching_count;
+        let total_count = projection.total_count;
+        let count_summary = if matching_count > shown_count {
+            format!(
+                "Showing {shown_count} of {matching_count} matching models ({total_count} total). Refine search or filters to see omitted matches."
+            )
+        } else {
+            format!("Showing {shown_count} of {total_count} models.")
+        };
+        let snapshot = self.remote_catalog.snapshot.as_ref();
+        let (kind, message) = if self.remote_catalog.loading {
+            let message = snapshot.map_or_else(
+                || "Loading the trusted catalog.".to_owned(),
+                |snapshot| {
                     format!(
-                        "Showing {matching_count} of {} trusted catalog models",
-                        snapshot.models.len()
-                    ),
-                );
-            }
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(section_heading("Discover compatible models"));
-                        ui.label(mut_text(
-                            "Catalog metadata is retrieved by Scribe from a trusted public publisher; model data never passes through the UI.",
-                        ));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let refresh = ui
-                            .add_enabled(
-                                !remote_catalog_loading,
-                                small_button(ui, "Refresh catalog"),
-                            )
-                            .on_hover_text(
-                                "Re-query the trusted Hugging Face catalog and replace the cache only after validation.",
-                            );
-                        if refresh.clicked() {
-                            refresh_remote_catalog = true;
-                        }
-                        if remote_catalog_loading {
-                            badge(ui, "Loading", ChipTone::Neutral);
-                        }
-                    });
-                });
-                if let Some(snapshot) = remote_catalog.as_ref() {
-                    ui.add_space(8.0);
-                    catalog_status_label(
-                        ui,
-                        format!(
-                            "{} · {} compatible candidate(s)",
-                            snapshot.source.label(),
-                            snapshot.models.len(),
-                        ),
-                    );
-                } else if let Some(error) = remote_catalog_error.as_deref() {
-                    ui.add_space(8.0);
-                    catalog_status_label(ui, format!("Catalog unavailable: {error}"));
-                } else {
-                    ui.add_space(8.0);
-                    catalog_status_label(
-                        ui,
-                        "Catalog discovery has not completed yet. Refresh to retry.",
-                    );
-                }
-            });
-
-            ui.add_space(12.0);
-            panel(ui, |ui| {
-                ui.label(section_heading("Import local GGUF"));
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Validate an existing .gguf file in place. Scribe hashes and smoke-tests it through the embedded runtime, but never copies, uploads, or deletes the source file.",
-                    ),
-                );
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label(label_caps("GGUF file path"));
-                    let path_input = ui.add_sized(
-                        [usable_width(ui).min(460.0), 28.0],
-                        TextEdit::singleline(&mut self.model_import_path)
-                            .hint_text("C:\\Models\\model.gguf"),
-                    );
-                    path_input.labelled_by(label.id);
-                });
-                ui.add_space(6.0);
-                if local_import_in_progress {
-                    ui.horizontal_wrapped(|ui| {
-                        badge(ui, "Validating local file", ChipTone::Neutral);
-                        if ui.add(small_button(ui, "Cancel import")).clicked()
-                            && let Some(cancellation) = local_import_cancellation.as_ref()
-                        {
-                            cancellation.cancel();
-                            self.status_message =
-                                "Cancelling local GGUF validation; source bytes are unchanged."
-                                    .to_owned();
-                        }
-                    });
-                } else if ui
-                    .add(primary_small_button(ui, "Validate and import"))
-                    .on_hover_text(
-                        "Hash and smoke-test this local GGUF before adding it to Scribe.",
+                        "Refreshing the trusted catalog from {}. {count_summary}",
+                        snapshot.source().label(),
                     )
-                    .clicked()
-                {
-                    start_local_import = true;
-                }
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "A local SHA-256 is an observed fingerprint, not an upstream checksum. Remove from Scribe only forgets its record and receipt.",
-                    ),
-                );
-            });
+                },
+            );
+            (RemoteCatalogStatusKind::Loading, message)
+        } else if let Some(error) = self.remote_catalog.error.as_deref() {
+            let message = snapshot.map_or_else(
+                || format!("Catalog unavailable: {error}"),
+                |snapshot| {
+                    format!(
+                        "Catalog refresh failed; showing data from {}. {count_summary} {error}",
+                        snapshot.source().label(),
+                    )
+                },
+            );
+            (RemoteCatalogStatusKind::Error, message)
+        } else if let Some(snapshot) = snapshot {
+            let kind = match snapshot.source() {
+                CatalogSource::BundledFallback => RemoteCatalogStatusKind::Offline,
+                CatalogSource::Network => RemoteCatalogStatusKind::Available,
+            };
+            (
+                kind,
+                format!("{} · {count_summary}", snapshot.source().label(),),
+            )
+        } else {
+            (
+                RemoteCatalogStatusKind::Idle,
+                "Catalog discovery has not completed yet. Refresh to retry.".to_owned(),
+            )
+        };
 
-            let imported_local_models = config::configured_models(&self.config)
-                .into_iter()
-                .filter_map(|model| {
-                    self.config
-                        .general
-                        .imported_gguf_models
-                        .get(&model.id)
-                        .cloned()
-                        .map(|install| (model, install))
-                })
-                .filter(|(model, install)| {
-                    remote_search.is_empty()
-                        || model.name.to_ascii_lowercase().contains(&remote_search)
-                        || install
-                            .path
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .contains(&remote_search)
-                })
-                .collect::<Vec<_>>();
-            if !imported_local_models.is_empty() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    ui.label(section_heading("Imported local models"));
-                    ui.add_space(8.0);
-                    for (index, (model, install)) in imported_local_models.iter().enumerate() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(body_strong(&model.name));
-                            badge(ui, "Imported in place", ChipTone::Neutral);
-                            badge(ui, "Embedded runtime", ChipTone::Neutral);
-                            if ui.add(small_button(ui, "Use")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                            if ui.add(small_button(ui, "Remove from Scribe")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                        });
-                        wrapped_label(
-                            ui,
-                            mut_text(format!(
-                                "{} · observed SHA-256 {}",
-                                install.path.display(),
-                                install.sha256
-                            )),
-                        );
-                        if index + 1 < imported_local_models.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
+        RemoteCatalogView {
+            local_import: crate::ui::LocalGgufImportView {
+                path: self.model_import_path.clone(),
+                in_progress: self.local_gguf_import.is_some(),
+                import_enabled: self.local_gguf_import.is_none()
+                    && self.artifact_mutation_block_reason().is_none(),
+                disabled_reason: self.artifact_mutation_block_reason(),
+                status_message: self.local_gguf_import_status.clone(),
+            },
+            query: self.model_search.clone(),
+            filters: self.remote_catalog_filters,
+            sort: self.remote_catalog_sort,
+            status: RemoteCatalogStatusView { kind, message },
+            refresh_enabled: !self.remote_catalog.loading,
+            has_snapshot: snapshot.is_some(),
+            entries,
+        }
+    }
+
+    fn build_remote_catalog_projection(
+        &self,
+        key: RemoteCatalogProjectionKey,
+    ) -> RemoteCatalogProjection {
+        let Some(snapshot) = self.remote_catalog.snapshot.as_ref() else {
+            return RemoteCatalogProjection {
+                key,
+                matching_count: 0,
+                total_count: 0,
+                entries: Vec::new(),
+            };
+        };
+        let matching = filtered_remote_models(
+            snapshot.models(),
+            &self.config,
+            &key.search,
+            key.filters,
+            key.sort,
+            key.language_filter,
+        );
+        let matching_count = matching.len();
+        let entries = matching
+            .into_iter()
+            .take(REMOTE_CATALOG_VISIBLE_LIMIT)
+            .map(|model| self.remote_catalog_entry_view(model))
+            .collect();
+        RemoteCatalogProjection {
+            key,
+            matching_count,
+            total_count: snapshot.models().len(),
+            entries,
+        }
+    }
+
+    fn remote_catalog_entry_view(&self, model: &RemoteModel) -> RemoteCatalogEntryView {
+        let mutation_block_reason = self.artifact_mutation_block_reason();
+        let variants = model
+            .variants
+            .iter()
+            .map(|variant| {
+                let artifact = model.artifact_for(&variant.id);
+                let normalized_model_id = artifact.as_ref().and_then(|artifact| {
+                    crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                        &artifact.model_id,
+                        &artifact.revision,
+                        &artifact.filename,
+                    )
                 });
-            }
-
-            let installed_remote_models = config::configured_models(&self.config)
-                .into_iter()
-                .filter_map(|model| {
+                let remote_id = artifact.as_ref().and_then(|artifact| {
+                    config::managed_remote_model_id(
+                        &artifact.model_id,
+                        &artifact.revision,
+                        &artifact.filename,
+                    )
+                });
+                let installed_id = remote_id.as_ref().and_then(|id| {
                     self.config
                         .general
                         .managed_remote_models
-                        .get(&model.id)
-                        .cloned()
-                        .map(|install| (model, install))
-                })
-                .filter(|(model, install)| {
-                    remote_search.is_empty()
-                        || model.name.to_ascii_lowercase().contains(&remote_search)
-                        || install
-                            .repository
-                            .to_ascii_lowercase()
-                            .contains(&remote_search)
-                        || install
-                            .languages
-                            .iter()
-                            .any(|language| language.to_ascii_lowercase().contains(&remote_search))
-                })
-                .collect::<Vec<_>>();
-            if !installed_remote_models.is_empty() {
-                ui.add_space(12.0);
-                panel(ui, |ui| {
-                    ui.label(section_heading("Installed Hugging Face models"));
-                    ui.add_space(8.0);
-                    for (index, (model, install)) in installed_remote_models.iter().enumerate() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(body_strong(&model.name));
-                            badge(
-                                ui,
-                                &model.install_status.label(),
-                                if model.install_status.is_runnable() {
-                                    ChipTone::Success
-                                } else {
-                                    ChipTone::Error
-                                },
-                            );
-                            badge(ui, "Embedded runtime", ChipTone::Neutral);
-                            if ui.add(small_button(ui, "Use")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::SelectInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                            if ui.add(small_button(ui, "Remove")).clicked() {
-                                remote_model_action = Some(RemoteModelCardAction::RemoveInstalled(
-                                    ModelId::new(model.id.clone()),
-                                ));
-                            }
-                        });
-                        wrapped_label(
-                            ui,
-                            mut_text(format!(
-                                "{} @ {} · {}",
-                                install.repository, install.revision, install.filename
-                            )),
-                        );
-                        if index + 1 < installed_remote_models.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
+                        .contains_key(id)
+                        .then(|| id.clone())
                 });
-            }
-
-            if let Some(snapshot) = remote_catalog.as_ref() {
-                let remote_models = filtered_remote_models(
-                    &snapshot.models,
-                    &self.config,
-                    &remote_search,
-                    self.remote_catalog_filters,
-                    self.remote_catalog_sort,
-                );
-                if remote_models.is_empty() {
-                    ui.add_space(8.0);
-                    wrapped_label(
-                        ui,
-                        mut_text("No trusted catalog models match the current search or filters."),
-                    );
-                } else if self.remote_catalog_sort == RemoteCatalogSort::Recommended {
-                    let recommended_models = remote_models
-                        .iter()
-                        .copied()
-                        .filter(|model| model.recommended)
-                        .collect::<Vec<_>>();
-                    if !recommended_models.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(section_heading("Recommended"));
-                        for model in recommended_models {
-                            if let Some(action) =
-                                remote_model_card(ui, model, &self.config, &self.model_downloads)
-                            {
-                                remote_model_action = Some(action);
-                            }
-                            ui.add_space(8.0);
-                        }
-                    }
-                    let experimental_models = remote_models
-                        .iter()
-                        .copied()
-                        .filter(|model| !model.recommended)
-                        .collect::<Vec<_>>();
-                    if !experimental_models.is_empty() {
-                        ui.add_space(8.0);
-                        let experimental =
-                            egui::CollapsingHeader::new("Browse compatible models (Experimental)")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    for model in experimental_models {
-                                        if let Some(action) = remote_model_card(
-                                            ui,
-                                            model,
-                                            &self.config,
-                                            &self.model_downloads,
-                                        ) {
-                                            remote_model_action = Some(action);
-                                        }
-                                        ui.add_space(8.0);
-                                    }
-                                });
-                        set_collapsing_header_accessibility(ui.ctx(), &experimental);
-                    } else {
-                        ui.add_space(8.0);
-                        wrapped_label(
-                            ui,
-                            mut_text(
-                                "All matching candidates are shown above. Additional trusted candidates will appear here after refresh.",
-                            ),
-                        );
-                    }
-                } else {
-                    ui.add_space(12.0);
-                    ui.label(section_heading("Matching trusted catalog models"));
-                    for model in remote_models {
-                        if let Some(action) =
-                            remote_model_card(ui, model, &self.config, &self.model_downloads)
-                        {
-                            remote_model_action = Some(action);
-                        }
-                        ui.add_space(8.0);
-                    }
-                }
-            }
-
-            ui.add_space(12.0);
-            let download_rows = current_download_rows(&self.config, &self.model_downloads)
-                .into_iter()
-                .filter(|(model, _)| descriptors_by_id.contains_key(model.id.as_str()))
-                .collect::<Vec<_>>();
-            if !download_rows.is_empty() {
-                panel(ui, |ui| {
-                    ui.label(section_heading("Downloads"));
-                    ui.add_space(8.0);
-                    for (index, (model, install_status)) in download_rows.iter().enumerate() {
-                        let descriptor = descriptors_by_id
-                            .get(model.id.as_str())
-                            .copied()
-                            .expect("filtered download row must have a neutral descriptor");
-                        download_summary_row(ui, descriptor, install_status);
-                        if let Some((_, cancellation)) = self.artifact_installations.get(&model.id)
-                        {
-                            let cancellation = cancellation.clone();
-                            let response = ui
-                                .add(small_button(ui, "Cancel installation"))
-                                .on_hover_text(
-                                    "Stop after the current native chunk and retain resumable download bytes.",
-                                );
-                            if response.clicked() {
-                                cancellation.cancel();
-                                self.status_message = format!(
-                                    "Cancelling {}. Downloaded partials will be kept for Resume.",
-                                    descriptor.display_name
-                                );
-                            }
-                        }
-                        if index + 1 < download_rows.len() {
-                            ui.add_space(8.0);
-                        }
-                    }
-                });
-                ui.add_space(12.0);
-            }
-
-            // Runtime packages are a compatibility-only path. None of the
-            // normal embedded GGUF descriptors may expose their install or
-            // maintenance controls in the Models experience.
-            let runtime_models = runtime_representative_models(&self.config)
-                .into_iter()
-                .filter(|model| descriptors_by_id.contains_key(model.id.as_str()))
-                .filter(|model| {
-                    !crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
-                })
-                .collect::<Vec<_>>();
-            if !runtime_models.is_empty() {
-                let mut runtime_action = None;
-                let runtime_maintenance = egui::CollapsingHeader::new("Runtime maintenance")
-                .default_open(false)
-                .show(ui, |ui| panel(ui, |ui| {
-                ui.label(mut_text(
-                    "Install, update, or remove the local speech runtime. Models prepare a missing runtime automatically.",
-                ));
-                wrapped_label(
-                    ui,
-                    mut_text(format!(
-                        "Storage: models in {} · runtimes in {}",
-                        config::model_storage_dir(&self.config).display(),
-                        config::runtime_storage_dir().display()
-                    )),
-                );
-                ui.add_space(8.0);
-                for model in runtime_models {
-                    let provider = compatibility_bridge::provider_for_model(&model);
-                    let runtime_busy = provider.is_some_and(|provider| {
-                        self.runtime_jobs.contains_key(provider.id())
-                    });
-                    let consumer_activity = provider
-                        .map(|provider| self.runtime_consumer_activity(provider.id()))
-                        .unwrap_or_default();
-                    let runtime_status = provider
-                        .map(|provider| provider.runtime_status(&self.config))
-                        .unwrap_or_else(|| {
-                            ModelRuntimeStatus::Error(
-                                "The model provider is not available.".to_owned(),
-                            )
-                        });
-                    let action_state = runtime_action_state_with_activity(
-                        &self.config,
-                        &model,
-                        runtime_busy,
-                        consumer_activity,
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(body_strong("Local speech runtime"));
-                            wrapped_label(
-                                ui,
-                                mut_text(runtime_detail_text(
-                                    &self.config,
-                                    &model,
-                                    &runtime_status,
-                                )),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                            let label = runtime_action_label(
-                                action_state.kind,
-                                "speech",
-                                runtime_busy,
-                            );
-                            let runtime_button = small_button(ui, &label);
-                            let response = add_enabled_button(
-                                ui,
-                                action_state.enabled,
-                                runtime_button,
-                                action_state.disabled_tooltip.as_deref(),
-                            )
-                            .on_hover_text("Manage the shared native runtime used by this model.");
-                            if response.clicked() {
-                                runtime_action = Some((model.clone(), action_state.kind));
-                            }
-                            badge(
-                                ui,
-                                &runtime_status.to_string(),
-                                runtime_chip_tone(&runtime_status),
-                            );
-                            if let Some((label, tone)) = runtime_version_badge(&self.config, &model)
-                            {
-                                badge(ui, &label, tone);
-                            }
-                            badge(
-                                ui,
-                                &format!(
-                                    "Runtime {}",
-                                    compatibility_bridge::runtime_storage_estimate(&model)
-                                ),
-                                ChipTone::Neutral,
-                            );
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-            }));
-                set_collapsing_header_accessibility(ui.ctx(), &runtime_maintenance);
-
-                if let Some((model, kind)) = runtime_action {
-                    match kind {
-                        RuntimeActionKind::Install | RuntimeActionKind::Update => {
-                            self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
-                        }
-                        RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
-                    }
-                }
-            }
-
-            ui.add_space(12.0);
-            let search = self.model_search.trim().to_ascii_lowercase();
-            let models = config::configured_models(&self.config)
-                .into_iter()
-                .filter(|model| {
-                    descriptors_by_id
-                        .get(model.id.as_str())
-                        .is_some_and(|descriptor| {
-                            search.is_empty()
-                                || descriptor
-                                    .display_name
-                                    .to_ascii_lowercase()
-                                    .contains(&search)
-                                || descriptor
-                                    .description
-                                    .to_ascii_lowercase()
-                                    .contains(&search)
-                                || descriptor
-                                    .languages
-                                    .iter()
-                                    .any(|language| language.to_ascii_lowercase().contains(&search))
+                let previous_revision = artifact.as_ref().is_some_and(|artifact| {
+                    self.config
+                        .general
+                        .managed_remote_models
+                        .values()
+                        .any(|install| {
+                            install.repository == artifact.model_id
+                                && install.filename == artifact.filename
+                                && install.revision != artifact.revision
                         })
-                })
-                .collect::<Vec<_>>();
-
-            for model in models {
-                let descriptor = descriptors_by_id
-                    .get(model.id.as_str())
-                    .expect("filtered normalized model must have a descriptor");
-                let selected = self.config.general.selected_default_model == model.id;
-                let install_status = self.effective_install_status(&model);
-                let runtime_ready =
-                    runtime_status_for_model(&self.config, &model) == ModelRuntimeStatus::Ready;
-                let action_state = model_action_state_with_runtime(
-                    &model,
-                    &install_status,
-                    selected,
-                    runtime_ready,
-                );
-                let primary_disabled_tooltip = model_primary_disabled_tooltip(
-                    &model,
-                    &install_status,
-                    selected,
-                    &action_state,
-                );
-                let mut select_default = false;
-                let mut start_install = false;
-                let mut uninstall = false;
-
-                model_catalog_row(ui, descriptor, &install_status, selected, |ui| {
-                    let primary_label =
-                        model_primary_action_label(action_state.primary, &model, &install_status);
-                    let primary_button = match action_state.primary {
-                        ModelPrimaryAction::Select | ModelPrimaryAction::Active => {
-                            primary_small_button(ui, &primary_label)
-                        }
-                        _ => small_button(ui, &primary_label),
-                    };
-                    let primary_response = add_enabled_button(
-                        ui,
-                        action_state.primary_enabled,
-                        primary_button,
-                        primary_disabled_tooltip.as_deref(),
-                    )
-                    .on_hover_text(match action_state.primary {
-                        ModelPrimaryAction::Repair => format!(
-                            "Prepare the shared local runtime for {} without downloading the model again.",
-                            descriptor.display_name
-                        ),
-                        _ => format!("{} for {}.", primary_label, descriptor.display_name),
-                    });
-                    if primary_response.clicked() {
-                        match action_state.primary {
-                            ModelPrimaryAction::Select => select_default = true,
-                            ModelPrimaryAction::Install | ModelPrimaryAction::Retry => {
-                                start_install = true;
-                            }
-                            ModelPrimaryAction::Repair => {
-                                self.request_runtime_install(
-                                    &model,
-                                    RuntimeJobIntent::RepairModel(model.id.clone()),
-                                );
-                            }
-                            ModelPrimaryAction::Installing | ModelPrimaryAction::Active => {}
-                        }
-                    }
-                    if action_state.show_uninstall
-                        && ui.add(small_button(ui, "Uninstall")).clicked()
-                    {
-                        uninstall = true;
-                    }
                 });
+                let install_disabled_reason = mutation_block_reason.clone();
+                let install_action = |label: &str| RemoteCatalogActionView {
+                    label: label.to_owned(),
+                    kind: RemoteCatalogActionKind::Install {
+                        remote_model_id: model.id.clone(),
+                        variant_id: variant.id.clone(),
+                    },
+                    enabled: artifact.is_some() && install_disabled_reason.is_none(),
+                    disabled_reason: install_disabled_reason.clone().or_else(|| {
+                        artifact.is_none().then(|| {
+                            "This catalog entry no longer resolves to a validated pinned artifact. Refresh the catalog."
+                                .to_owned()
+                        })
+                    }),
+                };
 
-                if select_default {
-                    self.select_model_as_default(&model);
+                let status_label;
+                let mut actions = Vec::new();
+                if let Some(remote_id) = remote_id.as_deref()
+                    && let Some(status) = self.model_downloads.get(remote_id)
+                {
+                    status_label = Some(status.label());
+                    if matches!(
+                        status,
+                        ModelInstallStatus::Downloading { .. }
+                            | ModelInstallStatus::InstallingRuntime
+                    ) {
+                        actions.push(RemoteCatalogActionView {
+                            label: "Cancel".to_owned(),
+                            kind: RemoteCatalogActionKind::Cancel {
+                                model_id: remote_id.to_owned(),
+                            },
+                            enabled: true,
+                            disabled_reason: None,
+                        });
+                    } else if matches!(status, ModelInstallStatus::Error(_)) {
+                        actions.push(install_action("Resume"));
+                    }
+                } else if let Some(installed_id) = installed_id {
+                    status_label = Some("Installed and verified".to_owned());
+                    actions.push(RemoteCatalogActionView {
+                        label: "Use".to_owned(),
+                        kind: RemoteCatalogActionKind::Use {
+                            model_id: installed_id.clone(),
+                        },
+                        enabled: mutation_block_reason.is_none(),
+                        disabled_reason: mutation_block_reason.clone(),
+                    });
+                    actions.push(RemoteCatalogActionView {
+                        label: "Remove".to_owned(),
+                        kind: RemoteCatalogActionKind::Remove {
+                            model_id: installed_id,
+                        },
+                        enabled: mutation_block_reason.is_none(),
+                        disabled_reason: mutation_block_reason.clone(),
+                    });
+                } else if previous_revision {
+                    status_label = Some("Update available".to_owned());
+                    actions.push(install_action("Install update"));
+                } else if normalized_model_id.is_some() {
+                    status_label = Some("Available in local catalog".to_owned());
+                    actions.push(install_action("Install verified variant"));
+                } else {
+                    status_label = Some("Pinned GGUF".to_owned());
+                    actions.push(install_action("Install"));
                 }
-                if start_install {
+
+                RemoteCatalogVariantView {
+                    id: variant.id.clone(),
+                    filename: variant.filename.clone(),
+                    size_label: format_bytes(variant.size_bytes),
+                    status_label,
+                    expected_sha256: variant.expected_sha256.clone(),
+                    normalized_model_id: normalized_model_id.map(|id| id.to_string()),
+                    managed_model_id: remote_id,
+                    size_bytes: variant.size_bytes,
+                    size_tier: size_tier_for_bytes(variant.size_bytes),
+                    speed_tier: ModelSpeedTier::Unknown,
+                    actions,
+                }
+            })
+            .collect();
+
+        RemoteCatalogEntryView {
+            id: model.id.clone(),
+            display_name: model.display_name.clone(),
+            description: model.description.clone(),
+            languages: model.languages.clone(),
+            language_summary: model.languages.join(", "),
+            recommended: model.recommended,
+            trust_label: model.trust.label().to_owned(),
+            compatibility_detail: model.compatibility.detail().to_owned(),
+            repository: model.id.clone(),
+            pinned_revision: model.revision.clone(),
+            variants,
+        }
+    }
+
+    fn mark_comparison_output_changed(&mut self, model_id: &str) {
+        let revision = self
+            .comparison_output_revisions
+            .entry(model_id.to_owned())
+            .or_default();
+        *revision = revision.wrapping_add(1);
+        self.comparison_projection_cache.remove(model_id);
+    }
+
+    fn reset_comparison_output_projection(&mut self) {
+        self.comparison_output_revisions.clear();
+        self.comparison_projection_cache.clear();
+    }
+
+    fn set_comparison_reference(&mut self, reference: Option<String>) {
+        if self.model_comparison.reference_transcript != reference {
+            self.model_comparison.reference_transcript = reference;
+            self.comparison_reference_revision = self.comparison_reference_revision.wrapping_add(1);
+        }
+    }
+
+    fn sync_model_comparison_state(&mut self) {
+        let Some(model_ids) = self.comparison_run_model_ids.clone() else {
+            return;
+        };
+        let pending_model_ids = self
+            .playground_runs
+            .values()
+            .flat_map(|run| run.pending_requests.values().cloned())
+            .collect::<HashSet<_>>();
+        self.model_comparison.recording_elapsed_ms = self
+            .comparison_started_at
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        self.model_comparison.audio_duration_ms = self
+            .playground_cards
+            .iter()
+            .find_map(|card| card.audio_duration_ms)
+            .and_then(|duration| u64::try_from(duration).ok());
+        let results_rebuilt = self.model_comparison.results.len() != model_ids.len()
+            || self
+                .model_comparison
+                .results
+                .iter()
+                .zip(&model_ids)
+                .any(|((result_model_id, _), model_id)| result_model_id != model_id);
+        if results_rebuilt {
+            self.model_comparison.results = model_ids
+                .iter()
+                .cloned()
+                .map(|model_id| (model_id, ComparisonResult::default()))
+                .collect();
+        }
+
+        for (index, model_id) in model_ids.iter().enumerate() {
+            let card = self
+                .playground_cards
+                .iter()
+                .find(|card| card.descriptor.id.as_str() == model_id);
+            let phase = match card.map(|card| &card.status) {
+                Some(ModelRuntimeStatus::Running) => ComparisonResultPhase::Processing,
+                Some(ModelRuntimeStatus::Error(_)) => ComparisonResultPhase::Error,
+                Some(_) if card.and_then(|card| card.latency_ms).is_some() => {
+                    ComparisonResultPhase::Complete
+                }
+                _ if pending_model_ids.contains(model_id) => ComparisonResultPhase::Pending,
+                _ => ComparisonResultPhase::Pending,
+            };
+            let processing_ms = card
+                .and_then(|card| card.latency_ms)
+                .and_then(|duration| u64::try_from(duration).ok());
+            let realtime_factor = processing_ms
+                .zip(self.model_comparison.audio_duration_ms)
+                .filter(|(_, audio)| *audio > 0)
+                .map(|(processing, audio)| processing as f32 / audio as f32);
+            let error = card.and_then(|card| match &card.status {
+                ModelRuntimeStatus::Error(error) => Some(error.clone()),
+                _ => None,
+            });
+            let output_revision = self
+                .comparison_output_revisions
+                .get(model_id)
+                .copied()
+                .unwrap_or_default();
+            let cached = self.comparison_projection_cache.get(model_id).copied();
+            let output_needs_replacement = results_rebuilt
+                || cached.is_none_or(|cached| cached.output_revision != output_revision);
+            let wer_needs_recompute = cached.is_none_or(|cached| {
+                cached.output_revision != output_revision
+                    || cached.reference_revision != self.comparison_reference_revision
+            });
+            let output_text = (output_needs_replacement || wer_needs_recompute)
+                .then(|| {
+                    card.map(|card| card.transcript.as_str())
+                        .filter(|output| !output.trim().is_empty())
+                })
+                .flatten();
+            let replacement = output_needs_replacement.then(|| output_text.map(str::to_owned));
+            let word_error_rate = if wer_needs_recompute {
+                let reference = self
+                    .model_comparison
+                    .reference_transcript
+                    .as_deref()
+                    .filter(|reference| !reference.trim().is_empty());
+                let word_error_rate = reference
+                    .zip(output_text)
+                    .map(|(reference, output)| benchmark::calculate_wer(reference, output) as f32);
+                #[cfg(test)]
+                if reference.is_some() && output_text.is_some() {
+                    self.comparison_wer_compute_count += 1;
+                }
+                self.comparison_projection_cache.insert(
+                    model_id.clone(),
+                    ComparisonProjectionCacheEntry {
+                        reference_revision: self.comparison_reference_revision,
+                        output_revision,
+                        word_error_rate,
+                    },
+                );
+                word_error_rate
+            } else {
+                cached.and_then(|cached| cached.word_error_rate)
+            };
+
+            let result = &mut self.model_comparison.results[index].1;
+            if let Some(replacement) = replacement {
+                result.output = replacement;
+                #[cfg(test)]
+                {
+                    self.comparison_output_replacement_count += 1;
+                }
+            }
+            result.phase = phase;
+            result.processing_ms = processing_ms;
+            result.realtime_factor = realtime_factor;
+            result.word_error_rate = word_error_rate;
+            result.error = error;
+        }
+        self.comparison_projection_cache
+            .retain(|model_id, _| model_ids.contains(model_id));
+
+        self.model_comparison.phase =
+            if self.recording_source() == Some(RecordingSource::Playground) {
+                ComparisonPhase::Recording
+            } else if self.playground_pending > 0 {
+                ComparisonPhase::Processing
+            } else if self
+                .model_comparison
+                .results
+                .iter()
+                .any(|(_, result)| result.phase == ComparisonResultPhase::Complete)
+            {
+                ComparisonPhase::Complete
+            } else if self.comparison_started_at.is_some() {
+                ComparisonPhase::Error
+            } else {
+                ComparisonPhase::Idle
+            };
+    }
+
+    fn comparison_start_block_reason(&self) -> Option<&'static str> {
+        (self.pending_output.is_some()
+            || matches!(
+                self.session_coordinator.active_purpose(),
+                Some(SessionPurpose::Dictation)
+            ))
+        .then_some("Finish the current dictation before starting a comparison.")
+    }
+
+    fn rebuild_model_inventory_projection(&mut self) {
+        if !self.remote_catalog.local_models_dirty {
+            return;
+        }
+        self.remote_catalog.local_models = self.build_model_management_catalog().into();
+        self.remote_catalog.local_models_dirty = false;
+        #[cfg(test)]
+        {
+            self.remote_catalog.local_models_build_count += 1;
+        }
+    }
+
+    /// Progress is volatile and arrives several times per second. Update the
+    /// cached local row in place instead of rebuilding the full catalog and
+    /// remote search projection for every byte update; durable lifecycle
+    /// transitions still invalidate and rebuild through their normal paths.
+    fn update_model_download_progress_projection(&mut self, model_id: &str) {
+        if self.remote_catalog.local_models_dirty {
+            return;
+        }
+        let Some(status) = self.model_downloads.get(model_id) else {
+            return;
+        };
+        let (download_state, downloaded_bytes, total_bytes) = match status {
+            ModelInstallStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => (
+                ModelDownloadState::Downloading,
+                *downloaded_bytes,
+                *total_bytes,
+            ),
+            ModelInstallStatus::InstallingRuntime => (ModelDownloadState::Verifying, 0, None),
+            _ => return,
+        };
+        if let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
+            .iter_mut()
+            .find(|model| model.id == model_id)
+        {
+            model.download_state = download_state;
+            model.downloaded_bytes = downloaded_bytes;
+            model.total_bytes = total_bytes.or(model.total_bytes);
+            model.error_message = None;
+        }
+    }
+
+    fn rebuild_local_models_after_committed_change(&mut self) {
+        self.remote_catalog.invalidate_local_models();
+        self.rebuild_model_inventory_projection();
+    }
+
+    #[cfg(test)]
+    fn model_management_catalog(&self) -> Vec<ModelViewModel> {
+        self.remote_catalog.local_models.to_vec()
+    }
+
+    fn build_model_management_catalog(&self) -> Vec<ModelViewModel> {
+        let descriptors = self
+            .transcription_service
+            .model_descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
+            .collect::<HashMap<_, _>>();
+        config::configured_models(&self.config)
+            .into_iter()
+            .filter_map(|model| {
+                let effective_status = self.effective_install_status(&model);
+                let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+                let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
+                    // Retained compatibility models stay out of discovery, but an existing
+                    // installed model must remain visible so it can be selected or removed.
+                    artifact_present.then(|| {
+                        self.transcription_service
+                            .model_descriptor(&ModelId::new(&model.id))
+                            .ok()
+                    })?
+                });
+                (descriptor.is_some() || artifact_present)
+                    .then(|| self.model_management_view_model(&model, descriptor.as_ref()))
+            })
+            .collect()
+    }
+
+    fn model_management_view_model(
+        &self,
+        model: &SttModelInfo,
+        descriptor: Option<&ModelDescriptor>,
+    ) -> ModelViewModel {
+        let (display_name, variant_label) = model_ui_labels(model, descriptor);
+        let install_status = self.effective_install_status(model);
+        let runtime_ready =
+            runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
+        let installed = model_artifact_remains_manageable(model, &install_status);
+        let imported_gguf = self
+            .config
+            .general
+            .imported_gguf_models
+            .contains_key(&model.id);
+        // Scribe versions before the verified GGUF catalog stored known GGML
+        // compatibility artifacts directly below the app's model directory,
+        // without a managed-install receipt. This exact, canonical path is
+        // still Scribe-owned; an arbitrary configured path is not.
+        let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
+        let custom = model.local_path.is_some()
+            && !self.config.general.managed_models.contains_key(&model.id)
+            && !self
+                .config
+                .general
+                .managed_remote_models
+                .contains_key(&model.id)
+            && !imported_gguf
+            && !app_owned_legacy_artifact;
+        let download_state = match &install_status {
+            ModelInstallStatus::Installed => ModelDownloadState::Installed,
+            ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
+            ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
+            ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message)
+                if message.contains("cancelled") || message.contains("Cancelled") =>
+            {
+                ModelDownloadState::Cancelled
+            }
+            ModelInstallStatus::Error(_)
+            | ModelInstallStatus::RuntimeError(_)
+            | ModelInstallStatus::Missing => ModelDownloadState::Failed,
+            ModelInstallStatus::NotInstalled => ModelDownloadState::NotInstalled,
+        };
+        let (downloaded_bytes, total_bytes) = match &install_status {
+            ModelInstallStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => (*downloaded_bytes, *total_bytes),
+            _ => (
+                0,
+                descriptor.map(|descriptor| descriptor.artifact_size_bytes),
+            ),
+        };
+        let mutation_block_reason = self.artifact_mutation_block_reason();
+        let mutation_blocked = mutation_block_reason.is_some();
+        let selected = installed && self.config.general.selected_default_model == model.id;
+        let active = selected && runtime_ready;
+        let migration_pending =
+            installed && config::model_needs_pinned_gguf_migration(&self.config, model);
+        let (
+            primary_action_label,
+            primary_action_enabled,
+            primary_action_installs_upgrade,
+            primary_action_repairs_runtime,
+            primary_action_disabled_reason,
+        ) = if migration_pending {
+            let installing = matches!(
+                install_status,
+                ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
+            );
+            (
+                "Upgrade model".to_owned(),
+                !mutation_blocked && !installing && supports_managed_install(model),
+                true,
+                false,
+                mutation_block_reason.clone().or_else(|| {
+                    installing.then(|| "This model upgrade is already in progress.".to_owned())
+                }),
+            )
+        } else if active {
+            (
+                "Active".to_owned(),
+                false,
+                false,
+                false,
+                Some("This model is already active.".to_owned()),
+            )
+        } else if installed && runtime_ready {
+            (
+                "Use this model".to_owned(),
+                !mutation_blocked,
+                false,
+                false,
+                mutation_block_reason.clone(),
+            )
+        } else if installed {
+            let runtime_busy = compatibility_bridge::provider_for_model(model)
+                .is_some_and(|provider| self.runtime_jobs.contains_key(provider.id()));
+            let runtime_action = runtime_action_state_with_activity(
+                &self.config,
+                model,
+                runtime_busy,
+                compatibility_bridge::provider_for_model(model)
+                    .map_or_else(RuntimeConsumerActivity::default, |provider| {
+                        self.runtime_consumer_activity(provider.id())
+                    }),
+            );
+            let repairable = matches!(
+                runtime_action.kind,
+                RuntimeActionKind::Install | RuntimeActionKind::Update
+            );
+            (
+                if repairable {
+                    "Repair runtime"
+                } else {
+                    "Runtime unavailable"
+                }
+                .to_owned(),
+                repairable && runtime_action.enabled && !mutation_blocked,
+                false,
+                repairable,
+                mutation_block_reason
+                    .clone()
+                    .or(runtime_action.disabled_tooltip)
+                    .or_else(|| {
+                        (!repairable)
+                            .then(|| "This model does not have a repairable runtime.".to_owned())
+                    }),
+            )
+        } else {
+            (
+                "Not installed".to_owned(),
+                false,
+                false,
+                false,
+                Some("Install this model before using it.".to_owned()),
+            )
+        };
+        let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
+        ModelViewModel {
+            id: model.id.clone(),
+            display_name,
+            variant_label,
+            description: Some(descriptor.map_or_else(
+                || model.description.clone(),
+                |value| value.description.to_owned(),
+            )),
+            runtime_group: "Local speech runtime".to_owned(),
+            architecture: None,
+            artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
+            artifact_revision: manifest.map(|manifest| manifest.artifact_revision.to_owned()),
+            artifact_filename: manifest.map(|manifest| manifest.artifact_filename.to_owned()),
+            artifact_path: model
+                .local_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            installed,
+            selected,
+            active,
+            ready: installed && runtime_ready,
+            recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
+            custom,
+            install_supported: supports_managed_install(model),
+            install_action_enabled: !mutation_blocked
+                && !installed
+                && !matches!(
+                    install_status,
+                    ModelInstallStatus::Downloading { .. } | ModelInstallStatus::InstallingRuntime
+                )
+                && supports_managed_install(model),
+            primary_action_label,
+            primary_action_enabled,
+            primary_action_installs_upgrade,
+            primary_action_repairs_runtime,
+            primary_action_disabled_reason,
+            cancel_supported: self.artifact_installations.contains_key(&model.id),
+            removal_supported: !custom
+                && (imported_gguf
+                    || app_owned_legacy_artifact
+                    || supports_managed_uninstall(model, &install_status)),
+            download_state,
+            downloaded_bytes,
+            total_bytes,
+            disk_bytes: installed
+                .then(|| {
+                    model
+                        .local_path
+                        .as_ref()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .map(|metadata| metadata.len())
+                })
+                .flatten(),
+            estimated_ram_bytes: descriptor
+                .map_or(model.expected_ram.as_str(), |descriptor| {
+                    descriptor.expected_ram
+                })
+                .trim_end_matches(" GB")
+                .parse::<u64>()
+                .ok()
+                .map(|gigabytes| gigabytes * 1_000_000_000),
+            languages: descriptor.map_or_else(Vec::new, |descriptor| {
+                descriptor
+                    .languages
+                    .iter()
+                    .map(|language| (*language).to_owned())
+                    .collect()
+            }),
+            language_summary: descriptor.map_or_else(
+                || "Not specified".to_owned(),
+                |descriptor| descriptor.languages.join(", "),
+            ),
+            speed_tier: match descriptor.map_or(model.speed_tier.as_str(), |descriptor| {
+                descriptor.speed_guidance
+            }) {
+                "Fastest" => ModelSpeedTier::VeryFast,
+                "Fast" => ModelSpeedTier::Fast,
+                "Medium" => ModelSpeedTier::Balanced,
+                "Slower" => ModelSpeedTier::AccurateSlow,
+                _ => ModelSpeedTier::Unknown,
+            },
+            accuracy_guidance: descriptor
+                .map_or("Not rated", |descriptor| descriptor.accuracy_guidance)
+                .to_owned(),
+            size_tier: descriptor.map_or(ModelSizeTier::Unknown, |descriptor| {
+                match descriptor.artifact_size_bytes {
+                    0..=100_000_000 => ModelSizeTier::Tiny,
+                    100_000_001..=200_000_000 => ModelSizeTier::Base,
+                    200_000_001..=600_000_000 => ModelSizeTier::Small,
+                    600_000_001..=1_000_000_000 => ModelSizeTier::Medium,
+                    _ => ModelSizeTier::Large,
+                }
+            }),
+            capabilities: descriptor.map_or_else(ModelCapabilities::default, |descriptor| {
+                ModelCapabilities {
+                    streaming_preview: descriptor.capabilities.native_streaming,
+                    translation: descriptor.capabilities.translation,
+                    timestamps: descriptor.capabilities.timestamps,
+                    language_detection: descriptor.capabilities.language_detection,
+                    cpu: descriptor.capabilities.cpu,
+                    gpu: descriptor.capabilities.gpu,
+                }
+            }),
+            compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
+                match descriptor.compatibility {
+                    CompatibilityStatus::Supported { .. } => ModelCompatibility::Supported,
+                    CompatibilityStatus::Experimental { .. } => ModelCompatibility::Experimental,
+                    CompatibilityStatus::Incompatible { .. } => ModelCompatibility::Incompatible,
+                }
+            }),
+            error_message: match install_status {
+                ModelInstallStatus::Error(message) | ModelInstallStatus::RuntimeError(message) => {
+                    Some(message)
+                }
+                _ => None,
+            },
+            ..Default::default()
+        }
+        .normalize()
+    }
+
+    fn apply_model_management_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::AddModel => {
+                if self.local_gguf_import.is_none() {
+                    self.local_gguf_import_status = None;
+                }
+                self.model_management.dialog = Some(ModelDialog::Add);
+                self.model_management.focus_dialog_initial = true;
+            }
+            ScreenAction::ShowModelDetails(id) => {
+                self.model_management.dialog = Some(ModelDialog::Details(id));
+                self.model_management.focus_dialog_initial = true;
+            }
+            ScreenAction::ShowRemoteModelDetails {
+                entry_id,
+                variant_id,
+            } => {
+                self.model_management.dialog = Some(ModelDialog::RemoteDetails {
+                    entry_id,
+                    variant_id,
+                });
+                self.model_management.focus_dialog_initial = true;
+            }
+            ScreenAction::RequestModelRemoval(id) => {
+                let active = self.config.general.selected_default_model == id;
+                let replacement = active
+                    .then(|| self.active_model_removal_replacement(&id))
+                    .flatten();
+                if active && replacement.is_none() {
+                    self.status_message =
+                        "Install another ready model before removing the active model.".to_owned();
+                } else {
+                    self.model_management.removal_replacement =
+                        replacement.as_ref().map(|model| model.id.clone());
+                    self.model_management.dialog = Some(ModelDialog::Remove(id));
+                    self.model_management.focus_dialog_initial = true;
+                }
+            }
+            ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
+                Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
+                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
+                Some(ModelDialog::Remove(id)) => {
+                    self.model_management.restore_remove_focus = Some(id);
+                    self.model_management.removal_replacement = None;
+                }
+                None => {}
+            },
+            ScreenAction::ToggleComparison => {
+                self.model_comparison.expanded = !self.model_comparison.expanded
+            }
+            ScreenAction::ToggleComparisonModel(id) => {
+                if matches!(
+                    self.model_comparison.phase,
+                    ComparisonPhase::Recording | ComparisonPhase::Processing
+                ) {
+                    self.model_comparison.selection_feedback =
+                        Some("Model selection is locked during a comparison.".to_owned());
+                } else if self.model_comparison.selected_model_ids.contains(&id) {
+                    self.model_comparison.selected_model_ids.remove(&id);
+                    self.model_comparison.selection_feedback = None;
+                } else if self.model_comparison.selected_model_ids.len() >= 4 {
+                    self.model_comparison.selection_feedback =
+                        Some("A comparison can include at most four models.".to_owned());
+                } else {
+                    self.model_comparison.selected_model_ids.insert(id);
+                    self.model_comparison.selection_feedback = None;
+                }
+            }
+            ScreenAction::StartComparison => {
+                if let Some(reason) = self.comparison_start_block_reason() {
+                    self.model_comparison.start_disabled_reason = Some(reason.to_owned());
+                    self.model_comparison.selection_feedback = Some(reason.to_owned());
+                } else if !self.model_comparison.begin() {
+                    self.model_comparison.selection_feedback = Some(
+                        "Select two to four ready models before starting a comparison.".to_owned(),
+                    );
+                } else {
+                    self.model_comparison.start_disabled_reason = None;
+                    self.comparison_run_model_ids = Some(
+                        self.model_comparison
+                            .selected_model_ids
+                            .iter()
+                            .cloned()
+                            .collect(),
+                    );
+                    self.comparison_started_at = Some(Instant::now());
+                    self.start_recording(RecordingSource::Playground);
+                    if self.recording_source() != Some(RecordingSource::Playground) {
+                        self.model_comparison.phase = ComparisonPhase::Error;
+                    }
+                }
+            }
+            ScreenAction::StopComparison => {
+                if self.recording_source() == Some(RecordingSource::Playground) {
+                    self.stop_recording();
+                }
+            }
+            ScreenAction::ShowComparisonReferenceEditor => {
+                if let Some(reference) = self.model_comparison.reference_transcript.as_deref() {
+                    self.model_comparison.reference_draft = reference.to_owned();
+                }
+                self.model_comparison.reference_editor_visible = true;
+                self.model_comparison.focus_reference_editor = true;
+                self.model_comparison.restore_reference_action_focus = false;
+            }
+            ScreenAction::HideComparisonReferenceEditor => {
+                self.model_comparison.reference_draft = self
+                    .model_comparison
+                    .reference_transcript
+                    .clone()
+                    .unwrap_or_default();
+                self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
+            }
+            ScreenAction::EditComparisonReference(reference) => {
+                self.model_comparison.reference_draft = reference;
+            }
+            ScreenAction::ApplyComparisonReference => {
+                let reference = self.model_comparison.reference_draft.trim().to_owned();
+                self.model_comparison.reference_draft = reference.clone();
+                self.set_comparison_reference((!reference.is_empty()).then_some(reference));
+                self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
+                self.model_comparison.reference_notice =
+                    Some("Reference transcript applied.".to_owned());
+                self.sync_model_comparison_state();
+            }
+            ScreenAction::ClearComparisonReference => {
+                self.model_comparison.reference_draft.clear();
+                self.set_comparison_reference(None);
+                self.model_comparison.reference_editor_visible = false;
+                self.model_comparison.focus_reference_editor = false;
+                self.model_comparison.restore_reference_action_focus = true;
+                self.model_comparison.reference_notice =
+                    Some("Reference transcript cleared.".to_owned());
+                self.sync_model_comparison_state();
+            }
+            ScreenAction::InstallModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
                     self.start_model_download(&model);
                 }
-                if uninstall {
+            }
+            ScreenAction::UpgradeModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    && config::model_needs_pinned_gguf_migration(&self.config, &model)
+                {
+                    self.start_model_download(&model);
+                }
+            }
+            ScreenAction::CancelModelInstall(id) => {
+                if let Some((_, cancellation)) = self.artifact_installations.get(&id) {
+                    cancellation.cancel();
+                    self.status_message =
+                        format!("Cancelling {id}. Downloaded partials will be kept for Resume.");
+                }
+            }
+            ScreenAction::SelectModel(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    && self.select_model_as_default(&model)
+                {
+                    self.model_management.dialog = None;
+                }
+            }
+            ScreenAction::ConfirmModelRemoval(id) => {
+                self.model_management.dialog = None;
+                self.model_management.restore_after_removal_focus = false;
+                let active = self.config.general.selected_default_model == id;
+                let mut replacement_name = None;
+                if active {
+                    let expected = self.model_management.removal_replacement.take();
+                    let replacement = expected.as_deref().and_then(|expected_id| {
+                        self.active_model_removal_replacement(&id)
+                            .filter(|candidate| candidate.id == expected_id)
+                    });
+                    let Some(replacement) = replacement else {
+                        self.status_message = "The replacement model is no longer ready. Install or repair another model before removing the active model.".to_owned();
+                        self.model_management.restore_remove_focus = Some(id);
+                        return;
+                    };
+                    if !self.persist_active_model_replacement(&replacement) {
+                        self.model_management.restore_remove_focus = Some(id);
+                        return;
+                    }
+                    replacement_name = Some(replacement.name.clone());
+                }
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    let removal_committed = self.uninstall_model(&model);
+                    if removal_committed {
+                        if let Some(replacement_name) = replacement_name
+                            && self.status == TranscriptionStatus::Error
+                        {
+                            self.status_message = format!(
+                                "{} The active model is now {replacement_name}.",
+                                self.status_message
+                            );
+                        }
+                        self.rebuild_local_models_after_committed_change();
+                        self.model_management.restore_after_removal_focus = true;
+                    } else {
+                        if let Some(replacement_name) = replacement_name {
+                            self.status_message = format!(
+                                "{} The active model is now {replacement_name}; the original model was kept.",
+                                self.status_message
+                            );
+                        }
+                        self.model_management.restore_remove_focus = Some(id);
+                    }
+                }
+            }
+            ScreenAction::RepairModelRuntime(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    self.request_runtime_install(&model, RuntimeJobIntent::RepairModel(id));
+                }
+            }
+            ScreenAction::MaintainModelRuntime(id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    && let Some(provider) = compatibility_bridge::provider_for_model(&model)
+                {
+                    let state = runtime_action_state_with_activity(
+                        &self.config,
+                        &model,
+                        self.runtime_jobs.contains_key(provider.id()),
+                        self.runtime_consumer_activity(provider.id()),
+                    );
+                    if state.enabled {
+                        match state.kind {
+                            RuntimeActionKind::Install | RuntimeActionKind::Update => {
+                                self.request_runtime_install(&model, RuntimeJobIntent::Maintenance)
+                            }
+                            RuntimeActionKind::Uninstall => self.uninstall_runtime(&model),
+                        }
+                    }
+                }
+            }
+            ScreenAction::SetLocalGgufImportPath(path) => {
+                self.model_import_path = path;
+                if self.local_gguf_import.is_none() {
+                    self.local_gguf_import_status = None;
+                }
+            }
+            ScreenAction::ValidateAndImportLocalGguf => self.start_local_gguf_import(),
+            ScreenAction::CancelLocalGgufImport => {
+                if let Some(job) = self.local_gguf_import.as_ref() {
+                    job.cancellation.cancel();
+                    self.set_local_gguf_import_message(
+                        "Cancelling local GGUF validation; source bytes are unchanged.",
+                    );
+                }
+            }
+            ScreenAction::SetRemoteCatalogQuery(query) => self.model_search = query,
+            ScreenAction::SetModelLanguageFilter(filter) => self.model_language_filter = filter,
+            ScreenAction::ToggleInstalledModels => {
+                self.model_management.installed_expanded = !self.model_management.installed_expanded
+            }
+            ScreenAction::ToggleAvailableModels => {
+                self.model_management.available_expanded = !self.model_management.available_expanded
+            }
+            ScreenAction::FocusModelCard(key) => {
+                self.model_management.focus_model_card = Some(key);
+            }
+            ScreenAction::AcknowledgeModelCardFocus(key) => {
+                if self.model_management.focus_model_card.as_ref() == Some(&key) {
+                    self.model_management.focus_model_card = None;
+                }
+            }
+            ScreenAction::AcknowledgeModelControlFocus { model_id, control } => {
+                self.model_management
+                    .acknowledge_control_focus(&model_id, control);
+            }
+            ScreenAction::RetryRemoteCatalog => {
+                self.remote_catalog.force_refresh_requested = true;
+            }
+            ScreenAction::InstallRemoteCatalogVariant {
+                remote_model_id,
+                variant_id,
+            } => {
+                let action = self
+                    .remote_catalog
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .models()
+                            .iter()
+                            .find(|model| model.id == remote_model_id)
+                    })
+                    .and_then(|model| {
+                        let artifact = model.artifact_for(&variant_id)?;
+                        let action = crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                            &artifact.model_id,
+                            &artifact.revision,
+                            &artifact.filename,
+                        )
+                        .map_or_else(
+                            || {
+                                RemoteModelCardAction::InstallTrusted(
+                                    trusted_remote_install_request(model, &artifact),
+                                )
+                            },
+                            RemoteModelCardAction::InstallNormalized,
+                        );
+                        Some(action)
+                    });
+                if let Some(action) = action {
+                    self.apply_remote_model_card_action(action);
+                } else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The selected catalog variant is no longer in the validated snapshot. Refresh the catalog and try again."
+                            .to_owned();
+                }
+            }
+            ScreenAction::CancelRemoteCatalogInstall(model_id) => self
+                .apply_remote_model_card_action(RemoteModelCardAction::CancelInstall(
+                    ModelId::new(model_id),
+                )),
+            ScreenAction::UseRemoteCatalogModel(model_id) => self.apply_remote_model_card_action(
+                RemoteModelCardAction::SelectInstalled(ModelId::new(model_id)),
+            ),
+            ScreenAction::RemoveRemoteCatalogModel(model_id) => self
+                .apply_remote_model_card_action(RemoteModelCardAction::RemoveInstalled(
+                    ModelId::new(model_id),
+                )),
+            ScreenAction::None => {}
+            other => self.apply_transcribe_screen_action(other),
+        }
+        self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        self.rebuild_model_inventory_projection();
+    }
+
+    fn apply_remote_model_card_action(&mut self, action: RemoteModelCardAction) {
+        match action {
+            RemoteModelCardAction::InstallNormalized(model_id) => {
+                if self.artifact_installations.contains_key(model_id.as_str()) {
+                    self.status_message =
+                        "That verified model variant is already being installed.".to_owned();
+                } else if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
+                {
+                    self.start_model_download(&model);
+                } else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message =
+                        "The selected catalog variant is no longer available in Scribe's verified local catalog. Refresh and try again."
+                            .to_owned();
+                }
+            }
+            RemoteModelCardAction::InstallTrusted(request) => {
+                self.start_trusted_remote_model_download(request);
+            }
+            RemoteModelCardAction::CancelInstall(model_id) => {
+                if let Some((_, cancellation)) = self.artifact_installations.get(model_id.as_str())
+                {
+                    cancellation.cancel();
+                    self.status_message =
+                        "Cancelling verified model installation. Downloaded partial bytes will be retained for Resume."
+                            .to_owned();
+                }
+            }
+            RemoteModelCardAction::SelectInstalled(model_id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
+                {
+                    self.select_model_as_default(&model);
+                }
+            }
+            RemoteModelCardAction::RemoveInstalled(model_id) => {
+                if let Some(model) = config::configured_models(&self.config)
+                    .into_iter()
+                    .find(|model| model.id == model_id.as_str())
+                {
                     self.uninstall_model(&model);
                 }
-                ui.add_space(8.0);
             }
-        });
-        if start_local_import {
-            self.start_local_gguf_import();
-        }
-        if let Some(action) = remote_model_action {
-            match action {
-                RemoteModelCardAction::InstallNormalized(model_id) => {
-                    if self.artifact_installations.contains_key(model_id.as_str()) {
-                        self.status_message =
-                            "That verified model variant is already being installed.".to_owned();
-                    } else if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.start_model_download(&model);
-                    } else {
-                        self.status = TranscriptionStatus::Error;
-                        self.status_message =
-                            "The selected catalog variant is no longer available in Scribe's verified local catalog. Refresh and try again."
-                                .to_owned();
-                    }
-                }
-                RemoteModelCardAction::InstallTrusted(request) => {
-                    self.start_trusted_remote_model_download(request);
-                }
-                RemoteModelCardAction::CancelInstall(model_id) => {
-                    if let Some((_, cancellation)) =
-                        self.artifact_installations.get(model_id.as_str())
-                    {
-                        cancellation.cancel();
-                        self.status_message =
-                            "Cancelling verified model installation. Downloaded partial bytes will be retained for Resume."
-                                .to_owned();
-                    }
-                }
-                RemoteModelCardAction::SelectInstalled(model_id) => {
-                    if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.select_model_as_default(&model);
-                    }
-                }
-                RemoteModelCardAction::RemoveInstalled(model_id) => {
-                    if let Some(model) = config::configured_models(&self.config)
-                        .into_iter()
-                        .find(|model| model.id == model_id.as_str())
-                    {
-                        self.uninstall_model(&model);
-                    }
-                }
-            }
-        }
-        if refresh_remote_catalog && !cfg!(test) {
-            self.request_remote_catalog(true);
         }
     }
 
@@ -9033,6 +9619,17 @@ impl LocalTranscriberApp {
         let status = self.effective_status();
         let status_message = self.status_message.clone();
         page(ui, "Model Playground", status, &status_message, |ui| {
+            if self.settings_playground_open {
+                let back = ui.add_sized([176.0, 44.0], Button::new("Back to Advanced"));
+                if self.settings_playground_needs_initial_focus {
+                    back.request_focus();
+                    self.settings_playground_needs_initial_focus = false;
+                }
+                if back.clicked() {
+                    self.close_settings_playground();
+                    return;
+                }
+            }
             if self.current_tab == Tab::Models {
                 if ui.add(small_button(ui, "Back to models")).clicked() {
                     self.models_show_comparison = false;
@@ -9059,6 +9656,8 @@ impl LocalTranscriberApp {
                         if self.capture_is_active() {
                             self.stop_recording();
                         } else {
+                            self.comparison_run_model_ids = None;
+                            self.comparison_started_at = None;
                             self.start_recording(RecordingSource::Playground);
                         }
                     }
@@ -9287,6 +9886,22 @@ impl LocalTranscriberApp {
         self.ui_playground_model_selector(ui.ctx());
     }
 
+    fn close_settings_playground(&mut self) {
+        self.settings_tab = SettingsTab::Advanced;
+        self.current_tab = Tab::General;
+        self.settings_playground_open = false;
+        self.settings_playground_needs_initial_focus = false;
+        self.settings_restore_playground_focus = true;
+    }
+
+    fn sync_settings_playground_route(&mut self) {
+        if self.current_tab != Tab::General {
+            self.settings_playground_open = false;
+            self.settings_playground_needs_initial_focus = false;
+            self.settings_restore_playground_focus = false;
+        }
+    }
+
     fn ui_playground_model_selector(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.playground_selector_draft.take() else {
             return;
@@ -9443,195 +10058,457 @@ impl LocalTranscriberApp {
         }
     }
 
+    fn settings_diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = self
+            .latest_latency
+            .as_ref()
+            .map(LatencyTrace::summary_lines)
+            .unwrap_or_else(|| vec!["No completed session latency is available yet.".to_owned()]);
+        if self.tray_service.is_none() {
+            diagnostics.push("Tray integration is unavailable in this desktop session.".to_owned());
+        }
+        if let Some(notice) = text_output::paste_automation_notice() {
+            diagnostics.push(notice.to_owned());
+        }
+        diagnostics
+    }
+
+    #[cfg(test)]
+    fn selected_model_ui_label(&self) -> String {
+        let selected_model = self.selected_model();
+        self.selected_model_ui_label_from(selected_model.as_ref())
+    }
+
+    fn selected_model_ui_label_from(&self, selected_model: Option<&SttModelInfo>) -> String {
+        let Some(model) = selected_model else {
+            return "No model selected".to_owned();
+        };
+        let descriptor = self
+            .transcription_service
+            .model_descriptor(&ModelId::new(&model.id))
+            .ok();
+        model_ui_labels(model, descriptor.as_ref()).0
+    }
+
     fn ui_general_settings(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "General", status, &status_message, |ui| {
-            card(ui, |ui| {
-                ui.label(section_heading("General"));
-                ui.add_space(8.0);
-                let mut close_to_tray = self.config.general.close_to_tray;
-                if ui.checkbox(&mut close_to_tray, "Close to tray").changed() {
-                    self.config.general.close_to_tray = close_to_tray;
-                    self.save_config();
-                }
-            });
+        let selected_model = self.selected_model();
+        let (selected_model_id, model_readiness) =
+            self.selected_model_screen_state_from(selected_model.as_ref());
+        let active_model_label = self.selected_model_ui_label_from(selected_model.as_ref());
+        let (levels, level_revision, level_source_active) = self.current_sensitivity_level_sample();
+        let input_level_percent = (self.microphone_level_envelope.update(
+            levels.rms,
+            level_revision,
+            level_source_active,
+            Instant::now(),
+        ) * 100.0)
+            .round() as u8;
+        let no_speech = self.status_message == "No speech detected; nothing was pasted.";
+        let state = transcription_state(
+            self.effective_status(),
+            selected_model_id,
+            model_readiness,
+            self.pending_recording.is_some(),
+            no_speech,
+            0,
+            self.transcript.clone(),
+            String::new(),
+            if no_speech {
+                Some("No speech detected — nothing was added.".to_owned())
+            } else {
+                (!self.status_message.is_empty()).then(|| self.status_message.clone())
+            },
+            self.config.recording.hotkey.clone(),
+            recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
+            self.microphone_permission(),
+        );
+        let settings = RecordingSettingsView {
+            close_to_tray: self.config.general.close_to_tray,
+            duration_seconds: self.config.recording.max_recording_seconds,
+            duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
+            provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
+            selected_audio_device: self.config.recording.audio_input_device_name.clone(),
+            audio_devices: self.audio_devices.clone(),
+            device_label: self
+                .config
+                .recording
+                .audio_input_device_name
+                .clone()
+                .unwrap_or_else(|| "OS default".to_owned()),
+            input_sensitivity_percent: (rms_to_slider_position(
+                self.config.recording.manual_activation_rms,
+            ) * 100.0)
+                .round() as u8,
+            input_level_percent,
+            microphone_error: self.microphone_test_error.clone(),
+            auto_insert_transcript: self.config.output.auto_insert_transcript,
+            output_label: if cfg!(target_os = "windows") {
+                "Insert final transcript into captured app".to_owned()
+            } else {
+                "Copy final transcript to clipboard automatically".to_owned()
+            },
+            show_restore_clipboard: cfg!(target_os = "windows"),
+            output_notice: self
+                .config
+                .output
+                .auto_insert_transcript
+                .then(text_output::paste_automation_notice)
+                .flatten()
+                .map(str::to_owned),
+            restore_clipboard_after_insert: self.config.output.restore_clipboard_after_insert,
+            paste_delay_ms: self.config.output.paste_delay_ms,
+            active_model_label,
+            hotkey_capture_active: self.capturing_hotkey,
+            hotkey_capture_status: self.capturing_hotkey.then(|| self.status_message.clone()),
+            theme_label: self.config.general.theme_mode.label().to_owned(),
+            overlay_label: self.config.overlay.mode.label().to_owned(),
+            overlay_available: overlay::overlay_focus_safety_available(),
+            vad_enabled: self.config.recording.vad_enabled,
+            speech_confirmation_ms: self.config.recording.speech_confirmation_ms,
+            internal_pause_ms: self.config.recording.internal_pause_ms,
+            endpoint_silence_ms: self.config.recording.endpoint_silence_ms,
+            pre_roll_ms: self.config.recording.pre_roll_ms,
+            post_roll_ms: self.config.recording.post_roll_ms,
+            streaming_label: self.config.streaming.mode.label().to_owned(),
+            acceleration_label: self
+                .config
+                .performance
+                .acceleration_preference
+                .label()
+                .to_owned(),
+            gpu_available: self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
+                .is_ok_and(|descriptor| descriptor.capabilities.gpu),
+            overlay_position_label: self.config.overlay.position.label().to_owned(),
+            debug_mode: self.config.developer.debug_mode,
+            focus_playground_open: self.settings_restore_playground_focus,
+            history_mode_label: self.config.history.mode.label().to_owned(),
+            history_locked: self.history_retry_is_active(),
+            max_history_entries: self.config.history.max_unpinned_entries,
+            transcript_retention_days: self.config.history.transcript_retention_days,
+            audio_retention_days: self.config.history.audio_retention_days,
+            store_application_identity: self.config.history.store_application_identity,
+            diagnostics: self.settings_diagnostics(),
+            about_model_directory: config::model_storage_dir(&self.config)
+                .display()
+                .to_string(),
+            about_settings_path: self
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            can_export_diagnostics: self.config_path.is_some(),
+            diagnostic_session_count: self.diagnostics.len(),
+            save_state: settings_save_state(
+                self.settings_store
+                    .as_ref()
+                    .is_some_and(SettingsStore::has_pending),
+                self.effective_status() == TranscriptionStatus::Error
+                    && self.status_message.starts_with("Failed to save settings:"),
+            ),
+        };
+        let comparison = Default::default();
+        let action = render_screen(
+            ui,
+            &ScreenView {
+                route: UiRoute::Settings(self.settings_tab),
+                transcription: &state,
+                models: &[],
+                model_catalog: &[],
+                comparison: &comparison,
+                model_management: &Default::default(),
+                model_language_filter: ModelLanguageFilter::default(),
+                remote_catalog: &Default::default(),
+                recording_settings: &settings,
+            },
+        );
+        self.apply_settings_screen_action(action);
+        self.settings_restore_playground_focus = false;
+    }
 
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Active model"));
-                let model_name = self
-                    .selected_model()
-                    .map(|model| model.name)
-                    .unwrap_or_else(|| "No model selected".to_owned());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(body_strong(&model_name));
-                    if ui.add(small_button(ui, "Manage models")).clicked() {
-                        self.current_tab = Tab::Models;
-                    }
-                });
-            });
+    fn open_system_audio_settings(&mut self) {
+        match launch_system_audio_settings() {
+            Ok(()) => {
+                self.status_message = "Opened system microphone settings".to_owned();
+            }
+            Err(error) => {
+                self.settings_tab = SettingsTab::Recording;
+                self.current_tab = Tab::General;
+                self.status_message = format!("Could not open system microphone settings: {error}");
+            }
+        }
+    }
 
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Shortcuts"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Record toggle");
-                    ui.add(
-                        TextEdit::singleline(&mut self.hotkey_input)
-                            .desired_width(width_before_trailing(ui, 154.0, 96.0)),
-                    );
-                    if ui.add(small_button(ui, "Apply")).clicked() {
-                        self.apply_hotkey();
-                    }
-                    if ui
-                        .add(small_button(
-                            ui,
-                            if self.capturing_hotkey {
-                                "Listening..."
-                            } else {
-                                "Capture"
-                            },
-                        ))
-                        .clicked()
-                    {
-                        self.capturing_hotkey = true;
-                        self.status_message = "Press the new hotkey combination.".to_owned();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.recording.hotkey_mode;
-                    ui.label("Hotkey mode");
-                    ComboBox::from_id_source("hotkey-mode")
-                        .selected_text(self.config.recording.hotkey_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in HotkeyMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.recording.hotkey_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    if before != self.config.recording.hotkey_mode {
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Audio"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.recording.audio_input_device_name.clone();
-                    let label = ui.label("Microphone");
-                    let combo = ComboBox::from_id_source("audio-input-device")
-                        .selected_text(
-                            self.config
-                                .recording
-                                .audio_input_device_name
-                                .as_deref()
-                                .unwrap_or("OS default"),
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.recording.audio_input_device_name,
-                                None,
-                                "OS default",
-                            );
-                            for device in &self.audio_devices {
-                                ui.selectable_value(
-                                    &mut self.config.recording.audio_input_device_name,
-                                    Some(device.clone()),
-                                    device,
-                                );
-                            }
-                        });
-                    combo.response.labelled_by(label.id);
-                    if before != self.config.recording.audio_input_device_name {
-                        self.stop_microphone_test();
-                        self.microphone_monitor_retry_at = None;
-                        self.microphone_level_envelope.reset_source();
-                        self.save_config();
-                    }
-                    if ui.add(small_button(ui, "Refresh")).clicked() {
-                        self.refresh_audio_devices();
-                    }
-                });
+    fn apply_settings_screen_action(&mut self, action: ScreenAction) {
+        match action {
+            ScreenAction::SetSettingsTab(tab) => {
+                self.settings_tab = match tab {
+                    SettingsTab::Output => SettingsTab::General,
+                    tab => tab,
+                };
+            }
+            ScreenAction::SetCloseToTray(value) => {
+                self.config.general.close_to_tray = value;
+                self.save_config();
+            }
+            ScreenAction::OpenModelSettings => self.current_tab = Tab::Models,
+            ScreenAction::SetTheme(value) => {
+                self.config.general.theme_mode = match value.as_str() {
+                    "Light" => ThemeMode::Light,
+                    "Dark" => ThemeMode::Dark,
+                    "System" => ThemeMode::System,
+                    _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetOverlayMode(value) => {
+                self.config.overlay.mode = match value.as_str() {
+                    "Live" => OverlayMode::Live,
+                    "Minimal" => OverlayMode::Minimal,
+                    "Off" => OverlayMode::Off,
+                    _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetRecordingMode(mode) => {
+                self.config.recording.hotkey_mode = match mode {
+                    RecordingMode::PressOnce => HotkeyMode::Toggle,
+                    RecordingMode::Hold => HotkeyMode::HoldToTalk,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetDurationSeconds(seconds) => {
+                self.config.recording.max_recording_seconds =
+                    seconds.clamp(1, config::MAX_RECORDING_SECONDS);
+                self.save_config();
+            }
+            ScreenAction::ToggleProvisionalFeedback => {
+                self.config.streaming.mode =
+                    if self.config.streaming.mode == StreamingMode::FinalOnly {
+                        StreamingMode::Auto
+                    } else {
+                        StreamingMode::FinalOnly
+                    };
+                self.save_config();
+            }
+            ScreenAction::SetAudioDevice(device) => {
+                self.config.recording.audio_input_device_name = device;
+                self.stop_microphone_test();
+                self.microphone_monitor_retry_required = false;
+                self.microphone_level_envelope.reset_source();
+                self.save_config();
+            }
+            ScreenAction::SetInputSensitivity(percent) => {
+                self.config.recording.manual_activation_rms =
+                    dbfs_to_rms(slider_position_to_dbfs(f32::from(percent) / 100.0));
+                self.apply_input_sensitivity_threshold();
+                self.save_config();
+            }
+            ScreenAction::RefreshDevices => self.refresh_audio_devices(),
+            ScreenAction::RetryMicrophone => {
+                self.microphone_test_error = None;
+                self.microphone_monitor_retry_required = false;
                 self.ensure_microphone_monitor();
-                ui.add_space(10.0);
-                let (levels, revision, source_active) = self.current_sensitivity_level_sample();
-                let live_level_position = self.microphone_level_envelope.update(
-                    levels.rms,
-                    revision,
-                    source_active,
-                    Instant::now(),
-                );
-                let label = ui.label("Input sensitivity");
-                let response = microphone_sensitivity_slider(
-                    ui,
-                    live_level_position,
-                    &mut self.config.recording.manual_activation_rms,
-                )
-                .labelled_by(label.id);
-                if response.changed() {
-                    self.apply_input_sensitivity_threshold();
-                    self.save_config();
+            }
+            ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
+            ScreenAction::ChangeShortcut => {
+                self.capturing_hotkey = !self.capturing_hotkey;
+                self.status_message = if self.capturing_hotkey {
+                    "Press the new hotkey combination. Press Capture again to cancel.".to_owned()
+                } else {
+                    "Hotkey capture cancelled.".to_owned()
+                };
+            }
+            ScreenAction::SetAutoInsertTranscript(value) => {
+                self.config.output.auto_insert_transcript = value;
+                self.save_config();
+            }
+            ScreenAction::SetRestoreClipboardAfterInsert(value) => {
+                self.config.output.restore_clipboard_after_insert = value;
+                self.save_config();
+            }
+            ScreenAction::SetPasteDelayMs(value) => {
+                self.config.output.paste_delay_ms = value.clamp(1, 1_000);
+                self.save_config();
+            }
+            ScreenAction::SetVadEnabled(value) => {
+                self.config.recording.vad_enabled = value;
+                self.save_config();
+            }
+            ScreenAction::SetSpeechConfirmationMs(value) => {
+                self.config.recording.speech_confirmation_ms = value.clamp(50, 1_000);
+                self.config.recording.internal_pause_ms = self
+                    .config
+                    .recording
+                    .internal_pause_ms
+                    .max(self.config.recording.speech_confirmation_ms);
+                self.save_config();
+            }
+            ScreenAction::SetInternalPauseMs(value) => {
+                self.config.recording.internal_pause_ms =
+                    value.clamp(self.config.recording.speech_confirmation_ms, 3_000);
+                self.config.recording.endpoint_silence_ms = self
+                    .config
+                    .recording
+                    .endpoint_silence_ms
+                    .max(self.config.recording.internal_pause_ms);
+                self.save_config();
+            }
+            ScreenAction::SetEndpointSilenceMs(value) => {
+                self.config.recording.endpoint_silence_ms =
+                    value.clamp(self.config.recording.internal_pause_ms, 5_000);
+                self.save_config();
+            }
+            ScreenAction::SetPreRollMs(value) => {
+                self.config.recording.pre_roll_ms = value.min(2_000);
+                self.save_config();
+            }
+            ScreenAction::SetPostRollMs(value) => {
+                self.config.recording.post_roll_ms = value.min(2_000);
+                self.save_config();
+            }
+            ScreenAction::SetStreamingMode(value) => {
+                self.config.streaming.mode = match value.as_str() {
+                    "Auto" => StreamingMode::Auto,
+                    "Rolling preview" => StreamingMode::Rolling,
+                    "Final text only" => StreamingMode::FinalOnly,
+                    _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetAcceleration(value) => {
+                self.config.performance.acceleration_preference = match value.as_str() {
+                    "Auto" => AccelerationPreference::Auto,
+                    "GPU" => AccelerationPreference::Gpu,
+                    "CPU only" => AccelerationPreference::Cpu,
+                    _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetOverlayPosition(value) => {
+                self.config.overlay.position = match value.as_str() {
+                    "Top" => OverlayPosition::Top,
+                    "Bottom" => OverlayPosition::Bottom,
+                    _ => return,
+                };
+                self.save_config();
+            }
+            ScreenAction::SetDebugMode(value) => {
+                self.config.developer.debug_mode = value;
+                if !value && (self.settings_playground_open || self.current_tab == Tab::Debug) {
+                    self.settings_tab = SettingsTab::Advanced;
+                    self.current_tab = Tab::General;
+                    self.settings_playground_open = false;
+                    self.settings_playground_needs_initial_focus = false;
+                    self.settings_restore_playground_focus = false;
                 }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                ui.label(section_heading("Appearance"));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.general.theme_mode;
-                    ui.label("Theme");
-                    ComboBox::from_id_source("theme-mode")
-                        .selected_text(self.config.general.theme_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in ThemeMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.general.theme_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    if before != self.config.general.theme_mode {
-                        self.save_config();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.overlay.mode;
-                    ui.label("Dictation overlay");
-                    ui.add_enabled_ui(overlay::overlay_focus_safety_available(), |ui| {
-                        ComboBox::from_id_source("overlay-mode")
-                            .selected_text(self.config.overlay.mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in OverlayMode::ALL {
-                                    ui.selectable_value(
-                                        &mut self.config.overlay.mode,
-                                        mode,
-                                        mode.label(),
-                                    );
-                                }
-                            });
-                    });
-                    if before != self.config.overlay.mode {
-                        self.save_config();
-                    }
-                });
-                if !overlay::overlay_focus_safety_available() {
-                    ui.colored_label(
-                        ui_palette(ui).warning,
-                        "The overlay is forced Off because no-focus window safety is not verified on this platform.",
-                    );
+                self.save_config();
+            }
+            ScreenAction::OpenDeveloperPlayground if self.config.developer.debug_mode => {
+                self.settings_tab = SettingsTab::Advanced;
+                self.settings_playground_open = true;
+                self.settings_playground_needs_initial_focus = true;
+                self.settings_restore_playground_focus = false;
+            }
+            ScreenAction::OpenDeveloperPlayground => {}
+            ScreenAction::ExportRedactedDiagnostics => {
+                let export_dir = self
+                    .config_path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(|parent| parent.join("diagnostics"));
+                match export_dir {
+                    Some(directory) => match diagnostics::export_redacted(&directory, &self.diagnostics) {
+                        Ok(path) => self.status_message = format!("Redacted diagnostics exported to {}", path.display()),
+                        Err(error) => {
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = format!("Could not export redacted diagnostics: {error}");
+                        }
+                    },
+                    None => self.status_message = "The platform settings directory is unavailable, so Scribe cannot choose a private export location.".to_owned(),
                 }
-            });
-        });
+            }
+            ScreenAction::SetHistoryMode(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.mode = match value.as_str() {
+                        "Off" => HistoryMode::Off,
+                        "Transcript only" => HistoryMode::TranscriptOnly,
+                        "Transcript and audio" => HistoryMode::TranscriptAndAudio,
+                        _ => return,
+                    };
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetMaxHistoryEntries(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.max_unpinned_entries =
+                        value.clamp(1, config::MAX_HISTORY_ENTRIES);
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetTranscriptRetentionDays(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.transcript_retention_days =
+                        value.map(|days| days.clamp(1, config::MAX_HISTORY_RETENTION_DAYS));
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetAudioRetentionDays(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.audio_retention_days =
+                        value.map(|days| days.clamp(1, config::MAX_HISTORY_RETENTION_DAYS));
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::SetStoreApplicationIdentity(value) => {
+                if !self.history_retry_is_active() {
+                    self.config.history.store_application_identity = value;
+                    self.save_history_config();
+                }
+            }
+            ScreenAction::None
+            | ScreenAction::SelectModel(_)
+            | ScreenAction::InstallModel(_)
+            | ScreenAction::UpgradeModel(_)
+            | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::ShowRemoteModelDetails { .. }
+            | ScreenAction::RequestModelRemoval(_)
+            | ScreenAction::ConfirmModelRemoval(_)
+            | ScreenAction::CloseModelDialog
+            | ScreenAction::AddModel
+            | ScreenAction::ChangeModel
+            | ScreenAction::StartRecording
+            | ScreenAction::StopRecording
+            | ScreenAction::ClearTranscript
+            | ScreenAction::CopyTranscript
+            | ScreenAction::ToggleComparison
+            | ScreenAction::ToggleComparisonModel(_)
+            | ScreenAction::StartComparison
+            | ScreenAction::StopComparison
+            | ScreenAction::ShowComparisonReferenceEditor
+            | ScreenAction::HideComparisonReferenceEditor
+            | ScreenAction::EditComparisonReference(_)
+            | ScreenAction::ApplyComparisonReference
+            | ScreenAction::ClearComparisonReference
+            | ScreenAction::SetRemoteCatalogQuery(_)
+            | ScreenAction::SetModelLanguageFilter(_)
+            | ScreenAction::ToggleInstalledModels
+            | ScreenAction::ToggleAvailableModels
+            | ScreenAction::FocusModelCard(_)
+            | ScreenAction::AcknowledgeModelCardFocus(_)
+            | ScreenAction::AcknowledgeModelControlFocus { .. }
+            | ScreenAction::RetryRemoteCatalog
+            | ScreenAction::InstallRemoteCatalogVariant { .. }
+            | ScreenAction::CancelRemoteCatalogInstall(_)
+            | ScreenAction::UseRemoteCatalogModel(_)
+            | ScreenAction::RemoveRemoteCatalogModel(_) => {}
+            ScreenAction::RepairModelRuntime(_)
+            | ScreenAction::MaintainModelRuntime(_)
+            | ScreenAction::SetLocalGgufImportPath(_)
+            | ScreenAction::ValidateAndImportLocalGguf
+            | ScreenAction::CancelLocalGgufImport => {}
+        }
     }
 
     fn ui_history(&mut self, ui: &mut Ui) {
@@ -9669,494 +10546,6 @@ impl LocalTranscriberApp {
             self.apply_history_action(action);
         }
     }
-
-    fn ui_about(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        let model_dir = config::model_storage_dir(&self.config);
-        let config_path = self.config_path.clone();
-        let export_dir = config_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|parent| parent.join("diagnostics"));
-        let session_count = self.diagnostics.len();
-        let mut export_requested = false;
-        page(ui, "About", status, &status_message, |ui| {
-            about_page(ui, &model_dir, config_path.as_deref());
-            ui.add_space(12.0);
-            ui.group(|ui| {
-                semantic_heading(ui, section_heading("Redacted diagnostics"));
-                ui.label(format!(
-                    "{session_count} recent session snapshot(s) are held in memory. Exports exclude transcript and audio content, secrets, filesystem paths, and raw errors."
-                ));
-                let unavailable_reason = export_dir.is_none().then_some(
-                    "The platform settings directory is unavailable, so Scribe cannot choose a private export location.",
-                );
-                let button = ui.add_enabled(
-                    export_dir.is_some(),
-                    Button::new("Export redacted diagnostics").min_size(Vec2::new(220.0, 44.0)),
-                );
-                if let Some(reason) = unavailable_reason {
-                    ui.ctx().accesskit_node_builder(button.id, |builder| {
-                        builder.set_description(reason);
-                    });
-                    ui.label(mut_text(reason));
-                }
-                export_requested = button.clicked();
-            });
-        });
-        if export_requested && let Some(directory) = export_dir {
-            match diagnostics::export_redacted(&directory, &self.diagnostics) {
-                Ok(path) => {
-                    self.status_message =
-                        format!("Redacted diagnostics exported to {}", path.display());
-                }
-                Err(error) => {
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Could not export redacted diagnostics: {error}");
-                }
-            }
-        }
-    }
-
-    fn ui_advanced_settings(&mut self, ui: &mut Ui) {
-        let status = self.effective_status();
-        let status_message = self.status_message.clone();
-        page(ui, "Advanced", status, &status_message, |ui| {
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Output"));
-                ui.add_space(8.0);
-                let mut auto_insert = self.config.output.auto_insert_transcript;
-                let output_label = if cfg!(target_os = "windows") {
-                    "Insert final transcript into captured app"
-                } else {
-                    "Copy final transcript to clipboard automatically"
-                };
-                if ui.checkbox(&mut auto_insert, output_label).changed() {
-                    self.config.output.auto_insert_transcript = auto_insert;
-                    self.save_config();
-                }
-                if cfg!(target_os = "windows") {
-                    ui.add_enabled_ui(self.config.output.auto_insert_transcript, |ui| {
-                        let mut restore_clipboard =
-                            self.config.output.restore_clipboard_after_insert;
-                        if ui
-                            .checkbox(&mut restore_clipboard, "Restore clipboard after insert")
-                            .changed()
-                        {
-                            self.config.output.restore_clipboard_after_insert = restore_clipboard;
-                            self.save_config();
-                        }
-                        let mut paste_delay = self.config.output.paste_delay_ms as i32;
-                        ui.horizontal_wrapped(|ui| {
-                            let label = ui.label("Paste delay ms");
-                            if ui
-                                .add(egui::DragValue::new(&mut paste_delay).clamp_range(1..=1000))
-                                .labelled_by(label.id)
-                                .changed()
-                            {
-                                self.config.output.paste_delay_ms = paste_delay.max(1) as u64;
-                                self.save_config();
-                            }
-                        });
-                    });
-                } else if self.config.output.auto_insert_transcript
-                    && let Some(notice) = text_output::paste_automation_notice()
-                {
-                    ui.label(notice);
-                }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Capture limits"));
-                let mut max_duration = self.config.recording.max_recording_seconds as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Maximum recording seconds");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut max_duration)
-                                .clamp_range(1..=config::MAX_RECORDING_SECONDS as i32),
-                        )
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.max_recording_seconds = max_duration.max(1) as u32;
-                        self.save_config();
-                    }
-                });
-                ui.add_space(6.0);
-                let mut vad_enabled = self.config.recording.vad_enabled;
-                if ui
-                    .checkbox(&mut vad_enabled, "Stop after speech ends in Toggle mode")
-                    .on_hover_text(
-                        "Stops after the configured silence interval. Input sensitivity still controls speech detection when this option is off, and an explicit shortcut release or Stop action always takes priority.",
-                    )
-                    .changed()
-                {
-                    self.config.recording.vad_enabled = vad_enabled;
-                    self.save_config();
-                }
-                let mut speech_confirmation = self.config.recording.speech_confirmation_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Speech confirmation ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut speech_confirmation).clamp_range(50..=1000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.speech_confirmation_ms =
-                            speech_confirmation.max(50) as u32;
-                        self.config.recording.internal_pause_ms = self
-                            .config
-                            .recording
-                            .internal_pause_ms
-                            .max(self.config.recording.speech_confirmation_ms);
-                        self.save_config();
-                    }
-                });
-                let mut internal_pause = self.config.recording.internal_pause_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Internal pause ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut internal_pause).clamp_range(100..=3000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.internal_pause_ms = internal_pause
-                            .max(self.config.recording.speech_confirmation_ms as i32)
-                            as u32;
-                        self.config.recording.endpoint_silence_ms = self
-                            .config
-                            .recording
-                            .endpoint_silence_ms
-                            .max(self.config.recording.internal_pause_ms);
-                        self.save_config();
-                    }
-                });
-                ui.add_enabled_ui(self.config.recording.vad_enabled, |ui| {
-                    let mut endpoint_silence = self.config.recording.endpoint_silence_ms as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("End after silence ms");
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut endpoint_silence).clamp_range(
-                                    self.config.recording.internal_pause_ms as i32..=5000,
-                                ),
-                            )
-                            .labelled_by(label.id)
-                            .changed()
-                        {
-                            self.config.recording.endpoint_silence_ms = endpoint_silence
-                                .max(self.config.recording.internal_pause_ms as i32)
-                                as u32;
-                            self.save_config();
-                        }
-                    });
-                });
-                let mut pre_roll = self.config.recording.pre_roll_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Pre-roll ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut pre_roll).clamp_range(0..=2000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.pre_roll_ms = pre_roll.max(0) as u32;
-                        self.save_config();
-                    }
-                });
-                let mut post_roll = self.config.recording.post_roll_ms as i32;
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Post-roll ms");
-                    if ui
-                        .add(egui::DragValue::new(&mut post_roll).clamp_range(0..=2000))
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.config.recording.post_roll_ms = post_roll.max(0) as u32;
-                        self.save_config();
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.overlay.position;
-                    let label = ui.label("Overlay position");
-                    let combo = ComboBox::from_id_source("overlay-position")
-                        .selected_text(self.config.overlay.position.label())
-                        .show_ui(ui, |ui| {
-                            for position in OverlayPosition::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.overlay.position,
-                                    position,
-                                    position.label(),
-                                );
-                            }
-                        });
-                    combo.response.clone().labelled_by(label.id);
-                    if before != self.config.overlay.position {
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Live transcription"));
-                ui.horizontal_wrapped(|ui| {
-                    let mut mode = self.config.streaming.mode;
-                    if streaming_mode_selector(ui, &mut mode) {
-                        self.config.streaming.mode = mode;
-                        self.save_config();
-                    }
-                });
-                ui.label(mut_text(
-                    "Rolling preview uses 250 ms decode intervals, 3-second windows, 650 ms overlap, two stability passes, and a 700 ms horizon. Tentative text stays inside Scribe; only the full final pass may reach another application.",
-                ));
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Performance"));
-                let gpu_available = self
-                    .transcription_service
-                    .model_descriptor(&ModelId::new(&self.config.general.selected_default_model))
-                    .is_ok_and(|descriptor| descriptor.capabilities.gpu);
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Transcription device");
-                    let mut preference = self.config.performance.acceleration_preference;
-                    let combo = ComboBox::from_id_source("advanced-transcription-device-mode")
-                        .selected_text(preference.label())
-                        .show_ui(ui, |ui| {
-                            for mode in AccelerationPreference::ALL {
-                                ui.add_enabled_ui(
-                                    mode != AccelerationPreference::Gpu || gpu_available,
-                                    |ui| {
-                                        ui.selectable_value(&mut preference, mode, mode.label());
-                                    },
-                                );
-                            }
-                        });
-                    combo.response.labelled_by(label.id);
-                    if preference != self.config.performance.acceleration_preference {
-                        self.config.performance.acceleration_preference = preference;
-                        self.save_config();
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("History and privacy"));
-                let retry_active = self.history_retry_is_active();
-                let history_lock_reason = retry_active
-                    .then_some("Unavailable while a retained-audio retry owns its history row.");
-                if retry_active {
-                    let locked = ui.label(mut_text(
-                        "History retention is locked while a retained-audio retry owns its row.",
-                    ));
-                    ui.ctx().accesskit_node_builder(locked.id, |builder| {
-                        builder.set_live(egui::accesskit::Live::Polite);
-                        builder.set_live_atomic();
-                    });
-                }
-                ui.add_enabled_ui(!retry_active, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let before = self.config.history.mode;
-                    let label = ui.label("History storage");
-                    let combo = ComboBox::from_id_source("history-storage-mode")
-                        .selected_text(self.config.history.mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in HistoryMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.config.history.mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                    combo.response.clone().labelled_by(label.id);
-                    if let Some(reason) = history_lock_reason {
-                        ui.ctx()
-                            .accesskit_node_builder(combo.response.id, |builder| {
-                                builder.set_description(reason);
-                            });
-                    }
-                    if before != self.config.history.mode {
-                        self.save_history_config();
-                    }
-                });
-                ui.label(mut_text(match self.config.history.mode {
-                    HistoryMode::Off => {
-                        "New dictations are not added to history. Existing entries remain subject to configured retention and manual deletion."
-                    }
-                    HistoryMode::TranscriptOnly => {
-                        "Final and raw transcripts stay on this device. Microphone audio is not retained."
-                    }
-                    HistoryMode::TranscriptAndAudio => {
-                        "Transcripts and canonical mono 16 kHz audio stay on this device for playback and retry."
-                    }
-                }));
-
-                ui.add_space(8.0);
-                ui.add_enabled_ui(self.config.history.mode.stores_transcripts(), |ui| {
-                    let mut maximum = self.config.history.max_unpinned_entries as i32;
-                    ui.horizontal_wrapped(|ui| {
-                        let label = ui.label("Maximum unpinned entries");
-                        let maximum_control = ui
-                            .add(
-                                egui::DragValue::new(&mut maximum)
-                                    .clamp_range(1..=config::MAX_HISTORY_ENTRIES as i32),
-                            )
-                            .labelled_by(label.id);
-                        if let Some(reason) = history_lock_reason {
-                            ui.ctx().accesskit_node_builder(
-                                maximum_control.id,
-                                |builder| builder.set_description(reason),
-                            );
-                        }
-                        if maximum_control.changed() {
-                            self.config.history.max_unpinned_entries = maximum.max(1) as u32;
-                            self.save_history_config();
-                        }
-                    });
-
-                    if optional_retention_days_control(
-                        ui,
-                        "Transcript age limit",
-                        "Keep transcripts until deleted",
-                        &mut self.config.history.transcript_retention_days,
-                        history_lock_reason,
-                    ) {
-                        self.save_history_config();
-                    }
-
-                    if self.config.history.mode.stores_audio()
-                        && optional_retention_days_control(
-                            ui,
-                            "Audio age limit",
-                            "Keep retained audio until its entry is deleted",
-                            &mut self.config.history.audio_retention_days,
-                            history_lock_reason,
-                        )
-                    {
-                        self.save_history_config();
-                    }
-
-                    let mut store_identity = self.config.history.store_application_identity;
-                    let identity_control = ui
-                        .checkbox(
-                            &mut store_identity,
-                            "Store coarse application identity with new entries",
-                        )
-                        .on_hover_text(
-                            "Stores only a coarse local application label, never a window title or document name.",
-                        );
-                    if let Some(reason) = history_lock_reason {
-                        ui.ctx().accesskit_node_builder(
-                            identity_control.id,
-                            |builder| builder.set_description(reason),
-                        );
-                    }
-                    if identity_control.changed() {
-                        self.config.history.store_application_identity = store_identity;
-                        self.save_history_config();
-                    }
-                });
-                });
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Developer"));
-                let mut debug_mode = self.config.developer.debug_mode;
-                if ui
-                    .checkbox(&mut debug_mode, "Enable local model Playground")
-                    .changed()
-                {
-                    self.config.developer.debug_mode = debug_mode;
-                    if !debug_mode && self.current_tab == Tab::Debug {
-                        self.current_tab = Tab::Advanced;
-                    }
-                    self.save_config();
-                }
-                ui.label(mut_text(
-                    "Debug enables the existing functional local comparison tools. It does not enable cloud processing.",
-                ));
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                semantic_heading(ui, section_heading("Diagnostics"));
-                if let Some(latency) = &self.latest_latency {
-                    for line in latency.summary_lines() {
-                        ui.label(mut_text(line));
-                    }
-                } else {
-                    ui.label(mut_text("No completed session latency is available yet."));
-                }
-                if self.tray_service.is_none() {
-                    ui.colored_label(
-                        ui_palette(ui).error,
-                        "Tray integration is unavailable in this desktop session.",
-                    );
-                }
-                if let Some(notice) = text_output::paste_automation_notice() {
-                    ui.colored_label(ui_palette(ui).warning, notice);
-                }
-            });
-        });
-    }
-}
-
-fn optional_retention_days_control(
-    ui: &mut Ui,
-    label_text: &str,
-    unlimited_text: &str,
-    value: &mut Option<u32>,
-    disabled_reason: Option<&str>,
-) -> bool {
-    let mut limited = value.is_some();
-    let limit_control = ui.checkbox(&mut limited, label_text);
-    if let Some(reason) = disabled_reason {
-        ui.ctx()
-            .accesskit_node_builder(limit_control.id, |builder| {
-                builder.set_description(reason);
-            });
-    }
-    let mut changed = limit_control.changed();
-    if !limited {
-        if value.take().is_some() {
-            changed = true;
-        }
-        ui.label(mut_text(unlimited_text));
-        return changed;
-    }
-
-    let mut days = value.unwrap_or(30) as i32;
-    ui.horizontal_wrapped(|ui| {
-        let label = ui.label("Days");
-        let days_control = ui
-            .add(
-                egui::DragValue::new(&mut days)
-                    .clamp_range(1..=config::MAX_HISTORY_RETENTION_DAYS as i32),
-            )
-            .labelled_by(label.id);
-        if let Some(reason) = disabled_reason {
-            ui.ctx().accesskit_node_builder(days_control.id, |builder| {
-                builder.set_description(reason);
-            });
-        }
-        if days_control.changed() {
-            changed = true;
-        }
-    });
-    let normalized = days.max(1) as u32;
-    if *value != Some(normalized) {
-        *value = Some(normalized);
-        changed = true;
-    }
-    changed
 }
 
 const PLAYGROUND_RESULT_HEIGHT: f32 = 92.0;
@@ -10192,20 +10581,25 @@ fn page(
 ) {
     let page_width = usable_width(ui);
     ui.allocate_ui_with_layout(
-        Vec2::new(page_width, ui.available_height()),
+        Vec2::new(page_width, 0.0),
         Layout::top_down(Align::LEFT),
         |ui| {
             set_exact_width(ui, page_width);
-            ui.add_space(24.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_top(|ui| {
                 let heading = ui.label(
                     RichText::new(title)
-                        .font(FontId::proportional(24.0))
+                        .font(FontId::proportional(30.0))
                         .color(ui_palette(ui).primary)
                         .strong(),
                 );
                 ui.ctx().accesskit_node_builder(heading.id, |builder| {
                     builder.set_role(egui::accesskit::Role::Heading);
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: heading.rect.min.x.into(),
+                        y0: heading.rect.min.y.into(),
+                        x1: heading.rect.max.x.into(),
+                        y1: heading.rect.max.y.into(),
+                    });
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     status_badge(ui, status);
@@ -10223,27 +10617,17 @@ fn page(
                 });
             }
             ui.add_space(14.0);
-            let body_width = usable_width(ui);
-            ScrollArea::vertical()
-                .id_source(("page-scroll", title))
-                .max_width(body_width)
-                .min_scrolled_width(body_width)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    with_usable_width_cap(ui, body_width, |ui| {
-                        set_exact_width(ui, body_width);
-                        add_contents(ui);
-                    });
-                });
+            with_usable_width_cap(ui, page_width, |ui| {
+                set_exact_width(ui, page_width);
+                add_contents(ui);
+            });
         },
     );
 }
 
 fn content_panel_frame(ctx: &egui::Context) -> Frame {
     let colors = theme_palette(ctx);
-    Frame::none()
-        .fill(colors.content_bg)
-        .inner_margin(Margin::symmetric(24.0, 0.0))
+    Frame::none().fill(colors.content_bg)
 }
 
 fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -10310,121 +10694,6 @@ fn info_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
             .inner_margin(Margin::same(14.0)),
         add_contents,
     );
-}
-
-fn model_search_filter_control(ui: &mut Ui, search: &mut String) {
-    ui.vertical(|ui| {
-        let label = ui.label(label_caps("Search imports and trusted catalog"));
-        let input = ui.add_sized(
-            [190.0, 28.0],
-            TextEdit::singleline(search).hint_text("Name, language, or filename"),
-        );
-        input.labelled_by(label.id);
-    });
-}
-
-fn remote_catalog_filter_controls(
-    ui: &mut Ui,
-    search: &mut String,
-    filters: &mut RemoteCatalogFilters,
-    sort: &mut RemoteCatalogSort,
-) {
-    model_search_filter_control(ui, search);
-    ui.add_space(6.0);
-    ui.label(label_caps("Trusted catalog filters"));
-    ui.horizontal_wrapped(|ui| {
-        ui.checkbox(
-            &mut filters.installed_only,
-            "Installed trusted catalog models only",
-        );
-        ui.checkbox(
-            &mut filters.recommended_only,
-            "Recommended trusted catalog models only",
-        );
-        ui.checkbox(
-            &mut filters.multilingual_only,
-            "Multilingual trusted catalog models only",
-        );
-    });
-    ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.vertical(|ui| {
-            let label = ui.label(label_caps("Trusted catalog size tier"));
-            let combo = ComboBox::from_id_source("remote-catalog-size-tier")
-                .selected_text(filters.size_tier.label())
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for tier in RemoteCatalogSizeTier::ALL {
-                        ui.selectable_value(&mut filters.size_tier, tier, tier.label());
-                    }
-            });
-            combo.response.clone().labelled_by(label.id);
-            ui.ctx().accesskit_node_builder(combo.response.id, |builder| {
-                builder.set_description(
-                    "Filters by the smallest available GGUF variant for each trusted catalog model.",
-                );
-            });
-        });
-        ui.vertical(|ui| {
-            let label = ui.label(label_caps("Sort trusted catalog results"));
-            let combo = ComboBox::from_id_source("remote-catalog-sort")
-                .selected_text(sort.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for order in RemoteCatalogSort::ALL {
-                        ui.selectable_value(sort, order, order.label());
-                    }
-                });
-            combo.response.labelled_by(label.id);
-        });
-    });
-}
-
-fn catalog_status_label(ui: &mut Ui, text: impl Into<String>) {
-    let response = ui.add(egui::Label::new(mut_text(text)).wrap(true));
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_role(egui::accesskit::Role::Status);
-        builder.set_live(egui::accesskit::Live::Polite);
-        builder.set_live_atomic();
-    });
-}
-
-fn recessed_panel(ui: &mut Ui, min_height: f32, add_contents: impl FnOnce(&mut Ui)) {
-    let colors = ui_palette(ui);
-    full_width_frame(
-        ui,
-        Frame::none()
-            .fill(colors.panel_bg)
-            .stroke(Stroke::new(1.0, colors.border_strong))
-            .rounding(Rounding::same(8.0))
-            .inner_margin(Margin::same(18.0)),
-        |ui| {
-            ui.set_min_height(min_height);
-            ui.centered_and_justified(add_contents);
-        },
-    );
-}
-
-fn transcript_panel(ui: &mut Ui, _status: TranscriptionStatus, add_contents: impl FnOnce(&mut Ui)) {
-    card(ui, add_contents);
-}
-
-fn summary_card(
-    ui: &mut Ui,
-    title: &str,
-    body: impl FnOnce(&mut Ui),
-    actions: impl FnOnce(&mut Ui),
-) {
-    full_width_frame(ui, card_frame(ui), |ui| {
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.label(label_caps(title));
-                ui.add_space(6.0);
-                body(ui);
-            });
-            ui.with_layout(Layout::right_to_left(Align::TOP), actions);
-        });
-    });
 }
 
 fn remote_model_matches_search(model: &RemoteModel, search: &str) -> bool {
@@ -10495,11 +10764,13 @@ fn filtered_remote_models<'model>(
     search: &str,
     filters: RemoteCatalogFilters,
     sort: RemoteCatalogSort,
+    language_filter: ModelLanguageFilter,
 ) -> Vec<&'model RemoteModel> {
     let mut matching = models
         .iter()
         .filter(|model| remote_model_matches_search(model, search))
         .filter(|model| remote_model_matches_catalog_filters(model, app_config, filters))
+        .filter(|model| language_filter.matches(&model.languages))
         .collect::<Vec<_>>();
 
     matching.sort_by(|left, right| match sort {
@@ -10524,6 +10795,17 @@ fn filtered_remote_models<'model>(
             .then_with(|| left.id.cmp(&right.id)),
     });
     matching
+}
+
+fn size_tier_for_bytes(size_bytes: u64) -> ModelSizeTier {
+    const MIB: u64 = 1024 * 1024;
+    match size_bytes / MIB {
+        0..=256 => ModelSizeTier::Tiny,
+        257..=512 => ModelSizeTier::Small,
+        513..=1024 => ModelSizeTier::Base,
+        1025..=2048 => ModelSizeTier::Medium,
+        _ => ModelSizeTier::Large,
+    }
 }
 
 fn disk_space_preflight_error(
@@ -10559,210 +10841,6 @@ fn trusted_model_install_space_error(
     ))
 }
 
-fn install_button(
-    ui: &mut Ui,
-    label: &str,
-    default_tooltip: &str,
-    disk_space_error: Option<&str>,
-) -> egui::Response {
-    match disk_space_error {
-        Some(reason) => ui
-            .add_enabled(false, small_button(ui, label))
-            .on_hover_text(reason),
-        None => ui
-            .add(small_button(ui, label))
-            .on_hover_text(default_tooltip),
-    }
-}
-
-fn remote_model_card(
-    ui: &mut Ui,
-    model: &RemoteModel,
-    app_config: &AppConfig,
-    downloads: &HashMap<String, ModelInstallStatus>,
-) -> Option<RemoteModelCardAction> {
-    let mut action = None;
-    panel(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(section_heading(&model.display_name));
-            if model.recommended {
-                badge(ui, "Recommended", ChipTone::Success);
-            }
-            badge(ui, model.trust.label(), ChipTone::Neutral);
-            badge(ui, "Experimental", ChipTone::Warning);
-        });
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(&model.description));
-        if !model.languages.is_empty() {
-            ui.add_space(4.0);
-            wrapped_label(
-                ui,
-                mut_text(format!("Languages: {}", model.languages.join(", "))),
-            );
-        }
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(model.compatibility.detail()));
-        ui.add_space(8.0);
-        ui.label(body_strong("Variants"));
-        for variant in &model.variants {
-            let artifact = model.artifact_for(&variant.id);
-            let normalized_model_id = artifact.as_ref().and_then(|artifact| {
-                crate::model_catalog::normalized_model_id_for_pinned_artifact(
-                    &artifact.model_id,
-                    &artifact.revision,
-                    &artifact.filename,
-                )
-            });
-            let is_available_in_local_catalog = normalized_model_id.is_some();
-            let disk_space_error = artifact
-                .as_ref()
-                .and_then(|artifact| match normalized_model_id.as_ref() {
-                    Some(model_id) => normalized_model_install_space_error(app_config, model_id),
-                    None => trusted_model_install_space_error(app_config, artifact),
-                });
-            let remote_id = artifact.as_ref().and_then(|artifact| {
-                config::managed_remote_model_id(
-                    &artifact.model_id,
-                    &artifact.revision,
-                    &artifact.filename,
-                )
-            });
-            let installed = remote_id.as_ref().and_then(|id| {
-                app_config
-                    .general
-                    .managed_remote_models
-                    .get_key_value(id)
-                    .map(|(id, _)| ModelId::new(id.clone()))
-            });
-            let previous_revision = artifact.as_ref().and_then(|artifact| {
-                app_config
-                    .general
-                    .managed_remote_models
-                    .iter()
-                    .find(|(_, install)| {
-                        install.repository == artifact.model_id
-                            && install.filename == artifact.filename
-                            && install.revision != artifact.revision
-                    })
-                    .map(|(id, _)| ModelId::new(id.clone()))
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(mut_text(&variant.filename));
-                badge(ui, &format_bytes(variant.size_bytes), ChipTone::Neutral);
-                if let Some(remote_id) = remote_id.as_ref()
-                    && let Some(status) = downloads.get(remote_id)
-                {
-                    badge(ui, &status.label(), ChipTone::Neutral);
-                    if matches!(
-                        status,
-                        ModelInstallStatus::Downloading { .. }
-                            | ModelInstallStatus::InstallingRuntime
-                    ) {
-                        if ui.add(small_button(ui, "Cancel")).clicked() {
-                            action = Some(RemoteModelCardAction::CancelInstall(ModelId::new(
-                                remote_id.clone(),
-                            )));
-                        }
-                    } else if matches!(status, ModelInstallStatus::Error(_))
-                        && install_button(
-                            ui,
-                            "Resume",
-                            "Resume this verified download from its retained partial bytes.",
-                            disk_space_error.as_deref(),
-                        )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                } else if let Some(installed_id) = installed {
-                    badge(ui, "Installed and verified", ChipTone::Success);
-                    if ui.add(small_button(ui, "Use")).clicked() {
-                        action = Some(RemoteModelCardAction::SelectInstalled(installed_id.clone()));
-                    }
-                    if ui.add(small_button(ui, "Remove")).clicked() {
-                        action = Some(RemoteModelCardAction::RemoveInstalled(installed_id));
-                    }
-                } else if let Some(previous_id) = previous_revision {
-                    badge(ui, "Update available", ChipTone::Warning);
-                    if install_button(
-                        ui,
-                        "Install update",
-                        "Download and validate this new pinned revision before switching models.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                    let _ = previous_id;
-                } else if is_available_in_local_catalog {
-                    badge(ui, "Available in local catalog", ChipTone::Success);
-                    if install_button(
-                        ui,
-                        "Install verified variant",
-                            "Download this exact revision and checksum through Scribe's verified local installer.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = normalized_model_id
-                            .clone()
-                            .map(RemoteModelCardAction::InstallNormalized);
-                    }
-                } else {
-                    badge(ui, "Pinned GGUF", ChipTone::Neutral);
-                    if install_button(
-                        ui,
-                        "Install",
-                        "Download this exact verified revision through Scribe's transactional installer.",
-                        disk_space_error.as_deref(),
-                    )
-                        .clicked()
-                    {
-                        action = artifact.as_ref().map(|artifact| {
-                            RemoteModelCardAction::InstallTrusted(
-                                trusted_remote_install_request(model, artifact),
-                            )
-                        });
-                    }
-                }
-            });
-        }
-        ui.add_space(4.0);
-        let details = egui::CollapsingHeader::new("Source and verification details")
-            .default_open(false)
-            .show(ui, |ui| {
-                wrapped_label(ui, mut_text(format!("Repository: {}", model.id)));
-                wrapped_label(ui, mut_text(format!("Pinned revision: {}", model.revision)));
-                for variant in &model.variants {
-                    wrapped_label(
-                        ui,
-                        mut_text(format!(
-                            "{} · SHA-256 {}",
-                            variant.filename, variant.expected_sha256
-                        )),
-                    );
-                }
-                wrapped_label(
-                    ui,
-                    mut_text(
-                        "Scribe pins the full repository revision, expected size, and SHA-256 before download. The model is selectable only after isolated runtime smoke validation and transactional activation.",
-                    ),
-                );
-            });
-        set_collapsing_header_accessibility(ui.ctx(), &details);
-    });
-    action
-}
-
 fn trusted_remote_install_request(
     model: &RemoteModel,
     artifact: &TrustedArtifact,
@@ -10773,278 +10851,6 @@ fn trusted_remote_install_request(
         description: model.description.clone(),
         languages: model.languages.clone(),
         recommended: model.recommended,
-    }
-}
-
-fn model_catalog_row(
-    ui: &mut Ui,
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-    selected: bool,
-    actions: impl FnOnce(&mut Ui),
-) {
-    full_width_frame(ui, model_card_frame(ui, selected), |ui| {
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let actions_width = 92.0;
-            let detail_width = (ui.available_width() - actions_width - 12.0).max(0.0);
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(detail_width, 0.0),
-                    Layout::top_down(Align::LEFT),
-                    |ui| {
-                        set_exact_width(ui, detail_width);
-                        wrapped_label(ui, card_title(ui, descriptor.display_name, selected));
-                        wrapped_label(ui, mut_text(descriptor.description));
-                        match descriptor.compatibility {
-                            CompatibilityStatus::Experimental { reason, .. }
-                            | CompatibilityStatus::Incompatible { reason, .. } => {
-                                ui.add_space(4.0);
-                                wrapped_label(
-                                    ui,
-                                    mut_text(format!(
-                                        "{}: {reason}",
-                                        descriptor.compatibility.label()
-                                    )),
-                                );
-                            }
-                            CompatibilityStatus::Supported { .. } => {}
-                        }
-                        if let Some(detail) = model_install_detail(descriptor, install_status) {
-                            ui.add_space(4.0);
-                            wrapped_label(ui, mut_text(&detail));
-                        }
-                        if matches!(
-                            install_status,
-                            ModelInstallStatus::Downloading { .. }
-                                | ModelInstallStatus::InstallingRuntime
-                        ) {
-                            ui.add_space(8.0);
-                            download_progress_bar(ui, install_status);
-                        }
-                        ui.add_space(8.0);
-                        tag_row(ui, |ui| {
-                            badge(
-                                ui,
-                                descriptor.compatibility.label(),
-                                match descriptor.compatibility {
-                                    CompatibilityStatus::Supported { .. } => ChipTone::Success,
-                                    CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
-                                    CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
-                                },
-                            );
-                            badge(
-                                ui,
-                                if descriptor.capabilities.gpu {
-                                    "Device CPU/GPU"
-                                } else {
-                                    "Device CPU"
-                                },
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("Model {}", format_bytes(descriptor.artifact_size_bytes)),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("RAM {}", descriptor.expected_ram),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("{} speed", descriptor.speed_guidance),
-                                ChipTone::Neutral,
-                            );
-                            badge(
-                                ui,
-                                &format!("{} accuracy", descriptor.accuracy_guidance),
-                                ChipTone::Neutral,
-                            );
-                        });
-                    },
-                );
-                ui.add_space(12.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(actions_width, 0.0),
-                    Layout::top_down(Align::RIGHT),
-                    |ui| {
-                        set_exact_width(ui, actions_width);
-                        actions(ui);
-                    },
-                );
-            });
-        });
-    });
-}
-
-fn current_download_rows(
-    config: &AppConfig,
-    downloads: &HashMap<String, ModelInstallStatus>,
-) -> Vec<(SttModelInfo, ModelInstallStatus)> {
-    let mut rows = config::configured_models(config)
-        .into_iter()
-        .filter_map(|model| {
-            downloads
-                .get(&model.id)
-                .cloned()
-                .map(|status| (model, status))
-        })
-        .filter(|(_, status)| !matches!(status, ModelInstallStatus::NotInstalled))
-        .collect::<Vec<_>>();
-
-    rows.sort_by_key(|(_, status)| match status {
-        ModelInstallStatus::InstallingRuntime => 0,
-        ModelInstallStatus::Downloading { .. } => 0,
-        ModelInstallStatus::Error(_) => 1,
-        ModelInstallStatus::RuntimeError(_) => 1,
-        ModelInstallStatus::Installed => 2,
-        ModelInstallStatus::Missing => 3,
-        ModelInstallStatus::NotInstalled => 4,
-    });
-    rows
-}
-
-fn download_summary_row(
-    ui: &mut Ui,
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-) {
-    full_width_frame(
-        ui,
-        Frame::none().inner_margin(Margin::symmetric(0.0, 4.0)),
-        |ui| {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    wrapped_label(ui, body_strong(descriptor.display_name));
-                    tag_row(ui, |ui| {
-                        badge(
-                            ui,
-                            descriptor.compatibility.label(),
-                            match descriptor.compatibility {
-                                CompatibilityStatus::Supported { .. } => ChipTone::Success,
-                                CompatibilityStatus::Experimental { .. } => ChipTone::Warning,
-                                CompatibilityStatus::Incompatible { .. } => ChipTone::Error,
-                            },
-                        );
-                        badge(
-                            ui,
-                            &install_status.label(),
-                            install_chip_tone(install_status),
-                        );
-                    });
-                    ui.add_space(6.0);
-                    download_progress_bar(ui, install_status);
-                });
-            });
-        },
-    );
-}
-
-fn download_progress_bar(ui: &mut Ui, install_status: &ModelInstallStatus) {
-    let progress = download_progress_fraction(install_status);
-    let text = download_progress_bar_text(install_status);
-    let indeterminate = progress.is_none()
-        && matches!(
-            install_status,
-            ModelInstallStatus::InstallingRuntime | ModelInstallStatus::Downloading { .. }
-        );
-    let response = ui.add(
-        egui::ProgressBar::new(progress.unwrap_or_default())
-            .desired_width(usable_width(ui).max(1.0))
-            .desired_height(18.0)
-            .text(text)
-            .animate(indeterminate),
-    );
-    if indeterminate {
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.clear_numeric_value();
-            builder.clear_min_numeric_value();
-            builder.clear_max_numeric_value();
-        });
-    }
-    if let Some(detail) = download_progress_detail(install_status) {
-        ui.add_space(4.0);
-        wrapped_label(ui, mut_text(detail));
-    }
-}
-
-fn set_collapsing_header_accessibility<R>(
-    ctx: &egui::Context,
-    response: &egui::containers::CollapsingResponse<R>,
-) {
-    ctx.accesskit_node_builder(response.header_response.id, |builder| {
-        builder.set_expanded(response.body_response.is_some());
-    });
-}
-
-fn download_progress_fraction(install_status: &ModelInstallStatus) -> Option<f32> {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes: Some(total_bytes),
-            ..
-        } if *total_bytes > 0 => {
-            Some((*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0))
-        }
-        ModelInstallStatus::Installed => Some(1.0),
-        _ => None,
-    }
-}
-
-fn download_progress_bar_text(install_status: &ModelInstallStatus) -> String {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes: Some(total_bytes),
-            ..
-        } if *total_bytes > 0 => {
-            let percent =
-                (*downloaded_bytes as f64 / *total_bytes as f64 * 100.0).clamp(0.0, 100.0);
-            format!("{percent:.0}% Completed")
-        }
-        ModelInstallStatus::Downloading { .. } => "Downloading".to_owned(),
-        ModelInstallStatus::InstallingRuntime => "Verifying and installing".to_owned(),
-        ModelInstallStatus::Installed => "100% Completed".to_owned(),
-        ModelInstallStatus::Error(_) => "Failed".to_owned(),
-        ModelInstallStatus::RuntimeError(_) => "Runtime repair failed".to_owned(),
-        ModelInstallStatus::Missing => "Missing".to_owned(),
-        ModelInstallStatus::NotInstalled => "Not installed".to_owned(),
-    }
-}
-
-fn download_progress_detail(install_status: &ModelInstallStatus) -> Option<String> {
-    match install_status {
-        ModelInstallStatus::Downloading {
-            downloaded_bytes,
-            total_bytes,
-            bytes_per_second,
-        } => {
-            let transferred = match total_bytes {
-                Some(total_bytes) if *total_bytes > 0 => {
-                    let displayed_total = (*total_bytes).max(*downloaded_bytes);
-                    format!(
-                        "{} / {}",
-                        format_bytes(*downloaded_bytes),
-                        format_bytes(displayed_total)
-                    )
-                }
-                _ => format_bytes(*downloaded_bytes),
-            };
-            Some(match bytes_per_second.filter(|speed| *speed > 0) {
-                Some(speed) => format!("{transferred} · {}/s", format_bytes(speed)),
-                None => transferred,
-            })
-        }
-        ModelInstallStatus::Installed => Some("Installed".to_owned()),
-        ModelInstallStatus::InstallingRuntime => {
-            Some("Preparing the shared local runtime before downloading this model.".to_owned())
-        }
-        ModelInstallStatus::Error(message) => Some(message.clone()),
-        ModelInstallStatus::RuntimeError(message) => Some(message.clone()),
-        ModelInstallStatus::Missing => Some("Missing file".to_owned()),
-        ModelInstallStatus::NotInstalled => None,
     }
 }
 
@@ -11233,7 +11039,9 @@ fn playground_card_ui(
                             offset: 1,
                         });
                     }
-                    if ui.add(small_button(ui, "Clear")).clicked() {
+                    let clear = ui.add(small_button(ui, "Clear"));
+                    scroll_focused_control_into_view(ui, &clear);
+                    if clear.clicked() {
                         actions.push(PlaygroundAction::Clear(
                             card_state.descriptor.id.as_str().to_owned(),
                         ));
@@ -11610,29 +11418,6 @@ fn full_width_frame<R>(
     egui::InnerResponse::new(inner, response)
 }
 
-fn width_before_trailing(ui: &Ui, trailing_width: f32, min_width: f32) -> f32 {
-    let available = usable_width(ui);
-    if available <= trailing_width {
-        return available.max(0.0);
-    }
-    (available - trailing_width)
-        .max(min_width)
-        .min(available - trailing_width)
-}
-
-fn primary_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
-    let colors = ui_palette(ui);
-    Button::new(
-        RichText::new(label)
-            .color(colors.primary_button_text)
-            .strong(),
-    )
-    .fill(colors.primary_button_bg)
-    .stroke(Stroke::new(1.0, colors.primary_button_bg))
-    .rounding(Rounding::same(24.0))
-    .min_size(Vec2::new(190.0, 46.0))
-}
-
 fn primary_small_button<'a>(ui: &Ui, label: &'a str) -> Button<'a> {
     let colors = ui_palette(ui);
     Button::new(
@@ -11686,10 +11471,6 @@ fn status_badge(ui: &mut Ui, status: TranscriptionStatus) {
         TranscriptionStatus::Error => ChipTone::Error,
     };
     badge(ui, &status.to_string(), tone);
-}
-
-fn ready_dot(ui: &mut Ui, status: TranscriptionStatus) {
-    status_badge(ui, status);
 }
 
 fn badge(ui: &mut Ui, label: &str, tone: ChipTone) {
@@ -11835,6 +11616,37 @@ fn recording_timer_text(active: &ActiveRecording) -> String {
     format!("{elapsed}s elapsed - {remaining}s left")
 }
 
+fn launch_system_audio_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer.exe")
+            .arg("ms-settings:privacy-microphone")
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("pavucontrol")
+            .spawn()
+            .or_else(|_| Command::new("gnome-control-center").arg("sound").spawn())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err("this platform does not expose a supported audio-settings launcher".to_owned())
+    }
+}
+
 fn tray_ui_state(is_recording: bool, transcript: &str) -> TrayUiState {
     TrayUiState {
         is_recording,
@@ -11923,149 +11735,51 @@ fn stitch_visuals(theme_mode: ThemeMode) -> egui::Visuals {
     visuals
 }
 
-fn model_install_detail(
-    descriptor: &ModelDescriptor,
-    install_status: &ModelInstallStatus,
-) -> Option<String> {
-    let base = format!(
-        "Model storage: {}",
-        format_bytes(descriptor.artifact_size_bytes)
-    );
-    match install_status {
-        ModelInstallStatus::Downloading { .. } => {
-            Some(format!("{base} · {}", install_status.label()))
-        }
-        ModelInstallStatus::InstallingRuntime => {
-            Some(format!("{base} · {}", install_status.label()))
-        }
-        ModelInstallStatus::Missing => Some(format!(
-            "{base} · The configured model path is missing or incomplete. Reinstall to use this model."
-        )),
-        ModelInstallStatus::Error(message) => Some(format!("{base} · Install failed: {message}")),
-        ModelInstallStatus::RuntimeError(message) => {
-            Some(format!("{base} · Runtime repair failed: {message}"))
-        }
-        ModelInstallStatus::NotInstalled | ModelInstallStatus::Installed => Some(base),
-    }
-}
-
-fn runtime_representative_models(config: &AppConfig) -> Vec<SttModelInfo> {
-    let mut seen_providers = Vec::new();
-    config::configured_models(config)
-        .into_iter()
-        .filter(|model| {
-            let Some(provider) = compatibility_bridge::provider_for_model(model) else {
-                return false;
-            };
-            if seen_providers.contains(&provider.id()) {
-                false
-            } else {
-                seen_providers.push(provider.id());
-                true
-            }
-        })
-        .collect()
-}
-
-fn runtime_detail_text(
-    config: &AppConfig,
-    model: &SttModelInfo,
-    status: &ModelRuntimeStatus,
-) -> String {
-    let used_by = runtime_model_summary(config, model);
-    let storage = compatibility_bridge::runtime_storage_detail(model);
-    let status_detail = match status {
-        ModelRuntimeStatus::Ready => "The local runtime is ready.".to_owned(),
-        ModelRuntimeStatus::MissingConfiguration => {
-            "The model is installed, but its local runtime is not configured.".to_owned()
-        }
-        ModelRuntimeStatus::NotImplemented => {
-            "No verified local runtime is available for this model.".to_owned()
-        }
-        ModelRuntimeStatus::Error(message) => message.clone(),
-        _ => setup_message_for_status(status),
-    };
-    let version = runtime_version_detail(config, model)
-        .map(|detail| format!(" {detail}"))
-        .unwrap_or_default();
-    format!("Used by: {used_by}. Runtime storage: {storage}. {status_detail}{version}")
-}
-
-fn runtime_model_summary(config: &AppConfig, representative: &SttModelInfo) -> String {
-    let provider = compatibility_bridge::provider_for_model(representative);
-    let models = config::configured_models(config)
-        .into_iter()
-        .filter(|model| provider.is_some_and(|provider| provider.same_provider(model)))
-        .map(|model| model.name)
-        .collect::<Vec<_>>();
-    let count = models.len();
-    let preview = models.into_iter().take(3).collect::<Vec<_>>().join(", ");
-    if count > 3 {
-        format!("{preview}, +{} more", count - 3)
-    } else if preview.is_empty() {
-        "no catalog models".to_owned()
-    } else {
-        preview
-    }
-}
-
 #[cfg(test)]
 fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
     compatibility_bridge::model_storage_estimate(model)
 }
 
+fn model_ui_labels(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> (String, String) {
+    let variant = model_variant_label(model, descriptor);
+    let name = descriptor.map_or(model.name.as_str(), |value| value.display_name);
+    (name.to_owned(), variant)
+}
+
+fn model_artifact_remains_manageable(
+    model: &SttModelInfo,
+    effective_status: &ModelInstallStatus,
+) -> bool {
+    model.install_status.is_runnable() || effective_status.is_runnable()
+}
+
+fn model_variant_label(model: &SttModelInfo, descriptor: Option<&ModelDescriptor>) -> String {
+    if let Some(descriptor) = descriptor {
+        return descriptor.variant_label.to_owned();
+    }
+
+    let words = model.name.split_whitespace().collect::<Vec<_>>();
+    let language = words
+        .last()
+        .is_some_and(|word| word.eq_ignore_ascii_case("English"))
+        .then_some("en");
+    let candidate = words
+        .iter()
+        .rev()
+        .find(|word| !word.eq_ignore_ascii_case("English"))
+        .copied()
+        .unwrap_or(model.name.as_str())
+        .to_ascii_lowercase();
+    match language {
+        Some(language) if !candidate.ends_with(format!(".{language}").as_str()) => {
+            format!("{candidate}.{language}")
+        }
+        _ => candidate,
+    }
+}
+
 fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
     compatibility_bridge::model_download_total_bytes(model)
-}
-
-fn runtime_version_badge(config: &AppConfig, model: &SttModelInfo) -> Option<(String, ChipTone)> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
-    match runtime_version_state(config, provider) {
-        RuntimeVersionState::NotTracked => None,
-        RuntimeVersionState::Current(version) => {
-            Some((format!("Version {version}"), ChipTone::Success))
-        }
-        RuntimeVersionState::UpdateAvailable { installed, .. } if installed.is_some() => Some((
-            if runtime_install_source(config, model).is_some() {
-                "Update available"
-            } else {
-                "Update not staged"
-            }
-            .to_owned(),
-            ChipTone::Warning,
-        )),
-        RuntimeVersionState::UpdateAvailable { .. } => {
-            Some(("Version unknown".to_owned(), ChipTone::Warning))
-        }
-    }
-}
-
-fn runtime_version_detail(config: &AppConfig, model: &SttModelInfo) -> Option<String> {
-    let provider = compatibility_bridge::provider_for_model(model)?;
-    match runtime_version_state(config, provider) {
-        RuntimeVersionState::NotTracked => None,
-        RuntimeVersionState::Current(version) => Some(format!("Runtime version: {version}.")),
-        RuntimeVersionState::UpdateAvailable {
-            installed: Some(installed),
-            available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime update available: installed {installed}, available {available}.")
-        } else {
-            format!(
-                "Installed runtime {installed} is usable. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
-        RuntimeVersionState::UpdateAvailable {
-            installed: None,
-            available,
-        } => Some(if runtime_install_source(config, model).is_some() {
-            format!("Runtime version is unknown; update to the staged {available} runtime.")
-        } else {
-            format!(
-                "Runtime version is unknown. This build does not include staged runtime {available} for an explicit update."
-            )
-        }),
-    }
 }
 
 fn build_development_runtime_package(
@@ -12524,12 +12238,49 @@ fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
         .is_some_and(|(path, storage)| path.starts_with(storage))
 }
 
+/// Returns true only for a retained GGML filename at Scribe's own canonical
+/// legacy catalog location. It deliberately excludes `model_paths` and any
+/// outside-storage path so an imported or user-owned artifact can never be
+/// staged for deletion merely because it shares a catalog model ID.
+fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
+    let Some(path) = model.local_path.as_deref() else {
+        return false;
+    };
+    let Some(legacy_path) = config::legacy_downloaded_model_path(config, model) else {
+        return false;
+    };
+    path == legacy_path && is_app_managed_model_path(config, path)
+}
+
 fn select_first_installed_model(config: &mut AppConfig) {
     config.general.selected_default_model = config::configured_models(config)
         .into_iter()
         .find(|model| model.install_status.is_runnable())
         .map(|model| model.id)
         .unwrap_or_default();
+}
+
+fn compare_active_model_replacements(
+    left: &SttModelInfo,
+    left_recommended: bool,
+    left_builtin_rank: Option<usize>,
+    right: &SttModelInfo,
+    right_recommended: bool,
+    right_builtin_rank: Option<usize>,
+) -> std::cmp::Ordering {
+    right_recommended
+        .cmp(&left_recommended)
+        .then_with(|| {
+            left_builtin_rank
+                .unwrap_or(usize::MAX)
+                .cmp(&right_builtin_rank.unwrap_or(usize::MAX))
+        })
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn set_model_selected(config: &mut AppConfig, model_id: &str, selected: bool) {
@@ -12596,12 +12347,24 @@ fn cards_from_config(
     config: &AppConfig,
     service: &TranscriptionService,
 ) -> Vec<PlaygroundCardState> {
+    cards_for_models(
+        config,
+        service,
+        config::playground_selected_installed_models(config),
+    )
+}
+
+fn cards_for_models(
+    config: &AppConfig,
+    service: &TranscriptionService,
+    models: Vec<SttModelInfo>,
+) -> Vec<PlaygroundCardState> {
     let descriptors = service
         .model_descriptors()
         .into_iter()
         .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
         .collect::<HashMap<_, _>>();
-    config::playground_selected_installed_models(config)
+    models
         .into_iter()
         .filter_map(|model| {
             let descriptor = descriptors.get(&model.id)?.clone();
@@ -12623,7 +12386,12 @@ fn cards_from_config(
 fn runtime_status_for_model(config: &AppConfig, model: &SttModelInfo) -> ModelRuntimeStatus {
     if config::remote_gguf_artifact(config, &model.id).is_some()
         || config::imported_gguf_artifact(config, &model.id).is_some()
-        || crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+        || (crate::model_catalog::model_uses_embedded_runtime(&ModelId::new(&model.id))
+            && model.local_path.as_ref().is_none_or(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            }))
     {
         return match model.install_status {
             ModelInstallStatus::Installed => ModelRuntimeStatus::Ready,
@@ -12781,19 +12549,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn model_catalog_row_paints_within_viewport_at_minimum_and_wide_widths() {
-        for width in [840.0, 1440.0, 4096.0] {
-            let output = render_model_catalog_row(width);
-            let max_painted_x = max_visible_painted_x(&output);
-
-            assert!(
-                max_painted_x <= width + 1.0,
-                "model catalog row painted beyond viewport: max_x={max_painted_x}, width={width}"
-            );
-        }
-    }
-
-    #[test]
     fn models_page_paints_within_viewport_at_minimum_and_wide_widths() {
         for width in [840.0, 1440.0, 4096.0] {
             let output = render_models_page(width);
@@ -12812,17 +12567,20 @@ mod layout_tests {
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         let mut app = test_app();
-        app.remote_catalog.snapshot = Some(CatalogSnapshot {
-            source: crate::huggingface_catalog::CatalogSource::BundledFallback,
-            fetched_at_unix_seconds: 0,
-            models: vec![remote_catalog_model(
-                "handy-computer/catalog-fixture",
-                "Catalog fixture",
-                &["en", "es"],
-                true,
-                320 * 1024 * 1024,
-            )],
-        });
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(
+                1,
+                crate::huggingface_catalog::CatalogSource::BundledFallback,
+                vec![remote_catalog_model(
+                    "handy-computer/catalog-fixture",
+                    "Catalog fixture",
+                    &["en", "es"],
+                    true,
+                    320 * 1024 * 1024,
+                )],
+            )
+            .unwrap(),
+        );
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -12844,45 +12602,26 @@ mod layout_tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Runtime maintenance"))
         );
-        for (label_name, role) in [
-            (
-                "Search imports and trusted catalog",
-                egui::accesskit::Role::TextInput,
-            ),
-            ("Trusted catalog size tier", egui::accesskit::Role::ComboBox),
-            (
-                "Sort trusted catalog results",
-                egui::accesskit::Role::ComboBox,
-            ),
+        for (name, role) in [
+            ("Search models", egui::accesskit::Role::TextInput),
+            ("Filter model languages", egui::accesskit::Role::ComboBox),
         ] {
-            let label_id = update
-                .nodes
-                .iter()
-                .find(|(_, node)| {
-                    node.name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
-                })
-                .map(|(id, _)| *id)
-                .unwrap_or_else(|| panic!("missing Models-page label {label_name:?}"));
             assert!(
                 update.nodes.iter().any(|(_, node)| {
-                    node.role() == role && node.labelled_by().contains(&label_id)
+                    node.role() == role && node.name().is_some_and(|actual| actual == name)
                 }),
-                "no {role:?} is programmatically labelled by {label_name:?}"
+                "missing named Models-page {role:?} {name:?}"
             );
         }
-        for filter_name in [
-            "Installed trusted catalog models only",
-            "Recommended trusted catalog models only",
-            "Multilingual trusted catalog models only",
-        ] {
-            assert!(update.nodes.iter().any(|(_, node)| {
-                node.role() == egui::accesskit::Role::CheckBox && node.name() == Some(filter_name)
-            }));
-        }
+        assert!(!update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("trusted catalog models only"))
+        }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Status
-                && node.name() == Some("Showing 1 of 1 trusted catalog models")
+                && node.name() == Some("Bundled trusted catalog · Showing 1 of 1 models.")
                 && node.live() == Some(egui::accesskit::Live::Polite)
                 && node.is_live_atomic()
         }));
@@ -12909,6 +12648,116 @@ mod layout_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn production_route_headings_share_the_28_point_top_inset() {
+        for (tab, title) in [
+            (Tab::Transcribe, "Transcribe"),
+            (Tab::General, "Settings"),
+            (Tab::Models, "Models"),
+            (Tab::History, "History"),
+            (Tab::Advanced, "Settings"),
+            (Tab::About, "Settings"),
+            (Tab::Debug, "Model Playground"),
+        ] {
+            let output = render_app_tab(tab, 840.0);
+            let bounds = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Heading && node.name() == Some(title)
+                })
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("missing production route heading {title}"));
+            assert!(
+                (bounds.y0 - 28.0).abs() <= 6.0,
+                "{title} heading should share the route top inset, got {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_final_playground_control_scrolls_the_outer_production_route() {
+        let width = 840.0;
+        let height = 420.0;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
+        let mut app = test_app();
+        app.current_tab = Tab::Debug;
+        assert_eq!(app.playground_cards.len(), 1);
+
+        let initial =
+            render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(0.0));
+        let target = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button && node.name() == Some("Clear")
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.bounds()
+                    .unwrap()
+                    .y1
+                    .total_cmp(&right.bounds().unwrap().y1)
+            })
+            .map(|(id, _)| *id)
+            .expect("final Playground card should expose a Clear action");
+        let _ = render_debug_route_with_input(
+            &ctx,
+            &mut app,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target,
+                    data: None,
+                },
+            )],
+            Some(0.1),
+        );
+        let _ = render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(0.2));
+        let settled =
+            render_debug_route_with_input(&ctx, &mut app, width, height, Vec::new(), Some(1.0));
+        let target_bounds = settled
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == target)
+            .and_then(|(_, node)| node.bounds())
+            .expect("focused Playground action should remain accessible");
+        let (_, offset, content_size, viewport) = ctx
+            .data(|data| {
+                data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
+                    "route-scroll-diagnostics",
+                ))
+            })
+            .expect("production Debug route should expose scroll diagnostics in tests");
+        assert!(
+            content_size.y > viewport.height() && offset.y > 0.0,
+            "final Playground focus must advance the overflowing production route"
+        );
+        let visible_y0 = target_bounds.y0 - f64::from(offset.y);
+        let visible_y1 = target_bounds.y1 - f64::from(offset.y);
+        assert!(
+            visible_y0 >= f64::from(viewport.min.y) - 1.0
+                && visible_y1 <= f64::from(viewport.max.y) + 1.0,
+            "focused Playground action must be visible; bounds={target_bounds:?}, offset={offset:?}, viewport={viewport:?}"
+        );
     }
 
     #[test]
@@ -12978,74 +12827,6 @@ mod layout_tests {
         for (text, fill) in combinations {
             let ratio = contrast_ratio(text, fill);
             assert!(ratio >= 4.5, "contrast ratio was {ratio:.2}");
-        }
-    }
-
-    #[test]
-    fn input_sensitivity_track_boundary_meets_non_text_contrast() {
-        for palette in [ThemePalette::light(), ThemePalette::dark()] {
-            for adjacent in [palette.panel_bg, palette.card_bg] {
-                let ratio = contrast_ratio(palette.slider_track_border, adjacent);
-                assert!(
-                    ratio >= 3.0,
-                    "input-sensitivity track contrast was {ratio:.2}"
-                );
-            }
-            let live_ratio =
-                contrast_ratio(palette.slider_live_below, palette.slider_threshold_fill);
-            assert!(
-                live_ratio >= 3.0,
-                "below-threshold live-fill contrast was {live_ratio:.2}"
-            );
-        }
-    }
-
-    #[test]
-    fn input_sensitivity_track_has_split_fills_and_constant_live_height() {
-        let palette = ThemePalette::light();
-        assert_ne!(palette.slider_threshold_fill, palette.slider_remainder_fill);
-        let threshold_position = 0.5;
-
-        for (live_position, expected_live_color) in
-            [(0.25, palette.slider_live_below), (0.75, palette.success)]
-        {
-            let ctx = egui::Context::default();
-            configure_stitch_style(&ctx);
-            ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-            let mut threshold = dbfs_to_rms(slider_position_to_dbfs(threshold_position));
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(480.0, 120.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        microphone_sensitivity_slider(ui, live_position, &mut threshold);
-                    });
-                },
-            );
-
-            let rects = output.shapes.iter().filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) => Some(rect),
-                _ => None,
-            });
-            let mut saw_threshold_fill = false;
-            let mut saw_remainder_fill = false;
-            let mut live_height = None;
-            for rect in rects {
-                saw_threshold_fill |= rect.fill == palette.slider_threshold_fill;
-                saw_remainder_fill |= rect.fill == palette.slider_remainder_fill;
-                if rect.fill == expected_live_color {
-                    live_height = Some(rect.rect.height());
-                }
-            }
-
-            assert!(saw_threshold_fill);
-            assert!(saw_remainder_fill);
-            assert_eq!(live_height, Some(INPUT_SENSITIVITY_LIVE_FILL_HEIGHT));
         }
     }
 
@@ -13384,14 +13165,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_db_label_rounds_to_a_compact_whole_db_value() {
-        assert_eq!(input_sensitivity_db_label(-54.4), "-54 dB");
-        assert_eq!(input_sensitivity_db_label(-53.6), "-54 dB");
-        assert_eq!(input_sensitivity_db_label(4.0), "0 dB");
-        assert_eq!(input_sensitivity_db_label(-80.0), "-72 dB");
-    }
-
-    #[test]
     fn sensitivity_slider_endpoints_remain_valid_capture_thresholds() {
         assert!(
             (dbfs_to_rms(INPUT_LEVEL_MIN_DBFS) - config::settings::MIN_MANUAL_ACTIVATION_RMS).abs()
@@ -13450,20 +13223,417 @@ mod layout_tests {
         assert_eq!(settled, 0.0);
     }
 
-    #[test]
-    fn leaving_general_clears_sensitivity_animation_and_fast_repaint() {
+    fn passive_monitor_test_app() -> LocalTranscriberApp {
         let mut app = test_app();
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Recording;
+        app.window_hidden_to_tray = false;
+        app.quit_requested = false;
+        app
+    }
+
+    fn set_fake_starting_monitor(app: &mut LocalTranscriberApp, request_id: u64) {
+        app.microphone_test_sequence = request_id;
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+    }
+
+    fn assert_fake_monitor_stops(mut app: LocalTranscriberApp) {
+        set_fake_starting_monitor(&mut app, 41);
+        app.sync_passive_microphone_monitor();
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 41,
+                stop_requested: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn passive_monitor_predicate_requires_visible_recording_settings_without_an_owner() {
+        let mut app = passive_monitor_test_app();
+        assert!(app.passive_microphone_monitor_needed());
+
+        app.current_tab = Tab::Models;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.settings_tab = SettingsTab::Recording;
+        app.window_hidden_to_tray = true;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.window_hidden_to_tray = false;
+        app.quit_requested = true;
+        assert!(!app.passive_microphone_monitor_needed());
+        app.quit_requested = false;
+        app.deferred_recording_start = Some(DeferredRecordingStart {
+            source: RecordingSource::Transcribe,
+            activation_at: Instant::now(),
+            trigger_observation: TriggerObservation::AppAction,
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+        app.deferred_recording_start = None;
+        app.deferred_history_playback = Some(7);
+        assert!(!app.passive_microphone_monitor_needed());
+        app.deferred_history_playback = None;
+        app.playing_history_id = Some(7);
+        assert!(!app.passive_microphone_monitor_needed());
+        app.playing_history_id = None;
+
+        app.pending_recording = Some(PendingRecording {
+            session_id: SessionId(70),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+        app.pending_recording = None;
+        app.active_recording = Some(ActiveRecording {
+            session_id: SessionId(71),
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            started_at: Instant::now(),
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+        });
+        assert!(!app.passive_microphone_monitor_needed());
+    }
+
+    #[test]
+    fn passive_monitor_sync_is_idempotent_and_never_duplicates_starting_sessions() {
+        let mut app = passive_monitor_test_app();
+        set_fake_starting_monitor(&mut app, 17);
+
+        app.sync_passive_microphone_monitor();
+        app.sync_passive_microphone_monitor();
+
+        assert_eq!(app.microphone_test_sequence, 17);
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 17,
+                stop_requested: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn passive_monitor_tears_down_for_every_competing_owner_and_visibility_exit() {
+        let mut route_exit = passive_monitor_test_app();
+        route_exit.settings_tab = SettingsTab::Advanced;
+        assert_fake_monitor_stops(route_exit);
+
+        let mut hidden = passive_monitor_test_app();
+        hidden.window_hidden_to_tray = true;
+        assert_fake_monitor_stops(hidden);
+
+        let mut quitting = passive_monitor_test_app();
+        quitting.quit_requested = true;
+        assert_fake_monitor_stops(quitting);
+
+        let mut deferred_capture = passive_monitor_test_app();
+        deferred_capture.deferred_recording_start = Some(DeferredRecordingStart {
+            source: RecordingSource::Transcribe,
+            activation_at: Instant::now(),
+            trigger_observation: TriggerObservation::AppAction,
+        });
+        assert_fake_monitor_stops(deferred_capture);
+
+        let mut deferred_playback = passive_monitor_test_app();
+        deferred_playback.deferred_history_playback = Some(7);
+        assert_fake_monitor_stops(deferred_playback);
+
+        let mut playback = passive_monitor_test_app();
+        playback.playing_history_id = Some(7);
+        assert_fake_monitor_stops(playback);
+
+        let mut capture = passive_monitor_test_app();
+        capture.pending_recording = Some(PendingRecording {
+            session_id: SessionId(72),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+        assert_fake_monitor_stops(capture);
+    }
+
+    #[test]
+    fn passive_monitor_repaints_at_twenty_hz_only_while_its_session_exists() {
+        let mut app = passive_monitor_test_app();
         let now = Instant::now();
         app.microphone_level_envelope
-            .update(0.1, Some(1), true, now);
-        assert!(app.microphone_level_envelope.is_animating());
+            .update(0.2, Some(1), true, now);
+        assert_eq!(app.next_repaint_delay(), IDLE_REPAINT_DELAY);
+
+        set_fake_starting_monitor(&mut app, 23);
+        assert_eq!(app.next_repaint_delay(), PASSIVE_MONITOR_REPAINT_DELAY);
+        assert_eq!(PASSIVE_MONITOR_REPAINT_DELAY, Duration::from_millis(50));
+
+        app.microphone_test = MicrophoneTest::Idle;
+        app.pending_recording = Some(PendingRecording {
+            session_id: SessionId(73),
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
         assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
+    }
 
-        app.current_tab = Tab::Transcribe;
-        app.suspend_microphone_monitor();
+    #[test]
+    fn stale_microphone_test_ready_is_discarded_without_replacing_the_current_request() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 2,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 1,
+                result: Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                )),
+            })
+            .unwrap();
 
-        assert!(!app.microphone_level_envelope.is_animating());
-        assert_ne!(app.next_repaint_delay(), METER_REPAINT_DELAY);
+        app.poll_events();
+
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Starting {
+                request_id: 2,
+                stop_requested: false,
+                ..
+            }
+        ));
+        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
+    }
+
+    #[test]
+    fn microphone_test_ready_keeps_capture_outside_dictation_lifecycle() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 1,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 1,
+                result: Ok(RecordingSession::simulated(
+                    None,
+                    CaptureStopReason::Explicit,
+                )),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Active { .. }));
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
+        app.stop_microphone_test();
+    }
+
+    #[test]
+    fn microphone_monitor_defers_retained_audio_playback_until_teardown() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+        };
+
+        app.apply_history_action(HistoryPageAction::Play(7));
+
+        assert!(app.playing_history_id.is_none());
+        assert_eq!(app.deferred_history_playback, Some(7));
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+        assert_eq!(app.status_message, "Preparing audio playback");
+    }
+
+    #[test]
+    fn cancelled_monitor_startup_keeps_audio_owners_excluded_until_confirmation() {
+        let mut app = test_app();
+        let cancellation = CaptureCancellation::new();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 12,
+            stop_requested: false,
+            cancellation: cancellation.clone(),
+        };
+
+        app.stop_microphone_test();
+        assert!(cancellation.is_cancelled());
+        app.apply_history_action(HistoryPageAction::Play(7));
+        assert_eq!(app.deferred_history_playback, Some(7));
+        app.start_recording(RecordingSource::Transcribe);
+        assert!(app.deferred_recording_start.is_some());
+        assert!(app.deferred_history_playback.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+
+        app.stop_recording();
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 12,
+                result: Err(CaptureError::StartupCancelled),
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
+        assert!(app.microphone_test_error.is_none());
+    }
+
+    #[test]
+    fn second_toggle_cancels_a_recording_deferred_for_monitor_teardown() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+        };
+
+        app.toggle_recording();
+        assert!(app.deferred_recording_start.is_some());
+        assert_eq!(app.recording_source(), Some(RecordingSource::Transcribe));
+
+        app.toggle_recording();
+        assert!(app.deferred_recording_start.is_none());
+        assert_eq!(app.status_message, "Recording cancelled");
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+    }
+
+    #[test]
+    fn hold_release_cancels_a_recording_deferred_for_monitor_teardown() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+        };
+        app.start_recording_at(
+            RecordingSource::Transcribe,
+            Instant::now(),
+            TriggerObservation::HotkeyPoll,
+        );
+
+        assert_eq!(
+            hotkey_recording_action(
+                HotkeyMode::HoldToTalk,
+                HotkeyEvent::Released,
+                app.recording_source(),
+            ),
+            Some(HotkeyRecordingAction::Stop)
+        );
+        app.stop_recording();
+
+        assert!(app.deferred_recording_start.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+    }
+
+    #[test]
+    fn quit_clears_deferred_audio_before_monitor_teardown_can_dispatch_it() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Active {
+            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
+        };
+        app.deferred_recording_start = Some(DeferredRecordingStart {
+            source: RecordingSource::Transcribe,
+            activation_at: Instant::now(),
+            trigger_observation: TriggerObservation::AppAction,
+        });
+        app.deferred_history_playback = Some(7);
+
+        app.apply_tray_command(TrayCommand::Quit, &ctx);
+        app.poll_microphone_test();
+
+        assert!(app.quit_requested);
+        assert!(app.deferred_recording_start.is_none());
+        assert!(app.deferred_history_playback.is_none());
+        assert!(app.pending_recording.is_none());
+        assert!(app.active_recording.is_none());
+        assert!(app.playing_history_id.is_none());
+    }
+
+    #[test]
+    fn monitor_failure_is_retry_gated_and_device_change_resets_the_source() {
+        let mut app = test_app();
+        app.microphone_test = MicrophoneTest::Starting {
+            request_id: 3,
+            stop_requested: false,
+            cancellation: CaptureCancellation::new(),
+        };
+        app.tx
+            .send(AppEvent::MicrophoneTestReady {
+                request_id: 3,
+                result: Err(CaptureError::StartupCancelled),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.microphone_monitor_retry_required);
+        let sequence = app.microphone_test_sequence;
+        app.ensure_microphone_monitor();
+        assert_eq!(app.microphone_test_sequence, sequence);
+
+        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
+        session.set_simulated_telemetry(LevelSnapshot {
+            rms: 0.08,
+            peak: 0.15,
+        });
+        app.microphone_test = MicrophoneTest::Active { session };
+        let now = Instant::now();
+        app.microphone_level_envelope
+            .update(0.08, Some(1), true, now);
+        app.apply_settings_screen_action(ScreenAction::SetAudioDevice(Some(
+            "Replacement microphone".to_owned(),
+        )));
+
+        assert_eq!(
+            app.config.recording.audio_input_device_name.as_deref(),
+            Some("Replacement microphone")
+        );
+        assert!(matches!(
+            app.microphone_test,
+            MicrophoneTest::Stopping { .. }
+        ));
+        assert!(!app.microphone_monitor_retry_required);
+        assert!(app.microphone_level_envelope.last_revision.is_none());
+    }
+
+    #[test]
+    fn settings_microphone_retry_clears_the_failure_gate_before_restarting() {
+        let mut app = test_app();
+        app.microphone_test_error = Some("Microphone permission denied".to_owned());
+        app.microphone_monitor_retry_required = true;
+        app.playing_history_id = Some(7);
+        let sequence = app.microphone_test_sequence;
+
+        app.apply_settings_screen_action(ScreenAction::RetryMicrophone);
+
+        assert!(app.microphone_test_error.is_none());
+        assert!(!app.microphone_monitor_retry_required);
+        assert_eq!(app.microphone_test_sequence, sequence);
+        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
     }
 
     #[test]
@@ -13593,207 +13763,6 @@ mod layout_tests {
                 activation_rms: 0.025
             }
         );
-    }
-
-    #[test]
-    fn stale_microphone_test_ready_is_discarded_without_replacing_the_current_request() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 2,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 1,
-                result: Ok(RecordingSession::simulated(
-                    None,
-                    CaptureStopReason::Explicit,
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 2,
-                stop_requested: false,
-                ..
-            }
-        ));
-        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
-    }
-
-    #[test]
-    fn microphone_test_ready_keeps_capture_outside_dictation_lifecycle() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 1,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 1,
-                result: Ok(RecordingSession::simulated(
-                    None,
-                    CaptureStopReason::Explicit,
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(app.microphone_test, MicrophoneTest::Active { .. }));
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
-        assert_eq!(app.session_coordinator.phase(), DictationPhase::Idle);
-        app.stop_microphone_test();
-    }
-
-    #[test]
-    fn microphone_monitor_defers_retained_audio_playback_until_teardown() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Active {
-            session: RecordingSession::simulated(None, CaptureStopReason::Explicit),
-        };
-
-        app.apply_history_action(HistoryPageAction::Play(7));
-
-        assert!(app.playing_history_id.is_none());
-        assert_eq!(app.deferred_history_playback, Some(7));
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        assert_eq!(app.status_message, "Preparing audio playback");
-    }
-
-    #[test]
-    fn stopping_microphone_test_keeps_all_audio_owners_excluded_until_completion() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Active {
-            session: RecordingSession::simulated_with_stop_delay(
-                None,
-                CaptureStopReason::Explicit,
-                Duration::from_millis(80),
-            ),
-        };
-
-        app.stop_microphone_test();
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-
-        let sequence = app.microphone_test_sequence;
-        app.start_microphone_test();
-        assert_eq!(app.microphone_test_sequence, sequence);
-        app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.pending_recording.is_none());
-        assert!(app.active_recording.is_none());
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-
-        app.poll_microphone_test();
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        app.stop_recording();
-        assert!(app.deferred_recording_start.is_none());
-        thread::sleep(Duration::from_millis(100));
-        app.poll_microphone_test();
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-    }
-
-    #[test]
-    fn stopping_during_microphone_startup_adopts_ready_session_until_teardown() {
-        let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 9,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
-        app.stop_microphone_test();
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 9,
-                result: Ok(RecordingSession::simulated_with_stop_delay(
-                    None,
-                    CaptureStopReason::Explicit,
-                    Duration::from_millis(50),
-                )),
-            })
-            .unwrap();
-
-        app.poll_events();
-
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Stopping { .. }
-        ));
-        assert!(app.microphone_test_is_active());
-        thread::sleep(Duration::from_millis(70));
-        app.poll_microphone_test();
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-    }
-
-    #[test]
-    fn cancelled_microphone_startup_keeps_audio_excluded_until_worker_confirmation() {
-        let mut app = test_app();
-        let cancellation = CaptureCancellation::new();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 12,
-            stop_requested: false,
-            cancellation: cancellation.clone(),
-        };
-
-        app.stop_microphone_test();
-        assert!(cancellation.is_cancelled());
-        assert!(matches!(
-            app.microphone_test,
-            MicrophoneTest::Starting {
-                request_id: 12,
-                stop_requested: true,
-                ..
-            }
-        ));
-        let sequence = app.microphone_test_sequence;
-        app.start_microphone_test();
-        assert_eq!(app.microphone_test_sequence, sequence);
-        app.apply_history_action(HistoryPageAction::Play(7));
-        assert_eq!(app.deferred_history_playback, Some(7));
-        app.start_recording(RecordingSource::Transcribe);
-        assert!(app.deferred_recording_start.is_some());
-        assert!(app.deferred_history_playback.is_none());
-        assert_eq!(app.status_message, "Preparing microphone");
-        app.apply_history_action(HistoryPageAction::Play(8));
-        assert!(app.playing_history_id.is_none());
-        assert!(app.deferred_history_playback.is_none());
-        assert_eq!(
-            app.status_message,
-            "Stop recording before playing retained audio"
-        );
-        assert!(app.microphone_test_is_active());
-
-        app.stop_recording();
-
-        app.tx
-            .send(AppEvent::MicrophoneTestReady {
-                request_id: 12,
-                result: Err(CaptureError::StartupCancelled),
-            })
-            .unwrap();
-        app.poll_events();
-
-        assert!(matches!(app.microphone_test, MicrophoneTest::Idle));
-        assert!(app.microphone_test_error.is_none());
     }
 
     #[test]
@@ -15324,6 +15293,664 @@ mod layout_tests {
     }
 
     #[test]
+    fn comparison_runs_one_model_at_a_time_and_keeps_success_after_failure() {
+        let mut app = test_app();
+        app.transcript = "keep active transcript".to_owned();
+        let first_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
+        let second_id = "comparison_second_model".to_owned();
+        let mut second_card = app.playground_cards[0].clone();
+        second_card.descriptor.id = ModelId::new(&second_id);
+        app.playground_cards.push(second_card);
+        for card in &mut app.playground_cards {
+            card.status = ModelRuntimeStatus::Ready;
+            card.audio_duration_ms = Some(1_000);
+        }
+
+        let session_id = SessionId(44);
+        let first_request = RequestId(440);
+        let second_request = RequestId(441);
+        app.session_coordinator.seed_active_for_test(
+            session_id,
+            SessionPurpose::Comparison,
+            [
+                (first_request, ModelId::new(&first_id)),
+                (second_request, ModelId::new(&second_id)),
+            ],
+        );
+        app.playground_pending = 2;
+        app.comparison_run_model_ids = Some(vec![first_id.clone(), second_id.clone()]);
+        app.comparison_started_at = Some(Instant::now());
+        app.model_comparison
+            .selected_model_ids
+            .extend([first_id.clone(), second_id.clone()]);
+        app.model_comparison.reference_draft = "hello world".to_owned();
+        app.model_comparison.reference_transcript = Some("hello world".to_owned());
+        let audio = test_prepared_audio();
+        let released = Arc::downgrade(&audio);
+        app.playground_runs.insert(
+            session_id,
+            PlaygroundRunState {
+                pending_requests: HashMap::from([
+                    (first_request, first_id.clone()),
+                    (second_request, second_id.clone()),
+                ]),
+                _audio: audio,
+            },
+        );
+
+        app.tx
+            .send(AppEvent::PlaygroundModelStarted {
+                session_id,
+                request_id: first_request,
+                model_id: first_id.clone(),
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(app.playground_cards[0].status, ModelRuntimeStatus::Running);
+        assert_eq!(app.playground_cards[1].status, ModelRuntimeStatus::Ready);
+
+        app.tx
+            .send(AppEvent::TranscriptionFailed {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id: first_request,
+                model_id: first_id.clone(),
+                message: "first failed".to_owned(),
+                latency: None,
+            })
+            .unwrap();
+        app.tx
+            .send(AppEvent::PlaygroundModelStarted {
+                session_id,
+                request_id: second_request,
+                model_id: second_id.clone(),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(matches!(
+            app.playground_cards[0].status,
+            ModelRuntimeStatus::Error(_)
+        ));
+        assert_eq!(app.playground_cards[1].status, ModelRuntimeStatus::Running);
+        assert_eq!(app.playground_pending, 1);
+        assert!(released.upgrade().is_some());
+
+        app.tx
+            .send(AppEvent::TranscriptionDone {
+                source: RecordingSource::Playground,
+                session_id,
+                request_id: second_request,
+                result: Box::new(test_transcription_outcome_for_model(
+                    session_id,
+                    second_request,
+                    &second_id,
+                    "hello world",
+                )),
+                latency: None,
+            })
+            .unwrap();
+        app.poll_events();
+        app.sync_model_comparison_state();
+
+        assert!(released.upgrade().is_none());
+        assert_eq!(app.playground_pending, 0);
+        assert_eq!(app.model_comparison.phase, ComparisonPhase::Complete);
+        assert_eq!(app.transcript, "keep active transcript");
+        assert_eq!(app.model_comparison.results.len(), 2);
+        assert_eq!(
+            app.model_comparison.results[0].1.phase,
+            ComparisonResultPhase::Error
+        );
+        assert_eq!(app.model_comparison.results[1].1.word_error_rate, Some(0.0));
+    }
+
+    #[test]
+    fn comparison_projection_recomputes_wer_only_for_changed_revisions() {
+        let mut app = test_app();
+        let first_id = app.playground_cards[0].descriptor.id.as_str().to_owned();
+        let second_id = "comparison-cache-second".to_owned();
+        let mut second_card = app.playground_cards[0].clone();
+        second_card.descriptor.id = ModelId::new(&second_id);
+        app.playground_cards.push(second_card);
+        app.playground_cards[0].status = ModelRuntimeStatus::Ready;
+        app.playground_cards[0].transcript = "hello brave world".to_owned();
+        app.playground_cards[0].latency_ms = Some(100);
+        app.playground_cards[1].status = ModelRuntimeStatus::Ready;
+        app.playground_cards[1].transcript = "hello word".to_owned();
+        app.playground_cards[1].latency_ms = Some(120);
+        app.comparison_run_model_ids = Some(vec![first_id.clone(), second_id.clone()]);
+        app.comparison_started_at = Some(Instant::now());
+        app.set_comparison_reference(Some("hello world".to_owned()));
+
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 2);
+        assert_eq!(app.comparison_output_replacement_count, 2);
+        assert_eq!(
+            app.model_comparison.results[0].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello world", "hello brave world") as f32)
+        );
+        let output_pointers = app
+            .model_comparison
+            .results
+            .iter()
+            .map(|(_, result)| result.output.as_ref().unwrap().as_ptr())
+            .collect::<Vec<_>>();
+
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 2);
+        assert_eq!(app.comparison_output_replacement_count, 2);
+        assert_eq!(
+            app.model_comparison
+                .results
+                .iter()
+                .map(|(_, result)| result.output.as_ref().unwrap().as_ptr())
+                .collect::<Vec<_>>(),
+            output_pointers
+        );
+
+        app.playground_cards[0].transcript = "hello world".to_owned();
+        app.mark_comparison_output_changed(&first_id);
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 3);
+        assert_eq!(app.comparison_output_replacement_count, 3);
+        assert_eq!(app.model_comparison.results[0].1.word_error_rate, Some(0.0));
+
+        app.set_comparison_reference(Some("hello brave world".to_owned()));
+        app.sync_model_comparison_state();
+
+        assert_eq!(app.comparison_wer_compute_count, 5);
+        assert_eq!(app.comparison_output_replacement_count, 3);
+        assert_eq!(
+            app.model_comparison.results[0].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello brave world", "hello world") as f32)
+        );
+        assert_eq!(
+            app.model_comparison.results[1].1.word_error_rate,
+            Some(benchmark::calculate_wer("hello brave world", "hello word") as f32)
+        );
+    }
+
+    #[test]
+    fn comparison_projection_drops_cached_output_when_a_card_is_removed() {
+        let mut app = test_app();
+        let removed_id = "comparison-removed-model".to_owned();
+        let mut removed_card = app.playground_cards[0].clone();
+        removed_card.descriptor.id = ModelId::new(&removed_id);
+        removed_card.transcript = "cached output".to_owned();
+        removed_card.latency_ms = Some(50);
+        app.playground_cards.push(removed_card);
+        app.comparison_run_model_ids = Some(vec![removed_id.clone()]);
+        app.set_comparison_reference(Some("cached output".to_owned()));
+        app.sync_model_comparison_state();
+        assert_eq!(
+            app.model_comparison.results[0].1.output.as_deref(),
+            Some("cached output")
+        );
+
+        app.refresh_playground_cards_from_config();
+        app.sync_model_comparison_state();
+
+        assert!(app.model_comparison.results[0].1.output.is_none());
+        assert!(app.model_comparison.results[0].1.word_error_rate.is_none());
+    }
+
+    #[test]
+    fn models_render_clears_reference_focus_requests_and_notice_after_one_frame() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.model_comparison.expanded = true;
+        app.model_comparison.reference_editor_visible = true;
+        app.model_comparison.focus_reference_editor = true;
+
+        let render = |ctx: &egui::Context, app: &mut LocalTranscriberApp| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_180.0, 815.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| app.ui_models(ui));
+                },
+            )
+        };
+
+        let output = render(&ctx, &mut app);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.name()),
+            Some("Reference transcript")
+        );
+        assert!(!app.model_comparison.focus_reference_editor);
+
+        app.model_comparison.reference_editor_visible = false;
+        app.model_comparison.reference_draft = "spoken words".into();
+        app.model_comparison.reference_transcript = Some("spoken words".into());
+        app.model_comparison.restore_reference_action_focus = true;
+        app.model_comparison.reference_notice = Some("Reference transcript applied.".into());
+        let output = render(&ctx, &mut app);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.name()),
+            Some("Edit reference")
+        );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.name() == Some("Reference transcript applied.")
+                && node.live() == Some(egui::accesskit::Live::Polite)
+                && node.is_live_atomic()
+        }));
+        assert!(!app.model_comparison.restore_reference_action_focus);
+        assert_eq!(app.model_comparison.reference_notice, None);
+    }
+
+    #[test]
+    fn live_model_projection_exposes_details_actions_for_ready_models() {
+        let mut app = test_app();
+        let base_fixture = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+
+        let selected = app.transcribe_screen_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].display_name, "Whisper Tiny — English");
+        assert_eq!(selected[0].variant_label, "tiny.en");
+
+        app.config.general.selected_default_model = "not-selected".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let ready = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .expect("tiny model should be projected");
+        assert!(ready.installed);
+        assert!(ready.ready);
+        assert!(!ready.active);
+        assert_eq!(ready.primary_action_label, "Use this model");
+        assert!(ready.primary_action_enabled);
+        assert!(!ready.primary_action_repairs_runtime);
+        assert_eq!(ready.primary_action_disabled_reason, None);
+        assert_eq!(ready.display_name, "Whisper Tiny — English");
+        assert_eq!(ready.variant_label, "tiny.en");
+
+        assert!(
+            app.model_management_catalog()
+                .iter()
+                .any(|model| model.id == "whisper_cpp_base_en" && model.installed),
+            "an installed retained-compatibility model must remain manageable"
+        );
+
+        app.config.general.selected_default_model = "whisper_cpp_tiny_en".to_owned();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        let active = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_tiny_en")
+            .expect("active tiny model should be projected");
+        assert!(active.active);
+        assert_eq!(active.primary_action_label, "Active");
+        assert!(!active.primary_action_enabled);
+        assert_eq!(
+            active.primary_action_disabled_reason.as_deref(),
+            Some("This model is already active.")
+        );
+        let _ = fs::remove_file(base_fixture);
+    }
+
+    #[test]
+    fn legacy_model_projection_exposes_upgrade_without_changing_its_stable_id() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-upgrade-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy = root.join("external").join("ggml-small.en.bin");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_small_en".to_owned();
+        app.config
+            .general
+            .model_paths
+            .insert("whisper_cpp_small_en".to_owned(), legacy.clone());
+        config::normalize_config(&mut app.config);
+        let model = config::selected_model(&app.config).unwrap();
+
+        let projected = app.model_management_view_model(&model, None);
+
+        assert_eq!(projected.id, "whisper_cpp_small_en");
+        assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.primary_action_enabled);
+        assert!(projected.primary_action_installs_upgrade);
+        assert!(!projected.primary_action_repairs_runtime);
+        assert!(legacy.is_file());
+        assert_eq!(
+            app.config.general.selected_default_model,
+            "whisper_cpp_small_en"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_owned_legacy_model_is_selected_but_unavailable_and_removable() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-owned-legacy-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("base legacy path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        config::normalize_config(&mut app.config);
+        let model = config::selected_model(&app.config).expect("selected base model");
+
+        let projected = app.model_management_view_model(&model, None);
+
+        assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
+        assert!(projected.installed);
+        assert!(projected.selected);
+        assert!(!projected.ready);
+        assert!(!projected.active);
+        assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.removal_supported);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_model_projection_exposes_repair_for_an_installed_runtime_failure() {
+        let app = test_app();
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&ModelId::new("whisper_cpp_tiny_en"))
+            .unwrap();
+        let model = SttModelInfo {
+            id: "installed-without-provider".to_owned(),
+            name: "Local compatibility model".to_owned(),
+            backend: "Unavailable runtime".to_owned(),
+            description: "Installed model with a missing runtime provider.".to_owned(),
+            expected_ram: "1 GB".to_owned(),
+            accuracy_tier: "Unknown".to_owned(),
+            speed_tier: "Unknown".to_owned(),
+            local_path: None,
+            install_status: ModelInstallStatus::Installed,
+            download_model: None,
+        };
+
+        let projected = app.model_management_view_model(&model, Some(&descriptor));
+
+        assert!(projected.installed);
+        assert!(!projected.ready);
+        assert_eq!(projected.primary_action_label, "Repair runtime");
+        assert!(projected.primary_action_repairs_runtime);
+        assert!(!projected.primary_action_enabled);
+        assert_eq!(
+            projected.primary_action_disabled_reason.as_deref(),
+            Some("This model has no compatible local provider.")
+        );
+    }
+
+    #[test]
+    fn descriptorless_installed_compatibility_model_remains_manageable_and_selectable() {
+        let mut app = test_app();
+        let id = "vosk_small_en";
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-vosk-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["am", "conf", "graph"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join("am").join("final.mdl"), b"model").unwrap();
+        fs::write(root.join("conf").join("model.conf"), b"conf").unwrap();
+        fs::write(root.join("graph").join("HCLG.fst"), b"graph").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert(id.to_owned(), root.clone());
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        assert!(
+            app.transcription_service
+                .model_descriptor(&ModelId::new(id))
+                .is_err(),
+            "the fixture must exercise the descriptor-less compatibility path"
+        );
+
+        let projected = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("installed compatibility model must remain visible");
+        assert!(projected.installed);
+        assert_eq!(projected.display_name, "Vosk small English");
+        assert_eq!(projected.variant_label, "small.en");
+        assert_eq!(projected.compatibility, ModelCompatibility::Incompatible);
+
+        app.model_downloads
+            .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        let repairing = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("compatibility model must remain visible during runtime repair");
+        assert!(repairing.installed);
+        assert!(!repairing.ready);
+        assert_eq!(repairing.download_state, ModelDownloadState::Verifying);
+        assert_eq!(repairing.primary_action_label, "Repair runtime");
+
+        app.model_downloads.insert(
+            id.to_owned(),
+            ModelInstallStatus::RuntimeError("runtime repair failed".into()),
+        );
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        let failed = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("compatibility model must remain visible after runtime repair fails");
+        assert!(failed.installed);
+        assert!(!failed.ready);
+        assert_eq!(failed.download_state, ModelDownloadState::Failed);
+        assert_eq!(failed.primary_action_label, "Repair runtime");
+
+        app.config.general.selected_default_model = id.to_owned();
+        assert_eq!(app.selected_model_ui_label(), "Vosk small English");
+        let selected = app.transcribe_screen_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, id);
+        assert_eq!(selected[0].display_name, "Vosk small English");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_model_projection_reuses_one_resolved_model_value() {
+        let mut app = test_app();
+        let resolved = app.selected_model().expect("test app has a selected model");
+        let expected_state = app.selected_model_screen_state();
+        let expected_label = app.selected_model_ui_label();
+
+        app.config.general.selected_default_model = "missing-after-resolution".to_owned();
+
+        assert_eq!(
+            app.selected_model_screen_state_from(Some(&resolved)),
+            expected_state
+        );
+        assert_eq!(
+            app.selected_model_ui_label_from(Some(&resolved)),
+            expected_label
+        );
+    }
+
+    #[test]
+    fn initial_runtime_preparation_does_not_claim_the_model_artifact_is_installed() {
+        let mut app = test_app();
+        let id = "whisper_cpp_base_en";
+        let mut model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == id)
+            .unwrap();
+        model.local_path = None;
+        model.install_status = ModelInstallStatus::NotInstalled;
+        let descriptor = app
+            .transcription_service
+            .model_descriptor(&ModelId::new(id))
+            .unwrap();
+        app.model_downloads
+            .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
+
+        let projected = app.model_management_view_model(&model, Some(&descriptor));
+
+        assert!(!projected.installed);
+        assert!(!projected.ready);
+        assert_eq!(projected.download_state, ModelDownloadState::Verifying);
+        assert_eq!(projected.primary_action_label, "Not installed");
+    }
+
+    #[test]
+    fn blocked_model_selection_keeps_the_details_dialog_open() {
+        let mut app = test_app();
+        let selected = app.config.general.selected_default_model.clone();
+        app.model_management.dialog = Some(ModelDialog::Details("whisper_cpp_tiny_en".into()));
+        app.artifact_recovery_error = Some("Resolve artifact recovery first.".into());
+
+        app.apply_model_management_action(ScreenAction::SelectModel("whisper_cpp_tiny_en".into()));
+
+        assert_eq!(app.config.general.selected_default_model, selected);
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Details("whisper_cpp_tiny_en".into()))
+        );
+        assert_eq!(app.status_message, "Resolve artifact recovery first.");
+        assert_eq!(app.model_management.restore_details_focus, None);
+    }
+
+    #[test]
+    fn live_compare_selection_rejects_a_fifth_model_and_locks_while_busy() {
+        let mut app = test_app();
+        app.model_comparison
+            .selected_model_ids
+            .extend(["one", "two", "three", "four"].map(str::to_owned));
+
+        app.apply_model_management_action(ScreenAction::ToggleComparisonModel("five".into()));
+
+        assert!(!app.model_comparison.selected_model_ids.contains("five"));
+        assert_eq!(
+            app.model_comparison.selection_feedback.as_deref(),
+            Some("A comparison can include at most four models.")
+        );
+
+        app.model_comparison.phase = ComparisonPhase::Recording;
+        app.apply_model_management_action(ScreenAction::ToggleComparisonModel("one".into()));
+        assert!(app.model_comparison.selected_model_ids.contains("one"));
+        assert_eq!(
+            app.model_comparison.selection_feedback.as_deref(),
+            Some("Model selection is locked during a comparison.")
+        );
+    }
+
+    #[test]
+    fn comparison_start_does_not_supersede_active_dictation_or_output() {
+        for output_pending in [false, true] {
+            let mut app = test_app();
+            let session_id = SessionId(44);
+            let request_id = RequestId(440);
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            app.transcript = "keep transcript".to_owned();
+            app.raw_transcript = "keep raw transcript".to_owned();
+            app.status = TranscriptionStatus::Transcribing;
+            app.model_comparison
+                .selected_model_ids
+                .extend(["one".to_owned(), "two".to_owned()]);
+            seed_test_request(
+                &mut app,
+                RecordingSource::Transcribe,
+                session_id,
+                request_id,
+                model_id.as_str(),
+            );
+            if output_pending {
+                app.session_coordinator
+                    .complete_request(session_id, request_id, &model_id)
+                    .unwrap();
+                app.session_coordinator.begin_output(session_id).unwrap();
+                app.pending_output = Some(PendingOutput {
+                    session_id,
+                    history_id: None,
+                    transcript: "queued output".to_owned(),
+                    completion_message: "Complete".to_owned(),
+                    config: app.config.clone(),
+                    latency: None,
+                });
+            }
+            let phase = app.session_coordinator.phase();
+            let history = app.history_records.clone();
+
+            app.apply_model_management_action(ScreenAction::StartComparison);
+
+            assert_eq!(
+                app.session_coordinator.active_session_id(),
+                Some(session_id)
+            );
+            assert_eq!(
+                app.session_coordinator.active_purpose(),
+                Some(SessionPurpose::Dictation)
+            );
+            assert_eq!(app.session_coordinator.phase(), phase);
+            assert_eq!(app.transcript, "keep transcript");
+            assert_eq!(app.raw_transcript, "keep raw transcript");
+            assert_eq!(app.history_records, history);
+            assert_eq!(
+                app.pending_output
+                    .as_ref()
+                    .map(|pending| pending.session_id),
+                output_pending.then_some(session_id)
+            );
+            assert!(app.comparison_run_model_ids.is_none());
+            assert_eq!(app.model_comparison.phase, ComparisonPhase::Idle);
+            assert_eq!(
+                app.model_comparison.start_disabled_reason.as_deref(),
+                Some("Finish the current dictation before starting a comparison.")
+            );
+        }
+    }
+
+    #[test]
     fn mismatched_service_ids_are_rejected_without_output() {
         let mut app = test_app();
         app.config.output.auto_insert_transcript = false;
@@ -15817,56 +16444,6 @@ mod layout_tests {
         );
     }
 
-    fn render_model_catalog_row(width: f32) -> egui::FullOutput {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-
-        let raw_input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(width, 760.0),
-            )),
-            ..Default::default()
-        };
-
-        ctx.run(raw_input, |ctx| {
-            let mut current_tab = Tab::Models;
-            show_test_navigation(ctx, &mut current_tab);
-            egui::CentralPanel::default()
-                .frame(content_panel_frame(ctx))
-                .show(ctx, |ui| {
-                    page(
-                        ui,
-                        "Models Catalog",
-                        TranscriptionStatus::Idle,
-                        "Ready",
-                        |ui| {
-                            panel(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    let mut search = "whisper".to_owned();
-                                    model_search_filter_control(ui, &mut search);
-                                });
-                            });
-
-                            ui.add_space(12.0);
-                            let model = test_model();
-                            let descriptor = crate::model_catalog::model_descriptor(
-                                &crate::transcription::ModelId::new(&model.id),
-                            )
-                            .unwrap();
-                            let install_status = ModelInstallStatus::Installed;
-
-                            model_catalog_row(ui, &descriptor, &install_status, true, |ui| {
-                                let _ = ui.add_enabled(false, primary_small_button(ui, "Active"));
-                                let _ = ui.add(small_button(ui, "Uninstall"));
-                            });
-                        },
-                    );
-                });
-        })
-    }
-
     fn render_page_body_width(width: f32) -> f32 {
         let ctx = egui::Context::default();
         configure_stitch_style(&ctx);
@@ -15887,15 +16464,17 @@ mod layout_tests {
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| {
-                    page(
-                        ui,
-                        "Model Playground",
-                        TranscriptionStatus::Idle,
-                        "Ready",
-                        |ui| {
-                            observed_width = usable_width(ui);
-                        },
-                    );
+                    show_route_scroll(ui, UiRoute::Debug, |ui| {
+                        page(
+                            ui,
+                            "Model Playground",
+                            TranscriptionStatus::Idle,
+                            "Ready",
+                            |ui| {
+                                observed_width = usable_width(ui);
+                            },
+                        );
+                    });
                 });
         });
 
@@ -15966,12 +16545,15 @@ mod layout_tests {
             show_test_navigation(ctx, &mut app.current_tab);
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
-                .show(ctx, |ui| app.ui_models(ui));
+                .show(ctx, |ui| {
+                    show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui))
+                });
         })
     }
 
     fn render_app_tab(tab: Tab, width: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
 
@@ -15984,21 +16566,85 @@ mod layout_tests {
         };
         let mut app = test_app();
         app.current_tab = tab;
+        match tab {
+            Tab::Advanced => {
+                app.settings_tab = SettingsTab::Advanced;
+                app.current_tab = Tab::General;
+            }
+            Tab::About => {
+                app.settings_tab = SettingsTab::About;
+                app.current_tab = Tab::General;
+            }
+            Tab::Debug => {
+                app.config.developer.debug_mode = true;
+                app.settings_tab = SettingsTab::Advanced;
+                app.current_tab = Tab::General;
+                app.settings_playground_open = true;
+                app.settings_playground_needs_initial_focus = true;
+            }
+            _ => {}
+        }
 
         ctx.run(raw_input, |ctx| {
             show_test_navigation(ctx, &mut app.current_tab);
             egui::CentralPanel::default()
                 .frame(content_panel_frame(ctx))
                 .show(ctx, |ui| match app.current_tab {
-                    Tab::Transcribe => app.ui_transcribe(ui),
-                    Tab::General => app.ui_general_settings(ui),
-                    Tab::Models => app.ui_models(ui),
-                    Tab::History => app.ui_history(ui),
-                    Tab::Advanced => app.ui_advanced_settings(ui),
-                    Tab::About => app.ui_about(ui),
-                    Tab::Debug => app.ui_playground(ui),
+                    Tab::Transcribe => {
+                        show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                    }
+                    Tab::General => {
+                        show_route_scroll(ui, UiRoute::Settings(app.settings_tab), |ui| {
+                            if app.settings_playground_open {
+                                app.ui_playground(ui)
+                            } else {
+                                app.ui_general_settings(ui)
+                            }
+                        })
+                    }
+                    Tab::Models => show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui)),
+                    Tab::History => {
+                        show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                    }
+                    Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
+                    Tab::About => {
+                        show_route_scroll(ui, UiRoute::Settings(SettingsTab::About), |ui| {
+                            app.ui_general_settings(ui)
+                        })
+                    }
+                    Tab::Debug => show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui)),
                 });
         })
+    }
+
+    fn render_debug_route_with_input(
+        ctx: &egui::Context,
+        app: &mut LocalTranscriberApp,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events,
+                time,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                show_test_navigation(ctx, &mut app.current_tab);
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui))
+                    });
+            },
+        )
     }
 
     fn selector_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
@@ -16069,6 +16715,10 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = tab;
+        if tab == Tab::Advanced {
+            app.settings_tab = SettingsTab::Advanced;
+            app.current_tab = Tab::General;
+        }
         let mut max_x_by_frame = Vec::new();
 
         for _ in 0..frames {
@@ -16084,13 +16734,29 @@ mod layout_tests {
                 egui::CentralPanel::default()
                     .frame(content_panel_frame(ctx))
                     .show(ctx, |ui| match app.current_tab {
-                        Tab::Transcribe => app.ui_transcribe(ui),
-                        Tab::General => app.ui_general_settings(ui),
-                        Tab::Models => app.ui_models(ui),
-                        Tab::History => app.ui_history(ui),
-                        Tab::Advanced => app.ui_advanced_settings(ui),
-                        Tab::About => app.ui_about(ui),
-                        Tab::Debug => app.ui_playground(ui),
+                        Tab::Transcribe => {
+                            show_route_scroll(ui, UiRoute::Transcribe, |ui| app.ui_transcribe(ui))
+                        }
+                        Tab::General => {
+                            show_route_scroll(ui, UiRoute::Settings(app.settings_tab), |ui| {
+                                app.ui_general_settings(ui)
+                            })
+                        }
+                        Tab::Models => {
+                            show_route_scroll(ui, UiRoute::Models, |ui| app.ui_models(ui))
+                        }
+                        Tab::History => {
+                            show_route_scroll(ui, UiRoute::History, |ui| app.ui_history(ui))
+                        }
+                        Tab::Advanced => unreachable!("advanced navigation is routed to Settings"),
+                        Tab::About => {
+                            show_route_scroll(ui, UiRoute::Settings(SettingsTab::About), |ui| {
+                                app.ui_general_settings(ui)
+                            })
+                        }
+                        Tab::Debug => {
+                            show_route_scroll(ui, UiRoute::Debug, |ui| app.ui_playground(ui))
+                        }
                     });
             });
             max_x_by_frame.push(max_painted_x(&output));
@@ -16136,6 +16802,36 @@ mod layout_tests {
         })
     }
 
+    fn test_local_gguf_import_job(
+        job_id: u64,
+        cancellation: InstallCancellation,
+    ) -> LocalGgufImportJob {
+        let (completed, completion) = bounded(1);
+        completed.send(()).unwrap();
+        LocalGgufImportJob {
+            job_id,
+            cancellation,
+            completion,
+            worker: None,
+        }
+    }
+
+    fn test_install_smoke() -> InstallSmoke {
+        InstallSmoke {
+            resolved_acceleration: crate::transcription::ResolvedAcceleration {
+                requested: AccelerationPreference::Cpu,
+                resolved: crate::transcription::ComputeDevice::Cpu,
+                diagnostic: None,
+            },
+            detected_architecture: "whisper".to_owned(),
+            capabilities: crate::transcription::RuntimeCapabilities::default(),
+            health_duration_ms: 0,
+            load_duration_ms: 0,
+            decode_duration_ms: 0,
+            reload_duration_ms: 0,
+        }
+    }
+
     fn test_app() -> LocalTranscriberApp {
         let mut config = AppConfig::default();
         // Keep Playground event tests independent from whichever legacy model
@@ -16157,9 +16853,10 @@ mod layout_tests {
 
         let transcription_service = TranscriptionService::new(config.clone());
         let playground_cards = cards_from_config(&config, &transcription_service);
-        LocalTranscriberApp {
+        let mut app = LocalTranscriberApp {
             hotkey_input: config.recording.hotkey.clone(),
             model_search: String::new(),
+            model_language_filter: ModelLanguageFilter::default(),
             remote_catalog_filters: RemoteCatalogFilters::default(),
             remote_catalog_sort: RemoteCatalogSort::default(),
             model_import_path: String::new(),
@@ -16168,7 +16865,7 @@ mod layout_tests {
             microphone_test: MicrophoneTest::Idle,
             microphone_test_sequence: 0,
             microphone_test_error: None,
-            microphone_monitor_retry_at: None,
+            microphone_monitor_retry_required: false,
             microphone_level_envelope: MicrophoneLevelEnvelope::default(),
             deferred_recording_start: None,
             deferred_history_playback: None,
@@ -16177,6 +16874,7 @@ mod layout_tests {
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
             local_gguf_import: None,
+            local_gguf_import_status: None,
             artifact_recovery_error: None,
             playground_cards,
             playground_selector_draft: None,
@@ -16191,7 +16889,20 @@ mod layout_tests {
             config_path: None,
             settings_store: None,
             current_tab: Tab::Models,
+            settings_tab: SettingsTab::General,
+            settings_playground_open: false,
+            settings_playground_needs_initial_focus: false,
+            settings_restore_playground_focus: false,
             models_show_comparison: false,
+            model_comparison: ModelComparisonState::default(),
+            comparison_run_model_ids: None,
+            comparison_started_at: None,
+            comparison_reference_revision: 0,
+            comparison_output_revisions: HashMap::new(),
+            comparison_projection_cache: HashMap::new(),
+            comparison_wer_compute_count: 0,
+            comparison_output_replacement_count: 0,
+            model_management: ModelManagementState::default(),
             status: TranscriptionStatus::Idle,
             transcript: String::new(),
             raw_transcript: String::new(),
@@ -16239,20 +16950,48 @@ mod layout_tests {
             last_tray_state: None,
             window_hidden_to_tray: false,
             quit_requested: false,
-        }
+        };
+        app.rebuild_model_inventory_projection();
+        app
+    }
+
+    fn install_test_catalog_model(app: &mut LocalTranscriberApp, model_id: &str) -> PathBuf {
+        let fixture = std::env::temp_dir().join(format!(
+            "scribe-app-{model_id}-{}-{}.gguf",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&fixture, b"test-only placeholder").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert(model_id.to_owned(), fixture.clone());
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        fixture
     }
 
     #[test]
     fn trusted_catalog_event_updates_only_backend_owned_catalog_state() {
         let mut app = test_app();
         app.remote_catalog.loading = true;
-        let snapshot = CatalogSnapshot {
-            source: crate::huggingface_catalog::CatalogSource::BundledFallback,
-            fetched_at_unix_seconds: 0,
-            models: Vec::new(),
-        };
+        let snapshot = ModelInventorySnapshot::from_trusted_records(
+            2,
+            CatalogSource::Network,
+            vec![remote_catalog_model(
+                "handy-computer/event-fixture",
+                "Event fixture",
+                &["en"],
+                false,
+                1,
+            )],
+        )
+        .unwrap();
+        app.remote_catalog.active_refresh_generation = Some(2);
         app.tx
             .send(AppEvent::RemoteCatalogLoaded {
+                generation: 2,
                 result: Ok(snapshot),
             })
             .unwrap();
@@ -16265,8 +17004,101 @@ mod layout_tests {
             app.remote_catalog
                 .snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.source),
-            Some(crate::huggingface_catalog::CatalogSource::BundledFallback)
+                .map(ModelInventorySnapshot::source),
+            Some(crate::huggingface_catalog::CatalogSource::Network)
+        );
+    }
+
+    #[test]
+    fn stale_or_failed_refresh_preserves_snapshot_until_current_success() {
+        let mut app = test_app();
+        let initial = app.remote_catalog.snapshot.as_ref().unwrap().clone();
+        let refreshed = |revision| {
+            ModelInventorySnapshot::from_trusted_records(
+                revision,
+                CatalogSource::Network,
+                vec![remote_catalog_model(
+                    "handy-computer/refresh-fixture",
+                    "Refresh fixture",
+                    &["en"],
+                    true,
+                    revision,
+                )],
+            )
+            .unwrap()
+        };
+
+        app.remote_catalog.loading = true;
+        app.remote_catalog.active_refresh_generation = Some(3);
+        app.tx
+            .send(AppEvent::RemoteCatalogLoaded {
+                generation: 2,
+                result: Ok(refreshed(2)),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.remote_catalog.loading);
+        assert!(initial.shares_records_with(app.remote_catalog.snapshot.as_ref().unwrap()));
+
+        app.tx
+            .send(AppEvent::RemoteCatalogLoaded {
+                generation: 3,
+                result: Err("offline".to_owned()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.remote_catalog.loading);
+        assert!(initial.shares_records_with(app.remote_catalog.snapshot.as_ref().unwrap()));
+        assert_eq!(app.remote_catalog.error.as_deref(), Some("offline"));
+
+        app.remote_catalog.loading = true;
+        app.remote_catalog.active_refresh_generation = Some(4);
+        app.tx
+            .send(AppEvent::RemoteCatalogLoaded {
+                generation: 4,
+                result: Ok(refreshed(4)),
+            })
+            .unwrap();
+        app.poll_events();
+        let current = app.remote_catalog.snapshot.as_ref().unwrap();
+        assert_eq!(current.revision(), 4);
+        assert!(!initial.shares_records_with(current));
+        assert!(app.remote_catalog.error.is_none());
+    }
+
+    #[test]
+    fn models_open_search_sort_and_unchanged_paints_use_cached_inventory() {
+        let ctx = egui::Context::default();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        let initial_local_builds = app.remote_catalog.local_models_build_count;
+        let initial_local_models = Arc::clone(&app.remote_catalog.local_models);
+        let initial_revision = app.remote_catalog.snapshot.as_ref().unwrap().revision();
+
+        for _ in 0..3 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.ui_models(ui));
+            });
+        }
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("tiny".into()));
+        app.remote_catalog_filters.recommended_only = true;
+        app.remote_catalog_sort = RemoteCatalogSort::Smallest;
+        let _ = app.remote_catalog_view();
+        let _ = app.remote_catalog_view();
+
+        assert_eq!(app.remote_catalog.catalog_io_request_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(
+            app.remote_catalog.local_models_build_count,
+            initial_local_builds
+        );
+        assert!(Arc::ptr_eq(
+            &initial_local_models,
+            &app.remote_catalog.local_models
+        ));
+        assert_eq!(
+            app.remote_catalog.snapshot.as_ref().unwrap().revision(),
+            initial_revision
         );
     }
 
@@ -16352,6 +17184,7 @@ mod layout_tests {
                 ..Default::default()
             },
             RemoteCatalogSort::Name,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             installed_only
@@ -16371,6 +17204,7 @@ mod layout_tests {
                 ..Default::default()
             },
             RemoteCatalogSort::Name,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             multilingual_standard
@@ -16386,6 +17220,7 @@ mod layout_tests {
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Recommended,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             recommended_first
@@ -16405,6 +17240,7 @@ mod layout_tests {
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Smallest,
+            ModelLanguageFilter::All,
         );
         assert_eq!(
             smallest_first
@@ -16417,6 +17253,492 @@ mod layout_tests {
                 "handy-computer/large"
             ]
         );
+    }
+
+    #[test]
+    fn remote_catalog_projection_is_bounded_cached_and_truthful_at_ten_thousand_models() {
+        let mut app = test_app();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_records_unchecked_for_projection(
+                2,
+                CatalogSource::Network,
+                (0..10_000)
+                    .map(|index| {
+                        remote_catalog_model(
+                            &format!("handy-computer/catalog-{index:05}"),
+                            &format!("Catalog model {index:05}"),
+                            &["en"],
+                            false,
+                            64 * 1024 * 1024,
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+
+        let first = app.remote_catalog_view();
+
+        assert_eq!(first.entries.len(), REMOTE_CATALOG_VISIBLE_LIMIT);
+        assert!(first.entries.iter().all(|entry| {
+            entry
+                .variants
+                .iter()
+                .all(|variant| variant.speed_tier == ModelSpeedTier::Unknown)
+        }));
+        assert!(first.status.message.contains(
+            "Showing 100 of 10000 matching models (10000 total). Refine search or filters"
+        ));
+        assert_eq!(app.remote_catalog.projection_build_count, 1);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+
+        let second = app.remote_catalog_view();
+
+        assert_eq!(second.entries, first.entries);
+        assert_eq!(app.remote_catalog.projection_build_count, 1);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+
+        let failed_model_id = config::managed_remote_model_id(
+            "handy-computer/catalog-00000",
+            &"a".repeat(40),
+            "fixture.gguf",
+        )
+        .unwrap();
+        app.fail_model_install(&failed_model_id, "synthetic install failure".to_owned());
+        let failed = app.remote_catalog_view();
+
+        assert_eq!(app.remote_catalog.projection_build_count, 2);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert!(
+            failed.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| action.label == "Resume")
+        );
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "catalog model 09999".to_owned(),
+        ));
+        let refined = app.remote_catalog_view();
+
+        assert_eq!(refined.entries.len(), 1);
+        assert!(
+            refined
+                .status
+                .message
+                .contains("Showing 1 of 10000 models.")
+        );
+        assert_eq!(app.remote_catalog.projection_build_count, 3);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "no catalog model has this phrase".to_owned(),
+        ));
+        let empty = app.remote_catalog_view();
+
+        assert!(empty.entries.is_empty());
+        assert!(empty.status.message.contains("Showing 0 of 10000 models."));
+        assert_eq!(app.remote_catalog.projection_build_count, 4);
+        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+    }
+
+    #[test]
+    fn shared_models_catalog_revalidates_import_and_install_lifecycle_tokens() {
+        let mut app = test_app();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(
+                2,
+                CatalogSource::Network,
+                vec![remote_catalog_model(
+                    "handy-computer/action-fixture",
+                    "Action fixture",
+                    &["en", "es"],
+                    true,
+                    320 * 1024 * 1024,
+                )],
+            )
+            .unwrap(),
+        );
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery("action".into()));
+        app.remote_catalog_filters = RemoteCatalogFilters {
+            installed_only: true,
+            recommended_only: true,
+            multilingual_only: true,
+            size_tier: RemoteCatalogSizeTier::Compact,
+        };
+        app.remote_catalog_sort = RemoteCatalogSort::Largest;
+        assert_eq!(app.model_search, "action");
+        assert_eq!(
+            app.remote_catalog_filters,
+            RemoteCatalogFilters {
+                installed_only: true,
+                recommended_only: true,
+                multilingual_only: true,
+                size_tier: RemoteCatalogSizeTier::Compact,
+            }
+        );
+        assert_eq!(app.remote_catalog_sort, RemoteCatalogSort::Largest);
+
+        app.apply_model_management_action(ScreenAction::ValidateAndImportLocalGguf);
+        assert_eq!(
+            app.status_message,
+            "Enter the path to a local .gguf file to import."
+        );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Enter the path to a local .gguf file to import.")
+        );
+        app.apply_model_management_action(ScreenAction::SetLocalGgufImportPath(
+            "C:\\Models\\local.gguf".into(),
+        ));
+        assert_eq!(app.model_import_path, "C:\\Models\\local.gguf");
+        let local_cancellation = InstallCancellation::default();
+        let local_job_id = 41;
+        app.local_gguf_import = Some(test_local_gguf_import_job(
+            local_job_id,
+            local_cancellation.clone(),
+        ));
+        let local_view = app.remote_catalog_view().local_import;
+        assert_eq!(local_view.path, "C:\\Models\\local.gguf");
+        assert!(local_view.in_progress);
+        assert!(!local_view.import_enabled);
+        app.finish_local_gguf_import(
+            local_job_id + 1,
+            Err("stale completion must be ignored".into()),
+        );
+        assert_eq!(
+            app.local_gguf_import.as_ref().map(|job| job.job_id),
+            Some(local_job_id)
+        );
+        app.apply_model_management_action(ScreenAction::CancelLocalGgufImport);
+        assert!(local_cancellation.is_cancelled());
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Cancelling local GGUF validation; source bytes are unchanged.")
+        );
+        app.finish_local_gguf_import(
+            local_job_id,
+            Err("completion delivered after cancellation".into()),
+        );
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        assert_eq!(
+            app.status_message,
+            "Local GGUF import was cancelled. The source file was left unchanged."
+        );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Local GGUF import was cancelled. The source file was left unchanged.")
+        );
+        assert!(app.local_gguf_import.is_none());
+
+        let failed_job_id = local_job_id + 2;
+        app.local_gguf_import = Some(test_local_gguf_import_job(
+            failed_job_id,
+            InstallCancellation::default(),
+        ));
+        app.finish_local_gguf_import(failed_job_id, Err("invalid model header".into()));
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some("Local GGUF import failed: invalid model header")
+        );
+
+        app.set_local_gguf_import_message(
+            "Imported and smoke-tested Example in place (health 1 ms, load 2 ms, decode 3 ms).",
+        );
+        assert_eq!(
+            app.remote_catalog_view()
+                .local_import
+                .status_message
+                .as_deref(),
+            Some(
+                "Imported and smoke-tested Example in place (health 1 ms, load 2 ms, decode 3 ms)."
+            )
+        );
+
+        app.apply_model_management_action(ScreenAction::RetryRemoteCatalog);
+        assert!(app.remote_catalog.force_refresh_requested);
+
+        app.remote_catalog_filters.installed_only = false;
+        let view = app.remote_catalog_view();
+        let install = &view.entries[0].variants[0].actions[0];
+        assert!(matches!(
+            &install.kind,
+            RemoteCatalogActionKind::Install {
+                remote_model_id,
+                variant_id,
+            } if remote_model_id == "handy-computer/action-fixture" && variant_id == "q4"
+        ));
+
+        let cancellation = InstallCancellation::default();
+        app.artifact_installations
+            .insert("managed-action-fixture".into(), (1, cancellation.clone()));
+        app.apply_model_management_action(ScreenAction::CancelRemoteCatalogInstall(
+            "managed-action-fixture".into(),
+        ));
+        assert!(cancellation.is_cancelled());
+
+        app.apply_model_management_action(ScreenAction::InstallRemoteCatalogVariant {
+            remote_model_id: "handy-computer/action-fixture".into(),
+            variant_id: "stale-variant".into(),
+        });
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(
+            app.status_message
+                .contains("no longer in the validated snapshot")
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_artifact_and_local_gguf_imports() {
+        let mut app = test_app();
+        let artifact_cancellation = InstallCancellation::default();
+        let local_cancellation = InstallCancellation::default();
+        app.artifact_installations.insert(
+            "managed-shutdown-fixture".to_owned(),
+            (1, artifact_cancellation.clone()),
+        );
+        app.local_gguf_import = Some(test_local_gguf_import_job(42, local_cancellation.clone()));
+
+        app.cancel_installations_for_shutdown();
+
+        assert!(artifact_cancellation.is_cancelled());
+        assert!(local_cancellation.is_cancelled());
+        assert!(app.local_gguf_import.is_none());
+    }
+
+    #[test]
+    fn local_gguf_shutdown_wait_is_bounded_before_worker_detach() {
+        let cancellation = InstallCancellation::default();
+        let (_completion_tx, completion) = bounded(1);
+        let mut job = LocalGgufImportJob {
+            job_id: 91,
+            cancellation: cancellation.clone(),
+            completion,
+            worker: None,
+        };
+        let expected_timeout = Duration::from_millis(37);
+        let observed_timeout = std::cell::Cell::new(None);
+
+        let completed = job.cancel_and_wait_with(expected_timeout, |_, timeout| {
+            observed_timeout.set(Some(timeout));
+            false
+        });
+
+        assert!(!completed);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(observed_timeout.get(), Some(expected_timeout));
+    }
+
+    #[test]
+    fn unknown_settings_labels_are_no_ops() {
+        let mut app = test_app();
+        app.config.general.theme_mode = ThemeMode::Dark;
+        app.config.overlay.mode = OverlayMode::Minimal;
+        app.config.streaming.mode = StreamingMode::Rolling;
+        app.config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        app.config.overlay.position = OverlayPosition::Top;
+        app.config.history.mode = HistoryMode::TranscriptAndAudio;
+
+        for action in [
+            ScreenAction::SetTheme("unknown".into()),
+            ScreenAction::SetOverlayMode("unknown".into()),
+            ScreenAction::SetStreamingMode("unknown".into()),
+            ScreenAction::SetAcceleration("unknown".into()),
+            ScreenAction::SetOverlayPosition("unknown".into()),
+            ScreenAction::SetHistoryMode("unknown".into()),
+        ] {
+            app.apply_settings_screen_action(action);
+        }
+
+        assert_eq!(app.config.general.theme_mode, ThemeMode::Dark);
+        assert_eq!(app.config.overlay.mode, OverlayMode::Minimal);
+        assert_eq!(app.config.streaming.mode, StreamingMode::Rolling);
+        assert_eq!(
+            app.config.performance.acceleration_preference,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(app.config.overlay.position, OverlayPosition::Top);
+        assert_eq!(app.config.history.mode, HistoryMode::TranscriptAndAudio);
+    }
+
+    #[test]
+    fn shared_settings_actions_cancel_capture_and_exit_disabled_debug() {
+        let mut app = test_app();
+        app.apply_settings_screen_action(ScreenAction::ChangeShortcut);
+        assert!(app.capturing_hotkey);
+        app.apply_settings_screen_action(ScreenAction::ChangeShortcut);
+        assert!(!app.capturing_hotkey);
+        assert_eq!(app.status_message, "Hotkey capture cancelled.");
+
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::Debug;
+        app.apply_settings_screen_action(ScreenAction::SetDebugMode(false));
+        assert!(!app.config.developer.debug_mode);
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+    }
+
+    #[test]
+    fn legacy_output_settings_action_stores_general() {
+        let mut app = test_app();
+        app.settings_tab = SettingsTab::Recording;
+
+        app.apply_settings_screen_action(ScreenAction::SetSettingsTab(SettingsTab::Output));
+
+        assert_eq!(app.settings_tab, SettingsTab::General);
+    }
+
+    #[test]
+    fn advanced_playground_actions_remain_inside_settings() {
+        let mut app = test_app();
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+
+        app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+        assert!(app.settings_playground_open);
+
+        app.close_settings_playground();
+
+        assert_eq!(app.current_tab, Tab::General);
+        assert_eq!(app.settings_tab, SettingsTab::Advanced);
+        assert!(!app.settings_playground_open);
+    }
+
+    #[test]
+    fn settings_playground_focus_moves_to_back_and_restores_open_action() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let mut app = test_app();
+        app.config.developer.debug_mode = true;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
+
+        app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+        let playground = render_playground(&ctx, &mut app, Vec::new());
+        let back = accesskit_control_id(&playground, "Back to Advanced");
+        assert_eq!(
+            playground
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("Playground should expose AccessKit")
+                .focus,
+            back
+        );
+        assert!(!app.settings_playground_needs_initial_focus);
+
+        app.close_settings_playground();
+        let advanced = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 3_000.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(content_panel_frame(ctx))
+                    .show(ctx, |ui| {
+                        show_route_scroll(ui, UiRoute::Settings(SettingsTab::Advanced), |ui| {
+                            app.ui_general_settings(ui)
+                        })
+                    });
+            },
+        );
+        let open = accesskit_control_id(&advanced, "Open model Playground");
+        assert_eq!(
+            advanced
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("Advanced settings should expose AccessKit")
+                .focus,
+            open
+        );
+        assert!(!app.settings_restore_playground_focus);
+    }
+
+    #[test]
+    fn settings_playground_closes_before_rendering_primary_route_departures() {
+        for destination in [Tab::Models, Tab::History, Tab::Transcribe] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_stitch_style(&ctx);
+            let mut app = test_app();
+            app.config.developer.debug_mode = true;
+            app.current_tab = Tab::General;
+            app.settings_tab = SettingsTab::Advanced;
+            app.apply_settings_screen_action(ScreenAction::OpenDeveloperPlayground);
+            assert!(app.settings_playground_open);
+            assert!(app.settings_playground_needs_initial_focus);
+
+            app.current_tab = destination;
+            app.sync_settings_playground_route();
+
+            assert_eq!(app.current_tab, destination);
+            assert!(!app.settings_playground_open);
+            assert!(!app.settings_playground_needs_initial_focus);
+            assert!(!app.settings_restore_playground_focus);
+
+            app.current_tab = Tab::General;
+            let settings = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 3_000.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(content_panel_frame(ctx))
+                        .show(ctx, |ui| {
+                            show_route_scroll(ui, UiRoute::Settings(SettingsTab::Advanced), |ui| {
+                                if app.settings_playground_open {
+                                    app.ui_playground(ui)
+                                } else {
+                                    app.ui_general_settings(ui)
+                                }
+                            })
+                        });
+                },
+            );
+            let nodes = &settings
+                .platform_output
+                .accesskit_update
+                .expect("Settings should expose AccessKit")
+                .nodes;
+            for tab in ["General", "Recording", "Advanced", "About"] {
+                assert!(nodes.iter().any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Tab && node.name() == Some(tab)
+                }));
+            }
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Back to Advanced"))
+            );
+        }
     }
 
     #[test]
@@ -16602,62 +17924,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn model_action_state_matches_install_select_uninstall_rules() {
-        let mut whisper = test_model();
-        whisper.install_status = ModelInstallStatus::NotInstalled;
-
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::NotInstalled, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Install,
-                primary_enabled: true,
-                show_uninstall: false,
-            }
-        );
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::Installed, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Select,
-                primary_enabled: true,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_action_state(&whisper, &ModelInstallStatus::Installed, true),
-            ModelActionState {
-                primary: ModelPrimaryAction::Active,
-                primary_enabled: false,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_action_state(
-                &whisper,
-                &ModelInstallStatus::Error("network failed".to_owned()),
-                false,
-            ),
-            ModelActionState {
-                primary: ModelPrimaryAction::Retry,
-                primary_enabled: true,
-                show_uninstall: false,
-            }
-        );
-
-        let mut unavailable = whisper;
-        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
-        unavailable.backend = "sherpa-onnx".to_owned();
-        unavailable.download_model = None;
-        assert_eq!(
-            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Install,
-                primary_enabled: false,
-                show_uninstall: false,
-            }
-        );
-    }
-
-    #[test]
     fn installation_failures_preserve_recovery_required_classification() {
         let normal = InstallJobFailure::from(InstallError::Failed("retryable".to_owned()));
         assert!(!normal.recovery_required);
@@ -16669,16 +17935,166 @@ mod layout_tests {
     }
 
     #[test]
-    fn installed_model_with_missing_runtime_offers_repair() {
-        let model = test_model();
-        assert_eq!(
-            model_action_state_with_runtime(&model, &ModelInstallStatus::Installed, true, false),
-            ModelActionState {
-                primary: ModelPrimaryAction::Repair,
-                primary_enabled: true,
-                show_uninstall: true,
+    fn cancelled_or_rejected_verified_install_keeps_legacy_selection_and_config_unchanged() {
+        for message in [
+            "Installation cancelled after smoke testing; no artifacts were activated.",
+            "The staged GGUF checksum did not match the pinned digest.",
+            "The staged GGUF failed the known-WAV smoke test.",
+        ] {
+            let mut app = test_app();
+            app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+            let previous_config = serde_json::to_value(&app.config).unwrap();
+            let cancellation = InstallCancellation::default();
+            app.artifact_installations
+                .insert("whisper_cpp_base_en".to_owned(), (42, cancellation));
+
+            app.tx
+                .send(AppEvent::VerifiedInstallFailed {
+                    job_id: 42,
+                    model_id: "whisper_cpp_base_en".to_owned(),
+                    message: message.to_owned(),
+                    recovery_required: false,
+                })
+                .unwrap();
+            app.poll_events();
+
+            assert_eq!(
+                serde_json::to_value(&app.config).unwrap(),
+                previous_config,
+                "{message}"
+            );
+            assert_eq!(
+                app.config.general.selected_default_model, "whisper_cpp_base_en",
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_verification_switches_the_stable_model_path_only_after_success() {
+        use std::cell::Cell;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-candidate-coordinator-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy = root.join("ggml-base.en.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&legacy, b"legacy").unwrap();
+
+        for outcome in [
+            "success",
+            "cancelled during verification",
+            "cancelled after verification",
+            "hash failure",
+            "smoke failure",
+            "identity mismatch",
+            "different cancellation handle",
+        ] {
+            let mut config = AppConfig::default();
+            config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+            config
+                .general
+                .model_paths
+                .insert("whisper_cpp_base_en".to_owned(), legacy.clone());
+            let previous = serde_json::to_value(&config).unwrap();
+            let cancellation = InstallCancellation::default();
+            let verifier_called = Cell::new(false);
+            let mutation_started = Cell::new(false);
+            let q8 = root.join("whisper-base.en-Q8_0.gguf");
+            let model_id = ModelId::new("whisper_cpp_base_en");
+            let candidate =
+                InstallationCandidate::normalized(model_id.clone(), q8.clone(), None).unwrap();
+            let expected_size_bytes = candidate.expected_size_bytes;
+            let expected_sha256 = candidate.expected_sha256.clone();
+            let service = TranscriptionService::new(config.clone());
+            let result = service.verify_installation_candidate_for_activation_with(
+                candidate,
+                &cancellation,
+                |_| {
+                    verifier_called.set(true);
+                    match outcome {
+                        "cancelled during verification" => {
+                            cancellation.cancel();
+                            Ok(test_install_smoke())
+                        }
+                        "hash failure" => Err(anyhow::anyhow!("checksum mismatch")),
+                        "smoke failure" => Err(anyhow::anyhow!("known-WAV smoke failure")),
+                        _ => Ok(test_install_smoke()),
+                    }
+                },
+            );
+
+            if outcome == "cancelled after verification" {
+                assert!(
+                    result.is_ok(),
+                    "verification must finish before cancellation"
+                );
+                cancellation.cancel();
             }
-        );
+
+            assert!(verifier_called.get(), "{outcome}");
+            assert!(legacy.is_file(), "{outcome}");
+            if outcome == "success" {
+                result
+                    .unwrap()
+                    .authorize_activation(
+                        &model_id,
+                        &q8,
+                        expected_size_bytes,
+                        &expected_sha256,
+                        &cancellation,
+                    )
+                    .unwrap();
+                mutation_started.set(true);
+                config
+                    .general
+                    .model_paths
+                    .insert("whisper_cpp_base_en".to_owned(), q8.clone());
+                assert!(mutation_started.get());
+                assert_eq!(config.general.selected_default_model, "whisper_cpp_base_en");
+                assert_eq!(
+                    config.general.model_paths.get("whisper_cpp_base_en"),
+                    Some(&q8)
+                );
+            } else {
+                if let Ok(verified) = result {
+                    let presented_path = if outcome == "identity mismatch" {
+                        root.join("whisper-small.en-Q8_0.gguf")
+                    } else {
+                        q8.clone()
+                    };
+                    let presented_cancellation = if outcome == "different cancellation handle" {
+                        InstallCancellation::default()
+                    } else {
+                        cancellation.clone()
+                    };
+                    let activation = verified.authorize_activation(
+                        &model_id,
+                        &presented_path,
+                        expected_size_bytes,
+                        &expected_sha256,
+                        &presented_cancellation,
+                    );
+                    assert!(activation.is_err(), "{outcome}");
+                }
+                assert!(!mutation_started.get(), "{outcome}");
+                assert_eq!(
+                    serde_json::to_value(&config).unwrap(),
+                    previous,
+                    "{outcome}"
+                );
+                assert_eq!(config.general.selected_default_model, model_id.as_str());
+                assert_eq!(
+                    config.general.model_paths.get(model_id.as_str()),
+                    Some(&legacy),
+                    "{outcome}"
+                );
+            }
+            assert!(legacy.is_file(), "{outcome}");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -17334,7 +18750,7 @@ mod layout_tests {
                 },
             )],
         );
-        let checkbox = accesskit_control_id_with_prefix(&output, "English Tiny;");
+        let checkbox = accesskit_control_id_with_prefix(&output, "Whisper Tiny — English;");
         let apply = accesskit_control_id(&output, "Apply model selection");
         render_playground(
             &ctx,
@@ -17436,23 +18852,36 @@ mod layout_tests {
                 .is_some_and(|message| message.contains("Choose models"))
         );
 
-        app.playground_cards.push(PlaygroundCardState {
-            install_status: ModelInstallStatus::Installed,
-            descriptor: app
-                .transcription_service
-                .model_descriptor(&crate::transcription::ModelId::new("whisper_cpp_base_en"))
-                .unwrap(),
-            status: ModelRuntimeStatus::MissingConfiguration,
-            transcript: String::new(),
-            latency_ms: None,
-            audio_duration_ms: None,
-            peak_ram_mb: None,
-            peak_vram_mb: None,
-        });
+        let base_path = std::env::temp_dir()
+            .join(format!(
+                "scribe-playground-not-ready-{}-{}",
+                std::process::id(),
+                NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("ggml-base.en.bin");
+        fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+        fs::write(&base_path, b"test-only installed model").unwrap();
+        app.config
+            .general
+            .model_paths
+            .insert("whisper_cpp_base_en".to_owned(), base_path.clone());
+        app.config.general.playground_selected_models = vec!["whisper_cpp_base_en".to_owned()];
+        app.config.general.playground_model_order = vec!["whisper_cpp_base_en".to_owned()];
+        config::normalize_config(&mut app.config);
+        app.transcription_service = app.transcription_service.with_config(app.config.clone());
+        app.refresh_playground_cards_from_config();
+        let selected = app.playground_selected_models();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].install_status, ModelInstallStatus::Installed);
+        assert_ne!(
+            runtime_status_for_model(&app.config, &selected[0]),
+            ModelRuntimeStatus::Ready
+        );
         assert!(
             app.playground_run_block_reason()
                 .is_some_and(|message| message.contains("not ready"))
         );
+        let _ = fs::remove_file(base_path);
     }
 
     #[test]
@@ -17489,7 +18918,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn busy_runtime_disables_maintenance_and_repair_keeps_model_installed() {
+    fn busy_runtime_disables_maintenance() {
         let model = test_model();
         let busy = runtime_action_state_with_busy(&AppConfig::default(), &model, true);
         assert!(!busy.enabled);
@@ -17497,37 +18926,6 @@ mod layout_tests {
             busy.disabled_tooltip
                 .as_deref()
                 .is_some_and(|message| message.contains("already being prepared"))
-        );
-        assert_eq!(
-            model_action_state_with_runtime(
-                &model,
-                &ModelInstallStatus::RuntimeError("failed".to_owned()),
-                true,
-                false,
-            ),
-            ModelActionState {
-                primary: ModelPrimaryAction::Repair,
-                primary_enabled: true,
-                show_uninstall: true,
-            }
-        );
-        assert_eq!(
-            model_primary_action_label(
-                ModelPrimaryAction::Repair,
-                &model,
-                &ModelInstallStatus::RuntimeError("failed".to_owned()),
-            ),
-            "Repair runtime"
-        );
-        assert_eq!(
-            model_primary_action_label(
-                ModelPrimaryAction::Retry,
-                &model,
-                &ModelInstallStatus::Error(
-                    "Installation cancelled; resumable partial retained".to_owned(),
-                ),
-            ),
-            "Resume"
         );
     }
 
@@ -17639,159 +19037,14 @@ mod layout_tests {
     }
 
     #[test]
-    fn disabled_model_actions_explain_why_they_are_disabled() {
-        let whisper = test_model();
-        let active_state = model_action_state(&whisper, &ModelInstallStatus::Installed, true);
-        assert_eq!(
-            model_primary_disabled_tooltip(
-                &whisper,
-                &ModelInstallStatus::Installed,
-                true,
-                &active_state,
-            ),
-            Some("This model is already the active transcription model.".to_owned())
-        );
-
-        let mut unavailable = whisper;
-        unavailable.id = "sherpa_onnx_zipformer_small".to_owned();
-        unavailable.backend = "sherpa-onnx".to_owned();
-        unavailable.download_model = None;
-        let unavailable_state =
-            model_action_state(&unavailable, &ModelInstallStatus::NotInstalled, false);
-        let tooltip = model_primary_disabled_tooltip(
-            &unavailable,
-            &ModelInstallStatus::NotInstalled,
-            false,
-            &unavailable_state,
-        )
-        .unwrap();
-
-        assert!(tooltip.contains("not available"));
-    }
-
-    #[test]
-    fn download_progress_uses_known_total_for_fraction_and_labels() {
-        let status = ModelInstallStatus::Downloading {
-            downloaded_bytes: 256 * 1024 * 1024,
-            total_bytes: Some(1024 * 1024 * 1024),
-            bytes_per_second: Some(4 * 1024 * 1024),
-        };
-
-        assert_eq!(download_progress_fraction(&status), Some(0.25));
-        assert_eq!(download_progress_bar_text(&status), "25% Completed");
-        assert_eq!(
-            download_progress_detail(&status),
-            Some("256 MB / 1.0 GB · 4 MB/s".to_owned())
-        );
-    }
-
-    #[test]
-    fn semantic_progress_bar_paints_proportional_fill_in_full_track() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        ctx.set_visuals(stitch_visuals(ThemeMode::Light));
-        let status = ModelInstallStatus::Downloading {
-            downloaded_bytes: 256 * 1024 * 1024,
-            total_bytes: Some(1024 * 1024 * 1024),
-            bytes_per_second: None,
-        };
-
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(640.0, 220.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(content_panel_frame(ctx))
-                    .show(ctx, |ui| {
-                        with_usable_width_cap(ui, 400.0, |ui| {
-                            download_progress_bar(ui, &status);
-                        });
-                    });
-            },
-        );
-
-        let track_fill = ThemePalette::light().panel_bg;
-        let track = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect)
-                    if rect.fill == track_fill && (rect.rect.height() - 18.0).abs() < 0.1 =>
-                {
-                    Some(rect.rect)
-                }
-                _ => None,
-            })
-            .max_by(|a, b| a.width().total_cmp(&b.width()))
-            .unwrap();
-        let fill = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect)
-                    if rect.fill == ThemePalette::light().accent
-                        && (rect.rect.height() - 18.0).abs() < 0.1 =>
-                {
-                    Some(rect.rect)
-                }
-                _ => None,
-            })
-            .max_by(|a, b| a.width().total_cmp(&b.width()))
-            .unwrap();
-
-        assert!(track.width() >= 390.0, "track width was {}", track.width());
-        assert!(
-            (fill.width() / track.width() - 0.25).abs() <= 0.01,
-            "fill was {} of track {}",
-            fill.width(),
-            track.width()
-        );
-    }
-
-    #[test]
-    fn indeterminate_progress_has_no_accessible_numeric_value() {
-        for status in [
-            ModelInstallStatus::InstallingRuntime,
-            ModelInstallStatus::Downloading {
-                downloaded_bytes: 1024,
-                total_bytes: None,
-                bytes_per_second: None,
-            },
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    download_progress_bar(ui, &status);
-                });
-            });
-            let update = output.platform_output.accesskit_update.unwrap();
-            let progress = update
-                .nodes
-                .iter()
-                .map(|(_, node)| node)
-                .find(|node| node.role() == egui::accesskit::Role::ProgressIndicator)
-                .unwrap();
-
-            assert_eq!(progress.numeric_value(), None);
-            assert_eq!(progress.min_numeric_value(), None);
-            assert_eq!(progress.max_numeric_value(), None);
-        }
-    }
-
-    #[test]
     fn capture_numeric_controls_have_programmatic_accessible_names() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
-        app.current_tab = Tab::Advanced;
+        app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Advanced;
         app.config.recording.vad_enabled = true;
         let output = ctx.run(
             egui::RawInput {
@@ -17805,7 +19058,7 @@ mod layout_tests {
                 show_test_navigation(ctx, &mut app.current_tab);
                 egui::CentralPanel::default()
                     .frame(content_panel_frame(ctx))
-                    .show(ctx, |ui| app.ui_advanced_settings(ui));
+                    .show(ctx, |ui| app.ui_general_settings(ui));
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -17816,8 +19069,6 @@ mod layout_tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "Paste delay ms",
-            "Maximum recording seconds",
             "Speech confirmation ms",
             "Internal pause ms",
             "End after silence ms",
@@ -17837,26 +19088,6 @@ mod layout_tests {
                 "no spin button is programmatically labelled by {expected:?}"
             );
         }
-
-        let combo_boxes = update
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
-            .collect::<Vec<_>>();
-        for expected in ["Overlay position", "Transcription device"] {
-            let label_id = update
-                .nodes
-                .iter()
-                .find(|(_, node)| node.name() == Some(expected))
-                .map(|(id, _)| *id)
-                .unwrap_or_else(|| panic!("missing AccessKit label {expected:?}"));
-            assert!(
-                combo_boxes
-                    .iter()
-                    .any(|(_, node)| node.labelled_by().contains(&label_id)),
-                "no combo box is programmatically labelled by {expected:?}"
-            );
-        }
     }
 
     #[test]
@@ -17867,6 +19098,7 @@ mod layout_tests {
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
+        app.settings_tab = SettingsTab::Recording;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
@@ -17884,16 +19116,19 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Heading && node.name() == Some("Audio")
-        }));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording input"))
+        );
 
         let microphone_label_id = update
             .nodes
             .iter()
-            .find(|(_, node)| node.name() == Some("Microphone"))
+            .find(|(_, node)| node.name() == Some("Device"))
             .map(|(id, _)| *id)
-            .expect("missing Microphone label");
+            .expect("missing Device label");
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::ComboBox
                 && node.labelled_by().contains(&microphone_label_id)
@@ -17904,17 +19139,17 @@ mod layout_tests {
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Input sensitivity")
+                    && node.name() == Some("Input level")
             })
             .map(|(id, _)| *id)
-            .expect("missing Input sensitivity label");
+            .expect("missing Input level label");
         let slider = update
             .nodes
             .iter()
             .map(|(_, node)| node)
             .find(|node| {
                 node.role() == egui::accesskit::Role::Slider
-                    && node.name() == Some("Input sensitivity")
+                    && node.name() == Some("Input level sensitivity")
             })
             .expect("missing accessible input sensitivity slider");
         assert!(slider.labelled_by().contains(&sensitivity_label_id));
@@ -17948,170 +19183,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_slider_supports_click_drag_and_arrow_keys() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
-        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
-        let mut slider_rect = egui::Rect::NOTHING;
-        let render = |ctx: &egui::Context,
-                      raw_input: egui::RawInput,
-                      threshold: &mut f32,
-                      slider_rect: &mut egui::Rect| {
-            let _ = ctx.run(raw_input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    *slider_rect = microphone_sensitivity_slider(ui, 0.4, threshold).rect;
-                });
-            });
-        };
-
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        let click = egui::pos2(
-            slider_rect.left() + slider_rect.width() * 0.8,
-            slider_rect.center().y,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(click),
-                    egui::Event::PointerButton {
-                        pos: click,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    egui::Event::PointerButton {
-                        pos: click,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        let clicked_position = rms_to_slider_position(threshold);
-        assert!((clicked_position - 0.8).abs() < 0.02);
-
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::Key {
-                    key: egui::Key::ArrowLeft,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        assert!(rms_to_slider_position(threshold) < clicked_position);
-
-        let drag_start = egui::pos2(
-            slider_rect.left() + slider_rect.width() * rms_to_slider_position(threshold),
-            slider_rect.center().y,
-        );
-        let drag_target = egui::pos2(
-            slider_rect.left() + slider_rect.width() * 0.25,
-            slider_rect.center().y,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(drag_start),
-                    egui::Event::PointerButton {
-                        pos: drag_start,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerMoved(drag_target)],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        render(
-            &ctx,
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos: drag_target,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            &mut threshold,
-            &mut slider_rect,
-        );
-        assert!((rms_to_slider_position(threshold) - 0.25).abs() < 0.02);
-    }
-
-    #[test]
-    fn input_sensitivity_slider_accepts_tab_focus() {
-        let ctx = egui::Context::default();
-        configure_stitch_style(&ctx);
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 120.0));
-        let mut threshold = config::settings::DEFAULT_MANUAL_ACTIVATION_RMS;
-        let mut slider_id = egui::Id::NULL;
-        let mut render = |raw_input: egui::RawInput| {
-            let _ = ctx.run(raw_input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    slider_id = microphone_sensitivity_slider(ui, 0.0, &mut threshold).id;
-                });
-            });
-        };
-
-        render(egui::RawInput {
-            screen_rect: Some(screen),
-            ..Default::default()
-        });
-        render(egui::RawInput {
-            screen_rect: Some(screen),
-            events: vec![egui::Event::Key {
-                key: egui::Key::Tab,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        });
-
-        assert!(ctx.memory(|memory| memory.has_focus(slider_id)));
-    }
-
-    #[test]
     fn input_sensitivity_avoids_live_meter_announcements_and_remains_usable() {
         fn render(
             ctx: &egui::Context,
@@ -18139,15 +19210,24 @@ mod layout_tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
+        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
+        session.set_simulated_telemetry(LevelSnapshot {
+            rms: 0.08,
+            peak: 0.15,
+        });
         let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Starting {
-            request_id: 1,
-            stop_requested: false,
-            cancellation: CaptureCancellation::new(),
-        };
+        app.settings_tab = SettingsTab::Recording;
+        app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+            node.role() == egui::accesskit::Role::Slider
+                && node.name() == Some("Input level sensitivity")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider
+                && node
+                    .description()
+                    .is_some_and(|description| description.contains("Input detected"))
         }));
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.live().is_some()
@@ -18162,37 +19242,36 @@ mod layout_tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
-        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
-        session.set_simulated_telemetry(LevelSnapshot {
-            rms: 0.08,
-            peak: 0.15,
-        });
         let mut app = test_app();
-        app.microphone_test = MicrophoneTest::Active { session };
+        app.settings_tab = SettingsTab::Recording;
+        app.microphone_test_error = Some("Microphone permission denied".to_owned());
+        app.microphone_monitor_retry_required = true;
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+            node.role() == egui::accesskit::Role::Slider
+                && node.name() == Some("Input level sensitivity")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider
+                && node
+                    .description()
+                    .is_some_and(|description| description.contains("No input detected"))
         }));
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")
         }));
-
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_stitch_style(&ctx);
-        let mut app = test_app();
-        app.microphone_test_error = Some("Microphone permission denied".to_owned());
-        app.microphone_monitor_retry_at = Some(Instant::now() + Duration::from_secs(60));
-        let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider && node.name() == Some("Input sensitivity")
+            node.role() == egui::accesskit::Role::Alert
+                && node.name() == Some("Microphone access error")
         }));
         assert!(
-            !update
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Microphone permission denied"))
+            update.nodes.iter().any(|(_, node)| {
+                node.name() == Some("Scribe couldn’t access your microphone.")
+            })
         );
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Try again")
+        }));
     }
 
     #[test]
@@ -18235,7 +19314,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn transcript_editor_and_queued_output_state_are_accessible() {
+    fn transcript_and_queued_output_state_are_accessible() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
@@ -18268,30 +19347,14 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        let transcript_label_id = update
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Transcript")
-            })
-            .map(|(id, _)| *id)
-            .expect("missing semantic Transcript heading");
-        let editor = update
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.role() == egui::accesskit::Role::MultilineTextInput)
-            .expect("missing transcript editor");
-
-        assert!(editor.labelled_by().contains(&transcript_label_id));
-        assert!(editor.is_disabled());
-        assert_eq!(
-            editor.description(),
-            Some("Transcript editing is temporarily locked while final output is sent.")
-        );
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Cancel pending output and clear transcript")
+            node.role() == egui::accesskit::Role::Group && node.name() == Some("Transcript panel")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::StaticText && node.name() == Some("final text")
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Clear")
         }));
     }
 
@@ -18414,31 +19477,6 @@ mod layout_tests {
     }
 
     #[test]
-    fn collapsing_header_exposes_expanded_accessibility_state() {
-        for open in [false, true] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = egui::CollapsingHeader::new("Runtime maintenance")
-                        .default_open(open)
-                        .show(ui, |ui| ui.label("Runtime controls"));
-                    set_collapsing_header_accessibility(ctx, &response);
-                });
-            });
-            let update = output.platform_output.accesskit_update.unwrap();
-            let header = update
-                .nodes
-                .iter()
-                .map(|(_, node)| node)
-                .find(|node| node.name() == Some("Runtime maintenance"))
-                .unwrap();
-
-            assert_eq!(header.is_expanded(), Some(open));
-        }
-    }
-
-    #[test]
     fn faster_whisper_large_v3_has_progress_total() {
         let model = config::configured_models(&AppConfig::default())
             .into_iter()
@@ -18502,7 +19540,7 @@ mod layout_tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].descriptor.id.as_str(), "whisper_cpp_tiny_en");
-        assert_eq!(cards[0].descriptor.display_name, "English Tiny");
+        assert_eq!(cards[0].descriptor.display_name, "Whisper Tiny — English");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19091,6 +20129,113 @@ mod layout_tests {
     }
 
     #[test]
+    fn active_model_replacement_order_is_recommended_then_catalog_then_stable_name() {
+        let model = |id: &str, name: &str| SttModelInfo {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            backend: "test".to_owned(),
+            description: String::new(),
+            expected_ram: String::new(),
+            accuracy_tier: String::new(),
+            speed_tier: String::new(),
+            local_path: None,
+            install_status: ModelInstallStatus::Installed,
+            download_model: None,
+        };
+        let recommended = model("recommended", "Zulu");
+        let catalog_early = model("catalog-early", "Zulu");
+        let catalog_late = model("catalog-late", "Alpha");
+        let dynamic_alpha = model("dynamic-alpha", "Alpha");
+        let dynamic_alpha_later = model("dynamic-zeta", "alpha");
+
+        assert_eq!(
+            compare_active_model_replacements(
+                &recommended,
+                true,
+                None,
+                &catalog_early,
+                false,
+                Some(0),
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_active_model_replacements(
+                &catalog_early,
+                false,
+                Some(0),
+                &catalog_late,
+                false,
+                Some(3),
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_active_model_replacements(
+                &dynamic_alpha,
+                false,
+                None,
+                &dynamic_alpha_later,
+                false,
+                None,
+            ),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn active_model_removal_is_blocked_without_another_ready_model() {
+        let mut app = test_app();
+        let active_id = app.config.general.selected_default_model.clone();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(app.model_management.removal_replacement.is_none());
+        assert_eq!(
+            app.status_message,
+            "Install another ready model before removing the active model."
+        );
+    }
+
+    #[test]
+    fn active_removal_revalidates_the_expected_replacement_before_persisting() {
+        let mut app = test_app();
+        let active_id = app.config.general.selected_default_model.clone();
+        let active_path = app
+            .config
+            .general
+            .model_paths
+            .get(&active_id)
+            .cloned()
+            .expect("test active model path");
+        let replacement_path = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id.clone()));
+        assert_eq!(
+            app.model_management.removal_replacement.as_deref(),
+            Some("whisper_cpp_base_en")
+        );
+
+        fs::remove_file(&replacement_path).unwrap();
+        config::normalize_config(&mut app.config);
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(active_id.clone()));
+
+        assert_eq!(app.config.general.selected_default_model, active_id);
+        assert!(active_path.is_file(), "active artifact must stay untouched");
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(active_id.as_str())
+        );
+        assert!(
+            app.status_message
+                .contains("replacement model is no longer ready")
+        );
+
+        let _ = fs::remove_file(active_path);
+    }
+
+    #[test]
     fn uninstall_clears_active_model_when_no_installed_models_remain() {
         let temp_dir =
             std::env::temp_dir().join(format!("scribe-empty-models-test-{}", std::process::id()));
@@ -19192,19 +20337,104 @@ mod layout_tests {
         fs::write(&source, b"original").unwrap();
         let before =
             fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
-        let install = config::ImportedGgufModelInstall::validated(
-            before.canonical_path.clone(),
-            before.size_bytes,
-            before.sha256,
-            "Imported fixture".to_owned(),
-        );
-
         fs::write(&source, b"changed!").unwrap();
         let after = fingerprint_file_cancellable(&source, &InstallCancellation::default()).unwrap();
 
-        assert_eq!(after.size_bytes, install.size_bytes);
-        assert!(!local_gguf_import_fingerprint_matches(&install, &after));
+        assert_eq!(after.size_bytes, before.size_bytes);
+        assert!(ensure_local_gguf_fingerprint_unchanged(&before, &after).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_gguf_final_fingerprint_honors_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-import-fingerprint-cancel-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("external").join("imported.gguf");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"fixture").unwrap();
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+
+        let result = fingerprint_file_cancellable(&source, &cancellation);
+
+        assert!(matches!(result, Err(InstallError::Cancelled { .. })));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_gguf_ui_completion_performs_no_source_file_read_or_fingerprint() {
+        let source = include_str!("app.rs");
+        let start = source
+            .find("    fn finish_local_gguf_import(")
+            .expect("local GGUF completion boundary exists");
+        let end = source[start..]
+            .find("\n    fn uninstall_model(")
+            .map(|offset| start + offset)
+            .expect("local GGUF completion boundary remains scoped");
+        let completion = &source[start..end];
+
+        for forbidden in [
+            "fingerprint_file_cancellable",
+            "fs::read",
+            "fs::metadata",
+            "fs::canonicalize",
+        ] {
+            assert!(
+                !completion.contains(forbidden),
+                "UI completion must not call source I/O boundary {forbidden}"
+            );
+        }
+        assert!(completion.contains("self.rebuild_local_models_after_committed_change();"));
+        assert!(
+            completion
+                .find("installed_manifest::persist_manifest_at")
+                .unwrap()
+                < completion
+                    .find("self.rebuild_local_models_after_committed_change();")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn successful_runtime_removal_paths_rebuild_inventory_only_after_commit() {
+        let source = include_str!("app.rs");
+        let start = source.find("    fn uninstall_runtime(").unwrap();
+        let end = source[start..]
+            .find("\n    fn refresh_playground_runtime_statuses(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let uninstall = &source[start..end];
+        let legacy_start = uninstall.find("        let Some(provider)").unwrap();
+        let (managed, legacy) = uninstall.split_at(legacy_start);
+        let refresh = "self.rebuild_local_models_after_committed_change();";
+
+        assert_eq!(uninstall.matches(refresh).count(), 2);
+        assert!(managed.find("removal.commit()").unwrap() < managed.find(refresh).unwrap());
+        assert!(managed.find("config::save_config").unwrap() < managed.find(refresh).unwrap());
+        assert!(legacy.find("config::save_config").unwrap() < legacy.find(refresh).unwrap());
+    }
+
+    #[test]
+    fn committed_inventory_change_replaces_the_cached_local_projection() {
+        let mut app = test_app();
+        let before = Arc::clone(&app.remote_catalog.local_models);
+        let builds = app.remote_catalog.local_models_build_count;
+        app.config.general.selected_default_model = "not-selected".to_owned();
+
+        app.rebuild_local_models_after_committed_change();
+
+        assert_eq!(app.remote_catalog.local_models_build_count, builds + 1);
+        assert!(!Arc::ptr_eq(&before, &app.remote_catalog.local_models));
+        assert!(
+            app.remote_catalog
+                .local_models
+                .iter()
+                .find(|model| model.id == "whisper_cpp_tiny_en")
+                .is_some_and(|model| !model.active)
+        );
     }
 
     #[test]
@@ -19369,23 +20599,5 @@ mod layout_tests {
             RecordingSource::Playground,
             StreamingMode::Auto
         ));
-    }
-
-    #[test]
-    fn streaming_mode_selector_has_an_accessible_name() {
-        let context = egui::Context::default();
-        context.enable_accesskit();
-        let mut mode = StreamingMode::Auto;
-
-        let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                assert!(!streaming_mode_selector(ui, &mut mode));
-            });
-        });
-        let update = output.platform_output.accesskit_update.unwrap();
-
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::ComboBox && node.name() == Some("Preview mode")
-        }));
     }
 }

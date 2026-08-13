@@ -171,10 +171,11 @@ cargo check
 ## Models and Runtime
 
 Open `Models` to import a local GGUF or install, select, update, and remove
-trusted Experimental models. The catalog can search model/language/filename,
-filter its trusted results by installed/recommended/multilingual/size metadata,
-and sort them; unavailable metadata such as download counts and native
-streaming is not presented as a control. Install is disabled with a clear
+trusted Experimental models. The page searches its immutable local inventory
+by friendly name and language, filters by language, and refreshes remote data
+only when you choose Refresh. Installed and Available sections use the same
+compact card design; unavailable speed or accuracy metadata is shown as
+`Not rated` instead of being inferred from file size. Install is disabled with a clear
 message when the destination volume cannot satisfy the download plus Scribe's
 1 GiB safety reserve. A model is not labelled Supported until its full
 compatibility matrix passes; currently none has.

@@ -1355,14 +1355,14 @@ mod tests {
     fn safe_gguf_catalog_artifacts_do_not_require_a_managed_runtime_package() {
         let router = RuntimeRouter::new();
 
-        assert_eq!(
-            router.managed_runtime_id(&ModelId::new("whisper_cpp_tiny_en")),
-            None
-        );
-        assert_eq!(
-            router.managed_runtime_id(&ModelId::new("whisper_cpp_base_en")),
-            Some("whisper_cpp")
-        );
+        for id in [
+            "whisper_cpp_tiny_en",
+            "whisper_cpp_base_en",
+            "whisper_cpp_small_en",
+            "whisper_cpp_medium_en",
+        ] {
+            assert_eq!(router.managed_runtime_id(&ModelId::new(id)), None);
+        }
     }
 
     #[test]

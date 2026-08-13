@@ -88,6 +88,7 @@ pub enum StreamingMode {
 }
 
 impl StreamingMode {
+    #[allow(dead_code)]
     pub const ALL: [Self; 3] = [Self::Auto, Self::Rolling, Self::FinalOnly];
 
     pub fn label(self) -> &'static str {
@@ -127,8 +128,6 @@ pub enum OverlayMode {
 }
 
 impl OverlayMode {
-    pub const ALL: [Self; 3] = [Self::Live, Self::Minimal, Self::Off];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "Live",
@@ -147,6 +146,7 @@ pub enum OverlayPosition {
 }
 
 impl OverlayPosition {
+    #[allow(dead_code)]
     pub const ALL: [Self; 2] = [Self::Top, Self::Bottom];
 
     pub fn label(self) -> &'static str {
@@ -176,6 +176,7 @@ pub enum HistoryMode {
 }
 
 impl HistoryMode {
+    #[allow(dead_code)]
     pub const ALL: [Self; 3] = [Self::Off, Self::TranscriptOnly, Self::TranscriptAndAudio];
 
     pub fn label(self) -> &'static str {

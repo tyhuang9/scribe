@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,17 @@ pub(crate) struct InstallProgress {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InstallCancellation {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
+}
+
+const INSTALL_ACTIVE: u8 = 0;
+const INSTALL_CANCELLED: u8 = 1;
+const INSTALL_ACTIVATION_COMMITTED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActivationCommitError {
+    Cancelled,
+    AlreadyCommitted,
 }
 
 /// Immutable facts observed while hashing a user-selected local artifact.
@@ -58,11 +68,41 @@ pub(crate) struct FileFingerprint {
 
 impl InstallCancellation {
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let _ = self.state.compare_exchange(
+            INSTALL_ACTIVE,
+            INSTALL_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == INSTALL_CANCELLED
+    }
+
+    pub(crate) fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Linearization point between cancellation and the first activation
+    /// mutation. Whichever transition wins is terminal for this install.
+    pub(crate) fn try_commit_activation(&self) -> Result<(), ActivationCommitError> {
+        match self.state.compare_exchange(
+            INSTALL_ACTIVE,
+            INSTALL_ACTIVATION_COMMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(INSTALL_CANCELLED) => Err(ActivationCommitError::Cancelled),
+            Err(INSTALL_ACTIVATION_COMMITTED) => Err(ActivationCommitError::AlreadyCommitted),
+            Err(_) => unreachable!("install cancellation state is invalid"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_is_committed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INSTALL_ACTIVATION_COMMITTED
     }
 }
 
@@ -3780,5 +3820,62 @@ mod tests {
         for invalid in ["4-9/10", "bytes */10", "bytes 4-9/*", "bytes 4/10"] {
             assert_eq!(parse_content_range(invalid), None);
         }
+    }
+
+    #[test]
+    fn cancellation_and_activation_commit_have_one_terminal_winner() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        for _ in 0..128 {
+            let cancellation = InstallCancellation::default();
+            let cancel_handle = cancellation.clone();
+            let activation_handle = cancellation.clone();
+            let barrier = Arc::new(Barrier::new(3));
+            let cancel_barrier = Arc::clone(&barrier);
+            let activate_barrier = Arc::clone(&barrier);
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_handle.cancel();
+            });
+            let activate = thread::spawn(move || {
+                activate_barrier.wait();
+                activation_handle.try_commit_activation()
+            });
+            barrier.wait();
+            cancel.join().unwrap();
+            let activation = activate.join().unwrap();
+
+            match activation {
+                Ok(()) => {
+                    assert!(cancellation.activation_is_committed());
+                    assert!(!cancellation.is_cancelled());
+                    cancellation.cancel();
+                    assert!(cancellation.activation_is_committed());
+                    assert!(!cancellation.is_cancelled());
+                }
+                Err(ActivationCommitError::Cancelled) => {
+                    assert!(cancellation.is_cancelled());
+                    assert!(!cancellation.activation_is_committed());
+                }
+                Err(ActivationCommitError::AlreadyCommitted) => {
+                    panic!("only one activation contender exists")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activation_commit_makes_late_cancellation_a_defined_no_op() {
+        let cancellation = InstallCancellation::default();
+        cancellation.try_commit_activation().unwrap();
+        cancellation.cancel();
+
+        assert!(cancellation.activation_is_committed());
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            cancellation.try_commit_activation(),
+            Err(ActivationCommitError::AlreadyCommitted)
+        );
     }
 }

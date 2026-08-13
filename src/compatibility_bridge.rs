@@ -73,10 +73,6 @@ impl ProviderHandle {
     ) -> Option<PathBuf> {
         runtime_catalog::resolve_runtime_entrypoint(self.id(), roots)
     }
-
-    pub(crate) fn same_provider(self, model: &SttModelInfo) -> bool {
-        model.backend == self.adapter.backend
-    }
 }
 
 pub(crate) fn record_selected_provider(config: &mut AppConfig, model: &SttModelInfo) {
@@ -98,18 +94,6 @@ pub(crate) fn model_storage_estimate(model: &SttModelInfo) -> &'static str {
 
 pub(crate) fn model_download_total_bytes(model: &SttModelInfo) -> Option<u64> {
     runtime_catalog::model_download_total_bytes(&model.id)
-}
-
-pub(crate) fn runtime_storage_estimate(model: &SttModelInfo) -> &'static str {
-    runtime_catalog::backend_spec(&model.backend)
-        .map(|spec| spec.runtime_storage_estimate)
-        .unwrap_or("varies")
-}
-
-pub(crate) fn runtime_storage_detail(model: &SttModelInfo) -> &'static str {
-    runtime_catalog::backend_spec(&model.backend)
-        .map(|spec| spec.runtime_storage_detail)
-        .unwrap_or("varies")
 }
 
 pub(crate) fn entrypoint_is_usable(provider_id: &str, path: &Path) -> bool {

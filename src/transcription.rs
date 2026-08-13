@@ -33,7 +33,10 @@ use crate::installations::{
 pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
-use crate::model_catalog::{model_descriptor, normal_model_descriptors, runtime_model_manifest};
+use crate::model_catalog::{
+    model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
+    runtime_model_manifest,
+};
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
@@ -288,15 +291,19 @@ impl InstallationCandidate {
         model_path: PathBuf,
         runtime_package_root: Option<PathBuf>,
     ) -> Result<Self> {
-        let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
-            anyhow!("model {model_id} has no normalized pinned artifact manifest")
-        })?;
+        let manifest =
+            runtime_artifact_manifest_for_path(&model_id, &model_path).ok_or_else(|| {
+                anyhow!(
+                    "model {model_id} has no pinned artifact manifest for {}",
+                    model_path.display()
+                )
+            })?;
         Ok(Self {
             model_id,
             model_path,
             runtime_package_root,
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256.to_owned(),
+            expected_size_bytes: manifest.size_bytes,
+            expected_sha256: manifest.sha256.to_owned(),
         })
     }
 
@@ -329,6 +336,54 @@ pub(crate) struct InstallSmoke {
     pub(crate) load_duration_ms: u128,
     pub(crate) decode_duration_ms: u128,
     pub(crate) reload_duration_ms: u128,
+}
+
+/// Single-use installation evidence sealed by the isolated verifier and bound
+/// to the exact staged artifact and cancellation handle it checked.
+pub(crate) struct VerifiedInstallationCandidate {
+    candidate: InstallationCandidate,
+    cancellation: InstallCancellation,
+    smoke: InstallSmoke,
+}
+
+impl VerifiedInstallationCandidate {
+    pub(crate) fn authorize_activation(
+        self,
+        model_id: &ModelId,
+        model_path: &Path,
+        expected_size_bytes: u64,
+        expected_sha256: &str,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        if !self.cancellation.same_handle(cancellation) {
+            return Err(anyhow!(
+                "verified installation candidate was presented with a different cancellation handle"
+            ));
+        }
+        if self.candidate.model_id != *model_id
+            || self.candidate.model_path != model_path
+            || self.candidate.expected_size_bytes != expected_size_bytes
+            || !self
+                .candidate
+                .expected_sha256
+                .eq_ignore_ascii_case(expected_sha256)
+        {
+            return Err(anyhow!(
+                "verified installation candidate no longer matches the staged artifact"
+            ));
+        }
+        cancellation
+            .try_commit_activation()
+            .map_err(|state| match state {
+                crate::installations::ActivationCommitError::Cancelled => {
+                    anyhow!("installation verification was cancelled before activation committed")
+                }
+                crate::installations::ActivationCommitError::AlreadyCommitted => {
+                    anyhow!("verified installation candidate was already consumed for activation")
+                }
+            })?;
+        Ok(self.smoke)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -863,9 +918,7 @@ impl TranscriptionService {
         self.config.performance.acceleration_preference
     }
 
-    /// Returns normal user-facing, runtime-neutral descriptors. Retained
-    /// compatibility descriptors remain resolvable individually for existing
-    /// configurations, but are deliberately absent from the default flow.
+    /// Returns normal user-facing, runtime-neutral descriptors.
     pub fn model_descriptors(&self) -> Vec<ModelDescriptor> {
         normal_model_descriptors()
             .into_iter()
@@ -1088,18 +1141,19 @@ impl TranscriptionService {
         let path = model
             .local_path
             .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
-        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
+        let manifest = runtime_artifact_manifest_for_path(model_id, &path).ok_or_else(|| {
             anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for verification",
-                model.name
+                "model {} has no pinned size and SHA-256 evidence for {}",
+                model.name,
+                path.display()
             )
         })?;
         let runtime_model = RuntimeModel {
             id: model_id.clone(),
             path,
             package_root: Some(package_root),
-            expected_size_bytes: manifest.artifact_size_bytes,
-            expected_sha256: manifest.artifact_sha256.to_owned(),
+            expected_size_bytes: manifest.size_bytes,
+            expected_sha256: manifest.sha256.to_owned(),
         };
         if let Some(package_root) = runtime_model.package_root.as_deref() {
             verify_primary_runtime_package_tree(package_root)?;
@@ -1134,20 +1188,18 @@ impl TranscriptionService {
             .local_path
             .ok_or_else(|| anyhow!("download {} before verification", model.name))?;
         let imported_artifact = config::imported_gguf_artifact(&self.config, model_id.as_str());
-        let manifest = runtime_model_manifest(model_id).ok_or_else(|| {
-            anyhow!(
-                "model {} has no pinned size and SHA-256 evidence for verification",
-                model.name
-            )
-        });
         let (expected_size_bytes, expected_sha256) = if let Some(artifact) = imported_artifact {
             (artifact.expected_size_bytes, artifact.expected_sha256)
         } else {
-            let manifest = manifest?;
-            (
-                manifest.artifact_size_bytes,
-                manifest.artifact_sha256.to_owned(),
-            )
+            let artifact =
+                runtime_artifact_manifest_for_path(model_id, &path).ok_or_else(|| {
+                    anyhow!(
+                        "model {} has no pinned artifact for {}",
+                        model.name,
+                        path.display()
+                    )
+                })?;
+            (artifact.size_bytes, artifact.sha256.to_owned())
         };
         crate::installations::verify_file(&path, expected_size_bytes, &expected_sha256)
             .map_err(|error| anyhow!("model integrity verification failed: {error}"))
@@ -1280,6 +1332,40 @@ impl TranscriptionService {
                 }
             }
         }
+    }
+
+    /// Issues activation evidence only after the real isolated verifier has
+    /// accepted the exact candidate under the retained cancellation handle.
+    pub(crate) fn verify_installation_candidate_for_activation(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+    ) -> Result<VerifiedInstallationCandidate> {
+        let verified_candidate = candidate.clone();
+        let smoke = self.verify_installation_candidate(candidate, cancellation)?;
+        ensure_install_not_cancelled(cancellation)?;
+        Ok(VerifiedInstallationCandidate {
+            candidate: verified_candidate,
+            cancellation: cancellation.clone(),
+            smoke,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_installation_candidate_for_activation_with(
+        &self,
+        candidate: InstallationCandidate,
+        cancellation: &InstallCancellation,
+        verify: impl FnOnce(&InstallationCandidate) -> Result<InstallSmoke>,
+    ) -> Result<VerifiedInstallationCandidate> {
+        ensure_install_not_cancelled(cancellation)?;
+        let smoke = verify(&candidate)?;
+        ensure_install_not_cancelled(cancellation)?;
+        Ok(VerifiedInstallationCandidate {
+            candidate,
+            cancellation: cancellation.clone(),
+            smoke,
+        })
     }
 
     fn verify_installation_candidate_blocking(
@@ -1640,16 +1726,15 @@ impl TranscriptionService {
         } else if let Some(artifact) = imported_artifact {
             (artifact.expected_size_bytes, artifact.expected_sha256)
         } else {
-            let manifest = runtime_model_manifest(&model_id).ok_or_else(|| {
-                anyhow!(
-                    "model {} has no pinned size and SHA-256 evidence for in-process native loading",
-                    model.name
-                )
-            })?;
-            (
-                manifest.artifact_size_bytes,
-                manifest.artifact_sha256.to_owned(),
-            )
+            let artifact =
+                runtime_artifact_manifest_for_path(&model_id, &path).ok_or_else(|| {
+                    anyhow!(
+                        "model {} has no pinned size and SHA-256 evidence for {}",
+                        model.name,
+                        path.display()
+                    )
+                })?;
+            (artifact.size_bytes, artifact.sha256.to_owned())
         };
         Ok(RuntimeModel {
             id: model.id.into(),
@@ -2334,6 +2419,93 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual: requires local GGUF, WAV, and retained legacy GGML paths"]
+    fn manual_known_wav_gguf_migration_smoke_uses_the_pinned_candidate_handoff() {
+        let gguf = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_GGUF")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_GGUF to the exact pinned base Q8 GGUF"),
+        );
+        let wav = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_AUDIO")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_AUDIO to a known spoken WAV"),
+        );
+        let legacy = PathBuf::from(
+            std::env::var("SCRIBE_TRANSCRIBE_CPP_LEGACY")
+                .expect("set SCRIBE_TRANSCRIBE_CPP_LEGACY to the retained ggml-base.en.bin"),
+        );
+        assert!(legacy.is_file(), "the retained legacy GGML file must exist");
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let candidate = InstallationCandidate::normalized(model_id.clone(), gguf.clone(), None)
+            .expect("the supplied GGUF filename must match the catalog-pinned base Q8 artifact");
+        let expected_size_bytes = candidate.expected_size_bytes;
+        let expected_sha256 = candidate.expected_sha256.clone();
+        let audio = Arc::new(PreparedAudio::from_wav_path(&wav).expect("load the supplied WAV"));
+        assert!(
+            !audio.samples.is_empty(),
+            "the supplied WAV must contain audio"
+        );
+
+        let mut config = AppConfig::default();
+        config.general.selected_default_model = model_id.as_str().to_owned();
+        config
+            .general
+            .model_paths
+            .insert(model_id.as_str().to_owned(), legacy.clone());
+        let prior = serde_json::to_value(&config).unwrap();
+        let service = TranscriptionService::new(config.clone());
+        let cancellation = InstallCancellation::default();
+        let verified = service
+            .verify_installation_candidate_for_activation_with(
+                candidate,
+                &cancellation,
+                |candidate| {
+                    let smoke =
+                        service.verify_installation_candidate(candidate.clone(), &cancellation)?;
+                    let mut request = TranscriptionRequest::new(
+                        SessionId(1),
+                        RequestId(1),
+                        Arc::clone(&audio),
+                        model_id.clone(),
+                    );
+                    request.model_path = Some(gguf.clone());
+                    let transcript = service.transcribe(request)?.transcript.text;
+                    assert!(
+                        !transcript.trim().is_empty(),
+                        "known-WAV smoke must produce a non-empty transcript"
+                    );
+                    if let Ok(expected) = std::env::var("SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT")
+                    {
+                        assert!(
+                            transcript.contains(&expected),
+                            "transcript did not contain SCRIBE_TRANSCRIBE_CPP_EXPECTED_TRANSCRIPT"
+                        );
+                    }
+                    Ok(smoke)
+                },
+            )
+            .expect("the local GGUF must pass its catalog pin and known-WAV smoke");
+        verified
+            .authorize_activation(
+                &model_id,
+                &gguf,
+                expected_size_bytes,
+                &expected_sha256,
+                &cancellation,
+            )
+            .expect("only a verified candidate may switch the configured path");
+        config
+            .general
+            .model_paths
+            .insert(model_id.as_str().to_owned(), gguf);
+        assert_eq!(config.general.selected_default_model, model_id.as_str());
+        assert_ne!(serde_json::to_value(&config).unwrap(), prior);
+        assert!(
+            legacy.is_file(),
+            "the migration smoke must not remove legacy GGML"
+        );
+    }
+
+    #[test]
     fn preview_hypothesis_preserves_and_offsets_native_segment_timing() {
         let identity = StreamIdentity {
             session_id: SessionId(1),
@@ -2578,7 +2750,7 @@ mod tests {
         let service = TranscriptionService::new(AppConfig::default());
         let descriptors = service.model_descriptors();
 
-        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors.len(), 4);
         for descriptor in descriptors {
             assert!(matches!(
                 descriptor.compatibility,
@@ -2639,14 +2811,14 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_descriptor_is_resolvable_but_absent_from_the_normal_catalog() {
+    fn normalized_base_descriptor_is_present_in_the_normal_catalog() {
         let service = TranscriptionService::new(AppConfig::default());
         let singular = service
             .model_descriptor(&ModelId::new("whisper_cpp_base_en"))
             .unwrap();
 
         assert!(
-            !service
+            service
                 .model_descriptors()
                 .into_iter()
                 .any(|descriptor| descriptor.id == singular.id)
@@ -2677,7 +2849,7 @@ mod tests {
         assert!(model_uses_embedded_gguf(&ModelId::new(
             "whisper_cpp_tiny_en"
         )));
-        assert!(!model_uses_embedded_gguf(&ModelId::new(
+        assert!(model_uses_embedded_gguf(&ModelId::new(
             "whisper_cpp_base_en"
         )));
     }

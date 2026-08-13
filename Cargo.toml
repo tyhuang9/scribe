@@ -3,6 +3,9 @@ name = "local-transcriber"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+ui-harness = []
+
 [dependencies]
 anyhow = "1"
 arboard = "3.6"
@@ -10,6 +13,7 @@ cpal = "0.15"
 crossbeam-channel = "0.5"
 directories = "5"
 eframe = "0.27"
+egui-phosphor = "=0.5.0"
 global-hotkey = "0.6"
 hound = "3.5"
 libloading = "0.8"

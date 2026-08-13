@@ -493,22 +493,18 @@ fn relative_time_label(created_at_ms: i64) -> String {
 }
 
 pub(crate) fn about_page(ui: &mut egui::Ui, model_dir: &Path, config_path: Option<&Path>) {
-    ui.heading("Scribe");
+    semantic_heading(ui, RichText::new("Scribe").size(24.0).strong());
     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
     ui.add_space(12.0);
-    ui.group(|ui| {
-        ui.label(RichText::new("Local-first privacy").strong());
-        ui.label(
-            "Microphone audio and speech preparation stay in native Rust workers. Scribe does not use a cloud speech service.",
-        );
-    });
+    ui.label(RichText::new("Local-first privacy").strong());
+    ui.label(
+        "Microphone audio and speech preparation stay in native Rust workers. Scribe does not use a cloud speech service.",
+    );
     ui.add_space(12.0);
-    ui.group(|ui| {
-        ui.label(RichText::new("Local paths").strong());
-        ui.label(format!("Models: {}", model_dir.display()));
-        ui.label(match config_path {
-            Some(path) => format!("Settings: {}", path.display()),
-            None => "Settings: platform path unavailable".to_owned(),
-        });
+    ui.label(RichText::new("Local paths").strong());
+    ui.label(format!("Models: {}", model_dir.display()));
+    ui.label(match config_path {
+        Some(path) => format!("Settings: {}", path.display()),
+        None => "Settings: platform path unavailable".to_owned(),
     });
 }

@@ -1105,19 +1105,16 @@ mod tests {
         assert!(revision.load(Ordering::Acquire) > 0);
         assert!(f32::from_bits(rms_bits.load(Ordering::Relaxed)) > 0.0);
         assert!(f32::from_bits(peak_bits.load(Ordering::Relaxed)) > 0.0);
-        assert!(pipeline.prepared.is_empty());
-        assert_eq!(
-            pipeline.prepared.len(),
-            0,
-            "prepared_frames must remain zero"
-        );
         assert!(
-            pipeline.preview_publisher.is_none(),
-            "meter-only never publishes preview audio"
+            pipeline.prepared.is_empty(),
+            "meter-only must not retain PCM"
         );
-        let audio = pipeline.finish(CaptureStopReason::Explicit).unwrap();
+
         assert!(
-            audio.is_none(),
+            pipeline
+                .finish(CaptureStopReason::Explicit)
+                .unwrap()
+                .is_none(),
             "meter-only completion has no PreparedAudio"
         );
         assert!(pipeline.prepared.is_empty());
