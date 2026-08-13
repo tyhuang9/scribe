@@ -6112,7 +6112,6 @@ impl LocalTranscriberApp {
                     {
                         continue;
                     }
-                    self.remote_catalog.invalidate_local_models();
                     let stage_label = match progress.stage {
                         InstallStage::Downloading => "Downloading",
                         InstallStage::Verifying => "Verifying checksum",
@@ -6134,6 +6133,7 @@ impl LocalTranscriberApp {
                             ModelInstallStatus::InstallingRuntime
                         },
                     );
+                    self.update_model_download_progress_projection(&model_id);
                     self.status_message = format!("{stage_label} for {model_id}...");
                 }
                 AppEvent::VerifiedInstallDone {
@@ -7032,6 +7032,78 @@ impl LocalTranscriberApp {
         true
     }
 
+    fn active_model_removal_replacement(&self, removed_id: &str) -> Option<SttModelInfo> {
+        let built_in_rank = crate::model_catalog::normal_model_descriptors()
+            .into_iter()
+            .enumerate()
+            .map(|(index, descriptor)| (descriptor.id.as_str().to_owned(), index))
+            .collect::<HashMap<_, _>>();
+        let mut candidates = config::configured_models(&self.config)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.id != removed_id
+                    && self.effective_install_status(candidate).is_runnable()
+                    && runtime_status_for_model(&self.config, candidate)
+                        == ModelRuntimeStatus::Ready
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_recommended = self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&left.id))
+                .ok()
+                .is_some_and(|descriptor| descriptor.recommended);
+            let right_recommended = self
+                .transcription_service
+                .model_descriptor(&ModelId::new(&right.id))
+                .ok()
+                .is_some_and(|descriptor| descriptor.recommended);
+            compare_active_model_replacements(
+                left,
+                left_recommended,
+                built_in_rank.get(&left.id).copied(),
+                right,
+                right_recommended,
+                built_in_rank.get(&right.id).copied(),
+            )
+        });
+        candidates.into_iter().next()
+    }
+
+    fn persist_active_model_replacement(&mut self, replacement: &SttModelInfo) -> bool {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return false;
+        }
+        if let Err(error) = self.transcription_service.unload_runtime() {
+            self.status = TranscriptionStatus::Error;
+            self.status_message =
+                format!("Could not unload the active model before replacement: {error}");
+            return false;
+        }
+        let previous = self.config.clone();
+        self.config.general.selected_default_model = replacement.id.clone();
+        compatibility_bridge::record_selected_provider(&mut self.config, replacement);
+        config::normalize_config(&mut self.config);
+        if let Err(error) = config::save_config(&self.config) {
+            self.config = previous;
+            self.transcription_service =
+                self.transcription_service.with_config(self.config.clone());
+            self.status = TranscriptionStatus::Error;
+            self.status_message = format!(
+                "Could not persist the replacement model before removal: {error}. The active model and its files were left unchanged."
+            );
+            return false;
+        }
+        if let Some(store) = self.settings_store.as_mut() {
+            store.mark_current_persisted();
+        }
+        self.transcription_service = self.transcription_service.with_config(self.config.clone());
+        self.refresh_playground_cards_from_config();
+        self.remote_catalog.invalidate_local_models();
+        true
+    }
+
     fn effective_install_status(&self, model: &SttModelInfo) -> ModelInstallStatus {
         self.model_downloads
             .get(&model.id)
@@ -7422,14 +7494,17 @@ impl LocalTranscriberApp {
         ));
     }
 
-    fn uninstall_model(&mut self, model: &SttModelInfo) {
+    /// Returns true after removal settings are durably committed. Cleanup can
+    /// still require recovery after that point, so callers must not undo the
+    /// newly persisted active-model selection on a committed removal.
+    fn uninstall_model(&mut self, model: &SttModelInfo) -> bool {
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = reason;
-            return;
+            return false;
         }
         if let Err(error) = self.transcription_service.unload_runtime() {
             self.status_message = format!("Could not unload the selected model: {error}");
-            return;
+            return false;
         }
         let static_managed_target = self
             .config
@@ -7441,6 +7516,9 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
+            .then(|| model.local_path.clone())
+            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -7463,14 +7541,15 @@ impl LocalTranscriberApp {
         let imported_local = imported_receipt_target.is_some();
         let managed_target = static_managed_target
             .or(remote_managed_target)
-            .or(imported_receipt_target);
+            .or(imported_receipt_target)
+            .or(legacy_catalog_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     format!("Could not prepare model removal settings witness: {error}");
-                return;
+                return false;
             }
         };
         let mut staged_removal = match managed_target.as_ref() {
@@ -7484,7 +7563,7 @@ impl LocalTranscriberApp {
                         }
                         self.status = TranscriptionStatus::Error;
                         self.status_message = format!("Could not stage model removal: {error}");
-                        return;
+                        return false;
                     }
                 }
             }
@@ -7530,7 +7609,7 @@ impl LocalTranscriberApp {
             }
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return false;
         }
         if let Err(error) = config::save_config(&self.config) {
             self.config = previous_config;
@@ -7542,7 +7621,7 @@ impl LocalTranscriberApp {
             }
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return false;
         }
         let cleanup = staged_removal.and_then(|removal| removal.commit().err());
         if let Some(store) = self.settings_store.as_mut() {
@@ -7558,7 +7637,7 @@ impl LocalTranscriberApp {
             self.artifact_recovery_error = Some(message.clone());
             self.status = TranscriptionStatus::Error;
             self.status_message = message;
-            return;
+            return true;
         }
         self.status = TranscriptionStatus::Idle;
         self.status_message = if imported_local {
@@ -7572,6 +7651,7 @@ impl LocalTranscriberApp {
                 false => format!("Removed {} from Scribe.", model.name),
             }
         };
+        true
     }
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
@@ -8187,6 +8267,7 @@ impl LocalTranscriberApp {
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::ShowRemoteModelDetails { .. }
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
@@ -8311,7 +8392,6 @@ impl LocalTranscriberApp {
         let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
         let clear_add_focus = self.model_management.restore_add_focus;
         let clear_after_removal_focus = self.model_management.restore_after_removal_focus;
-        let clear_removal_notice = self.model_management.removal_notice.is_some();
         let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
         let clear_comparison_focus = self.model_comparison.focus_panel;
         let clear_reference_action_focus = self.model_comparison.restore_reference_action_focus;
@@ -8336,9 +8416,6 @@ impl LocalTranscriberApp {
         }
         if clear_after_removal_focus {
             self.model_management.restore_after_removal_focus = false;
-        }
-        if clear_removal_notice {
-            self.model_management.removal_notice = None;
         }
         if clear_reference_editor_focus {
             self.model_comparison.focus_reference_editor = false;
@@ -8809,6 +8886,41 @@ impl LocalTranscriberApp {
         }
     }
 
+    /// Progress is volatile and arrives several times per second. Update the
+    /// cached local row in place instead of rebuilding the full catalog and
+    /// remote search projection for every byte update; durable lifecycle
+    /// transitions still invalidate and rebuild through their normal paths.
+    fn update_model_download_progress_projection(&mut self, model_id: &str) {
+        if self.remote_catalog.local_models_dirty {
+            return;
+        }
+        let Some(status) = self.model_downloads.get(model_id) else {
+            return;
+        };
+        let (download_state, downloaded_bytes, total_bytes) = match status {
+            ModelInstallStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => (
+                ModelDownloadState::Downloading,
+                *downloaded_bytes,
+                *total_bytes,
+            ),
+            ModelInstallStatus::InstallingRuntime => (ModelDownloadState::Verifying, 0, None),
+            _ => return,
+        };
+        if let Some(model) = Arc::make_mut(&mut self.remote_catalog.local_models)
+            .iter_mut()
+            .find(|model| model.id == model_id)
+        {
+            model.download_state = download_state;
+            model.downloaded_bytes = downloaded_bytes;
+            model.total_bytes = total_bytes.or(model.total_bytes);
+            model.error_message = None;
+        }
+    }
+
     fn rebuild_local_models_after_committed_change(&mut self) {
         self.remote_catalog.invalidate_local_models();
         self.rebuild_model_inventory_projection();
@@ -8856,8 +8968,25 @@ impl LocalTranscriberApp {
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
         let installed = model_artifact_remains_manageable(model, &install_status);
+        let imported_gguf = self
+            .config
+            .general
+            .imported_gguf_models
+            .contains_key(&model.id);
+        // Scribe versions before the verified GGUF catalog stored known GGML
+        // compatibility artifacts directly below the app's model directory,
+        // without a managed-install receipt. This exact, canonical path is
+        // still Scribe-owned; an arbitrary configured path is not.
+        let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
         let custom = model.local_path.is_some()
-            && !self.config.general.managed_models.contains_key(&model.id);
+            && !self.config.general.managed_models.contains_key(&model.id)
+            && !self
+                .config
+                .general
+                .managed_remote_models
+                .contains_key(&model.id)
+            && !imported_gguf
+            && !app_owned_legacy_artifact;
         let download_state = match &install_status {
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
@@ -8885,8 +9014,8 @@ impl LocalTranscriberApp {
         };
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let mutation_blocked = mutation_block_reason.is_some();
-        let active =
-            installed && runtime_ready && self.config.general.selected_default_model == model.id;
+        let selected = installed && self.config.general.selected_default_model == model.id;
+        let active = selected && runtime_ready;
         let migration_pending =
             installed && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
@@ -8968,6 +9097,7 @@ impl LocalTranscriberApp {
                 Some("Install this model before using it.".to_owned()),
             )
         };
+        let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
         ModelViewModel {
             id: model.id.clone(),
             display_name,
@@ -8977,7 +9107,16 @@ impl LocalTranscriberApp {
                 |value| value.description.to_owned(),
             )),
             runtime_group: "Local speech runtime".to_owned(),
+            architecture: None,
+            artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
+            artifact_revision: manifest.map(|manifest| manifest.artifact_revision.to_owned()),
+            artifact_filename: manifest.map(|manifest| manifest.artifact_filename.to_owned()),
+            artifact_path: model
+                .local_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             installed,
+            selected,
             active,
             ready: installed && runtime_ready,
             recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
@@ -8996,7 +9135,10 @@ impl LocalTranscriberApp {
             primary_action_repairs_runtime,
             primary_action_disabled_reason,
             cancel_supported: self.artifact_installations.contains_key(&model.id),
-            removal_supported: !custom && supports_managed_uninstall(model, &install_status),
+            removal_supported: !custom
+                && (imported_gguf
+                    || app_owned_legacy_artifact
+                    || supports_managed_uninstall(model, &install_status)),
             download_state,
             downloaded_bytes,
             total_bytes,
@@ -9055,6 +9197,8 @@ impl LocalTranscriberApp {
                     translation: descriptor.capabilities.translation,
                     timestamps: descriptor.capabilities.timestamps,
                     language_detection: descriptor.capabilities.language_detection,
+                    cpu: descriptor.capabilities.cpu,
+                    gpu: descriptor.capabilities.gpu,
                 }
             }),
             compatibility: descriptor.map_or(ModelCompatibility::Incompatible, |descriptor| {
@@ -9088,17 +9232,37 @@ impl LocalTranscriberApp {
                 self.model_management.dialog = Some(ModelDialog::Details(id));
                 self.model_management.focus_dialog_initial = true;
             }
-            ScreenAction::RequestModelRemoval(id) => {
-                self.model_management.dialog = Some(ModelDialog::Remove(id));
+            ScreenAction::ShowRemoteModelDetails {
+                entry_id,
+                variant_id,
+            } => {
+                self.model_management.dialog = Some(ModelDialog::RemoteDetails {
+                    entry_id,
+                    variant_id,
+                });
                 self.model_management.focus_dialog_initial = true;
+            }
+            ScreenAction::RequestModelRemoval(id) => {
+                let active = self.config.general.selected_default_model == id;
+                let replacement = active
+                    .then(|| self.active_model_removal_replacement(&id))
+                    .flatten();
+                if active && replacement.is_none() {
+                    self.status_message =
+                        "Install another ready model before removing the active model.".to_owned();
+                } else {
+                    self.model_management.removal_replacement =
+                        replacement.as_ref().map(|model| model.id.clone());
+                    self.model_management.dialog = Some(ModelDialog::Remove(id));
+                    self.model_management.focus_dialog_initial = true;
+                }
             }
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
-                Some(ModelDialog::Details(id)) => {
-                    self.model_management.restore_details_focus = Some(id)
-                }
+                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
                 Some(ModelDialog::Remove(id)) => {
-                    self.model_management.restore_remove_focus = Some(id)
+                    self.model_management.restore_remove_focus = Some(id);
+                    self.model_management.removal_replacement = None;
                 }
                 None => {}
             },
@@ -9225,17 +9389,55 @@ impl LocalTranscriberApp {
                     && self.select_model_as_default(&model)
                 {
                     self.model_management.dialog = None;
-                    self.model_management.restore_details_focus = Some(id);
                 }
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
-                self.model_management.restore_after_removal_focus = true;
+                self.model_management.restore_after_removal_focus = false;
+                let active = self.config.general.selected_default_model == id;
+                let mut replacement_name = None;
+                if active {
+                    let expected = self.model_management.removal_replacement.take();
+                    let replacement = expected.as_deref().and_then(|expected_id| {
+                        self.active_model_removal_replacement(&id)
+                            .filter(|candidate| candidate.id == expected_id)
+                    });
+                    let Some(replacement) = replacement else {
+                        self.status_message = "The replacement model is no longer ready. Install or repair another model before removing the active model.".to_owned();
+                        self.model_management.restore_remove_focus = Some(id);
+                        return;
+                    };
+                    if !self.persist_active_model_replacement(&replacement) {
+                        self.model_management.restore_remove_focus = Some(id);
+                        return;
+                    }
+                    replacement_name = Some(replacement.name.clone());
+                }
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
                     .find(|model| model.id == id)
                 {
-                    self.uninstall_model(&model);
+                    let removal_committed = self.uninstall_model(&model);
+                    if removal_committed {
+                        if let Some(replacement_name) = replacement_name
+                            && self.status == TranscriptionStatus::Error
+                        {
+                            self.status_message = format!(
+                                "{} The active model is now {replacement_name}.",
+                                self.status_message
+                            );
+                        }
+                        self.rebuild_local_models_after_committed_change();
+                        self.model_management.restore_after_removal_focus = true;
+                    } else {
+                        if let Some(replacement_name) = replacement_name {
+                            self.status_message = format!(
+                                "{} The active model is now {replacement_name}; the original model was kept.",
+                                self.status_message
+                            );
+                        }
+                        self.model_management.restore_remove_focus = Some(id);
+                    }
                 }
             }
             ScreenAction::RepairModelRuntime(id) => {
@@ -10270,6 +10472,7 @@ impl LocalTranscriberApp {
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
             | ScreenAction::ShowModelDetails(_)
+            | ScreenAction::ShowRemoteModelDetails { .. }
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
             | ScreenAction::CloseModelDialog
@@ -12035,12 +12238,49 @@ fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
         .is_some_and(|(path, storage)| path.starts_with(storage))
 }
 
+/// Returns true only for a retained GGML filename at Scribe's own canonical
+/// legacy catalog location. It deliberately excludes `model_paths` and any
+/// outside-storage path so an imported or user-owned artifact can never be
+/// staged for deletion merely because it shares a catalog model ID.
+fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
+    let Some(path) = model.local_path.as_deref() else {
+        return false;
+    };
+    let Some(legacy_path) = config::legacy_downloaded_model_path(config, model) else {
+        return false;
+    };
+    path == legacy_path && is_app_managed_model_path(config, path)
+}
+
 fn select_first_installed_model(config: &mut AppConfig) {
     config.general.selected_default_model = config::configured_models(config)
         .into_iter()
         .find(|model| model.install_status.is_runnable())
         .map(|model| model.id)
         .unwrap_or_default();
+}
+
+fn compare_active_model_replacements(
+    left: &SttModelInfo,
+    left_recommended: bool,
+    left_builtin_rank: Option<usize>,
+    right: &SttModelInfo,
+    right_recommended: bool,
+    right_builtin_rank: Option<usize>,
+) -> std::cmp::Ordering {
+    right_recommended
+        .cmp(&left_recommended)
+        .then_with(|| {
+            left_builtin_rank
+                .unwrap_or(usize::MAX)
+                .cmp(&right_builtin_rank.unwrap_or(usize::MAX))
+        })
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn set_model_selected(config: &mut AppConfig, model_id: &str, selected: bool) {
@@ -12362,26 +12602,15 @@ mod layout_tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Runtime maintenance"))
         );
-        for (label_name, role) in [
-            ("Search", egui::accesskit::Role::TextInput),
-            ("Language", egui::accesskit::Role::ComboBox),
+        for (name, role) in [
+            ("Search models", egui::accesskit::Role::TextInput),
+            ("Filter model languages", egui::accesskit::Role::ComboBox),
         ] {
-            let label_id = update
-                .nodes
-                .iter()
-                .find(|(_, node)| {
-                    node.role() == egui::accesskit::Role::StaticText
-                        && node
-                            .name()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(label_name))
-                })
-                .map(|(id, _)| *id)
-                .unwrap_or_else(|| panic!("missing Models-page label {label_name:?}"));
             assert!(
                 update.nodes.iter().any(|(_, node)| {
-                    node.role() == role && node.labelled_by().contains(&label_id)
+                    node.role() == role && node.name().is_some_and(|actual| actual == name)
                 }),
-                "no {role:?} is programmatically labelled by {label_name:?}"
+                "missing named Models-page {role:?} {name:?}"
             );
         }
         assert!(!update.nodes.iter().any(|(_, node)| {
@@ -15418,6 +15647,42 @@ mod layout_tests {
             app.config.general.selected_default_model,
             "whisper_cpp_small_en"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_owned_legacy_model_is_selected_but_unavailable_and_removable() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-owned-legacy-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("base legacy path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        config::normalize_config(&mut app.config);
+        let model = config::selected_model(&app.config).expect("selected base model");
+
+        let projected = app.model_management_view_model(&model, None);
+
+        assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
+        assert!(projected.installed);
+        assert!(projected.selected);
+        assert!(!projected.ready);
+        assert!(!projected.active);
+        assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.removal_supported);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19861,6 +20126,113 @@ mod layout_tests {
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn active_model_replacement_order_is_recommended_then_catalog_then_stable_name() {
+        let model = |id: &str, name: &str| SttModelInfo {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            backend: "test".to_owned(),
+            description: String::new(),
+            expected_ram: String::new(),
+            accuracy_tier: String::new(),
+            speed_tier: String::new(),
+            local_path: None,
+            install_status: ModelInstallStatus::Installed,
+            download_model: None,
+        };
+        let recommended = model("recommended", "Zulu");
+        let catalog_early = model("catalog-early", "Zulu");
+        let catalog_late = model("catalog-late", "Alpha");
+        let dynamic_alpha = model("dynamic-alpha", "Alpha");
+        let dynamic_alpha_later = model("dynamic-zeta", "alpha");
+
+        assert_eq!(
+            compare_active_model_replacements(
+                &recommended,
+                true,
+                None,
+                &catalog_early,
+                false,
+                Some(0),
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_active_model_replacements(
+                &catalog_early,
+                false,
+                Some(0),
+                &catalog_late,
+                false,
+                Some(3),
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_active_model_replacements(
+                &dynamic_alpha,
+                false,
+                None,
+                &dynamic_alpha_later,
+                false,
+                None,
+            ),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn active_model_removal_is_blocked_without_another_ready_model() {
+        let mut app = test_app();
+        let active_id = app.config.general.selected_default_model.clone();
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id));
+
+        assert!(app.model_management.dialog.is_none());
+        assert!(app.model_management.removal_replacement.is_none());
+        assert_eq!(
+            app.status_message,
+            "Install another ready model before removing the active model."
+        );
+    }
+
+    #[test]
+    fn active_removal_revalidates_the_expected_replacement_before_persisting() {
+        let mut app = test_app();
+        let active_id = app.config.general.selected_default_model.clone();
+        let active_path = app
+            .config
+            .general
+            .model_paths
+            .get(&active_id)
+            .cloned()
+            .expect("test active model path");
+        let replacement_path = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id.clone()));
+        assert_eq!(
+            app.model_management.removal_replacement.as_deref(),
+            Some("whisper_cpp_base_en")
+        );
+
+        fs::remove_file(&replacement_path).unwrap();
+        config::normalize_config(&mut app.config);
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(active_id.clone()));
+
+        assert_eq!(app.config.general.selected_default_model, active_id);
+        assert!(active_path.is_file(), "active artifact must stay untouched");
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(active_id.as_str())
+        );
+        assert!(
+            app.status_message
+                .contains("replacement model is no longer ready")
+        );
+
+        let _ = fs::remove_file(active_path);
     }
 
     #[test]

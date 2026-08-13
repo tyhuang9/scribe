@@ -6,7 +6,7 @@ use eframe::egui::{
 use super::theme::ui_palette;
 
 const PRIMARY_TARGET_HEIGHT: f32 = 44.0;
-const COMPACT_BUTTON_HEIGHT: f32 = 36.0;
+const COMPACT_BUTTON_HEIGHT: f32 = 32.0;
 const KEYCAP_VERTICAL_PADDING: f32 = 7.0;
 
 pub(crate) fn minimum_primary_target_height() -> f32 {
@@ -229,6 +229,7 @@ pub(crate) fn notice(ui: &mut Ui, text: &str, error: bool) -> Response {
     .response
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Icon {
     Waveform,
@@ -251,6 +252,11 @@ pub(crate) enum Icon {
     Gauge,
     Folder,
     Plus,
+    Download,
+    Trash,
+    Close,
+    ChevronRight,
+    Spinner,
 }
 
 pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
@@ -275,6 +281,11 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Gauge => regular::GAUGE,
         Icon::Folder => regular::FOLDER,
         Icon::Plus => regular::PLUS,
+        Icon::Download => regular::DOWNLOAD,
+        Icon::Trash => regular::TRASH,
+        Icon::Close => regular::X,
+        Icon::ChevronRight => regular::CARET_RIGHT,
+        Icon::Spinner => regular::CIRCLE_NOTCH,
     }
 }
 
@@ -323,12 +334,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(painted_rect_heights
-            .iter()
-            .any(|height| (*height - COMPACT_BUTTON_HEIGHT).abs() < 0.1));
-        assert!(painted_rect_heights
-            .iter()
-            .any(|height| { *height >= 28.0 && *height <= 30.0 }));
+        assert!(
+            painted_rect_heights
+                .iter()
+                .any(|height| (*height - COMPACT_BUTTON_HEIGHT).abs() < 0.1)
+        );
+        assert!(
+            painted_rect_heights
+                .iter()
+                .any(|height| { *height >= 28.0 && *height <= 30.0 })
+        );
     }
 
     #[test]

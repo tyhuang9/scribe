@@ -18,7 +18,10 @@ Valid state names are:
 - `transcribe/no-speech`
 - `transcribe/microphone-error`
 - `models/installed`
+- `models/lifecycle` — active, installed, uninstalled, partial, downloading, and failed row states
+- `models/details-drawer`
 - `models/compare-expanded`
+- `history`
 - `settings/recording`
 
 Any other value is ignored, so normal application startup remains fail-closed. The harness freezes timers, relative time, and sample metadata for repeatable screenshots. The visual references are stored in `docs/ui-reference/` and are documentation-only; they are not runtime assets.

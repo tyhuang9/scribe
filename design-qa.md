@@ -54,3 +54,76 @@ Focused regression coverage includes the exact navigation/tab inventory and owne
 ## Remaining limitation and deliberate non-goals
 
 The deterministic harness and state tests do not open a real microphone, so operating-system-level device release during native monitor teardown was not directly observed. Model downloads, live catalog access, transcription runtime smoke, audio capture, and GPU/CUDA smoke were deliberately excluded by branch scope; the corresponding ignored tests were not run.
+
+---
+
+# Revised STT model manager v2 — implementation evidence
+
+Status: **automated design evidence passed; native screenshot review pending**.
+
+## Current refinement — `e01bdd4`
+
+Final result: **blocked** for the revised-model-manager native visual gate.
+
+The current implementation replaces the row flow layout with one physical
+header/row cell splitter, clips long Model identity content to its own cell,
+uses compact 32 px visual buttons with 44 px interaction targets, and gives
+Recording Mode a contrast-checked purple pill. The Details drawer now has a
+stable two-column stat grid, keyboard containment, Escape/outside dismissal,
+and tested open/close behavior.
+
+Automated evidence on this commit: `cargo fmt --all -- --check`, `cargo check
+--all-targets --all-features`, `cargo clippy --all-targets --all-features --
+-D warnings`, `cargo test --all-targets --all-features -- --test-threads=1`
+(776 passed, 11 ignored), debug/release builds, and `git diff --check` all
+passed. Focused coverage proves header/row grid tracks, clipped long identity
+content, drawer Tab containment, Escape dismissal, and light/dark segmented
+control contrast.
+
+Native capture was attempted with the deterministic `models/details-drawer`
+fixture at 1180×815 in an isolated local-data directory. The Scribe process
+created a responsive native window and remained alive while the drawer was
+open, but the available desktop screenshot path captured the host browser
+rather than the GPU-composited Scribe window. `PrintWindow` returned only a
+black frame, and the bundled Windows Computer Use runtime is unavailable in
+this session. Direct visual comparison against the supplied model-list and
+drawer references is therefore still required before this visual gate can be
+called passed.
+
+## Implemented reference requirements
+
+- The Models route uses compact 76 px desktop rows (124 px at very narrow
+  widths), a single Active badge beside only the selected model name, separate
+  Installed and Available sections, five-segment Speed and Accuracy meters,
+  and exactly one lifecycle-dependent row action.
+- The toolbar is a full-width search field with compact Refresh, Import local
+  GGUF, and language-filter controls. Download state uses the installer’s
+  actual byte counts for both the circular cancel control and a 2 px row line.
+- Local and trusted-remote Details use an accessible right drawer with a
+  fixed header/footer, responsive full-width presentation, keyboard trap,
+  Escape/outside close when safe, and focus restoration. Only a ready inactive
+  local model exposes **Use this model** in the drawer footer.
+- Settings use leading labels/trailing values, responsive stacking, compact
+  shared button/keycap visuals with 44 px interaction targets, vertically
+  centered hotkeys, a 30 px History title, and a 16 px route bottom inset.
+
+## Automated evidence at `9145447`
+
+- `cargo test --all-targets --all-features ui::screens::tests -- --test-threads=1`: 43 passed.
+- `cargo test --all-targets --all-features app::layout_tests:: -- --test-threads=1`: 191 passed.
+- Focused harness regression for 375 px model rows: passed.
+- Focused active-removal replacement/blocking regressions: passed.
+- `cargo fmt --all -- --check`, `cargo check --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff
+  --check`: passed.
+
+## Native visual gate limitation
+
+The required light/dark native captures at 1476×1018, 1180×815, and 960×680
+could not be captured in this session because no native desktop-control or
+screenshot interface was available. The running debug executable also locks
+the normal debug output path. As a result, direct pixel comparison against
+`02-final-list-states.png` and `03-details-drawer.png` remains pending; this
+is an evidence gap, not a claim that the visual gate passed. The deterministic
+harness provides `models/lifecycle`, `models/details-drawer`, `history`, and
+`settings/recording` fixtures for the follow-up capture.
