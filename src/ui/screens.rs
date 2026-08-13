@@ -1539,19 +1539,29 @@ fn build_model_card_lists<'a>(
 fn formatted_language_summary(languages: &[String]) -> String {
     let codes = languages
         .iter()
-        .filter_map(
-            |language| match language.trim().to_ascii_lowercase().as_str() {
-                "en" | "english" => Some("EN"),
-                "es" | "spanish" => Some("ES"),
-                "ja" | "japanese" => Some("JA"),
-                "ko" | "korean" => Some("KO"),
-                "zh" | "chinese" | "mandarin" => Some("ZH"),
-                "fr" | "french" => Some("FR"),
-                "de" | "german" => Some("DE"),
-                "pt" | "portuguese" => Some("PT"),
-                _ => None,
-            },
-        )
+        .filter_map(|language| {
+            let normalized = language.trim().to_ascii_lowercase();
+            let code = match normalized.as_str() {
+                "en" | "english" => "EN",
+                "es" | "spanish" => "ES",
+                "ja" | "japanese" => "JA",
+                "ko" | "korean" => "KO",
+                "zh" | "chinese" | "mandarin" => "ZH",
+                "fr" | "french" => "FR",
+                "de" | "german" => "DE",
+                "pt" | "portuguese" => "PT",
+                "it" | "italian" => "IT",
+                "ru" | "russian" => "RU",
+                "ar" | "arabic" => "AR",
+                code if (2..=3).contains(&code.len())
+                    && code.bytes().all(|byte| byte.is_ascii_alphabetic()) =>
+                {
+                    return Some(code.to_ascii_uppercase());
+                }
+                _ => return None,
+            };
+            Some(code.to_owned())
+        })
         .fold(Vec::new(), |mut unique, code| {
             if !unique.contains(&code) {
                 unique.push(code);
@@ -1591,6 +1601,17 @@ fn description_overflows(ui: &egui::Ui, description: &str, width: f32) -> bool {
         .size()
         .x
         > width
+}
+
+fn render_model_description_preview(ui: &mut egui::Ui, description: &str, width: f32) {
+    let colors = ui_palette(ui);
+    let overflow = description_overflows(ui, description, width);
+    let preview = ui.add_sized(
+        Vec2::new(width, 18.0),
+        egui::Label::new(RichText::new(description).small().color(colors.muted_text))
+            .truncate(true),
+    );
+    paint_description_fade(ui, preview.rect, overflow);
 }
 
 fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, overflow: bool) {
@@ -1646,6 +1667,9 @@ fn friendly_language_name(language: &str) -> String {
         "fr" | "french" => "French".to_owned(),
         "de" | "german" => "German".to_owned(),
         "pt" | "portuguese" => "Portuguese".to_owned(),
+        "it" | "italian" => "Italian".to_owned(),
+        "ru" | "russian" => "Russian".to_owned(),
+        "ar" | "arabic" => "Arabic".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -2246,11 +2270,18 @@ fn render_unified_model_card(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     render_lifecycle(ui, &mut action, &mut restored_remove_focus);
                 });
+                if !expanded {
+                    let description_width = ui.available_width();
+                    render_model_description_preview(ui, &description, description_width);
+                }
+                ui.add_space(4.0);
+                render_model_metadata(ui, card, languages, true);
             } else {
                 let gap = ui.spacing().item_spacing.x;
                 let ratings_width = MODEL_RATING_METER_WIDTH * 2.0 + gap;
                 let lifecycle_width = 108.0;
                 let details_width = 44.0;
+                let summary_height = if expanded { 68.0 } else { 88.0 };
                 let identity_track = (ui.available_width()
                     - ratings_width
                     - lifecycle_width
@@ -2259,10 +2290,12 @@ fn render_unified_model_card(
                     .max(44.0);
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
-                        Vec2::new(identity_track, 0.0),
-                        Layout::left_to_right(Align::TOP),
+                        Vec2::new(identity_track, summary_height),
+                        Layout::top_down(Align::Min),
                         |ui| {
                             let identity_width = identity_track.min(360.0);
+                            ui.set_width(identity_width);
+                            ui.spacing_mut().item_spacing.y = 2.0;
                             if render_model_identity(
                                 ui,
                                 name,
@@ -2277,34 +2310,32 @@ fn render_unified_model_card(
                                     }
                                 });
                             }
+                            if !expanded {
+                                render_model_description_preview(ui, &description, identity_width);
+                            }
+                            ui.add_space(4.0);
+                            render_model_metadata(ui, card, languages, false);
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        Vec2::new(ratings_width, 44.0),
+                        Vec2::new(ratings_width, summary_height),
                         Layout::left_to_right(Align::Center),
                         |ui| render_model_ratings(ui, card),
                     );
                     ui.allocate_ui_with_layout(
-                        Vec2::new(lifecycle_width, 44.0),
+                        Vec2::new(lifecycle_width, summary_height),
                         Layout::right_to_left(Align::Center),
                         |ui| {
                             render_lifecycle(ui, &mut action, &mut restored_remove_focus);
                         },
                     );
-                    render_details(ui, &mut action);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(details_width, summary_height),
+                        Layout::left_to_right(Align::Center),
+                        |ui| render_details(ui, &mut action),
+                    );
                 });
             }
-            if !expanded {
-                let width = ui.available_width();
-                let overflow = description_overflows(ui, &description, width);
-                let preview = ui.add(
-                    egui::Label::new(RichText::new(&description).small().color(colors.muted_text))
-                        .truncate(true),
-                );
-                paint_description_fade(ui, preview.rect, overflow);
-            }
-            ui.add_space(4.0);
-            render_model_metadata(ui, card, languages, compact);
             if expanded {
                 ui.add_space(8.0);
                 ui.separator();
@@ -5431,6 +5462,10 @@ mod tests {
             formatted_language_summary(&["en".into(), "es".into(), "ja".into(), "ko".into()]),
             "Multilingual"
         );
+        assert_eq!(
+            formatted_language_summary(&["it".into(), "ru".into(), "ar".into()]),
+            "IT, RU, AR"
+        );
         assert_eq!(formatted_language_summary(&["unknown".into()]), "—");
     }
 
@@ -5708,6 +5743,10 @@ mod tests {
         assert_eq!(
             formatted_language_summary(&["en".into(), "es".into(), "ja".into(), "ko".into()]),
             "Multilingual"
+        );
+        assert_eq!(
+            model_language_summary(&["it".into(), "ru".into(), "ar".into()]),
+            ("Languages", "IT, RU, AR".into())
         );
         assert_eq!(
             model_language_summary(&["klingon".into()]),

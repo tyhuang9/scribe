@@ -3073,7 +3073,12 @@ mod tests {
             assert!(title.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             if width > 430.0 {
                 let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+                let description =
+                    named_node_bounds(&output, "More accurate for longer recordings.");
+                let language = named_node_bounds(&output, "Languages: EN");
                 assert!(title.x1 <= speed.x0 + LAYOUT_TOLERANCE);
+                assert!(description.x1 <= speed.x0 + LAYOUT_TOLERANCE);
+                assert!(language.x1 <= speed.x0 + LAYOUT_TOLERANCE);
                 assert!(speed.x1 <= lifecycle.x0 + LAYOUT_TOLERANCE);
                 assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             } else {
