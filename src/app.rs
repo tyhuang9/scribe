@@ -967,6 +967,34 @@ struct RemoteCatalogProjection {
     entries: Vec<RemoteCatalogEntryView>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PartialInspection {
+    Unknown,
+    Missing,
+    Present,
+    Error(String),
+}
+
+impl PartialInspection {
+    fn from_result(result: Result<bool, InstallError>) -> Self {
+        match result {
+            Ok(true) => Self::Present,
+            Ok(false) => Self::Missing,
+            Err(error) => Self::Error(format!(
+                "Could not inspect the retained partial download: {error}"
+            )),
+        }
+    }
+}
+
+type RemotePartialKey = (String, String);
+
+#[derive(Clone)]
+enum RemotePartialProbeSource {
+    Normalized(ModelId),
+    Trusted(TrustedArtifact),
+}
+
 struct RemoteCatalogState {
     snapshot: Option<ModelInventorySnapshot>,
     local_models: Arc<[ModelViewModel]>,
@@ -978,10 +1006,17 @@ struct RemoteCatalogState {
     error: Option<String>,
     projection_revision: u64,
     projection: Option<RemoteCatalogProjection>,
+    partial_inspections: HashMap<RemotePartialKey, PartialInspection>,
+    pending_partial_inspections: HashSet<RemotePartialKey>,
+    partial_inspection_generation: u64,
     #[cfg(test)]
     projection_build_count: usize,
     #[cfg(test)]
     disk_probe_count: usize,
+    #[cfg(test)]
+    sync_disk_probe_count: usize,
+    #[cfg(test)]
+    partial_probe_request_count: usize,
     #[cfg(test)]
     local_models_build_count: usize,
     #[cfg(test)]
@@ -1001,10 +1036,17 @@ impl Default for RemoteCatalogState {
             error: None,
             projection_revision: 0,
             projection: None,
+            partial_inspections: HashMap::new(),
+            pending_partial_inspections: HashSet::new(),
+            partial_inspection_generation: 0,
             #[cfg(test)]
             projection_build_count: 0,
             #[cfg(test)]
             disk_probe_count: 0,
+            #[cfg(test)]
+            sync_disk_probe_count: 0,
+            #[cfg(test)]
+            partial_probe_request_count: 0,
             #[cfg(test)]
             local_models_build_count: 0,
             #[cfg(test)]
@@ -1155,6 +1197,11 @@ enum AppEvent {
     RemoteCatalogLoaded {
         generation: u64,
         result: Result<ModelInventorySnapshot, String>,
+    },
+    RemotePartialInspectionsFinished {
+        snapshot_revision: u64,
+        generation: u64,
+        results: Vec<(RemotePartialKey, PartialInspection)>,
     },
     ModelDownloadProgress {
         job_id: u64,
@@ -5669,11 +5716,36 @@ impl LocalTranscriberApp {
                         Ok(snapshot) => {
                             self.remote_catalog.snapshot = Some(snapshot);
                             self.remote_catalog.error = None;
-                            self.remote_catalog.invalidate_projection();
+                            self.refresh_remote_partial_inspection_cache();
                         }
                         Err(error) => {
                             self.remote_catalog.error = Some(error);
                         }
+                    }
+                }
+                AppEvent::RemotePartialInspectionsFinished {
+                    snapshot_revision,
+                    generation,
+                    results,
+                } => {
+                    if self
+                        .remote_catalog
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.revision() == snapshot_revision)
+                        && self.remote_catalog.partial_inspection_generation == generation
+                    {
+                        #[cfg(test)]
+                        {
+                            self.remote_catalog.disk_probe_count += results.len();
+                        }
+                        for (key, inspection) in results {
+                            self.remote_catalog.pending_partial_inspections.remove(&key);
+                            self.remote_catalog
+                                .partial_inspections
+                                .insert(key, inspection);
+                        }
+                        self.remote_catalog.invalidate_projection();
                     }
                 }
                 AppEvent::LocalGgufImportFinished { job_id, result } => {
@@ -8261,7 +8333,11 @@ impl LocalTranscriberApp {
             .transcription_service
             .model_descriptor(&ModelId::new(&model.id))
             .ok();
-        vec![self.model_management_view_model(&model, descriptor.as_ref(), false)]
+        vec![self.model_management_view_model(
+            &model,
+            descriptor.as_ref(),
+            &PartialInspection::Missing,
+        )]
     }
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
@@ -8456,6 +8532,141 @@ impl LocalTranscriberApp {
         self.apply_model_management_action(action);
     }
 
+    fn inspect_remote_partial(
+        config: &AppConfig,
+        source: &RemotePartialProbeSource,
+    ) -> PartialInspection {
+        PartialInspection::from_result(match source {
+            RemotePartialProbeSource::Normalized(model_id) => {
+                managed_downloads::normalized_model_has_partial(config, model_id)
+            }
+            RemotePartialProbeSource::Trusted(artifact) => {
+                managed_downloads::trusted_gguf_has_partial(config, artifact)
+            }
+        })
+    }
+
+    fn remote_partial_probe(
+        model: &RemoteModel,
+        variant_id: &str,
+    ) -> Option<(RemotePartialKey, RemotePartialProbeSource)> {
+        let artifact = model.artifact_for(variant_id)?;
+        let source = crate::model_catalog::normalized_model_id_for_pinned_artifact(
+            &artifact.model_id,
+            &artifact.revision,
+            &artifact.filename,
+        )
+        .map_or_else(
+            || RemotePartialProbeSource::Trusted(artifact),
+            RemotePartialProbeSource::Normalized,
+        );
+        Some(((model.id.clone(), variant_id.to_owned()), source))
+    }
+
+    /// Refreshes only a bounded default catalog window. Other variants are
+    /// inspected asynchronously when they first enter a projection.
+    fn refresh_remote_partial_inspection_cache(&mut self) {
+        let keys = self
+            .remote_catalog
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .models()
+                    .iter()
+                    .flat_map(|model| {
+                        model
+                            .variants
+                            .iter()
+                            .map(|variant| (model.id.clone(), variant.id.clone()))
+                    })
+                    .take(REMOTE_CATALOG_VISIBLE_LIMIT)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.remote_catalog.partial_inspections.clear();
+        self.remote_catalog.pending_partial_inspections.clear();
+        self.remote_catalog.partial_inspection_generation = self
+            .remote_catalog
+            .partial_inspection_generation
+            .wrapping_add(1);
+        self.remote_catalog.invalidate_projection();
+        self.request_remote_partial_inspections(keys);
+    }
+
+    fn request_remote_partial_inspections(&mut self, keys: Vec<RemotePartialKey>) {
+        let Some(snapshot) = self.remote_catalog.snapshot.as_ref() else {
+            return;
+        };
+        let snapshot_revision = snapshot.revision();
+        let generation = self.remote_catalog.partial_inspection_generation;
+        let mut requests = Vec::new();
+        for key in keys {
+            if requests.len() == REMOTE_CATALOG_VISIBLE_LIMIT {
+                break;
+            }
+            if self.remote_catalog.partial_inspections.contains_key(&key)
+                || self
+                    .remote_catalog
+                    .pending_partial_inspections
+                    .contains(&key)
+            {
+                continue;
+            }
+            let Some(model) = snapshot.models().iter().find(|model| model.id == key.0) else {
+                continue;
+            };
+            let Some((_, source)) = Self::remote_partial_probe(model, &key.1) else {
+                continue;
+            };
+            self.remote_catalog
+                .pending_partial_inspections
+                .insert(key.clone());
+            requests.push((key, source));
+        }
+        if requests.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.remote_catalog.partial_probe_request_count += requests.len();
+        }
+        let failed_keys = requests
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("scribe-partial-inspection".to_owned())
+            .spawn(move || {
+                let results = requests
+                    .into_iter()
+                    .map(|(key, source)| {
+                        let inspection = Self::inspect_remote_partial(&config, &source);
+                        (key, inspection)
+                    })
+                    .collect();
+                let _ = tx.send(AppEvent::RemotePartialInspectionsFinished {
+                    snapshot_revision,
+                    generation,
+                    results,
+                });
+            })
+        {
+            let reason = PartialInspection::Error(format!(
+                "Could not inspect the retained partial download: {error}"
+            ));
+            for key in failed_keys {
+                self.remote_catalog.pending_partial_inspections.remove(&key);
+                self.remote_catalog
+                    .partial_inspections
+                    .insert(key, reason.clone());
+            }
+            self.remote_catalog.invalidate_projection();
+        }
+    }
+
     fn remote_catalog_view(&mut self) -> RemoteCatalogView {
         let search = self.model_search.trim().to_ascii_lowercase();
         let projection_key = RemoteCatalogProjectionKey {
@@ -8478,11 +8689,29 @@ impl LocalTranscriberApp {
             .is_none_or(|projection| projection.key != projection_key)
         {
             let projection = self.build_remote_catalog_projection(projection_key);
+            let unknown_keys = projection
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .variants
+                        .iter()
+                        .map(|variant| (entry.id.clone(), variant.id.clone()))
+                })
+                .filter(|key| {
+                    !self.remote_catalog.partial_inspections.contains_key(key)
+                        && !self
+                            .remote_catalog
+                            .pending_partial_inspections
+                            .contains(key)
+                })
+                .collect();
             self.remote_catalog.projection = Some(projection);
             #[cfg(test)]
             {
                 self.remote_catalog.projection_build_count += 1;
             }
+            self.request_remote_partial_inspections(unknown_keys);
         }
         let projection = self
             .remote_catalog
@@ -8620,19 +8849,19 @@ impl LocalTranscriberApp {
                 let exact_install_active = download_id
                     .as_deref()
                     .is_some_and(|id| self.artifact_installations.contains_key(id));
+                let partial_inspection = self
+                    .remote_catalog
+                    .partial_inspections
+                    .get(&(model.id.clone(), variant.id.clone()))
+                    .unwrap_or(&PartialInspection::Unknown);
                 let has_partial = !exact_install_active
-                    && match (normalized_model_id.as_ref(), artifact.as_ref()) {
-                        (Some(model_id), _) => managed_downloads::normalized_model_has_partial(
-                            &self.config,
-                            model_id,
-                        )
-                        .unwrap_or(false),
-                        (None, Some(artifact)) => {
-                            managed_downloads::trusted_gguf_has_partial(&self.config, artifact)
-                                .unwrap_or(false)
-                        }
-                        (None, None) => false,
-                    };
+                    && matches!(partial_inspection, PartialInspection::Present);
+                let partial_inspection_error = (!exact_install_active)
+                    .then(|| match partial_inspection {
+                        PartialInspection::Error(reason) => Some(reason.clone()),
+                        _ => None,
+                    })
+                    .flatten();
                 let installed_id = remote_id.as_ref().and_then(|id| {
                     self.config
                         .general
@@ -8710,6 +8939,9 @@ impl LocalTranscriberApp {
                 } else if has_partial {
                     status_label = Some("Partial download retained".to_owned());
                     actions.push(install_action("Resume"));
+                } else if partial_inspection_error.is_some() {
+                    status_label = Some("Partial download needs attention".to_owned());
+                    actions.push(install_action("Retry download"));
                 } else if previous_revision {
                     status_label = Some("Update available".to_owned());
                     actions.push(install_action("Install update"));
@@ -8720,15 +8952,17 @@ impl LocalTranscriberApp {
                     status_label = Some("Pinned GGUF".to_owned());
                     actions.push(install_action("Install"));
                 }
-                if has_partial {
+                if has_partial || partial_inspection_error.is_some() {
                     actions.push(RemoteCatalogActionView {
                         label: "Discard partial".to_owned(),
                         kind: RemoteCatalogActionKind::DiscardPartial {
                             remote_model_id: model.id.clone(),
                             variant_id: variant.id.clone(),
                         },
-                        enabled: mutation_block_reason.is_none(),
-                        disabled_reason: mutation_block_reason.clone(),
+                        enabled: has_partial && mutation_block_reason.is_none(),
+                        disabled_reason: partial_inspection_error
+                            .clone()
+                            .or_else(|| mutation_block_reason.clone()),
                     });
                 }
 
@@ -8936,6 +9170,7 @@ impl LocalTranscriberApp {
         if !self.remote_catalog.local_models_dirty {
             return;
         }
+        self.refresh_remote_partial_inspection_cache();
         self.remote_catalog.local_models = self.build_model_management_catalog().into();
         self.remote_catalog.local_models_dirty = false;
         #[cfg(test)]
@@ -8989,47 +9224,52 @@ impl LocalTranscriberApp {
         self.remote_catalog.local_models.to_vec()
     }
 
-    fn build_model_management_catalog(&self) -> Vec<ModelViewModel> {
+    fn build_model_management_catalog(&mut self) -> Vec<ModelViewModel> {
         let descriptors = self
             .transcription_service
             .model_descriptors()
             .into_iter()
             .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
             .collect::<HashMap<_, _>>();
-        config::configured_models(&self.config)
-            .into_iter()
-            .filter_map(|model| {
-                let effective_status = self.effective_install_status(&model);
-                let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
-                let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
-                    // Retained compatibility models stay out of discovery, but an existing
-                    // installed model must remain visible so it can be selected or removed.
-                    artifact_present.then(|| {
-                        self.transcription_service
-                            .model_descriptor(&ModelId::new(&model.id))
-                            .ok()
-                    })?
-                });
-                (descriptor.is_some() || artifact_present).then(|| {
-                    let has_partial = managed_downloads::normalized_model_has_partial(
+        let mut models = Vec::new();
+        for model in config::configured_models(&self.config) {
+            let effective_status = self.effective_install_status(&model);
+            let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+            let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
+                // Retained compatibility models stay out of discovery, but an existing
+                // installed model must remain visible so it can be selected or removed.
+                artifact_present.then(|| {
+                    self.transcription_service
+                        .model_descriptor(&ModelId::new(&model.id))
+                        .ok()
+                })?
+            });
+            if descriptor.is_some() || artifact_present {
+                let partial_inspection = PartialInspection::from_result(
+                    managed_downloads::normalized_model_has_partial(
                         &self.config,
                         &ModelId::new(&model.id),
-                    )
-                    .unwrap_or(false);
-                    self.model_management_view_model(&model, descriptor.as_ref(), has_partial)
-                })
-            })
-            .collect()
+                    ),
+                );
+                models.push(self.model_management_view_model(
+                    &model,
+                    descriptor.as_ref(),
+                    &partial_inspection,
+                ));
+            }
+        }
+        models
     }
 
     fn model_management_view_model(
         &self,
         model: &SttModelInfo,
         descriptor: Option<&ModelDescriptor>,
-        has_partial: bool,
+        partial_inspection: &PartialInspection,
     ) -> ModelViewModel {
         let (display_name, variant_label) = model_ui_labels(model, descriptor);
         let install_status = self.effective_install_status(model);
+        let has_partial = matches!(partial_inspection, PartialInspection::Present);
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
         let manageable = model_artifact_remains_manageable(model, &install_status);
@@ -9178,6 +9418,12 @@ impl LocalTranscriberApp {
             )
         };
         let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
+        let partial_inspection_error = match partial_inspection {
+            PartialInspection::Error(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let partial_cleanup_available =
+            !exact_install_active && (has_partial || partial_inspection_error.is_some());
         ModelViewModel {
             id: model.id.clone(),
             display_name,
@@ -9233,12 +9479,12 @@ impl LocalTranscriberApp {
                 && (imported_gguf
                     || app_owned_legacy_artifact
                     || supports_managed_uninstall(model, &install_status)),
-            partial_cleanup_available: has_partial && !exact_install_active,
-            partial_cleanup_enabled: has_partial
-                && !exact_install_active
+            partial_cleanup_available,
+            partial_cleanup_enabled: partial_cleanup_available
+                && has_partial
                 && !mutation_blocked,
-            partial_cleanup_disabled_reason: if has_partial && !exact_install_active {
-                mutation_block_reason.clone()
+            partial_cleanup_disabled_reason: if partial_cleanup_available {
+                partial_inspection_error.or_else(|| mutation_block_reason.clone())
             } else {
                 None
             },
@@ -9344,6 +9590,10 @@ impl LocalTranscriberApp {
                 entry_id,
                 variant_id,
             } => {
+                self.request_remote_partial_inspections(vec![(
+                    entry_id.clone(),
+                    variant_id.clone(),
+                )]);
                 self.model_management.dialog = Some(ModelDialog::RemoteDetails {
                     entry_id,
                     variant_id,
@@ -9832,6 +10082,9 @@ impl LocalTranscriberApp {
                     "No retained partial download was found. No files were changed.".to_owned();
             }
             Err(error) => {
+                if error.requires_recovery() {
+                    self.artifact_recovery_error = Some(error.to_string());
+                }
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
                     format!("Could not finish discarding the retained partial: {error}");
@@ -15885,7 +16138,7 @@ mod layout_tests {
         config::normalize_config(&mut app.config);
         let model = config::selected_model(&app.config).unwrap();
 
-        let projected = app.model_management_view_model(&model, None, false);
+        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
 
         assert_eq!(projected.id, "whisper_cpp_small_en");
         assert_eq!(projected.primary_action_label, "Upgrade model");
@@ -15927,7 +16180,7 @@ mod layout_tests {
         config::normalize_config(&mut app.config);
         let model = config::selected_model(&app.config).expect("selected base model");
 
-        let projected = app.model_management_view_model(&model, None, false);
+        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
 
         assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
         assert!(app_owned_legacy_cleanup_artifact(&app.config, &model));
@@ -16097,7 +16350,8 @@ mod layout_tests {
             download_model: None,
         };
 
-        let projected = app.model_management_view_model(&model, Some(&descriptor), false);
+        let projected =
+            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
 
         assert!(projected.installed);
         assert!(!projected.ready);
@@ -16225,7 +16479,8 @@ mod layout_tests {
         app.model_downloads
             .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
 
-        let projected = app.model_management_view_model(&model, Some(&descriptor), false);
+        let projected =
+            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
 
         assert!(!projected.installed);
         assert!(!projected.ready);
@@ -17560,6 +17815,17 @@ mod layout_tests {
             .join(&artifact.filename)
     }
 
+    fn wait_for_remote_partial_inspections(app: &mut LocalTranscriberApp) {
+        for _ in 0..100 {
+            app.poll_events();
+            if app.remote_catalog.pending_partial_inspections.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("remote partial inspection did not finish");
+    }
+
     #[test]
     fn local_partial_cleanup_survives_restart_and_refreshes_cached_projections() {
         let root = partial_cleanup_test_root("local");
@@ -17672,6 +17938,121 @@ mod layout_tests {
     }
 
     #[test]
+    fn invalid_local_partial_is_visible_but_cannot_be_discarded() {
+        let root = partial_cleanup_test_root("local-invalid-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::create_dir(&partial).unwrap();
+        app.config.general.model_paths.remove(model_id.as_str());
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let directory_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(directory_view.partial_cleanup_available);
+        assert!(!directory_view.partial_cleanup_enabled);
+        assert!(
+            directory_view
+                .partial_cleanup_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        assert!(directory_view.install_action_enabled);
+        assert_ne!(directory_view.download_state, ModelDownloadState::Cancelled);
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert!(partial.is_dir());
+
+        fs::remove_dir(&partial).unwrap();
+        let target = root.join("retained-target");
+        fs::write(&target, b"retained target").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &partial).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, &partial).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let link_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(link_view.partial_cleanup_available);
+        assert!(!link_view.partial_cleanup_enabled);
+        assert!(
+            link_view
+                .partial_cleanup_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert!(fs::symlink_metadata(&partial).is_ok());
+        assert_eq!(fs::read(target).unwrap(), b"retained target");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_local_partial_inspection_surfaces_the_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = partial_cleanup_test_root("local-unreadable-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        let parent = partial.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::write(&partial, b"retained partial").unwrap();
+        app.config.general.model_paths.remove(model_id.as_str());
+        config::normalize_config(&mut app.config);
+        let original = fs::metadata(parent).unwrap().permissions();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+        if managed_downloads::normalized_model_has_partial(&app.config, &model_id).is_ok() {
+            fs::set_permissions(parent, original).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        fs::set_permissions(parent, original).unwrap();
+
+        let view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(view.partial_cleanup_available);
+        assert!(!view.partial_cleanup_enabled);
+        assert!(view.partial_cleanup_disabled_reason.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn trusted_remote_partial_cleanup_revalidates_ids_and_refreshes_projection() {
         let root = partial_cleanup_test_root("remote");
         let mut app = test_app();
@@ -17692,7 +18073,8 @@ mod layout_tests {
             ModelInventorySnapshot::from_trusted_records(2, CatalogSource::Network, vec![model])
                 .unwrap(),
         );
-        app.remote_catalog.invalidate_projection();
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
 
         let before_revision = app.remote_catalog.projection_revision;
         let view = app.remote_catalog_view();
@@ -17727,7 +18109,8 @@ mod layout_tests {
         .unwrap();
         app.artifact_installations
             .insert(managed_id, (3, InstallCancellation::default()));
-        app.remote_catalog.invalidate_projection();
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
         assert!(
             !app.remote_catalog_view().entries[0].variants[0]
                 .actions
@@ -17755,6 +18138,77 @@ mod layout_tests {
                 .contains("no longer in the validated snapshot")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_trusted_remote_partial_is_visible_and_disabled_from_cache() {
+        let root = partial_cleanup_test_root("remote-invalid-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model = remote_catalog_model(
+            "handy-computer/invalid-partial-fixture",
+            "Invalid partial fixture",
+            &["en"],
+            false,
+            64 * 1024 * 1024,
+        );
+        let destination = trusted_fixture_destination(&app.config, &model, "q4");
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::create_dir(&partial).unwrap();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(8, CatalogSource::Network, vec![model])
+                .unwrap(),
+        );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+
+        let view = app.remote_catalog_view();
+        let actions = &view.entries[0].variants[0].actions;
+        assert!(
+            actions
+                .iter()
+                .any(|action| { action.label == "Retry download" && action.enabled })
+        );
+        let discard = actions
+            .iter()
+            .find(|action| matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. }))
+            .unwrap();
+        assert!(!discard.enabled);
+        assert!(
+            discard
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: "handy-computer/invalid-partial-fixture".to_owned(),
+            variant_id: "q4".to_owned(),
+        });
+        assert!(partial.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_discard_durability_failure_sets_the_recovery_barrier() {
+        let mut app = test_app();
+
+        app.finish_partial_discard(
+            "synthetic-model",
+            Err(InstallError::RecoveryRequired(
+                "partial was unlinked but parent sync failed".to_owned(),
+            )),
+        );
+
+        assert!(
+            app.artifact_recovery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("parent sync failed"))
+        );
+        assert!(app.artifact_mutation_block_reason().is_some());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("Could not finish discarding"));
     }
 
     #[test]
@@ -17900,6 +18354,12 @@ mod layout_tests {
                     .collect(),
             ),
         );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+        let seeded_probe_count = app.remote_catalog.disk_probe_count;
+        let seeded_request_count = app.remote_catalog.partial_probe_request_count;
+        assert_eq!(seeded_probe_count, REMOTE_CATALOG_VISIBLE_LIMIT);
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
 
         let first = app.remote_catalog_view();
 
@@ -17914,13 +18374,22 @@ mod layout_tests {
             "Showing 100 of 10000 matching models (10000 total). Refine search or filters"
         ));
         assert_eq!(app.remote_catalog.projection_build_count, 1);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
 
         let second = app.remote_catalog_view();
 
         assert_eq!(second.entries, first.entries);
         assert_eq!(app.remote_catalog.projection_build_count, 1);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
 
         let failed_model_id = config::managed_remote_model_id(
             "handy-computer/catalog-00000",
@@ -17928,17 +18397,39 @@ mod layout_tests {
             "fixture.gguf",
         )
         .unwrap();
-        app.fail_model_install(&failed_model_id, "synthetic install failure".to_owned());
+        app.model_downloads.insert(
+            failed_model_id,
+            ModelInstallStatus::Error("synthetic install failure".to_owned()),
+        );
+        app.remote_catalog.invalidate_projection();
         let failed = app.remote_catalog_view();
 
         assert_eq!(app.remote_catalog.projection_build_count, 2);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
         assert!(
             failed.entries[0].variants[0]
                 .actions
                 .iter()
                 .any(|action| action.label == "Resume")
         );
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "catalog model 00050".to_owned(),
+        ));
+        let cached_refined = app.remote_catalog_view();
+
+        assert_eq!(cached_refined.entries.len(), 1);
+        assert_eq!(app.remote_catalog.projection_build_count, 3);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "catalog model 09999".to_owned(),
@@ -17952,8 +18443,12 @@ mod layout_tests {
                 .message
                 .contains("Showing 1 of 10000 models.")
         );
-        assert_eq!(app.remote_catalog.projection_build_count, 3);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.projection_build_count, 4);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count + 1
+        );
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "no catalog model has this phrase".to_owned(),
@@ -17962,8 +18457,126 @@ mod layout_tests {
 
         assert!(empty.entries.is_empty());
         assert!(empty.status.message.contains("Showing 0 of 10000 models."));
-        assert_eq!(app.remote_catalog.projection_build_count, 4);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.projection_build_count, 5);
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+    }
+
+    #[test]
+    fn searched_remote_variant_outside_seed_window_is_inspected_asynchronously() {
+        let root = partial_cleanup_test_root("remote-outside-seed");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let models = (0..=REMOTE_CATALOG_VISIBLE_LIMIT)
+            .map(|index| {
+                remote_catalog_model(
+                    &format!("handy-computer/outside-{index:03}"),
+                    &format!("Outside {index:03}"),
+                    &["en"],
+                    false,
+                    64 * 1024 * 1024,
+                )
+            })
+            .collect::<Vec<_>>();
+        let target = models.last().unwrap();
+        let destination = trusted_fixture_destination(&app.config, target, "q4");
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::write(&partial, b"retained outside seed window").unwrap();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(7, CatalogSource::Network, models)
+                .unwrap(),
+        );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+        let seed_probes = app.remote_catalog.disk_probe_count;
+        let seed_requests = app.remote_catalog.partial_probe_request_count;
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "Outside 100".to_owned(),
+        ));
+        let unknown = app.remote_catalog_view();
+
+        assert_eq!(unknown.entries.len(), 1);
+        assert!(
+            !unknown.entries[0].variants[0].actions.iter().any(|action| {
+                matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
+            })
+        );
+        assert_eq!(app.remote_catalog.disk_probe_count, seed_probes);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seed_requests + 1
+        );
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+
+        wait_for_remote_partial_inspections(&mut app);
+        let inspected = app.remote_catalog_view();
+
+        assert!(
+            inspected.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| action.label == "Resume")
+        );
+        assert!(
+            inspected.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| {
+                    matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
+                        && action.enabled
+                })
+        );
+        assert_eq!(app.remote_catalog.disk_probe_count, seed_probes + 1);
+        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_remote_partial_probe_cannot_clear_current_pending_state() {
+        let mut app = test_app();
+        let revision = app.remote_catalog.snapshot.as_ref().unwrap().revision();
+        let key = ("handy-computer/stale".to_owned(), "q4".to_owned());
+        app.remote_catalog.partial_inspection_generation = 42;
+        app.remote_catalog.pending_partial_inspections.clear();
+        app.remote_catalog
+            .pending_partial_inspections
+            .insert(key.clone());
+        app.tx
+            .send(AppEvent::RemotePartialInspectionsFinished {
+                snapshot_revision: revision,
+                generation: 41,
+                results: vec![(key.clone(), PartialInspection::Present)],
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(
+            app.remote_catalog
+                .pending_partial_inspections
+                .contains(&key)
+        );
+        assert!(!app.remote_catalog.partial_inspections.contains_key(&key));
+
+        app.tx
+            .send(AppEvent::RemotePartialInspectionsFinished {
+                snapshot_revision: revision,
+                generation: 42,
+                results: vec![(key.clone(), PartialInspection::Missing)],
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(
+            !app.remote_catalog
+                .pending_partial_inspections
+                .contains(&key)
+        );
+        assert_eq!(
+            app.remote_catalog.partial_inspections.get(&key),
+            Some(&PartialInspection::Missing)
+        );
     }
 
     #[test]
