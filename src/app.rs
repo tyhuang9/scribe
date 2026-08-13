@@ -981,7 +981,7 @@ impl PartialInspection {
             Ok(true) => Self::Present,
             Ok(false) => Self::Missing,
             Err(error) => Self::Error(format!(
-                "Could not inspect the retained partial download: {error}"
+                "Scribe can't safely manage this partial file. Remove it from model storage, then retry. {error}"
             )),
         }
     }
@@ -1014,7 +1014,10 @@ struct RemoteCatalogState {
     #[cfg(test)]
     disk_probe_count: usize,
     #[cfg(test)]
-    sync_disk_probe_count: usize,
+    /// Regression counter for disk probes performed synchronously while
+    /// building a remote projection. Production projection code never
+    /// increments it because all remote inspection is worker-owned.
+    sync_remote_projection_probe_count: usize,
     #[cfg(test)]
     partial_probe_request_count: usize,
     #[cfg(test)]
@@ -1044,7 +1047,7 @@ impl Default for RemoteCatalogState {
             #[cfg(test)]
             disk_probe_count: 0,
             #[cfg(test)]
-            sync_disk_probe_count: 0,
+            sync_remote_projection_probe_count: 0,
             #[cfg(test)]
             partial_probe_request_count: 0,
             #[cfg(test)]
@@ -8856,12 +8859,23 @@ impl LocalTranscriberApp {
                     .unwrap_or(&PartialInspection::Unknown);
                 let has_partial = !exact_install_active
                     && matches!(partial_inspection, PartialInspection::Present);
-                let partial_inspection_error = (!exact_install_active)
-                    .then(|| match partial_inspection {
+                let partial_inspection_block_reason = if exact_install_active || artifact.is_none() {
+                    None
+                } else {
+                    match partial_inspection {
+                        PartialInspection::Unknown => {
+                            Some("Checking retained download…".to_owned())
+                        }
                         PartialInspection::Error(reason) => Some(reason.clone()),
-                        _ => None,
-                    })
-                    .flatten();
+                        PartialInspection::Missing | PartialInspection::Present => None,
+                    }
+                };
+                let partial_inspection_error = match partial_inspection {
+                    PartialInspection::Error(reason) if !exact_install_active => {
+                        Some(reason.clone())
+                    }
+                    _ => None,
+                };
                 let installed_id = remote_id.as_ref().and_then(|id| {
                     self.config
                         .general
@@ -8880,7 +8894,9 @@ impl LocalTranscriberApp {
                                 && install.revision != artifact.revision
                         })
                 });
-                let install_disabled_reason = mutation_block_reason.clone();
+                let install_disabled_reason = partial_inspection_block_reason
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone());
                 let install_action = |label: &str| RemoteCatalogActionView {
                     label: label.to_owned(),
                     kind: RemoteCatalogActionKind::Install {
@@ -8942,6 +8958,9 @@ impl LocalTranscriberApp {
                 } else if partial_inspection_error.is_some() {
                     status_label = Some("Partial download needs attention".to_owned());
                     actions.push(install_action("Retry download"));
+                } else if matches!(partial_inspection, PartialInspection::Unknown) {
+                    status_label = Some("Checking retained download…".to_owned());
+                    actions.push(install_action("Download"));
                 } else if previous_revision {
                     status_label = Some("Update available".to_owned());
                     actions.push(install_action("Install update"));
@@ -9270,6 +9289,10 @@ impl LocalTranscriberApp {
         let (display_name, variant_label) = model_ui_labels(model, descriptor);
         let install_status = self.effective_install_status(model);
         let has_partial = matches!(partial_inspection, PartialInspection::Present);
+        let partial_inspection_error = match partial_inspection {
+            PartialInspection::Error(reason) => Some(reason.clone()),
+            _ => None,
+        };
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
         let manageable = model_artifact_remains_manageable(model, &install_status);
@@ -9351,12 +9374,18 @@ impl LocalTranscriberApp {
             );
             (
                 "Upgrade model".to_owned(),
-                !mutation_blocked && !installing && supports_managed_install(model),
+                partial_inspection_error.is_none()
+                    && !mutation_blocked
+                    && !installing
+                    && supports_managed_install(model),
                 true,
                 false,
-                mutation_block_reason.clone().or_else(|| {
-                    installing.then(|| "This model upgrade is already in progress.".to_owned())
-                }),
+                partial_inspection_error
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone())
+                    .or_else(|| {
+                        installing.then(|| "This model upgrade is already in progress.".to_owned())
+                    }),
             )
         } else if active {
             (
@@ -9414,14 +9443,13 @@ impl LocalTranscriberApp {
                 false,
                 false,
                 false,
-                Some("Install this model before using it.".to_owned()),
+                partial_inspection_error
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone())
+                    .or_else(|| Some("Install this model before using it.".to_owned())),
             )
         };
         let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
-        let partial_inspection_error = match partial_inspection {
-            PartialInspection::Error(reason) => Some(reason.clone()),
-            _ => None,
-        };
         let partial_cleanup_available =
             !exact_install_active && (has_partial || partial_inspection_error.is_some());
         ModelViewModel {
@@ -9463,6 +9491,7 @@ impl LocalTranscriberApp {
             custom,
             install_supported: supports_managed_install(model),
             install_action_enabled: !mutation_blocked
+                && partial_inspection_error.is_none()
                 && !installed
                 && !matches!(
                     install_status,
@@ -16154,6 +16183,22 @@ mod layout_tests {
             app.config.general.selected_default_model,
             "whisper_cpp_small_en"
         );
+        let blocked = app.model_management_view_model(
+            &model,
+            None,
+            &PartialInspection::Error(
+                "Scribe can't safely manage this partial file. Remove it from model storage, then retry."
+                    .to_owned(),
+            ),
+        );
+        assert!(blocked.primary_action_installs_upgrade);
+        assert!(!blocked.primary_action_enabled);
+        assert!(
+            blocked
+                .primary_action_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16362,6 +16407,18 @@ mod layout_tests {
             projected.primary_action_disabled_reason.as_deref(),
             Some("This model has no compatible local provider.")
         );
+        let inspection_error = app.model_management_view_model(
+            &model,
+            Some(&descriptor),
+            &PartialInspection::Error("unsafe retained partial".to_owned()),
+        );
+        assert_eq!(inspection_error.primary_action_label, "Repair runtime");
+        assert_eq!(
+            inspection_error.primary_action_disabled_reason,
+            projected.primary_action_disabled_reason
+        );
+        assert!(inspection_error.partial_cleanup_available);
+        assert!(!inspection_error.partial_cleanup_enabled);
     }
 
     #[test]
@@ -17969,7 +18026,13 @@ mod layout_tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("not a regular file"))
         );
-        assert!(directory_view.install_action_enabled);
+        assert!(!directory_view.install_action_enabled);
+        assert!(
+            directory_view
+                .primary_action_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
+        );
         assert_ne!(directory_view.download_state, ModelDownloadState::Cancelled);
         app.apply_model_management_action(ScreenAction::DiscardModelPartial(
             model_id.as_str().to_owned(),
@@ -17996,6 +18059,7 @@ mod layout_tests {
             .unwrap();
         assert!(link_view.partial_cleanup_available);
         assert!(!link_view.partial_cleanup_enabled);
+        assert!(!link_view.install_action_enabled);
         assert!(
             link_view
                 .partial_cleanup_disabled_reason
@@ -18165,10 +18229,16 @@ mod layout_tests {
 
         let view = app.remote_catalog_view();
         let actions = &view.entries[0].variants[0].actions;
+        let retry = actions
+            .iter()
+            .find(|action| action.label == "Retry download")
+            .unwrap();
+        assert!(!retry.enabled);
         assert!(
-            actions
-                .iter()
-                .any(|action| { action.label == "Retry download" && action.enabled })
+            retry
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
         );
         let discard = actions
             .iter()
@@ -18181,7 +18251,7 @@ mod layout_tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("not a regular file"))
         );
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
         app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
             remote_model_id: "handy-computer/invalid-partial-fixture".to_owned(),
             variant_id: "q4".to_owned(),
@@ -18359,7 +18429,7 @@ mod layout_tests {
         let seeded_probe_count = app.remote_catalog.disk_probe_count;
         let seeded_request_count = app.remote_catalog.partial_probe_request_count;
         assert_eq!(seeded_probe_count, REMOTE_CATALOG_VISIBLE_LIMIT);
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         let first = app.remote_catalog_view();
 
@@ -18379,7 +18449,7 @@ mod layout_tests {
             app.remote_catalog.partial_probe_request_count,
             seeded_request_count
         );
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         let second = app.remote_catalog_view();
 
@@ -18429,7 +18499,7 @@ mod layout_tests {
             app.remote_catalog.partial_probe_request_count,
             seeded_request_count
         );
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "catalog model 09999".to_owned(),
@@ -18448,7 +18518,7 @@ mod layout_tests {
             app.remote_catalog.partial_probe_request_count,
             seeded_request_count + 1
         );
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "no catalog model has this phrase".to_owned(),
@@ -18458,7 +18528,7 @@ mod layout_tests {
         assert!(empty.entries.is_empty());
         assert!(empty.status.message.contains("Showing 0 of 10000 models."));
         assert_eq!(app.remote_catalog.projection_build_count, 5);
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
     }
 
     #[test]
@@ -18497,6 +18567,20 @@ mod layout_tests {
         let unknown = app.remote_catalog_view();
 
         assert_eq!(unknown.entries.len(), 1);
+        assert_eq!(
+            unknown.entries[0].variants[0].status_label.as_deref(),
+            Some("Checking retained download…")
+        );
+        let download = unknown.entries[0].variants[0]
+            .actions
+            .iter()
+            .find(|action| action.label == "Download")
+            .unwrap();
+        assert!(!download.enabled);
+        assert_eq!(
+            download.disabled_reason.as_deref(),
+            Some("Checking retained download…")
+        );
         assert!(
             !unknown.entries[0].variants[0].actions.iter().any(|action| {
                 matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
@@ -18507,7 +18591,7 @@ mod layout_tests {
             app.remote_catalog.partial_probe_request_count,
             seed_requests + 1
         );
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         wait_for_remote_partial_inspections(&mut app);
         let inspected = app.remote_catalog_view();
@@ -18528,7 +18612,7 @@ mod layout_tests {
                 })
         );
         assert_eq!(app.remote_catalog.disk_probe_count, seed_probes + 1);
-        assert_eq!(app.remote_catalog.sync_disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
         fs::remove_dir_all(root).unwrap();
     }
 

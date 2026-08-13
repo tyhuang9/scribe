@@ -1663,6 +1663,18 @@ mod tests {
             node.role() == egui::accesskit::Role::Button && node.name() == Some("Discard partial")
         });
         assert!(!discard.is_disabled());
+        let dialog_id = node_id_matching(&initial, |node| {
+            node.role() == egui::accesskit::Role::Dialog
+                && node
+                    .name()
+                    .is_some_and(|name| name.starts_with("Model details for"))
+        });
+        let modal_resume_id = named_node_id(&initial, "Resume");
+        assert!(accesskit_descends_from(
+            &initial,
+            dialog_id,
+            modal_resume_id
+        ));
         assert!(
             initial
                 .platform_output
@@ -1675,6 +1687,23 @@ mod tests {
         );
 
         let discard_id = named_node_id(&initial, "Discard partial");
+        data.model_management.focus_dialog_initial = false;
+        let (focused, focus_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target: discard_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(focus_action, ScreenAction::None);
+        assert_eq!(focused_node(&focused).name(), Some("Discard partial"));
         let (_, action) = render_with_input(
             &ctx,
             &mut data,
@@ -1705,6 +1734,7 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Discard partial"))
         );
+        assert_eq!(focused_node(&refreshed).name(), Some("Close model details"));
     }
 
     #[test]
@@ -1733,6 +1763,94 @@ mod tests {
         assert_eq!(
             discard.description(),
             Some("Wait for the active installation to finish or cancel it first.")
+        );
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name()
+                        == Some("Wait for the active installation to finish or cancel it first.")
+                })
+        );
+    }
+
+    #[test]
+    fn local_details_persistently_explains_an_unsafe_partial() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsLifecycle.data();
+        let mut page = Fixture::ModelsLifecycle.page();
+        let model = data
+            .model_catalog
+            .iter_mut()
+            .find(|model| model.id == "moonshine.base")
+            .unwrap();
+        let reason = "Scribe can't safely manage this partial file. Remove it from model storage, then retry.";
+        model.install_supported = true;
+        model.install_action_enabled = false;
+        model.primary_action_disabled_reason = Some(reason.into());
+        model.download_state = ModelDownloadState::Failed;
+        model.partial_cleanup_available = true;
+        model.partial_cleanup_enabled = false;
+        model.partial_cleanup_disabled_reason = Some(reason.into());
+        data.model_management.dialog = Some(ModelDialog::Details("moonshine.base".into()));
+
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let retry = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Retry")
+        });
+        assert!(retry.is_disabled());
+        assert_eq!(retry.description(), Some(reason));
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some(reason))
+        );
+    }
+
+    #[test]
+    fn remote_details_persistently_explains_pending_partial_inspection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let entry = &mut data.remote_catalog.entries[0];
+        let variant = &mut entry.variants[0];
+        variant.actions[0].label = "Download".into();
+        variant.actions[0].enabled = false;
+        variant.actions[0].disabled_reason = Some("Checking retained download…".into());
+        data.model_management.dialog = Some(ModelDialog::RemoteDetails {
+            entry_id: entry.id.clone(),
+            variant_id: variant.id.clone(),
+        });
+
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let download = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Button && node.name() == Some("Download")
+        });
+        assert!(download.is_disabled());
+        assert_eq!(download.description(), Some("Checking retained download…"));
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Checking retained download…"))
         );
     }
 

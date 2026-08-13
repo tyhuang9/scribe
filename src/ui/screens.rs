@@ -4321,6 +4321,15 @@ fn show_local_model_details_drawer(
                                 mark_accesskit_enabled(ui, &advanced.header_response);
                                 focusable_controls.push(advanced.header_response.id);
                         });
+                        if model.partial_cleanup_available
+                            && let Some(reason) = model.partial_cleanup_disabled_reason.as_deref()
+                        {
+                            drawer_ui.label(
+                                RichText::new(reason)
+                                    .small()
+                                    .color(ui_palette(drawer_ui).warning),
+                            );
+                        }
                         drawer_ui.separator();
                         drawer_ui.allocate_ui_with_layout(
                             Vec2::new(drawer_ui.available_width(), DETAILS_DRAWER_FOOTER_HEIGHT),
@@ -4356,6 +4365,34 @@ fn show_local_model_details_drawer(
                                 }
                                 if model.partial_cleanup_enabled && discard.clicked() {
                                     action = ScreenAction::DiscardModelPartial(model.id.clone());
+                                }
+                            }
+                            if !model.installed && model.partial_cleanup_available {
+                                let label = if model.download_state == ModelDownloadState::Failed {
+                                    "Retry"
+                                } else {
+                                    "Resume"
+                                };
+                                let resume = ui.add_enabled_ui(model.install_action_enabled, |ui| {
+                                    button(ui, label, ButtonTone::Primary)
+                                }).inner;
+                                if model.install_action_enabled {
+                                    mark_accesskit_enabled(ui, &resume);
+                                    focusable_controls.push(resume.id);
+                                } else {
+                                    describe_disabled_control(
+                                        ui,
+                                        &resume,
+                                        label,
+                                        model.primary_action_disabled_reason.as_deref(),
+                                    );
+                                }
+                                if model.install_action_enabled && resume.clicked() {
+                                    action = if model.primary_action_installs_upgrade {
+                                        ScreenAction::UpgradeModel(model.id.clone())
+                                    } else {
+                                        ScreenAction::InstallModel(model.id.clone())
+                                    };
                                 }
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4519,6 +4556,21 @@ fn show_remote_model_details_drawer(
                             mark_accesskit_enabled(ui, &advanced.header_response);
                             focusable_controls.push(advanced.header_response.id);
                         });
+                    let persistent_action_reason = drawer_action
+                        .filter(|action| !action.enabled)
+                        .and_then(|action| action.disabled_reason.as_deref())
+                        .or_else(|| {
+                            discard_action
+                                .filter(|action| !action.enabled)
+                                .and_then(|action| action.disabled_reason.as_deref())
+                        });
+                    if let Some(reason) = persistent_action_reason {
+                        drawer_ui.label(
+                            RichText::new(reason)
+                                .small()
+                                .color(ui_palette(drawer_ui).warning),
+                        );
+                    }
                     drawer_ui.separator();
                     drawer_ui.allocate_ui_with_layout(
                         Vec2::new(drawer_ui.available_width(), DETAILS_DRAWER_FOOTER_HEIGHT),

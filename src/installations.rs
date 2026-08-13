@@ -948,7 +948,18 @@ pub(crate) fn pinned_artifact_disk_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
-    let partial_bytes = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    let partial_bytes = if partial_file_exists(&partial)? {
+        fs::metadata(&partial)
+            .map_err(|error| {
+                failed(format!(
+                    "failed to inspect resumable partial {}: {error}",
+                    partial.display()
+                ))
+            })?
+            .len()
+    } else {
+        0
+    };
     let additional_bytes = additional_download_bytes(artifact.size_bytes, partial_bytes)?;
     disk_space::preflight_download_destination(&artifact.destination, additional_bytes)
         .map_err(InstallError::Failed)
@@ -1046,6 +1057,8 @@ fn download_pinned_artifact_with(
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     validate_artifact_spec(artifact)?;
+    let partial = partial_path(&artifact.destination)?;
+    let partial_exists = partial_file_exists(&partial)?;
     if artifact.destination.exists()
         && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
     {
@@ -1065,8 +1078,18 @@ fn download_pinned_artifact_with(
         fs::create_dir_all(parent)
             .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
     }
-    let partial = partial_path(&artifact.destination)?;
-    let mut offset = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    let mut offset = if partial_exists {
+        fs::metadata(&partial)
+            .map_err(|error| {
+                failed(format!(
+                    "failed to inspect resumable partial {}: {error}",
+                    partial.display()
+                ))
+            })?
+            .len()
+    } else {
+        0
+    };
     if offset > artifact.size_bytes {
         let quarantined = quarantine_partial(&partial, "oversized")?;
         return Err(failed(format!(
@@ -3147,14 +3170,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let spec = artifact(&root, b"complete artifact");
         let partial = partial_path(&spec.destination).unwrap();
-        fs::write(&spec.destination, b"activated artifact").unwrap();
+        fs::write(&spec.destination, b"complete artifact").unwrap();
         fs::write(&partial, b"resumable bytes").unwrap();
 
         assert!(pinned_artifact_has_partial(&spec).unwrap());
         assert!(discard_pinned_artifact_partial(&spec).unwrap());
         assert!(!pinned_artifact_has_partial(&spec).unwrap());
         assert!(!discard_pinned_artifact_partial(&spec).unwrap());
-        assert_eq!(fs::read(&spec.destination).unwrap(), b"activated artifact");
+        assert_eq!(fs::read(&spec.destination).unwrap(), b"complete artifact");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3193,9 +3216,25 @@ mod tests {
         let partial = partial_path(&spec.destination).unwrap();
         fs::write(&spec.destination, b"activated artifact").unwrap();
         fs::create_dir(&partial).unwrap();
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: b"complete artifact".to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        let download_error =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {})
+                .unwrap_err();
+        let preflight_error = pinned_artifact_disk_space_preflight(&spec).unwrap_err();
 
         let error = discard_pinned_artifact_partial(&spec).unwrap_err();
 
+        assert!(download_error.to_string().contains("not a regular file"));
+        assert!(preflight_error.to_string().contains("not a regular file"));
+        assert!(source.requested_ranges.lock().unwrap().is_empty());
         assert!(error.to_string().contains("not a regular file"));
         assert!(partial.is_dir());
         assert_eq!(fs::read(&spec.destination).unwrap(), b"activated artifact");
@@ -3209,6 +3248,7 @@ mod tests {
         let spec = artifact(&root, b"complete artifact");
         let partial = partial_path(&spec.destination).unwrap();
         let target = root.join("link-target");
+        fs::write(&spec.destination, b"complete artifact").unwrap();
         fs::write(&target, b"retained target").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &partial).unwrap();
@@ -3217,12 +3257,29 @@ mod tests {
             fs::remove_dir_all(root).unwrap();
             return;
         }
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: b"complete artifact".to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        let download_error =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {})
+                .unwrap_err();
+        let preflight_error = pinned_artifact_disk_space_preflight(&spec).unwrap_err();
 
         let error = discard_pinned_artifact_partial(&spec).unwrap_err();
 
+        assert!(download_error.to_string().contains("not a regular file"));
+        assert!(preflight_error.to_string().contains("not a regular file"));
+        assert!(source.requested_ranges.lock().unwrap().is_empty());
         assert!(error.to_string().contains("not a regular file"));
         assert!(fs::symlink_metadata(&partial).is_ok());
         assert_eq!(fs::read(target).unwrap(), b"retained target");
+        assert_eq!(fs::read(&spec.destination).unwrap(), b"complete artifact");
         fs::remove_dir_all(root).unwrap();
     }
 
