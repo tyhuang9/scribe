@@ -2080,9 +2080,8 @@ fn render_unified_model_card(
                     action = ScreenAction::ToggleModelCardDetails(card_key.clone());
                 }
                 let lifecycle_track = if compact { 0.0 } else { 108.0 };
-                let identity_width = (ui.available_width() - lifecycle_track - 8.0)
-                    .max(44.0)
-                    .min(360.0);
+                let identity_width =
+                    (ui.available_width() - lifecycle_track - 8.0).clamp(44.0, 360.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(identity_width, 0.0),
                     Layout::top_down(Align::LEFT),
