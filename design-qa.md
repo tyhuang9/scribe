@@ -135,7 +135,7 @@ harness provides `models/lifecycle`, `models/details-drawer`, `history`, and
 ## Scope
 
 - Branch: `agent/model-card-accordions`
-- Reviewed head: `7975724` (`Keep model route inside native viewport`)
+- Reviewed head: `51824ac` (`Left align model description previews`)
 - Route/state: `models/card-expanded`
 - Supported native viewports: 1180 x 815 and the application minimum of 960 x 680, at Windows 100% display scaling.
 - A 375 px full-shell viewport is intentionally excluded because Scribe enforces a 960 x 680 native minimum. Card-only behavior at 375 px is covered by deterministic component tests.
@@ -150,14 +150,14 @@ The source files are component crops, not full-screen mocks. They were compared 
 
 ## Implementation evidence
 
-- `design-qa-evidence/implementation-1180x815-expanded-v3.png` — 1194 x 853 px outer window; verified client area 1180 x 815.
-- `design-qa-evidence/implementation-960x680-expanded-v3.png` — 974 x 718 px outer window; verified client area 960 x 680.
-- `design-qa-evidence/implementation-1180x815-expanded-v2-scrolled.png` — complete expanded-card body at the standard viewport.
-- `design-qa-evidence/implementation-960x680-expanded-v2-scrolled.png` — complete expanded-card body at the supported minimum viewport.
-- `design-qa-evidence/comparison-source-vs-1180-v2.png` — combined reference/implementation comparison.
-- `design-qa-evidence/comparison-source-vs-960-v2.png` — combined minimum-width comparison.
+- `design-qa-evidence/implementation-1180x815-expanded-v6.png` — 1194 x 853 px outer window; verified client area 1180 x 815.
+- `design-qa-evidence/implementation-960x680-expanded-v6.png` — 974 x 718 px outer window; verified client area 960 x 680.
+- `design-qa-evidence/implementation-1180x815-expanded-v6-scrolled.png` — complete expanded-card body at the standard viewport.
+- `design-qa-evidence/implementation-960x680-expanded-v6-scrolled.png` — complete expanded-card body at the supported minimum viewport.
+- `design-qa-evidence/comparison-source-vs-1180-v6.png` — combined reference/implementation comparison.
+- `design-qa-evidence/comparison-source-vs-960-v6.png` — combined minimum-width expanded-details comparison.
 
-The application was rebuilt from `7975724` with `--features ui-harness` before the v3 captures. Windows `PrintWindow` succeeded for both windows. Native geometry was measured directly: 1180 x 815 and 960 x 680 client rectangles.
+The application was rebuilt from `51824ac` with `--features ui-harness` before the v6 captures. Windows `PrintWindow` succeeded for all top and scrolled captures. Native geometry was measured directly: 1180 x 815 and 960 x 680 client rectangles.
 
 ## States reviewed
 
@@ -178,6 +178,8 @@ The application was rebuilt from `7975724` with `--features ui-harness` before t
 5. Resolved: the expanded surface previously used redundant framing/separators. Summary and details now share one neutral outer card and one divider, with no colored left rail.
 6. Passed: all lifecycle and disclosure controls are visible and contained at both supported native widths. At 960 px the right outline is visually tight against the client edge, but neither Uninstall nor the trailing chevron is clipped. Automated component bounds tests independently cover the boundary.
 7. Intentional deviation from the references: the meters are unlabeled segmented bars because the user explicitly requested speed and accuracy bars with no visible text. Accessible names and tooltips retain their meaning.
+8. Resolved after final code review: the collapsed description and language now stay within the fixed identity track. The v6 glyphs visibly share the model-name text axis, while meters, lifecycle action, and disclosure remain in their own tracks.
+9. Resolved after final code review: recognized full language names and arbitrary valid two- or three-letter language codes remain truthful in the collapsed summary; more than three unique languages render as `Multilingual`.
 
 ## Remaining enhancements
 
