@@ -3702,7 +3702,11 @@ fn models(
             });
         }
         Some(ModelDialog::Remove(id)) => {
-            if let Some(model) = models.iter().find(|model| &model.id == id) {
+            if let Some(model) = models
+                .iter()
+                .chain(model_catalog.iter())
+                .find(|model| &model.id == id)
+            {
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
                 let dialog_accessibility_id =
@@ -7355,6 +7359,51 @@ mod tests {
             .into_iter()
             .find(|(_, node)| node.name() == Some("Remove model from device"))
             .expect("legacy cleanup removal action");
+        assert!(!remove.is_disabled());
+    }
+
+    #[test]
+    fn catalog_only_legacy_cleanup_renders_removal_confirmation() {
+        let model = ModelViewModel {
+            id: "whisper_cpp_base_en".into(),
+            display_name: "Whisper Base — English".into(),
+            legacy_cleanup_pending: true,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[model],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Remove("whisper_cpp_base_en".into())),
+                            ..Default::default()
+                        },
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::AlertDialog
+                && node.name() == Some("Remove Whisper Base — English")
+        }));
+        let (_, remove) = update
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.name() == Some("Remove"))
+            .expect("catalog-only legacy cleanup confirmation action");
         assert!(!remove.is_disabled());
     }
 

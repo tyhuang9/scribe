@@ -2228,6 +2228,62 @@ mod tests {
     }
 
     #[test]
+    fn catalog_only_legacy_cleanup_removal_dialog_is_actionable() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        data.model_catalog.push(ModelViewModel {
+            id: "whisper_cpp_base_en".into(),
+            display_name: "Whisper Base — English".into(),
+            legacy_cleanup_pending: true,
+            removal_supported: true,
+            ..Default::default()
+        });
+        data.model_management.dialog = Some(ModelDialog::Remove("whisper_cpp_base_en".into()));
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let dialog_id = node_id_matching(&initial, |node| {
+            node.role() == egui::accesskit::Role::AlertDialog
+                && node.name() == Some("Remove Whisper Base — English")
+        });
+        let update = initial.platform_output.accesskit_update.as_ref().unwrap();
+        let remove_id = update
+            .nodes
+            .iter()
+            .find(|(id, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Remove")
+                    && !node.is_disabled()
+                    && accesskit_descends_from(&initial, dialog_id, *id)
+            })
+            .map(|(id, _)| *id)
+            .expect("enabled Remove button for catalog-only legacy cleanup");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: remove_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::ConfirmModelRemoval("whisper_cpp_base_en".into())
+        );
+    }
+
+    #[test]
     fn model_dialog_and_comparison_table_preserve_accessible_hierarchy() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
