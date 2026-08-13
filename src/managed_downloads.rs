@@ -13,8 +13,8 @@ use crate::disk_space::DiskSpacePreflight;
 use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
-    StagedRuntime, download_pinned_artifact, pinned_artifact_disk_space_preflight,
-    stage_runtime_archive,
+    StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact,
+    pinned_artifact_disk_space_preflight, pinned_artifact_has_partial, stage_runtime_archive,
 };
 use crate::transcription::ModelId;
 
@@ -36,6 +36,26 @@ pub(crate) fn normalized_model_download_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     let artifact = normalized_model_download_spec(config, model_id)?;
     pinned_artifact_disk_space_preflight(&artifact)
+}
+
+/// Discards the resumable sidecar for a normalized catalog artifact. The
+/// caller supplies a catalog model ID, never a filesystem path.
+pub(crate) fn discard_normalized_model_partial(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<bool, InstallError> {
+    let artifact = normalized_model_download_spec(config, model_id)?;
+    discard_pinned_artifact_partial(&artifact)
+}
+
+/// Checks for a resumable sidecar for a normalized catalog model without
+/// allowing callers to choose its destination path.
+pub(crate) fn normalized_model_has_partial(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<bool, InstallError> {
+    let artifact = normalized_model_download_spec(config, model_id)?;
+    pinned_artifact_has_partial(&artifact)
 }
 
 fn normalized_model_download_spec(
@@ -85,6 +105,25 @@ pub(crate) fn trusted_gguf_download_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     let pinned = trusted_gguf_download_spec(config, artifact)?;
     pinned_artifact_disk_space_preflight(&pinned)
+}
+
+/// Discards the resumable sidecar for a backend-validated trusted artifact.
+/// The UI cannot supply a URL or filesystem path to this operation.
+pub(crate) fn discard_trusted_gguf_partial(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Result<bool, InstallError> {
+    let pinned = trusted_gguf_download_spec(config, artifact)?;
+    discard_pinned_artifact_partial(&pinned)
+}
+
+/// Checks for a resumable sidecar for a backend-validated trusted artifact.
+pub(crate) fn trusted_gguf_has_partial(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Result<bool, InstallError> {
+    let pinned = trusted_gguf_download_spec(config, artifact)?;
+    pinned_artifact_has_partial(&pinned)
 }
 
 fn trusted_gguf_download_spec(
@@ -254,6 +293,33 @@ mod tests {
                 )
                 .join("whisper-tiny.en-Q4_K_M.gguf")
         );
+    }
+
+    #[test]
+    fn typed_partial_helpers_only_manage_the_resolved_artifact_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-managed-download-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut config = AppConfig::default();
+        config.general.model_storage_dir = root.clone();
+        let artifact = trusted_artifact();
+        let spec = trusted_gguf_download_spec(&config, &artifact).unwrap();
+        let partial = spec.destination.with_file_name(format!(
+            "{}.partial",
+            spec.destination.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"partial").unwrap();
+        std::fs::write(&spec.destination, b"destination").unwrap();
+
+        assert!(trusted_gguf_has_partial(&config, &artifact).unwrap());
+        assert!(discard_trusted_gguf_partial(&config, &artifact).unwrap());
+        assert!(!trusted_gguf_has_partial(&config, &artifact).unwrap());
+        assert_eq!(std::fs::read(&spec.destination).unwrap(), b"destination");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
