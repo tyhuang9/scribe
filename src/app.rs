@@ -8401,6 +8401,12 @@ impl LocalTranscriberApp {
         self.sync_model_comparison_state();
         let remote_catalog = self.remote_catalog_view();
         let clear_initial_dialog_focus = self.model_management.focus_dialog_initial;
+        let clear_returned_details_remove_focus = clear_initial_dialog_focus
+            && matches!(
+                &self.model_management.dialog,
+                Some(ModelDialog::Details(id))
+                    if self.model_management.restore_remove_focus.as_deref() == Some(id)
+            );
         let clear_add_focus = self.model_management.restore_add_focus;
         let clear_after_removal_focus = self.model_management.restore_after_removal_focus;
         let clear_reference_editor_focus = self.model_comparison.focus_reference_editor;
@@ -8421,6 +8427,9 @@ impl LocalTranscriberApp {
         let action = render_screen(ui, &view);
         if clear_initial_dialog_focus {
             self.model_management.focus_dialog_initial = false;
+        }
+        if clear_returned_details_remove_focus {
+            self.model_management.restore_remove_focus = None;
         }
         if clear_add_focus {
             self.model_management.restore_add_focus = false;
@@ -9288,6 +9297,11 @@ impl LocalTranscriberApp {
                     self.status_message =
                         "Install another ready model before removing the active model.".to_owned();
                 } else {
+                    self.model_management.restore_remove_focus = matches!(
+                        &self.model_management.dialog,
+                        Some(ModelDialog::Details(current)) if current == &id
+                    )
+                    .then(|| id.clone());
                     self.model_management.removal_replacement =
                         replacement.as_ref().map(|model| model.id.clone());
                     self.model_management.dialog = Some(ModelDialog::Remove(id));
@@ -9297,6 +9311,13 @@ impl LocalTranscriberApp {
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
                 Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
+                Some(ModelDialog::Remove(id))
+                    if self.model_management.restore_remove_focus.as_deref() == Some(&id) =>
+                {
+                    self.model_management.dialog = Some(ModelDialog::Details(id));
+                    self.model_management.focus_dialog_initial = true;
+                    self.model_management.removal_replacement = None;
+                }
                 Some(ModelDialog::Remove(id)) => {
                     self.model_management.restore_remove_focus = Some(id);
                     self.model_management.removal_replacement = None;
@@ -9430,6 +9451,7 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
+                self.model_management.restore_remove_focus = None;
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
                 let legacy_cleanup_pending =
@@ -20398,6 +20420,30 @@ mod layout_tests {
             app.status_message,
             "Install another ready model before removing the active model."
         );
+    }
+
+    #[test]
+    fn cancelling_removal_launched_from_details_reopens_that_drawer() {
+        let mut app = test_app();
+        let id = "whisper_cpp_base_en".to_owned();
+        app.model_management.dialog = Some(ModelDialog::Details(id.clone()));
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(id.clone()));
+
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Remove(id.clone()))
+        );
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(id.as_str())
+        );
+
+        app.apply_model_management_action(ScreenAction::CloseModelDialog);
+
+        assert_eq!(app.model_management.dialog, Some(ModelDialog::Details(id)));
+        assert!(app.model_management.focus_dialog_initial);
+        assert!(app.model_management.removal_replacement.is_none());
     }
 
     #[test]

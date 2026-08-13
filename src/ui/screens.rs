@@ -3132,11 +3132,8 @@ fn models(
                     .map(|id| (id, ModelCardControl::Remove))
             });
         if let Some((model_id, control)) = pending_control {
-            // The drawer disables its invoking row while it is mounted. On
-            // Windows, immediately restoring native AccessKit focus to that
-            // unmounted/remounted row can freeze the host. Return to the
-            // stable Models toolbar instead, while retaining the pending
-            // control acknowledgement for the state machine.
+            // Immediately focusing a just-remounted card control can freeze
+            // Windows AccessKit. Keep the existing stable toolbar fallback.
             import.request_focus();
             import.scroll_to_me(Some(Align::Center));
             action = ScreenAction::AcknowledgeModelControlFocus {
@@ -3882,36 +3879,22 @@ fn contain_model_dialog_focus(
     ctx.memory_mut(|memory| memory.request_focus(target));
 }
 
-/// Details is primarily a pointer-invoked inspection surface. Do not move
-/// focus to a visible button when it opens or closes; the first Tab press
-/// starts a normal, contained drawer focus sequence instead.
+/// Details uses the same focus contract as the other modal model surfaces:
+/// focus a stable control on open and repair any escape back into its ring.
 fn contain_details_drawer_focus(
     ctx: &egui::Context,
     tab_backwards: Option<bool>,
     controls: &[egui::Id],
-    clear_initial_focus: bool,
+    initial_focus: Option<egui::Id>,
+    request_initial_focus: bool,
 ) {
-    if clear_initial_focus {
-        ctx.memory_mut(|memory| {
-            if let Some(focused) = memory.focused() {
-                memory.surrender_focus(focused);
-            }
-        });
-        return;
-    }
-
-    let Some(first) = controls.first().copied() else {
-        return;
-    };
-    let Some(backwards) = tab_backwards else {
-        return;
-    };
-    let target = if backwards {
-        controls.last().copied().unwrap_or(first)
-    } else {
-        first
-    };
-    ctx.memory_mut(|memory| memory.request_focus(target));
+    contain_model_dialog_focus(
+        ctx,
+        tab_backwards,
+        controls,
+        initial_focus,
+        request_initial_focus,
+    );
 }
 
 /// Keep pointer input intended for the Models page below the dialog layer.
@@ -4130,6 +4113,7 @@ fn show_local_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(drawer_id)
@@ -4153,6 +4137,7 @@ fn show_local_model_details_drawer(
                         );
                         mark_accesskit_enabled(drawer_ui, &close);
                         focusable_controls.push(close.id);
+                        initial_focus = Some(close.id);
                         if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
@@ -4335,6 +4320,11 @@ fn show_local_model_details_drawer(
                             if remove_reason.is_none() {
                                 mark_accesskit_enabled(ui, &remove);
                                 focusable_controls.push(remove.id);
+                                if management.restore_remove_focus.as_deref()
+                                    == Some(model.id.as_str())
+                                {
+                                    initial_focus = Some(remove.id);
+                                }
                             }
                             if remove.clicked() && remove_reason.is_none() { action = ScreenAction::RequestModelRemoval(model.id.clone()); }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4365,6 +4355,7 @@ fn show_local_model_details_drawer(
         &ctx,
         tab_direction,
         &focusable_controls,
+        initial_focus,
         management.focus_dialog_initial,
     );
     action
@@ -4393,6 +4384,7 @@ fn show_remote_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     let drawer_action = variant
         .actions
@@ -4425,6 +4417,7 @@ fn show_remote_model_details_drawer(
                     );
                     mark_accesskit_enabled(drawer_ui, &close);
                     focusable_controls.push(close.id);
+                    initial_focus = Some(close.id);
                     if close.clicked() {
                         action = ScreenAction::CloseModelDialog;
                     }
@@ -4535,6 +4528,7 @@ fn show_remote_model_details_drawer(
         &ctx,
         tab_direction,
         &focusable_controls,
+        initial_focus,
         management.focus_dialog_initial,
     );
     action
@@ -7405,6 +7399,21 @@ mod tests {
             .find(|(_, node)| node.name() == Some("Remove"))
             .expect("catalog-only legacy cleanup confirmation action");
         assert!(!remove.is_disabled());
+    }
+
+    #[test]
+    fn details_focus_starts_at_close_and_repairs_an_escape() {
+        let ctx = egui::Context::default();
+        let close = egui::Id::new("details-close-focus-test");
+        let remove = egui::Id::new("details-remove-focus-test");
+        let outside = egui::Id::new("details-outside-focus-test");
+
+        contain_details_drawer_focus(&ctx, None, &[close, remove], Some(close), true);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(close));
+
+        ctx.memory_mut(|memory| memory.request_focus(outside));
+        contain_details_drawer_focus(&ctx, None, &[close, remove], Some(close), false);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(close));
     }
 
     #[test]

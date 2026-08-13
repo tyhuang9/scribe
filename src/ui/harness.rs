@@ -345,6 +345,12 @@ impl UiHarnessApp {
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
+        let clear_returned_details_remove_focus = clear_initial_dialog_focus
+            && matches!(
+                &self.data.model_management.dialog,
+                Some(ModelDialog::Details(id))
+                    if self.data.model_management.restore_remove_focus.as_deref() == Some(id)
+            );
         let clear_add_focus = self.data.model_management.restore_add_focus;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
         let clear_comparison_focus = self.data.comparison.focus_panel;
@@ -366,6 +372,9 @@ impl eframe::App for UiHarnessApp {
         }
         if clear_initial_dialog_focus {
             self.data.model_management.focus_dialog_initial = false;
+        }
+        if clear_returned_details_remove_focus {
+            self.data.model_management.restore_remove_focus = None;
         }
         if clear_add_focus {
             self.data.model_management.restore_add_focus = false;
@@ -483,17 +492,31 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.focus_dialog_initial = true;
         }
         ScreenAction::RequestModelRemoval(id) => {
+            data.model_management.restore_remove_focus = matches!(
+                &data.model_management.dialog,
+                Some(ModelDialog::Details(current)) if current == &id
+            )
+            .then(|| id.clone());
             data.model_management.dialog = Some(ModelDialog::Remove(id));
             data.model_management.focus_dialog_initial = true;
         }
         ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
             Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
             Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
-            Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
+            Some(ModelDialog::Remove(id))
+                if data.model_management.restore_remove_focus.as_deref() == Some(&id) =>
+            {
+                data.model_management.dialog = Some(ModelDialog::Details(id));
+                data.model_management.focus_dialog_initial = true;
+            }
+            Some(ModelDialog::Remove(id)) => {
+                data.model_management.restore_remove_focus = Some(id);
+            }
             None => {}
         },
         ScreenAction::ConfirmModelRemoval(id) => {
             data.model_management.dialog = None;
+            data.model_management.restore_remove_focus = None;
             data.models.retain(|model| model.id != id);
             data.model_management.restore_after_removal_focus = true;
         }
@@ -768,6 +791,12 @@ mod tests {
         time: Option<f64>,
     ) -> (egui::FullOutput, ScreenAction) {
         let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
+        let clear_returned_details_remove_focus = clear_initial_dialog_focus
+            && matches!(
+                &data.model_management.dialog,
+                Some(ModelDialog::Details(id))
+                    if data.model_management.restore_remove_focus.as_deref() == Some(id)
+            );
         let clear_add_focus = data.model_management.restore_add_focus;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
@@ -802,6 +831,9 @@ mod tests {
         }
         if clear_initial_dialog_focus {
             data.model_management.focus_dialog_initial = false;
+        }
+        if clear_returned_details_remove_focus {
+            data.model_management.restore_remove_focus = None;
         }
         if clear_add_focus {
             data.model_management.restore_add_focus = false;
@@ -1488,7 +1520,7 @@ mod tests {
         let (output, action) =
             render_with_input(&ctx, &mut details, &mut page, 1180.0, 815.0, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(focused_node(&output).name(), Some("Close model details"));
         let (output, action) = render_with_input(
             &ctx,
             &mut details,
@@ -1529,7 +1561,7 @@ mod tests {
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&initial).name(), None);
+        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
 
         for _ in 0..8 {
             let (mut output, action) = render_with_input(
@@ -1569,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn details_drawer_pins_close_to_the_header_corner_without_initial_focus() {
+    fn details_drawer_pins_and_initially_focuses_close_in_the_header_corner() {
         let (width, height) = (960.0, 680.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1588,7 +1620,7 @@ mod tests {
             close.x1 >= drawer.x1 - 20.0 && close.y0 <= drawer.y0 + 20.0,
             "Close must stay in the drawer's top-right header corner: drawer={drawer:?}, close={close:?}"
         );
-        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(focused_node(&output).name(), Some("Close model details"));
     }
 
     #[test]
@@ -1642,6 +1674,8 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        // A stable toolbar fallback is used for explicit row-removal cancellation.
+        // Exact card restoration here can freeze Windows AccessKit during remount.
         assert_eq!(focused_node(&output).name(), None);
         assert_eq!(action, ScreenAction::None);
     }
@@ -1671,7 +1705,7 @@ mod tests {
             !close.is_disabled(),
             "the drawer close control must stay enabled"
         );
-        assert_eq!(focused_node(&initial).name(), None);
+        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
 
         let (_, action) = render_with_input(
             &ctx,
@@ -1975,6 +2009,101 @@ mod tests {
     }
 
     #[test]
+    fn legacy_details_accesskit_removal_cancel_returns_to_the_drawer_remove_action() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let legacy_index = data
+            .models
+            .iter()
+            .position(|model| model.id == "tiny.en")
+            .expect("installed tiny model");
+        let mut legacy = data.models.remove(legacy_index);
+        legacy.installed = false;
+        legacy.legacy_cleanup_pending = true;
+        legacy.ready = false;
+        legacy.selected = true;
+        legacy.download_state = ModelDownloadState::NotInstalled;
+        legacy.primary_action_label = "Upgrade model".into();
+        legacy.primary_action_enabled = true;
+        legacy.primary_action_installs_upgrade = true;
+        data.model_catalog.push(legacy);
+
+        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let details_id = named_node_id(&initial, "Details for whisper.cpp tiny.en");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: details_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::ShowModelDetails("tiny.en".into()));
+        apply_action(&mut data, &mut page, action);
+
+        let details = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        assert_eq!(focused_node(&details).name(), Some("Close model details"));
+        let remove_id = named_node_id(&details, "Remove model from device");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: remove_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::RequestModelRemoval("tiny.en".into()));
+        apply_action(&mut data, &mut page, action);
+
+        let confirmation =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        assert_eq!(focused_node(&confirmation).name(), Some("Cancel"));
+        let cancel_id = named_node_id(&confirmation, "Cancel");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: cancel_id,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::CloseModelDialog);
+        apply_action(&mut data, &mut page, action);
+        assert_eq!(
+            data.model_management.dialog,
+            Some(ModelDialog::Details("tiny.en".into()))
+        );
+
+        let returned = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        assert_eq!(
+            focused_node(&returned).name(),
+            Some("Remove model from device")
+        );
+    }
+
+    #[test]
     fn remove_dialog_cancel_moves_focus_to_the_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
@@ -2028,7 +2157,7 @@ mod tests {
             (
                 ModelDialog::Details("base.en".into()),
                 "Model details for whisper.cpp base.en",
-                None,
+                Some("Close model details"),
             ),
             (
                 ModelDialog::Remove("tiny.en".into()),
