@@ -109,6 +109,7 @@ impl Worker {
         audio::initialize_root(&root)?;
         let database_path = root.join("history.sqlite3");
         audio::validate_database_files_before_open(&database_path)?;
+        audio::secure_database_files(&database_path)?;
         let connection = Connection::open(&database_path)?;
         connection.busy_timeout(std::time::Duration::from_millis(750))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;

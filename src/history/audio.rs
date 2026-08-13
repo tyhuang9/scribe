@@ -268,7 +268,9 @@ pub(super) fn validate_database_files_before_open(database_path: &Path) -> Histo
 }
 
 pub(super) fn secure_database_files(database_path: &Path) -> HistoryResult<()> {
-    secure_file(database_path)?;
+    if validate_regular_file_or_missing(database_path)? {
+        secure_file(database_path)?;
+    }
     let file_name = database_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -338,8 +340,9 @@ fn secure_windows_path(path: &Path) -> HistoryResult<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // Protected DACL: full control for the owning user and LocalSystem only.
-    let sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+    let user_sid = current_process_user_sid()?;
+    // Protected DACL: full control for this process user and LocalSystem only.
+    let sddl = format!("D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -374,6 +377,79 @@ fn secure_windows_path(path: &Path) -> HistoryResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn current_process_user_sid() -> HistoryResult<String> {
+    use std::ffi::c_void;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    let result = (|| {
+        let mut length = 0;
+        let queried =
+            unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut length) };
+        let query_error = unsafe { GetLastError() };
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        if length == 0 || (queried == 0 && query_error != ERROR_INSUFFICIENT_BUFFER) {
+            return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
+                query_error as i32,
+            )));
+        }
+        let words = usize::try_from(length)
+            .map_err(|_| HistoryError::Io(std::io::Error::other("token user data is too large")))?
+            .div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32,
+            )));
+        }
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_ptr = ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_ptr) } == 0 {
+            return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32,
+            )));
+        }
+        let sid_length = unsafe { (0..).find(|&index| *sid_ptr.add(index) == 0).unwrap() };
+        let sid_string =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_ptr, sid_length) });
+        unsafe {
+            LocalFree(sid_ptr.cast());
+        }
+        Ok(sid_string)
+    })();
+    let close_error = (unsafe { CloseHandle(token) } == 0).then(|| unsafe { GetLastError() });
+    match result {
+        Ok(sid) => {
+            if let Some(code) = close_error {
+                return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
+                    code as i32,
+                )));
+            }
+            Ok(sid)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn open_no_follow_regular(path: &Path) -> HistoryResult<File> {
