@@ -1798,6 +1798,105 @@ mod tests {
     }
 
     #[test]
+    fn card_click_target_does_not_steal_details_or_remove_actions() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let details = named_node_bounds(&initial, "Details for whisper.cpp base.en");
+        let details_point = egui::pos2(
+            ((details.x0 + details.x1) / 2.0) as f32,
+            ((details.y0 + details.y1) / 2.0) as f32,
+        );
+        let (_, press_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(details_point),
+                egui::Event::PointerButton {
+                    pos: details_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, details_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(details_point),
+                egui::Event::PointerButton {
+                    pos: details_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            details_action,
+            ScreenAction::ShowModelDetails("base.en".into())
+        );
+
+        let remove = named_node_bounds(&initial, "Remove whisper.cpp tiny.en from device");
+        let remove_point = egui::pos2(
+            ((remove.x0 + remove.x1) / 2.0) as f32,
+            ((remove.y0 + remove.y1) / 2.0) as f32,
+        );
+        let (_, press_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(remove_point),
+                egui::Event::PointerButton {
+                    pos: remove_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, remove_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(remove_point),
+                egui::Event::PointerButton {
+                    pos: remove_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            remove_action,
+            ScreenAction::RequestModelRemoval("tiny.en".into())
+        );
+    }
+
+    #[test]
     fn clicking_a_legacy_installed_card_starts_its_real_upgrade() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();

@@ -2593,9 +2593,24 @@ fn render_model_card(
             ModelCard::Remote(entry, _) => format!("Open details for {}", entry.display_name),
         },
     };
+    // Register this after all content so static labels cannot consume the
+    // card click. Its rect ends before the two trailing 44px action targets
+    // (plus the card inset), leaving Details and lifecycle buttons unmasked.
+    let card_click_rect = egui::Rect::from_min_max(
+        card_rect.min,
+        egui::pos2(
+            (card_rect.right()
+                - MODEL_DETAILS_COLUMN_WIDTH
+                - MODEL_ACTION_COLUMN_WIDTH
+                - MODEL_CARD_HORIZONTAL_INSET
+                - 1.0)
+                .max(card_rect.left()),
+            card_rect.bottom(),
+        ),
+    );
     let card_click = ui
         .interact(
-            card_rect,
+            card_click_rect,
             ui.make_persistent_id(("model-card-select", &card_key)),
             Sense::click(),
         )
@@ -2606,7 +2621,7 @@ fn render_model_card(
     ui.ctx().accesskit_node_builder(card_click.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
         builder.set_name(card_click_name);
-        builder.set_bounds(accesskit_rect(card_rect));
+        builder.set_bounds(accesskit_rect(card_click_rect));
     });
     if action == ScreenAction::None && card_click.clicked() && !action_control_hovered {
         action = card_click_action;
