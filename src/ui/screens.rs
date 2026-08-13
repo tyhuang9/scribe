@@ -2058,21 +2058,29 @@ fn render_model_metadata(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
     languages: &[String],
-    size: &str,
     include_ratings: bool,
 ) {
     let colors = ui_palette(ui);
     ui.horizontal_wrapped(|ui| {
         let (language_name, language_summary) = model_language_summary(languages);
-        paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
-        let language = ui.label(
-            RichText::new(language_summary)
-                .small()
-                .color(colors.muted_text),
-        );
-        ui.ctx()
-            .accesskit_node_builder(language.id, |builder| builder.set_name(language_name));
-        ui.label(RichText::new(size).small().color(colors.muted_text));
+        // Keep the decorative globe and its language value in one layout unit so
+        // a wrapped row cannot leave the icon orphaned on the following line.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
+            let language = ui.label(
+                RichText::new(&language_summary)
+                    .small()
+                    .color(colors.muted_text),
+            );
+            ui.ctx().accesskit_node_builder(language.id, |builder| {
+                builder.set_name(if language_name == "Languages unavailable" {
+                    language_name.to_owned()
+                } else {
+                    format!("{language_name}: {language_summary}")
+                })
+            });
+        });
         if include_ratings {
             render_model_ratings(ui, card);
         }
@@ -2088,21 +2096,16 @@ fn render_unified_model_card(
 ) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
     let card_key = card.key();
-    let (name, languages, size, active, description) = match card {
+    let (name, languages, active, description) = match card {
         ModelCard::Local(model) => (
             &model.display_name,
             &model.languages,
-            model
-                .total_bytes
-                .or(model.disk_bytes)
-                .map_or_else(|| "Size unavailable".to_owned(), format_bytes),
             model.active,
             model_row_description(card),
         ),
-        ModelCard::Remote(entry, variant) => (
+        ModelCard::Remote(entry, _) => (
             &entry.display_name,
             &entry.languages,
-            variant.size_label.clone(),
             false,
             model_row_description(card),
         ),
@@ -2128,7 +2131,7 @@ fn render_unified_model_card(
                 format!("Installing {}", model.display_name),
                 false,
                 Some("Scribe is preparing the model and cannot cancel this step."),
-                "Installingâ€¦",
+                "Installing...",
             )
         }
         ModelCard::Local(model) if model.installed => {
@@ -2340,19 +2343,12 @@ fn render_unified_model_card(
                 paint_description_fade(ui, preview.rect, overflow);
             }
             ui.add_space(4.0);
-            render_model_metadata(ui, card, languages, &size, compact);
+            render_model_metadata(ui, card, languages, compact);
             if expanded {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
-                render_inline_model_details(
-                    ui,
-                    card,
-                    can_replace_active,
-                    restore_remove_focus && !restored_remove_focus,
-                    &mut restored_remove_focus,
-                    &mut action,
-                );
+                render_inline_model_details(ui, card, &mut action);
             }
         });
     ui.ctx()
@@ -2367,52 +2363,59 @@ fn render_unified_model_card(
     }
 }
 
-fn render_inline_model_details(
-    ui: &mut egui::Ui,
-    card: ModelCard<'_>,
-    can_replace_active: bool,
-    restore_remove_focus: bool,
-    restored_remove_focus: &mut bool,
-    action: &mut ScreenAction,
-) {
+fn render_inline_model_details(ui: &mut egui::Ui, card: ModelCard<'_>, action: &mut ScreenAction) {
     ui.vertical(|ui| {
-        ui.horizontal_wrapped(|ui| match card {
-            ModelCard::Local(model) => {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("GPU ACCELERATION").small());
-                    ui.label(acceleration_label(model.capabilities).unwrap_or("Not available"));
-                });
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("RAM USAGE").small());
-                    ui.label(
-                        model
-                            .estimated_ram_bytes
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "Not available".into()),
-                    );
-                });
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("FILE SIZE").small());
-                    ui.label(
-                        model
-                            .total_bytes
-                            .or(model.disk_bytes)
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "Not available".into()),
-                    );
-                });
-            }
-            ModelCard::Remote(_, variant) => {
-                for (label, value) in [
-                    ("GPU ACCELERATION", "Not available".to_owned()),
-                    ("RAM USAGE", "Not available".to_owned()),
-                    ("FILE SIZE", variant.size_label.clone()),
-                ] {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(label).small());
+        let stats = match card {
+            ModelCard::Local(model) => [
+                (
+                    "GPU ACCELERATION",
+                    acceleration_label(model.capabilities)
+                        .unwrap_or("Not available")
+                        .to_owned(),
+                ),
+                (
+                    "RAM USAGE",
+                    model
+                        .estimated_ram_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "Not available".into()),
+                ),
+                (
+                    "FILE SIZE",
+                    model
+                        .total_bytes
+                        .or(model.disk_bytes)
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "Not available".into()),
+                ),
+            ],
+            ModelCard::Remote(_, variant) => [
+                ("GPU ACCELERATION", "Not available".to_owned()),
+                ("RAM USAGE", "Not available".to_owned()),
+                ("FILE SIZE", variant.size_label.clone()),
+            ],
+        };
+        let available = ui.available_width();
+        let gap = 24.0;
+        let stat_width = ((available - gap * 2.0) / 3.0).max(88.0);
+        let colors = ui_palette(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (label, value) in stats {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(stat_width, 44.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            RichText::new(label)
+                                .small()
+                                .strong()
+                                .color(colors.muted_text),
+                        );
                         ui.label(value);
-                    });
-                }
+                    },
+                );
             }
         });
         ui.add_space(10.0);
@@ -2473,26 +2476,6 @@ fn render_inline_model_details(
                     );
                     if response.clicked() && model.runtime_action_enabled {
                         *action = ScreenAction::MaintainModelRuntime(model.id.clone());
-                    }
-                }
-                if model.installed && model.removal_supported {
-                    let enabled = !model.selected || can_replace_active;
-                    let reason = (!enabled).then_some(
-                        "Install another ready model before removing the selected model.",
-                    );
-                    let response = model_lifecycle_button(
-                        ui,
-                        "Uninstall",
-                        &format!("Uninstall {}", model.display_name),
-                        enabled,
-                        reason,
-                    );
-                    if restore_remove_focus {
-                        response.request_focus();
-                        *restored_remove_focus = true;
-                    }
-                    if response.clicked() && enabled {
-                        *action = ScreenAction::RequestModelRemoval(model.id.clone());
                     }
                 }
             }

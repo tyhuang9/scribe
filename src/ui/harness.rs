@@ -2575,6 +2575,7 @@ mod tests {
     #[test]
     fn model_cards_expose_accordion_and_semantic_contracts() {
         let collapsed = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let collapsed_names = node_names(&collapsed);
         let collapsed_nodes = &collapsed
             .platform_output
             .accesskit_update
@@ -2598,9 +2599,23 @@ mod tests {
             );
         }
         assert!(
-            !node_names(&collapsed)
+            !collapsed_names
                 .iter()
                 .any(|name| matches!(name.as_str(), "SPEED" | "ACCURACY" | "Very fast" | "Basic"))
+        );
+        assert!(
+            collapsed_names
+                .iter()
+                .filter(|name| *name == "Languages: EN")
+                .count()
+                >= 2,
+            "collapsed cards should expose compact language semantics"
+        );
+        assert!(
+            !collapsed_names
+                .iter()
+                .any(|name| matches!(name.as_str(), "400MB" | "75MB")),
+            "model size belongs only in the expanded details"
         );
 
         let expanded = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
@@ -2624,6 +2639,10 @@ mod tests {
             "expanded cards expose the full description exactly once"
         );
         for detail in [
+            "GPU ACCELERATION",
+            "RAM USAGE",
+            "FILE SIZE",
+            "75MB",
             "LANGUAGES",
             "English",
             "Runtime: Ready",
@@ -2631,6 +2650,14 @@ mod tests {
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
+        assert_eq!(
+            node_names(&expanded)
+                .iter()
+                .filter(|name| name.as_str() == "Uninstall whisper.cpp tiny.en")
+                .count(),
+            1,
+            "the summary row owns the single uninstall action"
+        );
     }
 
     #[test]
@@ -3017,6 +3044,21 @@ mod tests {
             let bounds = named_node_bounds(&output, &name);
             assert_bounds_within(bounds, card, "long-name compact model control");
             assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+        }
+    }
+
+    #[test]
+    fn model_cards_remain_inside_supported_route_widths() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsCardExpanded, width, height);
+            for name in ["whisper.cpp base.en model", "whisper.cpp tiny.en model"] {
+                let bounds = named_node_bounds(&output, name);
+                assert!(
+                    bounds.x0 >= -LAYOUT_TOLERANCE
+                        && bounds.x1 <= f64::from(width) + LAYOUT_TOLERANCE,
+                    "supported-width model card must remain horizontally contained: {bounds:?}"
+                );
+            }
         }
     }
 
