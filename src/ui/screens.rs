@@ -47,6 +47,11 @@ const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.
 const ROUTE_TOP_INSET: f32 = 28.0;
 const ROUTE_HORIZONTAL_INSET: f32 = 28.0;
 const ROUTE_BOTTOM_INSET: f32 = 16.0;
+const SETTINGS_COMPACT_BREAKPOINT: f32 = 620.0;
+const SETTINGS_LABEL_COLUMN_WIDTH: f32 = 270.0;
+const LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID: &str = "live-transcription-preview-switch";
+const LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION: &str =
+    "Temporary local live text is replaced by the final transcription.";
 const ROUTE_FOCUSED_CONTROL_SCROLL: &str = "route-focused-control-scroll";
 #[cfg(test)]
 const ROUTE_SCROLL_DIAGNOSTICS: &str = "route-scroll-diagnostics";
@@ -5151,17 +5156,14 @@ fn radio_control(
     ui: &mut egui::Ui,
     mode: RecordingMode,
     label: &str,
+    description: &str,
     checked: bool,
     width: f32,
     selected_text: egui::Color32,
 ) -> egui::Response {
     let colors = ui_palette(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 44.0), egui::Sense::hover());
-    let response = ui.interact(
-        rect,
-        ui.make_persistent_id(("recording-mode", mode)),
-        egui::Sense::click(),
-    );
+    let response = ui.interact(rect, recording_mode_id(mode), egui::Sense::click());
     let visual = rect.shrink2(Vec2::new(4.0, 6.0));
     if checked {
         ui.painter()
@@ -5188,6 +5190,7 @@ fn radio_control(
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::RadioButton);
         builder.set_name(label);
+        builder.set_description(description);
         builder.set_checked(if checked {
             egui::accesskit::Checked::True
         } else {
@@ -5195,7 +5198,21 @@ fn radio_control(
         });
     });
     paint_focus_ring(ui, &response, Rounding::same(18.0));
-    response
+    focus_tooltip(ui, &response, description);
+    response.on_hover_text(description)
+}
+
+fn recording_mode_id(mode: RecordingMode) -> egui::Id {
+    egui::Id::new(("recording-mode", mode))
+}
+
+fn recording_mode_description(mode: RecordingMode) -> &'static str {
+    match mode {
+        RecordingMode::PressOnce => {
+            "Press the recording hotkey once to start, then press it again to stop."
+        }
+        RecordingMode::Hold => "Hold the recording hotkey to record, then release it to stop.",
+    }
 }
 
 fn recording_mode_toggle(
@@ -5232,6 +5249,7 @@ fn recording_mode_toggle(
                 &mut toggle_ui,
                 mode,
                 label,
+                recording_mode_description(mode),
                 selected == mode,
                 TOGGLE_WIDTH / 2.0,
                 colors.segmented_control_selected_text,
@@ -5267,6 +5285,12 @@ fn recording_settings_panel(
         ui.add_enabled_ui(!recording_locked, |ui| {
             let mut radio_ids = Vec::new();
             let radio_group_id = ui.make_persistent_id("recording-mode-group");
+            let focused_mode = [RecordingMode::PressOnce, RecordingMode::Hold]
+                .into_iter()
+                .find(|mode| ui.memory(|memory| memory.has_focus(recording_mode_id(*mode))));
+            let mode_arrow_pressed = ui.input(|input| {
+                input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::ArrowLeft)
+            });
             let ctx = ui.ctx().clone();
             ctx.accesskit_node_builder(radio_group_id, |builder| {
                 builder.set_role(egui::accesskit::Role::RadioGroup);
@@ -5279,21 +5303,13 @@ fn recording_settings_panel(
                         if response.clicked() {
                             *action = ScreenAction::SetRecordingMode(mode);
                         }
-                        if response.has_focus()
-                            && ui.input(|input| {
-                                input.key_pressed(egui::Key::ArrowRight)
-                                    || input.key_pressed(egui::Key::ArrowLeft)
-                            })
-                        {
+                        if focused_mode == Some(mode) && mode_arrow_pressed {
                             let next = if mode == RecordingMode::PressOnce {
                                 RecordingMode::Hold
                             } else {
                                 RecordingMode::PressOnce
                             };
-                            ui.memory_mut(|memory| {
-                                memory
-                                    .request_focus(ui.make_persistent_id(("recording-mode", next)))
-                            });
+                            ui.memory_mut(|memory| memory.request_focus(recording_mode_id(next)));
                             *action = ScreenAction::SetRecordingMode(next);
                         }
                     }
@@ -5429,19 +5445,19 @@ fn recording_settings_panel(
     ui.add_space(16.0);
     settings_section(ui, "Transcription", |ui| {
         ui.add_enabled_ui(!recording_locked, |ui| {
-            let mut preview = settings.provisional_feedback;
-            let _ = SettingsRow::show(ui, "Provisional transcription", true, |ui, _| {
-                ui.vertical(|ui| {
-                    if settings_checkbox(ui, &mut preview, "Use live provisional preview").changed()
+            let _ = SettingsRow::show(ui, "Live transcription preview", true, |ui, _| {
+                ui.horizontal(|ui| {
+                    if settings_switch(
+                        ui,
+                        settings.provisional_feedback,
+                        "Live transcription preview",
+                        LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION,
+                    )
+                    .clicked()
                     {
                         *action = ScreenAction::ToggleProvisionalFeedback;
                     }
-                    ui.label(
-                        RichText::new(
-                            "Preview text remains inside Scribe until final transcription completes.",
-                        )
-                        .color(colors.muted_text),
-                    );
+                    settings_help_affordance(ui, LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION);
                 });
             });
             let mut streaming = settings.streaming_label.clone();
@@ -6024,7 +6040,7 @@ impl SettingsRow {
         separator_after: bool,
         contents: impl FnOnce(&mut egui::Ui, egui::Id),
     ) -> egui::Response {
-        let compact = current_content_width(ui) < 620.0;
+        let compact = current_content_width(ui) < SETTINGS_COMPACT_BREAKPOINT;
         let row = ui.scope(|ui| {
             let interaction_height = ui.spacing().interact_size.y.max(44.0);
             ui.spacing_mut().interact_size.y = interaction_height;
@@ -6036,16 +6052,12 @@ impl SettingsRow {
                 });
             } else {
                 ui.horizontal(|ui| {
-                    let available_width = ui.available_width();
-                    let label_width = (available_width * 0.32).clamp(180.0, 270.0);
                     let label = ui.add_sized(
-                        [label_width, 44.0],
+                        [SETTINGS_LABEL_COLUMN_WIDTH, 44.0],
                         egui::Label::new(RichText::new(label).color(ui_palette(ui).muted_text)),
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            contents(ui, label.id);
-                        });
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        contents(ui, label.id);
                     });
                 });
             }
@@ -6062,6 +6074,94 @@ fn settings_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::
         [ui.available_width().max(44.0), 44.0],
         egui::Checkbox::new(value, label),
     )
+}
+
+fn settings_switch(
+    ui: &mut egui::Ui,
+    checked: bool,
+    accessible_name: &str,
+    description: &str,
+) -> egui::Response {
+    const SWITCH_SIZE: Vec2 = Vec2::new(52.0, 44.0);
+    const SWITCH_VISUAL_SIZE: Vec2 = Vec2::new(44.0, 24.0);
+    const SWITCH_KNOB_DIAMETER: f32 = 18.0;
+
+    let (rect, _) = ui.allocate_exact_size(SWITCH_SIZE, Sense::hover());
+    let response = ui.interact(
+        rect,
+        egui::Id::new(LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID),
+        Sense::click(),
+    );
+    let visual = egui::Rect::from_center_size(rect.center(), SWITCH_VISUAL_SIZE);
+    let colors = ui_palette(ui);
+    let track_fill = if checked {
+        colors.accent
+    } else {
+        colors.inactive_toggle_track
+    };
+    let track_stroke = if checked {
+        Stroke::new(1.0, colors.accent)
+    } else {
+        Stroke::new(1.0, colors.inactive_toggle_track)
+    };
+    ui.painter()
+        .rect(visual, Rounding::same(12.0), track_fill, track_stroke);
+    let knob_center = egui::pos2(
+        if checked {
+            visual.right() - SWITCH_KNOB_DIAMETER / 2.0 - 3.0
+        } else {
+            visual.left() + SWITCH_KNOB_DIAMETER / 2.0 + 3.0
+        },
+        visual.center().y,
+    );
+    ui.painter()
+        .circle_filled(knob_center, SWITCH_KNOB_DIAMETER / 2.0, colors.card_bg);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Checkbox, accessible_name));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Switch);
+        builder.set_name(accessible_name);
+        builder.set_description(description);
+        builder.set_checked(if checked {
+            egui::accesskit::Checked::True
+        } else {
+            egui::accesskit::Checked::False
+        });
+        builder.set_bounds(accesskit_rect(rect));
+        if !response.enabled() {
+            builder.set_disabled();
+        }
+    });
+    paint_focus_ring(ui, &response, Rounding::same(12.0));
+    focus_tooltip(ui, &response, description);
+    response.on_hover_text(description)
+}
+
+fn settings_help_affordance(ui: &mut egui::Ui, description: &str) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+    let colors = ui_palette(ui);
+    let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0));
+    ui.painter()
+        .circle_filled(visual.center(), 10.0, colors.panel_bg);
+    ui.painter().circle_stroke(
+        visual.center(),
+        10.0,
+        Stroke::new(1.0, colors.border_strong),
+    );
+    ui.painter().text(
+        visual.center(),
+        Align2::CENTER_CENTER,
+        "?",
+        egui::FontId::proportional(14.0),
+        colors.muted_text,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, "More information"));
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::StaticText);
+        builder.set_name("Live transcription preview information");
+        builder.set_description(description);
+        builder.set_bounds(accesskit_rect(rect));
+    });
+    response.on_hover_text(description);
 }
 
 fn settings_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
@@ -6231,6 +6331,36 @@ mod tests {
                         &TranscriptionState::default(),
                         settings,
                         &mut action,
+                    );
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn render_recording_settings_with_input(
+        ctx: &egui::Context,
+        settings_view: &RecordingSettingsView,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 1_200.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = settings(
+                        ui,
+                        SettingsTab::Recording,
+                        &TranscriptionState::default(),
+                        settings_view,
                     );
                 });
             },
@@ -7491,7 +7621,7 @@ mod tests {
                     "Global record hotkey",
                     "Change shortcut",
                     "Input level",
-                    "Use live provisional preview",
+                    "Live transcription preview",
                     "Streaming mode",
                     "Transcription device",
                 ][..],
@@ -7948,6 +8078,166 @@ mod tests {
                 && node.checked() == Some(egui::accesskit::Checked::True)
                 && node.radio_group().len() == 2
         }));
+        for (name, description) in [
+            (
+                "Press once",
+                "Press the recording hotkey once to start, then press it again to stop.",
+            ),
+            (
+                "Hold",
+                "Hold the recording hotkey to record, then release it to stop.",
+            ),
+        ] {
+            assert!(nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::RadioButton
+                    && node.name() == Some(name)
+                    && node.description() == Some(description)
+            }));
+        }
+    }
+
+    #[test]
+    fn live_transcription_preview_is_a_named_switch_with_pointer_and_keyboard_activation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView {
+            provisional_feedback: true,
+            ..Default::default()
+        };
+
+        let (initial, action) =
+            render_recording_settings_with_input(&ctx, &settings_view, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let nodes = &initial
+            .platform_output
+            .accesskit_update
+            .expect("Recording settings should expose AccessKit")
+            .nodes;
+        let switch = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Switch
+                    && node.name() == Some("Live transcription preview"))
+                .then_some(node)
+            })
+            .expect("live transcription preview should be exposed as a switch");
+        assert_eq!(switch.checked(), Some(egui::accesskit::Checked::True));
+        assert_eq!(
+            switch.description(),
+            Some(LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION)
+        );
+        let bounds = switch.bounds().expect("switch should expose its bounds");
+        assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::StaticText
+                && node.name() == Some("Live transcription preview information")
+                && node.description() == Some(LIVE_TRANSCRIPTION_PREVIEW_DESCRIPTION)
+        }));
+
+        let point = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let (_, press_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, release_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(release_action, ScreenAction::ToggleProvisionalFeedback);
+
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(
+                        ui,
+                        SettingsTab::Recording,
+                        &TranscriptionState::default(),
+                        &settings_view,
+                    );
+                    ui.memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID))
+                    });
+                });
+            },
+        );
+        let _ = render_recording_settings_with_input(&ctx, &settings_view, Vec::new());
+        let (_, keyboard_action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(keyboard_action, ScreenAction::ToggleProvisionalFeedback);
+    }
+
+    #[test]
+    fn recording_mode_arrow_navigation_keeps_radio_behavior() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let settings_view = RecordingSettingsView::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = settings(
+                        ui,
+                        SettingsTab::Recording,
+                        &TranscriptionState::default(),
+                        &settings_view,
+                    );
+                    ui.memory_mut(|memory| {
+                        memory.request_focus(recording_mode_id(RecordingMode::PressOnce))
+                    });
+                });
+            },
+        );
+        let _ = render_recording_settings_with_input(&ctx, &settings_view, Vec::new());
+        let (_, action) = render_recording_settings_with_input(
+            &ctx,
+            &settings_view,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(action, ScreenAction::SetRecordingMode(RecordingMode::Hold));
     }
 
     #[test]
@@ -8290,6 +8580,53 @@ mod tests {
     }
 
     #[test]
+    fn desktop_settings_rows_use_fixed_left_aligned_columns() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = SettingsRow::show(ui, "Desktop column label", false, |ui, label_id| {
+                        ui.add_sized([120.0, 44.0], egui::Button::new("Desktop column control"))
+                            .labelled_by(label_id);
+                    });
+                });
+            },
+        );
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .expect("settings row should expose AccessKit")
+            .nodes;
+        let label = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Desktop column label"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("desktop label should expose bounds");
+        let control = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Desktop column control"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("desktop control should expose bounds");
+        assert!((label.x1 - label.x0 - f64::from(SETTINGS_LABEL_COLUMN_WIDTH)).abs() < 1.0);
+        assert!(control.x0 >= label.x1);
+        assert!(control.x0 - label.x1 < 24.0);
+    }
+
+    #[test]
     fn actual_settings_actions_have_full_targets_and_compact_rows_stack() {
         let settings_view = RecordingSettingsView {
             auto_insert_transcript: true,
@@ -8316,7 +8653,7 @@ mod tests {
                     &[
                         "Press once",
                         "Hold",
-                        "Use live provisional preview",
+                        "Live transcription preview",
                         "Refresh devices",
                         "Change shortcut",
                     ][..],
