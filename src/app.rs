@@ -7614,7 +7614,15 @@ impl LocalTranscriberApp {
             self.status_message = message;
             return false;
         }
-        if let Err(error) = config::save_config(&self.config) {
+        #[cfg(test)]
+        let persistence = if self.config_path.is_none() {
+            Ok(())
+        } else {
+            config::save_config(&self.config)
+        };
+        #[cfg(not(test))]
+        let persistence = config::save_config(&self.config);
+        if let Err(error) = persistence {
             self.config = previous_config;
             let message = format!(
                 "Could not confirm model removal settings persistence: {error}. The artifact tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
@@ -8970,7 +8978,7 @@ impl LocalTranscriberApp {
         let install_status = self.effective_install_status(model);
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
-        let installed = model_artifact_remains_manageable(model, &install_status);
+        let manageable = model_artifact_remains_manageable(model, &install_status);
         let imported_gguf = self
             .config
             .general
@@ -8981,6 +8989,8 @@ impl LocalTranscriberApp {
         // without a managed-install receipt. This exact, canonical path is
         // still Scribe-owned; an arbitrary configured path is not.
         let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
+        let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
+        let installed = manageable && !legacy_cleanup_pending;
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
             && !self
@@ -8991,6 +9001,9 @@ impl LocalTranscriberApp {
             && !imported_gguf
             && !app_owned_legacy_artifact;
         let download_state = match &install_status {
+            ModelInstallStatus::Installed if legacy_cleanup_pending => {
+                ModelDownloadState::NotInstalled
+            }
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
             ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
@@ -9017,10 +9030,10 @@ impl LocalTranscriberApp {
         };
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let mutation_blocked = mutation_block_reason.is_some();
-        let selected = installed && self.config.general.selected_default_model == model.id;
-        let active = selected && runtime_ready;
+        let selected = manageable && self.config.general.selected_default_model == model.id;
+        let active = installed && selected && runtime_ready;
         let migration_pending =
-            installed && config::model_needs_pinned_gguf_migration(&self.config, model);
+            manageable && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
             primary_action_label,
             primary_action_enabled,
@@ -9105,20 +9118,34 @@ impl LocalTranscriberApp {
             id: model.id.clone(),
             display_name,
             variant_label,
-            description: Some(descriptor.map_or_else(
-                || model.description.clone(),
-                |value| value.description.to_owned(),
-            )),
+            description: Some(if legacy_cleanup_pending {
+                "Legacy GGML file retained for cleanup. Upgrade to the verified GGUF model, or open Details to remove the legacy file."
+                    .to_owned()
+            } else {
+                descriptor.map_or_else(
+                    || model.description.clone(),
+                    |value| value.description.to_owned(),
+                )
+            }),
             runtime_group: "Local speech runtime".to_owned(),
             architecture: None,
             artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
             artifact_revision: manifest.map(|manifest| manifest.artifact_revision.to_owned()),
-            artifact_filename: manifest.map(|manifest| manifest.artifact_filename.to_owned()),
+            artifact_filename: if legacy_cleanup_pending {
+                model
+                    .local_path
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .map(|filename| filename.to_string_lossy().into_owned())
+            } else {
+                manifest.map(|manifest| manifest.artifact_filename.to_owned())
+            },
             artifact_path: model
                 .local_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
             installed,
+            legacy_cleanup_pending,
             selected,
             active,
             ready: installed && runtime_ready,
@@ -9142,10 +9169,15 @@ impl LocalTranscriberApp {
                 && (imported_gguf
                     || app_owned_legacy_artifact
                     || supports_managed_uninstall(model, &install_status)),
+            runtime_status_label: if legacy_cleanup_pending {
+                "Legacy model — upgrade available".to_owned()
+            } else {
+                String::new()
+            },
             download_state,
             downloaded_bytes,
             total_bytes,
-            disk_bytes: installed
+            disk_bytes: manageable
                 .then(|| {
                     model
                         .local_path
@@ -9247,10 +9279,12 @@ impl LocalTranscriberApp {
             }
             ScreenAction::RequestModelRemoval(id) => {
                 let active = self.config.general.selected_default_model == id;
-                let replacement = active
+                let replacement_required =
+                    active && !app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
+                let replacement = replacement_required
                     .then(|| self.active_model_removal_replacement(&id))
                     .flatten();
-                if active && replacement.is_none() {
+                if replacement_required && replacement.is_none() {
                     self.status_message =
                         "Install another ready model before removing the active model.".to_owned();
                 } else {
@@ -9398,8 +9432,10 @@ impl LocalTranscriberApp {
                 self.model_management.dialog = None;
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
+                let legacy_cleanup_pending =
+                    app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
                 let mut replacement_name = None;
-                if active {
+                if active && !legacy_cleanup_pending {
                     let expected = self.model_management.removal_replacement.take();
                     let replacement = expected.as_deref().and_then(|expected_id| {
                         self.active_model_removal_replacement(&id)
@@ -12253,6 +12289,28 @@ fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -
         return false;
     };
     path == legacy_path && is_app_managed_model_path(config, path)
+}
+
+fn app_owned_legacy_cleanup_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
+    app_owned_legacy_catalog_artifact(config, model)
+        && model
+            .local_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| {
+                matches!(
+                    filename,
+                    "ggml-base.en.bin" | "ggml-small.en.bin" | "ggml-medium.en.bin"
+                )
+            })
+}
+
+fn app_owned_legacy_cleanup_artifact_for_id(config: &AppConfig, model_id: &str) -> bool {
+    config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .is_some_and(|model| app_owned_legacy_cleanup_artifact(config, &model))
 }
 
 fn select_first_installed_model(config: &mut AppConfig) {
@@ -15645,6 +15703,10 @@ mod layout_tests {
         assert!(projected.primary_action_enabled);
         assert!(projected.primary_action_installs_upgrade);
         assert!(!projected.primary_action_repairs_runtime);
+        assert!(projected.installed);
+        assert!(!projected.legacy_cleanup_pending);
+        assert!(projected.custom);
+        assert!(!projected.removal_supported);
         assert!(legacy.is_file());
         assert_eq!(
             app.config.general.selected_default_model,
@@ -15679,12 +15741,149 @@ mod layout_tests {
         let projected = app.model_management_view_model(&model, None);
 
         assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
-        assert!(projected.installed);
+        assert!(app_owned_legacy_cleanup_artifact(&app.config, &model));
+        assert!(!projected.installed);
+        assert!(projected.legacy_cleanup_pending);
         assert!(projected.selected);
         assert!(!projected.ready);
         assert!(!projected.active);
+        assert_eq!(projected.download_state, ModelDownloadState::NotInstalled);
         assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.primary_action_installs_upgrade);
         assert!(projected.removal_supported);
+        assert_eq!(
+            projected.artifact_filename.as_deref(),
+            Some("ggml-base.en.bin")
+        );
+        assert!(
+            projected
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Legacy GGML"))
+        );
+        assert_eq!(
+            projected.runtime_status_label,
+            "Legacy model — upgrade available"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_legacy_base_small_and_medium_are_available_cleanup_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let legacy_ids = [
+            "whisper_cpp_base_en",
+            "whisper_cpp_small_en",
+            "whisper_cpp_medium_en",
+        ];
+        let mut legacy_paths = Vec::new();
+
+        for id in legacy_ids {
+            let model = config::configured_models(&app.config)
+                .into_iter()
+                .find(|model| model.id == id)
+                .expect("legacy catalog model");
+            let path = config::legacy_downloaded_model_path(&app.config, &model)
+                .expect("canonical legacy path");
+            fs::create_dir_all(path.parent().expect("legacy parent")).unwrap();
+            fs::write(&path, b"legacy GGML").unwrap();
+            legacy_paths.push(path);
+        }
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let rows = app
+            .model_management_catalog()
+            .into_iter()
+            .filter(|model| legacy_ids.contains(&model.id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().filter(|model| model.installed).count(), 0);
+        assert_eq!(rows.iter().filter(|model| !model.installed).count(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids
+        );
+        assert!(rows.iter().all(|model| {
+            model.legacy_cleanup_pending
+                && model.primary_action_installs_upgrade
+                && model.primary_action_label == "Upgrade model"
+                && model.removal_supported
+                && model
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("retained for cleanup"))
+        }));
+        assert!(legacy_paths.iter().all(|path| path.is_file()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_managed_gguf_supersedes_the_retained_legacy_cleanup_row() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-superseded-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("base legacy path");
+        let gguf =
+            config::downloaded_model_path(&app.config, &catalog_model).expect("base GGUF path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::create_dir_all(gguf.parent().expect("GGUF parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        fs::write(&gguf, b"verified GGUF").unwrap();
+        let manifest =
+            crate::model_catalog::runtime_model_manifest(&ModelId::new("whisper_cpp_base_en"))
+                .expect("base manifest");
+        let mut install =
+            config::ManagedModelInstall::app_managed(gguf.clone(), "verified-manifest-download");
+        install.sha256 = Some(manifest.artifact_sha256.to_owned());
+        app.config
+            .general
+            .managed_models
+            .insert("whisper_cpp_base_en".to_owned(), install);
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let configured = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("configured base model");
+        let projected = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("projected base model");
+        assert_eq!(configured.local_path.as_deref(), Some(gguf.as_path()));
+        assert!(projected.installed);
+        assert!(!projected.legacy_cleanup_pending);
+        assert!(!projected.primary_action_installs_upgrade);
+        assert_eq!(
+            projected.artifact_filename.as_deref(),
+            Some(manifest.artifact_filename)
+        );
+        assert!(legacy.is_file(), "superseding GGUF must not delete legacy");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -20199,6 +20398,56 @@ mod layout_tests {
             app.status_message,
             "Install another ready model before removing the active model."
         );
+    }
+
+    #[test]
+    fn selected_canonical_legacy_cleanup_can_be_removed_without_a_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-selected-legacy-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        let default_fixture = app
+            .config
+            .general
+            .model_paths
+            .remove("whisper_cpp_tiny_en")
+            .expect("default test fixture");
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("canonical legacy path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        config::normalize_config(&mut app.config);
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(
+            "whisper_cpp_base_en".to_owned(),
+        ));
+
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Remove("whisper_cpp_base_en".to_owned()))
+        );
+        assert!(app.model_management.removal_replacement.is_none());
+
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(
+            "whisper_cpp_base_en".to_owned(),
+        ));
+
+        assert!(app.config.general.selected_default_model.is_empty());
+        assert!(!legacy.exists());
+        assert!(app.model_management.restore_after_removal_focus);
+        assert!(app.status_message.contains("Uninstalled"));
+
+        let _ = fs::remove_file(default_fixture);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

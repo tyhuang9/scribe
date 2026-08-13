@@ -1686,6 +1686,7 @@ impl ModelCard<'_> {
             {
                 "Verifying"
             }
+            Self::Local(model) if model.primary_action_installs_upgrade => "Upgrade",
             Self::Local(model) if model.installed => "Remove",
             Self::Local(model) if model.download_state == ModelDownloadState::Failed => "Retry",
             Self::Local(model) if model.download_state == ModelDownloadState::Cancelled => "Resume",
@@ -2244,11 +2245,10 @@ fn render_model_card(
         // card's primary click starts it; Details remains available through
         // the separate chevron for inspection and removal.
         ModelCard::Local(model)
-            if model.installed
-                && !model.ready
+            if !model.ready
                 && model.primary_action_enabled
                 && (model.primary_action_installs_upgrade
-                    || model.primary_action_repairs_runtime) =>
+                    || (model.installed && model.primary_action_repairs_runtime)) =>
         {
             local_model_primary_action(model)
         }
@@ -2309,16 +2309,28 @@ fn render_model_card(
             )
         }
         ModelCard::Local(model) => {
-            let verb = match model.download_state {
-                ModelDownloadState::Failed => "Retry",
-                ModelDownloadState::Cancelled => "Resume",
-                _ => "Download",
+            let (action, verb, enabled) = if model.primary_action_installs_upgrade {
+                (
+                    ScreenAction::UpgradeModel(model.id.clone()),
+                    "Upgrade",
+                    model.primary_action_enabled,
+                )
+            } else {
+                (
+                    ScreenAction::InstallModel(model.id.clone()),
+                    match model.download_state {
+                        ModelDownloadState::Failed => "Retry",
+                        ModelDownloadState::Cancelled => "Resume",
+                        _ => "Download",
+                    },
+                    model.install_action_enabled,
+                )
             };
             (
-                ScreenAction::InstallModel(model.id.clone()),
+                action,
                 Icon::Download,
                 format!("{verb} {}", model.display_name),
-                model.install_action_enabled,
+                enabled,
                 model.primary_action_disabled_reason.as_deref().or_else(|| {
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
@@ -4314,7 +4326,7 @@ fn show_local_model_details_drawer(
                             Layout::left_to_right(Align::Center),
                             |ui| {
                             let remove_reason = (!model.removal_supported).then_some("This model is not an app-managed download and cannot be removed here.")
-                                .or_else(|| (model.selected && !can_replace_active).then_some("Install another ready model before removing the selected model."));
+                                .or_else(|| (model.selected && !model.legacy_cleanup_pending && !can_replace_active).then_some("Install another ready model before removing the selected model."));
                             let remove = compact_model_icon_action(ui, Icon::Trash, "Remove model from device", remove_reason.is_none(), remove_reason, None);
                             if remove_reason.is_none() {
                                 mark_accesskit_enabled(ui, &remove);
@@ -7299,6 +7311,54 @@ mod tests {
     }
 
     #[test]
+    fn selected_legacy_cleanup_details_allows_explicit_removal() {
+        let model = ModelViewModel {
+            id: "whisper_cpp_base_en".into(),
+            display_name: "Whisper Base — English".into(),
+            variant_label: "base.en".into(),
+            selected: true,
+            legacy_cleanup_pending: true,
+            primary_action_label: "Upgrade model".into(),
+            primary_action_enabled: true,
+            primary_action_installs_upgrade: true,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[model],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Details("whisper_cpp_base_en".into())),
+                            ..Default::default()
+                        },
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let (_, remove) = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.name() == Some("Remove model from device"))
+            .expect("legacy cleanup removal action");
+        assert!(!remove.is_disabled());
+    }
+
+    #[test]
     fn model_card_primary_words_follow_authoritative_state() {
         let downloading = ModelViewModel {
             download_state: ModelDownloadState::Downloading,
@@ -7327,13 +7387,42 @@ mod tests {
     fn legacy_model_upgrade_primary_dispatches_upgrade_action() {
         let model = ModelViewModel {
             id: "whisper_cpp_small_en".into(),
-            installed: true,
+            display_name: "Whisper Small — English".into(),
+            installed: false,
+            legacy_cleanup_pending: true,
+            download_state: ModelDownloadState::NotInstalled,
             primary_action_label: "Upgrade model".into(),
             primary_action_enabled: true,
             primary_action_installs_upgrade: true,
+            removal_supported: true,
             ..Default::default()
         };
+        let current = ModelViewModel {
+            id: "whisper_cpp_tiny_en".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        };
+        let catalog = vec![current, model.clone()];
+        let remote_catalog = RemoteCatalogView::default();
+        let (installed, available) = build_model_card_lists(
+            &catalog,
+            &catalog,
+            &remote_catalog,
+            ModelLanguageFilter::All,
+        );
 
+        assert_eq!(installed.len(), 1);
+        assert_eq!(available.len(), 1);
+        assert_eq!(
+            installed[0].key(),
+            ModelCardKey::Local("whisper_cpp_tiny_en".into())
+        );
+        assert_eq!(
+            available[0].key(),
+            ModelCardKey::Local("whisper_cpp_small_en".into())
+        );
+        assert_eq!(ModelCard::Local(&model).primary_verb(), "Upgrade");
         assert_eq!(
             local_model_primary_action(&model),
             ScreenAction::UpgradeModel("whisper_cpp_small_en".into())

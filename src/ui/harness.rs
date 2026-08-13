@@ -1897,27 +1897,45 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_legacy_installed_card_starts_its_real_upgrade() {
+    fn clicking_a_legacy_available_card_starts_its_real_upgrade() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
         let mut data = Fixture::ModelsInstalled.data();
         let mut page = Fixture::ModelsInstalled.page();
-        let legacy = data
+        let legacy_index = data
             .models
-            .iter_mut()
-            .find(|model| model.id == "tiny.en")
+            .iter()
+            .position(|model| model.id == "tiny.en")
             .expect("installed tiny model");
+        let mut legacy = data.models.remove(legacy_index);
+        legacy.installed = false;
+        legacy.legacy_cleanup_pending = true;
         legacy.ready = false;
         legacy.selected = true;
+        legacy.download_state = ModelDownloadState::NotInstalled;
         legacy.primary_action_label = "Upgrade model".into();
         legacy.primary_action_enabled = true;
         legacy.primary_action_installs_upgrade = true;
+        legacy.description = Some(
+            "Legacy GGML file retained for cleanup. Upgrade or open Details to remove it.".into(),
+        );
+        data.model_catalog.push(legacy);
 
         let (initial, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
         assert_eq!(action, ScreenAction::None);
+        assert!(
+            node_names(&initial)
+                .iter()
+                .any(|name| name == "3 model results: 1 installed, 2 available.")
+        );
+        assert!(
+            node_names(&initial)
+                .iter()
+                .any(|name| name == "Upgrade whisper.cpp tiny.en")
+        );
         let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
         let point = egui::pos2(card.x0 as f32 + 96.0, ((card.y0 + card.y1) / 2.0) as f32);
         let (_, press_action) = render_with_input(
