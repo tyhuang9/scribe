@@ -502,7 +502,9 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
             Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
-            Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
+            Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {
+                data.model_management.restore_add_focus = true;
+            }
             Some(ModelDialog::Remove(id))
                 if data.model_management.restore_remove_focus.as_deref() == Some(&id) =>
             {
@@ -1651,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn details_dialog_escape_leaves_no_button_focused() {
+    fn details_dialog_escape_restores_the_stable_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1674,14 +1676,12 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        // A stable toolbar fallback is used for explicit row-removal cancellation.
-        // Exact card restoration here can freeze Windows AccessKit during remount.
-        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
         assert_eq!(action, ScreenAction::None);
     }
 
     #[test]
-    fn remote_details_drawer_escape_leaves_no_button_focused() {
+    fn remote_details_drawer_escape_restores_the_stable_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1719,12 +1719,12 @@ mod tests {
         apply_action(&mut data, &mut page, action);
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
         assert_eq!(action, ScreenAction::None);
     }
 
     #[test]
-    fn details_drawer_close_leaves_no_button_focused() {
+    fn details_drawer_close_restores_the_stable_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -1755,7 +1755,7 @@ mod tests {
 
         let (output, action) =
             render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), None);
+        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
         assert_eq!(action, ScreenAction::None);
     }
 

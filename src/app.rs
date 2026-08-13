@@ -9310,7 +9310,12 @@ impl LocalTranscriberApp {
             }
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
-                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
+                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {
+                    // Exact focus restoration to a just-remounted model card can
+                    // freeze Windows AccessKit. Use the persistent Models toolbar
+                    // as the safe dismissal target instead.
+                    self.model_management.restore_add_focus = true;
+                }
                 Some(ModelDialog::Remove(id))
                     if self.model_management.restore_remove_focus.as_deref() == Some(&id) =>
                 {
