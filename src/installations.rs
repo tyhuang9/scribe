@@ -948,10 +948,72 @@ pub(crate) fn pinned_artifact_disk_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
-    let partial_bytes = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    let partial_bytes = if partial_file_exists(&partial)? {
+        fs::metadata(&partial)
+            .map_err(|error| {
+                failed(format!(
+                    "failed to inspect resumable partial {}: {error}",
+                    partial.display()
+                ))
+            })?
+            .len()
+    } else {
+        0
+    };
     let additional_bytes = additional_download_bytes(artifact.size_bytes, partial_bytes)?;
     disk_space::preflight_download_destination(&artifact.destination, additional_bytes)
         .map_err(InstallError::Failed)
+}
+
+/// Checks whether a validated artifact has retained resumable bytes.
+pub(crate) fn pinned_artifact_has_partial(artifact: &PinnedArtifact) -> Result<bool, InstallError> {
+    validate_artifact_spec(artifact)?;
+    partial_file_exists(&partial_path(&artifact.destination)?)
+}
+
+/// Removes only the resumable sidecar derived from a validated artifact.
+/// The activated destination is deliberately never removed.
+pub(crate) fn discard_pinned_artifact_partial(
+    artifact: &PinnedArtifact,
+) -> Result<bool, InstallError> {
+    validate_artifact_spec(artifact)?;
+    let partial = partial_path(&artifact.destination)?;
+    if !partial_file_exists(&partial)? {
+        return Ok(false);
+    }
+    fs::remove_file(&partial).map_err(|error| {
+        failed(format!(
+            "failed to discard resumable partial {}: {error}",
+            partial.display()
+        ))
+    })?;
+    sync_parent(&partial).map_err(|error| {
+        InstallError::RecoveryRequired(format!(
+            "discarded resumable partial {}, but could not confirm the directory update was durable: {error}",
+            partial.display()
+        ))
+    })?;
+    Ok(true)
+}
+
+fn partial_file_exists(partial: &Path) -> Result<bool, InstallError> {
+    match fs::symlink_metadata(partial) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !runtime_metadata_is_link_or_reparse(&metadata) =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err(failed(format!(
+            "resumable partial {} is not a regular file",
+            partial.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failed(format!(
+            "failed to inspect resumable partial {}: {error}",
+            partial.display()
+        ))),
+    }
 }
 
 fn additional_download_bytes(
@@ -995,6 +1057,8 @@ fn download_pinned_artifact_with(
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     validate_artifact_spec(artifact)?;
+    let partial = partial_path(&artifact.destination)?;
+    let partial_exists = partial_file_exists(&partial)?;
     if artifact.destination.exists()
         && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
     {
@@ -1014,8 +1078,18 @@ fn download_pinned_artifact_with(
         fs::create_dir_all(parent)
             .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
     }
-    let partial = partial_path(&artifact.destination)?;
-    let mut offset = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    let mut offset = if partial_exists {
+        fs::metadata(&partial)
+            .map_err(|error| {
+                failed(format!(
+                    "failed to inspect resumable partial {}: {error}",
+                    partial.display()
+                ))
+            })?
+            .len()
+    } else {
+        0
+    };
     if offset > artifact.size_bytes {
         let quarantined = quarantine_partial(&partial, "oversized")?;
         return Err(failed(format!(
@@ -3087,6 +3161,139 @@ mod tests {
         assert!(error.is_cancelled());
         let partial = partial_path(&spec.destination).unwrap();
         assert_eq!(fs::read(partial).unwrap(), &bytes[..4]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_cleanup_is_idempotent_and_preserves_the_destination() {
+        let root = unique_root("discard-partial");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let partial = partial_path(&spec.destination).unwrap();
+        fs::write(&spec.destination, b"complete artifact").unwrap();
+        fs::write(&partial, b"resumable bytes").unwrap();
+
+        assert!(pinned_artifact_has_partial(&spec).unwrap());
+        assert!(discard_pinned_artifact_partial(&spec).unwrap());
+        assert!(!pinned_artifact_has_partial(&spec).unwrap());
+        assert!(!discard_pinned_artifact_partial(&spec).unwrap());
+        assert_eq!(fs::read(&spec.destination).unwrap(), b"complete artifact");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discarded_partial_restarts_from_zero_bytes() {
+        let root = unique_root("discard-partial-restart");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        fs::write(partial_path(&spec.destination).unwrap(), &bytes[..8]).unwrap();
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: bytes.to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        assert!(discard_pinned_artifact_partial(&spec).unwrap());
+        let candidate =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {})
+                .unwrap();
+
+        assert_eq!(source.requested_ranges.lock().unwrap().as_slice(), &[None]);
+        assert_eq!(fs::read(candidate.path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_cleanup_rejects_a_directory_without_mutation() {
+        let root = unique_root("discard-partial-directory");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let partial = partial_path(&spec.destination).unwrap();
+        fs::write(&spec.destination, b"activated artifact").unwrap();
+        fs::create_dir(&partial).unwrap();
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: b"complete artifact".to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        let download_error =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {})
+                .unwrap_err();
+        let preflight_error = pinned_artifact_disk_space_preflight(&spec).unwrap_err();
+
+        let error = discard_pinned_artifact_partial(&spec).unwrap_err();
+
+        assert!(download_error.to_string().contains("not a regular file"));
+        assert!(preflight_error.to_string().contains("not a regular file"));
+        assert!(source.requested_ranges.lock().unwrap().is_empty());
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(partial.is_dir());
+        assert_eq!(fs::read(&spec.destination).unwrap(), b"activated artifact");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_cleanup_rejects_a_symbolic_link_without_mutation() {
+        let root = unique_root("discard-partial-link");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let partial = partial_path(&spec.destination).unwrap();
+        let target = root.join("link-target");
+        fs::write(&spec.destination, b"complete artifact").unwrap();
+        fs::write(&target, b"retained target").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &partial).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, &partial).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: b"complete artifact".to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        let download_error =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {})
+                .unwrap_err();
+        let preflight_error = pinned_artifact_disk_space_preflight(&spec).unwrap_err();
+
+        let error = discard_pinned_artifact_partial(&spec).unwrap_err();
+
+        assert!(download_error.to_string().contains("not a regular file"));
+        assert!(preflight_error.to_string().contains("not a regular file"));
+        assert!(source.requested_ranges.lock().unwrap().is_empty());
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(fs::symlink_metadata(&partial).is_ok());
+        assert_eq!(fs::read(target).unwrap(), b"retained target");
+        assert_eq!(fs::read(&spec.destination).unwrap(), b"complete artifact");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_cleanup_validates_the_typed_artifact_before_inspection() {
+        let root = unique_root("discard-partial-invalid-spec");
+        fs::create_dir_all(&root).unwrap();
+        let mut spec = artifact(&root, b"complete artifact");
+        let partial = partial_path(&spec.destination).unwrap();
+        fs::write(&partial, b"retained bytes").unwrap();
+        spec.sha256 = "invalid".to_owned();
+
+        assert!(discard_pinned_artifact_partial(&spec).is_err());
+        assert_eq!(fs::read(partial).unwrap(), b"retained bytes");
         fs::remove_dir_all(root).unwrap();
     }
 
