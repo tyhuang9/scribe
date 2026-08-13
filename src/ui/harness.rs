@@ -2638,11 +2638,8 @@ mod tests {
                     .any(|(_, node)| node.name() == Some(name))
             );
         }
-        assert!(
-            !collapsed_names
-                .iter()
-                .any(|name| matches!(name.as_str(), "SPEED" | "ACCURACY" | "Very fast" | "Basic"))
-        );
+        assert!(collapsed_names.iter().any(|name| name == "SPEED"));
+        assert!(collapsed_names.iter().any(|name| name == "ACCURACY"));
         assert!(
             collapsed_names
                 .iter()
@@ -2679,21 +2676,20 @@ mod tests {
             "expanded cards expose the full description exactly once"
         );
         for detail in [
-            "GPU ACCELERATION",
-            "RAM USAGE",
-            "FILE SIZE",
-            "75MB",
+            "REQUIREMENTS",
+            "RAM: 75MB",
+            "Storage: 75MB",
+            "GPU: Not available",
             "LANGUAGES",
             "English",
-            "Runtime: Ready",
-            "Architecture: Not available",
+            "FEATURES",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
         assert_eq!(
             node_names(&expanded)
                 .iter()
-                .filter(|name| name.as_str() == "Uninstall whisper.cpp tiny.en")
+                .filter(|name| name.as_str() == "Delete whisper.cpp tiny.en")
                 .count(),
             1,
             "the summary row owns the single uninstall action"
@@ -2737,7 +2733,7 @@ mod tests {
                 ScreenAction::CancelModelInstall("lifecycle".into()),
             ),
             (
-                "Uninstall",
+                "Delete",
                 ModelDownloadState::Installed,
                 true,
                 false,
@@ -2951,7 +2947,7 @@ mod tests {
         assert_eq!(action, ScreenAction::AcknowledgeModelRemovalFocus);
         assert_eq!(
             focused_node(&output).name(),
-            Some("Uninstall whisper.cpp tiny.en")
+            Some("Delete whisper.cpp tiny.en")
         );
         apply_action(&mut data, &mut page, action);
         assert!(data.model_management.restore_remove_focus.is_none());
@@ -3002,12 +2998,52 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|(_, node)| {
-                    node.name() == Some(format!("Uninstall {}", active.display_name).as_str())
+                    node.name() == Some(format!("Delete {}", active.display_name).as_str())
                         && node.description()
                             == Some(
                                 "Install another ready model before removing the selected model.",
                             )
                 })
+        );
+    }
+
+    #[test]
+    fn expanded_maintenance_control_participates_in_model_card_focus_within() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.runtime_action_label = Some("Repair".into());
+        model.runtime_action_enabled = true;
+        data.models = vec![model.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id.clone()));
+        let mut page = AppPage::Models;
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let name = format!("Repair runtime for {}", model.display_name);
+        let target = named_node_id(&initial, &name);
+        let (focused, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&focused).name(), Some(name.as_str()));
+        let card = named_node_bounds(&focused, &format!("{} model", model.display_name));
+        assert_bounds_within(
+            named_node_bounds(&focused, &name),
+            card,
+            "expanded maintenance focus target",
         );
     }
 
@@ -3041,7 +3077,7 @@ mod tests {
         let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
         for name in [
             "Collapse details for whisper.cpp tiny.en",
-            "Uninstall whisper.cpp tiny.en",
+            "Delete whisper.cpp tiny.en",
         ] {
             let bounds = named_node_bounds(&compact, name);
             assert_bounds_within(bounds, card, "compact model control");
@@ -3078,7 +3114,7 @@ mod tests {
             "long-name compact model title",
         );
         for name in [
-            format!("Uninstall {long_name}"),
+            format!("Delete {long_name}"),
             format!("Expand details for {long_name}"),
         ] {
             let bounds = named_node_bounds(&output, &name);
@@ -3129,9 +3165,8 @@ mod tests {
             let output = render(Fixture::ModelsInstalled, width, height);
             let title =
                 named_node_bounds(&output, "Use whisper.cpp tiny.en for future transcriptions");
-            let lifecycle = named_node_bounds(&output, "Uninstall whisper.cpp tiny.en");
+            let lifecycle = named_node_bounds(&output, "Delete whisper.cpp tiny.en");
             let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
-            assert!(title.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             if width > 430.0 {
                 let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
                 let description =
@@ -3150,10 +3185,12 @@ mod tests {
                     title.x0 + 26.0,
                     "language should align with identity title text",
                 );
-                assert!(speed.x1 <= lifecycle.x0 + LAYOUT_TOLERANCE);
+                assert!(speed.x0 >= title.x1 - LAYOUT_TOLERANCE);
+                assert!(speed.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
                 assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             } else {
                 assert!(title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
+                assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             }
         }
     }
@@ -3176,13 +3213,13 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let names = node_names(&output);
         for detail in [
-            "GPU ACCELERATION",
-            "RAM USAGE",
-            "FILE SIZE",
-            "82 MB",
+            "REQUIREMENTS",
+            "RAM: Not available",
+            "Storage: 82 MB",
+            "GPU: Not available",
             "LANGUAGES",
             "English",
-            "Repository: trusted-speech/compact-english",
+            "FEATURES",
         ] {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
@@ -3343,7 +3380,7 @@ mod tests {
         assert!(
             node_names(&output)
                 .iter()
-                .any(|name| name == "Uninstall Legacy model")
+                .any(|name| name == "Delete Legacy model")
         );
         assert!(
             !node_names(&output)
