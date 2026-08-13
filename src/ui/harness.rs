@@ -3079,6 +3079,16 @@ mod tests {
                 assert!(title.x1 <= speed.x0 + LAYOUT_TOLERANCE);
                 assert!(description.x1 <= speed.x0 + LAYOUT_TOLERANCE);
                 assert!(language.x1 <= speed.x0 + LAYOUT_TOLERANCE);
+                assert_near(
+                    description.x0,
+                    title.x0 + 26.0,
+                    "description should align with identity title text",
+                );
+                assert_near(
+                    language.x0,
+                    title.x0 + 26.0,
+                    "language should align with identity title text",
+                );
                 assert!(speed.x1 <= lifecycle.x0 + LAYOUT_TOLERANCE);
                 assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             } else {

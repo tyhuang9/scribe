@@ -1603,14 +1603,29 @@ fn description_overflows(ui: &egui::Ui, description: &str, width: f32) -> bool {
         > width
 }
 
-fn render_model_description_preview(ui: &mut egui::Ui, description: &str, width: f32) {
+fn render_model_description_preview(
+    ui: &mut egui::Ui,
+    description: &str,
+    width: f32,
+    left_inset: f32,
+) {
     let colors = ui_palette(ui);
-    let overflow = description_overflows(ui, description, width);
-    let preview = ui.add_sized(
-        Vec2::new(width, 18.0),
-        egui::Label::new(RichText::new(description).small().color(colors.muted_text))
-            .truncate(true),
-    );
+    let content_width = (width - left_inset).max(0.0);
+    let overflow = description_overflows(ui, description, content_width);
+    let preview = ui
+        .allocate_ui_with_layout(
+            Vec2::new(width, 18.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.add_space(left_inset);
+                ui.add_sized(
+                    Vec2::new(content_width, 18.0),
+                    egui::Label::new(RichText::new(description).small().color(colors.muted_text))
+                        .truncate(true),
+                )
+            },
+        )
+        .inner;
     paint_description_fade(ui, preview.rect, overflow);
 }
 
@@ -2048,6 +2063,10 @@ fn render_model_metadata(
     let colors = ui_palette(ui);
     ui.horizontal_wrapped(|ui| {
         let (language_name, language_summary) = model_language_summary(languages);
+        if !include_ratings {
+            // Match the title text inset (20 px icon slot + 6 px gap).
+            ui.add_space(6.0);
+        }
         // Keep the decorative globe and its language value in one layout unit so
         // a wrapped row cannot leave the icon orphaned on the following line.
         ui.horizontal(|ui| {
@@ -2272,7 +2291,7 @@ fn render_unified_model_card(
                 });
                 if !expanded {
                     let description_width = ui.available_width();
-                    render_model_description_preview(ui, &description, description_width);
+                    render_model_description_preview(ui, &description, description_width, 0.0);
                 }
                 ui.add_space(4.0);
                 render_model_metadata(ui, card, languages, true);
@@ -2311,7 +2330,12 @@ fn render_unified_model_card(
                                 });
                             }
                             if !expanded {
-                                render_model_description_preview(ui, &description, identity_width);
+                                render_model_description_preview(
+                                    ui,
+                                    &description,
+                                    identity_width,
+                                    26.0,
+                                );
                             }
                             ui.add_space(4.0);
                             render_model_metadata(ui, card, languages, false);
