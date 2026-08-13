@@ -901,6 +901,12 @@ fn stale_wal_and_shm_acl_is_repaired_before_history_reopen() {
         .execute_batch("BEGIN; UPDATE history SET updated_at_ms = updated_at_ms + 1; COMMIT;")
         .unwrap();
     let keeper = Connection::open(&database_path).unwrap();
+    let mut keeper_statement = keeper.prepare("SELECT id FROM history LIMIT 1").unwrap();
+    let mut keeper_rows = keeper_statement.query([]).unwrap();
+    assert!(
+        keeper_rows.next().unwrap().is_some(),
+        "keeper read snapshot did not observe the history record"
+    );
     assert!(wal_path.is_file(), "SQLite did not create the WAL sidecar");
     assert!(shm_path.is_file(), "SQLite did not create the SHM sidecar");
     drop(writer);
@@ -938,6 +944,8 @@ fn stale_wal_and_shm_acl_is_repaired_before_history_reopen() {
     }
 
     drop(reopened);
+    drop(keeper_rows);
+    drop(keeper_statement);
     drop(keeper);
 }
 

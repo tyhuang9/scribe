@@ -383,12 +383,12 @@ fn secure_windows_path(path: &Path) -> HistoryResult<()> {
 pub(super) fn current_process_user_sid() -> HistoryResult<String> {
     use std::ffi::c_void;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    let mut token = 0;
+    let mut token: HANDLE = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
             unsafe { GetLastError() } as i32,
@@ -424,18 +424,19 @@ pub(super) fn current_process_user_sid() -> HistoryResult<String> {
             )));
         }
         let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-        let mut sid = ptr::null_mut();
-        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) } == 0 {
+        let mut sid_ptr = ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_ptr) } == 0 {
             return Err(HistoryError::Io(std::io::Error::from_raw_os_error(
                 unsafe { GetLastError() } as i32,
             )));
         }
-        let sid_length = unsafe { (0..).find(|&index| *sid.add(index) == 0).unwrap() };
-        let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid, sid_length) });
+        let sid_length = unsafe { (0..).find(|&index| *sid_ptr.add(index) == 0).unwrap() };
+        let sid_string =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_ptr, sid_length) });
         unsafe {
-            LocalFree(sid.cast());
+            LocalFree(sid_ptr.cast());
         }
-        Ok(sid)
+        Ok(sid_string)
     })();
     let close_error = (unsafe { CloseHandle(token) } == 0).then(|| unsafe { GetLastError() });
     match result {
