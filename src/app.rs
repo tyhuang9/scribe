@@ -52,6 +52,7 @@ use crate::installations::{
 };
 use crate::installed_manifest;
 use crate::managed_downloads;
+use crate::model_catalog::ArtifactFormat;
 use crate::models::{
     ModelInstallStatus, ModelRuntimeStatus, SttModelInfo, TranscriptionStatus, format_bytes,
 };
@@ -966,6 +967,34 @@ struct RemoteCatalogProjection {
     entries: Vec<RemoteCatalogEntryView>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PartialInspection {
+    Unknown,
+    Missing,
+    Present,
+    Error(String),
+}
+
+impl PartialInspection {
+    fn from_result(result: Result<bool, InstallError>) -> Self {
+        match result {
+            Ok(true) => Self::Present,
+            Ok(false) => Self::Missing,
+            Err(error) => Self::Error(format!(
+                "Scribe can't safely manage this partial file. Remove it from model storage, then retry. {error}"
+            )),
+        }
+    }
+}
+
+type RemotePartialKey = (String, String);
+
+#[derive(Clone)]
+enum RemotePartialProbeSource {
+    Normalized(ModelId),
+    Trusted(TrustedArtifact),
+}
+
 struct RemoteCatalogState {
     snapshot: Option<ModelInventorySnapshot>,
     local_models: Arc<[ModelViewModel]>,
@@ -977,10 +1006,20 @@ struct RemoteCatalogState {
     error: Option<String>,
     projection_revision: u64,
     projection: Option<RemoteCatalogProjection>,
+    partial_inspections: HashMap<RemotePartialKey, PartialInspection>,
+    pending_partial_inspections: HashSet<RemotePartialKey>,
+    partial_inspection_generation: u64,
     #[cfg(test)]
     projection_build_count: usize,
     #[cfg(test)]
     disk_probe_count: usize,
+    #[cfg(test)]
+    /// Regression counter for disk probes performed synchronously while
+    /// building a remote projection. Production projection code never
+    /// increments it because all remote inspection is worker-owned.
+    sync_remote_projection_probe_count: usize,
+    #[cfg(test)]
+    partial_probe_request_count: usize,
     #[cfg(test)]
     local_models_build_count: usize,
     #[cfg(test)]
@@ -1000,10 +1039,17 @@ impl Default for RemoteCatalogState {
             error: None,
             projection_revision: 0,
             projection: None,
+            partial_inspections: HashMap::new(),
+            pending_partial_inspections: HashSet::new(),
+            partial_inspection_generation: 0,
             #[cfg(test)]
             projection_build_count: 0,
             #[cfg(test)]
             disk_probe_count: 0,
+            #[cfg(test)]
+            sync_remote_projection_probe_count: 0,
+            #[cfg(test)]
+            partial_probe_request_count: 0,
             #[cfg(test)]
             local_models_build_count: 0,
             #[cfg(test)]
@@ -1154,6 +1200,11 @@ enum AppEvent {
     RemoteCatalogLoaded {
         generation: u64,
         result: Result<ModelInventorySnapshot, String>,
+    },
+    RemotePartialInspectionsFinished {
+        snapshot_revision: u64,
+        generation: u64,
+        results: Vec<(RemotePartialKey, PartialInspection)>,
     },
     ModelDownloadProgress {
         job_id: u64,
@@ -1371,6 +1422,8 @@ enum RemoteModelCardAction {
     InstallNormalized(ModelId),
     InstallTrusted(TrustedRemoteInstallRequest),
     CancelInstall(ModelId),
+    DiscardNormalizedPartial(ModelId),
+    DiscardTrustedPartial(TrustedArtifact),
     SelectInstalled(ModelId),
     RemoveInstalled(ModelId),
 }
@@ -1477,6 +1530,7 @@ fn run_verified_install(
                 InstallationCandidate::pinned(
                     model_id.clone(),
                     model.path.clone(),
+                    ArtifactFormat::Gguf,
                     None,
                     manifest_source.expected_size_bytes,
                     manifest_source.expected_sha256.clone(),
@@ -1738,6 +1792,7 @@ fn validate_local_gguf_import(
             InstallationCandidate::pinned(
                 model_id.clone(),
                 fingerprint.canonical_path.clone(),
+                ArtifactFormat::Gguf,
                 None,
                 fingerprint.size_bytes,
                 fingerprint.sha256.clone(),
@@ -5664,11 +5719,36 @@ impl LocalTranscriberApp {
                         Ok(snapshot) => {
                             self.remote_catalog.snapshot = Some(snapshot);
                             self.remote_catalog.error = None;
-                            self.remote_catalog.invalidate_projection();
+                            self.refresh_remote_partial_inspection_cache();
                         }
                         Err(error) => {
                             self.remote_catalog.error = Some(error);
                         }
+                    }
+                }
+                AppEvent::RemotePartialInspectionsFinished {
+                    snapshot_revision,
+                    generation,
+                    results,
+                } => {
+                    if self
+                        .remote_catalog
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.revision() == snapshot_revision)
+                        && self.remote_catalog.partial_inspection_generation == generation
+                    {
+                        #[cfg(test)]
+                        {
+                            self.remote_catalog.disk_probe_count += results.len();
+                        }
+                        for (key, inspection) in results {
+                            self.remote_catalog.pending_partial_inspections.remove(&key);
+                            self.remote_catalog
+                                .partial_inspections
+                                .insert(key, inspection);
+                        }
+                        self.remote_catalog.invalidate_projection();
                     }
                 }
                 AppEvent::LocalGgufImportFinished { job_id, result } => {
@@ -7611,7 +7691,15 @@ impl LocalTranscriberApp {
             self.status_message = message;
             return false;
         }
-        if let Err(error) = config::save_config(&self.config) {
+        #[cfg(test)]
+        let persistence = if self.config_path.is_none() {
+            Ok(())
+        } else {
+            config::save_config(&self.config)
+        };
+        #[cfg(not(test))]
+        let persistence = config::save_config(&self.config);
+        if let Err(error) = persistence {
             self.config = previous_config;
             let message = format!(
                 "Could not confirm model removal settings persistence: {error}. The artifact tombstone and removal journal were retained; restart Scribe to reconcile the durable settings witness."
@@ -8248,7 +8336,11 @@ impl LocalTranscriberApp {
             .transcription_service
             .model_descriptor(&ModelId::new(&model.id))
             .ok();
-        vec![self.model_management_view_model(&model, descriptor.as_ref())]
+        vec![self.model_management_view_model(
+            &model,
+            descriptor.as_ref(),
+            &PartialInspection::Missing,
+        )]
     }
 
     fn apply_transcribe_screen_action(&mut self, action: ScreenAction) {
@@ -8267,6 +8359,7 @@ impl LocalTranscriberApp {
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::DiscardModelPartial(_)
             | ScreenAction::ToggleModelCardDetails(_)
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
@@ -8298,6 +8391,7 @@ impl LocalTranscriberApp {
             | ScreenAction::CancelRemoteCatalogInstall(_)
             | ScreenAction::UseRemoteCatalogModel(_)
             | ScreenAction::RemoveRemoteCatalogModel(_)
+            | ScreenAction::DiscardRemoteCatalogPartial { .. }
             | ScreenAction::SetLocalGgufImportPath(_)
             | ScreenAction::ValidateAndImportLocalGguf
             | ScreenAction::CancelLocalGgufImport
@@ -8429,6 +8523,141 @@ impl LocalTranscriberApp {
         self.apply_model_management_action(action);
     }
 
+    fn inspect_remote_partial(
+        config: &AppConfig,
+        source: &RemotePartialProbeSource,
+    ) -> PartialInspection {
+        PartialInspection::from_result(match source {
+            RemotePartialProbeSource::Normalized(model_id) => {
+                managed_downloads::normalized_model_has_partial(config, model_id)
+            }
+            RemotePartialProbeSource::Trusted(artifact) => {
+                managed_downloads::trusted_gguf_has_partial(config, artifact)
+            }
+        })
+    }
+
+    fn remote_partial_probe(
+        model: &RemoteModel,
+        variant_id: &str,
+    ) -> Option<(RemotePartialKey, RemotePartialProbeSource)> {
+        let artifact = model.artifact_for(variant_id)?;
+        let source = crate::model_catalog::normalized_model_id_for_pinned_artifact(
+            &artifact.model_id,
+            &artifact.revision,
+            &artifact.filename,
+        )
+        .map_or_else(
+            || RemotePartialProbeSource::Trusted(artifact),
+            RemotePartialProbeSource::Normalized,
+        );
+        Some(((model.id.clone(), variant_id.to_owned()), source))
+    }
+
+    /// Refreshes only a bounded default catalog window. Other variants are
+    /// inspected asynchronously when they first enter a projection.
+    fn refresh_remote_partial_inspection_cache(&mut self) {
+        let keys = self
+            .remote_catalog
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .models()
+                    .iter()
+                    .flat_map(|model| {
+                        model
+                            .variants
+                            .iter()
+                            .map(|variant| (model.id.clone(), variant.id.clone()))
+                    })
+                    .take(REMOTE_CATALOG_VISIBLE_LIMIT)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.remote_catalog.partial_inspections.clear();
+        self.remote_catalog.pending_partial_inspections.clear();
+        self.remote_catalog.partial_inspection_generation = self
+            .remote_catalog
+            .partial_inspection_generation
+            .wrapping_add(1);
+        self.remote_catalog.invalidate_projection();
+        self.request_remote_partial_inspections(keys);
+    }
+
+    fn request_remote_partial_inspections(&mut self, keys: Vec<RemotePartialKey>) {
+        let Some(snapshot) = self.remote_catalog.snapshot.as_ref() else {
+            return;
+        };
+        let snapshot_revision = snapshot.revision();
+        let generation = self.remote_catalog.partial_inspection_generation;
+        let mut requests = Vec::new();
+        for key in keys {
+            if requests.len() == REMOTE_CATALOG_VISIBLE_LIMIT {
+                break;
+            }
+            if self.remote_catalog.partial_inspections.contains_key(&key)
+                || self
+                    .remote_catalog
+                    .pending_partial_inspections
+                    .contains(&key)
+            {
+                continue;
+            }
+            let Some(model) = snapshot.models().iter().find(|model| model.id == key.0) else {
+                continue;
+            };
+            let Some((_, source)) = Self::remote_partial_probe(model, &key.1) else {
+                continue;
+            };
+            self.remote_catalog
+                .pending_partial_inspections
+                .insert(key.clone());
+            requests.push((key, source));
+        }
+        if requests.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.remote_catalog.partial_probe_request_count += requests.len();
+        }
+        let failed_keys = requests
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("scribe-partial-inspection".to_owned())
+            .spawn(move || {
+                let results = requests
+                    .into_iter()
+                    .map(|(key, source)| {
+                        let inspection = Self::inspect_remote_partial(&config, &source);
+                        (key, inspection)
+                    })
+                    .collect();
+                let _ = tx.send(AppEvent::RemotePartialInspectionsFinished {
+                    snapshot_revision,
+                    generation,
+                    results,
+                });
+            })
+        {
+            let reason = PartialInspection::Error(format!(
+                "Could not inspect the retained partial download: {error}"
+            ));
+            for key in failed_keys {
+                self.remote_catalog.pending_partial_inspections.remove(&key);
+                self.remote_catalog
+                    .partial_inspections
+                    .insert(key, reason.clone());
+            }
+            self.remote_catalog.invalidate_projection();
+        }
+    }
+
     fn remote_catalog_view(&mut self) -> RemoteCatalogView {
         let search = self.model_search.trim().to_ascii_lowercase();
         let projection_key = RemoteCatalogProjectionKey {
@@ -8451,11 +8680,29 @@ impl LocalTranscriberApp {
             .is_none_or(|projection| projection.key != projection_key)
         {
             let projection = self.build_remote_catalog_projection(projection_key);
+            let unknown_keys = projection
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .variants
+                        .iter()
+                        .map(|variant| (entry.id.clone(), variant.id.clone()))
+                })
+                .filter(|key| {
+                    !self.remote_catalog.partial_inspections.contains_key(key)
+                        && !self
+                            .remote_catalog
+                            .pending_partial_inspections
+                            .contains(key)
+                })
+                .collect();
             self.remote_catalog.projection = Some(projection);
             #[cfg(test)]
             {
                 self.remote_catalog.projection_build_count += 1;
             }
+            self.request_remote_partial_inspections(unknown_keys);
         }
         let projection = self
             .remote_catalog
@@ -8586,6 +8833,37 @@ impl LocalTranscriberApp {
                         &artifact.filename,
                     )
                 });
+                let download_id = normalized_model_id
+                    .as_ref()
+                    .map(|model_id| model_id.as_str().to_owned())
+                    .or_else(|| remote_id.clone());
+                let exact_install_active = download_id
+                    .as_deref()
+                    .is_some_and(|id| self.artifact_installations.contains_key(id));
+                let partial_inspection = self
+                    .remote_catalog
+                    .partial_inspections
+                    .get(&(model.id.clone(), variant.id.clone()))
+                    .unwrap_or(&PartialInspection::Unknown);
+                let has_partial = !exact_install_active
+                    && matches!(partial_inspection, PartialInspection::Present);
+                let partial_inspection_block_reason = if exact_install_active || artifact.is_none() {
+                    None
+                } else {
+                    match partial_inspection {
+                        PartialInspection::Unknown => {
+                            Some("Checking retained download…".to_owned())
+                        }
+                        PartialInspection::Error(reason) => Some(reason.clone()),
+                        PartialInspection::Missing | PartialInspection::Present => None,
+                    }
+                };
+                let partial_inspection_error = match partial_inspection {
+                    PartialInspection::Error(reason) if !exact_install_active => {
+                        Some(reason.clone())
+                    }
+                    _ => None,
+                };
                 let installed_id = remote_id.as_ref().and_then(|id| {
                     self.config
                         .general
@@ -8604,7 +8882,9 @@ impl LocalTranscriberApp {
                                 && install.revision != artifact.revision
                         })
                 });
-                let install_disabled_reason = mutation_block_reason.clone();
+                let install_disabled_reason = partial_inspection_block_reason
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone());
                 let install_action = |label: &str| RemoteCatalogActionView {
                     label: label.to_owned(),
                     kind: RemoteCatalogActionKind::Install {
@@ -8622,8 +8902,8 @@ impl LocalTranscriberApp {
 
                 let status_label;
                 let mut actions = Vec::new();
-                if let Some(remote_id) = remote_id.as_deref()
-                    && let Some(status) = self.model_downloads.get(remote_id)
+                if let Some(download_id) = download_id.as_deref()
+                    && let Some(status) = self.model_downloads.get(download_id)
                 {
                     status_label = Some(status.label());
                     if matches!(
@@ -8634,7 +8914,7 @@ impl LocalTranscriberApp {
                         actions.push(RemoteCatalogActionView {
                             label: "Cancel".to_owned(),
                             kind: RemoteCatalogActionKind::Cancel {
-                                model_id: remote_id.to_owned(),
+                                model_id: download_id.to_owned(),
                             },
                             enabled: true,
                             disabled_reason: None,
@@ -8660,6 +8940,15 @@ impl LocalTranscriberApp {
                         enabled: mutation_block_reason.is_none(),
                         disabled_reason: mutation_block_reason.clone(),
                     });
+                } else if has_partial {
+                    status_label = Some("Partial download retained".to_owned());
+                    actions.push(install_action("Resume"));
+                } else if partial_inspection_error.is_some() {
+                    status_label = Some("Partial download needs attention".to_owned());
+                    actions.push(install_action("Retry download"));
+                } else if matches!(partial_inspection, PartialInspection::Unknown) {
+                    status_label = Some("Checking retained download…".to_owned());
+                    actions.push(install_action("Download"));
                 } else if previous_revision {
                     status_label = Some("Update available".to_owned());
                     actions.push(install_action("Install update"));
@@ -8669,6 +8958,19 @@ impl LocalTranscriberApp {
                 } else {
                     status_label = Some("Pinned GGUF".to_owned());
                     actions.push(install_action("Install"));
+                }
+                if has_partial || partial_inspection_error.is_some() {
+                    actions.push(RemoteCatalogActionView {
+                        label: "Discard partial".to_owned(),
+                        kind: RemoteCatalogActionKind::DiscardPartial {
+                            remote_model_id: model.id.clone(),
+                            variant_id: variant.id.clone(),
+                        },
+                        enabled: has_partial && mutation_block_reason.is_none(),
+                        disabled_reason: partial_inspection_error
+                            .clone()
+                            .or_else(|| mutation_block_reason.clone()),
+                    });
                 }
 
                 RemoteCatalogVariantView {
@@ -8875,6 +9177,7 @@ impl LocalTranscriberApp {
         if !self.remote_catalog.local_models_dirty {
             return;
         }
+        self.refresh_remote_partial_inspection_cache();
         self.remote_catalog.local_models = self.build_model_management_catalog().into();
         self.remote_catalog.local_models_dirty = false;
         #[cfg(test)]
@@ -8928,43 +9231,59 @@ impl LocalTranscriberApp {
         self.remote_catalog.local_models.to_vec()
     }
 
-    fn build_model_management_catalog(&self) -> Vec<ModelViewModel> {
+    fn build_model_management_catalog(&mut self) -> Vec<ModelViewModel> {
         let descriptors = self
             .transcription_service
             .model_descriptors()
             .into_iter()
             .map(|descriptor| (descriptor.id.as_str().to_owned(), descriptor))
             .collect::<HashMap<_, _>>();
-        config::configured_models(&self.config)
-            .into_iter()
-            .filter_map(|model| {
-                let effective_status = self.effective_install_status(&model);
-                let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
-                let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
-                    // Retained compatibility models stay out of discovery, but an existing
-                    // installed model must remain visible so it can be selected or removed.
-                    artifact_present.then(|| {
-                        self.transcription_service
-                            .model_descriptor(&ModelId::new(&model.id))
-                            .ok()
-                    })?
-                });
-                (descriptor.is_some() || artifact_present)
-                    .then(|| self.model_management_view_model(&model, descriptor.as_ref()))
-            })
-            .collect()
+        let mut models = Vec::new();
+        for model in config::configured_models(&self.config) {
+            let effective_status = self.effective_install_status(&model);
+            let artifact_present = model_artifact_remains_manageable(&model, &effective_status);
+            let descriptor = descriptors.get(&model.id).cloned().or_else(|| {
+                // Retained compatibility models stay out of discovery, but an existing
+                // installed model must remain visible so it can be selected or removed.
+                artifact_present.then(|| {
+                    self.transcription_service
+                        .model_descriptor(&ModelId::new(&model.id))
+                        .ok()
+                })?
+            });
+            if descriptor.is_some() || artifact_present {
+                let partial_inspection = PartialInspection::from_result(
+                    managed_downloads::normalized_model_has_partial(
+                        &self.config,
+                        &ModelId::new(&model.id),
+                    ),
+                );
+                models.push(self.model_management_view_model(
+                    &model,
+                    descriptor.as_ref(),
+                    &partial_inspection,
+                ));
+            }
+        }
+        models
     }
 
     fn model_management_view_model(
         &self,
         model: &SttModelInfo,
         descriptor: Option<&ModelDescriptor>,
+        partial_inspection: &PartialInspection,
     ) -> ModelViewModel {
         let (display_name, variant_label) = model_ui_labels(model, descriptor);
         let install_status = self.effective_install_status(model);
+        let has_partial = matches!(partial_inspection, PartialInspection::Present);
+        let partial_inspection_error = match partial_inspection {
+            PartialInspection::Error(reason) => Some(reason.clone()),
+            _ => None,
+        };
         let runtime_ready =
             runtime_status_for_model(&self.config, model) == ModelRuntimeStatus::Ready;
-        let installed = model_artifact_remains_manageable(model, &install_status);
+        let manageable = model_artifact_remains_manageable(model, &install_status);
         let imported_gguf = self
             .config
             .general
@@ -8975,6 +9294,8 @@ impl LocalTranscriberApp {
         // without a managed-install receipt. This exact, canonical path is
         // still Scribe-owned; an arbitrary configured path is not.
         let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
+        let legacy_cleanup_pending = app_owned_legacy_cleanup_artifact(&self.config, model);
+        let installed = manageable && !legacy_cleanup_pending;
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
             && !self
@@ -8984,7 +9305,11 @@ impl LocalTranscriberApp {
                 .contains_key(&model.id)
             && !imported_gguf
             && !app_owned_legacy_artifact;
-        let download_state = match &install_status {
+        let exact_install_active = self.artifact_installations.contains_key(&model.id);
+        let mut download_state = match &install_status {
+            ModelInstallStatus::Installed if legacy_cleanup_pending => {
+                ModelDownloadState::NotInstalled
+            }
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
             ModelInstallStatus::InstallingRuntime => ModelDownloadState::Verifying,
@@ -8998,6 +9323,15 @@ impl LocalTranscriberApp {
             | ModelInstallStatus::Missing => ModelDownloadState::Failed,
             ModelInstallStatus::NotInstalled => ModelDownloadState::NotInstalled,
         };
+        if has_partial
+            && !self.model_downloads.contains_key(&model.id)
+            && matches!(
+                download_state,
+                ModelDownloadState::NotInstalled | ModelDownloadState::Failed
+            )
+        {
+            download_state = ModelDownloadState::Cancelled;
+        }
         let (downloaded_bytes, total_bytes) = match &install_status {
             ModelInstallStatus::Downloading {
                 downloaded_bytes,
@@ -9011,10 +9345,10 @@ impl LocalTranscriberApp {
         };
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let mutation_blocked = mutation_block_reason.is_some();
-        let selected = installed && self.config.general.selected_default_model == model.id;
-        let active = selected && runtime_ready;
+        let selected = manageable && self.config.general.selected_default_model == model.id;
+        let active = installed && selected && runtime_ready;
         let migration_pending =
-            installed && config::model_needs_pinned_gguf_migration(&self.config, model);
+            manageable && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
             primary_action_label,
             primary_action_enabled,
@@ -9028,12 +9362,18 @@ impl LocalTranscriberApp {
             );
             (
                 "Upgrade model".to_owned(),
-                !mutation_blocked && !installing && supports_managed_install(model),
+                partial_inspection_error.is_none()
+                    && !mutation_blocked
+                    && !installing
+                    && supports_managed_install(model),
                 true,
                 false,
-                mutation_block_reason.clone().or_else(|| {
-                    installing.then(|| "This model upgrade is already in progress.".to_owned())
-                }),
+                partial_inspection_error
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone())
+                    .or_else(|| {
+                        installing.then(|| "This model upgrade is already in progress.".to_owned())
+                    }),
             )
         } else if active {
             (
@@ -9091,28 +9431,47 @@ impl LocalTranscriberApp {
                 false,
                 false,
                 false,
-                Some("Install this model before using it.".to_owned()),
+                partial_inspection_error
+                    .clone()
+                    .or_else(|| mutation_block_reason.clone())
+                    .or_else(|| Some("Install this model before using it.".to_owned())),
             )
         };
         let manifest = crate::model_catalog::runtime_model_manifest(&ModelId::new(&model.id));
+        let partial_cleanup_available =
+            !exact_install_active && (has_partial || partial_inspection_error.is_some());
         ModelViewModel {
             id: model.id.clone(),
             display_name,
             variant_label,
-            description: Some(descriptor.map_or_else(
-                || model.description.clone(),
-                |value| value.description.to_owned(),
-            )),
+            description: Some(if legacy_cleanup_pending {
+                "Legacy GGML file retained for cleanup. Upgrade to the verified GGUF model, or open Details to remove the legacy file."
+                    .to_owned()
+            } else {
+                descriptor.map_or_else(
+                    || model.description.clone(),
+                    |value| value.description.to_owned(),
+                )
+            }),
             runtime_group: "Local speech runtime".to_owned(),
             architecture: None,
             artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
             artifact_revision: manifest.map(|manifest| manifest.artifact_revision.to_owned()),
-            artifact_filename: manifest.map(|manifest| manifest.artifact_filename.to_owned()),
+            artifact_filename: if legacy_cleanup_pending {
+                model
+                    .local_path
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .map(|filename| filename.to_string_lossy().into_owned())
+            } else {
+                manifest.map(|manifest| manifest.artifact_filename.to_owned())
+            },
             artifact_path: model
                 .local_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
             installed,
+            legacy_cleanup_pending,
             selected,
             active,
             ready: installed && runtime_ready,
@@ -9120,6 +9479,7 @@ impl LocalTranscriberApp {
             custom,
             install_supported: supports_managed_install(model),
             install_action_enabled: !mutation_blocked
+                && partial_inspection_error.is_none()
                 && !installed
                 && !matches!(
                     install_status,
@@ -9136,10 +9496,24 @@ impl LocalTranscriberApp {
                 && (imported_gguf
                     || app_owned_legacy_artifact
                     || supports_managed_uninstall(model, &install_status)),
+            partial_cleanup_available,
+            partial_cleanup_enabled: partial_cleanup_available
+                && has_partial
+                && !mutation_blocked,
+            partial_cleanup_disabled_reason: if partial_cleanup_available {
+                partial_inspection_error.or_else(|| mutation_block_reason.clone())
+            } else {
+                None
+            },
+            runtime_status_label: if legacy_cleanup_pending {
+                "Legacy model — upgrade available".to_owned()
+            } else {
+                String::new()
+            },
             download_state,
             downloaded_bytes,
             total_bytes,
-            disk_bytes: installed
+            disk_bytes: manageable
                 .then(|| {
                     model
                         .local_path
@@ -9229,18 +9603,35 @@ impl LocalTranscriberApp {
                 if self.model_management.expanded_model_card.as_ref() == Some(&key) {
                     self.model_management.expanded_model_card = None;
                 } else {
+                    if let ModelCardKey::Remote {
+                        entry_id,
+                        variant_id,
+                    } = &key
+                    {
+                        self.request_remote_partial_inspections(vec![(
+                            entry_id.clone(),
+                            variant_id.clone(),
+                        )]);
+                    }
                     self.model_management.expanded_model_card = Some(key);
                 }
             }
             ScreenAction::RequestModelRemoval(id) => {
                 let active = self.config.general.selected_default_model == id;
-                let replacement = active
+                let replacement_required =
+                    active && !app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
+                let replacement = replacement_required
                     .then(|| self.active_model_removal_replacement(&id))
                     .flatten();
-                if active && replacement.is_none() {
+                if replacement_required && replacement.is_none() {
                     self.status_message =
                         "Install another ready model before removing the active model.".to_owned();
                 } else {
+                    self.model_management.restore_remove_focus = matches!(
+                        &self.model_management.expanded_model_card,
+                        Some(ModelCardKey::Local(current)) if current == &id
+                    )
+                    .then(|| id.clone());
                     self.model_management.removal_replacement =
                         replacement.as_ref().map(|model| model.id.clone());
                     self.model_management.dialog = Some(ModelDialog::Remove(id));
@@ -9374,6 +9765,9 @@ impl LocalTranscriberApp {
                         format!("Cancelling {id}. Downloaded partials will be kept for Resume.");
                 }
             }
+            ScreenAction::DiscardModelPartial(id) => {
+                self.discard_normalized_model_partial(ModelId::new(id));
+            }
             ScreenAction::SelectModel(id) => {
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
@@ -9385,10 +9779,13 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
+                self.model_management.restore_remove_focus = None;
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
+                let legacy_cleanup_pending =
+                    app_owned_legacy_cleanup_artifact_for_id(&self.config, &id);
                 let mut replacement_name = None;
-                if active {
+                if active && !legacy_cleanup_pending {
                     let expected = self.model_management.removal_replacement.take();
                     let replacement = expected.as_deref().and_then(|expected_id| {
                         self.active_model_removal_replacement(&id)
@@ -9558,6 +9955,41 @@ impl LocalTranscriberApp {
                 .apply_remote_model_card_action(RemoteModelCardAction::RemoveInstalled(
                     ModelId::new(model_id),
                 )),
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id,
+                variant_id,
+            } => {
+                let action = self
+                    .remote_catalog
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .models()
+                            .iter()
+                            .find(|model| model.id == remote_model_id)
+                    })
+                    .and_then(|model| {
+                        let artifact = model.artifact_for(&variant_id)?;
+                        Some(
+                            crate::model_catalog::normalized_model_id_for_pinned_artifact(
+                                &artifact.model_id,
+                                &artifact.revision,
+                                &artifact.filename,
+                            )
+                            .map_or_else(
+                                || RemoteModelCardAction::DiscardTrustedPartial(artifact.clone()),
+                                RemoteModelCardAction::DiscardNormalizedPartial,
+                            ),
+                        )
+                    });
+                if let Some(action) = action {
+                    self.apply_remote_model_card_action(action);
+                } else {
+                    self.status = TranscriptionStatus::Error;
+                    self.status_message = "The selected catalog variant is no longer in the validated snapshot. Refresh the catalog and try again. No files were changed.".to_owned();
+                }
+            }
             ScreenAction::None => {}
             other => self.apply_transcribe_screen_action(other),
         }
@@ -9595,6 +10027,12 @@ impl LocalTranscriberApp {
                             .to_owned();
                 }
             }
+            RemoteModelCardAction::DiscardNormalizedPartial(model_id) => {
+                self.discard_normalized_model_partial(model_id);
+            }
+            RemoteModelCardAction::DiscardTrustedPartial(artifact) => {
+                self.discard_trusted_remote_model_partial(artifact);
+            }
             RemoteModelCardAction::SelectInstalled(model_id) => {
                 if let Some(model) = config::configured_models(&self.config)
                     .into_iter()
@@ -9612,6 +10050,61 @@ impl LocalTranscriberApp {
                 }
             }
         }
+    }
+
+    fn discard_normalized_model_partial(&mut self, model_id: ModelId) {
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = format!("Could not discard the retained partial: {reason}");
+            return;
+        }
+        let result = managed_downloads::discard_normalized_model_partial(&self.config, &model_id);
+        self.finish_partial_discard(model_id.as_str(), result);
+    }
+
+    fn discard_trusted_remote_model_partial(&mut self, artifact: TrustedArtifact) {
+        let Some(model_id) = config::managed_remote_model_id(
+            &artifact.model_id,
+            &artifact.revision,
+            &artifact.filename,
+        ) else {
+            self.status = TranscriptionStatus::Error;
+            self.status_message = "The selected catalog artifact failed Scribe's identity validation. Refresh the catalog and try again. No files were changed.".to_owned();
+            return;
+        };
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = format!("Could not discard the retained partial: {reason}");
+            return;
+        }
+        let result = managed_downloads::discard_trusted_gguf_partial(&self.config, &artifact);
+        self.finish_partial_discard(&model_id, result);
+    }
+
+    fn finish_partial_discard(&mut self, model_id: &str, result: Result<bool, InstallError>) {
+        match result {
+            Ok(true) => {
+                self.model_downloads.remove(model_id);
+                self.status = TranscriptionStatus::Idle;
+                self.status_message =
+                    "Discarded the retained partial download. The next download will start from zero."
+                        .to_owned();
+            }
+            Ok(false) => {
+                self.model_downloads.remove(model_id);
+                self.status = TranscriptionStatus::Idle;
+                self.status_message =
+                    "No retained partial download was found. No files were changed.".to_owned();
+            }
+            Err(error) => {
+                if error.requires_recovery() {
+                    self.artifact_recovery_error = Some(error.to_string());
+                }
+                self.status = TranscriptionStatus::Error;
+                self.status_message =
+                    format!("Could not finish discarding the retained partial: {error}");
+            }
+        }
+        self.remote_catalog.invalidate_local_models();
+        self.rebuild_model_inventory_projection();
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
@@ -10466,6 +10959,7 @@ impl LocalTranscriberApp {
             | ScreenAction::InstallModel(_)
             | ScreenAction::UpgradeModel(_)
             | ScreenAction::CancelModelInstall(_)
+            | ScreenAction::DiscardModelPartial(_)
             | ScreenAction::ToggleModelCardDetails(_)
             | ScreenAction::RequestModelRemoval(_)
             | ScreenAction::ConfirmModelRemoval(_)
@@ -10493,7 +10987,8 @@ impl LocalTranscriberApp {
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
             | ScreenAction::UseRemoteCatalogModel(_)
-            | ScreenAction::RemoveRemoteCatalogModel(_) => {}
+            | ScreenAction::RemoveRemoteCatalogModel(_)
+            | ScreenAction::DiscardRemoteCatalogPartial { .. } => {}
             ScreenAction::RepairModelRuntime(_)
             | ScreenAction::MaintainModelRuntime(_)
             | ScreenAction::SetLocalGgufImportPath(_)
@@ -12241,6 +12736,28 @@ fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -
         return false;
     };
     path == legacy_path && is_app_managed_model_path(config, path)
+}
+
+fn app_owned_legacy_cleanup_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
+    app_owned_legacy_catalog_artifact(config, model)
+        && model
+            .local_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| {
+                matches!(
+                    filename,
+                    "ggml-base.en.bin" | "ggml-small.en.bin" | "ggml-medium.en.bin"
+                )
+            })
+}
+
+fn app_owned_legacy_cleanup_artifact_for_id(config: &AppConfig, model_id: &str) -> bool {
+    config::configured_models(config)
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .is_some_and(|model| app_owned_legacy_cleanup_artifact(config, &model))
 }
 
 fn select_first_installed_model(config: &mut AppConfig) {
@@ -15626,17 +16143,37 @@ mod layout_tests {
         config::normalize_config(&mut app.config);
         let model = config::selected_model(&app.config).unwrap();
 
-        let projected = app.model_management_view_model(&model, None);
+        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
 
         assert_eq!(projected.id, "whisper_cpp_small_en");
         assert_eq!(projected.primary_action_label, "Upgrade model");
         assert!(projected.primary_action_enabled);
         assert!(projected.primary_action_installs_upgrade);
         assert!(!projected.primary_action_repairs_runtime);
+        assert!(projected.installed);
+        assert!(!projected.legacy_cleanup_pending);
+        assert!(projected.custom);
+        assert!(!projected.removal_supported);
         assert!(legacy.is_file());
         assert_eq!(
             app.config.general.selected_default_model,
             "whisper_cpp_small_en"
+        );
+        let blocked = app.model_management_view_model(
+            &model,
+            None,
+            &PartialInspection::Error(
+                "Scribe can't safely manage this partial file. Remove it from model storage, then retry."
+                    .to_owned(),
+            ),
+        );
+        assert!(blocked.primary_action_installs_upgrade);
+        assert!(!blocked.primary_action_enabled);
+        assert!(
+            blocked
+                .primary_action_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -15664,15 +16201,152 @@ mod layout_tests {
         config::normalize_config(&mut app.config);
         let model = config::selected_model(&app.config).expect("selected base model");
 
-        let projected = app.model_management_view_model(&model, None);
+        let projected = app.model_management_view_model(&model, None, &PartialInspection::Missing);
 
         assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
-        assert!(projected.installed);
+        assert!(app_owned_legacy_cleanup_artifact(&app.config, &model));
+        assert!(!projected.installed);
+        assert!(projected.legacy_cleanup_pending);
         assert!(projected.selected);
         assert!(!projected.ready);
         assert!(!projected.active);
+        assert_eq!(projected.download_state, ModelDownloadState::NotInstalled);
         assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.primary_action_installs_upgrade);
         assert!(projected.removal_supported);
+        assert_eq!(
+            projected.artifact_filename.as_deref(),
+            Some("ggml-base.en.bin")
+        );
+        assert!(
+            projected
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Legacy GGML"))
+        );
+        assert_eq!(
+            projected.runtime_status_label,
+            "Legacy model — upgrade available"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_legacy_base_small_and_medium_are_available_cleanup_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let legacy_ids = [
+            "whisper_cpp_base_en",
+            "whisper_cpp_small_en",
+            "whisper_cpp_medium_en",
+        ];
+        let mut legacy_paths = Vec::new();
+
+        for id in legacy_ids {
+            let model = config::configured_models(&app.config)
+                .into_iter()
+                .find(|model| model.id == id)
+                .expect("legacy catalog model");
+            let path = config::legacy_downloaded_model_path(&app.config, &model)
+                .expect("canonical legacy path");
+            fs::create_dir_all(path.parent().expect("legacy parent")).unwrap();
+            fs::write(&path, b"legacy GGML").unwrap();
+            legacy_paths.push(path);
+        }
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let rows = app
+            .model_management_catalog()
+            .into_iter()
+            .filter(|model| legacy_ids.contains(&model.id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().filter(|model| model.installed).count(), 0);
+        assert_eq!(rows.iter().filter(|model| !model.installed).count(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids
+        );
+        assert!(rows.iter().all(|model| {
+            model.legacy_cleanup_pending
+                && model.primary_action_installs_upgrade
+                && model.primary_action_label == "Upgrade model"
+                && model.removal_supported
+                && model
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("retained for cleanup"))
+        }));
+        assert!(legacy_paths.iter().all(|path| path.is_file()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_managed_gguf_supersedes_the_retained_legacy_cleanup_row() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-legacy-superseded-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("base legacy path");
+        let gguf =
+            config::downloaded_model_path(&app.config, &catalog_model).expect("base GGUF path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::create_dir_all(gguf.parent().expect("GGUF parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        fs::write(&gguf, b"verified GGUF").unwrap();
+        let manifest =
+            crate::model_catalog::runtime_model_manifest(&ModelId::new("whisper_cpp_base_en"))
+                .expect("base manifest");
+        let mut install =
+            config::ManagedModelInstall::app_managed(gguf.clone(), "verified-manifest-download");
+        install.sha256 = Some(manifest.artifact_sha256.to_owned());
+        app.config
+            .general
+            .managed_models
+            .insert("whisper_cpp_base_en".to_owned(), install);
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let configured = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("configured base model");
+        let projected = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("projected base model");
+        assert_eq!(configured.local_path.as_deref(), Some(gguf.as_path()));
+        assert!(projected.installed);
+        assert!(!projected.legacy_cleanup_pending);
+        assert!(!projected.primary_action_installs_upgrade);
+        assert_eq!(
+            projected.artifact_filename.as_deref(),
+            Some(manifest.artifact_filename)
+        );
+        assert!(legacy.is_file(), "superseding GGUF must not delete legacy");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -15697,7 +16371,8 @@ mod layout_tests {
             download_model: None,
         };
 
-        let projected = app.model_management_view_model(&model, Some(&descriptor));
+        let projected =
+            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
 
         assert!(projected.installed);
         assert!(!projected.ready);
@@ -15708,6 +16383,18 @@ mod layout_tests {
             projected.primary_action_disabled_reason.as_deref(),
             Some("This model has no compatible local provider.")
         );
+        let inspection_error = app.model_management_view_model(
+            &model,
+            Some(&descriptor),
+            &PartialInspection::Error("unsafe retained partial".to_owned()),
+        );
+        assert_eq!(inspection_error.primary_action_label, "Repair runtime");
+        assert_eq!(
+            inspection_error.primary_action_disabled_reason,
+            projected.primary_action_disabled_reason
+        );
+        assert!(inspection_error.partial_cleanup_available);
+        assert!(!inspection_error.partial_cleanup_enabled);
     }
 
     #[test]
@@ -15825,7 +16512,8 @@ mod layout_tests {
         app.model_downloads
             .insert(id.to_owned(), ModelInstallStatus::InstallingRuntime);
 
-        let projected = app.model_management_view_model(&model, Some(&descriptor));
+        let projected =
+            app.model_management_view_model(&model, Some(&descriptor), &PartialInspection::Missing);
 
         assert!(!projected.installed);
         assert!(!projected.ready);
@@ -17105,6 +17793,452 @@ mod layout_tests {
         }
     }
 
+    fn partial_cleanup_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "scribe-app-partial-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn partial_sidecar(destination: &Path) -> PathBuf {
+        destination.with_file_name(format!(
+            "{}.partial",
+            destination.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    fn trusted_fixture_destination(
+        config: &AppConfig,
+        model: &RemoteModel,
+        variant_id: &str,
+    ) -> PathBuf {
+        let artifact = model.artifact_for(variant_id).unwrap();
+        config::model_storage_dir(config)
+            .join("huggingface")
+            .join("handy-computer")
+            .join(model.id.strip_prefix("handy-computer/").unwrap())
+            .join(&model.revision)
+            .join(
+                config::managed_remote_model_id(
+                    &artifact.model_id,
+                    &artifact.revision,
+                    &artifact.filename,
+                )
+                .unwrap(),
+            )
+            .join(&artifact.filename)
+    }
+
+    fn wait_for_remote_partial_inspections(app: &mut LocalTranscriberApp) {
+        for _ in 0..100 {
+            app.poll_events();
+            if app.remote_catalog.pending_partial_inspections.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("remote partial inspection did not finish");
+    }
+
+    #[test]
+    fn local_partial_cleanup_survives_restart_and_refreshes_cached_projections() {
+        let root = partial_cleanup_test_root("local");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&partial, b"retained partial").unwrap();
+        app.config.general.model_paths.remove(model_id.as_str());
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let before_local = Arc::clone(&app.remote_catalog.local_models);
+        let restarted_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert_eq!(restarted_view.download_state, ModelDownloadState::Cancelled);
+        assert!(restarted_view.partial_cleanup_available);
+        assert!(restarted_view.partial_cleanup_enabled);
+        let _ = app.remote_catalog_view();
+        assert!(app.remote_catalog.projection.is_some());
+
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+
+        assert!(!partial.exists());
+        assert!(!destination.exists());
+        assert!(!Arc::ptr_eq(
+            &before_local,
+            &app.remote_catalog.local_models
+        ));
+        assert!(app.remote_catalog.projection.is_none());
+        assert!(
+            !app.model_management_catalog()
+                .into_iter()
+                .find(|model| model.id == model_id.as_str())
+                .unwrap()
+                .partial_cleanup_available
+        );
+        assert!(app.status_message.contains("start from zero"));
+
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert!(app.status_message.contains("No retained partial"));
+        assert!(!destination.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_artifact_and_runtime_jobs_block_partial_cleanup() {
+        let root = partial_cleanup_test_root("active-jobs");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::write(&partial, b"retained partial").unwrap();
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (1, InstallCancellation::default()),
+        );
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let active_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(!active_view.partial_cleanup_available);
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert_eq!(fs::read(&partial).unwrap(), b"retained partial");
+        assert!(app.status_message.contains("active installation"));
+
+        app.artifact_installations.remove(model_id.as_str());
+        app.runtime_jobs
+            .insert("queued-runtime".to_owned(), RuntimeInstallJob::default());
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        let runtime_blocked_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(runtime_blocked_view.partial_cleanup_available);
+        assert!(!runtime_blocked_view.partial_cleanup_enabled);
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert_eq!(fs::read(&partial).unwrap(), b"retained partial");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_local_partial_is_visible_but_cannot_be_discarded() {
+        let root = partial_cleanup_test_root("local-invalid-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::create_dir(&partial).unwrap();
+        app.config.general.model_paths.remove(model_id.as_str());
+        config::normalize_config(&mut app.config);
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let directory_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(directory_view.partial_cleanup_available);
+        assert!(!directory_view.partial_cleanup_enabled);
+        assert!(
+            directory_view
+                .partial_cleanup_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        assert!(!directory_view.install_action_enabled);
+        assert!(
+            directory_view
+                .primary_action_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
+        );
+        assert_ne!(directory_view.download_state, ModelDownloadState::Cancelled);
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert!(partial.is_dir());
+
+        fs::remove_dir(&partial).unwrap();
+        let target = root.join("retained-target");
+        fs::write(&target, b"retained target").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &partial).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, &partial).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let link_view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(link_view.partial_cleanup_available);
+        assert!(!link_view.partial_cleanup_enabled);
+        assert!(!link_view.install_action_enabled);
+        assert!(
+            link_view
+                .partial_cleanup_disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        app.apply_model_management_action(ScreenAction::DiscardModelPartial(
+            model_id.as_str().to_owned(),
+        ));
+        assert!(fs::symlink_metadata(&partial).is_ok());
+        assert_eq!(fs::read(target).unwrap(), b"retained target");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_local_partial_inspection_surfaces_the_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = partial_cleanup_test_root("local-unreadable-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        let parent = partial.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::write(&partial, b"retained partial").unwrap();
+        app.config.general.model_paths.remove(model_id.as_str());
+        config::normalize_config(&mut app.config);
+        let original = fs::metadata(parent).unwrap().permissions();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+        if managed_downloads::normalized_model_has_partial(&app.config, &model_id).is_ok() {
+            fs::set_permissions(parent, original).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        fs::set_permissions(parent, original).unwrap();
+
+        let view = app
+            .model_management_catalog()
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        assert!(view.partial_cleanup_available);
+        assert!(!view.partial_cleanup_enabled);
+        assert!(view.partial_cleanup_disabled_reason.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_remote_partial_cleanup_revalidates_ids_and_refreshes_projection() {
+        let root = partial_cleanup_test_root("remote");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model = remote_catalog_model(
+            "handy-computer/partial-fixture",
+            "Partial fixture",
+            &["en"],
+            true,
+            320 * 1024 * 1024,
+        );
+        let destination = trusted_fixture_destination(&app.config, &model, "q4");
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"activated destination").unwrap();
+        fs::write(&partial, b"retained partial").unwrap();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(2, CatalogSource::Network, vec![model])
+                .unwrap(),
+        );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+
+        let before_revision = app.remote_catalog.projection_revision;
+        let view = app.remote_catalog_view();
+        assert!(view.entries[0].variants[0].actions.iter().any(|action| {
+            matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. }) && action.enabled
+        }));
+        app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: "handy-computer/partial-fixture".to_owned(),
+            variant_id: "q4".to_owned(),
+        });
+
+        assert!(!partial.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"activated destination");
+        assert!(app.remote_catalog.projection.is_none());
+        assert!(app.remote_catalog.projection_revision > before_revision);
+        assert!(
+            !app.remote_catalog_view().entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| matches!(
+                    action.kind,
+                    RemoteCatalogActionKind::DiscardPartial { .. }
+                ))
+        );
+
+        fs::write(&partial, b"retained again").unwrap();
+        let managed_id = config::managed_remote_model_id(
+            "handy-computer/partial-fixture",
+            &"a".repeat(40),
+            "fixture.gguf",
+        )
+        .unwrap();
+        app.artifact_installations
+            .insert(managed_id, (3, InstallCancellation::default()));
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+        assert!(
+            !app.remote_catalog_view().entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| matches!(
+                    action.kind,
+                    RemoteCatalogActionKind::DiscardPartial { .. }
+                ))
+        );
+        app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: "handy-computer/partial-fixture".to_owned(),
+            variant_id: "q4".to_owned(),
+        });
+        assert_eq!(fs::read(&partial).unwrap(), b"retained again");
+        assert!(app.status_message.contains("active installation"));
+        app.artifact_installations.clear();
+
+        app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: "handy-computer/partial-fixture".to_owned(),
+            variant_id: "stale".to_owned(),
+        });
+        assert_eq!(fs::read(&partial).unwrap(), b"retained again");
+        assert!(
+            app.status_message
+                .contains("no longer in the validated snapshot")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_trusted_remote_partial_is_visible_and_disabled_from_cache() {
+        let root = partial_cleanup_test_root("remote-invalid-partial");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model = remote_catalog_model(
+            "handy-computer/invalid-partial-fixture",
+            "Invalid partial fixture",
+            &["en"],
+            false,
+            64 * 1024 * 1024,
+        );
+        let destination = trusted_fixture_destination(&app.config, &model, "q4");
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::create_dir(&partial).unwrap();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(8, CatalogSource::Network, vec![model])
+                .unwrap(),
+        );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+
+        let view = app.remote_catalog_view();
+        let actions = &view.entries[0].variants[0].actions;
+        let retry = actions
+            .iter()
+            .find(|action| action.label == "Retry download")
+            .unwrap();
+        assert!(!retry.enabled);
+        assert!(
+            retry
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Remove it from model storage"))
+        );
+        let discard = actions
+            .iter()
+            .find(|action| matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. }))
+            .unwrap();
+        assert!(!discard.enabled);
+        assert!(
+            discard
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
+        app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: "handy-computer/invalid-partial-fixture".to_owned(),
+            variant_id: "q4".to_owned(),
+        });
+        assert!(partial.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_discard_durability_failure_sets_the_recovery_barrier() {
+        let mut app = test_app();
+
+        app.finish_partial_discard(
+            "synthetic-model",
+            Err(InstallError::RecoveryRequired(
+                "partial was unlinked but parent sync failed".to_owned(),
+            )),
+        );
+
+        assert!(
+            app.artifact_recovery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("parent sync failed"))
+        );
+        assert!(app.artifact_mutation_block_reason().is_some());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
     #[test]
     fn remote_catalog_browse_filters_and_sorts_only_from_available_metadata() {
         const MIB: u64 = 1024 * 1024;
@@ -17248,6 +18382,12 @@ mod layout_tests {
                     .collect(),
             ),
         );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+        let seeded_probe_count = app.remote_catalog.disk_probe_count;
+        let seeded_request_count = app.remote_catalog.partial_probe_request_count;
+        assert_eq!(seeded_probe_count, REMOTE_CATALOG_VISIBLE_LIMIT);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         let first = app.remote_catalog_view();
 
@@ -17262,13 +18402,22 @@ mod layout_tests {
             "Showing 100 of 10000 matching models (10000 total). Refine search or filters"
         ));
         assert_eq!(app.remote_catalog.projection_build_count, 1);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         let second = app.remote_catalog_view();
 
         assert_eq!(second.entries, first.entries);
         assert_eq!(app.remote_catalog.projection_build_count, 1);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
 
         let failed_model_id = config::managed_remote_model_id(
             "handy-computer/catalog-00000",
@@ -17276,17 +18425,39 @@ mod layout_tests {
             "fixture.gguf",
         )
         .unwrap();
-        app.fail_model_install(&failed_model_id, "synthetic install failure".to_owned());
+        app.model_downloads.insert(
+            failed_model_id,
+            ModelInstallStatus::Error("synthetic install failure".to_owned()),
+        );
+        app.remote_catalog.invalidate_projection();
         let failed = app.remote_catalog_view();
 
         assert_eq!(app.remote_catalog.projection_build_count, 2);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
         assert!(
             failed.entries[0].variants[0]
                 .actions
                 .iter()
                 .any(|action| action.label == "Resume")
         );
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "catalog model 00050".to_owned(),
+        ));
+        let cached_refined = app.remote_catalog_view();
+
+        assert_eq!(cached_refined.entries.len(), 1);
+        assert_eq!(app.remote_catalog.projection_build_count, 3);
+        assert_eq!(app.remote_catalog.disk_probe_count, seeded_probe_count);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count
+        );
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "catalog model 09999".to_owned(),
@@ -17300,8 +18471,12 @@ mod layout_tests {
                 .message
                 .contains("Showing 1 of 10000 models.")
         );
-        assert_eq!(app.remote_catalog.projection_build_count, 3);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.projection_build_count, 4);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seeded_request_count + 1
+        );
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
 
         app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
             "no catalog model has this phrase".to_owned(),
@@ -17310,8 +18485,140 @@ mod layout_tests {
 
         assert!(empty.entries.is_empty());
         assert!(empty.status.message.contains("Showing 0 of 10000 models."));
-        assert_eq!(app.remote_catalog.projection_build_count, 4);
-        assert_eq!(app.remote_catalog.disk_probe_count, 0);
+        assert_eq!(app.remote_catalog.projection_build_count, 5);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
+    }
+
+    #[test]
+    fn searched_remote_variant_outside_seed_window_is_inspected_asynchronously() {
+        let root = partial_cleanup_test_root("remote-outside-seed");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let models = (0..=REMOTE_CATALOG_VISIBLE_LIMIT)
+            .map(|index| {
+                remote_catalog_model(
+                    &format!("handy-computer/outside-{index:03}"),
+                    &format!("Outside {index:03}"),
+                    &["en"],
+                    false,
+                    64 * 1024 * 1024,
+                )
+            })
+            .collect::<Vec<_>>();
+        let target = models.last().unwrap();
+        let destination = trusted_fixture_destination(&app.config, target, "q4");
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::write(&partial, b"retained outside seed window").unwrap();
+        app.remote_catalog.snapshot = Some(
+            ModelInventorySnapshot::from_trusted_records(7, CatalogSource::Network, models)
+                .unwrap(),
+        );
+        app.refresh_remote_partial_inspection_cache();
+        wait_for_remote_partial_inspections(&mut app);
+        let seed_probes = app.remote_catalog.disk_probe_count;
+        let seed_requests = app.remote_catalog.partial_probe_request_count;
+
+        app.apply_model_management_action(ScreenAction::SetRemoteCatalogQuery(
+            "Outside 100".to_owned(),
+        ));
+        let unknown = app.remote_catalog_view();
+
+        assert_eq!(unknown.entries.len(), 1);
+        assert_eq!(
+            unknown.entries[0].variants[0].status_label.as_deref(),
+            Some("Checking retained download…")
+        );
+        let download = unknown.entries[0].variants[0]
+            .actions
+            .iter()
+            .find(|action| action.label == "Download")
+            .unwrap();
+        assert!(!download.enabled);
+        assert_eq!(
+            download.disabled_reason.as_deref(),
+            Some("Checking retained download…")
+        );
+        assert!(
+            !unknown.entries[0].variants[0].actions.iter().any(|action| {
+                matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
+            })
+        );
+        assert_eq!(app.remote_catalog.disk_probe_count, seed_probes);
+        assert_eq!(
+            app.remote_catalog.partial_probe_request_count,
+            seed_requests + 1
+        );
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
+
+        wait_for_remote_partial_inspections(&mut app);
+        let inspected = app.remote_catalog_view();
+
+        assert!(
+            inspected.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| action.label == "Resume")
+        );
+        assert!(
+            inspected.entries[0].variants[0]
+                .actions
+                .iter()
+                .any(|action| {
+                    matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
+                        && action.enabled
+                })
+        );
+        assert_eq!(app.remote_catalog.disk_probe_count, seed_probes + 1);
+        assert_eq!(app.remote_catalog.sync_remote_projection_probe_count, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_remote_partial_probe_cannot_clear_current_pending_state() {
+        let mut app = test_app();
+        let revision = app.remote_catalog.snapshot.as_ref().unwrap().revision();
+        let key = ("handy-computer/stale".to_owned(), "q4".to_owned());
+        app.remote_catalog.partial_inspection_generation = 42;
+        app.remote_catalog.pending_partial_inspections.clear();
+        app.remote_catalog
+            .pending_partial_inspections
+            .insert(key.clone());
+        app.tx
+            .send(AppEvent::RemotePartialInspectionsFinished {
+                snapshot_revision: revision,
+                generation: 41,
+                results: vec![(key.clone(), PartialInspection::Present)],
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert!(
+            app.remote_catalog
+                .pending_partial_inspections
+                .contains(&key)
+        );
+        assert!(!app.remote_catalog.partial_inspections.contains_key(&key));
+
+        app.tx
+            .send(AppEvent::RemotePartialInspectionsFinished {
+                snapshot_revision: revision,
+                generation: 42,
+                results: vec![(key.clone(), PartialInspection::Missing)],
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(
+            !app.remote_catalog
+                .pending_partial_inspections
+                .contains(&key)
+        );
+        assert_eq!(
+            app.remote_catalog.partial_inspections.get(&key),
+            Some(&PartialInspection::Missing)
+        );
     }
 
     #[test]
@@ -20169,6 +21476,87 @@ mod layout_tests {
             app.status_message,
             "Install another ready model before removing the active model."
         );
+    }
+
+    #[test]
+    fn cancelling_removal_launched_from_expanded_card_preserves_expansion_and_focus() {
+        let mut app = test_app();
+        let id = "whisper_cpp_base_en".to_owned();
+        app.model_management.expanded_model_card = Some(ModelCardKey::Local(id.clone()));
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(id.clone()));
+
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Remove(id.clone()))
+        );
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(id.as_str())
+        );
+
+        app.apply_model_management_action(ScreenAction::CloseModelDialog);
+
+        assert!(app.model_management.dialog.is_none());
+        assert_eq!(
+            app.model_management.expanded_model_card,
+            Some(ModelCardKey::Local(id.clone()))
+        );
+        assert_eq!(
+            app.model_management.restore_remove_focus.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(app.model_management.removal_replacement.is_none());
+    }
+
+    #[test]
+    fn selected_canonical_legacy_cleanup_can_be_removed_without_a_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-selected-legacy-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        let default_fixture = app
+            .config
+            .general
+            .model_paths
+            .remove("whisper_cpp_tiny_en")
+            .expect("default test fixture");
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("canonical legacy path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        config::normalize_config(&mut app.config);
+
+        app.apply_model_management_action(ScreenAction::RequestModelRemoval(
+            "whisper_cpp_base_en".to_owned(),
+        ));
+
+        assert_eq!(
+            app.model_management.dialog,
+            Some(ModelDialog::Remove("whisper_cpp_base_en".to_owned()))
+        );
+        assert!(app.model_management.removal_replacement.is_none());
+
+        app.apply_model_management_action(ScreenAction::ConfirmModelRemoval(
+            "whisper_cpp_base_en".to_owned(),
+        ));
+
+        assert!(app.config.general.selected_default_model.is_empty());
+        assert!(!legacy.exists());
+        assert!(app.model_management.restore_after_removal_focus);
+        assert!(app.status_message.contains("Uninstalled"));
+
+        let _ = fs::remove_file(default_fixture);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

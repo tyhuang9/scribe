@@ -192,6 +192,19 @@ No P0, P1, or P2 visual issue remains in the reviewed supported-width evidence. 
 
 final result: passed
 
+## Accordion width follow-up — 2026-08-13
+
+- Source truth: the user-directed requirement that expanding a model must not change the card's horizontal bounds, applied to the three model-card references listed above.
+- Implementation evidence: `design-qa-evidence/implementation-1180x815-expanded-width-fix.png` (1194 x 853 outer window; requested 1180 x 815 client viewport; Windows `PrintWindow` succeeded).
+- State: `models/card-expanded`, light theme, installed active card collapsed above an installed inactive card with inline details expanded.
+- Full-view and focused-region result: the collapsed and expanded card outlines share the same left and right edges. The divider, three metadata columns, description, language list, runtime information, and any partial-cleanup action remain inside the single outer card frame. No separate crop was needed because both complete outlines and the expanded content are legible together in the full-resolution capture.
+- Automated responsive evidence: `expanding_model_details_preserves_the_card_width` compares both card edges in collapsed and expanded states at 1180 x 815, 960 x 680, and the 375 x 680 component viewport.
+- Interaction evidence: focused tests retain the correct Install/Retry/Resume/Cancel/Upgrade/Uninstall routing and local/remote partial-cleanup actions after the latest-main integration.
+- Console/runtime errors: the native harness remained alive through capture and emitted no visible runtime error; full UI/default test suites and strict Clippy passed on the same staged source.
+- Findings: no actionable P0, P1, or P2 issue remains. The targeted width regression is resolved.
+
+final result: passed
+
 ---
 
 # Settings design QA

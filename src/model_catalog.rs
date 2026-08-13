@@ -220,6 +220,13 @@ pub(crate) struct RuntimeModelManifest {
     pub(crate) legacy_ggml_artifact: Option<RuntimeArtifactManifest>,
 }
 
+/// Trusted runtime artifact format, assigned by catalog/provenance resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactFormat {
+    Gguf,
+    LegacyGgml,
+}
+
 /// Immutable integrity facts for an artifact the runtime may resolve.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeArtifactManifest {
@@ -228,6 +235,7 @@ pub(crate) struct RuntimeArtifactManifest {
     pub(crate) filename: &'static str,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: &'static str,
+    pub(crate) format: ArtifactFormat,
 }
 
 const TRANSCRIBE_CPP_VERSION: RuntimeVersion = RuntimeVersion {
@@ -468,7 +476,9 @@ pub(crate) fn runtime_model_manifest(id: &ModelId) -> Option<RuntimeModelManifes
             artifact_size_bytes: manifest.artifact.size_bytes,
             artifact_storage_estimate: manifest.storage_guidance,
             artifact_sha256: manifest.artifact.sha256,
-            legacy_ggml_artifact: manifest.legacy_ggml_artifact.map(runtime_artifact),
+            legacy_ggml_artifact: manifest
+                .legacy_ggml_artifact
+                .map(|artifact| runtime_artifact(artifact, ArtifactFormat::LegacyGgml)),
         })
 }
 
@@ -485,6 +495,7 @@ pub(crate) fn runtime_artifact_manifest_for_path(
             filename: manifest.artifact_filename,
             size_bytes: manifest.artifact_size_bytes,
             sha256: manifest.artifact_sha256,
+            format: ArtifactFormat::Gguf,
         });
     }
     manifest
@@ -492,13 +503,17 @@ pub(crate) fn runtime_artifact_manifest_for_path(
         .filter(|artifact| artifact.filename == filename)
 }
 
-const fn runtime_artifact(artifact: ArtifactManifest) -> RuntimeArtifactManifest {
+const fn runtime_artifact(
+    artifact: ArtifactManifest,
+    format: ArtifactFormat,
+) -> RuntimeArtifactManifest {
     RuntimeArtifactManifest {
         repository: artifact.repository,
         revision: artifact.revision,
         filename: artifact.filename,
         size_bytes: artifact.size_bytes,
         sha256: artifact.sha256,
+        format,
     }
 }
 
@@ -942,6 +957,7 @@ mod tests {
         ] {
             let artifact =
                 runtime_artifact_manifest_for_path(&ModelId::new(id), Path::new(filename)).unwrap();
+            assert_eq!(artifact.format, ArtifactFormat::LegacyGgml);
             assert_eq!(
                 (artifact.filename, artifact.size_bytes, artifact.sha256),
                 (filename, size_bytes, sha256)
@@ -955,6 +971,7 @@ mod tests {
             Path::new("whisper-base.en-Q8_0.gguf"),
         )
         .unwrap();
+        assert_eq!(artifact.format, ArtifactFormat::Gguf);
         assert_eq!(artifact.size_bytes, 84_886_208);
         assert_eq!(
             artifact.sha256,

@@ -446,6 +446,40 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         | ScreenAction::RepairModelRuntime(_)
         | ScreenAction::MaintainModelRuntime(_)
         | ScreenAction::RetryRemoteCatalog => {}
+        ScreenAction::DiscardModelPartial(id) => {
+            if let Some(model) = data
+                .models
+                .iter_mut()
+                .chain(data.model_catalog.iter_mut())
+                .find(|model| model.id == id)
+            {
+                model.partial_cleanup_available = false;
+                model.partial_cleanup_enabled = false;
+                model.partial_cleanup_disabled_reason = None;
+                model.download_state = ModelDownloadState::NotInstalled;
+            }
+        }
+        ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id,
+            variant_id,
+        } => {
+            if let Some(variant) = data
+                .remote_catalog
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == remote_model_id)
+                .and_then(|entry| {
+                    entry
+                        .variants
+                        .iter_mut()
+                        .find(|variant| variant.id == variant_id)
+                })
+            {
+                variant.actions.retain(|action| {
+                    !matches!(action.kind, RemoteCatalogActionKind::DiscardPartial { .. })
+                });
+            }
+        }
         ScreenAction::SelectModel(id) => {
             data.transcription.selected_model_id = Some(id.clone());
             for model in &mut data.models {
@@ -475,6 +509,11 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             }
         }
         ScreenAction::RequestModelRemoval(id) => {
+            data.model_management.restore_remove_focus = matches!(
+                &data.model_management.expanded_model_card,
+                Some(ModelCardKey::Local(current)) if current == &id
+            )
+            .then(|| id.clone());
             data.model_management.dialog = Some(ModelDialog::Remove(id));
             data.model_management.focus_dialog_initial = true;
         }
@@ -488,6 +527,7 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         },
         ScreenAction::ConfirmModelRemoval(id) => {
             data.model_management.dialog = None;
+            data.model_management.restore_remove_focus = None;
             data.models.retain(|model| model.id != id);
             data.model_management.restore_after_removal_focus = true;
         }
@@ -3064,7 +3104,7 @@ mod tests {
 
     #[test]
     fn expanding_model_details_preserves_the_card_width() {
-        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 680.0)] {
             let collapsed = render(Fixture::ModelsInstalled, width, height);
             let expanded = render(Fixture::ModelsCardExpanded, width, height);
             let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
@@ -3146,6 +3186,170 @@ mod tests {
         ] {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
+    }
+
+    #[test]
+    fn inline_local_partial_cleanup_keeps_resume_and_dispatches_discard() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsLifecycle.data();
+        let model = data
+            .model_catalog
+            .iter_mut()
+            .find(|model| model.id == "moonshine.base")
+            .expect("lifecycle fixture includes Moonshine");
+        model.partial_cleanup_available = true;
+        model.partial_cleanup_enabled = true;
+        data.model_management.expanded_model_card =
+            Some(ModelCardKey::Local("moonshine.base".into()));
+        let mut page = Fixture::ModelsLifecycle.page();
+
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            node_names(&initial)
+                .iter()
+                .any(|name| name == "Resume Whisper Moonshine")
+        );
+        let discard = named_node_id(&initial, "Discard partial for Whisper Moonshine");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: discard,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::DiscardModelPartial("moonshine.base".into())
+        );
+        apply_action(&mut data, &mut page, action);
+        let refreshed = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !node_names(&refreshed)
+                .iter()
+                .any(|name| name == "Discard partial for Whisper Moonshine")
+        );
+        assert!(
+            node_names(&refreshed)
+                .iter()
+                .any(|name| name == "Collapse details for Whisper Moonshine")
+        );
+    }
+
+    #[test]
+    fn inline_partial_cleanup_preserves_disabled_reason_and_remote_ids() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut local = Fixture::ModelsLifecycle.data();
+        let model = local
+            .model_catalog
+            .iter_mut()
+            .find(|model| model.id == "moonshine.base")
+            .expect("lifecycle fixture includes Moonshine");
+        model.partial_cleanup_available = true;
+        model.partial_cleanup_enabled = false;
+        model.partial_cleanup_disabled_reason =
+            Some("Wait for the active installation to finish.".into());
+        local.model_management.expanded_model_card =
+            Some(ModelCardKey::Local("moonshine.base".into()));
+        let mut page = Fixture::ModelsLifecycle.page();
+        let output = render_with_input(&ctx, &mut local, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let discard = node_matching(&output, |node| {
+            node.name() == Some("Discard partial for Whisper Moonshine")
+        });
+        assert!(discard.is_disabled());
+        assert_eq!(
+            discard.description(),
+            Some("Wait for the active installation to finish.")
+        );
+
+        let mut remote = Fixture::ModelsInstalled.data();
+        remote.remote_catalog.entries[0].variants[0]
+            .actions
+            .push(RemoteCatalogActionView {
+                label: "Discard partial".into(),
+                kind: RemoteCatalogActionKind::DiscardPartial {
+                    remote_model_id: "trusted-speech/compact-english".into(),
+                    variant_id: "compact-english-q5".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            });
+        remote.model_management.expanded_model_card = Some(ModelCardKey::Remote {
+            entry_id: "trusted-speech/compact-english".into(),
+            variant_id: "compact-english-q5".into(),
+        });
+        let mut page = Fixture::ModelsInstalled.page();
+        let initial = render_with_input(&ctx, &mut remote, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let discard = named_node_id(&initial, "Discard partial for Compact English");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut remote,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: discard,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn expanded_legacy_cleanup_uses_upgrade_and_explicit_uninstall() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog = vec![ModelViewModel {
+            id: "legacy".into(),
+            display_name: "Legacy model".into(),
+            legacy_cleanup_pending: true,
+            selected: true,
+            primary_action_installs_upgrade: true,
+            primary_action_enabled: true,
+            removal_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("legacy".into()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Upgrade Legacy model")
+        );
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Uninstall Legacy model")
+        );
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Install Legacy model")
+        );
     }
 
     #[test]

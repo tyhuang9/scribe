@@ -273,6 +273,7 @@ pub(crate) enum ScreenAction {
     InstallModel(String),
     UpgradeModel(String),
     CancelModelInstall(String),
+    DiscardModelPartial(String),
     RepairModelRuntime(String),
     MaintainModelRuntime(String),
     ToggleModelCardDetails(ModelCardKey),
@@ -295,6 +296,10 @@ pub(crate) enum ScreenAction {
     CancelRemoteCatalogInstall(String),
     UseRemoteCatalogModel(String),
     RemoveRemoteCatalogModel(String),
+    DiscardRemoteCatalogPartial {
+        remote_model_id: String,
+        variant_id: String,
+    },
     SetSettingsTab(SettingsTab),
     SetCloseToTray(bool),
     OpenModelSettings,
@@ -464,6 +469,13 @@ pub(crate) fn screen_action_for_remote_catalog_action(
         RemoteCatalogActionKind::Remove { model_id } => {
             ScreenAction::RemoveRemoteCatalogModel(model_id.clone())
         }
+        RemoteCatalogActionKind::DiscardPartial {
+            remote_model_id,
+            variant_id,
+        } => ScreenAction::DiscardRemoteCatalogPartial {
+            remote_model_id: remote_model_id.clone(),
+            variant_id: variant_id.clone(),
+        },
     }
 }
 
@@ -2201,7 +2213,8 @@ fn render_unified_model_card(
                             "This model is not an app-managed download and cannot be removed here.",
                         )
                         .or_else(|| {
-                            (model.selected && !can_replace_active).then_some(
+                            (model.selected && !model.legacy_cleanup_pending && !can_replace_active)
+                            .then_some(
                                 "Install another ready model before removing the selected model.",
                             )
                         });
@@ -2216,15 +2229,27 @@ fn render_unified_model_card(
             (row_action, row_name, enabled, reason, lifecycle_label)
         }
         ModelCard::Local(model) => {
-            let label = match model.download_state {
-                ModelDownloadState::Failed => "Retry",
-                ModelDownloadState::Cancelled => "Resume",
-                _ => "Install",
+            let (row_action, label, enabled) = if model.primary_action_installs_upgrade {
+                (
+                    ScreenAction::UpgradeModel(model.id.clone()),
+                    "Upgrade",
+                    model.primary_action_enabled,
+                )
+            } else {
+                (
+                    ScreenAction::InstallModel(model.id.clone()),
+                    match model.download_state {
+                        ModelDownloadState::Failed => "Retry",
+                        ModelDownloadState::Cancelled => "Resume",
+                        _ => "Install",
+                    },
+                    model.install_action_enabled,
+                )
             };
             (
-                ScreenAction::InstallModel(model.id.clone()),
+                row_action,
                 format!("{label} {}", model.display_name),
-                model.install_action_enabled,
+                enabled,
                 model.primary_action_disabled_reason.as_deref().or_else(|| {
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
@@ -2403,7 +2428,13 @@ fn render_unified_model_card(
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
-                render_inline_model_details(ui, card, &mut action);
+                restored_remove_focus |= render_inline_model_details(
+                    ui,
+                    card,
+                    can_replace_active,
+                    restore_remove_focus,
+                    &mut action,
+                );
             }
         });
     ui.ctx()
@@ -2418,7 +2449,14 @@ fn render_unified_model_card(
     }
 }
 
-fn render_inline_model_details(ui: &mut egui::Ui, card: ModelCard<'_>, action: &mut ScreenAction) {
+fn render_inline_model_details(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    can_replace_active: bool,
+    restore_remove_focus: bool,
+    action: &mut ScreenAction,
+) -> bool {
+    let mut restored_remove_focus = false;
     ui.vertical(|ui| {
         let stats = match card {
             ModelCard::Local(model) => [
@@ -2533,6 +2571,46 @@ fn render_inline_model_details(ui: &mut egui::Ui, card: ModelCard<'_>, action: &
                         *action = ScreenAction::MaintainModelRuntime(model.id.clone());
                     }
                 }
+                if model.partial_cleanup_available {
+                    let cleanup_name = format!("Discard partial for {}", model.display_name);
+                    let cleanup = model_lifecycle_button(
+                        ui,
+                        "Discard partial",
+                        &cleanup_name,
+                        model.partial_cleanup_enabled,
+                        model.partial_cleanup_disabled_reason.as_deref(),
+                    );
+                    if cleanup.clicked() && model.partial_cleanup_enabled {
+                        *action = ScreenAction::DiscardModelPartial(model.id.clone());
+                    }
+                }
+                if model.legacy_cleanup_pending {
+                    let removal_reason = (!model.removal_supported)
+                        .then_some(
+                            "This model is not an app-managed download and cannot be removed here.",
+                        )
+                        .or_else(|| {
+                            (model.selected && !model.legacy_cleanup_pending && !can_replace_active)
+                                .then_some(
+                                "Install another ready model before removing the selected model.",
+                            )
+                        });
+                    let removal_name = format!("Uninstall {}", model.display_name);
+                    let removal = model_lifecycle_button(
+                        ui,
+                        "Uninstall",
+                        &removal_name,
+                        removal_reason.is_none(),
+                        removal_reason,
+                    );
+                    if restore_remove_focus {
+                        removal.request_focus();
+                        restored_remove_focus = true;
+                    }
+                    if removal.clicked() && removal_reason.is_none() {
+                        *action = ScreenAction::RequestModelRemoval(model.id.clone());
+                    }
+                }
             }
             ModelCard::Remote(entry, variant) => {
                 ui.add_space(8.0);
@@ -2540,9 +2618,28 @@ fn render_inline_model_details(ui: &mut egui::Ui, card: ModelCard<'_>, action: &
                 ui.label(format!("Revision: {}", entry.pinned_revision));
                 ui.label(format!("Artifact: {}", variant.filename));
                 ui.label(format!("SHA-256: {}", variant.expected_sha256));
+                if let Some(cleanup) = variant.actions.iter().find(|candidate| {
+                    matches!(
+                        candidate.kind,
+                        RemoteCatalogActionKind::DiscardPartial { .. }
+                    )
+                }) {
+                    let cleanup_name = format!("Discard partial for {}", entry.display_name);
+                    let response = model_lifecycle_button(
+                        ui,
+                        "Discard partial",
+                        &cleanup_name,
+                        cleanup.enabled,
+                        cleanup.disabled_reason.as_deref(),
+                    );
+                    if response.clicked() && cleanup.enabled {
+                        *action = screen_action_for_remote_catalog_action(&cleanup.kind);
+                    }
+                }
             }
         }
     });
+    restored_remove_focus
 }
 
 fn merge_model_action(action: &mut ScreenAction, candidate: ScreenAction) {
@@ -3346,7 +3443,11 @@ fn models(
             }
         }
         Some(ModelDialog::Remove(id)) => {
-            if let Some(model) = models.iter().find(|model| &model.id == id) {
+            if let Some(model) = models
+                .iter()
+                .chain(model_catalog.iter())
+                .find(|model| &model.id == id)
+            {
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
                 let dialog_accessibility_id =
@@ -6493,13 +6594,41 @@ mod tests {
     fn legacy_model_upgrade_primary_dispatches_upgrade_action() {
         let model = ModelViewModel {
             id: "whisper_cpp_small_en".into(),
-            installed: true,
+            display_name: "Whisper Small — English".into(),
+            installed: false,
+            legacy_cleanup_pending: true,
+            download_state: ModelDownloadState::NotInstalled,
             primary_action_label: "Upgrade model".into(),
             primary_action_enabled: true,
             primary_action_installs_upgrade: true,
+            removal_supported: true,
             ..Default::default()
         };
+        let current = ModelViewModel {
+            id: "whisper_cpp_tiny_en".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        };
+        let catalog = vec![current, model.clone()];
+        let remote_catalog = RemoteCatalogView::default();
+        let (installed, available) = build_model_card_lists(
+            &catalog,
+            &catalog,
+            &remote_catalog,
+            ModelLanguageFilter::All,
+        );
 
+        assert_eq!(installed.len(), 1);
+        assert_eq!(available.len(), 1);
+        assert_eq!(
+            installed[0].key(),
+            ModelCardKey::Local("whisper_cpp_tiny_en".into())
+        );
+        assert_eq!(
+            available[0].key(),
+            ModelCardKey::Local("whisper_cpp_small_en".into())
+        );
         assert_eq!(
             local_model_primary_action(&model),
             ScreenAction::UpgradeModel("whisper_cpp_small_en".into())
