@@ -7516,6 +7516,9 @@ impl LocalTranscriberApp {
                 config::downloaded_model_path(&self.config, model).as_ref() == Some(path)
             })
             .filter(|path| is_app_managed_model_path(&self.config, path));
+        let legacy_catalog_target = app_owned_legacy_catalog_artifact(&self.config, model)
+            .then(|| model.local_path.clone())
+            .flatten();
         // Each trusted remote artifact owns an opaque leaf directory. Staging
         // that directory removes the generated provenance manifest together
         // with the model, without affecting another variant in the same Hub
@@ -7538,7 +7541,8 @@ impl LocalTranscriberApp {
         let imported_local = imported_receipt_target.is_some();
         let managed_target = static_managed_target
             .or(remote_managed_target)
-            .or(imported_receipt_target);
+            .or(imported_receipt_target)
+            .or(legacy_catalog_target);
         let prior_fingerprint = match config::settings::artifact_config_fingerprint(&self.config) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -8969,6 +8973,11 @@ impl LocalTranscriberApp {
             .general
             .imported_gguf_models
             .contains_key(&model.id);
+        // Scribe versions before the verified GGUF catalog stored known GGML
+        // compatibility artifacts directly below the app's model directory,
+        // without a managed-install receipt. This exact, canonical path is
+        // still Scribe-owned; an arbitrary configured path is not.
+        let app_owned_legacy_artifact = app_owned_legacy_catalog_artifact(&self.config, model);
         let custom = model.local_path.is_some()
             && !self.config.general.managed_models.contains_key(&model.id)
             && !self
@@ -8976,7 +8985,8 @@ impl LocalTranscriberApp {
                 .general
                 .managed_remote_models
                 .contains_key(&model.id)
-            && !imported_gguf;
+            && !imported_gguf
+            && !app_owned_legacy_artifact;
         let download_state = match &install_status {
             ModelInstallStatus::Installed => ModelDownloadState::Installed,
             ModelInstallStatus::Downloading { .. } => ModelDownloadState::Downloading,
@@ -9004,8 +9014,8 @@ impl LocalTranscriberApp {
         };
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let mutation_blocked = mutation_block_reason.is_some();
-        let active =
-            installed && runtime_ready && self.config.general.selected_default_model == model.id;
+        let selected = installed && self.config.general.selected_default_model == model.id;
+        let active = selected && runtime_ready;
         let migration_pending =
             installed && config::model_needs_pinned_gguf_migration(&self.config, model);
         let (
@@ -9106,6 +9116,7 @@ impl LocalTranscriberApp {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             installed,
+            selected,
             active,
             ready: installed && runtime_ready,
             recommended: descriptor.is_some_and(|descriptor| descriptor.recommended),
@@ -9125,7 +9136,9 @@ impl LocalTranscriberApp {
             primary_action_disabled_reason,
             cancel_supported: self.artifact_installations.contains_key(&model.id),
             removal_supported: !custom
-                && (imported_gguf || supports_managed_uninstall(model, &install_status)),
+                && (imported_gguf
+                    || app_owned_legacy_artifact
+                    || supports_managed_uninstall(model, &install_status)),
             download_state,
             downloaded_bytes,
             total_bytes,
@@ -12223,6 +12236,20 @@ fn is_app_managed_model_path(config: &AppConfig, path: &Path) -> bool {
         .ok()
         .zip(storage.canonicalize().ok())
         .is_some_and(|(path, storage)| path.starts_with(storage))
+}
+
+/// Returns true only for a retained GGML filename at Scribe's own canonical
+/// legacy catalog location. It deliberately excludes `model_paths` and any
+/// outside-storage path so an imported or user-owned artifact can never be
+/// staged for deletion merely because it shares a catalog model ID.
+fn app_owned_legacy_catalog_artifact(config: &AppConfig, model: &SttModelInfo) -> bool {
+    let Some(path) = model.local_path.as_deref() else {
+        return false;
+    };
+    let Some(legacy_path) = config::legacy_downloaded_model_path(config, model) else {
+        return false;
+    };
+    path == legacy_path && is_app_managed_model_path(config, path)
 }
 
 fn select_first_installed_model(config: &mut AppConfig) {
@@ -15620,6 +15647,42 @@ mod layout_tests {
             app.config.general.selected_default_model,
             "whisper_cpp_small_en"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_owned_legacy_model_is_selected_but_unavailable_and_removable() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-app-owned-legacy-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.selected_default_model = "whisper_cpp_base_en".to_owned();
+        let catalog_model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == "whisper_cpp_base_en")
+            .expect("base catalog model");
+        let legacy = config::legacy_downloaded_model_path(&app.config, &catalog_model)
+            .expect("base legacy path");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).unwrap();
+        fs::write(&legacy, b"legacy GGML").unwrap();
+        config::normalize_config(&mut app.config);
+        let model = config::selected_model(&app.config).expect("selected base model");
+
+        let projected = app.model_management_view_model(&model, None);
+
+        assert!(app_owned_legacy_catalog_artifact(&app.config, &model));
+        assert!(projected.installed);
+        assert!(projected.selected);
+        assert!(!projected.ready);
+        assert!(!projected.active);
+        assert_eq!(projected.primary_action_label, "Upgrade model");
+        assert!(projected.removal_supported);
+
         let _ = fs::remove_dir_all(root);
     }
 

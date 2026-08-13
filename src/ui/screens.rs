@@ -3,8 +3,8 @@
 use std::{collections::HashSet, path::Path};
 
 use eframe::egui::{
-    self, Align, Align2, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea, Sense,
-    Stroke, Vec2,
+    self, Align, Align2, Color32, ComboBox, Frame, Layout, Margin, RichText, Rounding, ScrollArea,
+    Sense, Stroke, Vec2,
 };
 
 use super::{
@@ -31,6 +31,10 @@ const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 0.0;
 const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
 const SELECTOR_VISUAL_HEIGHT: f32 = 36.0;
 const SELECTOR_ACTION_WIDTH: f32 = 72.0;
+// The selected-model card is deliberately only 36px tall, so a 32px action
+// makes the two surfaces read as one oversized control. Keep the 44px target
+// while reducing this particular button's painted height.
+const SELECTOR_ACTION_VISUAL_HEIGHT: f32 = 28.0;
 const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
 const TRANSCRIPT_BODY_PADDING: f32 = 26.0;
 const TRANSCRIPT_BODY_VERTICAL_PADDING: f32 = 24.0;
@@ -555,7 +559,7 @@ fn selector_row(
             let hovered = response.enabled() && response.hovered();
             let action_visual_rect = egui::Rect::from_center_size(
                 action_rect.center(),
-                Vec2::new(SELECTOR_ACTION_WIDTH, 32.0),
+                Vec2::new(SELECTOR_ACTION_WIDTH, SELECTOR_ACTION_VISUAL_HEIGHT),
             );
             ui.painter().rect(
                 action_visual_rect,
@@ -1393,12 +1397,18 @@ fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
     );
 }
 
-fn installed_model_badge(ui: &mut egui::Ui, text: &str, center_y: f32) {
+fn installed_model_badge(
+    ui: &mut egui::Ui,
+    text: &str,
+    center_y: f32,
+    dot_color: Color32,
+    text_color: Color32,
+) {
     let colors = ui_palette(ui);
     let font = egui::FontId::proportional(12.0);
     let text_width = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), colors.success_text)
+        .layout_no_wrap(text.to_owned(), font.clone(), text_color)
         .size()
         .x;
     let size = Vec2::new(8.0 + 6.0 + 6.0 + text_width + 8.0, 22.0);
@@ -1411,14 +1421,14 @@ fn installed_model_badge(ui: &mut egui::Ui, text: &str, center_y: f32) {
     ui.painter().circle_filled(
         egui::pos2(visual.left() + 11.0, visual.center().y),
         3.0,
-        colors.success,
+        dot_color,
     );
     ui.painter().text(
         egui::pos2(visual.left() + 20.0, visual.center().y),
         Align2::LEFT_CENTER,
         text,
         font,
-        colors.success_text,
+        text_color,
     );
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::StaticText);
@@ -2058,7 +2068,10 @@ fn compact_model_icon_action(
     let colors = ui_palette(ui);
     let enabled = enabled && ui.is_enabled();
     let (target, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
-    let visual = egui::Rect::from_center_size(target.center(), Vec2::splat(36.0));
+    // A 76px row needs clear breathing room around its actions. The invisible
+    // target remains 44px for keyboard/pointer accessibility, but the painted
+    // square stays compact instead of reading like a second card.
+    let visual = egui::Rect::from_center_size(target.center(), Vec2::splat(32.0));
     let hovered = response.hovered() && enabled;
     ui.painter().rect(
         visual,
@@ -2139,10 +2152,24 @@ fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &s
                         ModelCard::Remote(entry, _) => &entry.display_name,
                     };
                     let name = ui.label(RichText::new(name).strong());
-                    if let ModelCard::Local(model) = card
-                        && model.active
-                    {
-                        installed_model_badge(ui, "Active", name.rect.center().y);
+                    if let ModelCard::Local(model) = card {
+                        if model.active {
+                            installed_model_badge(
+                                ui,
+                                "Active",
+                                name.rect.center().y,
+                                colors.success,
+                                colors.success_text,
+                            );
+                        } else if model.selected {
+                            installed_model_badge(
+                                ui,
+                                "Selected \u{00b7} unavailable",
+                                name.rect.center().y,
+                                colors.warning,
+                                colors.text,
+                            );
+                        }
                     }
                 },
             );
@@ -2192,7 +2219,6 @@ fn render_model_card(
         });
         builder.set_bounds(accesskit_rect(card_rect));
     });
-
     let description = model_row_description(card);
     let card_key = card.key();
     let requested_focus = focus_card.is_some_and(|key| card.matches_key(key));
@@ -2212,6 +2238,19 @@ fn render_model_card(
     let card_click_action = match card {
         ModelCard::Local(model) if model.installed && model.ready && !model.active => {
             ScreenAction::SelectModel(model.id.clone())
+        }
+        // Older local artifacts and missing runtimes cannot safely be made
+        // active yet. When Scribe has a real repair/upgrade operation, the
+        // card's primary click starts it; Details remains available through
+        // the separate chevron for inspection and removal.
+        ModelCard::Local(model)
+            if model.installed
+                && !model.ready
+                && model.primary_action_enabled
+                && (model.primary_action_installs_upgrade
+                    || model.primary_action_repairs_runtime) =>
+        {
+            local_model_primary_action(model)
         }
         _ => details_action.clone(),
     };
@@ -2255,8 +2294,8 @@ fn render_model_card(
         ModelCard::Local(model) if model.installed => {
             let reason = if !model.removal_supported {
                 Some("This model is not an app-managed download and cannot be removed here.")
-            } else if model.active && !can_replace_active {
-                Some("Install another ready model before removing the active model.")
+            } else if model.selected && !can_replace_active {
+                Some("Install another ready model before removing the selected model.")
             } else {
                 None
             };
@@ -2535,6 +2574,25 @@ fn render_model_card(
             .rect_filled(progress_rect, Rounding::same(1.0), colors.primary);
     }
 
+    let card_click_name = match &card_click_action {
+        ScreenAction::SelectModel(_) => match card {
+            ModelCard::Local(model) => {
+                format!("Use {} for future transcriptions", model.display_name)
+            }
+            ModelCard::Remote(_, _) => unreachable!("remote cards always open details"),
+        },
+        ScreenAction::UpgradeModel(_) | ScreenAction::RepairModelRuntime(_) => match card {
+            ModelCard::Local(model) => format!(
+                "{} {} to make it available",
+                model.primary_action_label, model.display_name
+            ),
+            ModelCard::Remote(_, _) => unreachable!("remote cards never repair a local runtime"),
+        },
+        _ => match card {
+            ModelCard::Local(model) => format!("Open details for {}", model.display_name),
+            ModelCard::Remote(entry, _) => format!("Open details for {}", entry.display_name),
+        },
+    };
     let card_click = ui
         .interact(
             card_rect,
@@ -2542,6 +2600,14 @@ fn render_model_card(
             Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    card_click.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, card_click_name.clone())
+    });
+    ui.ctx().accesskit_node_builder(card_click.id, |builder| {
+        builder.set_role(egui::accesskit::Role::Button);
+        builder.set_name(card_click_name);
+        builder.set_bounds(accesskit_rect(card_rect));
+    });
     if action == ScreenAction::None && card_click.clicked() && !action_control_hovered {
         action = card_click_action;
     }
@@ -4233,7 +4299,7 @@ fn show_local_model_details_drawer(
                             Layout::left_to_right(Align::Center),
                             |ui| {
                             let remove_reason = (!model.removal_supported).then_some("This model is not an app-managed download and cannot be removed here.")
-                                .or_else(|| (model.active && !can_replace_active).then_some("Install another ready model before removing the active model."));
+                                .or_else(|| (model.selected && !can_replace_active).then_some("Install another ready model before removing the selected model."));
                             let remove = compact_model_icon_action(ui, Icon::Trash, "Remove model from device", remove_reason.is_none(), remove_reason, None);
                             if remove_reason.is_none() {
                                 mark_accesskit_enabled(ui, &remove);
@@ -7111,6 +7177,7 @@ mod tests {
             display_name: "whisper.cpp base.en".into(),
             variant_label: "base.en".into(),
             installed: true,
+            selected: true,
             active: true,
             ready: true,
             primary_action_label: "Active".into(),
@@ -7159,11 +7226,61 @@ mod tests {
         assert!(remove.is_disabled());
         assert_eq!(
             remove.description(),
-            Some("Install another ready model before removing the active model.")
+            Some("Install another ready model before removing the selected model.")
         );
         assert!(nodes.iter().any(|(_, node)| {
             node.name() == Some("Collapse comparison") && node.is_expanded() == Some(true)
         }));
+    }
+
+    #[test]
+    fn selected_unavailable_model_keeps_its_state_and_blocks_removal() {
+        let model = ModelViewModel {
+            id: "base.en".into(),
+            display_name: "whisper.cpp base.en".into(),
+            variant_label: "base.en".into(),
+            installed: true,
+            selected: true,
+            primary_action_label: "Upgrade model".into(),
+            primary_action_enabled: true,
+            primary_action_installs_upgrade: true,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[model],
+                        model_catalog: &[],
+                        comparison: &Default::default(),
+                        model_management: &Default::default(),
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::StaticText
+                && node.name() == Some("Selected · unavailable")
+        }));
+        let (_, remove) = nodes
+            .iter()
+            .find(|(_, node)| node.name() == Some("Remove whisper.cpp base.en from device"))
+            .expect("selected unavailable removal action");
+        assert!(remove.is_disabled());
+        assert_eq!(
+            remove.description(),
+            Some("Install another ready model before removing the selected model.")
+        );
     }
 
     #[test]

@@ -218,6 +218,7 @@ fn model(
         display_name: display_name.into(),
         variant_label: variant_label.into(),
         installed: true,
+        selected: active,
         active,
         ready: true,
         recommended,
@@ -1797,6 +1798,66 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_legacy_installed_card_starts_its_real_upgrade() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = Fixture::ModelsInstalled.page();
+        let legacy = data
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .expect("installed tiny model");
+        legacy.ready = false;
+        legacy.selected = true;
+        legacy.primary_action_label = "Upgrade model".into();
+        legacy.primary_action_enabled = true;
+        legacy.primary_action_installs_upgrade = true;
+
+        let (initial, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
+        let point = egui::pos2(card.x0 as f32 + 96.0, ((card.y0 + card.y1) / 2.0) as f32);
+        let (_, press_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press_action, ScreenAction::None);
+        let (_, release_action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            width,
+            height,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(release_action, ScreenAction::UpgradeModel("tiny.en".into()));
+    }
+
+    #[test]
     fn remove_dialog_cancel_moves_focus_to_the_models_toolbar() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
@@ -2468,7 +2529,7 @@ mod tests {
                 node.name() == Some("Remove model from device")
                     && node.is_disabled()
                     && node.description()
-                        == Some("Install another ready model before removing the active model.")
+                        == Some("Install another ready model before removing the selected model.")
             });
         assert!(
             has_disabled_remove,

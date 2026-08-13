@@ -270,6 +270,9 @@ pub(crate) struct ModelViewModel {
     pub artifact_filename: Option<String>,
     pub artifact_path: Option<String>,
     pub installed: bool,
+    /// The model selected in Settings. A selected model can be temporarily
+    /// unavailable while its runtime or a legacy artifact is being repaired.
+    pub selected: bool,
     pub active: bool,
     pub ready: bool,
     pub recommended: bool,
