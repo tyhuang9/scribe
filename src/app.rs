@@ -8292,9 +8292,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetModelLanguageFilter(_)
             | ScreenAction::ToggleInstalledModels
             | ScreenAction::ToggleAvailableModels
-            | ScreenAction::FocusModelCard(_)
-            | ScreenAction::AcknowledgeModelCardFocus(_)
-            | ScreenAction::AcknowledgeModelControlFocus { .. }
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -9251,7 +9248,6 @@ impl LocalTranscriberApp {
             }
             ScreenAction::CloseModelDialog => match self.model_management.dialog.take() {
                 Some(ModelDialog::Add) => self.model_management.restore_add_focus = true,
-                Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {}
                 Some(ModelDialog::Remove(id)) => {
                     self.model_management.restore_remove_focus = Some(id);
                     self.model_management.removal_replacement = None;
@@ -9503,18 +9499,6 @@ impl LocalTranscriberApp {
                 if !self.model_management.available_expanded {
                     self.model_management.expanded_model_card = None;
                 }
-            }
-            ScreenAction::FocusModelCard(key) => {
-                self.model_management.focus_model_card = Some(key);
-            }
-            ScreenAction::AcknowledgeModelCardFocus(key) => {
-                if self.model_management.focus_model_card.as_ref() == Some(&key) {
-                    self.model_management.focus_model_card = None;
-                }
-            }
-            ScreenAction::AcknowledgeModelControlFocus { model_id, control } => {
-                self.model_management
-                    .acknowledge_control_focus(&model_id, control);
             }
             ScreenAction::RetryRemoteCatalog => {
                 self.remote_catalog.force_refresh_requested = true;
@@ -10505,9 +10489,6 @@ impl LocalTranscriberApp {
             | ScreenAction::SetModelLanguageFilter(_)
             | ScreenAction::ToggleInstalledModels
             | ScreenAction::ToggleAvailableModels
-            | ScreenAction::FocusModelCard(_)
-            | ScreenAction::AcknowledgeModelCardFocus(_)
-            | ScreenAction::AcknowledgeModelControlFocus { .. }
             | ScreenAction::RetryRemoteCatalog
             | ScreenAction::InstallRemoteCatalogVariant { .. }
             | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -15853,6 +15834,7 @@ mod layout_tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn blocked_model_selection_keeps_the_details_dialog_open() {
         let mut app = test_app();
         let selected = app.config.general.selected_default_model.clone();

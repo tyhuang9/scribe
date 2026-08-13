@@ -325,11 +325,6 @@ impl ModelViewModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelDialog {
     Add,
-    Details(String),
-    RemoteDetails {
-        entry_id: String,
-        variant_id: String,
-    },
     Remove(String),
 }
 
@@ -342,12 +337,6 @@ pub(crate) enum ModelCardKey {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ModelCardControl {
-    Details,
-    Remove,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
@@ -358,9 +347,7 @@ pub(crate) struct ModelManagementState {
     pub restore_add_focus: bool,
     /// After removing a model, focus a control which remains in the Models page.
     pub restore_after_removal_focus: bool,
-    pub restore_details_focus: Option<String>,
     pub restore_remove_focus: Option<String>,
-    pub focus_model_card: Option<ModelCardKey>,
     /// The deterministic ready replacement named in an active-model removal confirmation.
     pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
@@ -376,25 +363,11 @@ impl Default for ModelManagementState {
             focus_dialog_initial: false,
             restore_add_focus: false,
             restore_after_removal_focus: false,
-            restore_details_focus: None,
             restore_remove_focus: None,
-            focus_model_card: None,
             removal_replacement: None,
             mutation_block_reason: None,
             installed_expanded: true,
             available_expanded: true,
-        }
-    }
-}
-
-impl ModelManagementState {
-    pub(crate) fn acknowledge_control_focus(&mut self, model_id: &str, control: ModelCardControl) {
-        let pending = match control {
-            ModelCardControl::Details => &mut self.restore_details_focus,
-            ModelCardControl::Remove => &mut self.restore_remove_focus,
-        };
-        if pending.as_deref() == Some(model_id) {
-            *pending = None;
         }
     }
 }

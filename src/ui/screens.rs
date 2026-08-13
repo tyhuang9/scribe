@@ -13,7 +13,7 @@ use super::{
         ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
-        ComparisonPhase, ComparisonResultPhase, ModelCapabilities, ModelCardControl, ModelCardKey,
+        ComparisonPhase, ComparisonResultPhase, ModelCapabilities, ModelCardKey,
         ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
         ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
         RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
@@ -260,12 +260,6 @@ pub(crate) enum ScreenAction {
     SetModelLanguageFilter(ModelLanguageFilter),
     ToggleInstalledModels,
     ToggleAvailableModels,
-    FocusModelCard(ModelCardKey),
-    AcknowledgeModelCardFocus(ModelCardKey),
-    AcknowledgeModelControlFocus {
-        model_id: String,
-        control: ModelCardControl,
-    },
     RetryRemoteCatalog,
     InstallRemoteCatalogVariant {
         remote_model_id: String,
@@ -1437,206 +1431,12 @@ const MODEL_COMPARISON_BOTTOM_GAP: f32 = 24.0;
 const MODEL_LIST_TO_DOCK_GAP: f32 = 24.0;
 const MODEL_COMPARISON_COLLAPSED_HEIGHT: f32 = 82.0;
 const COMPARISON_TABLE_MIN_WIDTH: f32 = 1_000.0;
-const MODEL_CARD_HEIGHT: f32 = 76.0;
-// The compact phone composition preserves the two 44px action targets and gives
-// the identity, language/size, and metric lines room to remain legible.
-const MODEL_CARD_NARROW_HEIGHT: f32 = 104.0;
-const MODEL_CARD_VERY_NARROW_HEIGHT: f32 = 124.0;
 const MODEL_CARD_GAP: f32 = 8.0;
 const MODEL_CARD_HORIZONTAL_INSET: f32 = 16.0;
 const MODEL_CARD_VERTICAL_INSET: f32 = 8.0;
-const MODEL_DETAILS_COLUMN_WIDTH: f32 = 44.0;
-const MODEL_ACTION_COLUMN_WIDTH: f32 = 44.0;
 const MODEL_RATING_METER_WIDTH: f32 = 62.0;
 const MODEL_RATING_LABEL_WIDTH: f32 = 72.0;
 const MODEL_RATING_GAP: f32 = 6.0;
-const DETAILS_DRAWER_INSET: f32 = 8.0;
-const DETAILS_DRAWER_MARGIN: f32 = 16.0;
-const DETAILS_DRAWER_HEADER_HEIGHT: f32 = 52.0;
-const DETAILS_DRAWER_FOOTER_HEIGHT: f32 = 44.0;
-const DETAILS_DRAWER_STAT_HEIGHT: f32 = 70.0;
-const MODEL_FOCUS_VISIBILITY_TOLERANCE: f32 = 1.0;
-const MODEL_FOCUSED_CARD_MEMORY: &str = "models-focused-card-memory";
-
-/// The medium and wide list layouts use the same physical track sizes for
-/// every row and its heading. Keeping this as one projection prevents a long
-/// model name, language label, or rating label from shifting any column.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ModelCardColumnLayout {
-    identity: f32,
-    languages: f32,
-    speed: f32,
-    accuracy: f32,
-    size: f32,
-    details: f32,
-    action: f32,
-}
-
-/// The physical cell rectangles for a desktop model row. Headers and row
-/// contents deliberately derive from this one splitter rather than a flow
-/// layout: a label or meter may be wider than its ideal content, but it can
-/// never push a following column out of alignment.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ModelCardColumnRects {
-    identity: egui::Rect,
-    languages: egui::Rect,
-    speed: egui::Rect,
-    accuracy: egui::Rect,
-    size: egui::Rect,
-    details: egui::Rect,
-    action: egui::Rect,
-}
-
-#[cfg(test)]
-impl ModelCardColumnLayout {
-    fn total_width(self) -> f32 {
-        self.identity
-            + self.languages
-            + self.speed
-            + self.accuracy
-            + self.size
-            + self.details
-            + self.action
-    }
-}
-
-fn model_card_column_layout(row_width: f32) -> Option<ModelCardColumnLayout> {
-    if row_width < 760.0 {
-        return None;
-    }
-
-    let wide = row_width >= 1_100.0;
-    let languages = if wide { 190.0 } else { 128.0 };
-    let metric = if wide { 175.0 } else { 92.0 };
-    let size = if wide { 100.0 } else { 72.0 };
-    let content_width = row_width - MODEL_CARD_HORIZONTAL_INSET * 2.0;
-    let fixed_width =
-        languages + metric * 2.0 + size + MODEL_DETAILS_COLUMN_WIDTH + MODEL_ACTION_COLUMN_WIDTH;
-    let identity = content_width - fixed_width;
-
-    (identity >= 0.0).then_some(ModelCardColumnLayout {
-        identity,
-        languages,
-        speed: metric,
-        accuracy: metric,
-        size,
-        details: MODEL_DETAILS_COLUMN_WIDTH,
-        action: MODEL_ACTION_COLUMN_WIDTH,
-    })
-}
-
-fn model_card_content_rect(card_rect: egui::Rect) -> egui::Rect {
-    card_rect.shrink2(Vec2::new(
-        MODEL_CARD_HORIZONTAL_INSET,
-        MODEL_CARD_VERTICAL_INSET,
-    ))
-}
-
-fn model_card_column_rects(
-    content_rect: egui::Rect,
-    columns: ModelCardColumnLayout,
-) -> ModelCardColumnRects {
-    let mut left = content_rect.left();
-    let mut next = |width| {
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(left, content_rect.top()),
-            Vec2::new(width, content_rect.height()),
-        );
-        left += width;
-        rect
-    };
-    ModelCardColumnRects {
-        identity: next(columns.identity),
-        languages: next(columns.languages),
-        speed: next(columns.speed),
-        accuracy: next(columns.accuracy),
-        size: next(columns.size),
-        details: next(columns.details),
-        action: next(columns.action),
-    }
-}
-
-fn model_card_cell_clip_rect(card_rect: egui::Rect, cell_rect: egui::Rect) -> egui::Rect {
-    cell_rect.intersect(card_rect.shrink(1.0))
-}
-
-fn model_row_width(ui: &egui::Ui) -> f32 {
-    ui.available_width()
-        .min((ui.ctx().screen_rect().right() - ui.cursor().left()).max(0.0))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct DetailsDrawerLayout {
-    content_width: f32,
-    content_height: f32,
-    body_height: f32,
-    position: egui::Pos2,
-}
-
-fn details_drawer_layout(screen: egui::Rect) -> DetailsDrawerLayout {
-    let outer_width = if screen.width() < 720.0 {
-        (screen.width() - DETAILS_DRAWER_INSET * 2.0).max(0.0)
-    } else {
-        (screen.width() * 0.42)
-            .clamp(420.0, 580.0)
-            .min((screen.width() - DETAILS_DRAWER_INSET * 2.0).max(0.0))
-    };
-    let outer_height = (screen.height() - DETAILS_DRAWER_INSET * 2.0).max(0.0);
-    let content_width = (outer_width - DETAILS_DRAWER_MARGIN * 2.0).max(0.0);
-    let content_height = (outer_height - DETAILS_DRAWER_MARGIN * 2.0).max(0.0);
-    let body_height =
-        (content_height - DETAILS_DRAWER_HEADER_HEIGHT - DETAILS_DRAWER_FOOTER_HEIGHT - 20.0)
-            .max(0.0);
-    DetailsDrawerLayout {
-        content_width,
-        content_height,
-        body_height,
-        position: egui::pos2(
-            screen.right() - outer_width - DETAILS_DRAWER_INSET,
-            screen.top() + DETAILS_DRAWER_INSET,
-        ),
-    }
-}
-
-fn render_model_column_header_cell(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    label: &str,
-    alignment: Align,
-) {
-    let colors = ui_palette(ui);
-    let mut cell_ui = ui.child_ui(rect, Layout::top_down(alignment));
-    cell_ui.set_clip_rect(rect);
-    cell_ui.add(
-        egui::Label::new(
-            RichText::new(label)
-                .small()
-                .color(colors.muted_text)
-                .strong(),
-        )
-        .truncate(true),
-    );
-}
-
-fn render_model_column_headers(ui: &mut egui::Ui) {
-    let row_width = model_row_width(ui);
-    let Some(columns) = model_card_column_layout(row_width) else {
-        return;
-    };
-    let (header_rect, _) = ui.allocate_exact_size(Vec2::new(row_width, 16.0), Sense::hover());
-    let content_rect = header_rect.shrink2(Vec2::new(MODEL_CARD_HORIZONTAL_INSET, 0.0));
-    let cells = model_card_column_rects(content_rect, columns);
-    for (rect, label, alignment) in [
-        (cells.identity, "MODEL", Align::LEFT),
-        (cells.languages, "LANGUAGES", Align::Center),
-        (cells.speed, "SPEED", Align::Center),
-        (cells.accuracy, "ACCURACY", Align::Center),
-        (cells.size, "SIZE", Align::Center),
-    ] {
-        render_model_column_header_cell(ui, rect, label, alignment);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum ModelCard<'a> {
     Local(&'a ModelViewModel),
@@ -1708,14 +1508,10 @@ impl ModelCard<'_> {
 
 struct ModelCardRenderResult {
     action: ScreenAction,
-    primary_has_focus: bool,
 }
 
 struct ModelSectionFocus<'a> {
-    card: Option<&'a ModelCardKey>,
-    restore_remove: Option<&'a str>,
     expanded: Option<&'a ModelCardKey>,
-    visible_rect: egui::Rect,
     can_replace_active: bool,
 }
 
@@ -1802,6 +1598,15 @@ fn formatted_language_summary(languages: &[String]) -> String {
     }
 }
 
+fn model_language_summary(languages: &[String]) -> (&'static str, String) {
+    let summary = formatted_language_summary(languages);
+    if summary == "â€”" {
+        ("Languages unavailable", summary)
+    } else {
+        ("Languages", summary)
+    }
+}
+
 fn normalized_languages(languages: &[String]) -> Vec<String> {
     languages
         .iter()
@@ -1863,6 +1668,7 @@ fn acceleration_label(capabilities: ModelCapabilities) -> Option<&'static str> {
 }
 
 #[allow(dead_code)]
+#[cfg(any())]
 fn accuracy_label(guidance: &str) -> String {
     accuracy_rating(guidance).map_or_else(
         || "Not rated".to_owned(),
@@ -1878,6 +1684,10 @@ fn rating_meter(
 ) {
     let colors = ui_palette(ui);
     let label = rating.map_or("Not rated", |(_, label)| label);
+    let accessible_name = rating.map_or_else(
+        || format!("{name}: Not rated"),
+        |(value, label)| format!("{name}: {label} ({} of 5)", value.min(5)),
+    );
     let content_width = MODEL_RATING_METER_WIDTH
         + if show_label {
             MODEL_RATING_GAP + MODEL_RATING_LABEL_WIDTH
@@ -1908,10 +1718,10 @@ fn rating_meter(
                 );
             }
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Label, format!("{name}: {label}"))
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, accessible_name.clone())
             });
             ui.ctx().accesskit_node_builder(response.id, |builder| {
-                builder.set_name(format!("{name}: {label}"))
+                builder.set_name(accessible_name.clone())
             });
             if show_label {
                 ui.add_sized(
@@ -1927,6 +1737,7 @@ fn rating_meter(
 /// Paint a rating inside an already allocated model-grid cell. The row grid is
 /// absolute, so the meter must not allocate from a parent flow layout: doing
 /// so lets its label consume width intended for the next logical column.
+#[cfg(any())]
 fn rating_meter_in_rect(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -1990,6 +1801,7 @@ fn rating_meter_in_rect(
     });
 }
 
+#[cfg(any())]
 fn render_model_grid_label(ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id, text: &str) {
     let colors = ui_palette(ui);
     let response = ui.interact(rect, id, Sense::hover());
@@ -2033,6 +1845,7 @@ fn model_row_description(card: ModelCard<'_>) -> String {
 }
 
 #[allow(dead_code)]
+#[cfg(any())]
 fn model_capability_label(model: &ModelViewModel) -> &'static str {
     if model.capabilities.streaming_preview {
         "Streaming"
@@ -2166,6 +1979,7 @@ fn model_lifecycle_button(
     response
 }
 
+#[cfg(any())]
 fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &str) {
     let colors = ui_palette(ui);
     ui.horizontal(|ui| {
@@ -2211,6 +2025,263 @@ fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &s
     });
 }
 
+fn render_unified_model_card(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    expanded: bool,
+    can_replace_active: bool,
+) -> ModelCardRenderResult {
+    let colors = ui_palette(ui);
+    let card_key = card.key();
+    let (name, languages, size, active, description) = match card {
+        ModelCard::Local(model) => (
+            &model.display_name,
+            &model.languages,
+            model
+                .total_bytes
+                .or(model.disk_bytes)
+                .map_or_else(|| "Size unavailable".to_owned(), format_bytes),
+            model.active,
+            model_row_description(card),
+        ),
+        ModelCard::Remote(entry, variant) => (
+            &entry.display_name,
+            &entry.languages,
+            variant.size_label.clone(),
+            false,
+            model_row_description(card),
+        ),
+    };
+    let (row_action, row_name, row_enabled, row_reason, lifecycle_label) = match card {
+        ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => (
+            ScreenAction::CancelModelInstall(model.id.clone()),
+            format!("Cancel {} download", model.display_name),
+            model.cancel_supported,
+            model.primary_action_disabled_reason.as_deref(),
+            "Cancel",
+        ),
+        ModelCard::Local(model)
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Queued
+                    | ModelDownloadState::Verifying
+                    | ModelDownloadState::Extracting
+            ) =>
+        {
+            (
+                ScreenAction::None,
+                format!("Installing {}", model.display_name),
+                false,
+                Some("Scribe is preparing the model and cannot cancel this step."),
+                "Installingâ€¦",
+            )
+        }
+        ModelCard::Local(model) if model.installed => {
+            let reason = (!model.removal_supported)
+                .then_some("This model is not an app-managed download and cannot be removed here.")
+                .or_else(|| {
+                    (model.selected && !can_replace_active).then_some(
+                        "Install another ready model before removing the selected model.",
+                    )
+                });
+            (
+                ScreenAction::RequestModelRemoval(model.id.clone()),
+                format!("Uninstall {}", model.display_name),
+                reason.is_none(),
+                reason,
+                if model.primary_action_installs_upgrade {
+                    "Upgrade"
+                } else if model.primary_action_repairs_runtime {
+                    "Repair"
+                } else {
+                    "Uninstall"
+                },
+            )
+        }
+        ModelCard::Local(model) => {
+            let label = match model.download_state {
+                ModelDownloadState::Failed => "Retry",
+                ModelDownloadState::Cancelled => "Resume",
+                _ => "Install",
+            };
+            (
+                ScreenAction::InstallModel(model.id.clone()),
+                format!("{label} {}", model.display_name),
+                model.install_action_enabled,
+                model.primary_action_disabled_reason.as_deref().or_else(|| {
+                    (!model.install_supported)
+                        .then_some("This model has no supported managed download in this build.")
+                }),
+                label,
+            )
+        }
+        ModelCard::Remote(entry, variant) => {
+            let remote = variant
+                .actions
+                .iter()
+                .find(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. }))
+                .or_else(|| remote_primary_action(variant));
+            (
+                remote.map_or(ScreenAction::None, |action| {
+                    screen_action_for_remote_catalog_action(&action.kind)
+                }),
+                remote.map_or_else(
+                    || format!("Install {}", entry.display_name),
+                    |action| action.label.clone(),
+                ),
+                remote.is_some_and(|action| action.enabled),
+                remote.and_then(|action| action.disabled_reason.as_deref()),
+                remote.map_or("Install", |action| action.label.as_str()),
+            )
+        }
+    };
+    let summary_action = match card {
+        ModelCard::Local(model) if model.installed && model.ready && !model.active => {
+            ScreenAction::SelectModel(model.id.clone())
+        }
+        ModelCard::Local(model)
+            if model.installed
+                && !model.ready
+                && model.primary_action_enabled
+                && (model.primary_action_installs_upgrade
+                    || model.primary_action_repairs_runtime) =>
+        {
+            local_model_primary_action(model)
+        }
+        _ => ScreenAction::ToggleModelCardDetails(card_key.clone()),
+    };
+    let mut action = ScreenAction::None;
+    let frame = Frame::none()
+        .fill(colors.card_bg)
+        .stroke(Stroke::new(1.0, colors.border))
+        .rounding(Rounding::same(9.0))
+        .inner_margin(Margin::symmetric(
+            MODEL_CARD_HORIZONTAL_INSET,
+            MODEL_CARD_VERTICAL_INSET,
+        ))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let details_name = format!(
+                    "{} details for {name}",
+                    if expanded { "Collapse" } else { "Expand" }
+                );
+                let details = compact_model_icon_action(
+                    ui,
+                    if expanded {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    },
+                    &details_name,
+                    true,
+                    None,
+                    None,
+                );
+                ui.ctx()
+                    .accesskit_node_builder(details.id, |builder| builder.set_expanded(expanded));
+                if details.clicked() {
+                    action = ScreenAction::ToggleModelCardDetails(card_key.clone());
+                }
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(icon_glyph(if active {
+                                Icon::CheckCircle
+                            } else {
+                                Icon::Waveform
+                            }))
+                            .color(if active {
+                                colors.success
+                            } else {
+                                colors.muted_text
+                            }),
+                        );
+                        let summary = ui.add(
+                            egui::Label::new(RichText::new(name).strong()).sense(Sense::click()),
+                        );
+                        if summary.clicked() {
+                            action = summary_action.clone();
+                        }
+                        if active {
+                            installed_model_badge(
+                                ui,
+                                "Active",
+                                ui.cursor().top(),
+                                colors.success,
+                                colors.success_text,
+                            );
+                        }
+                    });
+                    if !expanded {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&description).small().color(colors.muted_text),
+                            )
+                            .truncate(true),
+                        );
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let lifecycle = model_lifecycle_button(
+                        ui,
+                        lifecycle_label,
+                        &row_name,
+                        row_enabled,
+                        row_reason,
+                    );
+                    if lifecycle.clicked() && row_enabled {
+                        action = row_action.clone();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let (language_name, language_summary) = model_language_summary(languages);
+                ui.label(RichText::new(icon_glyph(Icon::Globe)).color(colors.muted_text));
+                let language = ui.label(
+                    RichText::new(language_summary)
+                        .small()
+                        .color(colors.muted_text),
+                );
+                ui.ctx()
+                    .accesskit_node_builder(language.id, |builder| builder.set_name(language_name));
+                ui.label(RichText::new(size).small().color(colors.muted_text));
+                rating_meter(
+                    ui,
+                    "Speed",
+                    match card {
+                        ModelCard::Local(model) => speed_rating(model.speed_tier),
+                        ModelCard::Remote(_, _) => None,
+                    },
+                    false,
+                );
+                rating_meter(
+                    ui,
+                    "Accuracy",
+                    match card {
+                        ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
+                        ModelCard::Remote(_, _) => None,
+                    },
+                    false,
+                );
+            });
+            if expanded {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                render_inline_model_details(ui, card, can_replace_active, &mut action);
+            }
+        });
+    ui.ctx()
+        .accesskit_node_builder(frame.response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Group);
+            builder.set_name(format!("{name} model"));
+            builder.set_bounds(accesskit_rect(frame.response.rect));
+        });
+    ModelCardRenderResult { action }
+}
+
+#[cfg(any())]
 fn render_model_card(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
@@ -2726,14 +2797,6 @@ fn render_model_card(
     }
 }
 
-fn is_focus_acknowledgement(action: &ScreenAction) -> bool {
-    matches!(
-        action,
-        ScreenAction::AcknowledgeModelCardFocus(_)
-            | ScreenAction::AcknowledgeModelControlFocus { .. }
-    )
-}
-
 fn render_inline_model_details(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
@@ -2855,16 +2918,13 @@ fn render_inline_model_details(
 }
 
 fn merge_model_action(action: &mut ScreenAction, candidate: ScreenAction) {
-    if candidate == ScreenAction::None
-        || (*action != ScreenAction::None
-            && !is_focus_acknowledgement(action)
-            && is_focus_acknowledgement(&candidate))
-    {
+    if candidate == ScreenAction::None {
         return;
     }
     *action = candidate;
 }
 
+#[cfg(any())]
 fn render_model_page_sentinel(
     ui: &mut egui::Ui,
     section: &str,
@@ -2933,7 +2993,7 @@ fn render_model_section(
     cards: &[ModelCard<'_>],
     expanded: bool,
     toggle_action: Option<ScreenAction>,
-    focus: ModelSectionFocus<'_>,
+    focus: ModelSectionFocus,
     _terminal: bool,
 ) -> ScreenAction {
     let colors = ui_palette(ui);
@@ -2996,15 +3056,7 @@ fn render_model_section(
         let expanded = focus.expanded.is_some_and(|key| card.matches_key(key));
         let rendered = ui
             .push_id(("model-card", card.key()), |ui| {
-                render_model_card(
-                    ui,
-                    card,
-                    focus.card,
-                    focus.restore_remove,
-                    expanded,
-                    focus.visible_rect,
-                    focus.can_replace_active,
-                )
+                render_unified_model_card(ui, card, expanded, focus.can_replace_active)
             })
             .inner;
         merge_model_action(&mut action, rendered.action);
@@ -3124,13 +3176,6 @@ fn models(
     } else {
         MODEL_COMPARISON_COLLAPSED_HEIGHT
     };
-    let mut model_card_focus_rect = ui.clip_rect();
-    model_card_focus_rect.max.y = model_card_focus_rect.max.y.min(
-        comparison_viewport.bottom()
-            - MODEL_COMPARISON_BOTTOM_GAP
-            - comparison_max_height
-            - MODEL_LIST_TO_DOCK_GAP,
-    );
     let result_count = ui.label(
         RichText::new(format!(
             "{} model results: {} installed, {} available.",
@@ -3157,10 +3202,7 @@ fn models(
             management.installed_expanded || search_active,
             (!search_active).then_some(ScreenAction::ToggleInstalledModels),
             ModelSectionFocus {
-                card: management.focus_model_card.as_ref(),
-                restore_remove: management.restore_remove_focus.as_deref(),
                 expanded: management.expanded_model_card.as_ref(),
-                visible_rect: model_card_focus_rect,
                 can_replace_active,
             },
             available_cards.is_empty(),
@@ -3174,43 +3216,13 @@ fn models(
             management.available_expanded || search_active,
             (!search_active).then_some(ScreenAction::ToggleAvailableModels),
             ModelSectionFocus {
-                card: management.focus_model_card.as_ref(),
-                restore_remove: management.restore_remove_focus.as_deref(),
                 expanded: management.expanded_model_card.as_ref(),
-                visible_rect: model_card_focus_rect,
                 can_replace_active,
             },
             true,
         );
         merge_model_action(&mut action, available_action);
     });
-    if action == ScreenAction::None
-        && let Some(import) = import_control.as_ref()
-    {
-        let pending_control = management
-            .restore_details_focus
-            .as_ref()
-            .map(|id| (id, ModelCardControl::Details))
-            .or_else(|| {
-                management
-                    .restore_remove_focus
-                    .as_ref()
-                    .map(|id| (id, ModelCardControl::Remove))
-            });
-        if let Some((model_id, control)) = pending_control {
-            // The drawer disables its invoking row while it is mounted. On
-            // Windows, immediately restoring native AccessKit focus to that
-            // unmounted/remounted row can freeze the host. Return to the
-            // stable Models toolbar instead, while retaining the pending
-            // control acknowledgement for the state machine.
-            import.request_focus();
-            import.scroll_to_me(Some(Align::Center));
-            action = ScreenAction::AcknowledgeModelControlFocus {
-                model_id: model_id.clone(),
-                control,
-            };
-        }
-    }
     let comparison_width =
         (comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0);
     let comparison_surface_id = ui.make_persistent_id("model-comparison-surface");
@@ -3722,51 +3734,6 @@ fn models(
                     });
             }
         }
-        Some(ModelDialog::Details(id)) => {
-            let can_replace_active = models
-                .iter()
-                .filter(|candidate| candidate.installed && candidate.ready && candidate.id != *id)
-                .count()
-                > 0;
-            action = model_catalog
-                .iter()
-                .chain(models.iter())
-                .find(|model| &model.id == id)
-                .map_or(ScreenAction::CloseModelDialog, |model| {
-                    show_local_model_details_drawer(
-                        ui,
-                        model,
-                        management,
-                        dialog_tab_direction,
-                        can_replace_active,
-                    )
-                });
-        }
-        Some(ModelDialog::RemoteDetails {
-            entry_id,
-            variant_id,
-        }) => {
-            let detail = remote_catalog
-                .entries
-                .iter()
-                .find(|entry| &entry.id == entry_id)
-                .and_then(|entry| {
-                    entry
-                        .variants
-                        .iter()
-                        .find(|variant| &variant.id == variant_id)
-                        .map(|variant| (entry, variant))
-                });
-            action = detail.map_or(ScreenAction::CloseModelDialog, |(entry, variant)| {
-                show_remote_model_details_drawer(
-                    ui,
-                    entry,
-                    variant,
-                    management,
-                    dialog_tab_direction,
-                )
-            });
-        }
         Some(ModelDialog::Remove(id)) => {
             if let Some(model) = models.iter().find(|model| &model.id == id) {
                 let mut focusable_controls = Vec::new();
@@ -3887,6 +3854,7 @@ fn mark_accesskit_enabled(ui: &egui::Ui, response: &egui::Response) {
     });
 }
 
+#[cfg(any())]
 fn describe_disabled_control(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -3947,6 +3915,7 @@ fn contain_model_dialog_focus(
 /// Details is primarily a pointer-invoked inspection surface. Do not move
 /// focus to a visible button when it opens or closes; the first Tab press
 /// starts a normal, contained drawer focus sequence instead.
+#[cfg(any())]
 fn contain_details_drawer_focus(
     ctx: &egui::Context,
     tab_backwards: Option<bool>,
@@ -4011,6 +3980,7 @@ fn model_dialog_dismiss_action(
     }
 }
 
+#[cfg(any())]
 fn drawer_outside_was_clicked(ctx: &egui::Context, drawer_rect: egui::Rect) -> bool {
     ctx.input(|input| {
         input.pointer.any_pressed()
@@ -4021,6 +3991,7 @@ fn drawer_outside_was_clicked(ctx: &egui::Context, drawer_rect: egui::Rect) -> b
     })
 }
 
+#[cfg(any())]
 fn drawer_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
     let heading = ui.label(RichText::new(title).small().strong());
     ui.ctx().accesskit_node_builder(heading.id, |builder| {
@@ -4032,6 +4003,7 @@ fn drawer_section(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egu
     ui.add_space(14.0);
 }
 
+#[cfg(any())]
 fn drawer_model_icon(ui: &mut egui::Ui) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
     let visual = egui::Rect::from_center_size(rect.center(), Vec2::splat(40.0));
@@ -4054,6 +4026,7 @@ fn drawer_model_icon(ui: &mut egui::Ui) {
 
 /// Render the drawer header against fixed tracks so the close target remains
 /// anchored to the top-right corner even when a model name is long.
+#[cfg(any())]
 fn model_details_drawer_header(
     ui: &mut egui::Ui,
     title: &str,
@@ -4108,6 +4081,7 @@ fn model_details_drawer_header(
     )
 }
 
+#[cfg(any())]
 fn drawer_stat(ui: &mut egui::Ui, label: &str, value: &str, success: bool) {
     let colors = ui_palette(ui);
     let (rect, response) = ui.allocate_exact_size(
@@ -4148,6 +4122,7 @@ fn drawer_stat(ui: &mut egui::Ui, label: &str, value: &str, success: bool) {
     });
 }
 
+#[cfg(any())]
 fn drawer_stat_row(
     ui: &mut egui::Ui,
     first: (&str, &str, bool),
@@ -4172,6 +4147,7 @@ fn drawer_stat_row(
     }
 }
 
+#[cfg(any())]
 fn show_local_model_details_drawer(
     ui: &mut egui::Ui,
     model: &ModelViewModel,
@@ -4432,6 +4408,7 @@ fn show_local_model_details_drawer(
     action
 }
 
+#[cfg(any())]
 fn show_remote_model_details_drawer(
     ui: &mut egui::Ui,
     entry: &RemoteCatalogEntryView,
@@ -6576,6 +6553,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn model_card_ratings_preserve_an_explicit_not_rated_value() {
         assert_eq!(accuracy_label(""), "Not rated");
         assert_eq!(accuracy_label("unknown"), "Not rated");
@@ -6638,6 +6616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn model_card_columns_fill_the_same_fixed_tracks_as_the_header() {
         for width in [760.0, 960.0, 1_180.0, 1_476.0] {
             let columns = model_card_column_layout(width).expect("desktop grid width");
@@ -6663,6 +6642,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn model_card_cell_rects_share_the_header_column_centers() {
         for width in [760.0, 960.0, 1_180.0, 1_476.0] {
             let columns = model_card_column_layout(width).expect("desktop grid width");
@@ -6696,6 +6676,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn long_model_identity_content_is_clipped_to_its_fixed_column() {
         let width = 1_180.0;
         let card_rect =
@@ -6741,6 +6722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn details_drawer_geometry_is_bounded_at_desktop_and_narrow_widths() {
         let desktop = details_drawer_layout(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -7165,6 +7147,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn model_dialogs_expose_import_progress_and_runtime_disclosure_state() {
         let remote_catalog = RemoteCatalogView {
             local_import: super::super::state::LocalGgufImportView {
