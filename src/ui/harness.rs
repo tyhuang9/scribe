@@ -17,7 +17,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase};
+use super::state::{ComparisonResult, ComparisonResultPhase, ModelCapabilities};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -1567,6 +1567,124 @@ mod tests {
     }
 
     #[test]
+    fn model_card_ratings_render_catalog_values_as_accessible_meters() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.speed_tier = ModelSpeedTier::AccurateSlow;
+        model.accuracy_guidance = "Highest accuracy".into();
+        data.models = vec![model];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        for (name, value) in [
+            ("Speed: Slow (2 of 5)", 2.0),
+            ("Accuracy: Highest (5 of 5)", 5.0),
+        ] {
+            let meter = node_matching(&output, |node| node.name() == Some(name));
+            assert_eq!(meter.role(), egui::accesskit::Role::Meter);
+            assert_eq!(meter.min_numeric_value(), Some(0.0));
+            assert_eq!(meter.max_numeric_value(), Some(5.0));
+            assert_eq!(meter.numeric_value(), Some(value));
+        }
+    }
+
+    #[test]
+    fn install_controls_show_compact_sizes_and_dispatch_local_or_remote_actions() {
+        fn shape_texts(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        shape_texts(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut local = Fixture::ModelsInstalled.data();
+        local.models.clear();
+        let model = ModelViewModel {
+            id: "local-install".into(),
+            display_name: "Local install".into(),
+            total_bytes: Some(1_500_000_000),
+            install_supported: true,
+            install_action_enabled: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        };
+        local.model_catalog = vec![model.clone()];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut local, &mut page, width, height, Vec::new()).0;
+        let install = node_matching(&output, |node| node.name() == Some("Install Local install"));
+        assert!(
+            install
+                .bounds()
+                .is_some_and(|bounds| bounds.width() >= 44.0 && bounds.height() >= 44.0)
+        );
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            shape_texts(&shape.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|text| text.contains("1.5 GB")));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut local,
+                &mut page,
+                width,
+                height,
+                "Install Local install"
+            ),
+            ScreenAction::InstallModel(model.id.clone())
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut remote = Fixture::ModelsInstalled.data();
+        remote.models.clear();
+        remote.model_catalog.clear();
+        remote.remote_catalog.entries[0].variants[0].size_bytes = 82_000_000;
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut remote, &mut page, width, height, Vec::new()).0;
+        let install = node_matching(&output, |node| {
+            node.name() == Some("Install Compact English")
+        });
+        assert!(
+            install
+                .bounds()
+                .is_some_and(|bounds| bounds.width() >= 44.0 && bounds.height() >= 44.0)
+        );
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            shape_texts(&shape.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|text| text.contains("82 MB")));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut remote,
+                &mut page,
+                width,
+                height,
+                "Install Compact English"
+            ),
+            ScreenAction::InstallRemoteCatalogVariant {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            }
+        );
+    }
+
+    #[test]
     fn comparison_panel_stays_near_the_bottom_without_infinite_scroll_spacing() {
         for (fixture, expanded) in [
             (Fixture::ModelsInstalled, false),
@@ -2638,8 +2756,12 @@ mod tests {
                     .any(|(_, node)| node.name() == Some(name))
             );
         }
-        assert!(collapsed_names.iter().any(|name| name == "SPEED"));
-        assert!(collapsed_names.iter().any(|name| name == "ACCURACY"));
+        assert!(
+            !collapsed_names
+                .iter()
+                .any(|name| name == "SPEED" || name == "ACCURACY"),
+            "metric labels are painter-only; the Meter remains the single semantic node"
+        );
         assert!(
             collapsed_names
                 .iter()
@@ -2677,9 +2799,11 @@ mod tests {
         );
         for detail in [
             "REQUIREMENTS",
-            "RAM: 75MB",
-            "Storage: 75MB",
-            "GPU: Not available",
+            "RAM",
+            "75MB",
+            "ON DISK",
+            "GPU",
+            "Unknown",
             "LANGUAGES",
             "English",
             "FEATURES",
@@ -2694,6 +2818,308 @@ mod tests {
             1,
             "the summary row owns the single uninstall action"
         );
+    }
+
+    #[test]
+    fn expanded_requirements_use_distinct_responsive_cells() {
+        let render_expanded = |width, height| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let model = data
+                .models
+                .iter_mut()
+                .find(|model| model.id == "tiny.en")
+                .expect("expanded fixture includes tiny.en");
+            model.estimated_ram_bytes = Some(150_000_000);
+            model.disk_bytes = Some(75_000_000);
+            model.capabilities = ModelCapabilities {
+                capabilities_known: true,
+                ..Default::default()
+            };
+            let mut page = Fixture::ModelsCardExpanded.page();
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0
+        };
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render_expanded(width, height);
+            let card = named_node_bounds(&output, "whisper.cpp tiny.en model");
+            let ram = named_node_bounds(&output, "RAM");
+            let ram_value = named_node_bounds(&output, "150MB");
+            let disk = named_node_bounds(&output, "ON DISK");
+            let disk_value = named_node_bounds(&output, "75MB");
+            let gpu = named_node_bounds(&output, "GPU");
+            let gpu_value = named_node_bounds(&output, "Not supported");
+            for (label, value, name) in [
+                (ram, ram_value, "RAM cell"),
+                (disk, disk_value, "disk cell"),
+                (gpu, gpu_value, "GPU cell"),
+            ] {
+                assert_bounds_within(label, card, name);
+                assert_bounds_within(value, card, name);
+                assert!(
+                    label.y1 <= value.y0 + LAYOUT_TOLERANCE,
+                    "{name} label must sit above its value"
+                );
+            }
+            assert!(ram.x1 <= disk.x0 + LAYOUT_TOLERANCE);
+            assert!(disk.x1 <= gpu.x0 + LAYOUT_TOLERANCE);
+        }
+
+        let compact = render_expanded(375.0, 680.0);
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        let ram = named_node_bounds(&compact, "RAM");
+        let disk = named_node_bounds(&compact, "ON DISK");
+        let gpu = named_node_bounds(&compact, "GPU");
+        for bounds in [ram, disk, gpu] {
+            assert_bounds_within(bounds, card, "compact requirement cell");
+        }
+        assert!(ram.y1 <= disk.y0 + LAYOUT_TOLERANCE);
+        assert!(disk.y1 <= gpu.y0 + LAYOUT_TOLERANCE);
+    }
+
+    #[test]
+    fn model_metric_labels_sit_above_their_continuous_meters() {
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let speed_label = named_node_bounds(&output, "SPEED visible label");
+        let accuracy_label = named_node_bounds(&output, "ACCURACY visible label");
+        let speed_meter = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+        let accuracy_meter = named_node_bounds(&output, "Accuracy: Basic (1 of 5)");
+        assert!(speed_label.y1 <= speed_meter.y0);
+        assert!(accuracy_label.y1 <= accuracy_meter.y0);
+        assert!(speed_meter.x0 < accuracy_meter.x0);
+        assert!(speed_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+        assert!(accuracy_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+    }
+
+    #[test]
+    fn expanded_features_list_every_known_capability_without_summary_truncation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.id = "full-features".into();
+        model.display_name = "Full features".into();
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            native_streaming: true,
+            cancellation: true,
+            timestamps: true,
+            translation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            cpu: true,
+            gpu: true,
+        };
+        data.models = vec![model.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id.clone()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let names = node_names(&output);
+        for capability in [
+            "Batch transcription",
+            "Native streaming",
+            "Cancellation",
+            "Word timestamps",
+            "Translation",
+            "Automatic language detection",
+            "Confidence scores",
+            "Custom vocabulary",
+        ] {
+            assert!(
+                names.iter().any(|name| name.contains(capability)),
+                "missing {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_summary_limits_priority_icons_and_keeps_each_glyph_hover_only() {
+        fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_shapes(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.id = "priority-features".into();
+        model.display_name = "Priority features".into();
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            native_streaming: true,
+            cancellation: true,
+            timestamps: true,
+            translation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            cpu: true,
+            gpu: true,
+        };
+        data.models = vec![model];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let feature_name = "Features: Native streaming, Word timestamps, Translation, Automatic language detection";
+        let feature_group = node_matching(&initial, |node| node.name() == Some(feature_name));
+        assert_eq!(feature_group.role(), egui::accesskit::Role::Group);
+        let nodes = &initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.name() == Some(feature_name))
+                .count(),
+            1
+        );
+        assert!(!nodes.iter().any(|(_, node)| {
+            matches!(
+                node.role(),
+                egui::accesskit::Role::Button | egui::accesskit::Role::Link
+            ) && [
+                "Native streaming",
+                "Word timestamps",
+                "Translation",
+                "Automatic language detection",
+            ]
+            .contains(&node.name().unwrap_or_default())
+        }));
+        let bounds = feature_group.bounds().unwrap();
+        for (index, tooltip) in [
+            "Native streaming",
+            "Word timestamps",
+            "Translation",
+            "Automatic language detection",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let time = index as f64 * 2.0;
+            let _ = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+                Some(time),
+            );
+            let pointer = egui::pos2(
+                bounds.x0 as f32 + 10.0 + index as f32 * 20.0,
+                (bounds.y0 as f32 + bounds.y1 as f32) / 2.0,
+            );
+            let _ = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(pointer)],
+                Some(time + 0.1),
+            );
+            let (hovered, _) = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(pointer)],
+                Some(time + 1.0),
+            );
+            let mut texts = Vec::new();
+            for shape in &hovered.shapes {
+                text_shapes(&shape.shape, &mut texts);
+            }
+            assert!(
+                texts.iter().any(|text| text == tooltip),
+                "missing tooltip {tooltip}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_summary_uses_batch_transcription_as_the_known_fallback() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            ..Default::default()
+        };
+        data.models = vec![model];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let feature_name = "Features: Batch transcription";
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.name() == Some(feature_name))
+                .count(),
+            1
+        );
+        assert_eq!(
+            node_matching(&output, |node| node.name() == Some(feature_name)).role(),
+            egui::accesskit::Role::Group
+        );
+    }
+
+    #[test]
+    fn expanded_features_distinguish_known_empty_from_unknown() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut known_empty = data.models.remove(0);
+        known_empty.id = "known-empty".into();
+        known_empty.display_name = "Known empty".into();
+        known_empty.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            ..Default::default()
+        };
+        let mut unknown = known_empty.clone();
+        unknown.id = "unknown".into();
+        unknown.display_name = "Unknown".into();
+        unknown.capabilities = ModelCapabilities::default();
+        data.models = vec![known_empty.clone(), unknown.clone()];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        for (model, expected) in [
+            (known_empty, "No supported features"),
+            (unknown, "Feature support is unknown"),
+        ] {
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id));
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            assert!(node_names(&output).iter().any(|name| name == expected));
+        }
     }
 
     #[test]
@@ -3214,15 +3640,24 @@ mod tests {
         let names = node_names(&output);
         for detail in [
             "REQUIREMENTS",
-            "RAM: Not available",
-            "Storage: 82 MB",
-            "GPU: Not available",
+            "RAM",
+            "DOWNLOAD SIZE",
+            "82 MB",
+            "GPU",
             "LANGUAGES",
             "English",
             "FEATURES",
         ] {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "Unknown")
+                .count(),
+            2,
+            "the remote RAM and GPU requirement cells each expose Unknown"
+        );
     }
 
     #[test]

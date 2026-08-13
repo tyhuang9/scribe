@@ -318,3 +318,34 @@ The different source and implementation themes and the source's cropped card ver
 - Pointer timing and popup placement at unusual display scales and near viewport edges.
 - Touch input on a Windows touch device.
 final result: passed
+
+---
+
+# Two-column model cards current implementation QA — 2026-08-13
+
+## Evidence
+
+The following native Windows captures were produced from the current staged implementation with the UI harness and inspected at original resolution. The requested client rectangles were verified before every capture.
+
+- 1180 x 815 installed idle: `design-qa-evidence/two-column-1180x815-installed-idle.png`
+- 1180 x 815 installed pointer hover: `design-qa-evidence/two-column-1180x815-installed-hover.png`
+- 1180 x 815 installed keyboard focus: `design-qa-evidence/two-column-1180x815-installed-focus.png`
+- 1180 x 815 expanded top: `design-qa-evidence/two-column-1180x815-expanded-top.png`
+- 1180 x 815 expanded scrolled: `design-qa-evidence/two-column-1180x815-expanded-scrolled.png`
+- 960 x 680 installed idle: `design-qa-evidence/two-column-960x680-installed-idle.png`
+- 960 x 680 installed pointer hover: `design-qa-evidence/two-column-960x680-installed-hover.png`
+- 960 x 680 installed keyboard focus: `design-qa-evidence/two-column-960x680-installed-focus.png`
+- 960 x 680 expanded top: `design-qa-evidence/two-column-960x680-expanded-top.png`
+- 960 x 680 expanded scrolled: `design-qa-evidence/two-column-960x680-expanded-scrolled.png`
+
+## Implementation findings
+
+Implementation-only visual inspection passed with no P0, P1, or P2 finding at either supported native width. Collapsed cards retain the intended identity/metrics hierarchy, keep the Active badge adjacent to the short model name, place SPEED and ACCURACY labels above continuous meters, expose contained red-outline Delete actions and trailing chevrons, and preserve their right edges without horizontal clipping. Pointer-hover captures show the accent border, tint, and elevated shadow. Keyboard-focus captures show both the focused descendant control and the containing card's focus-within surface.
+
+Expanded cards retain the same left and right edges as collapsed neighbors and hide the collapsed preview. Their readable section order is DESCRIPTION, LANGUAGES, FEATURES, REQUIREMENTS, followed by conditional MAINTENANCE when applicable. REQUIREMENTS uses three distinct responsive cells with muted uppercase labels above normal values; the installed fixture renders RAM `75MB`, ON DISK `75MB`, and GPU `Unknown`, which is truthful for its unknown capability metadata. No technical repository, revision, SHA, or architecture metadata and no nested decorative rail are present.
+
+## Source-reference blocker
+
+Source-to-implementation comparison is not verified because the exact newer selected two-column source reference has no local attachment path in this workspace. The older `image-1`, `image-2`, and `image-3` references were not substituted, and no combined reference comparison was created. Reattach or provide the exact path to the newer selected source reference to complete source fidelity review.
+
+final result: blocked

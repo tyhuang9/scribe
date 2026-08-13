@@ -13,12 +13,12 @@ use super::{
         ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
     },
     state::{
-        ComparisonPhase, ComparisonResultPhase, ModelCapabilities, ModelCardKey,
-        ModelComparisonState, ModelDialog, ModelDownloadState, ModelLanguageFilter,
-        ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel, RecordingMode,
-        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
-        RemoteCatalogStatusKind, RemoteCatalogVariantView, RemoteCatalogView, SettingsSaveState,
-        SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, RecordingMode, RemoteCatalogActionKind,
+        RemoteCatalogActionView, RemoteCatalogEntryView, RemoteCatalogStatusKind,
+        RemoteCatalogVariantView, RemoteCatalogView, SettingsSaveState, SettingsTab,
+        TranscriptionPhase, TranscriptionState, UiRoute,
     },
     ui_palette,
 };
@@ -1475,8 +1475,6 @@ const MODEL_CARD_GAP: f32 = 8.0;
 const MODEL_CARD_HORIZONTAL_INSET: f32 = 16.0;
 const MODEL_CARD_VERTICAL_INSET: f32 = 8.0;
 const MODEL_RATING_METER_WIDTH: f32 = 62.0;
-const MODEL_RATING_LABEL_WIDTH: f32 = 72.0;
-const MODEL_RATING_GAP: f32 = 6.0;
 const MODEL_CARD_COMPACT_BREAKPOINT: f32 = 620.0;
 const MODEL_CARD_SHADOW_GUTTER: f32 = 6.0;
 
@@ -1793,15 +1791,6 @@ fn accuracy_rating(guidance: &str) -> Option<(u8, &'static str)> {
     }
 }
 
-fn acceleration_label(capabilities: ModelCapabilities) -> Option<&'static str> {
-    match (capabilities.cpu, capabilities.gpu) {
-        (true, true) => Some("CPU or GPU"),
-        (true, false) => Some("CPU"),
-        (false, true) => Some("GPU"),
-        (false, false) => None,
-    }
-}
-
 fn rating_meter(
     ui: &mut egui::Ui,
     name: &str,
@@ -1813,17 +1802,31 @@ fn rating_meter(
         || format!("{name}: Not rated"),
         |(value, label)| format!("{name}: {label} ({} of 5)", value.min(5)),
     );
-    let content_width = MODEL_RATING_METER_WIDTH
-        + if show_label {
-            MODEL_RATING_GAP + MODEL_RATING_LABEL_WIDTH
-        } else {
-            0.0
-        };
+    let content_height = if show_label { 28.0 } else { 18.0 };
     ui.allocate_ui_with_layout(
-        Vec2::new(content_width, 18.0),
-        Layout::left_to_right(Align::Center),
+        Vec2::new(MODEL_RATING_METER_WIDTH, content_height),
+        Layout::top_down(Align::Min),
         |ui| {
-            ui.spacing_mut().item_spacing.x = MODEL_RATING_GAP;
+            if show_label {
+                let (label_rect, _) = ui
+                    .allocate_exact_size(Vec2::new(MODEL_RATING_METER_WIDTH, 14.0), Sense::hover());
+                ui.painter().text(
+                    label_rect.left_top(),
+                    Align2::LEFT_TOP,
+                    name.to_ascii_uppercase(),
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    colors.muted_text,
+                );
+                #[cfg(test)]
+                ui.ctx().accesskit_node_builder(
+                    ui.make_persistent_id(("model-metric-label", name)),
+                    |builder| {
+                        builder.set_role(egui::accesskit::Role::StaticText);
+                        builder.set_name(format!("{} visible label", name.to_ascii_uppercase()));
+                        builder.set_bounds(accesskit_rect(label_rect));
+                    },
+                );
+            }
             let (rect, response) =
                 ui.allocate_exact_size(Vec2::new(MODEL_RATING_METER_WIDTH, 18.0), Sense::hover());
             let filled = rating.map_or(0.0, |(value, _)| f32::from(value.min(5)) / 5.0);
@@ -1857,17 +1860,6 @@ fn rating_meter(
                     builder.set_numeric_value(f64::from(value.min(5)));
                 }
             });
-            if show_label {
-                ui.add_sized(
-                    Vec2::new(MODEL_RATING_LABEL_WIDTH, 18.0),
-                    egui::Label::new(
-                        RichText::new(name.to_ascii_uppercase())
-                            .small()
-                            .color(colors.muted_text),
-                    )
-                    .truncate(true),
-                );
-            }
         },
     );
 }
@@ -1927,6 +1919,13 @@ struct ModelLifecyclePresentation<'a> {
     enabled: bool,
     disabled_reason: Option<&'a str>,
     compact_size: Option<String>,
+    tone: ModelLifecycleTone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelLifecycleTone {
+    Standard,
+    DestructiveOutline,
 }
 
 fn model_lifecycle_presentation<'a>(
@@ -1943,6 +1942,7 @@ fn model_lifecycle_presentation<'a>(
                 enabled: model.cancel_supported,
                 disabled_reason: model.primary_action_disabled_reason.as_deref(),
                 compact_size: None,
+                tone: ModelLifecycleTone::Standard,
             }
         }
         ModelCard::Local(model)
@@ -1961,6 +1961,7 @@ fn model_lifecycle_presentation<'a>(
                 enabled: false,
                 disabled_reason: Some("Scribe is preparing the model and cannot cancel this step."),
                 compact_size: None,
+                tone: ModelLifecycleTone::Standard,
             }
         }
         ModelCard::Local(model) if model.installed => {
@@ -1982,6 +1983,7 @@ fn model_lifecycle_presentation<'a>(
                     enabled: model.primary_action_enabled,
                     disabled_reason: model.primary_action_disabled_reason.as_deref(),
                     compact_size: None,
+                    tone: ModelLifecycleTone::Standard,
                 }
             } else {
                 let reason = (!model.removal_supported)
@@ -2002,6 +2004,7 @@ fn model_lifecycle_presentation<'a>(
                     enabled: reason.is_none(),
                     disabled_reason: reason,
                     compact_size: None,
+                    tone: ModelLifecycleTone::DestructiveOutline,
                 }
             }
         }
@@ -2036,6 +2039,7 @@ fn model_lifecycle_presentation<'a>(
                     .total_bytes
                     .map(format_compact_artifact_size)
                     .filter(|_| label == "Install"),
+                tone: ModelLifecycleTone::Standard,
             }
         }
         ModelCard::Remote(entry, variant) => {
@@ -2064,6 +2068,7 @@ fn model_lifecycle_presentation<'a>(
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
+                tone: ModelLifecycleTone::Standard,
             }
         }
     }
@@ -2113,6 +2118,123 @@ fn model_summary_features(card: ModelCard<'_>) -> (Vec<(Icon, &'static str)>, bo
     (features, true)
 }
 
+fn model_full_feature_names(card: ModelCard<'_>) -> (Vec<&'static str>, bool) {
+    let capabilities = match card {
+        ModelCard::Local(model) => model.capabilities,
+        ModelCard::Remote(_, variant) => variant.capabilities,
+    };
+    if !capabilities.capabilities_known {
+        return (Vec::new(), false);
+    }
+    (
+        [
+            (capabilities.batch_transcription, "Batch transcription"),
+            (capabilities.native_streaming, "Native streaming"),
+            (capabilities.cancellation, "Cancellation"),
+            (capabilities.timestamps, "Word timestamps"),
+            (capabilities.translation, "Translation"),
+            (
+                capabilities.language_detection,
+                "Automatic language detection",
+            ),
+            (capabilities.confidence_scores, "Confidence scores"),
+            (capabilities.custom_vocabulary, "Custom vocabulary"),
+        ]
+        .into_iter()
+        .filter_map(|(supported, name)| supported.then_some(name))
+        .collect(),
+        true,
+    )
+}
+
+fn model_requirement_cells(card: ModelCard<'_>) -> [(&'static str, String); 3] {
+    let (ram_bytes, storage_label, storage_bytes, capabilities) = match card {
+        ModelCard::Local(model) => (
+            model.estimated_ram_bytes,
+            if model.installed {
+                "ON DISK"
+            } else {
+                "DOWNLOAD SIZE"
+            },
+            if model.installed {
+                model.disk_bytes.or(model.total_bytes)
+            } else {
+                model.total_bytes
+            },
+            model.capabilities,
+        ),
+        ModelCard::Remote(_, variant) => (
+            variant.expected_ram_bytes,
+            "DOWNLOAD SIZE",
+            None,
+            variant.capabilities,
+        ),
+    };
+    let storage = match card {
+        ModelCard::Local(_) => storage_bytes.map(format_bytes),
+        ModelCard::Remote(_, variant) => (!variant.size_label.is_empty())
+            .then(|| variant.size_label.clone())
+            .or_else(|| (variant.size_bytes > 0).then(|| format_bytes(variant.size_bytes))),
+    }
+    .unwrap_or_else(|| "Unknown".into());
+    let gpu = if !capabilities.capabilities_known {
+        "Unknown"
+    } else if capabilities.gpu {
+        "Supported"
+    } else {
+        "Not supported"
+    };
+    [
+        (
+            "RAM",
+            ram_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "Unknown".into()),
+        ),
+        (storage_label, storage),
+        ("GPU", gpu.into()),
+    ]
+}
+
+fn render_model_requirement_cells(ui: &mut egui::Ui, cells: [(&str, String); 3]) {
+    let colors = ui_palette(ui);
+    let width = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let three_columns = width >= 480.0;
+    let cell_width = if three_columns {
+        ((width - gap * 2.0) / 3.0).max(0.0)
+    } else {
+        width
+    };
+    let render_cell = |ui: &mut egui::Ui, label: &str, value: String| {
+        ui.vertical(|ui| {
+            ui.set_min_width(cell_width);
+            ui.label(
+                RichText::new(label)
+                    .small()
+                    .strong()
+                    .color(colors.muted_text),
+            );
+            ui.label(value);
+        });
+    };
+    if three_columns {
+        ui.horizontal(|ui| {
+            for (label, value) in cells {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(cell_width, 0.0),
+                    Layout::top_down(Align::LEFT),
+                    |ui| render_cell(ui, label, value),
+                );
+            }
+        });
+    } else {
+        for (label, value) in cells {
+            render_cell(ui, label, value);
+        }
+    }
+}
+
 fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
     let colors = ui_palette(ui);
     let (features, known) = model_summary_features(card);
@@ -2133,14 +2255,24 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
     let width = (features.len().max(1) as f32 * 20.0).max(44.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::hover());
     if known {
-        for (index, (icon, _)) in features.iter().enumerate() {
-            ui.painter().text(
+        for (index, (icon, feature_name)) in features.iter().enumerate() {
+            let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.left() + 10.0 + index as f32 * 20.0, rect.center().y),
+                Vec2::splat(18.0),
+            );
+            ui.painter().text(
+                icon_rect.center(),
                 Align2::CENTER_CENTER,
                 icon_glyph(*icon),
                 egui::FontId::proportional(16.0),
                 colors.muted_text,
             );
+            ui.interact(
+                icon_rect,
+                response.id.with(("feature-tooltip", index)),
+                Sense::hover(),
+            )
+            .on_hover_text(*feature_name);
         }
     } else {
         ui.painter().text(
@@ -2156,7 +2288,9 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
         builder.set_name(name.as_str());
         builder.set_bounds(accesskit_rect(rect));
     });
-    response.on_hover_text(name);
+    if !known {
+        response.on_hover_text(name);
+    }
 }
 
 fn compact_model_icon_action(
@@ -2223,11 +2357,43 @@ fn model_lifecycle_button(
     accessible_name: &str,
     enabled: bool,
     disabled_reason: Option<&str>,
+    tone: ModelLifecycleTone,
 ) -> egui::Response {
-    let response = ui.add_enabled(
-        enabled && ui.is_enabled(),
-        egui::Button::new(label).min_size(Vec2::new(44.0, 44.0)),
-    );
+    let enabled = enabled && ui.is_enabled();
+    let response = match tone {
+        ModelLifecycleTone::Standard => ui.add_enabled(
+            enabled,
+            egui::Button::new(label).min_size(Vec2::new(44.0, 44.0)),
+        ),
+        ModelLifecycleTone::DestructiveOutline => {
+            let colors = ui_palette(ui);
+            let text = format!("{}  {label}", icon_glyph(Icon::Trash));
+            let galley = ui.painter().layout_no_wrap(
+                text,
+                egui::TextStyle::Button.resolve(ui.style()),
+                colors.error_text,
+            );
+            let visual_size = Vec2::new(galley.size().x + 24.0, 32.0);
+            let (target, response) =
+                ui.allocate_exact_size(Vec2::new(visual_size.x.max(44.0), 44.0), Sense::click());
+            let visual = egui::Rect::from_center_size(target.center(), visual_size);
+            let color = if enabled {
+                colors.error_text
+            } else {
+                colors.muted_text
+            };
+            let fill = if response.hovered() && enabled {
+                colors.error_pale
+            } else {
+                colors.card_bg
+            };
+            ui.painter()
+                .rect(visual, Rounding::same(7.0), fill, Stroke::new(1.0, color));
+            ui.painter()
+                .galley(visual.center() - galley.size() * 0.5, galley, color);
+            response
+        }
+    };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
@@ -2334,8 +2500,11 @@ fn render_model_identity(
     );
     ui.painter().galley(title_pos, galley.clone(), colors.text);
     if active {
-        let badge_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - badge_size.x / 2.0, first_line_center_y),
+        let badge_rect = active_badge_rect(
+            rect,
+            title_pos,
+            galley.rows.first().map_or(0.0, |row| row.rect.width()),
+            first_line_center_y,
             badge_size,
         );
         paint_installed_model_badge(
@@ -2372,6 +2541,21 @@ fn render_model_identity(
         clicked: selectable && response.clicked(),
         has_focus: response.has_focus(),
     }
+}
+
+fn active_badge_rect(
+    identity_rect: egui::Rect,
+    title_pos: egui::Pos2,
+    first_line_width: f32,
+    first_line_center_y: f32,
+    badge_size: Vec2,
+) -> egui::Rect {
+    let left = (title_pos.x + first_line_width + 8.0)
+        .clamp(identity_rect.left(), identity_rect.right() - badge_size.x);
+    egui::Rect::from_min_size(
+        egui::pos2(left, first_line_center_y - badge_size.y / 2.0),
+        badge_size,
+    )
 }
 
 fn render_model_ratings(ui: &mut egui::Ui, card: ModelCard<'_>) {
@@ -2508,15 +2692,21 @@ fn render_unified_model_card(
                                 action: &mut ScreenAction,
                                 restored_remove_focus: &mut bool,
                                 focus_within: &mut bool| {
-            let lifecycle_response = model_lifecycle_button(
-                ui,
-                &lifecycle.compact_size.as_ref().map_or_else(
+            let label = if lifecycle.tone == ModelLifecycleTone::DestructiveOutline {
+                lifecycle.label.clone()
+            } else {
+                lifecycle.compact_size.as_ref().map_or_else(
                     || format!("{}  {}", icon_glyph(lifecycle.icon), lifecycle.label),
                     |size| format!("{}  {size}", icon_glyph(lifecycle.icon)),
-                ),
+                )
+            };
+            let lifecycle_response = model_lifecycle_button(
+                ui,
+                &label,
                 &lifecycle.accessible_name,
                 lifecycle.enabled,
                 lifecycle.disabled_reason,
+                lifecycle.tone,
             );
             *focus_within |= lifecycle_response.has_focus();
             if restore_remove_focus
@@ -2747,66 +2937,17 @@ fn render_inline_model_details(
         });
         ui.add_space(8.0);
         detail_heading(ui, "FEATURES", colors);
-        let (features, known) = model_summary_features(card);
+        let (features, known) = model_full_feature_names(card);
         ui.label(if !known {
             "Feature support is unknown".to_owned()
         } else if features.is_empty() {
             "No supported features".to_owned()
         } else {
-            features
-                .iter()
-                .map(|(_, name)| *name)
-                .collect::<Vec<_>>()
-                .join(", ")
+            features.join(", ")
         });
         ui.add_space(8.0);
         detail_heading(ui, "REQUIREMENTS", colors);
-        let requirements = match card {
-            ModelCard::Local(model) => [
-                (
-                    "RAM",
-                    model
-                        .estimated_ram_bytes
-                        .map(format_bytes)
-                        .unwrap_or_else(|| "Not available".into()),
-                ),
-                (
-                    "Storage",
-                    model
-                        .total_bytes
-                        .or(model.disk_bytes)
-                        .map(format_bytes)
-                        .unwrap_or_else(|| "Not available".into()),
-                ),
-                (
-                    "GPU",
-                    acceleration_label(model.capabilities)
-                        .unwrap_or("Not available")
-                        .to_owned(),
-                ),
-            ],
-            ModelCard::Remote(_, variant) => [
-                (
-                    "RAM",
-                    variant
-                        .expected_ram_bytes
-                        .map(format_bytes)
-                        .unwrap_or_else(|| "Not available".into()),
-                ),
-                ("Storage", variant.size_label.clone()),
-                (
-                    "GPU",
-                    acceleration_label(variant.capabilities)
-                        .unwrap_or("Not available")
-                        .to_owned(),
-                ),
-            ],
-        };
-        ui.horizontal_wrapped(|ui| {
-            for (label, value) in requirements {
-                ui.label(format!("{label}: {value}"));
-            }
-        });
+        render_model_requirement_cells(ui, model_requirement_cells(card));
         match card {
             ModelCard::Local(model) => {
                 let maintenance = model.runtime_action_label.is_some()
@@ -2824,6 +2965,7 @@ fn render_inline_model_details(
                         &runtime_name,
                         model.runtime_action_enabled,
                         model.runtime_action_disabled_reason.as_deref(),
+                        ModelLifecycleTone::Standard,
                     );
                     *focus_within |= response.has_focus();
                     if response.clicked() && model.runtime_action_enabled {
@@ -2838,6 +2980,7 @@ fn render_inline_model_details(
                         &cleanup_name,
                         model.partial_cleanup_enabled,
                         model.partial_cleanup_disabled_reason.as_deref(),
+                        ModelLifecycleTone::Standard,
                     );
                     *focus_within |= cleanup.has_focus();
                     if cleanup.clicked() && model.partial_cleanup_enabled {
@@ -2862,6 +3005,7 @@ fn render_inline_model_details(
                         &removal_name,
                         removal_reason.is_none(),
                         removal_reason,
+                        ModelLifecycleTone::Standard,
                     );
                     *focus_within |= removal.has_focus();
                     if restore_remove_focus {
@@ -2889,6 +3033,7 @@ fn render_inline_model_details(
                         &cleanup_name,
                         cleanup.enabled,
                         cleanup.disabled_reason.as_deref(),
+                        ModelLifecycleTone::Standard,
                     );
                     *focus_within |= response.has_focus();
                     if response.clicked() && cleanup.enabled {
@@ -6025,6 +6170,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_badge_follows_first_title_row_and_stays_bounded() {
+        let identity = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(300.0, 44.0));
+        let badge = Vec2::new(60.0, 22.0);
+        let short = active_badge_rect(identity, egui::pos2(36.0, 30.0), 80.0, 40.0, badge);
+        assert_eq!(short.left(), 124.0);
+        assert_eq!(short.center().y, 40.0);
+        assert!(identity.contains_rect(short));
+
+        let wrapped = active_badge_rect(identity, egui::pos2(36.0, 30.0), 260.0, 40.0, badge);
+        assert_eq!(wrapped.right(), identity.right());
+        assert_eq!(wrapped.center().y, 40.0);
+        assert!(identity.contains_rect(wrapped));
+    }
+
+    #[test]
+    fn stable_delete_uses_destructive_outline_without_changing_action() {
+        let stable = ModelViewModel {
+            id: "stable".into(),
+            installed: true,
+            download_state: ModelDownloadState::Installed,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let stable = model_lifecycle_presentation(ModelCard::Local(&stable), true);
+        assert!(matches!(
+            stable.action,
+            ScreenAction::RequestModelRemoval(_)
+        ));
+        assert_eq!(stable.tone, ModelLifecycleTone::DestructiveOutline);
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let mut expected_error = Color32::PLACEHOLDER;
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected_error = ui_palette(ui).error_text;
+                model_lifecycle_button(
+                    ui,
+                    "Delete",
+                    "Delete stable",
+                    true,
+                    None,
+                    ModelLifecycleTone::DestructiveOutline,
+                );
+            });
+        });
+        let trash = icon_glyph(Icon::Trash);
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().contains("Delete") => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("stable Delete text");
+        assert_eq!(text.galley.text().matches(trash).count(), 1);
+        assert!(text.galley.text().contains("Delete"));
+        let outline = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect)
+                    if rect.stroke == Stroke::new(1.0, expected_error)
+                        && rect.rect.contains_rect(text.visual_bounding_rect()) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("stable Delete error outline");
+        assert!(outline.contains_rect(text.visual_bounding_rect()));
+        let delete = output
+            .platform_output
+            .accesskit_update
+            .expect("Delete accessibility update")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| (node.name() == Some("Delete stable")).then_some(node))
+            .expect("Delete accessibility node");
+        let bounds = delete.bounds().expect("Delete target bounds");
+        assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+
+        for model in [
+            ModelViewModel {
+                installed: true,
+                download_state: ModelDownloadState::Installed,
+                primary_action_installs_upgrade: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                installed: true,
+                download_state: ModelDownloadState::Installed,
+                primary_action_repairs_runtime: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                download_state: ModelDownloadState::Downloading,
+                ..Default::default()
+            },
+            ModelViewModel::default(),
+        ] {
+            assert_eq!(
+                model_lifecycle_presentation(ModelCard::Local(&model), true).tone,
+                ModelLifecycleTone::Standard
+            );
+        }
+    }
+
+    #[test]
     fn model_card_visual_states_keep_geometry_and_use_approved_tokens() {
         let colors = crate::ui::theme::ThemePalette::light();
         let (idle_fill, idle_stroke, idle_shadow) =
@@ -6566,6 +6823,14 @@ mod tests {
         assert_eq!(accuracy_rating("High"), Some((4, "High")));
         assert_eq!(accuracy_rating("Highest"), Some((5, "Highest")));
         assert_eq!(accuracy_rating("marketing copy"), None);
+    }
+
+    #[test]
+    fn compact_artifact_size_uses_whole_mb_below_one_gb_and_one_decimal_above_it() {
+        assert_eq!(format_compact_artifact_size(0), "1 MB");
+        assert_eq!(format_compact_artifact_size(999_999_999), "999 MB");
+        assert_eq!(format_compact_artifact_size(1_000_000_000), "1.0 GB");
+        assert_eq!(format_compact_artifact_size(1_550_000_000), "1.6 GB");
     }
 
     #[test]

@@ -21708,7 +21708,7 @@ mod layout_tests {
                 .iter()
                 .find(|(id, _)| *id == update.focus)
                 .and_then(|(_, node)| node.name())
-                .is_some_and(|name| name.starts_with("Uninstall "))
+                .is_some_and(|name| name.starts_with("Delete "))
         );
         assert!(app.model_management.restore_remove_focus.is_none());
 
@@ -21739,7 +21739,7 @@ mod layout_tests {
                 .iter()
                 .find(|(node_id, _)| *node_id == update.focus)
                 .and_then(|(_, node)| node.name())
-                .is_some_and(|name| name.starts_with("Uninstall "))
+                .is_some_and(|name| name.starts_with("Delete "))
         );
         assert!(app.model_management.restore_remove_focus.is_none());
     }
