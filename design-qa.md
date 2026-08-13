@@ -127,3 +127,65 @@ the normal debug output path. As a result, direct pixel comparison against
 is an evidence gap, not a claim that the visual gate passed. The deterministic
 harness provides `models/lifecycle`, `models/details-drawer`, `history`, and
 `settings/recording` fixtures for the follow-up capture.
+
+---
+
+# Model card redesign: design QA
+
+## Scope
+
+- Branch: `agent/model-card-accordions`
+- Reviewed head: `7975724` (`Keep model route inside native viewport`)
+- Route/state: `models/card-expanded`
+- Supported native viewports: 1180 x 815 and the application minimum of 960 x 680, at Windows 100% display scaling.
+- A 375 px full-shell viewport is intentionally excluded because Scribe enforces a 960 x 680 native minimum. Card-only behavior at 375 px is covered by deterministic component tests.
+
+## Source references
+
+- `C:\Users\huang\.codex\attachments\1364743b-4158-4cb2-b03d-82a39e511f2d\image-1.png` — 769 x 119 px; collapsed installed-card structure.
+- `C:\Users\huang\.codex\attachments\1364743b-4158-4cb2-b03d-82a39e511f2d\image-2.png` — 748 x 92 px; Install/Uninstall action treatment.
+- `C:\Users\huang\.codex\attachments\1364743b-4158-4cb2-b03d-82a39e511f2d\image-3.png` — 756 x 179 px; expanded metadata and description treatment.
+
+The source files are component crops, not full-screen mocks. They were compared against the corresponding model-card regions rather than scaled to the full native window.
+
+## Implementation evidence
+
+- `design-qa-evidence/implementation-1180x815-expanded-v3.png` — 1194 x 853 px outer window; verified client area 1180 x 815.
+- `design-qa-evidence/implementation-960x680-expanded-v3.png` — 974 x 718 px outer window; verified client area 960 x 680.
+- `design-qa-evidence/implementation-1180x815-expanded-v2-scrolled.png` — complete expanded-card body at the standard viewport.
+- `design-qa-evidence/implementation-960x680-expanded-v2-scrolled.png` — complete expanded-card body at the supported minimum viewport.
+- `design-qa-evidence/comparison-source-vs-1180-v2.png` — combined reference/implementation comparison.
+- `design-qa-evidence/comparison-source-vs-960-v2.png` — combined minimum-width comparison.
+
+The application was rebuilt from `7975724` with `--features ui-harness` before the v3 captures. Windows `PrintWindow` succeeded for both windows. Native geometry was measured directly: 1180 x 815 and 960 x 680 client rectangles.
+
+## States reviewed
+
+- Installed inactive card with Uninstall action.
+- Installed active card with the sole Active badge.
+- Expanded installed card with GPU acceleration, RAM usage, file size, full description, full languages, and runtime metadata.
+- Collapsed name/description/language stack with language glyph and abbreviated language.
+- Bar-only speed and accuracy indicators.
+- Trailing collapsed and expanded disclosure controls.
+- Supported wide and minimum-width native layouts.
+
+## Findings and resolution history
+
+1. Resolved: collapsed metadata leaked model size and allowed the globe to wrap away from the language code. The collapsed row now contains one atomic globe-and-language group and no size.
+2. Resolved: expanded statistics ran together. GPU acceleration, RAM usage, and file size now use distinct spaced columns with label/value hierarchy.
+3. Resolved: expanded content repeated Uninstall. The single lifecycle control remains in the card summary.
+4. Resolved: the installing label contained mojibake. It now renders as `Installing...`.
+5. Resolved: the expanded surface previously used redundant framing/separators. Summary and details now share one neutral outer card and one divider, with no colored left rail.
+6. Passed: all lifecycle and disclosure controls are visible and contained at both supported native widths. At 960 px the right outline is visually tight against the client edge, but neither Uninstall nor the trailing chevron is clipped. Automated component bounds tests independently cover the boundary.
+7. Intentional deviation from the references: the meters are unlabeled segmented bars because the user explicitly requested speed and accuracy bars with no visible text. Accessible names and tooltips retain their meaning.
+
+## Remaining enhancements
+
+- P3: if future shell geometry allows it, a little more visual breathing room at the 960 px right edge would be pleasant. This is not a usability or containment defect.
+- Native screen-reader and non-100%-DPI application testing were not performed in this visual pass. Deterministic AccessKit role, name, expanded-state, focus, target-size, and containment tests cover the implemented semantics.
+
+## Verdict
+
+No P0, P1, or P2 visual issue remains in the reviewed supported-width evidence. The model cards match the requested information hierarchy and lifecycle behavior while preserving Scribe's existing design system.
+
+final result: passed
