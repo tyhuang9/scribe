@@ -18,7 +18,9 @@ use thiserror::Error;
 use transcribe_cpp::CancelToken;
 
 use crate::embedded_runtime::{EmbeddedRuntime, TRANSCRIBE_CPP_VERSION};
-use crate::model_catalog::{RuntimeRequirement, RuntimeVersion, runtime_model_manifest};
+use crate::model_catalog::{
+    ArtifactFormat, RuntimeRequirement, RuntimeVersion, runtime_model_manifest,
+};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::transcription::{
     AccelerationPreference, ComputeDevice, ModelId, ResolvedAcceleration, RuntimeCapabilities,
@@ -83,6 +85,7 @@ const COMMON_GGML_DEPENDENCIES: [(&str, &str); 11] = [
 pub(crate) struct RuntimeModel {
     pub id: ModelId,
     pub path: PathBuf,
+    pub format: ArtifactFormat,
     /// Legacy GGML uses a hash-verified package; the safe GGUF route is
     /// statically linked and deliberately has no downloaded runtime package.
     pub package_root: Option<PathBuf>,
@@ -184,6 +187,10 @@ pub(crate) enum RuntimeError {
     UnsupportedModel(ModelId),
     #[error("dedicated native runtime worker is unavailable: {0}")]
     WorkerUnavailable(String),
+    #[error(
+        "legacy GGML model {model_id} at {path} requires a verified whisper.cpp package root; install or repair the compatibility runtime before loading it"
+    )]
+    MissingLegacyPackageRoot { model_id: ModelId, path: PathBuf },
 }
 
 /// Deliberately private: the only Phase 2 selection has one variant.
@@ -211,11 +218,7 @@ fn runtime_kind_for_model(model_id: &ModelId) -> Option<RuntimeKind> {
 }
 
 fn is_gguf_model(model: &RuntimeModel) -> bool {
-    model
-        .path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    model.format == ArtifactFormat::Gguf
 }
 
 /// A remote GGUF is admitted only after `TranscriptionService` has resolved
@@ -609,7 +612,7 @@ impl RouterState {
                 model,
                 acceleration,
                 cancel_generation,
-            ));
+            )?);
         }
         Ok(self
             .transcribe_cpp
@@ -710,14 +713,17 @@ impl TranscribeCppRuntime {
         model: RuntimeModel,
         acceleration: ResolvedAcceleration,
         cancel_generation: Arc<AtomicU64>,
-    ) -> Self {
-        let package = NativePackage::from_root(
+    ) -> Result<Self, RuntimeError> {
+        let package_root =
             model
                 .package_root
                 .clone()
-                .expect("legacy transcribe-cpp runtime requires a package root"),
-        );
-        Self {
+                .ok_or_else(|| RuntimeError::MissingLegacyPackageRoot {
+                    model_id: model.id.clone(),
+                    path: model.path.clone(),
+                })?;
+        let package = NativePackage::from_root(package_root);
+        Ok(Self {
             model,
             package,
             acceleration,
@@ -725,7 +731,7 @@ impl TranscribeCppRuntime {
             last_used_at: None,
             cancel_generation,
             request_cancel_snapshot: None,
-        }
+        })
     }
 
     /// Returns whether a retained model context was reused. The mutex held by
@@ -1384,6 +1390,7 @@ mod tests {
         let first = RuntimeModel {
             id: ModelId::new("first"),
             path: first_path.clone(),
+            format: ArtifactFormat::Gguf,
             package_root: None,
             expected_size_bytes: std::fs::metadata(&first_path).unwrap().len(),
             expected_sha256: sha256_file(&first_path).unwrap(),
@@ -1391,6 +1398,7 @@ mod tests {
         let second = RuntimeModel {
             id: ModelId::new("second"),
             path: second_path.clone(),
+            format: ArtifactFormat::Gguf,
             package_root: None,
             expected_size_bytes: std::fs::metadata(&second_path).unwrap().len(),
             expected_sha256: sha256_file(&second_path).unwrap(),
@@ -1427,6 +1435,54 @@ mod tests {
         RUNTIME_MODEL_VERIFICATION_COUNT.with(|count| assert_eq!(count.get(), 2));
         std::fs::remove_file(first_path).unwrap();
         std::fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn trusted_gguf_format_routes_staged_and_final_paths_to_the_embedded_runtime() {
+        for path in [
+            "whisper-base.en-Q8_0.gguf.partial",
+            "whisper-base.en-Q8_0.gguf",
+        ] {
+            let model = RuntimeModel {
+                id: ModelId::new("trusted-gguf"),
+                path: PathBuf::from(path),
+                format: ArtifactFormat::Gguf,
+                package_root: None,
+                expected_size_bytes: 1,
+                expected_sha256: "0".repeat(64),
+            };
+
+            assert!(is_gguf_model(&model), "{path}");
+            assert!(matches!(
+                runtime_kind_for_runtime_model(&model),
+                Some(RuntimeKind::TranscribeCpp)
+            ));
+        }
+    }
+
+    #[test]
+    fn rootless_legacy_ggml_returns_an_actionable_typed_error() {
+        let model = RuntimeModel {
+            id: ModelId::new("whisper_cpp_base_en"),
+            path: PathBuf::from("ggml-base.en.bin"),
+            format: ArtifactFormat::LegacyGgml,
+            package_root: None,
+            expected_size_bytes: 1,
+            expected_sha256: "0".repeat(64),
+        };
+
+        let Err(error) = TranscribeCppRuntime::new(
+            model,
+            resolve_acceleration(AccelerationPreference::Cpu).unwrap(),
+            Arc::new(AtomicU64::new(0)),
+        ) else {
+            panic!("rootless legacy GGML must fail before runtime construction");
+        };
+        assert!(matches!(
+            error,
+            RuntimeError::MissingLegacyPackageRoot { .. }
+        ));
+        assert!(error.to_string().contains("install or repair"));
     }
 
     #[test]

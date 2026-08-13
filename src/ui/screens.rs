@@ -1712,6 +1712,7 @@ impl ModelCard<'_> {
             {
                 "Verifying"
             }
+            Self::Local(model) if model.primary_action_installs_upgrade => "Upgrade",
             Self::Local(model) if model.installed => "Remove",
             Self::Local(model) if model.download_state == ModelDownloadState::Failed => "Retry",
             Self::Local(model) if model.download_state == ModelDownloadState::Cancelled => "Resume",
@@ -2270,11 +2271,10 @@ fn render_model_card(
         // card's primary click starts it; Details remains available through
         // the separate chevron for inspection and removal.
         ModelCard::Local(model)
-            if model.installed
-                && !model.ready
+            if !model.ready
                 && model.primary_action_enabled
                 && (model.primary_action_installs_upgrade
-                    || model.primary_action_repairs_runtime) =>
+                    || (model.installed && model.primary_action_repairs_runtime)) =>
         {
             local_model_primary_action(model)
         }
@@ -2335,16 +2335,28 @@ fn render_model_card(
             )
         }
         ModelCard::Local(model) => {
-            let verb = match model.download_state {
-                ModelDownloadState::Failed => "Retry",
-                ModelDownloadState::Cancelled => "Resume",
-                _ => "Download",
+            let (action, verb, enabled) = if model.primary_action_installs_upgrade {
+                (
+                    ScreenAction::UpgradeModel(model.id.clone()),
+                    "Upgrade",
+                    model.primary_action_enabled,
+                )
+            } else {
+                (
+                    ScreenAction::InstallModel(model.id.clone()),
+                    match model.download_state {
+                        ModelDownloadState::Failed => "Retry",
+                        ModelDownloadState::Cancelled => "Resume",
+                        _ => "Download",
+                    },
+                    model.install_action_enabled,
+                )
             };
             (
-                ScreenAction::InstallModel(model.id.clone()),
+                action,
                 Icon::Download,
                 format!("{verb} {}", model.display_name),
-                model.install_action_enabled,
+                enabled,
                 model.primary_action_disabled_reason.as_deref().or_else(|| {
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
@@ -3146,11 +3158,8 @@ fn models(
                     .map(|id| (id, ModelCardControl::Remove))
             });
         if let Some((model_id, control)) = pending_control {
-            // The drawer disables its invoking row while it is mounted. On
-            // Windows, immediately restoring native AccessKit focus to that
-            // unmounted/remounted row can freeze the host. Return to the
-            // stable Models toolbar instead, while retaining the pending
-            // control acknowledgement for the state machine.
+            // Immediately focusing a just-remounted card control can freeze
+            // Windows AccessKit. Keep the existing stable toolbar fallback.
             import.request_focus();
             import.scroll_to_me(Some(Align::Center));
             action = ScreenAction::AcknowledgeModelControlFocus {
@@ -3716,7 +3725,11 @@ fn models(
             });
         }
         Some(ModelDialog::Remove(id)) => {
-            if let Some(model) = models.iter().find(|model| &model.id == id) {
+            if let Some(model) = models
+                .iter()
+                .chain(model_catalog.iter())
+                .find(|model| &model.id == id)
+            {
                 let mut focusable_controls = Vec::new();
                 let mut initial_focus = None;
                 let dialog_accessibility_id =
@@ -3892,36 +3905,22 @@ fn contain_model_dialog_focus(
     ctx.memory_mut(|memory| memory.request_focus(target));
 }
 
-/// Details is primarily a pointer-invoked inspection surface. Do not move
-/// focus to a visible button when it opens or closes; the first Tab press
-/// starts a normal, contained drawer focus sequence instead.
+/// Details uses the same focus contract as the other modal model surfaces:
+/// focus a stable control on open and repair any escape back into its ring.
 fn contain_details_drawer_focus(
     ctx: &egui::Context,
     tab_backwards: Option<bool>,
     controls: &[egui::Id],
-    clear_initial_focus: bool,
+    initial_focus: Option<egui::Id>,
+    request_initial_focus: bool,
 ) {
-    if clear_initial_focus {
-        ctx.memory_mut(|memory| {
-            if let Some(focused) = memory.focused() {
-                memory.surrender_focus(focused);
-            }
-        });
-        return;
-    }
-
-    let Some(first) = controls.first().copied() else {
-        return;
-    };
-    let Some(backwards) = tab_backwards else {
-        return;
-    };
-    let target = if backwards {
-        controls.last().copied().unwrap_or(first)
-    } else {
-        first
-    };
-    ctx.memory_mut(|memory| memory.request_focus(target));
+    contain_model_dialog_focus(
+        ctx,
+        tab_backwards,
+        controls,
+        initial_focus,
+        request_initial_focus,
+    );
 }
 
 /// Keep pointer input intended for the Models page below the dialog layer.
@@ -4140,6 +4139,7 @@ fn show_local_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     ctx.with_accessibility_parent(accessibility_id, || {
         let drawer = egui::Area::new(drawer_id)
@@ -4163,6 +4163,7 @@ fn show_local_model_details_drawer(
                         );
                         mark_accesskit_enabled(drawer_ui, &close);
                         focusable_controls.push(close.id);
+                        initial_focus = Some(close.id);
                         if close.clicked() {
                             action = ScreenAction::CloseModelDialog;
                         }
@@ -4340,11 +4341,16 @@ fn show_local_model_details_drawer(
                             Layout::left_to_right(Align::Center),
                             |ui| {
                             let remove_reason = (!model.removal_supported).then_some("This model is not an app-managed download and cannot be removed here.")
-                                .or_else(|| (model.selected && !can_replace_active).then_some("Install another ready model before removing the selected model."));
+                                .or_else(|| (model.selected && !model.legacy_cleanup_pending && !can_replace_active).then_some("Install another ready model before removing the selected model."));
                             let remove = compact_model_icon_action(ui, Icon::Trash, "Remove model from device", remove_reason.is_none(), remove_reason, None);
                             if remove_reason.is_none() {
                                 mark_accesskit_enabled(ui, &remove);
                                 focusable_controls.push(remove.id);
+                                if management.restore_remove_focus.as_deref()
+                                    == Some(model.id.as_str())
+                                {
+                                    initial_focus = Some(remove.id);
+                                }
                             }
                             if remove.clicked() && remove_reason.is_none() { action = ScreenAction::RequestModelRemoval(model.id.clone()); }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4375,6 +4381,7 @@ fn show_local_model_details_drawer(
         &ctx,
         tab_direction,
         &focusable_controls,
+        initial_focus,
         management.focus_dialog_initial,
     );
     action
@@ -4403,6 +4410,7 @@ fn show_remote_model_details_drawer(
     let mut action = ScreenAction::None;
     let mut drawer_rect = None;
     let mut focusable_controls = Vec::new();
+    let mut initial_focus = None;
     let compact_stats = screen.width() < 440.0;
     let drawer_action = variant
         .actions
@@ -4435,6 +4443,7 @@ fn show_remote_model_details_drawer(
                     );
                     mark_accesskit_enabled(drawer_ui, &close);
                     focusable_controls.push(close.id);
+                    initial_focus = Some(close.id);
                     if close.clicked() {
                         action = ScreenAction::CloseModelDialog;
                     }
@@ -4545,6 +4554,7 @@ fn show_remote_model_details_drawer(
         &ctx,
         tab_direction,
         &focusable_controls,
+        initial_focus,
         management.focus_dialog_initial,
     );
     action
@@ -7945,6 +7955,114 @@ mod tests {
     }
 
     #[test]
+    fn selected_legacy_cleanup_details_allows_explicit_removal() {
+        let model = ModelViewModel {
+            id: "whisper_cpp_base_en".into(),
+            display_name: "Whisper Base — English".into(),
+            variant_label: "base.en".into(),
+            selected: true,
+            legacy_cleanup_pending: true,
+            primary_action_label: "Upgrade model".into(),
+            primary_action_enabled: true,
+            primary_action_installs_upgrade: true,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[model],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Details("whisper_cpp_base_en".into())),
+                            ..Default::default()
+                        },
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let (_, remove) = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.name() == Some("Remove model from device"))
+            .expect("legacy cleanup removal action");
+        assert!(!remove.is_disabled());
+    }
+
+    #[test]
+    fn catalog_only_legacy_cleanup_renders_removal_confirmation() {
+        let model = ModelViewModel {
+            id: "whisper_cpp_base_en".into(),
+            display_name: "Whisper Base — English".into(),
+            legacy_cleanup_pending: true,
+            removal_supported: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_screen(
+                    ui,
+                    &ScreenView {
+                        route: UiRoute::Models,
+                        transcription: &Default::default(),
+                        models: &[],
+                        model_catalog: &[model],
+                        comparison: &Default::default(),
+                        model_management: &ModelManagementState {
+                            dialog: Some(ModelDialog::Remove("whisper_cpp_base_en".into())),
+                            ..Default::default()
+                        },
+                        model_language_filter: ModelLanguageFilter::default(),
+                        remote_catalog: &Default::default(),
+                        recording_settings: &Default::default(),
+                    },
+                );
+            });
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::AlertDialog
+                && node.name() == Some("Remove Whisper Base — English")
+        }));
+        let (_, remove) = update
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.name() == Some("Remove"))
+            .expect("catalog-only legacy cleanup confirmation action");
+        assert!(!remove.is_disabled());
+    }
+
+    #[test]
+    fn details_focus_starts_at_close_and_repairs_an_escape() {
+        let ctx = egui::Context::default();
+        let close = egui::Id::new("details-close-focus-test");
+        let remove = egui::Id::new("details-remove-focus-test");
+        let outside = egui::Id::new("details-outside-focus-test");
+
+        contain_details_drawer_focus(&ctx, None, &[close, remove], Some(close), true);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(close));
+
+        ctx.memory_mut(|memory| memory.request_focus(outside));
+        contain_details_drawer_focus(&ctx, None, &[close, remove], Some(close), false);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(close));
+    }
+
+    #[test]
     fn model_card_primary_words_follow_authoritative_state() {
         let downloading = ModelViewModel {
             download_state: ModelDownloadState::Downloading,
@@ -7973,13 +8091,42 @@ mod tests {
     fn legacy_model_upgrade_primary_dispatches_upgrade_action() {
         let model = ModelViewModel {
             id: "whisper_cpp_small_en".into(),
-            installed: true,
+            display_name: "Whisper Small — English".into(),
+            installed: false,
+            legacy_cleanup_pending: true,
+            download_state: ModelDownloadState::NotInstalled,
             primary_action_label: "Upgrade model".into(),
             primary_action_enabled: true,
             primary_action_installs_upgrade: true,
+            removal_supported: true,
             ..Default::default()
         };
+        let current = ModelViewModel {
+            id: "whisper_cpp_tiny_en".into(),
+            installed: true,
+            ready: true,
+            ..Default::default()
+        };
+        let catalog = vec![current, model.clone()];
+        let remote_catalog = RemoteCatalogView::default();
+        let (installed, available) = build_model_card_lists(
+            &catalog,
+            &catalog,
+            &remote_catalog,
+            ModelLanguageFilter::All,
+        );
 
+        assert_eq!(installed.len(), 1);
+        assert_eq!(available.len(), 1);
+        assert_eq!(
+            installed[0].key(),
+            ModelCardKey::Local("whisper_cpp_tiny_en".into())
+        );
+        assert_eq!(
+            available[0].key(),
+            ModelCardKey::Local("whisper_cpp_small_en".into())
+        );
+        assert_eq!(ModelCard::Local(&model).primary_verb(), "Upgrade");
         assert_eq!(
             local_model_primary_action(&model),
             ScreenAction::UpgradeModel("whisper_cpp_small_en".into())

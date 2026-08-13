@@ -270,6 +270,8 @@ pub(crate) struct ModelViewModel {
     pub artifact_filename: Option<String>,
     pub artifact_path: Option<String>,
     pub installed: bool,
+    /// A canonical app-owned GGML artifact retained for explicit migration or removal.
+    pub legacy_cleanup_pending: bool,
     /// The model selected in Settings. A selected model can be temporarily
     /// unavailable while its runtime or a legacy artifact is being repaired.
     pub selected: bool,

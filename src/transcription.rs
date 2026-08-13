@@ -29,13 +29,13 @@ use crate::config::{self, AppConfig};
 use crate::installations::{
     InstallCancellation, previous_runtime_root, rollback_to_previous_runtime, verify_runtime_tree,
 };
+use crate::model_catalog::{
+    ArtifactFormat, model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
+    runtime_model_manifest,
+};
 #[allow(unused_imports)]
 pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
-};
-use crate::model_catalog::{
-    model_descriptor, normal_model_descriptors, runtime_artifact_manifest_for_path,
-    runtime_model_manifest,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
@@ -280,6 +280,7 @@ pub struct RuntimeCapabilities {
 pub(crate) struct InstallationCandidate {
     pub(crate) model_id: ModelId,
     pub(crate) model_path: PathBuf,
+    pub(crate) artifact_format: ArtifactFormat,
     pub(crate) runtime_package_root: Option<PathBuf>,
     pub(crate) expected_size_bytes: u64,
     pub(crate) expected_sha256: String,
@@ -301,6 +302,7 @@ impl InstallationCandidate {
         Ok(Self {
             model_id,
             model_path,
+            artifact_format: manifest.format,
             runtime_package_root,
             expected_size_bytes: manifest.size_bytes,
             expected_sha256: manifest.sha256.to_owned(),
@@ -310,6 +312,7 @@ impl InstallationCandidate {
     pub(crate) fn pinned(
         model_id: ModelId,
         model_path: PathBuf,
+        artifact_format: ArtifactFormat,
         runtime_package_root: Option<PathBuf>,
         expected_size_bytes: u64,
         expected_sha256: String,
@@ -317,6 +320,7 @@ impl InstallationCandidate {
         Self {
             model_id,
             model_path,
+            artifact_format,
             runtime_package_root,
             expected_size_bytes,
             expected_sha256,
@@ -1118,6 +1122,7 @@ impl TranscriptionService {
                 InstallationCandidate::pinned(
                     runtime_model.id,
                     runtime_model.path,
+                    runtime_model.format,
                     runtime_model.package_root,
                     runtime_model.expected_size_bytes,
                     runtime_model.expected_sha256,
@@ -1151,6 +1156,7 @@ impl TranscriptionService {
         let runtime_model = RuntimeModel {
             id: model_id.clone(),
             path,
+            format: manifest.format,
             package_root: Some(package_root),
             expected_size_bytes: manifest.size_bytes,
             expected_sha256: manifest.sha256.to_owned(),
@@ -1166,6 +1172,7 @@ impl TranscriptionService {
                 InstallationCandidate::pinned(
                     runtime_model.id,
                     runtime_model.path,
+                    runtime_model.format,
                     runtime_model.package_root,
                     runtime_model.expected_size_bytes,
                     runtime_model.expected_sha256,
@@ -1274,6 +1281,10 @@ impl TranscriptionService {
             .arg(INSTALL_SMOKE_HELPER_FLAG)
             .arg(candidate.model_id.as_str())
             .arg(&candidate.model_path)
+            .arg(match candidate.artifact_format {
+                ArtifactFormat::Gguf => "gguf",
+                ArtifactFormat::LegacyGgml => "legacy-ggml",
+            })
             .arg(
                 candidate
                     .runtime_package_root
@@ -1376,6 +1387,7 @@ impl TranscriptionService {
         let runtime_model = RuntimeModel {
             id: candidate.model_id,
             path: candidate.model_path,
+            format: candidate.artifact_format,
             package_root: candidate.runtime_package_root,
             expected_size_bytes: candidate.expected_size_bytes,
             expected_sha256: candidate.expected_sha256,
@@ -1697,13 +1709,35 @@ impl TranscriptionService {
         let model_id = ModelId::new(model.id.clone());
         let remote_artifact = config::remote_gguf_artifact(&self.config, &model.id);
         let imported_artifact = config::imported_gguf_artifact(&self.config, &model.id);
-        let is_gguf = remote_artifact.is_some()
-            || imported_artifact.is_some()
-            || path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
-        let package_root = if is_gguf {
+        let (artifact_format, expected_size_bytes, expected_sha256) =
+            if let Some(artifact) = remote_artifact {
+                (
+                    ArtifactFormat::Gguf,
+                    artifact.expected_size_bytes,
+                    artifact.expected_sha256,
+                )
+            } else if let Some(artifact) = imported_artifact {
+                (
+                    ArtifactFormat::Gguf,
+                    artifact.expected_size_bytes,
+                    artifact.expected_sha256,
+                )
+            } else {
+                let artifact =
+                    runtime_artifact_manifest_for_path(&model_id, &path).ok_or_else(|| {
+                        anyhow!(
+                            "model {} has no pinned size and SHA-256 evidence for {}",
+                            model.name,
+                            path.display()
+                        )
+                    })?;
+                (
+                    artifact.format,
+                    artifact.size_bytes,
+                    artifact.sha256.to_owned(),
+                )
+            };
+        let package_root = if artifact_format == ArtifactFormat::Gguf {
             None
         } else {
             Some(
@@ -1721,24 +1755,10 @@ impl TranscriptionService {
                 })?,
             )
         };
-        let (expected_size_bytes, expected_sha256) = if let Some(artifact) = remote_artifact {
-            (artifact.expected_size_bytes, artifact.expected_sha256)
-        } else if let Some(artifact) = imported_artifact {
-            (artifact.expected_size_bytes, artifact.expected_sha256)
-        } else {
-            let artifact =
-                runtime_artifact_manifest_for_path(&model_id, &path).ok_or_else(|| {
-                    anyhow!(
-                        "model {} has no pinned size and SHA-256 evidence for {}",
-                        model.name,
-                        path.display()
-                    )
-                })?;
-            (artifact.size_bytes, artifact.sha256.to_owned())
-        };
         Ok(RuntimeModel {
             id: model.id.into(),
             path,
+            format: artifact_format,
             package_root,
             expected_size_bytes,
             expected_sha256,
@@ -1784,6 +1804,16 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
             .into_string()
             .map_err(|_| anyhow!("model ID is not valid Unicode"))?;
         let model_path = args.next().ok_or_else(|| anyhow!("missing model path"))?;
+        let artifact_format = args
+            .next()
+            .ok_or_else(|| anyhow!("missing artifact format"))?
+            .into_string()
+            .map_err(|_| anyhow!("artifact format is not valid Unicode"))?;
+        let artifact_format = match artifact_format.as_str() {
+            "gguf" => ArtifactFormat::Gguf,
+            "legacy-ggml" => ArtifactFormat::LegacyGgml,
+            _ => return Err(anyhow!("invalid artifact format")),
+        };
         let runtime_package_root = args
             .next()
             .ok_or_else(|| anyhow!("missing runtime package root"))?;
@@ -1824,6 +1854,7 @@ pub(crate) fn maybe_run_installation_smoke_helper() -> Option<i32> {
         let candidate = InstallationCandidate::pinned(
             ModelId::new(model_id),
             PathBuf::from(model_path),
+            artifact_format,
             (runtime_package_root != "-").then(|| PathBuf::from(runtime_package_root)),
             expected_size_bytes,
             expected_sha256,
