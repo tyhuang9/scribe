@@ -3063,6 +3063,27 @@ mod tests {
     }
 
     #[test]
+    fn expanding_model_details_preserves_the_card_width() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let collapsed = render(Fixture::ModelsInstalled, width, height);
+            let expanded = render(Fixture::ModelsCardExpanded, width, height);
+            let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
+            let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
+
+            assert_near(
+                expanded_card.x0,
+                collapsed_card.x0,
+                "expanding details must preserve the card's left edge",
+            );
+            assert_near(
+                expanded_card.x1,
+                collapsed_card.x1,
+                "expanding details must preserve the card's right edge",
+            );
+        }
+    }
+
+    #[test]
     fn model_card_controls_keep_trailing_chevron_order_without_decorative_nodes() {
         for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);

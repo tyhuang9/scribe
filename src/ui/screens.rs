@@ -2395,6 +2395,10 @@ fn render_unified_model_card(
                     );
                 });
             }
+            // The summary establishes the card width. Keep the divider and inline
+            // details inside that measured width instead of letting expansion
+            // consume the route's remaining horizontal space.
+            ui.shrink_width_to_current();
             if expanded {
                 ui.add_space(8.0);
                 ui.separator();
