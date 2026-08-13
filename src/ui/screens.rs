@@ -2181,18 +2181,15 @@ fn render_model_identity(ui: &mut egui::Ui, card: ModelCard<'_>, description: &s
             colors.primary,
         );
         ui.vertical(|ui| {
-            // Reserve the title's visual line, then center both the text and
-            // badge within it. This keeps the active state aligned to the
-            // model name instead of the description below it.
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 22.0),
+                Vec2::new(ui.available_width(), 40.0),
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     let name = match card {
                         ModelCard::Local(model) => &model.display_name,
                         ModelCard::Remote(entry, _) => &entry.display_name,
                     };
-                    let name = ui.label(RichText::new(name).strong());
+                    let name = ui.add(egui::Label::new(RichText::new(name).strong()).wrap(true));
                     if let ModelCard::Local(model) = card {
                         if model.active {
                             installed_model_badge(
@@ -2743,10 +2740,7 @@ fn render_inline_model_details(
     can_replace_active: bool,
     action: &mut ScreenAction,
 ) {
-    let colors = ui_palette(ui);
     Frame::none()
-        .fill(colors.card_bg)
-        .stroke(Stroke::new(1.0, colors.border))
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
             ui.separator();
@@ -6588,6 +6582,19 @@ mod tests {
         assert_eq!(accuracy_label("Not rated"), "Not rated");
         assert_eq!(accuracy_label("High accuracy"), "High accuracy");
         assert_eq!(accuracy_label("Basic"), "Basic accuracy");
+    }
+
+    #[test]
+    fn compact_language_codes_are_unique_and_bounded() {
+        assert_eq!(
+            formatted_language_summary(&["en".into(), "English".into(), "es".into(), "ja".into()]),
+            "EN, ES, JA"
+        );
+        assert_eq!(
+            formatted_language_summary(&["en".into(), "es".into(), "ja".into(), "ko".into()]),
+            "Multilingual"
+        );
+        assert_eq!(formatted_language_summary(&["unknown".into()]), "—");
     }
 
     #[test]
