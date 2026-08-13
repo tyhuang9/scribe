@@ -192,3 +192,53 @@ The dark source and light implementation are different theme states, and the imp
 - Touch input on a physical Windows touch device.
 
 final result: passed
+
+---
+
+# Label-adjacent Settings help design QA
+
+## Evidence
+
+- Source visual truth: `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-1.png`
+- Rendered implementation: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\recording-label-help.png`
+- Pinned-disclosure implementation: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\recording-help-pinned.png`
+- Combined comparison input: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\comparison-label-help.png`
+- Source pixels: 1080 x 696. Implementation pixels: 1194 x 1190. Combined comparison pixels: 1100 x 780.
+- Requested harness viewport: 1180 x 1200 CSS pixels at the host display density. The Windows work area constrained the native outer capture to 1194 x 1190 pixels, including non-client chrome; no density resampling was used for the focused implementation crop.
+- State: Settings / Recording / Transcription. The source is the prior dark-theme checkbox layout and the implementation is the deterministic light-theme harness, so this pass compares structure, alignment, control placement, and copy rather than exact cross-theme color values.
+
+## Full-view comparison evidence
+
+The final Recording capture and pinned-disclosure capture were opened and inspected at original resolution. The setting name begins at the same left edge as the other row labels, the `?` immediately follows the name inside the label track, and the toggle remains in the fixed control column. The label-side disclosure does not shift the toggle or alter the card width, separator rhythm, or surrounding controls. The pinned popover stays anchored beneath its `?`, remains readable, and leaves the toggle unobscured.
+
+## Focused-region comparison evidence
+
+The prior and final Transcription regions were cropped without altering their content and placed together in `comparison-label-help.png`. This focused view was required because the label/help relationship is too small to judge reliably from a full-screen capture. It shows the intended change from a centered checkbox-era row to `Live transcription preview (?)` in the left label column with the switch in the trailing control column. No overlap, truncation, or control-column drift is visible.
+
+## Required fidelity surfaces
+
+- Fonts and typography: the existing Scribe family, size, weight, line height, and hierarchy are preserved; the revised label is readable without wrapping or truncation.
+- Spacing and layout rhythm: the 270-point desktop label track remains fixed and left-aligned; the 44-point help target fits beside the label without moving the switch. The automated 480-pixel regression verifies compact stacking.
+- Colors and visual tokens: the new control reuses the existing panel, border, muted-text, focus-ring, and semantic switch tokens. Theme contrast remains covered by the existing light/dark token tests; exact source-to-implementation palette comparison is intentionally excluded because the evidence uses different themes.
+- Image quality and asset fidelity: no product imagery is involved. The existing Scribe glyphs and control rendering remain sharp in the native capture.
+- Copy and content: the checkbox-era `Provisional transcription` wording is replaced by the clearer `Live transcription preview`; the explanation is retained in the disclosure description instead of occupying the field column.
+- Interaction and accessibility: focused regression tests cover the 300 ms hover delay, icon-to-popover pointer transfer, leave-close behavior, click pin/toggle, outside-click and Escape dismissal, focus exposure, Enter/Space activation, one active disclosure, disabled-setting help, and desktop/compact geometry. Native smoke checks displayed the UI Automation focus ring, exposed the help name and description, opened the pinned popover through a pointer click, kept the process alive, and produced empty stderr.
+
+## Findings
+
+No actionable P0, P1, or P2 visual differences remain for the requested label-adjacent help pattern.
+
+The different source and implementation themes and the source's cropped card versus the implementation's full application shell are expected evidence differences. They do not change the evaluated alignment or information hierarchy.
+
+## Comparison history
+
+1. Earlier implementation: the help button was rendered beside the setting field. Fix: moved shared help rendering into the Settings row's label cell for both desktop and compact layouts. Post-fix evidence: `recording-label-help.png` and `comparison-label-help.png`.
+2. Review finding: independent row state could compete, the disclosure exposed an invalid checked state, and Escape/same-button dismissal could reopen it. Fix: introduced one shared active-help state, retained only the valid expanded state, and added dismissal suppression until leave/re-entry. Post-fix evidence: six focused interaction test groups and the final accessibility/code review pass.
+
+## Residual manual checks
+
+- Narrator or NVDA announcement wording on a physical Windows desktop.
+- Pointer timing and popup placement at unusual display scales and near viewport edges.
+- Touch input on a Windows touch device.
+
+final result: passed
