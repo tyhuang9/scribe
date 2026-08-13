@@ -1887,7 +1887,7 @@ fn model_lifecycle_button(
 ) -> egui::Response {
     let response = ui.add_enabled(
         enabled && ui.is_enabled(),
-        egui::Button::new(label).min_size(Vec2::new(88.0, 44.0)),
+        egui::Button::new(label).min_size(Vec2::new(44.0, 44.0)),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
     ui.ctx().accesskit_node_builder(response.id, |builder| {

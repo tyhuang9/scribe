@@ -2568,6 +2568,120 @@ mod tests {
         let names = node_names(&render(Fixture::SettingsRecording, 960.0, 680.0));
         assert!(names.iter().any(|name| name == "Refresh devices"));
     }
+
+    #[test]
+    fn model_cards_expose_accordion_and_semantic_contracts() {
+        let collapsed = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let collapsed_nodes = &collapsed
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let active_count = collapsed_nodes
+            .iter()
+            .filter(|(_, node)| node.name() == Some("Active"))
+            .count();
+        assert_eq!(active_count, 1, "Active must be the sole card badge");
+        assert!(collapsed_nodes.iter().any(|(_, node)| {
+            node.name() == Some("Expand details for whisper.cpp tiny.en")
+                && node.is_expanded() == Some(false)
+        }));
+        for name in ["Speed: Very fast (5 of 5)", "Accuracy: Basic (1 of 5)"] {
+            assert!(
+                collapsed_nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(name))
+            );
+        }
+        assert!(
+            !node_names(&collapsed)
+                .iter()
+                .any(|name| matches!(name.as_str(), "SPEED" | "ACCURACY" | "Very fast" | "Basic"))
+        );
+
+        let expanded = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let expanded_nodes = &expanded
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert!(expanded_nodes.iter().any(|(_, node)| {
+            node.name() == Some("Collapse details for whisper.cpp tiny.en")
+                && node.is_expanded() == Some(true)
+        }));
+        let description = "More accurate for longer recordings.";
+        assert_eq!(
+            node_names(&expanded)
+                .iter()
+                .filter(|name| name.as_str() == description)
+                .count(),
+            1,
+            "expanded cards expose the full description exactly once"
+        );
+        for detail in [
+            "Languages: English",
+            "Runtime: Ready",
+            "Architecture: Not available",
+        ] {
+            assert!(node_names(&expanded).iter().any(|name| name == detail));
+        }
+    }
+
+    #[test]
+    fn model_card_render_all_and_compact_controls_remain_contained() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.model_catalog
+            .extend((0..100).map(|index| ModelViewModel {
+                id: format!("catalog-{index:03}"),
+                display_name: format!("Catalog model {index:03}"),
+                variant_label: format!("catalog-{index:03}"),
+                install_supported: true,
+                install_action_enabled: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }));
+        let mut page = Fixture::ModelsInstalled.page();
+        let (wide, action) =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert!(
+            node_names(&wide)
+                .iter()
+                .any(|name| name == "Install Catalog model 099")
+        );
+
+        let compact = render(Fixture::ModelsCardExpanded, 375.0, 680.0);
+        for node in compact
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+        {
+            if node.role() == egui::accesskit::Role::Button
+                && node.name().is_some_and(|name| {
+                    name.contains("details")
+                        || name.starts_with("Install")
+                        || name.starts_with("Uninstall")
+                })
+            {
+                let bounds = node.bounds().expect("model control bounds");
+                assert!(
+                    bounds.x0 >= 0.0 && bounds.x1 <= 400.0,
+                    "compact model control must not create horizontal overflow: {bounds:?}"
+                );
+                assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
+            }
+        }
+    }
+
     #[test]
     fn harness_parser_is_exact_and_fail_closed() {
         assert_eq!(
