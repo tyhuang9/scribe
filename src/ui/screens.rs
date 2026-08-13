@@ -1618,11 +1618,20 @@ fn render_model_description_preview(
             Layout::left_to_right(Align::Center),
             |ui| {
                 ui.add_space(left_inset);
-                ui.add_sized(
+                ui.allocate_ui_with_layout(
                     Vec2::new(content_width, 18.0),
-                    egui::Label::new(RichText::new(description).small().color(colors.muted_text))
-                        .truncate(true),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_width(content_width);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(description).small().color(colors.muted_text),
+                            )
+                            .truncate(true),
+                        )
+                    },
                 )
+                .inner
             },
         )
         .inner;
