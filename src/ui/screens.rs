@@ -2599,6 +2599,10 @@ fn models(
     language_filter: ModelLanguageFilter,
     remote_catalog: &RemoteCatalogView,
 ) -> ScreenAction {
+    // A native scroll viewport can reserve space that is not reflected in the
+    // inherited layout width. Bound this route to the actually paintable area
+    // so card frames and trailing controls keep their right inset.
+    ui.set_width(current_content_width(ui));
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
     let mut import_control = None;
