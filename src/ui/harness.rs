@@ -2486,7 +2486,7 @@ mod tests {
         data.route = UiRoute::Settings(SettingsTab::Advanced);
         let mut page = AppPage::General;
         let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let target = named_node_id(&initial, "Enable local model Playground");
+        let target = named_node_id(&initial, "Enable model Playground");
         let focused = render_with_input_at_time(
             &ctx,
             &mut data,
@@ -2505,7 +2505,7 @@ mod tests {
         .0;
         assert_eq!(
             focused_node(&focused).name(),
-            Some("Enable local model Playground")
+            Some("Enable model Playground")
         );
         let _ = render_with_input_at_time(
             &ctx,
@@ -2526,7 +2526,7 @@ mod tests {
             Some(1.0),
         )
         .0;
-        let final_bounds = named_node_bounds(&settled, "Enable local model Playground");
+        let final_bounds = named_node_bounds(&settled, "Enable model Playground");
         let route_scroll = ctx
             .data(|data| {
                 data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(

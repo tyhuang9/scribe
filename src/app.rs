@@ -10141,11 +10141,6 @@ impl LocalTranscriberApp {
             input_level_percent,
             microphone_error: self.microphone_test_error.clone(),
             auto_insert_transcript: self.config.output.auto_insert_transcript,
-            output_label: if cfg!(target_os = "windows") {
-                "Insert final transcript into captured app".to_owned()
-            } else {
-                "Copy final transcript to clipboard automatically".to_owned()
-            },
             show_restore_clipboard: cfg!(target_os = "windows"),
             output_notice: self
                 .config

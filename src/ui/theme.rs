@@ -21,10 +21,12 @@ pub(crate) struct ThemePalette {
     pub slider_live_above: Color32,
     pub primary: Color32,
     pub accent: Color32,
-    /// Purple track for the compact recording-mode selector.
+    /// Theme-coherent blue/neutral track for the compact recording-mode selector.
     pub segmented_control_bg: Color32,
     /// Foreground for the selected segment on the current card surface.
     pub segmented_control_selected_text: Color32,
+    /// Distinguishable inactive toggle track and border on card surfaces.
+    pub inactive_toggle_track: Color32,
     /// Package green for fills and dots; use `success_text` for text on light surfaces.
     pub success: Color32,
     pub success_text: Color32,
@@ -71,8 +73,9 @@ impl ThemePalette {
             slider_live_above: Color32::from_rgb(6, 118, 71),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
-            segmented_control_bg: Color32::from_rgb(124, 58, 237),
-            segmented_control_selected_text: Color32::from_rgb(109, 40, 217),
+            segmented_control_bg: Color32::from_rgb(37, 99, 235),
+            segmented_control_selected_text: Color32::from_rgb(29, 33, 42),
+            inactive_toggle_track: Color32::from_rgb(100, 116, 139),
             success: Color32::from_rgb(18, 183, 106),
             success_text: Color32::from_rgb(6, 118, 71),
             warning: Color32::from_rgb(146, 64, 14),
@@ -108,8 +111,9 @@ impl ThemePalette {
             slider_live_above: Color32::from_rgb(74, 222, 128),
             primary: Color32::from_rgb(247, 250, 252),
             accent: Color32::from_rgb(96, 165, 250),
-            segmented_control_bg: Color32::from_rgb(124, 58, 237),
-            segmented_control_selected_text: Color32::from_rgb(196, 181, 253),
+            segmented_control_bg: Color32::from_rgb(96, 115, 140),
+            segmented_control_selected_text: Color32::from_rgb(236, 241, 247),
+            inactive_toggle_track: Color32::from_rgb(96, 115, 140),
             success: Color32::from_rgb(74, 222, 128),
             success_text: Color32::from_rgb(134, 239, 172),
             warning: Color32::from_rgb(251, 191, 36),
@@ -158,14 +162,29 @@ mod tests {
     }
 
     #[test]
-    fn recording_mode_toggle_colours_meet_aa_in_both_themes() {
-        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+    fn recording_mode_toggle_uses_semantic_colours_with_aa_contrast() {
+        let light = ThemePalette::light();
+        assert_eq!(light.segmented_control_bg, light.accent);
+        assert_eq!(light.segmented_control_selected_text, light.text);
+
+        let dark = ThemePalette::dark();
+        assert_eq!(dark.segmented_control_selected_text, dark.text);
+
+        for palette in [light, dark] {
             assert!(
                 contrast_ratio(palette.primary_button_text, palette.segmented_control_bg) >= 4.5
             );
             assert!(
                 contrast_ratio(palette.segmented_control_selected_text, palette.card_bg) >= 4.5
             );
+            assert!(contrast_ratio(palette.card_bg, palette.segmented_control_bg) >= 3.0);
+        }
+    }
+
+    #[test]
+    fn inactive_toggle_track_contrasts_with_card_surfaces_in_both_themes() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(contrast_ratio(palette.inactive_toggle_track, palette.card_bg) >= 3.0);
         }
     }
 

@@ -191,3 +191,117 @@ The application was rebuilt from `51824ac` with `--features ui-harness` before t
 No P0, P1, or P2 visual issue remains in the reviewed supported-width evidence. The model cards match the requested information hierarchy and lifecycle behavior while preserving Scribe's existing design system.
 
 final result: passed
+
+---
+
+# Settings design QA
+
+## Evidence
+
+- Source visual truth:
+  - `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-1.png`
+  - `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-2.png`
+  - The follow-up Advanced screenshot was also reviewed from the conversation, but it did not have a workspace file path.
+- Implementation screenshots:
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\recording-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\recording-help-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\advanced-light.png`
+  - `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\general-light.png`
+- Combined comparison: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-all-tabs\comparison-recording.png`
+- Source pixels: 1082 x 696 and 870 x 174; source density was not declared.
+- Implementation viewport request: 1180 x 1200 CSS pixels. Native Windows capture: 1493 x 1487 pixels, including window chrome and display scaling.
+- Combined comparison pixels: 2200 x 1500. The implementation was proportionally scaled for the comparison; source pixels were not resampled.
+- State: Settings / Recording, General, and Advanced; light theme; default fixture data. The source Recording image is dark while the mode-selector reference is light, so exact palette matching across the two source images was not treated as a requirement.
+
+## Full-view comparison evidence
+
+The file-backed source and final Recording capture were placed together in `comparison-recording.png` and reviewed as one comparison input. The final screen preserves the existing Scribe structure and typography while applying the requested changes: every desktop settings label begins at one fixed left edge, controls begin in one fixed control column, boolean settings use switches, and the mode selector uses the product's blue semantic accent rather than the unrelated purple reference color.
+
+General and Advanced native captures show the same 270-point left-aligned label track. No overlap, clipping, broken card rhythm, or inconsistent control start position was found at the captured desktop viewport. Compact layout behavior is covered by the automated 480-pixel layout test.
+
+## Focused-region comparison evidence
+
+Focused review was necessary because alignment, switch state, and help behavior are too small to judge reliably from the full-screen comparison alone.
+
+- The Recording transcription region replaces the source checkbox with a switch and adjacent 44 x 44 help button.
+- `recording-help-light.png` confirms that activating the help button opens readable persistent content below the trigger without obscuring the setting name or switch.
+- The Advanced capture confirms that “Stop after speech ends” and all timing-row labels share the same left edge and that timing inputs share the control column.
+- The General capture confirms the same label track across switch, button, and combo-box rows.
+
+## Required fidelity surfaces
+
+- Fonts and typography: existing Scribe font family, hierarchy, weight, and wrapping are preserved. The clearer setting names fit without truncation at the desktop reference viewport.
+- Spacing and layout rhythm: settings cards, separators, row heights, and section gaps remain consistent. Desktop labels use a fixed 270-point column and left alignment; compact rows stack below the breakpoint.
+- Colors and visual tokens: switches and the recording-mode selector use semantic theme tokens. Automated contrast tests cover light and dark selector and inactive-switch states.
+- Image quality and asset fidelity: no source imagery or decorative assets are involved. Existing product icons remain unchanged and sharp in the native captures.
+- Copy and content: checkbox-era phrases were replaced with concise setting names; supporting detail moved into accessible help disclosures. Locked voice-detection state includes a visible reason.
+- Interaction and accessibility: switches expose stable Switch roles, names, descriptions, checked states, and 44-point targets. Help controls expose a keyboard-focusable Toggle pattern, persistent expanded state, and Escape dismissal. Locked switches remain disabled while their help remains available.
+
+## Findings
+
+No actionable P0, P1, or P2 visual or interaction differences remain.
+
+The dark source and light implementation are different theme states, and the implementation capture includes the full application shell while the source is cropped to settings cards. Those are expected evidence differences, not product defects. Dark-theme visual behavior is additionally protected by semantic-token contrast tests; a native dark harness capture is not available because the current harness fixes light visuals.
+
+## Comparison history
+
+1. Initial reference issue: settings labels were centered and boolean settings used checkboxes. Fix: added a fixed 270-point desktop label track, left-aligned label painting, shared switches, clearer labels, and help controls. Post-fix evidence: `recording-light.png`, `advanced-light.png`, and `general-light.png`.
+2. Accessibility review issue: the first help affordance was hover-only and locked help could not be opened. Fix: replaced transient tooltips with persistent 44 x 44 disclosure buttons, kept help available beside disabled switches, and added an explicit voice-detection lock reason. Post-fix evidence: `recording-help-light.png` and AccessKit interaction tests.
+3. Interaction review issue: a switch could report its pre-click state during the activation frame. Fix: the shared switch now paints and exposes its effective post-click state immediately. Post-fix evidence: bidirectional action and AccessKit checked-state tests.
+
+## Residual manual checks
+
+- Narrator or NVDA announcement wording for the disclosure's expanded state.
+- High-contrast mode and display scaling above the captured configuration.
+- Touch input on a physical Windows touch device.
+
+final result: passed
+
+---
+
+# Label-adjacent Settings help design QA
+
+## Evidence
+
+- Source visual truth: `C:\Users\huang\.codex\attachments\f475cd0d-5607-489a-9100-f25a528b6f10\image-1.png`
+- Rendered implementation: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\recording-label-help.png`
+- Pinned-disclosure implementation: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\recording-help-pinned.png`
+- Combined comparison input: `C:\Users\huang\Documents\Projects\scribe-gguf-q8-catalog\.codex-artifacts\settings-label-help\comparison-label-help.png`
+- Source pixels: 1080 x 696. Implementation pixels: 1194 x 1190. Combined comparison pixels: 1100 x 780.
+- Requested harness viewport: 1180 x 1200 CSS pixels at the host display density. The Windows work area constrained the native outer capture to 1194 x 1190 pixels, including non-client chrome; no density resampling was used for the focused implementation crop.
+- State: Settings / Recording / Transcription. The source is the prior dark-theme checkbox layout and the implementation is the deterministic light-theme harness, so this pass compares structure, alignment, control placement, and copy rather than exact cross-theme color values.
+
+## Full-view comparison evidence
+
+The final Recording capture and pinned-disclosure capture were opened and inspected at original resolution. The setting name begins at the same left edge as the other row labels, the `?` immediately follows the name inside the label track, and the toggle remains in the fixed control column. The label-side disclosure does not shift the toggle or alter the card width, separator rhythm, or surrounding controls. The pinned popover stays anchored beneath its `?`, remains readable, and leaves the toggle unobscured.
+
+## Focused-region comparison evidence
+
+The prior and final Transcription regions were cropped without altering their content and placed together in `comparison-label-help.png`. This focused view was required because the label/help relationship is too small to judge reliably from a full-screen capture. It shows the intended change from a centered checkbox-era row to `Live transcription preview (?)` in the left label column with the switch in the trailing control column. No overlap, truncation, or control-column drift is visible.
+
+## Required fidelity surfaces
+
+- Fonts and typography: the existing Scribe family, size, weight, line height, and hierarchy are preserved; the revised label is readable without wrapping or truncation.
+- Spacing and layout rhythm: the 270-point desktop label track remains fixed and left-aligned; the 44-point help target fits beside the label without moving the switch. The automated 480-pixel regression verifies compact stacking.
+- Colors and visual tokens: the new control reuses the existing panel, border, muted-text, focus-ring, and semantic switch tokens. Theme contrast remains covered by the existing light/dark token tests; exact source-to-implementation palette comparison is intentionally excluded because the evidence uses different themes.
+- Image quality and asset fidelity: no product imagery is involved. The existing Scribe glyphs and control rendering remain sharp in the native capture.
+- Copy and content: the checkbox-era `Provisional transcription` wording is replaced by the clearer `Live transcription preview`; the explanation is retained in the disclosure description instead of occupying the field column.
+- Interaction and accessibility: focused regression tests cover the 300 ms hover delay, icon-to-popover pointer transfer, leave-close behavior, click pin/toggle, outside-click and Escape dismissal, focus exposure, Enter/Space activation, one active disclosure, disabled-setting help, and desktop/compact geometry. Native smoke checks displayed the UI Automation focus ring, exposed the help name and description, opened the pinned popover through a pointer click, kept the process alive, and produced empty stderr.
+
+## Findings
+
+No actionable P0, P1, or P2 visual differences remain for the requested label-adjacent help pattern.
+
+The different source and implementation themes and the source's cropped card versus the implementation's full application shell are expected evidence differences. They do not change the evaluated alignment or information hierarchy.
+
+## Comparison history
+
+1. Earlier implementation: the help button was rendered beside the setting field. Fix: moved shared help rendering into the Settings row's label cell for both desktop and compact layouts. Post-fix evidence: `recording-label-help.png` and `comparison-label-help.png`.
+2. Review finding: independent row state could compete, the disclosure exposed an invalid checked state, and Escape/same-button dismissal could reopen it. Fix: introduced one shared active-help state, retained only the valid expanded state, and added dismissal suppression until leave/re-entry. Post-fix evidence: six focused interaction test groups and the final accessibility/code review pass.
+
+## Residual manual checks
+
+- Narrator or NVDA announcement wording on a physical Windows desktop.
+- Pointer timing and popup placement at unusual display scales and near viewport edges.
+- Touch input on a Windows touch device.
+final result: passed
