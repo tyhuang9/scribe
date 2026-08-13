@@ -1,11 +1,13 @@
 use eframe::egui::{
-    self, Align, Button, Color32, FontFamily, FontId, Frame, Layout, Margin, Response, Rounding,
-    Sense, Stroke, TextStyle, Ui, Vec2,
+    self, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, Response, Rounding, Sense,
+    Stroke, TextStyle, Ui, Vec2,
 };
 
 use super::theme::ui_palette;
 
 const PRIMARY_TARGET_HEIGHT: f32 = 44.0;
+const COMPACT_BUTTON_HEIGHT: f32 = 36.0;
+const KEYCAP_VERTICAL_PADDING: f32 = 7.0;
 
 pub(crate) fn minimum_primary_target_height() -> f32 {
     PRIMARY_TARGET_HEIGHT
@@ -66,13 +68,27 @@ pub(crate) fn button(
         ButtonTone::Danger => (colors.error, Stroke::NONE, colors.danger_button_text),
         ButtonTone::Text => (Color32::TRANSPARENT, Stroke::NONE, colors.text),
     };
-    let response = ui.add(
-        Button::new(label.into().color(text))
-            .fill(fill)
-            .stroke(stroke)
-            .rounding(Rounding::same(5.0))
-            .min_size(Vec2::splat(PRIMARY_TARGET_HEIGHT)),
+    let label = label.into().color(text);
+    let available_width = (ui.available_width() - 24.0).max(0.0);
+    let galley = label.into_galley(ui, None, available_width, TextStyle::Button);
+    let visual_size = Vec2::new(
+        (galley.size().x + 24.0).max(COMPACT_BUTTON_HEIGHT),
+        COMPACT_BUTTON_HEIGHT,
     );
+    let target_size = Vec2::new(
+        visual_size.x.max(PRIMARY_TARGET_HEIGHT),
+        PRIMARY_TARGET_HEIGHT,
+    );
+    let (target_rect, response) = ui.allocate_exact_size(target_size, Sense::click());
+    let visual_rect = egui::Rect::from_center_size(target_rect.center(), visual_size);
+
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, galley.text()));
+    if ui.is_rect_visible(visual_rect) {
+        ui.painter()
+            .rect(visual_rect, Rounding::same(5.0), fill, stroke);
+        ui.painter()
+            .galley(visual_rect.center() - galley.size() * 0.5, galley, text);
+    }
     if !response.enabled() {
         ui.ctx().accesskit_node_builder(response.id, |builder| {
             builder.set_disabled();
@@ -85,10 +101,12 @@ pub(crate) fn button(
 #[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Response {
     let colors = ui_palette(ui);
-    let (rect, response) =
+    let (target_rect, response) =
         ui.allocate_exact_size(Vec2::splat(PRIMARY_TARGET_HEIGHT), Sense::click());
+    let visual_rect =
+        egui::Rect::from_center_size(target_rect.center(), Vec2::splat(COMPACT_BUTTON_HEIGHT));
     ui.painter().rect(
-        rect,
+        visual_rect,
         Rounding::same(5.0),
         if response.hovered() {
             colors.panel_bg
@@ -98,7 +116,7 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, accessible_name: &str) -> Res
         Stroke::new(1.0, colors.border),
     );
     ui.painter().text(
-        rect.center(),
+        visual_rect.center(),
         egui::Align2::CENTER_CENTER,
         icon_glyph(icon),
         FontId::proportional(20.0),
@@ -160,7 +178,7 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border_strong))
         .rounding(Rounding::same(3.0))
-        .inner_margin(Margin::symmetric(7.0, 4.0))
+        .inner_margin(Margin::symmetric(7.0, KEYCAP_VERTICAL_PADDING))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(text)
@@ -270,6 +288,47 @@ mod tests {
         let ctx = egui::Context::default();
         configure_accessible_style(&ctx);
         assert!(ctx.style().spacing.interact_size.y >= 44.0);
+    }
+
+    #[test]
+    fn compact_controls_keep_full_size_pointer_targets() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        let mut button_target_height = 0.0;
+        let mut icon_target_height = 0.0;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640.0, 320.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button_target_height = button(ui, "Save", ButtonTone::Primary).rect.height();
+                    icon_target_height = icon_button(ui, Icon::Refresh, "Refresh").rect.height();
+                    keycap(ui, "Ctrl");
+                });
+            },
+        );
+
+        assert_eq!(button_target_height, PRIMARY_TARGET_HEIGHT);
+        assert_eq!(icon_target_height, PRIMARY_TARGET_HEIGHT);
+        let painted_rect_heights: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape.shape {
+                egui::epaint::Shape::Rect(ref rect) => Some(rect.rect.height()),
+                _ => None,
+            })
+            .collect();
+        assert!(painted_rect_heights
+            .iter()
+            .any(|height| (*height - COMPACT_BUTTON_HEIGHT).abs() < 0.1));
+        assert!(painted_rect_heights
+            .iter()
+            .any(|height| { *height >= 28.0 && *height <= 30.0 }));
     }
 
     #[test]

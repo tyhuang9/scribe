@@ -10385,7 +10385,7 @@ fn page(
             ui.horizontal_top(|ui| {
                 let heading = ui.label(
                     RichText::new(title)
-                        .font(FontId::proportional(24.0))
+                        .font(FontId::proportional(30.0))
                         .color(ui_palette(ui).primary)
                         .strong(),
                 );
