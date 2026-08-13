@@ -9385,11 +9385,6 @@ impl LocalTranscriberApp {
             }
             ScreenAction::ConfirmModelRemoval(id) => {
                 self.model_management.dialog = None;
-                if self.model_management.expanded_model_card.as_ref()
-                    == Some(&ModelCardKey::Local(id.clone()))
-                {
-                    self.model_management.expanded_model_card = None;
-                }
                 self.model_management.restore_after_removal_focus = false;
                 let active = self.config.general.selected_default_model == id;
                 let mut replacement_name = None;
@@ -9416,6 +9411,11 @@ impl LocalTranscriberApp {
                 {
                     let removal_committed = self.uninstall_model(&model);
                     if removal_committed {
+                        if self.model_management.expanded_model_card.as_ref()
+                            == Some(&ModelCardKey::Local(id.clone()))
+                        {
+                            self.model_management.expanded_model_card = None;
+                        }
                         if let Some(replacement_name) = replacement_name
                             && self.status == TranscriptionStatus::Error
                         {
@@ -20209,7 +20209,21 @@ mod layout_tests {
             app.status_message
                 .contains("replacement model is no longer ready")
         );
-        app.apply_model_management_action(ScreenAction::AcknowledgeModelRemovalFocus);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_models(ui));
+        });
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.name())
+                .is_some_and(|name| name.starts_with("Uninstall "))
+        );
         assert!(app.model_management.restore_remove_focus.is_none());
 
         let _ = fs::remove_file(active_path);
@@ -20226,7 +20240,21 @@ mod layout_tests {
             app.model_management.restore_remove_focus.as_deref(),
             Some(id.as_str())
         );
-        app.apply_model_management_action(ScreenAction::AcknowledgeModelRemovalFocus);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_stitch_style(&ctx);
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_models(ui));
+        });
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        assert!(
+            update
+                .nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == update.focus)
+                .and_then(|(_, node)| node.name())
+                .is_some_and(|name| name.starts_with("Uninstall "))
+        );
         assert!(app.model_management.restore_remove_focus.is_none());
     }
 

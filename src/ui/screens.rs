@@ -1388,43 +1388,44 @@ fn metadata(ui: &mut egui::Ui, icon: Icon, text: &str) {
     );
 }
 
-fn installed_model_badge(
+fn installed_model_badge_size(ui: &egui::Ui, text: &str, text_color: Color32) -> Vec2 {
+    let font = egui::FontId::proportional(12.0);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, text_color)
+        .size()
+        .x;
+    Vec2::new(8.0 + 6.0 + 6.0 + text_width + 8.0, 22.0)
+}
+
+fn paint_installed_model_badge(
     ui: &mut egui::Ui,
     text: &str,
-    center_y: f32,
+    rect: egui::Rect,
     dot_color: Color32,
     text_color: Color32,
 ) {
     let colors = ui_palette(ui);
     let font = egui::FontId::proportional(12.0);
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), text_color)
-        .size()
-        .x;
-    let size = Vec2::new(8.0 + 6.0 + 6.0 + text_width + 8.0, 22.0);
-    let (slot, response) = ui.allocate_exact_size(size, Sense::hover());
-    // `Label::rect` includes extra ascent/descent space. Offset the capsule
-    // to the text ink's optical center rather than its full line box.
-    let visual = egui::Rect::from_center_size(egui::pos2(slot.center().x, center_y - 3.0), size);
     ui.painter()
-        .rect_filled(visual, Rounding::same(999.0), colors.disabled_bg);
+        .rect_filled(rect, Rounding::same(999.0), colors.disabled_bg);
     ui.painter().circle_filled(
-        egui::pos2(visual.left() + 11.0, visual.center().y),
+        egui::pos2(rect.left() + 11.0, rect.center().y),
         3.0,
         dot_color,
     );
     ui.painter().text(
-        egui::pos2(visual.left() + 20.0, visual.center().y),
+        egui::pos2(rect.left() + 20.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
         font,
         text_color,
     );
+    let response = ui.interact(rect, ui.make_persistent_id("active-badge"), Sense::hover());
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::StaticText);
         builder.set_name(text);
-        builder.set_bounds(accesskit_rect(visual));
+        builder.set_bounds(accesskit_rect(rect));
     });
 }
 
@@ -1509,11 +1510,13 @@ impl ModelCard<'_> {
 
 struct ModelCardRenderResult {
     action: ScreenAction,
+    restored_remove_focus: bool,
 }
 
 struct ModelSectionFocus<'a> {
     expanded: Option<&'a ModelCardKey>,
     can_replace_active: bool,
+    restore_remove_focus: Option<&'a str>,
 }
 
 fn local_model_matches(
@@ -1609,6 +1612,11 @@ fn model_language_summary(languages: &[String]) -> (&'static str, String) {
 }
 
 const MODEL_DESCRIPTION_FADE_WIDTH: f32 = 28.0;
+const MODEL_DESCRIPTION_FADE_STEPS: usize = 4;
+
+fn description_fade_alpha(step: usize) -> u8 {
+    (((step + 1) * u8::MAX as usize) / MODEL_DESCRIPTION_FADE_STEPS) as u8
+}
 
 fn description_overflows(ui: &egui::Ui, description: &str, width: f32) -> bool {
     ui.painter()
@@ -1628,17 +1636,22 @@ fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, overflow: bool) {
     }
     let colors = ui_palette(ui);
     let fade = MODEL_DESCRIPTION_FADE_WIDTH.min(rect.width());
-    for step in 0..4 {
-        let x0 = rect.right() - fade + fade * step as f32 / 4.0;
-        let alpha = ((step + 1) * 64) as u8;
+    let band_width = fade / MODEL_DESCRIPTION_FADE_STEPS as f32;
+    for step in 0..MODEL_DESCRIPTION_FADE_STEPS {
+        let x0 = rect.right() - fade + band_width * step as f32;
+        let x1 = if step + 1 == MODEL_DESCRIPTION_FADE_STEPS {
+            rect.right()
+        } else {
+            x0 + band_width
+        };
         ui.painter().rect_filled(
-            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), rect.right_bottom()),
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
             Rounding::ZERO,
             Color32::from_rgba_premultiplied(
                 colors.card_bg.r(),
                 colors.card_bg.g(),
                 colors.card_bg.b(),
-                alpha,
+                description_fade_alpha(step),
             ),
         );
     }
@@ -1901,11 +1914,177 @@ fn model_lifecycle_button(
     response
 }
 
+fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon_glyph(icon),
+        egui::FontId::proportional(14.0),
+        color,
+    );
+}
+
+fn render_model_identity(
+    ui: &mut egui::Ui,
+    name: &str,
+    active: bool,
+    selectable: bool,
+    width: f32,
+) -> bool {
+    let colors = ui_palette(ui);
+    let badge_size = if active {
+        installed_model_badge_size(ui, "Active", colors.success_text)
+    } else {
+        Vec2::ZERO
+    };
+    let icon_width = 20.0;
+    let content_gap = 6.0;
+    let badge_gap = if active { 8.0 } else { 0.0 };
+    let title_width = (width - icon_width - content_gap - badge_size.x - badge_gap).max(44.0);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        name,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Button.resolve(ui.style()),
+            color: colors.text,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = title_width;
+    job.wrap.max_rows = 2;
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    let height = galley.size().y.max(44.0);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(width, height),
+        if selectable {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if selectable && (response.hovered() || response.has_focus()) {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(5.0), colors.active_card_bg);
+    }
+    let title_pos = egui::pos2(
+        rect.left() + icon_width + content_gap,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    let first_line_center_y = title_pos.y
+        + galley
+            .rows
+            .first()
+            .map_or(galley.size().y / 2.0, |row| row.rect.center().y);
+    ui.painter().text(
+        egui::pos2(rect.left() + icon_width / 2.0, first_line_center_y),
+        Align2::CENTER_CENTER,
+        icon_glyph(if active {
+            Icon::CheckCircle
+        } else {
+            Icon::Waveform
+        }),
+        egui::FontId::proportional(14.0),
+        if active {
+            colors.success
+        } else {
+            colors.muted_text
+        },
+    );
+    ui.painter().galley(title_pos, galley.clone(), colors.text);
+    if active {
+        let badge_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - badge_size.x / 2.0, first_line_center_y),
+            badge_size,
+        );
+        paint_installed_model_badge(
+            ui,
+            "Active",
+            badge_rect,
+            colors.success,
+            colors.success_text,
+        );
+    }
+    if selectable {
+        let accessible_name = format!("Use {name} for future transcriptions");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name.clone())
+        });
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::Button);
+            builder.set_name(accessible_name.as_str());
+            builder.set_bounds(accesskit_rect(rect));
+        });
+        focus_tooltip(ui, &response, &accessible_name);
+        paint_focus_ring(ui, &response, Rounding::same(5.0));
+    } else {
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_role(egui::accesskit::Role::StaticText);
+            builder.set_name(name);
+            builder.set_bounds(accesskit_rect(egui::Rect::from_min_size(
+                title_pos,
+                galley.size(),
+            )));
+        });
+    }
+    selectable && response.clicked()
+}
+
+fn render_model_ratings(ui: &mut egui::Ui, card: ModelCard<'_>) {
+    ui.horizontal(|ui| {
+        rating_meter(
+            ui,
+            "Speed",
+            match card {
+                ModelCard::Local(model) => speed_rating(model.speed_tier),
+                ModelCard::Remote(_, _) => None,
+            },
+            false,
+        );
+        rating_meter(
+            ui,
+            "Accuracy",
+            match card {
+                ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
+                ModelCard::Remote(_, _) => None,
+            },
+            false,
+        );
+    });
+}
+
+fn render_model_metadata(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    languages: &[String],
+    size: &str,
+    include_ratings: bool,
+) {
+    let colors = ui_palette(ui);
+    ui.horizontal_wrapped(|ui| {
+        let (language_name, language_summary) = model_language_summary(languages);
+        paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
+        let language = ui.label(
+            RichText::new(language_summary)
+                .small()
+                .color(colors.muted_text),
+        );
+        ui.ctx()
+            .accesskit_node_builder(language.id, |builder| builder.set_name(language_name));
+        ui.label(RichText::new(size).small().color(colors.muted_text));
+        if include_ratings {
+            render_model_ratings(ui, card);
+        }
+    });
+}
+
 fn render_unified_model_card(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
     expanded: bool,
     can_replace_active: bool,
+    restore_remove_focus: bool,
 ) -> ModelCardRenderResult {
     let colors = ui_palette(ui);
     let card_key = card.key();
@@ -2031,22 +2210,10 @@ fn render_unified_model_card(
             )
         }
     };
-    let summary_action = match card {
-        ModelCard::Local(model) if model.installed && model.ready && !model.active => {
-            ScreenAction::SelectModel(model.id.clone())
-        }
-        ModelCard::Local(model)
-            if model.installed
-                && !model.ready
-                && model.primary_action_enabled
-                && (model.primary_action_installs_upgrade
-                    || model.primary_action_repairs_runtime) =>
-        {
-            local_model_primary_action(model)
-        }
-        _ => ScreenAction::ToggleModelCardDetails(card_key.clone()),
-    };
+    let title_selects_model =
+        matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
     let mut action = ScreenAction::None;
+    let mut restored_remove_focus = false;
     let frame = Frame::none()
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border))
@@ -2057,11 +2224,11 @@ fn render_unified_model_card(
         ))
         .show(ui, |ui| {
             let compact = ui.available_width() < 430.0;
-            ui.horizontal_top(|ui| {
-                let details_name = format!(
-                    "{} details for {name}",
-                    if expanded { "Collapse" } else { "Expand" }
-                );
+            let details_name = format!(
+                "{} details for {name}",
+                if expanded { "Collapse" } else { "Expand" }
+            );
+            let render_details = |ui: &mut egui::Ui, action: &mut ScreenAction| {
                 let details = compact_model_icon_action(
                     ui,
                     if expanded {
@@ -2077,88 +2244,11 @@ fn render_unified_model_card(
                 ui.ctx()
                     .accesskit_node_builder(details.id, |builder| builder.set_expanded(expanded));
                 if details.clicked() {
-                    action = ScreenAction::ToggleModelCardDetails(card_key.clone());
+                    *action = ScreenAction::ToggleModelCardDetails(card_key.clone());
                 }
-                let lifecycle_track = if compact { 0.0 } else { 108.0 };
-                let identity_width =
-                    (ui.available_width() - lifecycle_track - 8.0).clamp(44.0, 360.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(identity_width, 0.0),
-                    Layout::top_down(Align::LEFT),
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(icon_glyph(if active {
-                                    Icon::CheckCircle
-                                } else {
-                                    Icon::Waveform
-                                }))
-                                .color(if active {
-                                    colors.success
-                                } else {
-                                    colors.muted_text
-                                }),
-                            );
-                            let summary_name = format!("Use {name} for future transcriptions");
-                            let summary = ui.add_sized(
-                                Vec2::new(
-                                    (ui.available_width() - if active { 58.0 } else { 0.0 })
-                                        .max(44.0),
-                                    44.0,
-                                ),
-                                egui::Button::new(RichText::new(name).strong()).wrap(true),
-                            );
-                            summary.widget_info(|| {
-                                egui::WidgetInfo::labeled(egui::WidgetType::Button, &summary_name)
-                            });
-                            ui.ctx().accesskit_node_builder(summary.id, |builder| {
-                                builder.set_role(egui::accesskit::Role::Button);
-                                builder.set_name(summary_name.as_str());
-                                builder.set_bounds(accesskit_rect(summary.rect));
-                            });
-                            if summary.clicked() {
-                                action = summary_action.clone();
-                            }
-                            if active {
-                                installed_model_badge(
-                                    ui,
-                                    "Active",
-                                    ui.cursor().top(),
-                                    colors.success,
-                                    colors.success_text,
-                                );
-                            }
-                        });
-                        if !expanded {
-                            let width = ui.available_width();
-                            let overflow = description_overflows(ui, &description, width);
-                            let preview = ui.add(
-                                egui::Label::new(
-                                    RichText::new(&description).small().color(colors.muted_text),
-                                )
-                                .truncate(true),
-                            );
-                            paint_description_fade(ui, preview.rect, overflow);
-                        }
-                    },
-                );
-                if !compact {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let lifecycle = model_lifecycle_button(
-                            ui,
-                            lifecycle_label,
-                            &row_name,
-                            row_enabled,
-                            row_reason,
-                        );
-                        if lifecycle.clicked() && row_enabled {
-                            action = row_action.clone();
-                        }
-                    });
-                }
-            });
-            if compact {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            };
+            let render_lifecycle =
+                |ui: &mut egui::Ui, action: &mut ScreenAction, restored_remove_focus: &mut bool| {
                     let lifecycle = model_lifecycle_button(
                         ui,
                         lifecycle_label,
@@ -2166,47 +2256,103 @@ fn render_unified_model_card(
                         row_enabled,
                         row_reason,
                     );
-                    if lifecycle.clicked() && row_enabled {
-                        action = row_action.clone();
+                    if restore_remove_focus
+                        && matches!(row_action, ScreenAction::RequestModelRemoval(_))
+                    {
+                        lifecycle.request_focus();
+                        *restored_remove_focus = true;
                     }
+                    if lifecycle.clicked() && row_enabled {
+                        *action = row_action.clone();
+                    }
+                };
+            if compact {
+                let gap = ui.spacing().item_spacing.x;
+                let identity_width = (ui.available_width() - 44.0 - gap).max(44.0);
+                ui.horizontal_top(|ui| {
+                    if render_model_identity(ui, name, active, title_selects_model, identity_width)
+                    {
+                        action = ScreenAction::SelectModel(match card {
+                            ModelCard::Local(model) => model.id.clone(),
+                            ModelCard::Remote(_, _) => unreachable!("only local titles select"),
+                        });
+                    }
+                    render_details(ui, &mut action);
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    render_lifecycle(ui, &mut action, &mut restored_remove_focus);
+                });
+            } else {
+                let gap = ui.spacing().item_spacing.x;
+                let ratings_width = MODEL_RATING_METER_WIDTH * 2.0 + gap;
+                let lifecycle_width = 108.0;
+                let details_width = 44.0;
+                let identity_track = (ui.available_width()
+                    - ratings_width
+                    - lifecycle_width
+                    - details_width
+                    - gap * 3.0)
+                    .max(44.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(identity_track, 0.0),
+                        Layout::left_to_right(Align::TOP),
+                        |ui| {
+                            let identity_width = identity_track.min(360.0);
+                            if render_model_identity(
+                                ui,
+                                name,
+                                active,
+                                title_selects_model,
+                                identity_width,
+                            ) {
+                                action = ScreenAction::SelectModel(match card {
+                                    ModelCard::Local(model) => model.id.clone(),
+                                    ModelCard::Remote(_, _) => {
+                                        unreachable!("only local titles select")
+                                    }
+                                });
+                            }
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ratings_width, 44.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| render_model_ratings(ui, card),
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(lifecycle_width, 44.0),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            render_lifecycle(ui, &mut action, &mut restored_remove_focus);
+                        },
+                    );
+                    render_details(ui, &mut action);
                 });
             }
+            if !expanded {
+                let width = ui.available_width();
+                let overflow = description_overflows(ui, &description, width);
+                let preview = ui.add(
+                    egui::Label::new(RichText::new(&description).small().color(colors.muted_text))
+                        .truncate(true),
+                );
+                paint_description_fade(ui, preview.rect, overflow);
+            }
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                let (language_name, language_summary) = model_language_summary(languages);
-                ui.label(RichText::new(icon_glyph(Icon::Globe)).color(colors.muted_text));
-                let language = ui.label(
-                    RichText::new(language_summary)
-                        .small()
-                        .color(colors.muted_text),
-                );
-                ui.ctx()
-                    .accesskit_node_builder(language.id, |builder| builder.set_name(language_name));
-                ui.label(RichText::new(size).small().color(colors.muted_text));
-                rating_meter(
-                    ui,
-                    "Speed",
-                    match card {
-                        ModelCard::Local(model) => speed_rating(model.speed_tier),
-                        ModelCard::Remote(_, _) => None,
-                    },
-                    false,
-                );
-                rating_meter(
-                    ui,
-                    "Accuracy",
-                    match card {
-                        ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
-                        ModelCard::Remote(_, _) => None,
-                    },
-                    false,
-                );
-            });
+            render_model_metadata(ui, card, languages, &size, compact);
             if expanded {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
-                render_inline_model_details(ui, card, can_replace_active, &mut action);
+                render_inline_model_details(
+                    ui,
+                    card,
+                    can_replace_active,
+                    restore_remove_focus && !restored_remove_focus,
+                    &mut restored_remove_focus,
+                    &mut action,
+                );
             }
         });
     ui.ctx()
@@ -2215,13 +2361,18 @@ fn render_unified_model_card(
             builder.set_name(format!("{name} model"));
             builder.set_bounds(accesskit_rect(frame.response.rect));
         });
-    ModelCardRenderResult { action }
+    ModelCardRenderResult {
+        action,
+        restored_remove_focus,
+    }
 }
 
 fn render_inline_model_details(
     ui: &mut egui::Ui,
     card: ModelCard<'_>,
     can_replace_active: bool,
+    restore_remove_focus: bool,
+    restored_remove_focus: &mut bool,
     action: &mut ScreenAction,
 ) {
     ui.vertical(|ui| {
@@ -2336,6 +2487,10 @@ fn render_inline_model_details(
                         enabled,
                         reason,
                     );
+                    if restore_remove_focus {
+                        response.request_focus();
+                        *restored_remove_focus = true;
+                    }
                     if response.clicked() && enabled {
                         *action = ScreenAction::RequestModelRemoval(model.id.clone());
                     }
@@ -2367,7 +2522,7 @@ fn render_model_section(
     toggle_action: Option<ScreenAction>,
     focus: ModelSectionFocus,
     _terminal: bool,
-) -> ScreenAction {
+) -> (ScreenAction, bool) {
     let colors = ui_palette(ui);
     let toggle_enabled = toggle_action.is_some();
     let (header_rect, header) = ui.allocate_exact_size(
@@ -2420,23 +2575,36 @@ fn render_model_section(
         ScreenAction::None
     };
     if !expanded || cards.is_empty() {
-        return action;
+        return (action, false);
     }
 
+    let mut restored_remove_focus = false;
     ui.add_space(MODEL_CARD_GAP);
     for (index, card) in cards.iter().copied().enumerate() {
         let expanded = focus.expanded.is_some_and(|key| card.matches_key(key));
+        let restore_remove_focus = matches!(
+            card,
+            ModelCard::Local(model)
+                if focus.restore_remove_focus.is_some_and(|id| id == model.id)
+        );
         let rendered = ui
             .push_id(("model-card", card.key()), |ui| {
-                render_unified_model_card(ui, card, expanded, focus.can_replace_active)
+                render_unified_model_card(
+                    ui,
+                    card,
+                    expanded,
+                    focus.can_replace_active,
+                    restore_remove_focus,
+                )
             })
             .inner;
         merge_model_action(&mut action, rendered.action);
+        restored_remove_focus |= rendered.restored_remove_focus;
         if index + 1 < cards.len() {
             ui.add_space(MODEL_CARD_GAP);
         }
     }
-    action
+    (action, restored_remove_focus)
 }
 
 fn models(
@@ -2451,7 +2619,12 @@ fn models(
     let colors = ui_palette(ui);
     let mut action = ScreenAction::None;
     let mut import_control = None;
+    let mut restored_remove_focus = false;
     let dialog_active = management.dialog.is_some();
+    let restore_remove_target_gone = management
+        .restore_remove_focus
+        .as_deref()
+        .is_some_and(|id| !models.iter().any(|model| model.installed && model.id == id));
     #[cfg(test)]
     ui.data_mut(|data| {
         data.remove::<egui::Rect>(egui::Id::new("models-final-card-rect"));
@@ -2497,7 +2670,7 @@ fn models(
             let import = compact_model_icon_action(ui, Icon::Plus, "Import local GGUF", true, None, None);
             if management.restore_add_focus
                 || management.restore_after_removal_focus
-                || management.restore_remove_focus.is_some()
+                || restore_remove_target_gone
             {
                 import.request_focus();
             }
@@ -2531,12 +2704,22 @@ fn models(
         builder.set_live(egui::accesskit::Live::Polite);
         builder.set_live_atomic();
     });
-    let (installed_cards, available_cards) = build_model_card_lists(
+    let (mut installed_cards, available_cards) = build_model_card_lists(
         models,
         model_catalog,
         remote_catalog,
         language_filter,
     );
+    if let Some(restore_id) = management.restore_remove_focus.as_deref()
+        && !installed_cards.iter().any(
+            |card| matches!(card, ModelCard::Local(model) if model.id == restore_id),
+        )
+        && let Some(model) = models
+            .iter()
+            .find(|model| model.installed && model.id == restore_id)
+    {
+        installed_cards.insert(0, ModelCard::Local(model));
+    }
     let can_replace_active = models
         .iter()
         .filter(|model| model.installed && model.ready)
@@ -2570,21 +2753,24 @@ fn models(
     ui.add_space(12.0);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let installed_action = render_model_section(
+        let (installed_action, restored_installed_focus) = render_model_section(
             ui,
             "Installed",
             &installed_cards,
-            management.installed_expanded || search_active,
+            management.installed_expanded
+                || search_active
+                || management.restore_remove_focus.is_some(),
             (!search_active).then_some(ScreenAction::ToggleInstalledModels),
             ModelSectionFocus {
                 expanded: management.expanded_model_card.as_ref(),
                 can_replace_active,
+                restore_remove_focus: management.restore_remove_focus.as_deref(),
             },
             available_cards.is_empty(),
         );
         merge_model_action(&mut action, installed_action);
         ui.add_space(12.0);
-        let available_action = render_model_section(
+        let (available_action, restored_available_focus) = render_model_section(
             ui,
             "Available",
             &available_cards,
@@ -2593,10 +2779,12 @@ fn models(
             ModelSectionFocus {
                 expanded: management.expanded_model_card.as_ref(),
                 can_replace_active,
+                restore_remove_focus: management.restore_remove_focus.as_deref(),
             },
             true,
         );
         merge_model_action(&mut action, available_action);
+        restored_remove_focus = restored_installed_focus || restored_available_focus;
     });
     let comparison_width =
         (comparison_viewport.width() - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0);
@@ -2956,7 +3144,10 @@ fn models(
         );
     });
     });
-    if management.restore_remove_focus.is_some() && action == ScreenAction::None {
+    if management.restore_remove_focus.is_some()
+        && (restored_remove_focus || restore_remove_target_gone)
+        && action == ScreenAction::None
+    {
         action = ScreenAction::AcknowledgeModelRemovalFocus;
     }
     // The disabled scope above is the primary boundary for both pointer and
@@ -5638,6 +5829,57 @@ mod tests {
             ("Languages unavailable", "\u{2014}".into())
         );
         assert!(!MODEL_DESCRIPTION_FADE_WIDTH.is_sign_negative());
+        let alphas = (0..MODEL_DESCRIPTION_FADE_STEPS)
+            .map(description_fade_alpha)
+            .collect::<Vec<_>>();
+        assert!(alphas.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(alphas.last(), Some(&u8::MAX));
+    }
+
+    #[test]
+    fn decorative_model_card_icons_do_not_create_accessibility_nodes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let models = [
+            ModelViewModel {
+                id: "active".into(),
+                display_name: "Active model".into(),
+                installed: true,
+                active: true,
+                ready: true,
+                removal_supported: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "inactive".into(),
+                display_name: "Inactive model".into(),
+                installed: true,
+                ready: true,
+                removal_supported: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            },
+        ];
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for model in &models {
+                    let _ =
+                        render_unified_model_card(ui, ModelCard::Local(model), false, true, false);
+                }
+            });
+        });
+        let names = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.name().map(str::to_owned))
+            .collect::<Vec<_>>();
+        for icon in [Icon::CheckCircle, Icon::Waveform, Icon::Globe] {
+            assert!(!names.iter().any(|name| name == icon_glyph(icon)));
+        }
     }
 
     #[test]
