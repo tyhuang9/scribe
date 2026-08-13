@@ -746,6 +746,209 @@ fn dangling_database_reparse_is_rejected_when_symlink_creation_is_available() {
     assert!(!outside.exists());
 }
 
+#[cfg(windows)]
+fn set_restrictive_sidecar_dacl(path: &Path, user_sid: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        SetFileSecurityW,
+    };
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Keep WRITE_DAC for this process user so the production repair can
+    // replace the DACL while normal read/write opens remain denied.
+    let sddl = format!("D:P(A;OICI;WD;;;{user_sid})(A;OICI;FA;;;SY)")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    assert_ne!(converted, 0, "failed to build restrictive sidecar DACL");
+    let applied = unsafe {
+        SetFileSecurityW(
+            path_wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    let error = (applied == 0).then(|| unsafe { GetLastError() });
+    unsafe {
+        LocalFree(descriptor);
+    }
+    assert!(
+        error.is_none(),
+        "failed to apply restrictive sidecar DACL: {}",
+        std::io::Error::from_raw_os_error(error.unwrap_or_default() as i32)
+    );
+}
+
+#[cfg(windows)]
+fn sidecar_security_descriptor_sddl(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut::<PSID>(),
+            ptr::null_mut::<PSID>(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, 0, "failed to read sidecar DACL: {status}");
+
+    let mut descriptor_sddl = ptr::null_mut();
+    let mut descriptor_sddl_length = 0;
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut descriptor_sddl,
+            &mut descriptor_sddl_length,
+        )
+    };
+    if converted == 0 {
+        let error = unsafe { GetLastError() };
+        unsafe {
+            LocalFree(descriptor);
+        }
+        panic!(
+            "failed to stringify sidecar DACL: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+    }
+    let length = unsafe { (0..).find(|&index| *descriptor_sddl.add(index) == 0) };
+    let length = length.unwrap_or(descriptor_sddl_length as usize);
+    let sddl =
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(descriptor_sddl, length) });
+    unsafe {
+        LocalFree(descriptor_sddl.cast());
+        LocalFree(descriptor);
+    }
+    sddl
+}
+
+#[cfg(windows)]
+fn assert_sidecar_open_is_denied(path: &Path) {
+    let error = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect_err("restrictive sidecar DACL unexpectedly allowed read/write open");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(5),
+        "expected ERROR_ACCESS_DENIED from restrictive sidecar DACL, got {error:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn stale_wal_and_shm_acl_is_repaired_before_history_reopen() {
+    use rusqlite::Connection;
+
+    let root = TestRoot::new("sidecar-acl-recovery");
+    let record_id = {
+        let store = HistoryStore::open(&root, policy(100)).unwrap();
+        completed(&store, "acl recovery record").id
+    };
+    let database_path = root.as_ref().join("history.sqlite3");
+    let wal_path = root.as_ref().join("history.sqlite3-wal");
+    let shm_path = root.as_ref().join("history.sqlite3-shm");
+
+    // Keep a second SQLite connection open so SQLite leaves both sidecars in
+    // place while the ACLs are denied and the history store is reopened.
+    let writer = Connection::open(&database_path).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0i64)
+        .unwrap();
+    writer
+        .execute_batch("BEGIN; UPDATE history SET updated_at_ms = updated_at_ms + 1; COMMIT;")
+        .unwrap();
+    let keeper = Connection::open(&database_path).unwrap();
+    let mut keeper_statement = keeper.prepare("SELECT id FROM history LIMIT 1").unwrap();
+    let mut keeper_rows = keeper_statement.query([]).unwrap();
+    assert!(
+        keeper_rows.next().unwrap().is_some(),
+        "keeper read snapshot did not observe the history record"
+    );
+    assert!(wal_path.is_file(), "SQLite did not create the WAL sidecar");
+    assert!(shm_path.is_file(), "SQLite did not create the SHM sidecar");
+    drop(writer);
+
+    let user_sid = super::audio::current_process_user_sid().unwrap();
+    set_restrictive_sidecar_dacl(&wal_path, &user_sid);
+    set_restrictive_sidecar_dacl(&shm_path, &user_sid);
+    assert_sidecar_open_is_denied(&wal_path);
+    assert_sidecar_open_is_denied(&shm_path);
+
+    let reopened = HistoryStore::open(&root, policy(100)).unwrap();
+    let page = reopened.search(HistoryQuery::default()).unwrap();
+    assert!(page.records.iter().any(|record| record.id == record_id));
+
+    for sidecar in [&wal_path, &shm_path] {
+        let sddl = sidecar_security_descriptor_sddl(sidecar);
+        assert!(
+            sddl.starts_with("D:P"),
+            "sidecar DACL is not protected: {sddl}"
+        );
+        assert!(
+            sddl.contains(&format!(";;;{user_sid}")),
+            "repaired sidecar DACL omitted current user SID {user_sid}: {sddl}"
+        );
+        assert!(
+            sddl.contains(";;;SY"),
+            "repaired sidecar DACL omitted SY: {sddl}"
+        );
+        for principal in [";;;OW", ";;;AU", ";;;BU", ";;;WD"] {
+            assert!(
+                !sddl.contains(principal),
+                "repaired sidecar DACL unexpectedly contains {principal}: {sddl}"
+            );
+        }
+    }
+
+    drop(reopened);
+    drop(keeper_rows);
+    drop(keeper_statement);
+    drop(keeper);
+}
+
 #[test]
 fn cloned_handles_share_one_worker_and_only_last_drop_stops_it() {
     let root = TestRoot::new("clone");
