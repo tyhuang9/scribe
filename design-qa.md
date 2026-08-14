@@ -365,7 +365,8 @@ final result: blocked
   AccessKit Default activation for ready inactive installed cards, plus child
   lifecycle/disclosure/feature/maintenance exclusion and action precedence.
 - Windows UI Automation exposed the complete current Models route while the
-  process remained responsive: the full-card `Select whisper.cpp tiny.en`
+  process remained responsive: the full-card
+  `Use whisper.cpp tiny.en for future transcriptions`
   target, lifecycle controls, feature group, and disclosure controls were all
   present with their expected names and roles.
 
@@ -421,8 +422,8 @@ final result: blocked
   section heading to its content, 12 px between Features, Requirements, and
   Maintenance, 32 px expanded feature rows with 4 px row gaps, and natural
   Requirements height.
-- Full UI-harness suite: 827 passed, 0 failed, 11 ignored.
-- Full default suite: 763 passed, 0 failed, 10 ignored.
+- Full UI-harness suite: 828 passed, 0 failed, 11 ignored.
+- Full default suite: 764 passed, 0 failed, 10 ignored.
 - Strict all-targets UI-harness Clippy, all-targets/all-features check,
   formatting, and diff checks passed.
 

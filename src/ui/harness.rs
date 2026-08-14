@@ -3611,7 +3611,7 @@ mod tests {
         let mut page = AppPage::Models;
         let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
         let card_target = node_matching(&output, |node| {
-            node.name() == Some("Select whisper.cpp tiny.en")
+            node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
         });
         assert_eq!(card_target.role(), egui::accesskit::Role::Button);
         assert!(card_target.supports_action(egui::accesskit::Action::Default));
@@ -3620,7 +3620,8 @@ mod tests {
                 .bounds()
                 .is_some_and(|bounds| bounds.height() >= 44.0)
         );
-        let card_target_id = named_node_id(&output, "Select whisper.cpp tiny.en");
+        let card_target_id =
+            named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
         assert_eq!(
             render_with_input(
                 &ctx,
@@ -3648,7 +3649,7 @@ mod tests {
         assert!(
             !node_names(&output)
                 .iter()
-                .any(|name| name == "Select whisper.cpp base.en")
+                .any(|name| name == "Use whisper.cpp base.en for future transcriptions")
         );
 
         for (display_name, model) in [
@@ -3705,9 +3706,9 @@ mod tests {
                 egui::accesskit::Role::StaticText,
             );
             assert!(
-                !node_names(&rendered)
-                    .iter()
-                    .any(|name| name == &format!("Select {display_name}"))
+                !node_names(&rendered).iter().any(|name| {
+                    name == &format!("Use {display_name} for future transcriptions")
+                })
             );
         }
     }
@@ -3788,7 +3789,10 @@ mod tests {
             let mut page = AppPage::Models;
             let initial =
                 render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-            let target = named_node_id(&initial, "Select whisper.cpp tiny.en");
+            let target = named_node_id(
+                &initial,
+                "Use whisper.cpp tiny.en for future transcriptions",
+            );
             assert_eq!(
                 render_with_input(
                     &ctx,
@@ -3827,14 +3831,14 @@ mod tests {
     fn ready_card_has_one_selectable_sibling_of_its_child_buttons() {
         let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
         let update = output.platform_output.accesskit_update.as_ref().unwrap();
-        let select_id = named_node_id(&output, "Select whisper.cpp tiny.en");
+        let select_id = named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
         assert_eq!(
             update
                 .nodes
                 .iter()
                 .filter(|(_, node)| {
                     node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Select whisper.cpp tiny.en")
+                        && node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
                 })
                 .count(),
             1,

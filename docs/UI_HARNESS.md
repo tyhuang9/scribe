@@ -77,7 +77,7 @@ Capture and inspect original-resolution client-area screenshots at exactly
 1180 × 815 and 960 × 680:
 
 1. `models/installed`: idle, hover a selectable inactive-card coordinate, and
-   keyboard-focus `Select whisper.cpp tiny.en`.
+   keyboard-focus `Use whisper.cpp tiny.en for future transcriptions`.
 2. `models/lifecycle`: inspect the inverse Install glyph and compact size,
    then confirm partial/download/error controls remain truthful and contained.
 3. `models/card-expanded`: inspect expanded top content, then scroll the

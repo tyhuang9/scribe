@@ -1680,7 +1680,7 @@ fn render_model_description_preview(
     description: &str,
     width: f32,
     left_inset: f32,
-) {
+) -> Option<egui::Rect> {
     let colors = ui_palette(ui);
     let content_width = (width - left_inset).max(0.0);
     let overflow = description_overflows(ui, description, content_width);
@@ -1707,7 +1707,7 @@ fn render_model_description_preview(
             },
         )
         .inner;
-    paint_description_fade(ui, preview.rect, overflow);
+    overflow.then_some(preview.rect)
 }
 
 fn render_model_description(
@@ -1716,10 +1716,9 @@ fn render_model_description(
     width: f32,
     left_inset: f32,
     expanded: bool,
-) {
+) -> Option<egui::Rect> {
     if !expanded {
-        render_model_description_preview(ui, description, width, left_inset);
-        return;
+        return render_model_description_preview(ui, description, width, left_inset);
     }
     let colors = ui_palette(ui);
     let content_width = (width - left_inset).max(0.0);
@@ -1734,13 +1733,19 @@ fn render_model_description(
             },
         );
     });
+    None
 }
 
-fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, overflow: bool) {
-    if !overflow {
-        return;
-    }
-    let colors = ui_palette(ui);
+fn description_fade_color(surface: Color32, step: usize) -> Color32 {
+    Color32::from_rgba_premultiplied(
+        surface.r(),
+        surface.g(),
+        surface.b(),
+        description_fade_alpha(step),
+    )
+}
+
+fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, surface: Color32) {
     let fade = MODEL_DESCRIPTION_FADE_WIDTH.min(rect.width());
     let band_width = fade / MODEL_DESCRIPTION_FADE_STEPS as f32;
     for step in 0..MODEL_DESCRIPTION_FADE_STEPS {
@@ -1753,12 +1758,7 @@ fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, overflow: bool) {
         ui.painter().rect_filled(
             egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
             Rounding::ZERO,
-            Color32::from_rgba_premultiplied(
-                colors.card_bg.r(),
-                colors.card_bg.g(),
-                colors.card_bg.b(),
-                description_fade_alpha(step),
-            ),
+            description_fade_color(surface, step),
         );
     }
 }
@@ -2760,6 +2760,7 @@ fn render_unified_model_card(
     let mut action = ScreenAction::None;
     let mut restored_remove_focus = false;
     let mut focus_within = false;
+    let mut description_fade_rect = None;
     let mut activation_exclusions = Vec::new();
     let (idle_fill, idle_stroke, idle_shadow) =
         model_card_visual_style(colors, ModelCardVisualState::Idle);
@@ -2842,7 +2843,8 @@ fn render_unified_model_card(
             let identity = render_model_identity(ui, name, active, false, identity_width);
             focus_within |= identity.has_focus;
             let description_width = card_content_width;
-            render_model_description(ui, &description, description_width, 26.0, expanded);
+            description_fade_rect =
+                render_model_description(ui, &description, description_width, 26.0, expanded);
             ui.horizontal(|ui| {
                 rating_meter(
                     ui,
@@ -2896,7 +2898,7 @@ fn render_unified_model_card(
                             let identity =
                                 render_model_identity(ui, name, active, false, identity_track);
                             focus_within |= identity.has_focus;
-                            render_model_description(
+                            description_fade_rect = render_model_description(
                                 ui,
                                 &description,
                                 identity_track,
@@ -3090,7 +3092,7 @@ fn render_unified_model_card(
             focus_within |= activation_has_focus;
             ui.ctx().accesskit_node_builder(activation.id, |builder| {
                 builder.set_role(egui::accesskit::Role::Button);
-                builder.set_name(format!("Select {name}"));
+                builder.set_name(format!("Use {name} for future transcriptions"));
                 builder.set_bounds(accesskit_rect(response.rect));
                 builder.set_default_action_verb(egui::accesskit::DefaultActionVerb::Click);
                 builder.add_action(egui::accesskit::Action::Default);
@@ -3169,6 +3171,9 @@ fn render_unified_model_card(
         prepared.frame.stroke = stroke;
         prepared.frame.shadow = shadow;
         prepared.paint(ui);
+        if let Some(rect) = description_fade_rect {
+            paint_description_fade(ui, rect, fill);
+        }
         response
     };
     ui.ctx().accesskit_node_builder(frame.id, |builder| {
@@ -6754,6 +6759,36 @@ mod tests {
         assert_eq!(active_shadow.blur, 18.0);
         assert_eq!(active_shadow.spread, 1.0);
         assert_eq!(MODEL_CARD_SHADOW_GUTTER, 6.0);
+    }
+
+    #[test]
+    fn description_fade_tracks_the_resolved_card_surface_in_both_themes() {
+        for colors in [
+            crate::ui::theme::ThemePalette::light(),
+            crate::ui::theme::ThemePalette::dark(),
+        ] {
+            let (idle_fill, _, _) = model_card_visual_style(colors, ModelCardVisualState::Idle);
+            let (active_fill, _, _) = model_card_visual_style(colors, ModelCardVisualState::Active);
+            assert_ne!(idle_fill, active_fill);
+            for (surface, state) in [
+                (idle_fill, ModelCardVisualState::Idle),
+                (active_fill, ModelCardVisualState::Active),
+            ] {
+                for step in 0..MODEL_DESCRIPTION_FADE_STEPS {
+                    let fade = description_fade_color(surface, step);
+                    assert_eq!(
+                        (fade.r(), fade.g(), fade.b()),
+                        (surface.r(), surface.g(), surface.b())
+                    );
+                    assert_eq!(fade.a(), description_fade_alpha(step));
+                }
+                assert_eq!(
+                    model_card_visual_style(colors, state).0,
+                    surface,
+                    "fade must use the resolved {state:?} card surface",
+                );
+            }
+        }
     }
 
     fn render_route(route: UiRoute) -> egui::FullOutput {
