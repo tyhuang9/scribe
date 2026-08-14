@@ -2804,12 +2804,22 @@ mod tests {
             "ON DISK",
             "GPU",
             "Unknown",
-            "LANGUAGES",
-            "English",
             "FEATURES",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
+        assert!(
+            node_names(&expanded)
+                .iter()
+                .any(|name| name == "Languages: English"),
+            "expanded identity metadata should use full language names"
+        );
+        assert!(
+            !node_names(&expanded)
+                .iter()
+                .any(|name| name == "DESCRIPTION" || name == "LANGUAGES"),
+            "description and languages belong in the identity stack, not duplicate details"
+        );
         assert_eq!(
             node_names(&expanded)
                 .iter()
@@ -3598,6 +3608,90 @@ mod tests {
     }
 
     #[test]
+    fn model_card_summary_uses_sixty_forty_tracks_and_expands_metadata_in_place() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.retain(|model| model.id == "tiny.en");
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = AppPage::Models;
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+            let card = named_node_bounds(&output, "whisper.cpp tiny.en model");
+            let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+            let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
+            let content_left = card.x0 + 16.0;
+            let content_width = card.x1 - card.x0 - 32.0;
+            let expected_boundary = content_left + content_width * 0.60;
+            assert!(
+                (speed.x0 - expected_boundary).abs() <= LAYOUT_TOLERANCE * 2.0,
+                "desktop metrics must begin at the exact 60/40 track boundary: card={card:?}, speed={speed:?}, expected={expected_boundary}",
+            );
+            assert_near(
+                chevron.x1,
+                card.x1 - 16.0 - 6.0,
+                "the chevron must trail inside the right 40% track at the card gutter",
+            );
+        }
+
+        let long_description = "A deliberately long model description that must wrap when details are expanded while preserving the identity stack origin.";
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let model = data
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .expect("tiny model fixture");
+        model.description = Some(long_description.into());
+        let mut page = AppPage::Models;
+        let (collapsed, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
+        let collapsed_description = named_node_bounds(&collapsed, long_description);
+        let collapsed_language = named_node_bounds(&collapsed, "Languages: EN");
+
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+        let (expanded, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
+        let expanded_description = named_node_bounds(&expanded, long_description);
+        let expanded_language = named_node_bounds(&expanded, "Languages: English");
+        assert_near(
+            expanded_description.x0,
+            collapsed_description.x0,
+            "expanded description must keep the collapsed identity x origin",
+        );
+        assert_near(
+            expanded_language.x0,
+            collapsed_language.x0,
+            "expanded languages must stay in the identity metadata row",
+        );
+        assert!(
+            expanded_card.y1 > collapsed_card.y1,
+            "wrapping expanded metadata and details must grow the card naturally"
+        );
+
+        let compact = render(Fixture::ModelsInstalled, 375.0, 680.0);
+        let title = named_node_bounds(
+            &compact,
+            "Use whisper.cpp tiny.en for future transcriptions",
+        );
+        let lifecycle = named_node_bounds(&compact, "Delete whisper.cpp tiny.en");
+        assert!(
+            title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE,
+            "below 620px the summary must stack identity before controls"
+        );
+    }
+
+    #[test]
     fn model_card_controls_keep_trailing_chevron_order_without_decorative_nodes() {
         for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
@@ -3656,12 +3750,14 @@ mod tests {
             "DOWNLOAD SIZE",
             "82 MB",
             "GPU",
-            "LANGUAGES",
-            "English",
             "FEATURES",
         ] {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
+        assert!(
+            names.iter().any(|name| name == "Languages: English"),
+            "expanded remote identity should expose its full language name"
+        );
         assert_eq!(
             names
                 .iter()

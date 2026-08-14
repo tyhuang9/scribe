@@ -1710,6 +1710,32 @@ fn render_model_description_preview(
     paint_description_fade(ui, preview.rect, overflow);
 }
 
+fn render_model_description(
+    ui: &mut egui::Ui,
+    description: &str,
+    width: f32,
+    left_inset: f32,
+    expanded: bool,
+) {
+    if !expanded {
+        render_model_description_preview(ui, description, width, left_inset);
+        return;
+    }
+    let colors = ui_palette(ui);
+    let content_width = (width - left_inset).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(left_inset);
+        ui.allocate_ui_with_layout(
+            Vec2::new(content_width, 0.0),
+            Layout::top_down(Align::LEFT),
+            |ui| {
+                ui.set_width(content_width);
+                ui.label(RichText::new(description).small().color(colors.muted_text));
+            },
+        );
+    });
+}
+
 fn paint_description_fade(ui: &egui::Ui, rect: egui::Rect, overflow: bool) {
     if !overflow {
         return;
@@ -2619,38 +2645,31 @@ fn active_badge_rect(
     )
 }
 
-fn render_model_ratings(ui: &mut egui::Ui, card: ModelCard<'_>) {
-    ui.horizontal(|ui| {
-        rating_meter(
-            ui,
-            "Speed",
-            match card {
-                ModelCard::Local(model) => speed_rating(model.speed_tier),
-                ModelCard::Remote(_, variant) => speed_rating(variant.speed_tier),
-            },
-            false,
-        );
-        rating_meter(
-            ui,
-            "Accuracy",
-            match card {
-                ModelCard::Local(model) => accuracy_rating(&model.accuracy_guidance),
-                ModelCard::Remote(_, variant) => accuracy_rating(&variant.accuracy_guidance),
-            },
-            false,
-        );
-    });
-}
-
 fn render_model_metadata(
     ui: &mut egui::Ui,
-    card: ModelCard<'_>,
     languages: &[String],
     include_ratings: bool,
+    expanded: bool,
 ) {
     let colors = ui_palette(ui);
     ui.horizontal_wrapped(|ui| {
-        let (language_name, language_summary) = model_language_summary(languages);
+        let (language_name, language_summary) = if expanded {
+            let names = normalized_languages(languages).join(", ");
+            (
+                if names.is_empty() {
+                    "Languages unavailable"
+                } else {
+                    "Languages"
+                },
+                if names.is_empty() {
+                    "â€”".to_owned()
+                } else {
+                    names
+                },
+            )
+        } else {
+            model_language_summary(languages)
+        };
         if !include_ratings {
             // Match the title text inset (20 px icon slot + 6 px gap).
             ui.add_space(6.0);
@@ -2673,9 +2692,7 @@ fn render_model_metadata(
                 })
             });
         });
-        if include_ratings {
-            render_model_ratings(ui, card);
-        }
+        debug_assert!(!include_ratings, "ratings are rendered by the card layout");
     });
 }
 
@@ -2723,7 +2740,9 @@ fn render_unified_model_card(
         .begin(ui);
     {
         let ui = &mut prepared.content_ui;
-        let compact = ui.available_width() < MODEL_CARD_COMPACT_BREAKPOINT;
+        let card_content_width = ui.available_width();
+        ui.set_min_width(card_content_width);
+        let compact = card_content_width < MODEL_CARD_COMPACT_BREAKPOINT;
         let details_name = format!(
             "{} details for {name}",
             if expanded { "Collapse" } else { "Expand" }
@@ -2781,7 +2800,7 @@ fn render_unified_model_card(
             }
         };
         if compact {
-            let identity_width = ui.available_width();
+            let identity_width = card_content_width;
             let identity =
                 render_model_identity(ui, name, active, title_selects_model, identity_width);
             focus_within |= identity.has_focus;
@@ -2791,10 +2810,8 @@ fn render_unified_model_card(
                     ModelCard::Remote(_, _) => unreachable!("only local titles select"),
                 });
             }
-            if !expanded {
-                let description_width = ui.available_width();
-                render_model_description_preview(ui, &description, description_width, 0.0);
-            }
+            let description_width = card_content_width;
+            render_model_description(ui, &description, description_width, 26.0, expanded);
             ui.horizontal(|ui| {
                 rating_meter(
                     ui,
@@ -2817,7 +2834,7 @@ fn render_unified_model_card(
                     true,
                 );
             });
-            render_model_metadata(ui, card, languages, false);
+            render_model_metadata(ui, languages, false, expanded);
             ui.horizontal(|ui| {
                 render_model_features(ui, card);
                 render_lifecycle(
@@ -2829,95 +2846,102 @@ fn render_unified_model_card(
                 render_details(ui, &mut action, &mut focus_within);
             });
         } else {
-            let gap = ui.spacing().item_spacing.x;
+            let identity_track = card_content_width * 0.60;
+            let right_track = card_content_width - identity_track;
             let details_width = 44.0;
-            let identity_track = (ui.available_width() * 0.44).clamp(300.0, 360.0);
-            let metrics_width = (ui.available_width() - identity_track - details_width - gap * 2.0)
-                .max(MODEL_RATING_METER_WIDTH * 2.0 + 160.0);
-            let details_width = 44.0;
-            let summary_height = if expanded { 88.0 } else { 108.0 };
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(identity_track, summary_height),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        let identity_width = identity_track.min(360.0);
-                        ui.set_width(identity_width);
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        let identity = render_model_identity(
-                            ui,
-                            name,
-                            active,
-                            title_selects_model,
-                            identity_width,
-                        );
-                        focus_within |= identity.has_focus;
-                        if identity.clicked {
-                            action = ScreenAction::SelectModel(match card {
-                                ModelCard::Local(model) => model.id.clone(),
-                                ModelCard::Remote(_, _) => {
-                                    unreachable!("only local titles select")
-                                }
-                            });
-                        }
-                        if !expanded {
-                            render_model_description_preview(
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(identity_track, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(identity_track);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let identity = render_model_identity(
+                                ui,
+                                name,
+                                active,
+                                title_selects_model,
+                                identity_track,
+                            );
+                            focus_within |= identity.has_focus;
+                            if identity.clicked {
+                                action = ScreenAction::SelectModel(match card {
+                                    ModelCard::Local(model) => model.id.clone(),
+                                    ModelCard::Remote(_, _) => {
+                                        unreachable!("only local titles select")
+                                    }
+                                });
+                            }
+                            render_model_description(
                                 ui,
                                 &description,
-                                identity_width,
+                                identity_track,
                                 26.0,
+                                expanded,
                             );
-                        }
-                        ui.add_space(4.0);
-                        render_model_metadata(ui, card, languages, false);
-                    },
-                );
-                ui.allocate_ui_with_layout(
-                    Vec2::new(metrics_width, summary_height),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            rating_meter(
-                                ui,
-                                "Speed",
-                                match card {
-                                    ModelCard::Local(model) => speed_rating(model.speed_tier),
-                                    ModelCard::Remote(_, variant) => {
-                                        speed_rating(variant.speed_tier)
-                                    }
+                            ui.add_space(4.0);
+                            render_model_metadata(ui, languages, false, expanded);
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(right_track, 0.0),
+                        Layout::left_to_right(Align::TOP),
+                        |ui| {
+                            ui.set_width(right_track);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new((right_track - details_width).max(0.0), 0.0),
+                                Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.set_width((right_track - details_width).max(0.0));
+                                    ui.horizontal(|ui| {
+                                        rating_meter(
+                                            ui,
+                                            "Speed",
+                                            match card {
+                                                ModelCard::Local(model) => {
+                                                    speed_rating(model.speed_tier)
+                                                }
+                                                ModelCard::Remote(_, variant) => {
+                                                    speed_rating(variant.speed_tier)
+                                                }
+                                            },
+                                            true,
+                                        );
+                                        rating_meter(
+                                            ui,
+                                            "Accuracy",
+                                            match card {
+                                                ModelCard::Local(model) => {
+                                                    accuracy_rating(&model.accuracy_guidance)
+                                                }
+                                                ModelCard::Remote(_, variant) => {
+                                                    accuracy_rating(&variant.accuracy_guidance)
+                                                }
+                                            },
+                                            true,
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        render_model_features(ui, card);
+                                        render_lifecycle(
+                                            ui,
+                                            &mut action,
+                                            &mut restored_remove_focus,
+                                            &mut focus_within,
+                                        );
+                                    });
                                 },
-                                true,
                             );
-                            rating_meter(
-                                ui,
-                                "Accuracy",
-                                match card {
-                                    ModelCard::Local(model) => {
-                                        accuracy_rating(&model.accuracy_guidance)
-                                    }
-                                    ModelCard::Remote(_, variant) => {
-                                        accuracy_rating(&variant.accuracy_guidance)
-                                    }
-                                },
-                                true,
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(details_width, 0.0),
+                                Layout::left_to_right(Align::Center),
+                                |ui| render_details(ui, &mut action, &mut focus_within),
                             );
-                        });
-                        ui.horizontal(|ui| {
-                            render_model_features(ui, card);
-                            render_lifecycle(
-                                ui,
-                                &mut action,
-                                &mut restored_remove_focus,
-                                &mut focus_within,
-                            );
-                        });
-                    },
-                );
-                ui.allocate_ui_with_layout(
-                    Vec2::new(details_width, summary_height),
-                    Layout::left_to_right(Align::Center),
-                    |ui| render_details(ui, &mut action, &mut focus_within),
-                );
+                        },
+                    );
+                });
             });
         }
         // The summary establishes the card width. Keep the divider and inline
@@ -2975,28 +2999,6 @@ fn render_inline_model_details(
     let mut restored_remove_focus = false;
     ui.vertical(|ui| {
         let colors = ui_palette(ui);
-        let description = match card {
-            ModelCard::Local(model) => model
-                .description
-                .as_deref()
-                .unwrap_or("Local speech-to-text model."),
-            ModelCard::Remote(entry, _) => &entry.description,
-        };
-        detail_heading(ui, "DESCRIPTION", colors);
-        ui.label(description);
-        ui.add_space(8.0);
-        let languages = match card {
-            ModelCard::Local(model) => &model.languages,
-            ModelCard::Remote(entry, _) => &entry.languages,
-        };
-        let language_summary = normalized_languages(languages).join(", ");
-        detail_heading(ui, "LANGUAGES", colors);
-        ui.label(if language_summary.is_empty() {
-            "Languages unavailable".to_owned()
-        } else {
-            language_summary
-        });
-        ui.add_space(8.0);
         detail_heading(ui, "FEATURES", colors);
         let (features, known) = model_full_feature_names(card);
         ui.label(if !known {
