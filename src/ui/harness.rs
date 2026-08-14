@@ -7,17 +7,18 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelCardKey, ModelComparisonState, ModelDialog, ModelDownloadState,
-        ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
-        RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
-        RemoteCatalogView, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ModelCapabilities, ModelCardKey, ModelComparisonState, ModelDialog,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
+        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
+        RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, TranscriptionPhase,
+        TranscriptionState, UiRoute,
     },
     theme_palette,
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase, ModelCapabilities};
+use super::state::{ComparisonResult, ComparisonResultPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -88,7 +89,7 @@ impl Fixture {
             last_successful_capture_ms: Some(120_000),
             ..Default::default()
         };
-        let models = vec![
+        let mut models = vec![
             model("whisper.cpp base.en", "base.en", true, true, 400),
             model("whisper.cpp tiny.en", "tiny.en", false, false, 75),
         ];
@@ -175,6 +176,32 @@ impl Fixture {
                 ];
 
                 model_catalog = vec![partial, downloading, failed, available];
+                if self == Self::ModelsCardExpanded {
+                    let expanded = models
+                        .iter_mut()
+                        .find(|model| model.id == "tiny.en")
+                        .expect("expanded fixture includes tiny.en");
+                    expanded.description = Some(
+                        "A compact local model for responsive dictation, long recordings, and offline language-aware transcription."
+                            .into(),
+                    );
+                    expanded.languages = vec!["en".into(), "es".into(), "ja".into()];
+                    expanded.capabilities = ModelCapabilities {
+                        capabilities_known: true,
+                        batch_transcription: true,
+                        native_streaming: true,
+                        cancellation: true,
+                        timestamps: true,
+                        translation: true,
+                        language_detection: true,
+                        confidence_scores: true,
+                        custom_vocabulary: true,
+                        cpu: true,
+                        gpu: true,
+                    };
+                    expanded.runtime_action_label = Some("Repair".into());
+                    expanded.runtime_action_enabled = true;
+                }
             }
             Self::ModelsCompareExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
@@ -2788,7 +2815,7 @@ mod tests {
             node.name() == Some("Collapse details for whisper.cpp tiny.en")
                 && node.is_expanded() == Some(true)
         }));
-        let description = "More accurate for longer recordings.";
+        let description = "A compact local model for responsive dictation, long recordings, and offline language-aware transcription.";
         assert_eq!(
             node_names(&expanded)
                 .iter()
@@ -2803,15 +2830,16 @@ mod tests {
             "75MB",
             "ON DISK",
             "GPU",
-            "Unknown",
+            "Supported",
             "FEATURES",
+            "MAINTENANCE",
         ] {
             assert!(node_names(&expanded).iter().any(|name| name == detail));
         }
         assert!(
             node_names(&expanded)
                 .iter()
-                .any(|name| name == "Languages: English"),
+                .any(|name| name == "Languages: English, Spanish, Japanese"),
             "expanded identity metadata should use full language names"
         );
         assert!(
@@ -2827,6 +2855,32 @@ mod tests {
                 .count(),
             1,
             "the summary row owns the single uninstall action"
+        );
+    }
+
+    #[test]
+    fn expanded_fixture_exposes_all_feature_grid_evidence() {
+        let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let names = node_names(&output);
+        for feature in [
+            "Batch transcription",
+            "Native streaming",
+            "Cancellation",
+            "Word timestamps",
+            "Translation",
+            "Automatic language detection",
+            "Confidence scores",
+            "Custom vocabulary",
+        ] {
+            assert!(
+                names.iter().any(|name| name == feature),
+                "missing {feature}"
+            );
+        }
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Repair runtime for whisper.cpp tiny.en")
         );
     }
 
@@ -2890,20 +2944,26 @@ mod tests {
 
     #[test]
     fn model_metric_labels_sit_above_their_continuous_meters() {
-        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
-        let speed_label = named_node_bounds(&output, "SPEED visible label");
-        let accuracy_label = named_node_bounds(&output, "ACCURACY visible label");
-        let speed_meter = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
-        let accuracy_meter = named_node_bounds(&output, "Accuracy: Basic (1 of 5)");
-        assert!(speed_label.y1 <= speed_meter.y0);
-        assert!(accuracy_label.y1 <= accuracy_meter.y0);
-        assert!(speed_meter.x0 < accuracy_meter.x0);
-        assert!(speed_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
-        assert!(accuracy_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+        for width in [1180.0, 960.0] {
+            let output = render(Fixture::ModelsInstalled, width, 815.0);
+            let speed_meter_name = "Speed: Very fast (5 of 5)";
+            let accuracy_meter_name = "Accuracy: Basic (1 of 5)";
+            let speed_label =
+                named_node_bounds(&output, &format!("{speed_meter_name} visible label"));
+            let accuracy_label =
+                named_node_bounds(&output, &format!("{accuracy_meter_name} visible label"));
+            let speed_meter = named_node_bounds(&output, speed_meter_name);
+            let accuracy_meter = named_node_bounds(&output, accuracy_meter_name);
+            assert!(speed_label.y1 <= speed_meter.y0);
+            assert!(accuracy_label.y1 <= accuracy_meter.y0);
+            assert!(speed_meter.x0 < accuracy_meter.x0);
+            assert!(speed_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+            assert!(accuracy_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+        }
     }
 
     #[test]
-    fn expanded_features_list_every_known_capability_without_summary_truncation() {
+    fn expanded_features_render_all_capabilities_as_icon_label_grid() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
@@ -2941,14 +3001,14 @@ mod tests {
             "Custom vocabulary",
         ] {
             assert!(
-                names.iter().any(|name| name.contains(capability)),
+                names.iter().any(|name| name == capability),
                 "missing {capability}"
             );
         }
     }
 
     #[test]
-    fn feature_summary_wraps_all_known_icons_and_keeps_each_glyph_hover_only() {
+    fn feature_tooltip_hit_regions_wrap_and_never_select_the_card() {
         fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
             match shape {
                 egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
@@ -3036,7 +3096,7 @@ mod tests {
         .enumerate()
         {
             let time = index as f64 * 2.0;
-            let _ = render_with_input_at_time(
+            let (_, move_away_action) = render_with_input_at_time(
                 &ctx,
                 &mut data,
                 &mut page,
@@ -3045,11 +3105,12 @@ mod tests {
                 vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
                 Some(time),
             );
+            assert_eq!(move_away_action, ScreenAction::None);
             let pointer = egui::pos2(
                 bounds.x0 as f32 + 10.0 + (index % 4) as f32 * 20.0,
                 bounds.y0 as f32 + 22.0 + (index / 4) as f32 * 44.0,
             );
-            let _ = render_with_input_at_time(
+            let (_, hover_start_action) = render_with_input_at_time(
                 &ctx,
                 &mut data,
                 &mut page,
@@ -3058,7 +3119,8 @@ mod tests {
                 vec![egui::Event::PointerMoved(pointer)],
                 Some(time + 0.1),
             );
-            let (hovered, _) = render_with_input_at_time(
+            assert_eq!(hover_start_action, ScreenAction::None);
+            let (hovered, hover_action) = render_with_input_at_time(
                 &ctx,
                 &mut data,
                 &mut page,
@@ -3066,6 +3128,11 @@ mod tests {
                 815.0,
                 vec![egui::Event::PointerMoved(pointer)],
                 Some(time + 1.0),
+            );
+            assert_eq!(
+                hover_action,
+                ScreenAction::None,
+                "tooltip {tooltip} must not select the card"
             );
             let mut texts = Vec::new();
             for shape in &hovered.shapes {
@@ -3270,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    fn model_title_interaction_exists_only_for_ready_inactive_installed_models() {
+    fn full_card_interaction_exists_only_for_ready_inactive_installed_models() {
         let (width, height) = (1180.0, 815.0);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3278,12 +3345,17 @@ mod tests {
         let mut data = Fixture::ModelsInstalled.data();
         let mut page = AppPage::Models;
         let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let title = node_matching(&output, |node| {
-            node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
+        let card_target = node_matching(&output, |node| {
+            node.name() == Some("Select whisper.cpp tiny.en")
         });
-        assert_eq!(title.role(), egui::accesskit::Role::Button);
-        assert!(title.bounds().is_some_and(|bounds| bounds.height() >= 44.0));
-        let title_id = named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
+        assert_eq!(card_target.role(), egui::accesskit::Role::Button);
+        assert!(card_target.supports_action(egui::accesskit::Action::Default));
+        assert!(
+            card_target
+                .bounds()
+                .is_some_and(|bounds| bounds.height() >= 44.0)
+        );
+        let card_target_id = named_node_id(&output, "Select whisper.cpp tiny.en");
         assert_eq!(
             render_with_input(
                 &ctx,
@@ -3294,7 +3366,7 @@ mod tests {
                 vec![egui::Event::AccessKitActionRequest(
                     egui::accesskit::ActionRequest {
                         action: egui::accesskit::Action::Default,
-                        target: title_id,
+                        target: card_target_id,
                         data: None,
                     }
                 )],
@@ -3311,7 +3383,7 @@ mod tests {
         assert!(
             !node_names(&output)
                 .iter()
-                .any(|name| name == "Use whisper.cpp base.en for future transcriptions")
+                .any(|name| name == "Select whisper.cpp base.en")
         );
 
         for (display_name, model) in [
@@ -3370,7 +3442,152 @@ mod tests {
             assert!(
                 !node_names(&rendered)
                     .iter()
-                    .any(|name| name == &format!("Use {display_name} for future transcriptions"))
+                    .any(|name| name == &format!("Select {display_name}"))
+            );
+        }
+    }
+
+    #[test]
+    fn full_card_background_pointer_keyboard_and_accesskit_activate_once() {
+        let (width, height) = (1180.0, 815.0);
+        let activate_at = |label: &str, node_name: Option<&str>| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let point = if let Some(node_name) = node_name {
+                let bounds = named_node_bounds(&initial, node_name);
+                egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                )
+            } else {
+                let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
+                egui::pos2((card.x0 + 8.0) as f32, (card.y1 - 8.0) as f32)
+            };
+            let (_, press) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(press, ScreenAction::None, "{label} must wait for release");
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1
+        };
+        for (label, node_name) in [
+            ("identity", Some("whisper.cpp tiny.en")),
+            ("metrics", Some("Speed: Very fast (5 of 5)")),
+            ("expanded whitespace", None),
+        ] {
+            assert_eq!(
+                activate_at(label, node_name),
+                ScreenAction::SelectModel("tiny.en".into()),
+                "{label}"
+            );
+        }
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let target = named_node_id(&initial, "Select whisper.cpp tiny.en");
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target,
+                            data: None,
+                        }
+                    ),]
+                )
+                .1,
+                ScreenAction::None,
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![page_event(key)]
+                )
+                .1,
+                ScreenAction::SelectModel("tiny.en".into()),
+                "{key:?} on the focused card target",
+            );
+        }
+    }
+
+    #[test]
+    fn ready_card_has_one_selectable_sibling_of_its_child_buttons() {
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        let select_id = named_node_id(&output, "Select whisper.cpp tiny.en");
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Select whisper.cpp tiny.en")
+                })
+                .count(),
+            1,
+        );
+        for child_name in [
+            "Delete whisper.cpp tiny.en",
+            "Expand details for whisper.cpp tiny.en",
+        ] {
+            let child_id = named_node_id(&output, child_name);
+            assert_ne!(
+                child_id, select_id,
+                "{child_name} must not reuse the card target"
+            );
+            assert!(
+                !update.nodes.iter().any(|(parent_id, node)| {
+                    *parent_id == select_id && node.children().contains(&child_id)
+                }),
+                "{child_name} must be a sibling, not a nested child of the selectable card",
             );
         }
     }
@@ -3574,23 +3791,97 @@ mod tests {
     #[test]
     fn model_cards_remain_inside_supported_route_widths() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
-            let output = render(Fixture::ModelsCardExpanded, width, height);
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let mut page = Fixture::ModelsCardExpanded.page();
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let route_viewport = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models)))
+                })
+                .expect("Models route viewport diagnostic");
+            let route_left = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Models")
+            })
+            .bounds()
+            .expect("Models heading should expose bounds")
+            .x0;
+            let route_right = f64::from(route_viewport.right() - 28.0);
             for name in ["whisper.cpp base.en model", "whisper.cpp tiny.en model"] {
                 let bounds = named_node_bounds(&output, name);
-                assert!(
-                    bounds.x0 >= -LAYOUT_TOLERANCE
-                        && bounds.x1 <= f64::from(width) + LAYOUT_TOLERANCE,
-                    "supported-width model card must remain horizontally contained: {bounds:?}"
+                assert_near(
+                    bounds.x0,
+                    route_left,
+                    "supported-width model card must align to the route's left usable edge",
+                );
+                assert_near(
+                    bounds.x1,
+                    route_right,
+                    "supported-width model card must align to the route's right usable edge",
                 );
             }
         }
     }
 
     #[test]
+    fn model_card_summary_switches_at_the_exact_620px_content_breakpoint() {
+        let compact = render(Fixture::ModelsInstalled, 785.0, 680.0);
+        let compact_card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        let compact_title = named_node_bounds(&compact, "whisper.cpp tiny.en");
+        let compact_lifecycle = named_node_bounds(&compact, "Delete whisper.cpp tiny.en");
+        assert_near(
+            compact_card.x1 - compact_card.x0 - 44.0,
+            619.0,
+            "the compact breakpoint's 619px content width",
+        );
+        assert!(
+            compact_title.y1 <= compact_lifecycle.y0 + LAYOUT_TOLERANCE,
+            "619px card content must use the stacked summary branch: title={compact_title:?}, lifecycle={compact_lifecycle:?}"
+        );
+
+        let desktop = render(Fixture::ModelsInstalled, 786.0, 680.0);
+        let desktop_card = named_node_bounds(&desktop, "whisper.cpp tiny.en model");
+        let desktop_title = named_node_bounds(&desktop, "whisper.cpp tiny.en");
+        let desktop_lifecycle = named_node_bounds(&desktop, "Delete whisper.cpp tiny.en");
+        let desktop_speed = named_node_bounds(&desktop, "Speed: Very fast (5 of 5)");
+        let desktop_chevron = named_node_bounds(&desktop, "Expand details for whisper.cpp tiny.en");
+        let content_left = desktop_card.x0 + 16.0;
+        let content_width = desktop_card.x1 - desktop_card.x0 - 32.0;
+        let expected_boundary = content_left + content_width * 0.60;
+        assert_near(
+            desktop_card.x1 - desktop_card.x0 - 44.0,
+            620.0,
+            "the desktop breakpoint's 620px content width",
+        );
+        assert!(
+            (desktop_speed.x0 - expected_boundary).abs() <= 2.0,
+            "620px card content must use the desktop 60/40 track boundary: expected {expected_boundary} +/- 2, got {}",
+            desktop_speed.x0,
+        );
+        assert!(
+            desktop_title.x1 <= desktop_speed.x0 + LAYOUT_TOLERANCE
+                && desktop_speed.y1 <= desktop_lifecycle.y0 + LAYOUT_TOLERANCE
+                && desktop_lifecycle.x1 <= desktop_chevron.x0 + LAYOUT_TOLERANCE,
+            "620px card content must keep identity, metrics, lifecycle, and chevron in desktop order: title={desktop_title:?}, speed={desktop_speed:?}, lifecycle={desktop_lifecycle:?}, chevron={desktop_chevron:?}"
+        );
+    }
+
+    #[test]
     fn expanding_model_details_preserves_the_card_width() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 680.0)] {
-            let collapsed = render(Fixture::ModelsInstalled, width, height);
-            let expanded = render(Fixture::ModelsCardExpanded, width, height);
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            data.model_management.expanded_model_card = None;
+            let mut page = Fixture::ModelsCardExpanded.page();
+            let collapsed =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+            let expanded =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
             let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
             let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
 
@@ -3680,10 +3971,7 @@ mod tests {
         );
 
         let compact = render(Fixture::ModelsInstalled, 375.0, 680.0);
-        let title = named_node_bounds(
-            &compact,
-            "Use whisper.cpp tiny.en for future transcriptions",
-        );
+        let title = named_node_bounds(&compact, "whisper.cpp tiny.en");
         let lifecycle = named_node_bounds(&compact, "Delete whisper.cpp tiny.en");
         assert!(
             title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE,
@@ -3695,8 +3983,7 @@ mod tests {
     fn model_card_controls_keep_trailing_chevron_order_without_decorative_nodes() {
         for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
             let output = render(Fixture::ModelsInstalled, width, height);
-            let title =
-                named_node_bounds(&output, "Use whisper.cpp tiny.en for future transcriptions");
+            let title = named_node_bounds(&output, "whisper.cpp tiny.en");
             let lifecycle = named_node_bounds(&output, "Delete whisper.cpp tiny.en");
             let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
             if width > 430.0 {
@@ -3709,12 +3996,12 @@ mod tests {
                 assert!(language.x1 <= speed.x0 + LAYOUT_TOLERANCE);
                 assert_near(
                     description.x0,
-                    title.x0 + 26.0,
+                    title.x0,
                     "description should align with identity title text",
                 );
                 assert_near(
                     language.x0,
-                    title.x0 + 26.0,
+                    title.x0,
                     "language should align with identity title text",
                 );
                 assert!(speed.x0 >= title.x1 - LAYOUT_TOLERANCE);

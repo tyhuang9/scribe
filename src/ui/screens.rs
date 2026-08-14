@@ -1845,10 +1845,10 @@ fn rating_meter(
                 );
                 #[cfg(test)]
                 ui.ctx().accesskit_node_builder(
-                    ui.make_persistent_id(("model-metric-label", name)),
+                    ui.make_persistent_id(("model-metric-label", &accessible_name)),
                     |builder| {
                         builder.set_role(egui::accesskit::Role::StaticText);
-                        builder.set_name(format!("{} visible label", name.to_ascii_uppercase()));
+                        builder.set_name(format!("{accessible_name} visible label"));
                         builder.set_bounds(accesskit_rect(label_rect));
                     },
                 );
@@ -2066,9 +2066,11 @@ fn model_lifecycle_presentation<'a>(
                     .total_bytes
                     .map(format_compact_artifact_size)
                     .filter(|_| label == "Install"),
-                tone: (label == "Install")
-                    .then_some(ModelLifecycleTone::InverseFilled)
-                    .unwrap_or(ModelLifecycleTone::Standard),
+                tone: if label == "Install" {
+                    ModelLifecycleTone::InverseFilled
+                } else {
+                    ModelLifecycleTone::Standard
+                },
             }
         }
         ModelCard::Remote(entry, variant) => {
@@ -2097,9 +2099,11 @@ fn model_lifecycle_presentation<'a>(
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
-                tone: (label == "Install")
-                    .then_some(ModelLifecycleTone::InverseFilled)
-                    .unwrap_or(ModelLifecycleTone::Standard),
+                tone: if label == "Install" {
+                    ModelLifecycleTone::InverseFilled
+                } else {
+                    ModelLifecycleTone::Standard
+                },
             }
         }
     }
@@ -2164,35 +2168,6 @@ fn model_summary_features(card: ModelCard<'_>) -> (Vec<(Icon, &'static str)>, bo
     .filter_map(|(supported, icon, name)| supported.then_some((icon, name)))
     .collect::<Vec<_>>();
     (features, true)
-}
-
-fn model_full_feature_names(card: ModelCard<'_>) -> (Vec<&'static str>, bool) {
-    let capabilities = match card {
-        ModelCard::Local(model) => model.capabilities,
-        ModelCard::Remote(_, variant) => variant.capabilities,
-    };
-    if !capabilities.capabilities_known {
-        return (Vec::new(), false);
-    }
-    (
-        [
-            (capabilities.batch_transcription, "Batch transcription"),
-            (capabilities.native_streaming, "Native streaming"),
-            (capabilities.cancellation, "Cancellation"),
-            (capabilities.timestamps, "Word timestamps"),
-            (capabilities.translation, "Translation"),
-            (
-                capabilities.language_detection,
-                "Automatic language detection",
-            ),
-            (capabilities.confidence_scores, "Confidence scores"),
-            (capabilities.custom_vocabulary, "Custom vocabulary"),
-        ]
-        .into_iter()
-        .filter_map(|(supported, name)| supported.then_some(name))
-        .collect(),
-        true,
-    )
 }
 
 fn model_requirement_cells(card: ModelCard<'_>) -> [(&'static str, String); 3] {
@@ -2283,7 +2258,7 @@ fn render_model_requirement_cells(ui: &mut egui::Ui, cells: [(&str, String); 3])
     }
 }
 
-fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
+fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) -> egui::Response {
     let colors = ui_palette(ui);
     let (features, known) = model_summary_features(card);
     let name = if !known {
@@ -2350,7 +2325,39 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
         builder.set_bounds(accesskit_rect(rect));
     });
     if !known {
-        response.on_hover_text(name);
+        return response.on_hover_text(name);
+    }
+    response
+}
+
+fn render_expanded_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
+    let colors = ui_palette(ui);
+    let (features, known) = model_summary_features(card);
+    if !known {
+        ui.label("Feature support is unknown");
+        return;
+    }
+    if features.is_empty() {
+        ui.label("No supported features");
+        return;
+    }
+    let columns = if ui.available_width() >= 480.0 { 2 } else { 1 };
+    let gap = ui.spacing().item_spacing.x;
+    let cell_width =
+        ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(0.0);
+    for row in features.chunks(columns) {
+        ui.horizontal(|ui| {
+            for (icon, name) in row {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(cell_width, 44.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        paint_decorative_icon(ui, *icon, colors.muted_text);
+                        ui.label(*name);
+                    },
+                );
+            }
+        });
     }
 }
 
@@ -2514,7 +2521,6 @@ fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
 }
 
 struct ModelIdentityResponse {
-    clicked: bool,
     has_focus: bool,
 }
 
@@ -2625,7 +2631,6 @@ fn render_model_identity(
         });
     }
     ModelIdentityResponse {
-        clicked: selectable && response.clicked(),
         has_focus: response.has_focus(),
     }
 }
@@ -2722,9 +2727,19 @@ fn render_unified_model_card(
     let lifecycle = model_lifecycle_presentation(card, can_replace_active);
     let title_selects_model =
         matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
+    let activation_id = ui.make_persistent_id(("select-model-card", card_key.clone()));
+    let activation_press_id = activation_id.with("primary-press");
+    let activation = title_selects_model.then(|| {
+        ui.interact(
+            egui::Rect::from_min_size(ui.cursor().min, Vec2::ZERO),
+            activation_id,
+            Sense::focusable_noninteractive(),
+        )
+    });
     let mut action = ScreenAction::None;
     let mut restored_remove_focus = false;
     let mut focus_within = false;
+    let mut activation_exclusions = Vec::new();
     let (idle_fill, idle_stroke, idle_shadow) =
         model_card_visual_style(colors, ModelCardVisualState::Idle);
     let mut prepared = Frame::none()
@@ -2767,6 +2782,7 @@ fn render_unified_model_card(
                 if details.clicked() {
                     *action = ScreenAction::ToggleModelCardDetails(card_key.clone());
                 }
+                details
             };
         let render_lifecycle = |ui: &mut egui::Ui,
                                 action: &mut ScreenAction,
@@ -2798,18 +2814,12 @@ fn render_unified_model_card(
             if lifecycle_response.clicked() && lifecycle.enabled {
                 *action = lifecycle.action.clone();
             }
+            lifecycle_response
         };
         if compact {
             let identity_width = card_content_width;
-            let identity =
-                render_model_identity(ui, name, active, title_selects_model, identity_width);
+            let identity = render_model_identity(ui, name, active, false, identity_width);
             focus_within |= identity.has_focus;
-            if identity.clicked {
-                action = ScreenAction::SelectModel(match card {
-                    ModelCard::Local(model) => model.id.clone(),
-                    ModelCard::Remote(_, _) => unreachable!("only local titles select"),
-                });
-            }
             let description_width = card_content_width;
             render_model_description(ui, &description, description_width, 26.0, expanded);
             ui.horizontal(|ui| {
@@ -2836,14 +2846,17 @@ fn render_unified_model_card(
             });
             render_model_metadata(ui, languages, false, expanded);
             ui.horizontal(|ui| {
-                render_model_features(ui, card);
-                render_lifecycle(
-                    ui,
-                    &mut action,
-                    &mut restored_remove_focus,
-                    &mut focus_within,
+                activation_exclusions.push(render_model_features(ui, card).rect);
+                activation_exclusions.push(
+                    render_lifecycle(
+                        ui,
+                        &mut action,
+                        &mut restored_remove_focus,
+                        &mut focus_within,
+                    )
+                    .rect,
                 );
-                render_details(ui, &mut action, &mut focus_within);
+                activation_exclusions.push(render_details(ui, &mut action, &mut focus_within).rect);
             });
         } else {
             let identity_track = card_content_width * 0.60;
@@ -2858,22 +2871,9 @@ fn render_unified_model_card(
                         |ui| {
                             ui.set_width(identity_track);
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            let identity = render_model_identity(
-                                ui,
-                                name,
-                                active,
-                                title_selects_model,
-                                identity_track,
-                            );
+                            let identity =
+                                render_model_identity(ui, name, active, false, identity_track);
                             focus_within |= identity.has_focus;
-                            if identity.clicked {
-                                action = ScreenAction::SelectModel(match card {
-                                    ModelCard::Local(model) => model.id.clone(),
-                                    ModelCard::Remote(_, _) => {
-                                        unreachable!("only local titles select")
-                                    }
-                                });
-                            }
                             render_model_description(
                                 ui,
                                 &description,
@@ -2924,12 +2924,16 @@ fn render_unified_model_card(
                                         );
                                     });
                                     ui.horizontal(|ui| {
-                                        render_model_features(ui, card);
-                                        render_lifecycle(
-                                            ui,
-                                            &mut action,
-                                            &mut restored_remove_focus,
-                                            &mut focus_within,
+                                        activation_exclusions
+                                            .push(render_model_features(ui, card).rect);
+                                        activation_exclusions.push(
+                                            render_lifecycle(
+                                                ui,
+                                                &mut action,
+                                                &mut restored_remove_focus,
+                                                &mut focus_within,
+                                            )
+                                            .rect,
                                         );
                                     });
                                 },
@@ -2937,7 +2941,11 @@ fn render_unified_model_card(
                             ui.allocate_ui_with_layout(
                                 Vec2::new(details_width, 0.0),
                                 Layout::left_to_right(Align::Center),
-                                |ui| render_details(ui, &mut action, &mut focus_within),
+                                |ui| {
+                                    activation_exclusions.push(
+                                        render_details(ui, &mut action, &mut focus_within).rect,
+                                    )
+                                },
                             );
                         },
                     );
@@ -2959,12 +2967,86 @@ fn render_unified_model_card(
                 restore_remove_focus,
                 &mut focus_within,
                 &mut action,
+                &mut activation_exclusions,
             );
         }
     }
     let frame = {
         let response = prepared.allocate_space(ui);
-        let hovered = response.hovered();
+        if let Some(activation) = &activation {
+            let activation_has_focus = activation.has_focus();
+            focus_within |= activation_has_focus;
+            ui.ctx().accesskit_node_builder(activation.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Button);
+                builder.set_name(format!("Select {name}"));
+                builder.set_bounds(accesskit_rect(response.rect));
+                builder.set_default_action_verb(egui::accesskit::DefaultActionVerb::Click);
+                builder.add_action(egui::accesskit::Action::Default);
+            });
+
+            let point_activates_card = |point: egui::Pos2| {
+                response.rect.contains(point)
+                    && !activation_exclusions
+                        .iter()
+                        .any(|rect| rect.contains(point))
+            };
+            let (
+                primary_pressed,
+                primary_released,
+                primary_clicked,
+                press_origin,
+                release_position,
+                keyboard_activation,
+                accesskit_activation,
+            ) = ui.input(|input| {
+                (
+                    input.pointer.primary_pressed(),
+                    input.pointer.primary_released(),
+                    input.pointer.button_clicked(egui::PointerButton::Primary),
+                    input.pointer.press_origin(),
+                    input.pointer.interact_pos(),
+                    activation_has_focus
+                        && (input.key_pressed(egui::Key::Enter)
+                            || input.key_pressed(egui::Key::Space)),
+                    input.has_accesskit_action_request(
+                        activation.id,
+                        egui::accesskit::Action::Default,
+                    ),
+                )
+            });
+            if primary_pressed {
+                let started_on_card = press_origin.is_some_and(point_activates_card);
+                ui.data_mut(|data| {
+                    if started_on_card {
+                        data.insert_temp(activation_press_id, true);
+                    } else {
+                        data.remove::<bool>(activation_press_id);
+                    }
+                });
+            }
+            let pointer_activation = if primary_released {
+                let started_on_card = ui
+                    .data_mut(|data| data.remove_temp::<bool>(activation_press_id))
+                    .unwrap_or(false);
+                started_on_card
+                    && primary_clicked
+                    && release_position.is_some_and(point_activates_card)
+            } else {
+                false
+            };
+            if (pointer_activation || keyboard_activation || accesskit_activation)
+                && action == ScreenAction::None
+            {
+                activation.request_focus();
+                focus_within = true;
+                action = ScreenAction::SelectModel(match card {
+                    ModelCard::Local(model) => model.id.clone(),
+                    ModelCard::Remote(_, _) => unreachable!("only local cards select"),
+                });
+            }
+        }
+        let hovered =
+            response.hovered() || activation.as_ref().is_some_and(egui::Response::hovered);
         let state = if hovered || focus_within {
             ModelCardVisualState::Active
         } else {
@@ -2995,19 +3077,13 @@ fn render_inline_model_details(
     restore_remove_focus: bool,
     focus_within: &mut bool,
     action: &mut ScreenAction,
+    activation_exclusions: &mut Vec<egui::Rect>,
 ) -> bool {
     let mut restored_remove_focus = false;
     ui.vertical(|ui| {
         let colors = ui_palette(ui);
         detail_heading(ui, "FEATURES", colors);
-        let (features, known) = model_full_feature_names(card);
-        ui.label(if !known {
-            "Feature support is unknown".to_owned()
-        } else if features.is_empty() {
-            "No supported features".to_owned()
-        } else {
-            features.join(", ")
-        });
+        render_expanded_model_features(ui, card);
         ui.add_space(8.0);
         detail_heading(ui, "REQUIREMENTS", colors);
         render_model_requirement_cells(ui, model_requirement_cells(card));
@@ -3031,6 +3107,7 @@ fn render_inline_model_details(
                         ModelLifecycleTone::Standard,
                     );
                     *focus_within |= response.has_focus();
+                    activation_exclusions.push(response.rect);
                     if response.clicked() && model.runtime_action_enabled {
                         *action = ScreenAction::MaintainModelRuntime(model.id.clone());
                     }
@@ -3046,6 +3123,7 @@ fn render_inline_model_details(
                         ModelLifecycleTone::Standard,
                     );
                     *focus_within |= cleanup.has_focus();
+                    activation_exclusions.push(cleanup.rect);
                     if cleanup.clicked() && model.partial_cleanup_enabled {
                         *action = ScreenAction::DiscardModelPartial(model.id.clone());
                     }
@@ -3071,6 +3149,7 @@ fn render_inline_model_details(
                         ModelLifecycleTone::Standard,
                     );
                     *focus_within |= removal.has_focus();
+                    activation_exclusions.push(removal.rect);
                     if restore_remove_focus {
                         removal.request_focus();
                         restored_remove_focus = true;
@@ -3099,6 +3178,7 @@ fn render_inline_model_details(
                         ModelLifecycleTone::Standard,
                     );
                     *focus_within |= response.has_focus();
+                    activation_exclusions.push(response.rect);
                     if response.clicked() && cleanup.enabled {
                         *action = screen_action_for_remote_catalog_action(&cleanup.kind);
                     }

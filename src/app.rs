@@ -21568,8 +21568,15 @@ mod layout_tests {
 
     #[test]
     fn active_model_removal_is_blocked_without_another_ready_model() {
+        let root = partial_cleanup_test_root("active-removal-no-replacement");
+        let _ = fs::remove_dir_all(&root);
         let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.managed_models.clear();
+        config::normalize_config(&mut app.config);
+        app.rebuild_model_inventory_projection();
         let active_id = app.config.general.selected_default_model.clone();
+        assert!(app.active_model_removal_replacement(&active_id).is_none());
 
         app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id));
 
@@ -21579,6 +21586,15 @@ mod layout_tests {
             app.status_message,
             "Install another ready model before removing the active model."
         );
+
+        let _ = fs::remove_file(
+            app.config
+                .general
+                .model_paths
+                .get("whisper_cpp_tiny_en")
+                .expect("default test fixture"),
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -21664,7 +21680,13 @@ mod layout_tests {
 
     #[test]
     fn active_removal_revalidates_the_expected_replacement_before_persisting() {
+        let root = partial_cleanup_test_root("active-removal-revalidation");
+        let _ = fs::remove_dir_all(&root);
         let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.managed_models.clear();
+        config::normalize_config(&mut app.config);
+        app.rebuild_model_inventory_projection();
         let active_id = app.config.general.selected_default_model.clone();
         let active_path = app
             .config
@@ -21674,6 +21696,15 @@ mod layout_tests {
             .cloned()
             .expect("test active model path");
         let replacement_path = install_test_catalog_model(&mut app, "whisper_cpp_base_en");
+        let installed_ids = config::configured_models(&app.config)
+            .into_iter()
+            .filter(|model| model.install_status == ModelInstallStatus::Installed)
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            installed_ids,
+            ["whisper_cpp_tiny_en", "whisper_cpp_base_en"]
+        );
 
         app.apply_model_management_action(ScreenAction::RequestModelRemoval(active_id.clone()));
         assert_eq!(
@@ -21713,6 +21744,7 @@ mod layout_tests {
         assert!(app.model_management.restore_remove_focus.is_none());
 
         let _ = fs::remove_file(active_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

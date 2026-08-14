@@ -349,3 +349,52 @@ Expanded cards retain the same left and right edges as collapsed neighbors and h
 Source-to-implementation comparison is not verified because the exact newer selected two-column source reference has no local attachment path in this workspace. The older `image-1`, `image-2`, and `image-3` references were not substituted, and no combined reference comparison was created. Reattach or provide the exact path to the newer selected source reference to complete source fidelity review.
 
 final result: blocked
+
+---
+
+# Full-width interactive model cards QA - 2026-08-14
+
+## Verified implementation evidence
+
+- Full UI-harness suite: 823 passed, 0 failed, 11 ignored.
+- Full default suite: 763 passed, 0 failed, 10 ignored.
+- Strict all-targets UI-harness Clippy, UI-harness check, formatting, and diff checks passed.
+- Deterministic geometry covers the 60/40 desktop split at 1180 x 815 and
+  960 x 680, stacked 375 px component layout, equal collapsed/expanded card
+  edges, in-place description/language expansion, and the responsive feature
+  grid.
+- Deterministic interaction coverage verifies pointer, Enter, Space, and
+  AccessKit Default activation for ready inactive installed cards, plus child
+  lifecycle/disclosure/feature/maintenance exclusion and action precedence.
+- Windows UI Automation exposed the complete current Models route while the
+  process remained responsive: the full-card `Select whisper.cpp tiny.en`
+  target, lifecycle controls, feature group, and disclosure controls were all
+  present with their expected names and roles.
+
+## Native presentation blocker
+
+Fresh implementation screenshots could not be accepted because the current
+Windows console session presents the Scribe OpenGL client as solid white. The
+same behavior occurs for the normal application, the current UI-harness build,
+and a clean detached build of the previously visually validated commit
+`e72ab68`. Both foreground screen capture and PrintWindow reproduce the blank
+client while the process remains responsive, emits no panic or stderr, and
+continues to expose a populated accessibility tree. This A/B result rules out
+the full-width model-card changes as the cause and identifies an external
+NVIDIA/OpenGL session presentation failure. Invalid blank PNGs were removed
+and are not evidence.
+
+Recovery requires a user-visible graphics-driver/session reset, sign-out, or
+reboot. No such system-wide action was performed implicitly. Native idle,
+hover, keyboard-focus, expanded, and scrolled captures at 1180 x 815 and
+960 x 680 must be repeated after recovery.
+
+## Source-reference blocker
+
+The two newer selected reference images are visible in the conversation but
+have no local attachment paths in this workspace. Older model-card references
+were not substituted. Source-to-implementation comparison therefore remains
+blocked until the exact newer references are reattached or their local paths
+are provided.
+
+final result: blocked
