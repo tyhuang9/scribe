@@ -8930,6 +8930,7 @@ impl LocalTranscriberApp {
                 let status_label;
                 let mut downloaded_bytes = None;
                 let mut total_bytes = None;
+                let mut error_message = None;
                 let mut actions = Vec::new();
                 if let Some(download_id) = download_id.as_deref()
                     && let Some(status) = self.model_downloads.get(download_id)
@@ -8943,6 +8944,11 @@ impl LocalTranscriberApp {
                     {
                         downloaded_bytes = Some(*progress_downloaded_bytes);
                         total_bytes = *progress_total_bytes;
+                    }
+                    if let ModelInstallStatus::Error(message)
+                    | ModelInstallStatus::RuntimeError(message) = status
+                    {
+                        error_message = Some(message.clone());
                     }
                     if matches!(
                         status,
@@ -8997,6 +9003,13 @@ impl LocalTranscriberApp {
                     status_label = Some("Pinned GGUF".to_owned());
                     actions.push(install_action("Install"));
                 }
+                if downloaded_bytes.is_none()
+                    && let PartialInspection::Present(partial) = partial_inspection
+                    && partial.bytes > 0
+                {
+                    downloaded_bytes = Some(partial.bytes);
+                    total_bytes = Some(variant.size_bytes);
+                }
                 if has_partial || partial_inspection_error.is_some() {
                     actions.push(RemoteCatalogActionView {
                         label: "Discard partial".to_owned(),
@@ -9022,6 +9035,7 @@ impl LocalTranscriberApp {
                     size_bytes: variant.size_bytes,
                     downloaded_bytes,
                     total_bytes,
+                    error_message,
                     size_tier: size_tier_for_bytes(variant.size_bytes),
                     speed_tier: descriptor
                         .as_ref()
@@ -9414,7 +9428,10 @@ impl LocalTranscriberApp {
                 ..
             } => (*downloaded_bytes, *total_bytes),
             _ => (
-                0,
+                match partial_inspection {
+                    PartialInspection::Present(partial) => partial.bytes,
+                    _ => 0,
+                },
                 descriptor.map(|descriptor| descriptor.artifact_size_bytes),
             ),
         };
@@ -9519,15 +9536,10 @@ impl LocalTranscriberApp {
             id: model.id.clone(),
             display_name,
             variant_label,
-            description: Some(if legacy_cleanup_pending {
-                "Legacy GGML file retained for cleanup. Upgrade to the verified GGUF model, or open Details to remove the legacy file."
-                    .to_owned()
-            } else {
-                descriptor.map_or_else(
-                    || model.description.clone(),
-                    |value| value.description.to_owned(),
-                )
-            }),
+            description: Some(descriptor.map_or_else(
+                || model.description.clone(),
+                |value| value.description.to_owned(),
+            )),
             runtime_group: "Local speech runtime".to_owned(),
             architecture: None,
             artifact_repository: manifest.map(|manifest| manifest.artifact_repository.to_owned()),
@@ -9572,9 +9584,7 @@ impl LocalTranscriberApp {
                     || app_owned_legacy_artifact
                     || supports_managed_uninstall(model, &install_status)),
             partial_cleanup_available,
-            partial_cleanup_enabled: partial_cleanup_available
-                && has_partial
-                && !mutation_blocked,
+            partial_cleanup_enabled: partial_cleanup_available && has_partial && !mutation_blocked,
             partial_cleanup_disabled_reason: if partial_cleanup_available {
                 partial_inspection_error.or_else(|| mutation_block_reason.clone())
             } else {
@@ -10203,10 +10213,7 @@ impl LocalTranscriberApp {
         model_id: &str,
         job_id: u64,
     ) -> Option<RemotePartialProbeSource> {
-        let Some((requested_job_id, source)) = self.discard_partial_after_install.get(model_id)
-        else {
-            return None;
-        };
+        let (requested_job_id, source) = self.discard_partial_after_install.get(model_id)?;
         if *requested_job_id != job_id {
             return None;
         }

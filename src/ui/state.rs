@@ -547,6 +547,8 @@ pub(crate) struct RemoteCatalogVariantView {
     pub downloaded_bytes: Option<u64>,
     /// Volatile live total, which may remain unknown even when a download is active.
     pub total_bytes: Option<u64>,
+    /// The installer-reported failure retained for the model-card error alert.
+    pub error_message: Option<String>,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
     pub accuracy_guidance: String,

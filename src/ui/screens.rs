@@ -1896,30 +1896,11 @@ fn rating_meter(
 /// so lets its label consume width intended for the next logical column.
 fn model_row_description(card: ModelCard<'_>) -> String {
     match card {
-        ModelCard::Local(model)
-            if matches!(
-                model.download_state,
-                ModelDownloadState::Downloading
-                    | ModelDownloadState::Verifying
-                    | ModelDownloadState::Failed
-                    | ModelDownloadState::Cancelled
-            ) =>
-        {
-            model_download_label(model)
-        }
         ModelCard::Local(model) => model
             .description
             .clone()
             .unwrap_or_else(|| "Local speech-to-text model.".to_owned()),
-        ModelCard::Remote(entry, variant) => model_download_progress_presentation(card)
-            .map(|progress| progress.display_text)
-            .or_else(|| {
-                variant
-                    .status_label
-                    .clone()
-                    .filter(|status| !status.trim().is_empty())
-            })
-            .unwrap_or_else(|| entry.description.clone()),
+        ModelCard::Remote(entry, _) => entry.description.clone(),
     }
 }
 
@@ -1953,6 +1934,14 @@ struct ModelLifecyclePresentation<'a> {
     tone: ModelLifecycleTone,
 }
 
+struct ModelLifecycleControls<'a> {
+    primary: ModelLifecyclePresentation<'a>,
+    discard: Option<ScreenAction>,
+    discard_name: Option<String>,
+    error_message: Option<&'a str>,
+    error_accessible_name: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelLifecycleTone {
     Standard,
@@ -1968,9 +1957,9 @@ fn model_lifecycle_presentation<'a>(
         ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => {
             ModelLifecyclePresentation {
                 action: ScreenAction::CancelModelInstall(model.id.clone()),
-                icon: Icon::Close,
-                label: "Cancel".into(),
-                accessible_name: format!("Cancel {} download", model.display_name),
+                icon: Icon::Pause,
+                label: "Pause".into(),
+                accessible_name: format!("Pause {} download", model.display_name),
                 enabled: model.cancel_supported,
                 disabled_reason: model.primary_action_disabled_reason.as_deref(),
                 compact_size: None,
@@ -2047,15 +2036,26 @@ fn model_lifecycle_presentation<'a>(
                 (
                     ScreenAction::InstallModel(model.id.clone()),
                     match model.download_state {
-                        ModelDownloadState::Failed => "Retry",
-                        ModelDownloadState::Cancelled => "Resume",
+                        ModelDownloadState::Failed | ModelDownloadState::Cancelled
+                            if model.partial_cleanup_available =>
+                        {
+                            "Resume"
+                        }
                         _ => "Install",
                     },
                 )
             };
             ModelLifecyclePresentation {
                 action,
-                icon: Icon::Download,
+                icon: if matches!(
+                    model.download_state,
+                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
+                ) && model.partial_cleanup_available
+                {
+                    Icon::Play
+                } else {
+                    Icon::Download
+                },
                 label: label.into(),
                 accessible_name: format!("{label} {}", model.display_name),
                 enabled: if model.primary_action_installs_upgrade {
@@ -2094,14 +2094,32 @@ fn model_lifecycle_presentation<'a>(
                     remote.map(|action| &action.kind),
                     Some(RemoteCatalogActionKind::Cancel { .. })
                 ) {
-                    Icon::Close
+                    Icon::Pause
                 } else if label == "Delete" || label == "Remove" {
                     Icon::Trash
                 } else {
                     Icon::Download
                 },
-                label: label.into(),
-                accessible_name: format!("{label} {}", entry.display_name),
+                label: if matches!(
+                    remote.map(|action| &action.kind),
+                    Some(RemoteCatalogActionKind::Cancel { .. })
+                ) {
+                    "Pause".into()
+                } else {
+                    label.into()
+                },
+                accessible_name: format!(
+                    "{} {}",
+                    if matches!(
+                        remote.map(|action| &action.kind),
+                        Some(RemoteCatalogActionKind::Cancel { .. })
+                    ) {
+                        "Pause"
+                    } else {
+                        label
+                    },
+                    entry.display_name
+                ),
                 enabled: remote.is_some_and(|action| action.enabled),
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
                 compact_size: (label == "Install")
@@ -2113,6 +2131,101 @@ fn model_lifecycle_presentation<'a>(
                 },
             }
         }
+    }
+}
+
+fn model_lifecycle_controls<'a>(
+    card: ModelCard<'a>,
+    can_replace_active: bool,
+) -> ModelLifecycleControls<'a> {
+    let mut primary = model_lifecycle_presentation(card, can_replace_active);
+    let discard = match card {
+        ModelCard::Local(model)
+            if model.download_state == ModelDownloadState::Downloading
+                || (matches!(
+                    model.download_state,
+                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
+                ) && model.partial_cleanup_available) =>
+        {
+            Some(ScreenAction::DiscardModelPartial(model.id.clone()))
+        }
+        ModelCard::Remote(entry, variant)
+            if matches!(
+                variant.status_label.as_deref(),
+                Some("Downloading") | Some("Cancelled") | Some("Failed")
+            ) =>
+        {
+            variant
+                .actions
+                .iter()
+                .find_map(|action| match &action.kind {
+                    RemoteCatalogActionKind::DiscardPartial {
+                        remote_model_id,
+                        variant_id,
+                    } => Some(ScreenAction::DiscardRemoteCatalogPartial {
+                        remote_model_id: remote_model_id.clone(),
+                        variant_id: variant_id.clone(),
+                    }),
+                    _ => None,
+                })
+                .or_else(|| {
+                    (variant.status_label.as_deref() == Some("Downloading")).then(|| {
+                        ScreenAction::DiscardRemoteCatalogPartial {
+                            remote_model_id: entry.id.clone(),
+                            variant_id: variant.id.clone(),
+                        }
+                    })
+                })
+        }
+        _ => None,
+    };
+    let discard_name = discard.as_ref().map(|_| match card {
+        ModelCard::Local(model) => format!("Discard partial for {}", model.display_name),
+        ModelCard::Remote(entry, _) => format!("Discard partial for {}", entry.display_name),
+    });
+    if discard.is_some()
+        && matches!(primary.label.as_str(), "Install" | "Retry" | "Resume")
+        && !matches!(
+            primary.action,
+            ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
+        )
+    {
+        primary.icon = Icon::Play;
+        primary.label = "Resume".into();
+        primary.accessible_name = format!(
+            "Resume {} download",
+            match card {
+                ModelCard::Local(model) => model.display_name.as_str(),
+                ModelCard::Remote(entry, _) => entry.display_name.as_str(),
+            }
+        );
+    }
+    ModelLifecycleControls {
+        primary,
+        discard,
+        discard_name,
+        error_message: model_download_error(card),
+        error_accessible_name: model_download_error(card).map(|_| match card {
+            ModelCard::Local(model) => format!("Show download error for {}", model.display_name),
+            ModelCard::Remote(entry, _) => {
+                format!("Show download error for {}", entry.display_name)
+            }
+        }),
+    }
+}
+
+fn model_download_error(card: ModelCard<'_>) -> Option<&str> {
+    match card {
+        ModelCard::Local(model)
+            if model.download_state == ModelDownloadState::Failed
+                && !model.partial_cleanup_available =>
+        {
+            model.error_message.as_deref()
+        }
+        ModelCard::Remote(_, variant) if variant.downloaded_bytes.is_none() => {
+            variant.error_message.as_deref()
+        }
+        _ => None,
     }
 }
 
@@ -2548,54 +2661,73 @@ struct ModelDownloadModuleResponse {
     response: egui::Response,
     cancel_clicked: bool,
     cancel_has_focus: bool,
+    discard_clicked: bool,
+    discard_has_focus: bool,
 }
 
 fn render_model_download_module(
     ui: &mut egui::Ui,
     progress: &ModelDownloadProgressPresentation,
+    primary_icon: Icon,
     cancel_name: &str,
     cancel_enabled: bool,
     cancel_reason: Option<&str>,
+    discard_name: Option<&str>,
 ) -> ModelDownloadModuleResponse {
     let colors = ui_palette(ui);
     let mut cancel_clicked = false;
     let mut cancel_has_focus = false;
+    let mut discard_clicked = false;
+    let mut discard_has_focus = false;
     let response = ui
         .allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 64.0),
+            Vec2::new(ui.available_width(), 0.0),
             Layout::top_down(Align::Min),
             |ui| {
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new((ui.available_width() - 44.0).max(0.0), 44.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            let header = progress.fraction.map_or_else(
-                                || "Downloading".to_owned(),
-                                |fraction| format!("{:.0}%", fraction * 100.0),
-                            );
-                            let detail = progress.total_bytes.map_or_else(
-                                || {
-                                    format!(
-                                        "{} downloaded",
-                                        format_download_bytes(progress.downloaded_bytes)
-                                    )
-                                },
-                                |total| {
-                                    format!(
-                                        "{} / {}",
-                                        format_download_bytes(progress.downloaded_bytes),
-                                        format_download_bytes(total)
-                                    )
-                                },
-                            );
-                            ui.label(RichText::new(header).small().strong());
-                            ui.label(RichText::new(detail).small().color(colors.muted_text));
-                        },
+                let control_count = if discard_name.is_some() { 2.0 } else { 1.0 };
+                let controls_width =
+                    44.0 * control_count + ui.spacing().item_spacing.x * (control_count - 1.0);
+                let label_width =
+                    download_label_slot_width(ui, progress.total_bytes.unwrap_or(u64::MAX));
+                let horizontal = ui.available_width()
+                    >= label_width + controls_width + ui.spacing().item_spacing.x;
+                let render_track = |ui: &mut egui::Ui, width: f32| {
+                    let (track, meter) =
+                        ui.allocate_exact_size(Vec2::new(width, 6.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(track, Rounding::same(3.0), colors.meter_track);
+                    if let Some(fraction) = progress.fraction {
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                track.min,
+                                Vec2::new(track.width() * fraction, track.height()),
+                            ),
+                            Rounding::same(3.0),
+                            colors.accent,
+                        );
+                    }
+                    ui.ctx().accesskit_node_builder(meter.id, |builder| {
+                        builder.set_role(egui::accesskit::Role::Meter);
+                        builder.set_name(progress.accessible_text.as_str());
+                        if let Some(fraction) = progress.fraction {
+                            builder.set_min_numeric_value(0.0);
+                            builder.set_max_numeric_value(1.0);
+                            builder.set_numeric_value(f64::from(fraction));
+                        }
+                        builder.set_bounds(accesskit_rect(track));
+                    });
+                    #[cfg(test)]
+                    register_model_layout_rect(
+                        ui,
+                        &progress.accessible_text,
+                        "download track",
+                        track,
                     );
+                };
+                let mut render_controls = |ui: &mut egui::Ui| {
                     let cancel = compact_model_icon_action(
                         ui,
-                        Icon::Close,
+                        primary_icon,
                         cancel_name,
                         cancel_enabled,
                         cancel_reason,
@@ -2603,51 +2735,65 @@ fn render_model_download_module(
                     );
                     cancel_clicked = cancel.clicked();
                     cancel_has_focus = cancel.has_focus();
-                });
-                let (track, meter) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(track, Rounding::same(3.0), colors.meter_track);
-                if let Some(fraction) = progress.fraction {
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            track.min,
-                            Vec2::new(track.width() * fraction, track.height()),
-                        ),
-                        Rounding::same(3.0),
-                        colors.accent,
-                    );
-                }
-                ui.ctx().accesskit_node_builder(meter.id, |builder| {
-                    builder.set_role(egui::accesskit::Role::Meter);
-                    builder.set_name(progress.accessible_text.as_str());
-                    if let Some(fraction) = progress.fraction {
-                        builder.set_min_numeric_value(0.0);
-                        builder.set_max_numeric_value(1.0);
-                        builder.set_numeric_value(f64::from(fraction));
+                    if let Some(discard_name) = discard_name {
+                        let discard = compact_model_icon_action(
+                            ui,
+                            Icon::Close,
+                            discard_name,
+                            true,
+                            None,
+                            None,
+                        );
+                        discard_clicked = discard.clicked();
+                        discard_has_focus = discard.has_focus();
                     }
-                    builder.set_bounds(accesskit_rect(track));
-                });
-                #[cfg(test)]
-                {
-                    register_model_layout_rect(
-                        ui,
-                        &progress.accessible_text,
-                        "download track",
-                        track,
-                    );
-                    if let Some(fraction) = progress.fraction {
+                };
+                if horizontal {
+                    ui.horizontal(|ui| {
+                        let _label = ui.allocate_ui_with_layout(
+                            Vec2::new(label_width, 22.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(&progress.display_text)
+                                        .small()
+                                        .color(colors.muted_text),
+                                );
+                            },
+                        );
+                        #[cfg(test)]
                         register_model_layout_rect(
                             ui,
                             &progress.accessible_text,
-                            "download fill",
-                            egui::Rect::from_min_size(
-                                track.min,
-                                Vec2::new(track.width() * fraction, track.height()),
-                            ),
+                            "download label",
+                            _label.response.rect,
                         );
-                    }
+                        render_controls(ui);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let _label = ui.allocate_ui_with_layout(
+                            Vec2::new(label_width.min(ui.available_width()), 22.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(&progress.display_text)
+                                        .small()
+                                        .color(colors.muted_text),
+                                );
+                            },
+                        );
+                        #[cfg(test)]
+                        register_model_layout_rect(
+                            ui,
+                            &progress.accessible_text,
+                            "download label",
+                            _label.response.rect,
+                        );
+                    });
+                    ui.horizontal(|ui| render_controls(ui));
                 }
+                render_track(ui, ui.available_width());
             },
         )
         .response;
@@ -2655,7 +2801,28 @@ fn render_model_download_module(
         response,
         cancel_clicked,
         cancel_has_focus,
+        discard_clicked,
+        discard_has_focus,
     }
+}
+
+fn download_label_slot_width(ui: &egui::Ui, total_bytes: u64) -> f32 {
+    let maximum_label = format!(
+        "{} / {}",
+        format_download_bytes(total_bytes),
+        format_download_bytes(total_bytes)
+    );
+    ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                maximum_label,
+                egui::TextStyle::Small.resolve(ui.style()),
+                ui_palette(ui).muted_text,
+            )
+            .rect
+            .width()
+            .ceil()
+    })
 }
 
 fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
@@ -2866,7 +3033,7 @@ fn render_unified_model_card(
             model_row_description(card),
         ),
     };
-    let lifecycle = model_lifecycle_presentation(card, can_replace_active);
+    let lifecycle = model_lifecycle_controls(card, can_replace_active);
     let title_selects_model =
         matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
     let activation_id = ui.make_persistent_id(("select-model-card", card_key.clone()));
@@ -2931,51 +3098,77 @@ fn render_unified_model_card(
                                 action: &mut ScreenAction,
                                 restored_remove_focus: &mut bool,
                                 focus_within: &mut bool| {
-            if matches!(
-                lifecycle.action,
+            if (matches!(
+                lifecycle.primary.action,
                 ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
-            ) && let Some(progress) = model_download_progress_presentation(card)
+            ) || (lifecycle.discard.is_some() && matches!(lifecycle.primary.icon, Icon::Play)))
+                && let Some(progress) = model_download_progress_presentation(card)
             {
                 let download = render_model_download_module(
                     ui,
                     &progress,
-                    &lifecycle.accessible_name,
-                    lifecycle.enabled,
-                    lifecycle.disabled_reason,
+                    lifecycle.primary.icon,
+                    &lifecycle.primary.accessible_name,
+                    lifecycle.primary.enabled,
+                    lifecycle.primary.disabled_reason,
+                    lifecycle.discard_name.as_deref(),
                 );
-                *focus_within |= download.cancel_has_focus;
-                if download.cancel_clicked && lifecycle.enabled {
-                    *action = lifecycle.action.clone();
+                *focus_within |= download.cancel_has_focus || download.discard_has_focus;
+                if download.cancel_clicked && lifecycle.primary.enabled {
+                    *action = lifecycle.primary.action.clone();
+                } else if download.discard_clicked
+                    && let Some(discard) = lifecycle.discard.as_ref()
+                {
+                    *action = discard.clone();
                 }
                 return download.response;
             }
-            let label = if lifecycle.tone == ModelLifecycleTone::DestructiveOutline {
-                lifecycle.label.clone()
+            let label = if lifecycle.primary.tone == ModelLifecycleTone::DestructiveOutline {
+                lifecycle.primary.label.clone()
             } else {
-                lifecycle.compact_size.as_ref().map_or_else(
-                    || format!("{}  {}", icon_glyph(lifecycle.icon), lifecycle.label),
-                    |size| format!("{}  {size}", icon_glyph(lifecycle.icon)),
+                lifecycle.primary.compact_size.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "{}  {}",
+                            icon_glyph(lifecycle.primary.icon),
+                            lifecycle.primary.label
+                        )
+                    },
+                    |size| format!("{}  {size}", icon_glyph(lifecycle.primary.icon)),
                 )
             };
             let lifecycle_response = model_lifecycle_button(
                 ui,
                 &label,
-                &lifecycle.accessible_name,
-                lifecycle.enabled,
-                lifecycle.disabled_reason,
-                lifecycle.tone,
+                &lifecycle.primary.accessible_name,
+                lifecycle.primary.enabled,
+                lifecycle.primary.disabled_reason,
+                lifecycle.primary.tone,
             );
             *focus_within |= lifecycle_response.has_focus();
             if restore_remove_focus
-                && matches!(lifecycle.action, ScreenAction::RequestModelRemoval(_))
+                && matches!(
+                    lifecycle.primary.action,
+                    ScreenAction::RequestModelRemoval(_)
+                )
             {
                 lifecycle_response.request_focus();
                 *restored_remove_focus = true;
             }
-            if lifecycle_response.clicked() && lifecycle.enabled {
-                *action = lifecycle.action.clone();
+            if lifecycle_response.clicked() && lifecycle.primary.enabled {
+                *action = lifecycle.primary.action.clone();
             }
-            lifecycle_response
+            if let (Some(error_name), Some(error_message)) = (
+                lifecycle.error_accessible_name.as_deref(),
+                lifecycle.error_message,
+            ) {
+                let alert =
+                    model_download_error_affordance(ui, card.key(), error_name, error_message);
+                *focus_within |= alert.has_focus();
+                lifecycle_response.union(alert)
+            } else {
+                lifecycle_response
+            }
         };
         if compact {
             let identity_width = card_content_width;
@@ -3115,15 +3308,19 @@ fn render_unified_model_card(
                             }
                         },
                     );
-                    let _lifecycle_zone = ui.allocate_ui_with_layout(
-                        Vec2::new(lifecycle_width, 0.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
+                    let (lifecycle_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(lifecycle_width, MODEL_CARD_SUMMARY_HEIGHT),
+                        Sense::hover(),
+                    );
+                    let _lifecycle_zone = ui.allocate_ui_at_rect(lifecycle_rect, |ui| {
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             let body_width = (lifecycle_width - details_width).max(0.0);
-                            let _body = ui.allocate_ui_with_layout(
-                                Vec2::new(body_width, 0.0),
-                                Layout::right_to_left(Align::Center),
-                                |ui| {
+                            let body_rect = egui::Rect::from_min_size(
+                                lifecycle_rect.min,
+                                Vec2::new(body_width, MODEL_CARD_SUMMARY_HEIGHT),
+                            );
+                            let _body = ui.allocate_ui_at_rect(body_rect, |ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     activation_exclusions.push(
                                         render_lifecycle(
                                             ui,
@@ -3133,26 +3330,25 @@ fn render_unified_model_card(
                                         )
                                         .rect,
                                     );
-                                },
-                            );
-                            let _rail = ui.allocate_ui_with_layout(
+                                });
+                            });
+                            #[cfg(test)]
+                            register_model_layout_rect(ui, name, "lifecycle body", body_rect);
+                            let rail_rect = egui::Rect::from_min_size(
+                                egui::pos2(body_rect.right(), lifecycle_rect.center().y - 22.0),
                                 Vec2::new(details_width, 44.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
+                            );
+                            let _rail = ui.allocate_ui_at_rect(rail_rect, |ui| {
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                     activation_exclusions.push(
                                         render_details(ui, &mut action, &mut focus_within).rect,
                                     )
-                                },
-                            );
+                                });
+                            });
                             #[cfg(test)]
-                            register_model_layout_rect(
-                                ui,
-                                name,
-                                "chevron zone",
-                                _rail.response.rect,
-                            );
-                        },
-                    );
+                            register_model_layout_rect(ui, name, "chevron zone", rail_rect);
+                        });
+                    });
                     #[cfg(test)]
                     {
                         register_model_layout_rect(
@@ -3167,12 +3363,7 @@ fn render_unified_model_card(
                             "metrics zone",
                             _metrics_zone.response.rect,
                         );
-                        register_model_layout_rect(
-                            ui,
-                            name,
-                            "lifecycle zone",
-                            _lifecycle_zone.response.rect,
-                        );
+                        register_model_layout_rect(ui, name, "lifecycle zone", lifecycle_rect);
                     }
                 });
             });
@@ -3345,9 +3536,8 @@ fn render_inline_model_details(
         register_model_layout_rect(ui, model_name, "requirements content", _requirements.rect);
         match card {
             ModelCard::Local(model) => {
-                let maintenance = model.runtime_action_label.is_some()
-                    || model.partial_cleanup_available
-                    || model.legacy_cleanup_pending;
+                let maintenance =
+                    model.runtime_action_label.is_some() || model.legacy_cleanup_pending;
                 if maintenance {
                     render_model_layout_gap(ui, model_name, "requirements maintenance gap", 12.0);
                     let _maintenance_heading = detail_heading(ui, "MAINTENANCE", colors);
@@ -3374,22 +3564,6 @@ fn render_inline_model_details(
                     activation_exclusions.push(response.rect);
                     if response.clicked() && model.runtime_action_enabled {
                         *action = ScreenAction::MaintainModelRuntime(model.id.clone());
-                    }
-                }
-                if model.partial_cleanup_available {
-                    let cleanup_name = format!("Discard partial for {}", model.display_name);
-                    let cleanup = model_lifecycle_button(
-                        ui,
-                        "Discard partial",
-                        &cleanup_name,
-                        model.partial_cleanup_enabled,
-                        model.partial_cleanup_disabled_reason.as_deref(),
-                        ModelLifecycleTone::Standard,
-                    );
-                    *focus_within |= cleanup.has_focus();
-                    activation_exclusions.push(cleanup.rect);
-                    if cleanup.clicked() && model.partial_cleanup_enabled {
-                        *action = ScreenAction::DiscardModelPartial(model.id.clone());
                     }
                 }
                 if model.legacy_cleanup_pending {
@@ -3423,39 +3597,7 @@ fn render_inline_model_details(
                     }
                 }
             }
-            ModelCard::Remote(entry, variant) => {
-                if let Some(cleanup) = variant.actions.iter().find(|candidate| {
-                    matches!(
-                        candidate.kind,
-                        RemoteCatalogActionKind::DiscardPartial { .. }
-                    )
-                }) {
-                    render_model_layout_gap(ui, model_name, "requirements maintenance gap", 12.0);
-                    let _maintenance_heading = detail_heading(ui, "MAINTENANCE", colors);
-                    #[cfg(test)]
-                    register_model_layout_rect(
-                        ui,
-                        model_name,
-                        "maintenance heading",
-                        _maintenance_heading.rect,
-                    );
-                    render_model_layout_gap(ui, model_name, "maintenance heading content gap", 6.0);
-                    let cleanup_name = format!("Discard partial for {}", entry.display_name);
-                    let response = model_lifecycle_button(
-                        ui,
-                        "Discard partial",
-                        &cleanup_name,
-                        cleanup.enabled,
-                        cleanup.disabled_reason.as_deref(),
-                        ModelLifecycleTone::Standard,
-                    );
-                    *focus_within |= response.has_focus();
-                    activation_exclusions.push(response.rect);
-                    if response.clicked() && cleanup.enabled {
-                        *action = screen_action_for_remote_catalog_action(&cleanup.kind);
-                    }
-                }
-            }
+            ModelCard::Remote(_, _) => {}
         }
     });
     restored_remove_focus
@@ -4381,27 +4523,6 @@ fn models(
     action
 }
 
-fn model_download_label(model: &ModelViewModel) -> String {
-    match model.download_state {
-        ModelDownloadState::Downloading => {
-            model_download_progress_presentation(ModelCard::Local(model)).map_or_else(
-                || "Downloading".to_owned(),
-                |progress| progress.display_text,
-            )
-        }
-        ModelDownloadState::Queued => "Queued".to_owned(),
-        ModelDownloadState::Verifying => "Verifying".to_owned(),
-        ModelDownloadState::Extracting => "Extracting".to_owned(),
-        ModelDownloadState::Installed => "Installed".to_owned(),
-        ModelDownloadState::Failed => model
-            .error_message
-            .clone()
-            .unwrap_or_else(|| "Install failed".to_owned()),
-        ModelDownloadState::Cancelled => "Cancelled; partial download can be resumed.".to_owned(),
-        ModelDownloadState::NotInstalled => "Not installed".to_owned(),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct ModelDownloadProgressPresentation {
     downloaded_bytes: u64,
@@ -4416,7 +4537,13 @@ fn model_download_progress_presentation(
     card: ModelCard<'_>,
 ) -> Option<ModelDownloadProgressPresentation> {
     let (downloaded_bytes, total_bytes) = match card {
-        ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => {
+        ModelCard::Local(model)
+            if model.download_state == ModelDownloadState::Downloading
+                || (matches!(
+                    model.download_state,
+                    ModelDownloadState::Cancelled | ModelDownloadState::Failed
+                ) && model.partial_cleanup_available) =>
+        {
             (model.downloaded_bytes, model.total_bytes)
         }
         // Remote progress exists only when the live installer supplied it.
@@ -4431,7 +4558,7 @@ fn model_download_progress_presentation(
             let percent = fraction.expect("known totals always have a fraction") * 100.0;
             (
                 format!(
-                    "Downloading {} of {} ({percent:.0}%)",
+                    "{} / {}",
                     format_download_bytes(downloaded_bytes),
                     format_download_bytes(total)
                 ),
@@ -4443,7 +4570,10 @@ fn model_download_progress_presentation(
             )
         }
         None => (
-            format!("Downloading {}", format_download_bytes(downloaded_bytes)),
+            format!(
+                "{} / Total unknown",
+                format_download_bytes(downloaded_bytes)
+            ),
             format!(
                 "Downloading {}; total download size unknown",
                 format_download_bytes(downloaded_bytes)
@@ -6393,15 +6523,46 @@ fn settings_help_affordance(
     accessible_name: &str,
     description: &str,
 ) {
+    popup_affordance(
+        ui,
+        egui::Id::new(("settings-help-affordance", id_source)),
+        egui::Id::new(("settings-help-popup", id_source)),
+        egui::Id::new("settings-help-state"),
+        &format!("{accessible_name} information"),
+        description,
+        "?",
+    );
+}
+
+fn model_download_error_affordance(
+    ui: &mut egui::Ui,
+    card_key: ModelCardKey,
+    accessible_name: &str,
+    description: &str,
+) -> egui::Response {
+    popup_affordance(
+        ui,
+        egui::Id::new(("model-download-error-affordance", card_key.clone())),
+        egui::Id::new(("model-download-error-popup", card_key)),
+        egui::Id::new("model-download-error-state"),
+        accessible_name,
+        description,
+        icon_glyph(Icon::Warning),
+    )
+}
+
+fn popup_affordance(
+    ui: &mut egui::Ui,
+    control_id: egui::Id,
+    popup_id: egui::Id,
+    state_id: egui::Id,
+    accessible_name: &str,
+    description: &str,
+    glyph: &str,
+) -> egui::Response {
     const HOVER_DELAY_SECONDS: f64 = 0.3;
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-    let response = ui.interact(
-        rect,
-        egui::Id::new(("settings-help-affordance", id_source)),
-        Sense::click(),
-    );
-    let popup_id = egui::Id::new(("settings-help-popup", id_source));
-    let state_id = egui::Id::new("settings-help-state");
+    let response = ui.interact(rect, control_id, Sense::click());
     let mut state = ui.data(|data| {
         data.get_temp::<SettingsHelpState>(state_id)
             .unwrap_or_default()
@@ -6500,15 +6661,14 @@ fn settings_help_affordance(
     ui.painter().text(
         visual.center(),
         Align2::CENTER_CENTER,
-        "?",
+        glyph,
         egui::FontId::proportional(14.0),
         colors.muted_text,
     );
-    let help_name = format!("{accessible_name} information");
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, &help_name));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, accessible_name));
     ui.ctx().accesskit_node_builder(response.id, |builder| {
         builder.set_role(egui::accesskit::Role::Button);
-        builder.set_name(help_name);
+        builder.set_name(accessible_name);
         builder.set_description(description);
         builder.set_expanded(expanded);
         builder.set_bounds(accesskit_rect(rect));
@@ -6558,6 +6718,7 @@ fn settings_help_affordance(
         }
     }
     ui.data_mut(|data| data.insert_temp(state_id, state));
+    response
 }
 
 #[derive(Clone, Copy, Default)]
@@ -6825,7 +6986,7 @@ mod tests {
                 total_bytes: Some(100),
                 fraction: Some(1.0),
                 total_is_unknown: false,
-                display_text: "Downloading 120B of 100B (100%)".into(),
+                display_text: "120B / 100B".into(),
                 accessible_text: "Downloading 120B of 100B, 100% complete".into(),
             })
         );
@@ -6843,16 +7004,392 @@ mod tests {
                 total_bytes: None,
                 fraction: None,
                 total_is_unknown: true,
-                display_text: "Downloading 42B".into(),
+                display_text: "42B / Total unknown".into(),
                 accessible_text: "Downloading 42B; total download size unknown".into(),
             })
         );
-        assert_eq!(model_download_label(&unknown_total), "Downloading 42B");
         let not_downloading = ModelViewModel::default();
         assert_eq!(
             model_download_progress_presentation(ModelCard::Local(&not_downloading)),
             None
         );
+    }
+
+    #[test]
+    fn download_label_slot_uses_the_actual_byte_label_font_and_maximum_value() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let total = 1_500_000_000;
+                let expected = format!(
+                    "{} / {}",
+                    format_download_bytes(total),
+                    format_download_bytes(total)
+                );
+                let expected_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            expected,
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            ui_palette(ui).muted_text,
+                        )
+                        .rect
+                        .width()
+                });
+                assert_eq!(
+                    download_label_slot_width(ui, total),
+                    expected_width.ceil(),
+                    "the reserved label slot must be measured using the rendered byte-label style"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn settled_download_without_partial_keeps_install_primary_and_never_uses_play_or_warning() {
+        for download_state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
+            let model = ModelViewModel {
+                display_name: "Settled local model".into(),
+                download_state,
+                partial_cleanup_available: false,
+                ..Default::default()
+            };
+            let primary = model_lifecycle_presentation(ModelCard::Local(&model), true);
+            assert_eq!(primary.label, "Install");
+            assert_eq!(primary.icon, Icon::Download);
+            assert_eq!(primary.tone, ModelLifecycleTone::InverseFilled);
+        }
+    }
+
+    #[test]
+    fn download_card_desktop_zones_are_summary_height_and_keep_the_chevron_rail_separate() {
+        let model = ModelViewModel {
+            id: "geometry-download".into(),
+            display_name: "Geometry download".into(),
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 82_000_000,
+            total_bytes: Some(100_000_000),
+            cancel_supported: true,
+            ..Default::default()
+        };
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render_model_card_at(&model, width, height, Vec::new());
+            let lifecycle = model_layout_bounds(&output, "Geometry download layout lifecycle zone");
+            let body = model_layout_bounds(&output, "Geometry download layout lifecycle body");
+            let rail = model_layout_bounds(&output, "Geometry download layout chevron zone");
+            let progress_name = "Downloading 82.0MB of 100.0MB, 82% complete";
+            let label =
+                model_layout_bounds(&output, &format!("{progress_name} layout download label"));
+            let track =
+                model_layout_bounds(&output, &format!("{progress_name} layout download track"));
+            let pause = named_role_bounds(
+                &output,
+                "Pause Geometry download download",
+                egui::accesskit::Role::Button,
+            );
+            let discard = named_role_bounds(
+                &output,
+                "Discard partial for Geometry download",
+                egui::accesskit::Role::Button,
+            );
+            assert_eq!(lifecycle.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
+            assert_eq!(body.height(), f64::from(MODEL_CARD_SUMMARY_HEIGHT));
+            assert_eq!(rail.width(), 44.0);
+            assert_eq!(rail.height(), 44.0);
+            assert!((rail.y0 + rail.y1 - lifecycle.y0 - lifecycle.y1).abs() < 0.1);
+            if width >= 1180.0 {
+                assert!(label.y0 < pause.y1 && pause.y0 < label.y1);
+                assert!(label.y0 < discard.y1 && discard.y0 < label.y1);
+            } else {
+                assert!(pause.y0 >= label.y1);
+                assert!(discard.y0 >= label.y1);
+            }
+            assert!(track.y0 >= pause.y1 && track.y0 >= discard.y1);
+            assert!((track.x0 - body.x0).abs() < 0.1);
+            assert!((track.x1 - body.x1).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn narrow_download_module_moves_controls_below_the_byte_and_track_row_without_overlap() {
+        let progress = ModelDownloadProgressPresentation {
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            fraction: Some(0.42),
+            total_is_unknown: false,
+            display_text: "42B / 100B".into(),
+            accessible_text: "Downloading 42B of 100B, 42% complete".into(),
+        };
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(180.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(120.0, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(120.0);
+                            ui.set_max_width(120.0);
+                            render_model_download_module(
+                                ui,
+                                &progress,
+                                Icon::Pause,
+                                "Pause Narrow download",
+                                true,
+                                None,
+                                Some("Discard partial for Narrow download"),
+                            );
+                        },
+                    );
+                });
+            },
+        );
+        let label = model_layout_bounds(
+            &output,
+            "Downloading 42B of 100B, 42% complete layout download label",
+        );
+        let track = model_layout_bounds(
+            &output,
+            "Downloading 42B of 100B, 42% complete layout download track",
+        );
+        let pause = named_role_bounds(
+            &output,
+            "Pause Narrow download",
+            egui::accesskit::Role::Button,
+        );
+        let close = named_role_bounds(
+            &output,
+            "Discard partial for Narrow download",
+            egui::accesskit::Role::Button,
+        );
+        assert!(pause.y0 >= label.y1, "label={label:?} pause={pause:?}");
+        assert!(close.y0 >= label.y1, "label={label:?} close={close:?}");
+        assert!(track.y0 >= pause.y1, "pause={pause:?} track={track:?}");
+        assert!(track.y0 >= close.y1, "close={close:?} track={track:?}");
+        assert!(track.width() >= label.width());
+        assert!(pause.width() >= 44.0 && pause.height() >= 44.0);
+        assert!(close.width() >= 44.0 && close.height() >= 44.0);
+    }
+
+    #[test]
+    fn failed_download_warning_is_a_named_44px_button_with_the_actual_error() {
+        let model = ModelViewModel {
+            id: "failed-warning".into(),
+            display_name: "Failed warning".into(),
+            download_state: ModelDownloadState::Failed,
+            error_message: Some("TLS certificate validation failed.".into()),
+            ..Default::default()
+        };
+        let output = render_model_card_at(&model, 960.0, 680.0, Vec::new());
+        let warning = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .and_then(|update| {
+                update.nodes.iter().find_map(|(_, node)| {
+                    (node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Show download error for Failed warning"))
+                    .then_some(node)
+                })
+            })
+            .expect("download error warning control");
+        let bounds = warning.bounds().expect("warning bounds");
+        assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+        assert_eq!(
+            warning.description(),
+            Some("TLS certificate validation failed.")
+        );
+    }
+
+    #[test]
+    fn remote_download_error_is_preserved_for_the_warning_alert() {
+        let entry = RemoteCatalogEntryView {
+            display_name: "Remote failure".into(),
+            ..Default::default()
+        };
+        let variant = RemoteCatalogVariantView {
+            error_message: Some("Pinned artifact could not be fetched.".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_download_error(ModelCard::Remote(&entry, &variant)),
+            Some("Pinned artifact could not be fetched.")
+        );
+    }
+
+    #[test]
+    fn local_retained_partial_bytes_project_after_failed_and_cancelled_restarts() {
+        for state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
+            let model = ModelViewModel {
+                download_state: state,
+                partial_cleanup_available: true,
+                downloaded_bytes: 82_000_000,
+                total_bytes: Some(100_000_000),
+                ..Default::default()
+            };
+            let progress = model_download_progress_presentation(ModelCard::Local(&model))
+                .expect("retained local partial projects after restart");
+            assert_eq!(progress.downloaded_bytes, 82_000_000);
+            assert_eq!(progress.total_bytes, Some(100_000_000));
+            assert_eq!(progress.display_text, "82.0MB / 100.0MB");
+        }
+    }
+
+    #[test]
+    fn remote_retained_partial_bytes_project_after_failed_and_cancelled_restarts() {
+        for status_label in ["Failed", "Cancelled"] {
+            let entry = RemoteCatalogEntryView {
+                display_name: "Remote retained partial".into(),
+                ..Default::default()
+            };
+            let variant = RemoteCatalogVariantView {
+                status_label: Some(status_label.into()),
+                downloaded_bytes: Some(82_000_000),
+                total_bytes: Some(100_000_000),
+                ..Default::default()
+            };
+            let progress =
+                model_download_progress_presentation(ModelCard::Remote(&entry, &variant))
+                    .expect("retained remote partial projects after restart");
+            assert_eq!(progress.downloaded_bytes, 82_000_000);
+            assert_eq!(progress.total_bytes, Some(100_000_000));
+            assert_eq!(progress.display_text, "82.0MB / 100.0MB");
+        }
+    }
+
+    #[test]
+    fn download_card_hides_lifecycle_and_percent_text_from_the_visible_surface() {
+        let model = ModelViewModel {
+            id: "quiet-download".into(),
+            display_name: "Quiet download".into(),
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            cancel_supported: true,
+            ..Default::default()
+        };
+        let output = render_model_card_at(&model, 960.0, 680.0, Vec::new());
+        let visible_text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!visible_text.iter().any(|text| text.contains("Downloading")));
+        assert!(!visible_text.iter().any(|text| text.contains('%')));
+        assert!(visible_text.iter().any(|text| text.contains("42B / 100B")));
+    }
+
+    #[test]
+    fn download_warning_click_is_excluded_from_card_activation_and_escape_or_outside_click_dismisses()
+     {
+        let model = failed_warning_model();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let initial = render_model_card_with_context(&ctx, &model, Vec::new());
+        let warning = named_role_bounds(
+            &initial.0,
+            "Show download error for Failed warning",
+            egui::accesskit::Role::Button,
+        );
+        let point = accesskit_rect_center(warning);
+        let pressed = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(pressed.1, ScreenAction::None);
+        let opened = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(opened.1, ScreenAction::None);
+        assert!(button_expanded(
+            &opened.0,
+            "Show download error for Failed warning"
+        ));
+        let still_pinned = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![egui::Event::PointerMoved(egui::pos2(900.0, 600.0))],
+        );
+        assert!(button_expanded(
+            &still_pinned.0,
+            "Show download error for Failed warning"
+        ));
+        let dismissed = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!button_expanded(
+            &dismissed.0,
+            "Show download error for Failed warning"
+        ));
+
+        let reopened = click_model_warning(&ctx, &model, point);
+        assert!(button_expanded(
+            &reopened.0,
+            "Show download error for Failed warning"
+        ));
+        let _outside_press = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(900.0, 600.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let outside = render_model_card_with_context(
+            &ctx,
+            &model,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(900.0, 600.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!button_expanded(
+            &outside.0,
+            "Show download error for Failed warning"
+        ));
     }
 
     #[test]
@@ -9406,6 +9943,121 @@ mod tests {
                 })
             })
             .unwrap_or_else(|| panic!("missing {name} {role:?} bounds"))
+    }
+
+    fn model_layout_bounds(output: &egui::FullOutput, name: &str) -> egui::accesskit::Rect {
+        named_role_bounds(output, name, egui::accesskit::Role::StaticText)
+    }
+
+    fn render_model_card_at(
+        model: &ModelViewModel,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, height),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ =
+                        render_unified_model_card(ui, ModelCard::Local(model), false, true, false);
+                });
+            },
+        )
+    }
+
+    fn failed_warning_model() -> ModelViewModel {
+        ModelViewModel {
+            id: "failed-warning".into(),
+            display_name: "Failed warning".into(),
+            download_state: ModelDownloadState::Failed,
+            error_message: Some("TLS certificate validation failed.".into()),
+            ..Default::default()
+        }
+    }
+
+    fn render_model_card_with_context(
+        ctx: &egui::Context,
+        model: &ModelViewModel,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(960.0, 680.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action =
+                        render_unified_model_card(ui, ModelCard::Local(model), false, true, false)
+                            .action;
+                });
+            },
+        );
+        (output, action)
+    }
+
+    fn click_model_warning(
+        ctx: &egui::Context,
+        model: &ModelViewModel,
+        point: egui::Pos2,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let _ = render_model_card_with_context(
+            ctx,
+            model,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        render_model_card_with_context(
+            ctx,
+            model,
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+    }
+
+    fn button_expanded(output: &egui::FullOutput, name: &str) -> bool {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .is_some_and(|update| {
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(name) && node.is_expanded() == Some(true))
+            })
     }
 
     fn accesskit_rect_center(rect: egui::accesskit::Rect) -> egui::Pos2 {
