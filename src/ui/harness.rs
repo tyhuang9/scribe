@@ -2839,8 +2839,8 @@ mod tests {
         assert!(
             node_names(&expanded)
                 .iter()
-                .any(|name| name == "Languages: English, Spanish, Japanese"),
-            "expanded identity metadata should use full language names"
+                .any(|name| name == "Languages: EN,ES,JA"),
+            "expanded identity metadata should keep the compact language summary"
         );
         assert!(
             !node_names(&expanded)
@@ -2859,22 +2859,144 @@ mod tests {
     }
 
     #[test]
+    fn model_card_languages_stay_compact_with_full_names_in_tooltip_and_a11y_metadata() {
+        fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_shapes(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCardExpanded.data();
+        let mut page = Fixture::ModelsCardExpanded.page();
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let language_name = "Languages: EN,ES,JA";
+        let language = node_matching(&initial, |node| node.name() == Some(language_name));
+        assert_eq!(language.description(), Some("English, Spanish, Japanese"));
+        let bounds = language.bounds().expect("language metadata bounds");
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            Some(0.0),
+        );
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ))],
+            Some(0.1),
+        );
+        let hovered = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ))],
+            Some(1.0),
+        )
+        .0;
+        let mut texts = Vec::new();
+        for shape in &hovered.shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "English, Spanish, Japanese"),
+            "full language names should remain available in the language tooltip"
+        );
+
+        data.models[0].languages = vec!["klingon".into()];
+        let unavailable =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let unavailable_name = "Languages unavailable";
+        let unavailable_language =
+            node_matching(&unavailable, |node| node.name() == Some(unavailable_name));
+        assert_eq!(unavailable_language.description(), Some(unavailable_name));
+        let unavailable_bounds = unavailable_language.bounds().expect("unavailable bounds");
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            Some(2.0),
+        );
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((unavailable_bounds.x0 + unavailable_bounds.x1) / 2.0) as f32,
+                ((unavailable_bounds.y0 + unavailable_bounds.y1) / 2.0) as f32,
+            ))],
+            Some(2.1),
+        );
+        let unavailable_hovered = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((unavailable_bounds.x0 + unavailable_bounds.x1) / 2.0) as f32,
+                ((unavailable_bounds.y0 + unavailable_bounds.y1) / 2.0) as f32,
+            ))],
+            Some(3.0),
+        )
+        .0;
+        let mut unavailable_texts = Vec::new();
+        for shape in &unavailable_hovered.shapes {
+            text_shapes(&shape.shape, &mut unavailable_texts);
+        }
+        assert!(
+            unavailable_texts
+                .iter()
+                .any(|text| text == unavailable_name),
+            "unavailable languages should expose a truthful tooltip"
+        );
+    }
+
+    #[test]
     fn expanded_fixture_exposes_all_feature_grid_evidence() {
         let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
         let names = node_names(&output);
-        for feature in [
-            "Batch transcription",
-            "Native streaming",
+        assert!(names.iter().any(|name| {
+            name == "Features: Native streaming, Translation, Word timestamps, Batch transcription"
+        }));
+        for hidden in [
             "Cancellation",
-            "Word timestamps",
-            "Translation",
             "Automatic language detection",
             "Confidence scores",
             "Custom vocabulary",
         ] {
             assert!(
-                names.iter().any(|name| name == feature),
-                "missing {feature}"
+                !names.iter().any(|name| name == hidden),
+                "hidden feature {hidden}"
             );
         }
         assert!(
@@ -2991,18 +3113,25 @@ mod tests {
         let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
         let names = node_names(&output);
         for capability in [
-            "Batch transcription",
             "Native streaming",
-            "Cancellation",
-            "Word timestamps",
             "Translation",
+            "Word timestamps",
+            "Batch transcription",
+        ] {
+            assert!(
+                names.iter().any(|name| name == capability),
+                "missing {capability}"
+            );
+        }
+        for hidden in [
+            "Cancellation",
             "Automatic language detection",
             "Confidence scores",
             "Custom vocabulary",
         ] {
             assert!(
-                names.iter().any(|name| name == capability),
-                "missing {capability}"
+                !names.iter().any(|name| name == hidden),
+                "hidden feature {hidden}"
             );
         }
     }
@@ -3045,7 +3174,8 @@ mod tests {
         data.model_catalog.clear();
         let mut page = AppPage::Models;
         let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let feature_name = "Features: Batch transcription, Native streaming, Cancellation, Word timestamps, Translation, Automatic language detection, Confidence scores, Custom vocabulary";
+        let feature_name =
+            "Features: Native streaming, Translation, Word timestamps, Batch transcription";
         let feature_group = node_matching(&initial, |node| node.name() == Some(feature_name));
         assert_eq!(feature_group.role(), egui::accesskit::Role::Group);
         let nodes = &initial
@@ -3067,30 +3197,22 @@ mod tests {
                 egui::accesskit::Role::Button | egui::accesskit::Role::Link
             ) && [
                 "Native streaming",
-                "Batch transcription",
-                "Cancellation",
-                "Word timestamps",
                 "Translation",
-                "Automatic language detection",
-                "Confidence scores",
-                "Custom vocabulary",
+                "Word timestamps",
+                "Batch transcription",
             ]
             .contains(&node.name().unwrap_or_default())
         }));
         let bounds = feature_group.bounds().unwrap();
         assert!(
-            bounds.height() >= 88.0 - LAYOUT_TOLERANCE,
-            "eight summary icons should wrap within the compact feature group: {bounds:?}"
+            bounds.height() >= 44.0 - LAYOUT_TOLERANCE,
+            "four summary icons should fit within the compact feature group: {bounds:?}"
         );
         for (index, tooltip) in [
-            "Batch transcription",
             "Native streaming",
-            "Cancellation",
-            "Word timestamps",
             "Translation",
-            "Automatic language detection",
-            "Confidence scores",
-            "Custom vocabulary",
+            "Word timestamps",
+            "Batch transcription",
         ]
         .into_iter()
         .enumerate()
@@ -3192,6 +3314,10 @@ mod tests {
         known_empty.display_name = "Known empty".into();
         known_empty.capabilities = ModelCapabilities {
             capabilities_known: true,
+            cancellation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
             ..Default::default()
         };
         let mut unknown = known_empty.clone();
@@ -3954,7 +4080,7 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
         let expanded_description = named_node_bounds(&expanded, long_description);
-        let expanded_language = named_node_bounds(&expanded, "Languages: English");
+        let expanded_language = named_node_bounds(&expanded, "Languages: EN");
         assert_near(
             expanded_description.x0,
             collapsed_description.x0,
@@ -4042,8 +4168,8 @@ mod tests {
             assert!(names.iter().any(|name| name == detail), "missing {detail}");
         }
         assert!(
-            names.iter().any(|name| name == "Languages: English"),
-            "expanded remote identity should expose its full language name"
+            names.iter().any(|name| name == "Languages: EN"),
+            "expanded remote identity should expose its compact language summary"
         );
         assert_eq!(
             names

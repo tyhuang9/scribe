@@ -1642,7 +1642,7 @@ fn formatted_language_summary(languages: &[String]) -> String {
         });
     match codes.len() {
         0 => "—".to_owned(),
-        1..=3 => codes.join(", "),
+        1..=3 => codes.join(","),
         _ => "Multilingual".to_owned(),
     }
 }
@@ -2128,40 +2128,20 @@ fn model_summary_features(card: ModelCard<'_>) -> (Vec<(Icon, &'static str)>, bo
     }
     let features = [
         (
-            capabilities.batch_transcription,
-            Icon::BatchTranscription,
-            "Batch transcription",
-        ),
-        (
             capabilities.native_streaming,
             Icon::Streaming,
             "Native streaming",
         ),
-        (
-            capabilities.cancellation,
-            Icon::Cancellation,
-            "Cancellation",
-        ),
+        (capabilities.translation, Icon::Translation, "Translation"),
         (
             capabilities.timestamps,
             Icon::WordTimestamps,
             "Word timestamps",
         ),
-        (capabilities.translation, Icon::Translation, "Translation"),
         (
-            capabilities.language_detection,
-            Icon::LanguageDetection,
-            "Automatic language detection",
-        ),
-        (
-            capabilities.confidence_scores,
-            Icon::ConfidenceScores,
-            "Confidence scores",
-        ),
-        (
-            capabilities.custom_vocabulary,
-            Icon::CustomVocabulary,
-            "Custom vocabulary",
+            capabilities.batch_transcription,
+            Icon::BatchTranscription,
+            "Batch transcription",
         ),
     ]
     .into_iter()
@@ -2277,8 +2257,7 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) -> egui::Respon
     };
     const ICON_STEP: f32 = 20.0;
     const ICON_TARGET: f32 = 44.0;
-    // Keep the complete feature set compact beside metrics and lifecycle controls;
-    // additional supported features wrap rather than disappearing.
+    // Keep the curated feature set compact beside metrics and lifecycle controls.
     let max_columns = ((ui.available_width() / ICON_STEP).floor() as usize).clamp(1, 4);
     let columns = features.len().min(max_columns).max(1);
     let rows = features.len().div_ceil(columns).max(1);
@@ -2650,30 +2629,14 @@ fn active_badge_rect(
     )
 }
 
-fn render_model_metadata(
-    ui: &mut egui::Ui,
-    languages: &[String],
-    include_ratings: bool,
-    expanded: bool,
-) {
+fn render_model_metadata(ui: &mut egui::Ui, languages: &[String], include_ratings: bool) {
     let colors = ui_palette(ui);
     ui.horizontal_wrapped(|ui| {
-        let (language_name, language_summary) = if expanded {
-            let names = normalized_languages(languages).join(", ");
-            (
-                if names.is_empty() {
-                    "Languages unavailable"
-                } else {
-                    "Languages"
-                },
-                if names.is_empty() {
-                    "â€”".to_owned()
-                } else {
-                    names
-                },
-            )
+        let (language_name, language_summary) = model_language_summary(languages);
+        let language_description = if language_name == "Languages unavailable" {
+            language_name.to_owned()
         } else {
-            model_language_summary(languages)
+            normalized_languages(languages).join(", ")
         };
         if !include_ratings {
             // Match the title text inset (20 px icon slot + 6 px gap).
@@ -2694,8 +2657,10 @@ fn render_model_metadata(
                     language_name.to_owned()
                 } else {
                     format!("{language_name}: {language_summary}")
-                })
+                });
+                builder.set_description(language_description.as_str());
             });
+            language.on_hover_text(language_description);
         });
         debug_assert!(!include_ratings, "ratings are rendered by the card layout");
     });
@@ -2844,7 +2809,7 @@ fn render_unified_model_card(
                     true,
                 );
             });
-            render_model_metadata(ui, languages, false, expanded);
+            render_model_metadata(ui, languages, false);
             ui.horizontal(|ui| {
                 activation_exclusions.push(render_model_features(ui, card).rect);
                 activation_exclusions.push(
@@ -2882,7 +2847,7 @@ fn render_unified_model_card(
                                 expanded,
                             );
                             ui.add_space(4.0);
-                            render_model_metadata(ui, languages, false, expanded);
+                            render_model_metadata(ui, languages, false);
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -7059,7 +7024,7 @@ mod tests {
     fn compact_language_codes_are_unique_and_bounded() {
         assert_eq!(
             formatted_language_summary(&["en".into(), "English".into(), "es".into(), "ja".into()]),
-            "EN, ES, JA"
+            "EN,ES,JA"
         );
         assert_eq!(
             formatted_language_summary(&["en".into(), "es".into(), "ja".into(), "ko".into()]),
@@ -7067,7 +7032,7 @@ mod tests {
         );
         assert_eq!(
             formatted_language_summary(&["it".into(), "ru".into(), "ar".into()]),
-            "IT, RU, AR"
+            "IT,RU,AR"
         );
         assert_eq!(formatted_language_summary(&["unknown".into()]), "—");
     }
@@ -7349,7 +7314,7 @@ mod tests {
     fn model_card_languages_and_description_contracts_are_truthful() {
         assert_eq!(
             formatted_language_summary(&["en".into(), "ES".into(), "ja".into()]),
-            "EN, ES, JA"
+            "EN,ES,JA"
         );
         assert_eq!(
             formatted_language_summary(&["en".into(), "es".into(), "ja".into(), "ko".into()]),
@@ -7357,7 +7322,7 @@ mod tests {
         );
         assert_eq!(
             model_language_summary(&["it".into(), "ru".into(), "ar".into()]),
-            ("Languages", "IT, RU, AR".into())
+            ("Languages", "IT,RU,AR".into())
         );
         assert_eq!(
             model_language_summary(&["klingon".into()]),
