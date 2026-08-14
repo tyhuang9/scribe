@@ -1723,13 +1723,33 @@ fn render_model_description(
     }
     let colors = ui_palette(ui);
     let content_width = (width - left_inset).max(0.0);
+    if !description_overflows(ui, description, content_width) {
+        // A fitting expanded description is the same summary line as its
+        // collapsed preview, without any truncation to apply.
+        return render_model_description_preview(ui, description, width, left_inset);
+    }
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        description,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Small.resolve(ui.style()),
+            color: colors.muted_text,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = content_width;
+    let content_height = ui.fonts(|fonts| fonts.layout_job(job).size().y.max(18.0)) + 2.0;
     ui.horizontal_top(|ui| {
         ui.add_space(left_inset);
         ui.allocate_ui_with_layout(
-            Vec2::new(content_width, 0.0),
+            Vec2::new(content_width, content_height),
             Layout::top_down(Align::LEFT),
             |ui| {
                 ui.set_width(content_width);
+                // Match the preview's vertically centered first-line
+                // baseline, then let wrapped content extend below it.
+                ui.add_space(2.0);
                 ui.label(RichText::new(description).small().color(colors.muted_text));
             },
         );
@@ -2679,18 +2699,28 @@ fn render_model_download_module(
     let mut cancel_has_focus = false;
     let mut discard_clicked = false;
     let mut discard_has_focus = false;
+    let available_width = ui.available_width();
+    let control_count = if discard_name.is_some() { 2.0 } else { 1.0 };
+    let controls_width = 44.0 * control_count + ui.spacing().item_spacing.x * (control_count - 1.0);
+    const MIN_TRACK_WIDTH: f32 = 44.0;
+    let track_and_controls_fit =
+        available_width >= controls_width + ui.spacing().item_spacing.x + MIN_TRACK_WIDTH;
+    let module_height = if track_and_controls_fit {
+        22.0 + ui.spacing().item_spacing.y + 44.0
+    } else {
+        22.0 + 6.0 + 44.0 + 2.0 * ui.spacing().item_spacing.y
+    };
     let response = ui
         .allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 0.0),
+            // The parent lifecycle zone centers this response as one summary
+            // item. Reserving its full height centers the label and its
+            // track/control row together rather than overflowing downward
+            // from a zero-height allocation.
+            Vec2::new(available_width, module_height),
             Layout::top_down(Align::Min),
             |ui| {
-                let control_count = if discard_name.is_some() { 2.0 } else { 1.0 };
-                let controls_width =
-                    44.0 * control_count + ui.spacing().item_spacing.x * (control_count - 1.0);
                 let label_width =
                     download_label_slot_width(ui, progress.total_bytes.unwrap_or(u64::MAX));
-                let horizontal = ui.available_width()
-                    >= label_width + controls_width + ui.spacing().item_spacing.x;
                 let render_track = |ui: &mut egui::Ui, width: f32| {
                     let (track, meter) =
                         ui.allocate_exact_size(Vec2::new(width, 6.0), Sense::hover());
@@ -2753,52 +2783,41 @@ fn render_model_download_module(
                         discard_has_focus = discard.has_focus();
                     }
                 };
-                if horizontal {
+                let (label_slot, _) = ui.allocate_exact_size(
+                    Vec2::new(label_width.min(ui.available_width()), 22.0),
+                    Sense::hover(),
+                );
+                ui.allocate_ui_at_rect(label_slot, |ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(&progress.display_text)
+                                .small()
+                                .color(colors.muted_text),
+                        );
+                    });
+                });
+                #[cfg(test)]
+                register_model_layout_rect(
+                    ui,
+                    &progress.accessible_text,
+                    "download label",
+                    label_slot,
+                );
+                if track_and_controls_fit {
                     ui.horizontal(|ui| {
-                        let _label = ui.allocate_ui_with_layout(
-                            Vec2::new(label_width, 22.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(&progress.display_text)
-                                        .small()
-                                        .color(colors.muted_text),
-                                );
-                            },
-                        );
-                        #[cfg(test)]
-                        register_model_layout_rect(
-                            ui,
-                            &progress.accessible_text,
-                            "download label",
-                            _label.response.rect,
-                        );
+                        let track_width =
+                            (ui.available_width() - controls_width - ui.spacing().item_spacing.x)
+                                .max(MIN_TRACK_WIDTH);
+                        render_track(ui, track_width);
                         render_controls(ui);
                     });
                 } else {
-                    ui.horizontal(|ui| {
-                        let _label = ui.allocate_ui_with_layout(
-                            Vec2::new(label_width.min(ui.available_width()), 22.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(&progress.display_text)
-                                        .small()
-                                        .color(colors.muted_text),
-                                );
-                            },
-                        );
-                        #[cfg(test)]
-                        register_model_layout_rect(
-                            ui,
-                            &progress.accessible_text,
-                            "download label",
-                            _label.response.rect,
-                        );
-                    });
+                    // Only wrap at widths that cannot retain a useful 44px
+                    // track beside the 44px accessibility targets. Controls
+                    // stay below, never above, the progress track.
+                    render_track(ui, ui.available_width());
                     ui.horizontal(|ui| render_controls(ui));
                 }
-                render_track(ui, ui.available_width());
             },
         )
         .response;
@@ -7067,7 +7086,7 @@ mod tests {
     }
 
     #[test]
-    fn download_card_desktop_zones_are_summary_height_and_keep_the_chevron_rail_separate() {
+    fn download_card_desktop_zones_center_progress_with_track_row_controls() {
         let model = ModelViewModel {
             id: "geometry-download".into(),
             display_name: "Geometry download".into(),
@@ -7102,21 +7121,43 @@ mod tests {
             assert_eq!(rail.width(), 44.0);
             assert_eq!(rail.height(), 44.0);
             assert!((rail.y0 + rail.y1 - lifecycle.y0 - lifecycle.y1).abs() < 0.1);
-            if width >= 1180.0 {
-                assert!(label.y0 < pause.y1 && pause.y0 < label.y1);
-                assert!(label.y0 < discard.y1 && discard.y0 < label.y1);
-            } else {
-                assert!(pause.y0 >= label.y1);
-                assert!(discard.y0 >= label.y1);
-            }
-            assert!(track.y0 >= pause.y1 && track.y0 >= discard.y1);
+            assert!(
+                label.y1 <= track.y0,
+                "the stable byte label must stay above the track: label={label:?} track={track:?}"
+            );
+            assert!(
+                label.y1 <= pause.y0 && label.y1 <= discard.y0,
+                "the stable byte label must stay above its controls: label={label:?} pause={pause:?} discard={discard:?}"
+            );
+            assert!(
+                track.y0 < pause.y1 && pause.y0 < track.y1,
+                "Pause must share the desktop track row: track={track:?} pause={pause:?}"
+            );
+            assert!(
+                track.y0 < discard.y1 && discard.y0 < track.y1,
+                "Discard must share the desktop track row: track={track:?} discard={discard:?}"
+            );
+            let module_bottom = track.y1.max(pause.y1).max(discard.y1);
+            let module_center = (label.y0 + module_bottom) / 2.0;
+            let lifecycle_center = (lifecycle.y0 + lifecycle.y1) / 2.0;
+            assert!(
+                (module_center - lifecycle_center).abs() <= 1.0,
+                "the complete progress module must be vertically centered: module={module_center} lifecycle={lifecycle_center}"
+            );
             assert!((track.x0 - body.x0).abs() < 0.1);
-            assert!((track.x1 - body.x1).abs() < 0.1);
+            assert!(
+                track.x1 <= pause.x0 + 0.1,
+                "track={track:?} pause={pause:?}"
+            );
+            assert!(
+                pause.x1 <= discard.x0 + 0.1,
+                "pause={pause:?} discard={discard:?}"
+            );
         }
     }
 
     #[test]
-    fn narrow_download_module_moves_controls_below_the_byte_and_track_row_without_overlap() {
+    fn narrow_download_module_wraps_controls_below_the_track_only_when_needed() {
         let progress = ModelDownloadProgressPresentation {
             downloaded_bytes: 42,
             total_bytes: Some(100),
@@ -7175,13 +7216,113 @@ mod tests {
             "Discard partial for Narrow download",
             egui::accesskit::Role::Button,
         );
-        assert!(pause.y0 >= label.y1, "label={label:?} pause={pause:?}");
-        assert!(close.y0 >= label.y1, "label={label:?} close={close:?}");
-        assert!(track.y0 >= pause.y1, "pause={pause:?} track={track:?}");
-        assert!(track.y0 >= close.y1, "close={close:?} track={track:?}");
-        assert!(track.width() >= label.width());
+        assert!(label.y1 <= track.y0, "label={label:?} track={track:?}");
+        assert!(pause.y0 >= track.y1, "pause={pause:?} track={track:?}");
+        assert!(close.y0 >= track.y1, "close={close:?} track={track:?}");
+        assert!(track.width() > 0.0);
         assert!(pause.width() >= 44.0 && pause.height() >= 44.0);
         assert!(close.width() >= 44.0 && close.height() >= 44.0);
+    }
+
+    #[test]
+    fn compact_download_card_keeps_track_and_controls_on_one_row_at_375px() {
+        let model = ModelViewModel {
+            id: "compact-download".into(),
+            display_name: "Compact download".into(),
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 42,
+            total_bytes: Some(100),
+            cancel_supported: true,
+            ..Default::default()
+        };
+        let output = render_model_card_at(&model, 375.0, 680.0, Vec::new());
+        let progress_name = "Downloading 42B of 100B, 42% complete";
+        let label = model_layout_bounds(&output, &format!("{progress_name} layout download label"));
+        let track = model_layout_bounds(&output, &format!("{progress_name} layout download track"));
+        let pause = named_role_bounds(
+            &output,
+            "Pause Compact download download",
+            egui::accesskit::Role::Button,
+        );
+        let discard = named_role_bounds(
+            &output,
+            "Discard partial for Compact download",
+            egui::accesskit::Role::Button,
+        );
+        assert!(label.y1 <= track.y0, "label={label:?} track={track:?}");
+        assert!(
+            track.y0 < pause.y1 && pause.y0 < track.y1,
+            "pause={pause:?} track={track:?}"
+        );
+        assert!(
+            track.y0 < discard.y1 && discard.y0 < track.y1,
+            "discard={discard:?} track={track:?}"
+        );
+        assert!(
+            track.x1 <= pause.x0 + 0.1,
+            "track={track:?} pause={pause:?}"
+        );
+        assert!(
+            pause.x1 <= discard.x0 + 0.1,
+            "pause={pause:?} discard={discard:?}"
+        );
+    }
+
+    #[test]
+    fn byte_label_slot_keeps_progress_controls_fixed_for_equal_totals() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 680.0)] {
+            let base = ModelViewModel {
+                id: "stable-byte-slot".into(),
+                display_name: "Stable byte slot".into(),
+                download_state: ModelDownloadState::Downloading,
+                total_bytes: Some(100_000_000),
+                cancel_supported: true,
+                ..Default::default()
+            };
+            let early = ModelViewModel {
+                downloaded_bytes: 0,
+                ..base.clone()
+            };
+            let late = ModelViewModel {
+                downloaded_bytes: 99_000_000,
+                ..base
+            };
+            let early_progress = model_download_progress_presentation(ModelCard::Local(&early))
+                .expect("early progress");
+            let late_progress = model_download_progress_presentation(ModelCard::Local(&late))
+                .expect("late progress");
+            let early_output = render_model_card_at(&early, width, height, Vec::new());
+            let late_output = render_model_card_at(&late, width, height, Vec::new());
+            let layout = |output: &egui::FullOutput,
+                          progress: &ModelDownloadProgressPresentation| {
+                (
+                    model_layout_bounds(
+                        output,
+                        &format!("{} layout download label", progress.accessible_text),
+                    ),
+                    model_layout_bounds(
+                        output,
+                        &format!("{} layout download track", progress.accessible_text),
+                    ),
+                    named_role_bounds(
+                        output,
+                        "Pause Stable byte slot download",
+                        egui::accesskit::Role::Button,
+                    ),
+                    named_role_bounds(
+                        output,
+                        "Discard partial for Stable byte slot",
+                        egui::accesskit::Role::Button,
+                    ),
+                )
+            };
+            let early_layout = layout(&early_output, &early_progress);
+            let late_layout = layout(&late_output, &late_progress);
+            assert_eq!(early_layout.0, late_layout.0, "label slot at {width}px");
+            assert_eq!(early_layout.1, late_layout.1, "track slot at {width}px");
+            assert_eq!(early_layout.2, late_layout.2, "Pause slot at {width}px");
+            assert_eq!(early_layout.3, late_layout.3, "Discard slot at {width}px");
+        }
     }
 
     #[test]

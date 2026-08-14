@@ -4515,6 +4515,99 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_accessibility_and_actions_hold_at_viewport_bounds() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 815.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog = vec![ModelViewModel {
+                id: "viewport-install".into(),
+                display_name: "Viewport install".into(),
+                install_supported: true,
+                install_action_enabled: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }];
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let install = node_matching(&output, |node| {
+                node.name() == Some("Install Viewport install")
+                    && node.role() == egui::accesskit::Role::Button
+            });
+            let install_bounds = install.bounds().expect("Install bounds");
+            assert!(
+                install_bounds.width() >= 44.0 && install_bounds.height() >= 44.0,
+                "Install must retain a named 44px target at {width}px"
+            );
+            if width >= 620.0 {
+                let lifecycle =
+                    named_node_bounds(&output, "Viewport install layout lifecycle zone");
+                assert_near(
+                    (install_bounds.y0 + install_bounds.y1) / 2.0,
+                    (lifecycle.y0 + lifecycle.y1) / 2.0,
+                    &format!("Install vertical center at {width}px"),
+                );
+            }
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    "Install Viewport install",
+                ),
+                ScreenAction::InstallModel("viewport-install".into()),
+                "Install action at {width}px"
+            );
+
+            data.model_catalog.clear();
+            data.models = vec![ModelViewModel {
+                id: "viewport-delete".into(),
+                display_name: "Viewport delete".into(),
+                installed: true,
+                ready: true,
+                removal_supported: true,
+                download_state: ModelDownloadState::Installed,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }];
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let delete = node_matching(&output, |node| {
+                node.name() == Some("Delete Viewport delete")
+                    && node.role() == egui::accesskit::Role::Button
+            });
+            let delete_bounds = delete.bounds().expect("Delete bounds");
+            assert!(
+                delete_bounds.width() >= 44.0 && delete_bounds.height() >= 44.0,
+                "Delete must retain a named 44px target at {width}px"
+            );
+            if width >= 620.0 {
+                let lifecycle = named_node_bounds(&output, "Viewport delete layout lifecycle zone");
+                assert_near(
+                    (delete_bounds.y0 + delete_bounds.y1) / 2.0,
+                    (lifecycle.y0 + lifecycle.y1) / 2.0,
+                    &format!("Delete vertical center at {width}px"),
+                );
+            }
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    "Delete Viewport delete",
+                ),
+                ScreenAction::RequestModelRemoval("viewport-delete".into()),
+                "Delete action at {width}px"
+            );
+        }
+    }
+
+    #[test]
     fn model_cards_remain_inside_supported_route_widths() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
             let ctx = egui::Context::default();
@@ -4654,7 +4747,12 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
         let collapsed_description = named_node_bounds(&collapsed, long_description);
-        let collapsed_language = named_node_bounds(&collapsed, "Languages: EN");
+        let collapsed_language =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout language row");
+        let collapsed_metrics =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout metrics zone");
+        let collapsed_lifecycle =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout lifecycle zone");
 
         data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
         let (expanded, action) =
@@ -4662,17 +4760,37 @@ mod tests {
         assert_eq!(action, ScreenAction::None);
         let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
         let expanded_description = named_node_bounds(&expanded, long_description);
-        let expanded_language = named_node_bounds(&expanded, "Languages: EN");
+        let expanded_language =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout language row");
+        let expanded_metrics =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout metrics zone");
+        let expanded_lifecycle =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout lifecycle zone");
         assert_near(
             expanded_description.x0,
             collapsed_description.x0,
             "expanded description must keep the collapsed identity x origin",
         );
         assert_near(
+            expanded_description.y0,
+            collapsed_description.y0,
+            "wrapped description must keep the collapsed identity y origin",
+        );
+        assert_near(
             expanded_language.x0,
             collapsed_language.x0,
             "expanded languages must stay in the identity metadata row",
         );
+        for (collapsed_zone, expanded_zone, name) in [
+            (collapsed_metrics, expanded_metrics, "metrics"),
+            (collapsed_lifecycle, expanded_lifecycle, "lifecycle"),
+        ] {
+            assert_near(
+                expanded_zone.y0,
+                collapsed_zone.y0,
+                &format!("expanded {name} zone must retain its summary y origin"),
+            );
+        }
         assert!(
             expanded_card.y1 > collapsed_card.y1,
             "wrapping expanded metadata and details must grow the card naturally"
@@ -4685,6 +4803,70 @@ mod tests {
             title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE,
             "below 620px the summary must stack identity before controls"
         );
+    }
+
+    #[test]
+    fn one_line_expansion_preserves_desktop_summary_geometry_and_compact_containment() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let collapsed =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+            let expanded =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            for name in [
+                "whisper.cpp tiny.en",
+                "More accurate for longer recordings.",
+                "whisper.cpp tiny.en layout language row",
+                "whisper.cpp tiny.en layout metrics zone",
+                "whisper.cpp tiny.en layout lifecycle zone",
+                "whisper.cpp tiny.en layout chevron zone",
+            ] {
+                let collapsed_bounds = named_node_bounds(&collapsed, name);
+                let expanded_bounds = named_node_bounds(&expanded, name);
+                assert_near(
+                    expanded_bounds.x0,
+                    collapsed_bounds.x0,
+                    &format!("{name} x origin"),
+                );
+                assert_near(
+                    expanded_bounds.y0,
+                    collapsed_bounds.y0,
+                    &format!("{name} y origin"),
+                );
+                assert_near(
+                    expanded_bounds.y1,
+                    collapsed_bounds.y1,
+                    &format!("{name} height"),
+                );
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+        let mut page = AppPage::Models;
+        let compact = render_with_input(&ctx, &mut data, &mut page, 375.0, 680.0, Vec::new()).0;
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        for name in [
+            "whisper.cpp tiny.en",
+            "More accurate for longer recordings.",
+            "whisper.cpp tiny.en layout language row",
+            "Delete whisper.cpp tiny.en",
+            "Collapse details for whisper.cpp tiny.en",
+        ] {
+            assert_bounds_within(
+                named_node_bounds(&compact, name),
+                card,
+                &format!("375px {name}"),
+            );
+        }
     }
 
     #[test]

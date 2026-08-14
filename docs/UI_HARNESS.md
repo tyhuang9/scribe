@@ -56,8 +56,10 @@ not runtime assets.
   has a 960 × 680 minimum; 375 px component behavior is deterministic-test
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
-  card's left and right edges. The description wraps in place, language codes
-  remain compact in the existing identity metadata row, and there are no
+  card's left and right edges. A one-line description retains the summary's
+  18 px preview geometry when expanded; only wrapped copy grows downward from
+  that original identity position. Language codes remain compact in the
+  existing identity metadata row, and there are no
   duplicate `DESCRIPTION` or `LANGUAGES` headings. Full language names remain
   available through the metadata tooltip and accessibility description.
 - Model cards expose only Native streaming, Translation, Word timestamps, and
@@ -82,10 +84,13 @@ not runtime assets.
   Stable Delete keeps its destructive outline treatment without changing the
   underlying action or accessible name. Active downloads replace the lifecycle
   action body with a truthful progress module: known totals show a stable-width
-  downloaded/total byte label and a full-width 6 px track plus current fill;
+  downloaded/total byte label and a 6 px track plus current fill;
   unknown totals show `downloaded / Total unknown` without a fabricated fill.
   Named 44 x 44 Pause or Play and discard-partial controls remain beside the
-  progress body. Failed downloads expose their complete error through a separate
+  progress body: the byte label stays above the track, while Play/Pause and
+  discard controls share the track row whenever it fits (and only wrap below
+  the track when it cannot). Failed downloads expose their complete error
+  through a separate
   accessible Warning popover. Remote cards show progress only after validated
   live or retained byte metadata is available.
 - Requirements use responsive RAM, storage, and GPU cells. Optional
@@ -93,6 +98,23 @@ not runtime assets.
   discard, and runtime-safety constraints remain unchanged by expansion.
 
 ## Native manual states
+
+Run the debug harness from a Visual Studio Developer PowerShell. Bootstrap it
+directly from PowerShell, then run the fixture command above:
+
+```powershell
+$vsRoot = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+$vsDevShell = "$vsRoot\Common7\Tools\Launch-VsDevShell.ps1"
+if (-not (Test-Path -LiteralPath $vsDevShell)) { throw "Visual Studio Build Tools Developer PowerShell was not found." }
+& $vsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+$vsCmake = "$vsRoot\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+$linker = (Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe" |
+  Sort-Object FullName -Descending | Select-Object -First 1).FullName
+if (-not $linker) { throw "The x64 MSVC linker was not found." }
+$env:PATH = "$vsCmake;$([IO.Path]::GetDirectoryName($linker));$env:PATH"
+$env:CMAKE_GENERATOR = 'Visual Studio 17 2022'
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $linker
+```
 
 Capture and inspect original-resolution client-area screenshots at exactly
 1180 × 815 and 960 × 680:
@@ -104,8 +126,9 @@ Capture and inspect original-resolution client-area screenshots at exactly
    inspect the isolated lifecycle states. For the failed-alert fixture, capture
    both closed and warning-alert-open states.
 3. `models/lifecycle`: inspect inverse Install and the icon-only Play/Pause
-   treatments; verify the stable-width byte detail, full 6 px progress track and
-   fill, named 44 x 44 discard target, and contained error controls. No visible
+   treatments; verify the byte detail is above the full 6 px progress track and
+   fill, named 44 x 44 controls share that track row, and contained error
+   controls. No visible
    percentage or lifecycle status copy should replace the model description.
 4. `models/card-expanded`: inspect expanded top content, then scroll the
    Models route to inspect the complete feature grid, Requirements, optional
