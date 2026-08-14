@@ -350,8 +350,6 @@ Source-to-implementation comparison is not verified because the exact newer sele
 
 final result: blocked
 
----
-
 # Full-width interactive model cards QA - 2026-08-14
 
 ## Verified implementation evidence
@@ -395,6 +393,56 @@ The two newer selected reference images are visible in the conversation but
 have no local attachment paths in this workspace. Older model-card references
 were not substituted. Source-to-implementation comparison therefore remains
 blocked until the exact newer references are reattached or their local paths
+are provided.
+
+final result: blocked
+
+---
+
+# Model card feature and spacing refinement QA - 2026-08-14
+
+## Verified deterministic evidence
+
+- Model-card presentation exposes exactly Native streaming, Translation, Word
+  timestamps, and Batch transcription while retaining the complete internal
+  capability projection.
+- The all-capabilities fixture renders four 28 x 32 px summary slots with 8 px
+  gaps; the current curated feature pair renders a compact 64 x 32 px group.
+  Individual hover tooltips remain non-activating and the cluster remains one
+  accessibility group.
+- At 1180 x 815 and 960 x 680, Speed and Accuracy have equal top-row regions,
+  features and lifecycle have equal bottom-row regions, and the 44 x 44
+  disclosure stays in the trailing rail.
+- The language row's actual left edge aligns with both the title and
+  description axes within one pixel. Compact codes remain unchanged when the
+  card expands; full names remain available through tooltip and accessibility
+  description.
+- Rendered layout diagnostics verify 6 px around the divider, 6 px from each
+  section heading to its content, 12 px between Features, Requirements, and
+  Maintenance, 32 px expanded feature rows with 4 px row gaps, and natural
+  Requirements height.
+- Full UI-harness suite: 827 passed, 0 failed, 11 ignored.
+- Full default suite: 763 passed, 0 failed, 10 ignored.
+- Strict all-targets UI-harness Clippy, all-targets/all-features check,
+  formatting, and diff checks passed.
+
+## Native presentation blocker
+
+Fresh native visual evidence was not accepted because the current Windows
+graphics session has not been reset since the independently diagnosed
+NVIDIA/OpenGL white-client failure. The same external failure previously
+reproduced on both this branch and a known-good historical commit while the
+application remained responsive and exposed a populated accessibility tree.
+No blank capture is retained as evidence. After a graphics-session reset,
+repeat the 1180 x 815 and 960 x 680 idle, hover, keyboard-focus, expanded-top,
+and expanded-scrolled captures.
+
+## Source-reference blocker
+
+The latest selected reference images are visible in the conversation but do
+not have resolvable local attachment paths in this workspace. Older references
+were not substituted. A same-state, same-viewport source comparison therefore
+remains blocked until those exact images are reattached or their local paths
 are provided.
 
 final result: blocked

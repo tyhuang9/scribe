@@ -2199,7 +2199,7 @@ fn model_requirement_cells(card: ModelCard<'_>) -> [(&'static str, String); 3] {
     ]
 }
 
-fn render_model_requirement_cells(ui: &mut egui::Ui, cells: [(&str, String); 3]) {
+fn render_model_requirement_cells(ui: &mut egui::Ui, cells: [(&str, String); 3]) -> egui::Response {
     let colors = ui_palette(ui);
     let width = ui.available_width();
     let gap = ui.spacing().item_spacing.x;
@@ -2230,15 +2230,41 @@ fn render_model_requirement_cells(ui: &mut egui::Ui, cells: [(&str, String); 3])
                     |ui| render_cell(ui, label, value),
                 );
             }
-        });
+        })
+        .response
     } else {
-        for (label, value) in cells {
-            render_cell(ui, label, value);
-        }
+        ui.vertical(|ui| {
+            for (label, value) in cells {
+                render_cell(ui, label, value);
+            }
+        })
+        .response
     }
 }
 
-fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) -> egui::Response {
+fn model_feature_grid_geometry(feature_count: usize, available_width: f32) -> (usize, usize, Vec2) {
+    const ICON_WIDTH: f32 = 28.0;
+    const ICON_GAP: f32 = 8.0;
+    const ICON_TARGET: f32 = 32.0;
+    let max_columns =
+        (((available_width + ICON_GAP) / (ICON_WIDTH + ICON_GAP)).floor() as usize).clamp(1, 4);
+    let columns = feature_count.min(max_columns).max(1);
+    let rows = feature_count.div_ceil(columns).max(1);
+    (
+        columns,
+        rows,
+        Vec2::new(
+            columns as f32 * ICON_WIDTH + columns.saturating_sub(1) as f32 * ICON_GAP,
+            rows as f32 * ICON_TARGET + rows.saturating_sub(1) as f32 * ICON_GAP,
+        ),
+    )
+}
+
+fn render_model_features(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    available_width: f32,
+) -> egui::Response {
     let colors = ui_palette(ui);
     let (features, known) = model_summary_features(card);
     let name = if !known {
@@ -2255,25 +2281,21 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) -> egui::Respon
                 .join(", ")
         )
     };
-    const ICON_STEP: f32 = 20.0;
-    const ICON_TARGET: f32 = 44.0;
-    // Keep the curated feature set compact beside metrics and lifecycle controls.
-    let max_columns = ((ui.available_width() / ICON_STEP).floor() as usize).clamp(1, 4);
-    let columns = features.len().min(max_columns).max(1);
-    let rows = features.len().div_ceil(columns).max(1);
-    let width = (columns as f32 * ICON_STEP).max(ICON_TARGET);
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, rows as f32 * ICON_TARGET), Sense::hover());
+    const ICON_GAP: f32 = 8.0;
+    const ICON_TARGET: f32 = 32.0;
+    const ICON_WIDTH: f32 = 28.0;
+    let (columns, _, size) = model_feature_grid_geometry(features.len(), available_width);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if known {
         for (index, (icon, feature_name)) in features.iter().enumerate() {
             let column = index % columns;
             let row = index / columns;
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(
-                    rect.left() + ICON_STEP * (column as f32 + 0.5),
-                    rect.top() + ICON_TARGET * (row as f32 + 0.5),
+                    rect.left() + ICON_WIDTH / 2.0 + column as f32 * (ICON_WIDTH + ICON_GAP),
+                    rect.top() + ICON_TARGET / 2.0 + row as f32 * (ICON_TARGET + ICON_GAP),
                 ),
-                Vec2::splat(18.0),
+                Vec2::new(ICON_WIDTH, ICON_TARGET),
             );
             ui.painter().text(
                 icon_rect.center(),
@@ -2309,35 +2331,62 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) -> egui::Respon
     response
 }
 
-fn render_expanded_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
+fn render_expanded_model_features(
+    ui: &mut egui::Ui,
+    card: ModelCard<'_>,
+    model_name: &str,
+) -> egui::Response {
     let colors = ui_palette(ui);
     let (features, known) = model_summary_features(card);
     if !known {
-        ui.label("Feature support is unknown");
-        return;
+        return ui.label("Feature support is unknown");
     }
     if features.is_empty() {
-        ui.label("No supported features");
-        return;
+        return ui.label("No supported features");
     }
     let columns = if ui.available_width() >= 480.0 { 2 } else { 1 };
     let gap = ui.spacing().item_spacing.x;
     let cell_width =
         ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(0.0);
-    for row in features.chunks(columns) {
-        ui.horizontal(|ui| {
-            for (icon, name) in row {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(cell_width, 44.0),
-                    Layout::left_to_right(Align::Center),
-                    |ui| {
-                        paint_decorative_icon(ui, *icon, colors.muted_text);
-                        ui.label(*name);
-                    },
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for (row_index, row) in features.chunks(columns).enumerate() {
+            if row_index > 0 {
+                render_model_layout_gap(
+                    ui,
+                    model_name,
+                    &format!("expanded feature row gap {row_index}"),
+                    4.0,
                 );
             }
-        });
-    }
+            let _row_response = ui
+                .allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 32.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        for (icon, name) in row {
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(cell_width, 32.0),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    paint_decorative_icon(ui, *icon, colors.muted_text);
+                                    ui.label(*name);
+                                },
+                            );
+                        }
+                    },
+                )
+                .response;
+            #[cfg(test)]
+            register_model_layout_rect(
+                ui,
+                model_name,
+                &format!("expanded feature row {row_index}"),
+                _row_response.rect,
+            );
+        }
+    })
+    .response
 }
 
 fn compact_model_icon_action(
@@ -2629,7 +2678,12 @@ fn active_badge_rect(
     )
 }
 
-fn render_model_metadata(ui: &mut egui::Ui, languages: &[String], include_ratings: bool) {
+fn render_model_metadata(
+    ui: &mut egui::Ui,
+    _model_name: &str,
+    languages: &[String],
+    include_ratings: bool,
+) {
     let colors = ui_palette(ui);
     ui.horizontal_wrapped(|ui| {
         let (language_name, language_summary) = model_language_summary(languages);
@@ -2640,11 +2694,11 @@ fn render_model_metadata(ui: &mut egui::Ui, languages: &[String], include_rating
         };
         if !include_ratings {
             // Match the title text inset (20 px icon slot + 6 px gap).
-            ui.add_space(6.0);
+            ui.add_space(26.0);
         }
         // Keep the decorative globe and its language value in one layout unit so
         // a wrapped row cannot leave the icon orphaned on the following line.
-        ui.horizontal(|ui| {
+        let _language_row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
             let language = ui.label(
@@ -2662,6 +2716,8 @@ fn render_model_metadata(ui: &mut egui::Ui, languages: &[String], include_rating
             });
             language.on_hover_text(language_description);
         });
+        #[cfg(test)]
+        register_model_layout_rect(ui, _model_name, "language row", _language_row.response.rect);
         debug_assert!(!include_ratings, "ratings are rendered by the card layout");
     });
 }
@@ -2809,9 +2865,10 @@ fn render_unified_model_card(
                     true,
                 );
             });
-            render_model_metadata(ui, languages, false);
+            render_model_metadata(ui, name, languages, false);
             ui.horizontal(|ui| {
-                activation_exclusions.push(render_model_features(ui, card).rect);
+                let feature_width = ui.available_width();
+                activation_exclusions.push(render_model_features(ui, card, feature_width).rect);
                 activation_exclusions.push(
                     render_lifecycle(
                         ui,
@@ -2847,7 +2904,7 @@ fn render_unified_model_card(
                                 expanded,
                             );
                             ui.add_space(4.0);
-                            render_model_metadata(ui, languages, false);
+                            render_model_metadata(ui, name, languages, false);
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -2860,45 +2917,130 @@ fn render_unified_model_card(
                                 Layout::top_down(Align::Min),
                                 |ui| {
                                     ui.set_width((right_track - details_width).max(0.0));
+                                    let usable_width = ui.available_width();
+                                    let region_width = (usable_width / 2.0).max(0.0);
+                                    ui.spacing_mut().item_spacing.x = 0.0;
                                     ui.horizontal(|ui| {
-                                        rating_meter(
-                                            ui,
-                                            "Speed",
-                                            match card {
-                                                ModelCard::Local(model) => {
-                                                    speed_rating(model.speed_tier)
-                                                }
-                                                ModelCard::Remote(_, variant) => {
-                                                    speed_rating(variant.speed_tier)
-                                                }
-                                            },
-                                            true,
-                                        );
-                                        rating_meter(
-                                            ui,
-                                            "Accuracy",
-                                            match card {
-                                                ModelCard::Local(model) => {
-                                                    accuracy_rating(&model.accuracy_guidance)
-                                                }
-                                                ModelCard::Remote(_, variant) => {
-                                                    accuracy_rating(&variant.accuracy_guidance)
-                                                }
-                                            },
-                                            true,
-                                        );
+                                        for (metric_name, rating) in [
+                                            (
+                                                "Speed",
+                                                match card {
+                                                    ModelCard::Local(model) => {
+                                                        speed_rating(model.speed_tier)
+                                                    }
+                                                    ModelCard::Remote(_, variant) => {
+                                                        speed_rating(variant.speed_tier)
+                                                    }
+                                                },
+                                            ),
+                                            (
+                                                "Accuracy",
+                                                match card {
+                                                    ModelCard::Local(model) => {
+                                                        accuracy_rating(&model.accuracy_guidance)
+                                                    }
+                                                    ModelCard::Remote(_, variant) => {
+                                                        accuracy_rating(&variant.accuracy_guidance)
+                                                    }
+                                                },
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        {
+                                            let _region = ui.allocate_ui_with_layout(
+                                                Vec2::new(region_width, 28.0),
+                                                Layout::top_down(Align::Min),
+                                                |ui| {
+                                                    ui.set_width(region_width);
+                                                    rating_meter(ui, metric_name, rating, true)
+                                                },
+                                            );
+                                            #[cfg(test)]
+                                            ui.ctx().accesskit_node_builder(
+                                                ui.make_persistent_id((
+                                                    "model-layout",
+                                                    name,
+                                                    "metric",
+                                                    metric_name,
+                                                )),
+                                                |builder| {
+                                                    builder.set_role(
+                                                        egui::accesskit::Role::StaticText,
+                                                    );
+                                                    builder.set_name(format!(
+                                                        "{name} metric region {metric_name}"
+                                                    ));
+                                                    builder.set_bounds(accesskit_rect(
+                                                        _region.response.rect,
+                                                    ));
+                                                },
+                                            );
+                                        }
                                     });
+                                    let feature_count = model_summary_features(card).0.len();
+                                    let bottom_row_height =
+                                        model_feature_grid_geometry(feature_count, region_width)
+                                            .2
+                                            .y
+                                            .max(44.0);
                                     ui.horizontal(|ui| {
-                                        activation_exclusions
-                                            .push(render_model_features(ui, card).rect);
-                                        activation_exclusions.push(
-                                            render_lifecycle(
-                                                ui,
-                                                &mut action,
-                                                &mut restored_remove_focus,
-                                                &mut focus_within,
-                                            )
-                                            .rect,
+                                        let _feature_region = ui.allocate_ui_with_layout(
+                                            Vec2::new(region_width, bottom_row_height),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.set_width(region_width);
+                                                activation_exclusions.push(
+                                                    render_model_features(ui, card, region_width)
+                                                        .rect,
+                                                )
+                                            },
+                                        );
+                                        #[cfg(test)]
+                                        ui.ctx().accesskit_node_builder(
+                                            ui.make_persistent_id((
+                                                "model-layout",
+                                                name,
+                                                "features",
+                                            )),
+                                            |builder| {
+                                                builder.set_role(egui::accesskit::Role::StaticText);
+                                                builder.set_name(format!("{name} feature region"));
+                                                builder.set_bounds(accesskit_rect(
+                                                    _feature_region.response.rect,
+                                                ));
+                                            },
+                                        );
+                                        let _lifecycle_region = ui.allocate_ui_with_layout(
+                                            Vec2::new(region_width, bottom_row_height),
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                ui.set_width(region_width);
+                                                activation_exclusions.push(
+                                                    render_lifecycle(
+                                                        ui,
+                                                        &mut action,
+                                                        &mut restored_remove_focus,
+                                                        &mut focus_within,
+                                                    )
+                                                    .rect,
+                                                )
+                                            },
+                                        );
+                                        #[cfg(test)]
+                                        ui.ctx().accesskit_node_builder(
+                                            ui.make_persistent_id((
+                                                "model-layout",
+                                                name,
+                                                "lifecycle",
+                                            )),
+                                            |builder| {
+                                                builder.set_role(egui::accesskit::Role::StaticText);
+                                                builder
+                                                    .set_name(format!("{name} lifecycle region"));
+                                                builder.set_bounds(accesskit_rect(
+                                                    _lifecycle_region.response.rect,
+                                                ));
+                                            },
                                         );
                                     });
                                 },
@@ -2922,18 +3064,23 @@ fn render_unified_model_card(
         // consume the route's remaining horizontal space.
         ui.shrink_width_to_current();
         if expanded {
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            restored_remove_focus |= render_inline_model_details(
-                ui,
-                card,
-                can_replace_active,
-                restore_remove_focus,
-                &mut focus_within,
-                &mut action,
-                &mut activation_exclusions,
-            );
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                render_model_layout_gap(ui, name, "gap before divider", 6.0);
+                let _divider = ui.separator();
+                #[cfg(test)]
+                register_model_layout_rect(ui, name, "divider", _divider.rect);
+                render_model_layout_gap(ui, name, "gap after divider", 6.0);
+                restored_remove_focus |= render_inline_model_details(
+                    ui,
+                    card,
+                    can_replace_active,
+                    restore_remove_focus,
+                    &mut focus_within,
+                    &mut action,
+                    &mut activation_exclusions,
+                );
+            });
         }
     }
     let frame = {
@@ -3046,20 +3193,48 @@ fn render_inline_model_details(
 ) -> bool {
     let mut restored_remove_focus = false;
     ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
         let colors = ui_palette(ui);
-        detail_heading(ui, "FEATURES", colors);
-        render_expanded_model_features(ui, card);
-        ui.add_space(8.0);
-        detail_heading(ui, "REQUIREMENTS", colors);
-        render_model_requirement_cells(ui, model_requirement_cells(card));
+        let model_name = match card {
+            ModelCard::Local(model) => model.display_name.as_str(),
+            ModelCard::Remote(entry, _) => entry.display_name.as_str(),
+        };
+        let _features_heading = detail_heading(ui, "FEATURES", colors);
+        #[cfg(test)]
+        register_model_layout_rect(ui, model_name, "features heading", _features_heading.rect);
+        render_model_layout_gap(ui, model_name, "features heading content gap", 6.0);
+        let _features = render_expanded_model_features(ui, card, model_name);
+        #[cfg(test)]
+        register_model_layout_rect(ui, model_name, "features content", _features.rect);
+        render_model_layout_gap(ui, model_name, "features requirements gap", 12.0);
+        let _requirements_heading = detail_heading(ui, "REQUIREMENTS", colors);
+        #[cfg(test)]
+        register_model_layout_rect(
+            ui,
+            model_name,
+            "requirements heading",
+            _requirements_heading.rect,
+        );
+        render_model_layout_gap(ui, model_name, "requirements heading content gap", 6.0);
+        let _requirements = render_model_requirement_cells(ui, model_requirement_cells(card));
+        #[cfg(test)]
+        register_model_layout_rect(ui, model_name, "requirements content", _requirements.rect);
         match card {
             ModelCard::Local(model) => {
                 let maintenance = model.runtime_action_label.is_some()
                     || model.partial_cleanup_available
                     || model.legacy_cleanup_pending;
                 if maintenance {
-                    ui.add_space(8.0);
-                    detail_heading(ui, "MAINTENANCE", colors);
+                    render_model_layout_gap(ui, model_name, "requirements maintenance gap", 12.0);
+                    let _maintenance_heading = detail_heading(ui, "MAINTENANCE", colors);
+                    #[cfg(test)]
+                    register_model_layout_rect(
+                        ui,
+                        model_name,
+                        "maintenance heading",
+                        _maintenance_heading.rect,
+                    );
+                    render_model_layout_gap(ui, model_name, "maintenance heading content gap", 6.0);
                 }
                 if let Some(label) = model.runtime_action_label.as_deref() {
                     let runtime_name = format!("{label} runtime for {}", model.display_name);
@@ -3131,8 +3306,16 @@ fn render_inline_model_details(
                         RemoteCatalogActionKind::DiscardPartial { .. }
                     )
                 }) {
-                    ui.add_space(8.0);
-                    detail_heading(ui, "MAINTENANCE", colors);
+                    render_model_layout_gap(ui, model_name, "requirements maintenance gap", 12.0);
+                    let _maintenance_heading = detail_heading(ui, "MAINTENANCE", colors);
+                    #[cfg(test)]
+                    register_model_layout_rect(
+                        ui,
+                        model_name,
+                        "maintenance heading",
+                        _maintenance_heading.rect,
+                    );
+                    render_model_layout_gap(ui, model_name, "maintenance heading content gap", 6.0);
                     let cleanup_name = format!("Discard partial for {}", entry.display_name);
                     let response = model_lifecycle_button(
                         ui,
@@ -3154,12 +3337,45 @@ fn render_inline_model_details(
     restored_remove_focus
 }
 
-fn detail_heading(ui: &mut egui::Ui, text: &str, colors: super::theme::ThemePalette) {
+fn detail_heading(
+    ui: &mut egui::Ui,
+    text: &str,
+    colors: super::theme::ThemePalette,
+) -> egui::Response {
     ui.label(
         RichText::new(text)
             .small()
             .strong()
             .color(colors.muted_text),
+    )
+}
+
+fn render_model_layout_gap(
+    ui: &mut egui::Ui,
+    _model_name: &str,
+    _diagnostic_name: &str,
+    height: f32,
+) {
+    let (_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    #[cfg(test)]
+    register_model_layout_rect(ui, _model_name, _diagnostic_name, _rect);
+}
+
+#[cfg(test)]
+fn register_model_layout_rect(
+    ui: &egui::Ui,
+    model_name: &str,
+    diagnostic_name: &str,
+    rect: egui::Rect,
+) {
+    ui.ctx().accesskit_node_builder(
+        ui.make_persistent_id(("model-layout-diagnostic", model_name, diagnostic_name)),
+        |builder| {
+            builder.set_role(egui::accesskit::Role::StaticText);
+            builder.set_name(format!("{model_name} layout {diagnostic_name}"));
+            builder.set_bounds(accesskit_rect(rect));
+        },
     );
 }
 

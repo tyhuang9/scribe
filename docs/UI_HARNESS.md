@@ -30,8 +30,9 @@ not runtime assets.
 - `models/lifecycle` — active, installed, available/Install, partial,
   downloading, and failed lifecycle rows.
 - `models/card-expanded` — the inline `tiny.en` card expanded with a long
-  description, English/Spanish/Japanese metadata, all eight known feature
-  capabilities, Requirements, and a fixture-only Repair maintenance control.
+  description, compact English/Spanish/Japanese metadata, all eight internal
+  capability flags for verifying the four-feature UI filter, Requirements,
+  and a fixture-only Repair maintenance control.
 - `models/compare-expanded`
 - `history`
 - `settings/recording`
@@ -45,13 +46,20 @@ not runtime assets.
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
   card's left and right edges. The description wraps in place, language codes
-  switch to full language names in the existing identity metadata row, and
-  there are no duplicate `DESCRIPTION` or `LANGUAGES` headings.
-- Known capabilities render all eight feature glyphs: Batch transcription,
-  Native streaming, Cancellation, Word timestamps, Translation, Automatic
-  language detection, Confidence scores, and Custom vocabulary. The collapsed
-  feature group wraps glyphs and exposes hover tooltips; the expanded surface
-  renders the same capabilities as a wrapping icon-and-label grid.
+  remain compact in the existing identity metadata row, and there are no
+  duplicate `DESCRIPTION` or `LANGUAGES` headings. Full language names remain
+  available through the metadata tooltip and accessibility description.
+- Model cards expose only Native streaming, Translation, Word timestamps, and
+  Batch transcription, in that order. Cancellation, language detection,
+  confidence scores, and custom vocabulary remain internal metadata. The
+  collapsed feature group uses 28 x 32 px glyph slots with 8 px gaps, wraps
+  when needed, and exposes hover tooltips; the expanded surface renders the
+  same four capabilities as a 32 px icon-and-label grid with 4 px row gaps.
+- The right summary track divides its non-chevron width evenly: Speed and
+  Accuracy share the top row, while feature icons and the lifecycle action
+  share the bottom row. Expanded sections use 6 px divider and
+  heading-to-content gaps plus 12 px between Features, Requirements, and
+  Maintenance; requirement cells retain their natural compact height.
 - A ready inactive installed card is selectable across the full card with
   pointer click, Enter, Space, and AccessKit Default activation. Lifecycle,
   disclosure, maintenance, and partial-cleanup child controls are excluded

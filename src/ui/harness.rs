@@ -3085,6 +3085,145 @@ mod tests {
     }
 
     #[test]
+    fn model_card_summary_uses_compact_feature_slots_and_globe_text_axis() {
+        for width in [1180.0, 960.0] {
+            let output = render(Fixture::ModelsCardExpanded, width, 815.0);
+            let features = named_node_bounds(
+                &output,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+            );
+            assert_near(
+                features.x1 - features.x0,
+                136.0,
+                "four feature slots should use four 28px columns with three 8px gaps",
+            );
+            assert_near(
+                features.y1 - features.y0,
+                32.0,
+                "four feature slots should remain on one row when the balanced region fits",
+            );
+
+            let title = named_node_bounds(&output, "whisper.cpp tiny.en");
+            let description = named_node_bounds(
+                &output,
+                "A compact local model for responsive dictation, long recordings, and offline language-aware transcription.",
+            );
+            let language_row =
+                named_node_bounds(&output, "whisper.cpp tiny.en layout language row");
+            assert_near(
+                language_row.x0,
+                title.x0,
+                "globe left edge must align to the identity text axis",
+            );
+            assert_near(
+                language_row.x0,
+                description.x0,
+                "globe left edge must align to the description text axis",
+            );
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCardExpanded.data();
+        let tiny = data
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .expect("expanded fixture includes tiny.en");
+        tiny.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            timestamps: true,
+            ..Default::default()
+        };
+        let mut page = Fixture::ModelsCardExpanded.page();
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let curated = named_node_bounds(&output, "Features: Word timestamps, Batch transcription");
+        assert_near(curated.width(), 64.0, "two curated feature slots width");
+        assert_near(curated.height(), 32.0, "two curated feature slots height");
+    }
+
+    #[test]
+    fn model_card_desktop_right_regions_are_balanced() {
+        for width in [1180.0, 960.0] {
+            let output = render(Fixture::ModelsCardExpanded, width, 815.0);
+            let card_name = "whisper.cpp tiny.en";
+            let speed = named_node_bounds(&output, &format!("{card_name} metric region Speed"));
+            let accuracy =
+                named_node_bounds(&output, &format!("{card_name} metric region Accuracy"));
+            let features = named_node_bounds(&output, &format!("{card_name} feature region"));
+            let lifecycle = named_node_bounds(&output, &format!("{card_name} lifecycle region"));
+            let chevron = named_node_bounds(&output, &format!("Collapse details for {card_name}"));
+            assert_near(
+                speed.x1 - speed.x0,
+                accuracy.x1 - accuracy.x0,
+                "metric regions equal",
+            );
+            assert_near(
+                features.x1 - features.x0,
+                lifecycle.x1 - lifecycle.x0,
+                "bottom regions equal",
+            );
+            assert_near(speed.x0, features.x0, "left regions share edge");
+            assert_near(accuracy.x1, lifecycle.x1, "right regions share edge");
+            assert_near(lifecycle.x1, chevron.x0, "right region meets chevron");
+        }
+    }
+
+    #[test]
+    fn expanded_model_details_keep_compact_section_density() {
+        let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let card_name = "whisper.cpp tiny.en";
+        let rect = |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+        for (name, expected_height) in [
+            ("gap before divider", 6.0),
+            ("gap after divider", 6.0),
+            ("features heading content gap", 6.0),
+            ("expanded feature row gap 1", 4.0),
+            ("features requirements gap", 12.0),
+            ("requirements heading content gap", 6.0),
+            ("requirements maintenance gap", 12.0),
+            ("maintenance heading content gap", 6.0),
+        ] {
+            assert_near(
+                rect(name).height(),
+                expected_height,
+                &format!("{name} height"),
+            );
+        }
+
+        let feature_row_0 = rect("expanded feature row 0");
+        let feature_row_1 = rect("expanded feature row 1");
+        assert_near(feature_row_0.height(), 32.0, "first feature row height");
+        assert_near(feature_row_1.height(), 32.0, "second feature row height");
+        assert_near(
+            rect("expanded feature row gap 1").y0,
+            feature_row_0.y1,
+            "feature row gap starts immediately after first row",
+        );
+        assert_near(
+            rect("expanded feature row gap 1").y1,
+            feature_row_1.y0,
+            "second feature row starts immediately after its gap",
+        );
+
+        let features_heading = rect("features heading");
+        let features_content = rect("features content");
+        let requirements_heading = rect("requirements heading");
+        let requirements_content = rect("requirements content");
+        let maintenance_heading = rect("maintenance heading");
+        assert!(features_heading.y1 <= features_content.y0);
+        assert!(features_content.y1 <= requirements_heading.y0);
+        assert!(requirements_heading.y1 <= requirements_content.y0);
+        assert!(requirements_content.y1 <= maintenance_heading.y0);
+        assert!(
+            requirements_content.height() <= 44.0 + LAYOUT_TOLERANCE,
+            "requirement cells should keep their natural compact height"
+        );
+    }
+
+    #[test]
     fn expanded_features_render_all_capabilities_as_icon_label_grid() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3205,7 +3344,7 @@ mod tests {
         }));
         let bounds = feature_group.bounds().unwrap();
         assert!(
-            bounds.height() >= 44.0 - LAYOUT_TOLERANCE,
+            bounds.height() >= 32.0 - LAYOUT_TOLERANCE,
             "four summary icons should fit within the compact feature group: {bounds:?}"
         );
         for (index, tooltip) in [
@@ -3229,8 +3368,8 @@ mod tests {
             );
             assert_eq!(move_away_action, ScreenAction::None);
             let pointer = egui::pos2(
-                bounds.x0 as f32 + 10.0 + (index % 4) as f32 * 20.0,
-                bounds.y0 as f32 + 22.0 + (index / 4) as f32 * 44.0,
+                bounds.x0 as f32 + 14.0 + (index % 4) as f32 * 36.0,
+                bounds.y0 as f32 + 16.0 + (index / 4) as f32 * 40.0,
             );
             let (_, hover_start_action) = render_with_input_at_time(
                 &ctx,
@@ -4126,9 +4265,9 @@ mod tests {
                     "description should align with identity title text",
                 );
                 assert_near(
-                    language.x0,
+                    language.x0 - 20.0,
                     title.x0,
-                    "language should align with identity title text",
+                    "globe should align with identity title text",
                 );
                 assert!(speed.x0 >= title.x1 - LAYOUT_TOLERANCE);
                 assert!(speed.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
