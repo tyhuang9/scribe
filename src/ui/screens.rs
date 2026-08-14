@@ -1860,6 +1860,8 @@ fn rating_meter(
             let track = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 7.0));
             ui.painter()
                 .rect_filled(track, Rounding::same(3.5), colors.meter_track);
+            #[cfg(test)]
+            register_model_layout_rect(ui, &accessible_name, "rating track", track);
             if filled > 0.0 {
                 let fill = egui::Rect::from_min_size(
                     track.min,
@@ -1870,6 +1872,8 @@ fn rating_meter(
                     Rounding::same(3.5),
                     colors.meter_rating(rating.unwrap().0),
                 );
+                #[cfg(test)]
+                register_model_layout_rect(ui, &accessible_name, "rating fill", fill);
             }
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Label, accessible_name.clone())
@@ -2624,6 +2628,26 @@ fn render_model_download_module(
                     }
                     builder.set_bounds(accesskit_rect(track));
                 });
+                #[cfg(test)]
+                {
+                    register_model_layout_rect(
+                        ui,
+                        &progress.accessible_text,
+                        "download track",
+                        track,
+                    );
+                    if let Some(fraction) = progress.fraction {
+                        register_model_layout_rect(
+                            ui,
+                            &progress.accessible_text,
+                            "download fill",
+                            egui::Rect::from_min_size(
+                                track.min,
+                                Vec2::new(track.width() * fraction, track.height()),
+                            ),
+                        );
+                    }
+                }
             },
         )
         .response;
@@ -3007,7 +3031,7 @@ fn render_unified_model_card(
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
+                    let _identity_zone = ui.allocate_ui_with_layout(
                         Vec2::new(identity_width, 0.0),
                         Layout::top_down(Align::Min),
                         |ui| {
@@ -3039,7 +3063,7 @@ fn render_unified_model_card(
                             });
                         },
                     );
-                    ui.allocate_ui_with_layout(
+                    let _metrics_zone = ui.allocate_ui_with_layout(
                         Vec2::new(metrics_width, MODEL_CARD_SUMMARY_HEIGHT),
                         Layout::top_down(Align::Min),
                         |ui| {
@@ -3091,7 +3115,7 @@ fn render_unified_model_card(
                             }
                         },
                     );
-                    ui.allocate_ui_with_layout(
+                    let _lifecycle_zone = ui.allocate_ui_with_layout(
                         Vec2::new(lifecycle_width, 0.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
@@ -3121,18 +3145,35 @@ fn render_unified_model_card(
                                 },
                             );
                             #[cfg(test)]
-                            ui.ctx().accesskit_node_builder(
-                                ui.make_persistent_id(("model-layout", name, "lifecycle")),
-                                |builder| {
-                                    builder.set_role(egui::accesskit::Role::StaticText);
-                                    builder.set_name(format!("{name} lifecycle region"));
-                                    builder.set_bounds(accesskit_rect(
-                                        _body.response.rect.union(_rail.response.rect),
-                                    ));
-                                },
+                            register_model_layout_rect(
+                                ui,
+                                name,
+                                "chevron zone",
+                                _rail.response.rect,
                             );
                         },
                     );
+                    #[cfg(test)]
+                    {
+                        register_model_layout_rect(
+                            ui,
+                            name,
+                            "identity zone",
+                            _identity_zone.response.rect,
+                        );
+                        register_model_layout_rect(
+                            ui,
+                            name,
+                            "metrics zone",
+                            _metrics_zone.response.rect,
+                        );
+                        register_model_layout_rect(
+                            ui,
+                            name,
+                            "lifecycle zone",
+                            _lifecycle_zone.response.rect,
+                        );
+                    }
                 });
             });
         }

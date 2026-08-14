@@ -447,3 +447,101 @@ remains blocked until those exact images are reattached or their local paths
 are provided.
 
 final result: blocked
+
+---
+
+# Three-zone model cards and download progress QA - 2026-08-14
+
+## Visual source and review result
+
+The newest user-provided sketch is the visual source of truth for this pass,
+but it has no resolvable local file path in the workspace. Older references and
+captures were not substituted. A same-state, same-viewport source comparison
+therefore cannot be performed, and this section does not claim visual parity or
+a visual pass.
+
+## Verified deterministic evidence
+
+- The focused model-card matrix passed 22 tests with 0 failures. It covers the
+  exact contiguous 50/24/26 desktop zones at 1180 x 815 and 960 x 680, equal
+  Speed/Accuracy cells, the fixed 44 x 44 chevron inside lifecycle, the 619/620
+  stack boundary, 375 px containment, equal collapsed/expanded edges, and the
+  shrink-width invariant.
+- One or two core features occupy one 32 px row; three or four use at most two
+  columns and a second 32 px row with 8 px column and row gaps. Only Native
+  streaming, Translation, Word timestamps, and Batch transcription are visible,
+  tooltip-enabled, and grouped for accessibility.
+- Rating coverage exercises every 1..5 proportional fill, the shared five-bin
+  light/dark color mapping with at least 3:1 non-text contrast, equal metric
+  cells, visible labels, AccessKit Meter names and numeric values, and an empty
+  non-numeric unknown state.
+- Lifecycle coverage verifies inverse Install, Retry, and Resume actions,
+  destructive Delete, named 44 x 44 Cancel, child-control isolation from full
+  card selection, clamped determinate percentages, full-height 6 px tracks and
+  fills, concise byte labels, truthful unknown totals, remote progress only
+  after live byte projection, and removal of progress after download state ends.
+- Existing pointer, Enter, Space, and AccessKit Default selection coverage,
+  accordion semantics, removal focus restoration, active-removal revalidation,
+  partial cleanup, legacy cleanup, and safe removal routing remain green.
+- Full `ui-harness` suite: 831 passed, 0 failed, 11 ignored. Full default suite:
+  765 passed, 0 failed, 10 ignored. Strict all-target/all-feature Clippy with
+  warnings denied, all-target/all-feature check, formatting, and diff checks
+  passed under the Visual Studio x64 environment with bundled CMake and MSVC.
+
+## Fresh native implementation evidence
+
+Four current-branch client captures survived original-resolution inspection:
+
+- `design-qa-evidence/three-zone-1180x815-installed-idle.png` - installed idle,
+  1475 x 1019 physical pixels at 120 DPI, corresponding to an 1180 x 815 logical
+  egui client.
+- `design-qa-evidence/three-zone-960x680-installed-idle.png` - installed idle,
+  1200 x 850 physical pixels at 120 DPI, corresponding to a 960 x 680 logical
+  egui client.
+- `design-qa-evidence/three-zone-1180x815-expanded.png` - expanded-card top,
+  1475 x 1019 physical pixels at 120 DPI. The lower expanded details are outside
+  the visible area or covered by the comparison dock.
+- `design-qa-evidence/three-zone-960x680-expanded.png` - expanded-card top,
+  1200 x 850 physical pixels at 120 DPI. The lower expanded details are outside
+  the visible area or covered by the comparison dock.
+
+The idle captures show the current Models client and the three-zone installed
+cards. The expanded captures show the expanded `tiny.en` identity and top detail
+state. They are implementation-only evidence; without the source artifact they
+cannot establish source fidelity.
+
+## Exact blockers and comparison gaps
+
+- Source artifact: the newest sketch has no local path, so no source crop,
+  overlay, side-by-side, or measured source comparison is available.
+- Full-view comparison: no accepted current capture shows the complete expanded
+  Features, Requirements, and conditional Maintenance surface at either
+  viewport.
+- Focused comparison: no accepted current capture proves pointer hover,
+  keyboard focus/focus-within, or a visible downloading progress module at
+  either viewport.
+- Native state confirmation: one attempted downloading capture contained the
+  Windows task switcher and another did not expose a progress card. Both invalid
+  generated files were deleted and are not evidence. Further capture stopped
+  because the available helper could not simultaneously prove the exact titled
+  Scribe HWND, client rectangle, and UI Automation state target.
+
+Required fidelity surfaces still needing direct review are the 50/24/26 visual
+balance, metric alignment and color progression, one-row/two-row feature
+geometry, inverse and destructive lifecycle treatments, hover elevation,
+focus-within ring, determinate and unknown-total progress modules, 44 x 44
+Cancel/disclosure targets, and complete expanded section spacing at both
+viewports.
+
+## Recovery steps
+
+1. Reattach the newest sketch or provide its exact local path.
+2. Use a title-aware capture flow that selects the exact Scribe HWND, verifies
+   the logical client size, and asserts the target card/control state through
+   UI Automation before each capture.
+3. Capture idle, hover, keyboard focus, visible downloading, expanded top, and
+   expanded scrolled states at logical 1180 x 815 and 960 x 680.
+4. Inspect every PNG at original resolution, reject contaminated or stale
+   frames, then compare each accepted state directly with the source artifact.
+
+final result: blocked

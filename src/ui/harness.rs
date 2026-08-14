@@ -1594,28 +1594,61 @@ mod tests {
     }
 
     #[test]
-    fn model_card_ratings_render_catalog_values_as_accessible_meters() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut model = data.models.remove(0);
-        model.speed_tier = ModelSpeedTier::AccurateSlow;
-        model.accuracy_guidance = "Highest accuracy".into();
-        data.models = vec![model];
-        data.model_catalog.clear();
-        let mut page = AppPage::Models;
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        for (name, value) in [
-            ("Speed: Slow (2 of 5)", 2.0),
-            ("Accuracy: Highest (5 of 5)", 5.0),
+    fn model_card_ratings_render_all_proportional_bins_and_truthful_unknown_meters() {
+        for (guidance, label, value) in [
+            ("Basic", "Basic", 1_u8),
+            ("Fair", "Fair", 2),
+            ("Good", "Good", 3),
+            ("High", "High", 4),
+            ("Highest", "Highest", 5),
         ] {
-            let meter = node_matching(&output, |node| node.name() == Some(name));
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut model = data.models.remove(0);
+            model.accuracy_guidance = guidance.into();
+            data.models = vec![model];
+            data.model_catalog.clear();
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            let name = format!("Accuracy: {label} ({value} of 5)");
+            let meter = node_matching(&output, |node| node.name() == Some(name.as_str()));
             assert_eq!(meter.role(), egui::accesskit::Role::Meter);
             assert_eq!(meter.min_numeric_value(), Some(0.0));
             assert_eq!(meter.max_numeric_value(), Some(5.0));
-            assert_eq!(meter.numeric_value(), Some(value));
+            assert_eq!(meter.numeric_value(), Some(f64::from(value)));
+
+            let track = named_node_bounds(&output, &format!("{name} layout rating track"));
+            let fill = named_node_bounds(&output, &format!("{name} layout rating fill"));
+            assert_near(track.height(), 7.0, "rating track height");
+            assert_near(fill.x0, track.x0, "rating fill starts at track origin");
+            assert_near(
+                fill.height(),
+                track.height(),
+                "rating fill uses full track height",
+            );
+            assert_near(
+                fill.width(),
+                track.width() * f64::from(value) / 5.0,
+                "rating fill is proportional to the bin",
+            );
         }
+
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let unknown = node_matching(&output, |node| node.name() == Some("Accuracy: Not rated"));
+        assert_eq!(unknown.role(), egui::accesskit::Role::Meter);
+        assert_eq!(unknown.min_numeric_value(), None);
+        assert_eq!(unknown.max_numeric_value(), None);
+        assert_eq!(unknown.numeric_value(), None);
+        let track = named_node_bounds(&output, "Accuracy: Not rated layout rating track");
+        assert_near(track.height(), 7.0, "unknown rating keeps an empty track");
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Accuracy: Not rated layout rating fill"),
+            "an unknown rating must not fabricate a filled bin"
+        );
     }
 
     #[test]
@@ -3094,13 +3127,13 @@ mod tests {
             );
             assert_near(
                 features.x1 - features.x0,
-                136.0,
-                "four feature slots should use four 28px columns with three 8px gaps",
+                64.0,
+                "four feature slots use two 28px columns with one 8px gap",
             );
             assert_near(
                 features.y1 - features.y0,
-                32.0,
-                "four feature slots should remain on one row when the balanced region fits",
+                72.0,
+                "four feature slots use two 32px rows with one 8px gap",
             );
 
             let title = named_node_bounds(&output, "whisper.cpp tiny.en");
@@ -3122,52 +3155,127 @@ mod tests {
             );
         }
 
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsCardExpanded.data();
-        let tiny = data
-            .models
-            .iter_mut()
-            .find(|model| model.id == "tiny.en")
-            .expect("expanded fixture includes tiny.en");
-        tiny.capabilities = ModelCapabilities {
-            capabilities_known: true,
-            batch_transcription: true,
-            timestamps: true,
-            ..Default::default()
-        };
-        let mut page = Fixture::ModelsCardExpanded.page();
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let curated = named_node_bounds(&output, "Features: Word timestamps, Batch transcription");
-        assert_near(curated.width(), 64.0, "two curated feature slots width");
-        assert_near(curated.height(), 32.0, "two curated feature slots height");
+        for (feature_count, expected_name, expected_width, expected_height) in [
+            (1, "Features: Batch transcription", 28.0, 32.0),
+            (
+                2,
+                "Features: Word timestamps, Batch transcription",
+                64.0,
+                32.0,
+            ),
+            (
+                3,
+                "Features: Translation, Word timestamps, Batch transcription",
+                64.0,
+                72.0,
+            ),
+            (
+                4,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+                64.0,
+                72.0,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let tiny = data
+                .models
+                .iter_mut()
+                .find(|model| model.id == "tiny.en")
+                .expect("expanded fixture includes tiny.en");
+            tiny.capabilities = ModelCapabilities {
+                capabilities_known: true,
+                batch_transcription: true,
+                timestamps: feature_count >= 2,
+                translation: feature_count >= 3,
+                native_streaming: feature_count >= 4,
+                ..Default::default()
+            };
+            data.models.retain(|model| model.id == "tiny.en");
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = Fixture::ModelsCardExpanded.page();
+            for width in [1180.0, 960.0] {
+                let output =
+                    render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new()).0;
+                let features = named_node_bounds(&output, expected_name);
+                assert_near(
+                    features.width(),
+                    expected_width,
+                    &format!("{feature_count}-feature group width"),
+                );
+                assert_near(
+                    features.height(),
+                    expected_height,
+                    &format!("{feature_count}-feature group height"),
+                );
+            }
+        }
     }
 
     #[test]
-    fn model_card_desktop_right_regions_are_balanced() {
-        for width in [1180.0, 960.0] {
-            let output = render(Fixture::ModelsCardExpanded, width, 815.0);
+    fn model_card_desktop_uses_exact_three_zone_bounds() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            data.models.retain(|model| model.id == "tiny.en");
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
             let card_name = "whisper.cpp tiny.en";
-            let speed = named_node_bounds(&output, &format!("{card_name} metric region Speed"));
-            let accuracy =
-                named_node_bounds(&output, &format!("{card_name} metric region Accuracy"));
-            let features = named_node_bounds(&output, &format!("{card_name} feature region"));
-            let lifecycle = named_node_bounds(&output, &format!("{card_name} lifecycle region"));
+            let identity = named_node_bounds(&output, &format!("{card_name} layout identity zone"));
+            let metrics = named_node_bounds(&output, &format!("{card_name} layout metrics zone"));
+            let lifecycle =
+                named_node_bounds(&output, &format!("{card_name} layout lifecycle zone"));
+            let chevron_zone =
+                named_node_bounds(&output, &format!("{card_name} layout chevron zone"));
             let chevron = named_node_bounds(&output, &format!("Collapse details for {card_name}"));
+            let summary_width = identity.width() + metrics.width() + lifecycle.width();
             assert_near(
-                speed.x1 - speed.x0,
-                accuracy.x1 - accuracy.x0,
-                "metric regions equal",
+                identity.width(),
+                summary_width * 0.50,
+                "identity zone is exactly 50%",
             );
             assert_near(
-                features.x1 - features.x0,
-                lifecycle.x1 - lifecycle.x0,
-                "bottom regions equal",
+                metrics.width(),
+                summary_width * 0.24,
+                "metrics zone is exactly 24%",
             );
-            assert_near(speed.x0, features.x0, "left regions share edge");
-            assert_near(accuracy.x1, lifecycle.x1, "right regions share edge");
-            assert_near(lifecycle.x1, chevron.x0, "right region meets chevron");
+            assert_near(
+                lifecycle.width(),
+                summary_width * 0.26,
+                "lifecycle zone is exactly 26%",
+            );
+            assert_near(identity.x1, metrics.x0, "identity meets metrics");
+            assert_near(metrics.x1, lifecycle.x0, "metrics meets lifecycle");
+            assert_near(chevron_zone.width(), 44.0, "chevron zone width");
+            assert_near(chevron_zone.height(), 44.0, "chevron zone height");
+            assert_near(
+                chevron_zone.x1,
+                lifecycle.x1,
+                "chevron trails lifecycle zone",
+            );
+            assert_bounds_within(chevron, chevron_zone, "chevron target");
+
+            let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+            let accuracy = named_node_bounds(&output, "Accuracy: Basic (1 of 5)");
+            assert_near(
+                speed.width(),
+                accuracy.width(),
+                "metric meter widths are equal",
+            );
+            assert_near(
+                speed.x0 - metrics.x0,
+                metrics.x1 - accuracy.x1,
+                &format!(
+                    "metric meters are symmetrically inset; metrics={metrics:?}, speed={speed:?}, accuracy={accuracy:?}"
+                ),
+            );
         }
     }
 
@@ -3344,8 +3452,8 @@ mod tests {
         }));
         let bounds = feature_group.bounds().unwrap();
         assert!(
-            bounds.height() >= 32.0 - LAYOUT_TOLERANCE,
-            "four summary icons should fit within the compact feature group: {bounds:?}"
+            bounds.height() >= 72.0 - LAYOUT_TOLERANCE,
+            "four summary icons should fit within a two-column, two-row group: {bounds:?}"
         );
         for (index, tooltip) in [
             "Native streaming",
@@ -3368,8 +3476,8 @@ mod tests {
             );
             assert_eq!(move_away_action, ScreenAction::None);
             let pointer = egui::pos2(
-                bounds.x0 as f32 + 14.0 + (index % 4) as f32 * 36.0,
-                bounds.y0 as f32 + 16.0 + (index / 4) as f32 * 40.0,
+                bounds.x0 as f32 + 14.0 + (index % 2) as f32 * 36.0,
+                bounds.y0 as f32 + 16.0 + (index / 2) as f32 * 40.0,
             );
             let (_, hover_start_action) = render_with_input_at_time(
                 &ctx,
@@ -3599,6 +3707,192 @@ mod tests {
                 .description()
                 .is_some_and(|text| text.contains("cannot cancel"))
         );
+    }
+
+    #[test]
+    fn active_download_progress_is_truthful_clamped_and_isolated_from_card_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models = vec![ModelViewModel {
+            id: "progress".into(),
+            display_name: "Progress".into(),
+            installed: true,
+            ready: true,
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 120,
+            total_bytes: Some(100),
+            cancel_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_catalog.clear();
+        data.remote_catalog.entries.clear();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let accessible_progress = "Downloading 120B of 100B, 100% complete";
+        let meter = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(accessible_progress)
+        });
+        assert_eq!(meter.min_numeric_value(), Some(0.0));
+        assert_eq!(meter.max_numeric_value(), Some(1.0));
+        assert_eq!(meter.numeric_value(), Some(1.0));
+        let track = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download track"),
+        );
+        let fill = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download fill"),
+        );
+        let lifecycle = named_node_bounds(&output, "Progress layout lifecycle zone");
+        let chevron = named_node_bounds(&output, "Progress layout chevron zone");
+        assert_near(track.height(), 6.0, "download track height");
+        assert_near(fill.height(), 6.0, "download fill height");
+        assert_near(fill.x0, track.x0, "download fill starts at track origin");
+        assert_near(fill.width(), track.width(), "clamped full download fill");
+        assert_bounds_within(track, lifecycle, "download track");
+        assert!(track.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+
+        let cancel = named_node_bounds(&output, "Cancel Progress download");
+        assert_near(cancel.width(), 44.0, "Cancel target width");
+        assert_near(cancel.height(), 44.0, "Cancel target height");
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                "Cancel Progress download",
+            ),
+            ScreenAction::CancelModelInstall("progress".into()),
+            "Cancel must win over the selectable full-card target exactly once",
+        );
+
+        data.models[0].downloaded_bytes = 42;
+        data.models[0].total_bytes = None;
+        let unknown = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let unknown_text = "Downloading 42B; total download size unknown";
+        let unknown_meter = node_matching(&unknown, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(unknown_text)
+        });
+        assert_eq!(unknown_meter.min_numeric_value(), None);
+        assert_eq!(unknown_meter.max_numeric_value(), None);
+        assert_eq!(unknown_meter.numeric_value(), None);
+        let names = node_names(&unknown);
+        assert!(names.iter().any(|name| name == "Downloading"));
+        assert!(names.iter().any(|name| name == "42B downloaded"));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == &format!("{unknown_text} layout download fill")),
+            "unknown totals must not fabricate a numeric fill",
+        );
+
+        data.models[0].download_state = ModelDownloadState::Failed;
+        let settled = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !node_names(&settled)
+                .iter()
+                .any(|name| name.starts_with("Downloading 42B")),
+            "progress must disappear once the model is no longer downloading",
+        );
+    }
+
+    #[test]
+    fn remote_download_progress_requires_live_installer_bytes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog.clear();
+        let variant = &mut data.remote_catalog.entries[0].variants[0];
+        variant.status_label = Some("Downloading".into());
+        variant.downloaded_bytes = None;
+        variant.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Meter
+                        && node
+                            .name()
+                            .is_some_and(|name| name.starts_with("Downloading"))
+                }),
+            "a status label without live byte progress must not fabricate a progress meter",
+        );
+    }
+
+    #[test]
+    fn remote_download_progress_uses_live_installer_bytes_and_cancels_without_card_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog.clear();
+        let variant = &mut data.remote_catalog.entries[0].variants[0];
+        variant.status_label = Some("Downloading".into());
+        variant.downloaded_bytes = Some(40);
+        variant.total_bytes = Some(100);
+        variant.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let accessible_progress = "Downloading 40B of 100B, 40% complete";
+        let meter = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(accessible_progress)
+        });
+        assert_eq!(meter.min_numeric_value(), Some(0.0));
+        assert_eq!(meter.max_numeric_value(), Some(1.0));
+        assert_eq!(meter.numeric_value(), Some(f64::from(0.4_f32)));
+        let track = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download track"),
+        );
+        let fill = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download fill"),
+        );
+        assert_near(
+            fill.width(),
+            track.width() * 0.4,
+            "remote download fill ratio",
+        );
+
+        let cancel_name = "Cancel Compact English";
+        let cancel = named_node_bounds(&output, cancel_name);
+        assert_near(cancel.width(), 44.0, "remote Cancel target width");
+        assert_near(cancel.height(), 44.0, "remote Cancel target height");
+        let action = click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, cancel_name);
+        assert_eq!(
+            action,
+            ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into())
+        );
+        assert!(!matches!(action, ScreenAction::SelectModel(_)));
     }
 
     #[test]
@@ -4095,7 +4389,7 @@ mod tests {
     }
 
     #[test]
-    fn model_card_summary_switches_at_the_exact_620px_content_breakpoint() {
+    fn model_card_summary_stacks_below_and_uses_three_zones_at_the_620px_breakpoint() {
         let compact = render(Fixture::ModelsInstalled, 785.0, 680.0);
         let compact_card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
         let compact_title = named_node_bounds(&compact, "whisper.cpp tiny.en");
@@ -4114,26 +4408,37 @@ mod tests {
         let desktop_card = named_node_bounds(&desktop, "whisper.cpp tiny.en model");
         let desktop_title = named_node_bounds(&desktop, "whisper.cpp tiny.en");
         let desktop_lifecycle = named_node_bounds(&desktop, "Delete whisper.cpp tiny.en");
-        let desktop_speed = named_node_bounds(&desktop, "Speed: Very fast (5 of 5)");
+        let identity = named_node_bounds(&desktop, "whisper.cpp tiny.en layout identity zone");
+        let metrics = named_node_bounds(&desktop, "whisper.cpp tiny.en layout metrics zone");
+        let lifecycle_zone =
+            named_node_bounds(&desktop, "whisper.cpp tiny.en layout lifecycle zone");
         let desktop_chevron = named_node_bounds(&desktop, "Expand details for whisper.cpp tiny.en");
-        let content_left = desktop_card.x0 + 16.0;
-        let content_width = desktop_card.x1 - desktop_card.x0 - 32.0;
-        let expected_boundary = content_left + content_width * 0.60;
         assert_near(
             desktop_card.x1 - desktop_card.x0 - 44.0,
             620.0,
             "the desktop breakpoint's 620px content width",
         );
-        assert!(
-            (desktop_speed.x0 - expected_boundary).abs() <= 2.0,
-            "620px card content must use the desktop 60/40 track boundary: expected {expected_boundary} +/- 2, got {}",
-            desktop_speed.x0,
+        let summary_width = identity.width() + metrics.width() + lifecycle_zone.width();
+        assert_near(
+            identity.width(),
+            summary_width * 0.50,
+            "breakpoint identity zone",
+        );
+        assert_near(
+            metrics.width(),
+            summary_width * 0.24,
+            "breakpoint metrics zone",
+        );
+        assert_near(
+            lifecycle_zone.width(),
+            summary_width * 0.26,
+            "breakpoint lifecycle zone",
         );
         assert!(
-            desktop_title.x1 <= desktop_speed.x0 + LAYOUT_TOLERANCE
-                && desktop_speed.y1 <= desktop_lifecycle.y0 + LAYOUT_TOLERANCE
-                && desktop_lifecycle.x1 <= desktop_chevron.x0 + LAYOUT_TOLERANCE,
-            "620px card content must keep identity, metrics, lifecycle, and chevron in desktop order: title={desktop_title:?}, speed={desktop_speed:?}, lifecycle={desktop_lifecycle:?}, chevron={desktop_chevron:?}"
+            desktop_title.x1 <= metrics.x0 + LAYOUT_TOLERANCE
+                && desktop_lifecycle.x1 <= desktop_chevron.x0 + LAYOUT_TOLERANCE
+                && desktop_chevron.x1 <= lifecycle_zone.x1 + LAYOUT_TOLERANCE,
+            "620px card content must keep identity, metrics, lifecycle, and chevron in three-zone order: title={desktop_title:?}, metrics={metrics:?}, lifecycle={desktop_lifecycle:?}, chevron={desktop_chevron:?}"
         );
     }
 
@@ -4168,36 +4473,7 @@ mod tests {
     }
 
     #[test]
-    fn model_card_summary_uses_sixty_forty_tracks_and_expands_metadata_in_place() {
-        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_accessible_style(&ctx);
-            let mut data = Fixture::ModelsInstalled.data();
-            data.models.retain(|model| model.id == "tiny.en");
-            data.model_catalog.clear();
-            data.remote_catalog.entries.clear();
-            let mut page = AppPage::Models;
-            let (output, action) =
-                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-            assert_eq!(action, ScreenAction::None);
-            let card = named_node_bounds(&output, "whisper.cpp tiny.en model");
-            let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
-            let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
-            let content_left = card.x0 + 16.0;
-            let content_width = card.x1 - card.x0 - 32.0;
-            let expected_boundary = content_left + content_width * 0.60;
-            assert!(
-                (speed.x0 - expected_boundary).abs() <= LAYOUT_TOLERANCE * 2.0,
-                "desktop metrics must begin at the exact 60/40 track boundary: card={card:?}, speed={speed:?}, expected={expected_boundary}",
-            );
-            assert_near(
-                chevron.x1,
-                card.x1 - 16.0 - 6.0,
-                "the chevron must trail inside the right 40% track at the card gutter",
-            );
-        }
-
+    fn model_card_expansion_keeps_metadata_in_place_and_compact_stacking() {
         let long_description = "A deliberately long model description that must wrap when details are expanded while preserving the identity stack origin.";
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -4257,12 +4533,15 @@ mod tests {
             let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
             if width > 430.0 {
                 let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+                let metrics = named_node_bounds(&output, "whisper.cpp tiny.en layout metrics zone");
+                let lifecycle_zone =
+                    named_node_bounds(&output, "whisper.cpp tiny.en layout lifecycle zone");
                 let description =
                     named_node_bounds(&output, "More accurate for longer recordings.");
                 let language = named_node_bounds(&output, "Languages: EN");
-                assert!(title.x1 <= speed.x0 + LAYOUT_TOLERANCE);
-                assert!(description.x1 <= speed.x0 + LAYOUT_TOLERANCE);
-                assert!(language.x1 <= speed.x0 + LAYOUT_TOLERANCE);
+                assert!(title.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
+                assert!(description.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
+                assert!(language.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
                 assert_near(
                     description.x0,
                     title.x0,
@@ -4273,8 +4552,9 @@ mod tests {
                     title.x0,
                     "globe should align with identity title text",
                 );
-                assert!(speed.x0 >= title.x1 - LAYOUT_TOLERANCE);
-                assert!(speed.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
+                assert_bounds_within(speed, metrics, "speed meter");
+                assert_bounds_within(lifecycle, lifecycle_zone, "lifecycle control");
+                assert_bounds_within(chevron, lifecycle_zone, "chevron control");
                 assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
             } else {
                 assert!(title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);

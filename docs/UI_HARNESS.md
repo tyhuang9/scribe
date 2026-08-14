@@ -40,8 +40,10 @@ not runtime assets.
 ## Model-card contract
 
 - Cards use the full usable Models-route width. At widths at least 620 px, the
-  summary uses deterministic 60/40 identity and metric/control tracks. Below
-  620 px, identity content stacks above trailing controls. The native shell
+  summary uses deterministic nested zones: 50% identity, 24% Speed/Accuracy,
+  and 26% lifecycle. The fixed 44 x 44 disclosure target lives inside the
+  lifecycle zone. Below 620 px, identity content stacks above metrics,
+  features, lifecycle, and disclosure controls. The native shell
   has a 960 × 680 minimum; 375 px component behavior is deterministic-test
   coverage only.
 - Expanded details grow inside the same card surface and preserve the collapsed
@@ -52,21 +54,32 @@ not runtime assets.
 - Model cards expose only Native streaming, Translation, Word timestamps, and
   Batch transcription, in that order. Cancellation, language detection,
   confidence scores, and custom vocabulary remain internal metadata. The
-  collapsed feature group uses 28 x 32 px glyph slots with 8 px gaps, wraps
-  when needed, and exposes hover tooltips; the expanded surface renders the
-  same four capabilities as a 32 px icon-and-label grid with 4 px row gaps.
-- The right summary track divides its non-chevron width evenly: Speed and
-  Accuracy share the top row, while feature icons and the lifecycle action
-  share the bottom row. Expanded sections use 6 px divider and
-  heading-to-content gaps plus 12 px between Features, Requirements, and
+  collapsed feature group uses at most two 28 x 32 px glyph columns with 8 px
+  column and row gaps: one or two features occupy one row, while three or four
+  use a second row. Every visible glyph has a hover tooltip and the cluster is
+  one accessibility group. The expanded surface renders the same four
+  capabilities as a 32 px icon-and-label grid.
+- Speed and Accuracy occupy equal cells in the 24% metrics zone. Their visible
+  labels sit above continuous 7 px meters, use the same five-bin color mapping,
+  and expose AccessKit Meter names and values. Unknown ratings keep an empty
+  track without inventing a numeric value. Expanded sections use 6 px divider
+  and heading-to-content gaps plus 12 px between Features, Requirements, and
   Maintenance; requirement cells retain their natural compact height.
 - A ready inactive installed card is selectable across the full card with
   pointer click, Enter, Space, and AccessKit Default activation. Lifecycle,
   disclosure, maintenance, and partial-cleanup child controls are excluded
   from the card activation hit area and keep their independent behavior.
 - Available Install actions use the inverse-neutral Download glyph treatment
-  with the compact artifact size. Stable Delete keeps its destructive outline
-  treatment without changing the underlying action or accessible name.
+  with the compact artifact size; Retry and Resume use the same inverse
+  treatment. Stable Delete keeps its destructive outline treatment without
+  changing the underlying action or accessible name. Active downloads replace
+  the lifecycle action body with a truthful progress module: known totals show
+  a clamped percentage, concise downloaded/total bytes, and a full-width 6 px
+  track plus current fill; unknown totals show downloaded bytes and explicitly
+  say the total is unknown without a fake value or fill. The named 44 x 44
+  Cancel target remains beside the progress body. Remote cards show progress
+  only after the live installer supplies byte counts, and the module disappears
+  as soon as the card is no longer downloading.
 - Requirements use responsive RAM, storage, and GPU cells. Optional
   Maintenance appears after Requirements; supported removal, partial-resume,
   discard, and runtime-safety constraints remain unchanged by expansion.
@@ -78,8 +91,9 @@ Capture and inspect original-resolution client-area screenshots at exactly
 
 1. `models/installed`: idle, hover a selectable inactive-card coordinate, and
    keyboard-focus `Use whisper.cpp tiny.en for future transcriptions`.
-2. `models/lifecycle`: inspect the inverse Install glyph and compact size,
-   then confirm partial/download/error controls remain truthful and contained.
+2. `models/lifecycle`: inspect inverse Install, Retry, and Resume treatments;
+   verify the determinate percentage, concise byte detail, full 6 px progress
+   track/fill, named 44 x 44 Cancel target, and contained error controls.
 3. `models/card-expanded`: inspect expanded top content, then scroll the
    Models route to inspect the complete feature grid, Requirements, optional
    Maintenance order, and shared card edges.
