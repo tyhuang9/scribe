@@ -1477,6 +1477,7 @@ const MODEL_CARD_VERTICAL_INSET: f32 = 8.0;
 const MODEL_RATING_METER_WIDTH: f32 = 62.0;
 const MODEL_CARD_COMPACT_BREAKPOINT: f32 = 620.0;
 const MODEL_CARD_SHADOW_GUTTER: f32 = 6.0;
+const MODEL_CARD_SUMMARY_HEIGHT: f32 = 100.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelCardVisualState {
@@ -2085,7 +2086,12 @@ fn model_lifecycle_presentation<'a>(
                 action: remote.map_or(ScreenAction::None, |action| {
                     screen_action_for_remote_catalog_action(&action.kind)
                 }),
-                icon: if label == "Delete" || label == "Remove" {
+                icon: if matches!(
+                    remote.map(|action| &action.kind),
+                    Some(RemoteCatalogActionKind::Cancel { .. })
+                ) {
+                    Icon::Close
+                } else if label == "Delete" || label == "Remove" {
                     Icon::Trash
                 } else {
                     Icon::Download
@@ -2244,7 +2250,7 @@ fn model_feature_grid_geometry(feature_count: usize, available_width: f32) -> (u
     const ICON_GAP: f32 = 8.0;
     const ICON_TARGET: f32 = 32.0;
     let max_columns =
-        (((available_width + ICON_GAP) / (ICON_WIDTH + ICON_GAP)).floor() as usize).clamp(1, 4);
+        (((available_width + ICON_GAP) / (ICON_WIDTH + ICON_GAP)).floor() as usize).clamp(1, 2);
     let columns = feature_count.min(max_columns).max(1);
     let rows = feature_count.div_ceil(columns).max(1);
     (
@@ -2534,6 +2540,100 @@ fn model_lifecycle_button(
     response
 }
 
+struct ModelDownloadModuleResponse {
+    response: egui::Response,
+    cancel_clicked: bool,
+    cancel_has_focus: bool,
+}
+
+fn render_model_download_module(
+    ui: &mut egui::Ui,
+    progress: &ModelDownloadProgressPresentation,
+    cancel_name: &str,
+    cancel_enabled: bool,
+    cancel_reason: Option<&str>,
+) -> ModelDownloadModuleResponse {
+    let colors = ui_palette(ui);
+    let mut cancel_clicked = false;
+    let mut cancel_has_focus = false;
+    let response = ui
+        .allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 64.0),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new((ui.available_width() - 44.0).max(0.0), 44.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            let header = progress.fraction.map_or_else(
+                                || "Downloading".to_owned(),
+                                |fraction| format!("{:.0}%", fraction * 100.0),
+                            );
+                            let detail = progress.total_bytes.map_or_else(
+                                || {
+                                    format!(
+                                        "{} downloaded",
+                                        format_download_bytes(progress.downloaded_bytes)
+                                    )
+                                },
+                                |total| {
+                                    format!(
+                                        "{} / {}",
+                                        format_download_bytes(progress.downloaded_bytes),
+                                        format_download_bytes(total)
+                                    )
+                                },
+                            );
+                            ui.label(RichText::new(header).small().strong());
+                            ui.label(RichText::new(detail).small().color(colors.muted_text));
+                        },
+                    );
+                    let cancel = compact_model_icon_action(
+                        ui,
+                        Icon::Close,
+                        cancel_name,
+                        cancel_enabled,
+                        cancel_reason,
+                        None,
+                    );
+                    cancel_clicked = cancel.clicked();
+                    cancel_has_focus = cancel.has_focus();
+                });
+                let (track, meter) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(track, Rounding::same(3.0), colors.meter_track);
+                if let Some(fraction) = progress.fraction {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            track.min,
+                            Vec2::new(track.width() * fraction, track.height()),
+                        ),
+                        Rounding::same(3.0),
+                        colors.accent,
+                    );
+                }
+                ui.ctx().accesskit_node_builder(meter.id, |builder| {
+                    builder.set_role(egui::accesskit::Role::Meter);
+                    builder.set_name(progress.accessible_text.as_str());
+                    if let Some(fraction) = progress.fraction {
+                        builder.set_min_numeric_value(0.0);
+                        builder.set_max_numeric_value(1.0);
+                        builder.set_numeric_value(f64::from(fraction));
+                    }
+                    builder.set_bounds(accesskit_rect(track));
+                });
+            },
+        )
+        .response;
+    ModelDownloadModuleResponse {
+        response,
+        cancel_clicked,
+        cancel_has_focus,
+    }
+}
+
 fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
     ui.painter().text(
@@ -2807,6 +2907,24 @@ fn render_unified_model_card(
                                 action: &mut ScreenAction,
                                 restored_remove_focus: &mut bool,
                                 focus_within: &mut bool| {
+            if matches!(
+                lifecycle.action,
+                ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
+            ) && let Some(progress) = model_download_progress_presentation(card)
+            {
+                let download = render_model_download_module(
+                    ui,
+                    &progress,
+                    &lifecycle.accessible_name,
+                    lifecycle.enabled,
+                    lifecycle.disabled_reason,
+                );
+                *focus_within |= download.cancel_has_focus;
+                if download.cancel_clicked && lifecycle.enabled {
+                    *action = lifecycle.action.clone();
+                }
+                return download.response;
+            }
             let label = if lifecycle.tone == ModelLifecycleTone::DestructiveOutline {
                 lifecycle.label.clone()
             } else {
@@ -2866,8 +2984,10 @@ fn render_unified_model_card(
             });
             render_model_metadata(ui, name, languages, false);
             ui.horizontal(|ui| {
-                let feature_width = ui.available_width();
+                let feature_width = ui.available_width().min(72.0);
                 activation_exclusions.push(render_model_features(ui, card, feature_width).rect);
+            });
+            ui.horizontal(|ui| {
                 activation_exclusions.push(
                     render_lifecycle(
                         ui,
@@ -2880,177 +3000,135 @@ fn render_unified_model_card(
                 activation_exclusions.push(render_details(ui, &mut action, &mut focus_within).rect);
             });
         } else {
-            let identity_track = card_content_width * 0.60;
-            let right_track = card_content_width - identity_track;
+            let identity_width = card_content_width * 0.50;
+            let metrics_width = card_content_width * 0.24;
+            let lifecycle_width = card_content_width - identity_width - metrics_width;
             let details_width = 44.0;
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
-                        Vec2::new(identity_track, 0.0),
+                        Vec2::new(identity_width, 0.0),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_width(identity_track);
-                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.set_width(identity_width);
                             let identity =
-                                render_model_identity(ui, name, active, false, identity_track);
+                                render_model_identity(ui, name, active, false, identity_width);
                             focus_within |= identity.has_focus;
                             description_fade_rect = render_model_description(
                                 ui,
                                 &description,
-                                identity_track,
+                                identity_width,
                                 26.0,
                                 expanded,
                             );
                             ui.add_space(4.0);
-                            render_model_metadata(ui, name, languages, false);
+                            ui.horizontal(|ui| {
+                                let cell_width = (identity_width / 2.0).max(0.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(cell_width, 32.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| render_model_metadata(ui, name, languages, false),
+                                );
+                                let features = ui.allocate_ui_with_layout(
+                                    Vec2::new(cell_width, 32.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| render_model_features(ui, card, cell_width),
+                                );
+                                activation_exclusions.push(features.inner.rect);
+                            });
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        Vec2::new(right_track, 0.0),
-                        Layout::left_to_right(Align::TOP),
+                        Vec2::new(metrics_width, MODEL_CARD_SUMMARY_HEIGHT),
+                        Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_width(right_track);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new((right_track - details_width).max(0.0), 0.0),
-                                Layout::top_down(Align::Min),
-                                |ui| {
-                                    ui.set_width((right_track - details_width).max(0.0));
-                                    let usable_width = ui.available_width();
-                                    let region_width = (usable_width / 2.0).max(0.0);
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    ui.horizontal(|ui| {
-                                        for (metric_name, rating) in [
-                                            (
-                                                "Speed",
-                                                match card {
-                                                    ModelCard::Local(model) => {
-                                                        speed_rating(model.speed_tier)
-                                                    }
-                                                    ModelCard::Remote(_, variant) => {
-                                                        speed_rating(variant.speed_tier)
-                                                    }
-                                                },
-                                            ),
-                                            (
-                                                "Accuracy",
-                                                match card {
-                                                    ModelCard::Local(model) => {
-                                                        accuracy_rating(&model.accuracy_guidance)
-                                                    }
-                                                    ModelCard::Remote(_, variant) => {
-                                                        accuracy_rating(&variant.accuracy_guidance)
-                                                    }
-                                                },
-                                            ),
-                                        ]
-                                        .into_iter()
-                                        {
-                                            let _region = ui.allocate_ui_with_layout(
-                                                Vec2::new(region_width, 28.0),
-                                                Layout::top_down(Align::Min),
-                                                |ui| {
-                                                    ui.set_width(region_width);
-                                                    rating_meter(ui, metric_name, rating, true)
-                                                },
-                                            );
-                                            #[cfg(test)]
-                                            ui.ctx().accesskit_node_builder(
-                                                ui.make_persistent_id((
-                                                    "model-layout",
-                                                    name,
-                                                    "metric",
-                                                    metric_name,
-                                                )),
-                                                |builder| {
-                                                    builder.set_role(
-                                                        egui::accesskit::Role::StaticText,
-                                                    );
-                                                    builder.set_name(format!(
-                                                        "{name} metric region {metric_name}"
-                                                    ));
-                                                    builder.set_bounds(accesskit_rect(
-                                                        _region.response.rect,
-                                                    ));
-                                                },
-                                            );
+                            ui.set_width(metrics_width);
+                            ui.add_space((MODEL_CARD_SUMMARY_HEIGHT - 44.0) / 2.0);
+                            let (metric_row, _) = ui.allocate_exact_size(
+                                Vec2::new(metrics_width, 44.0),
+                                Sense::hover(),
+                            );
+                            let metric_width = metric_row.width() / 2.0;
+                            for (index, (metric_name, rating)) in [
+                                (
+                                    "Speed",
+                                    match card {
+                                        ModelCard::Local(model) => speed_rating(model.speed_tier),
+                                        ModelCard::Remote(_, variant) => {
+                                            speed_rating(variant.speed_tier)
                                         }
+                                    },
+                                ),
+                                (
+                                    "Accuracy",
+                                    match card {
+                                        ModelCard::Local(model) => {
+                                            accuracy_rating(&model.accuracy_guidance)
+                                        }
+                                        ModelCard::Remote(_, variant) => {
+                                            accuracy_rating(&variant.accuracy_guidance)
+                                        }
+                                    },
+                                ),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        metric_row.left() + index as f32 * metric_width,
+                                        metric_row.top(),
+                                    ),
+                                    Vec2::new(metric_width, metric_row.height()),
+                                );
+                                ui.allocate_ui_at_rect(cell, |ui| {
+                                    ui.set_width(cell.width());
+                                    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                                        rating_meter(ui, metric_name, rating, true)
                                     });
-                                    let feature_count = model_summary_features(card).0.len();
-                                    let bottom_row_height =
-                                        model_feature_grid_geometry(feature_count, region_width)
-                                            .2
-                                            .y
-                                            .max(44.0);
-                                    ui.horizontal(|ui| {
-                                        let _feature_region = ui.allocate_ui_with_layout(
-                                            Vec2::new(region_width, bottom_row_height),
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                ui.set_width(region_width);
-                                                activation_exclusions.push(
-                                                    render_model_features(ui, card, region_width)
-                                                        .rect,
-                                                )
-                                            },
-                                        );
-                                        #[cfg(test)]
-                                        ui.ctx().accesskit_node_builder(
-                                            ui.make_persistent_id((
-                                                "model-layout",
-                                                name,
-                                                "features",
-                                            )),
-                                            |builder| {
-                                                builder.set_role(egui::accesskit::Role::StaticText);
-                                                builder.set_name(format!("{name} feature region"));
-                                                builder.set_bounds(accesskit_rect(
-                                                    _feature_region.response.rect,
-                                                ));
-                                            },
-                                        );
-                                        let _lifecycle_region = ui.allocate_ui_with_layout(
-                                            Vec2::new(region_width, bottom_row_height),
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                ui.set_width(region_width);
-                                                activation_exclusions.push(
-                                                    render_lifecycle(
-                                                        ui,
-                                                        &mut action,
-                                                        &mut restored_remove_focus,
-                                                        &mut focus_within,
-                                                    )
-                                                    .rect,
-                                                )
-                                            },
-                                        );
-                                        #[cfg(test)]
-                                        ui.ctx().accesskit_node_builder(
-                                            ui.make_persistent_id((
-                                                "model-layout",
-                                                name,
-                                                "lifecycle",
-                                            )),
-                                            |builder| {
-                                                builder.set_role(egui::accesskit::Role::StaticText);
-                                                builder
-                                                    .set_name(format!("{name} lifecycle region"));
-                                                builder.set_bounds(accesskit_rect(
-                                                    _lifecycle_region.response.rect,
-                                                ));
-                                            },
-                                        );
-                                    });
+                                });
+                            }
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(lifecycle_width, 0.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            let body_width = (lifecycle_width - details_width).max(0.0);
+                            let _body = ui.allocate_ui_with_layout(
+                                Vec2::new(body_width, 0.0),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    activation_exclusions.push(
+                                        render_lifecycle(
+                                            ui,
+                                            &mut action,
+                                            &mut restored_remove_focus,
+                                            &mut focus_within,
+                                        )
+                                        .rect,
+                                    );
                                 },
                             );
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(details_width, 0.0),
+                            let _rail = ui.allocate_ui_with_layout(
+                                Vec2::new(details_width, 44.0),
                                 Layout::left_to_right(Align::Center),
                                 |ui| {
                                     activation_exclusions.push(
                                         render_details(ui, &mut action, &mut focus_within).rect,
                                     )
+                                },
+                            );
+                            #[cfg(test)]
+                            ui.ctx().accesskit_node_builder(
+                                ui.make_persistent_id(("model-layout", name, "lifecycle")),
+                                |builder| {
+                                    builder.set_role(egui::accesskit::Role::StaticText);
+                                    builder.set_name(format!("{name} lifecycle region"));
+                                    builder.set_bounds(accesskit_rect(
+                                        _body.response.rect.union(_rail.response.rect),
+                                    ));
                                 },
                             );
                         },
