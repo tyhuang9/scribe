@@ -30,6 +30,12 @@ pub(crate) enum Fixture {
     TranscribeMicrophoneError,
     ModelsInstalled,
     ModelsLifecycle,
+    ModelsDownloadDownloading,
+    ModelsDownloadRetained,
+    ModelsDownloadFailedPartial,
+    ModelsDownloadFailedAlert,
+    ModelsCardIdle,
+    ModelsCardFocus,
     ModelsCardExpanded,
     ModelsCompareExpanded,
     History,
@@ -38,7 +44,7 @@ pub(crate) enum Fixture {
 
 impl Fixture {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::TranscribeNoModel,
         Self::TranscribeReady,
         Self::TranscribeListening,
@@ -47,6 +53,12 @@ impl Fixture {
         Self::TranscribeMicrophoneError,
         Self::ModelsInstalled,
         Self::ModelsLifecycle,
+        Self::ModelsDownloadDownloading,
+        Self::ModelsDownloadRetained,
+        Self::ModelsDownloadFailedPartial,
+        Self::ModelsDownloadFailedAlert,
+        Self::ModelsCardIdle,
+        Self::ModelsCardFocus,
         Self::ModelsCardExpanded,
         Self::ModelsCompareExpanded,
         Self::History,
@@ -62,6 +74,12 @@ impl Fixture {
             "transcribe/microphone-error" => Self::TranscribeMicrophoneError,
             "models/installed" => Self::ModelsInstalled,
             "models/lifecycle" => Self::ModelsLifecycle,
+            "models/download-downloading" => Self::ModelsDownloadDownloading,
+            "models/download-retained" => Self::ModelsDownloadRetained,
+            "models/download-failed-partial" => Self::ModelsDownloadFailedPartial,
+            "models/download-failed-alert" => Self::ModelsDownloadFailedAlert,
+            "models/card-idle" => Self::ModelsCardIdle,
+            "models/card-focus" => Self::ModelsCardFocus,
             "models/card-expanded" => Self::ModelsCardExpanded,
             "models/compare-expanded" => Self::ModelsCompareExpanded,
             "history" => Self::History,
@@ -73,6 +91,12 @@ impl Fixture {
         match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
             | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => AppPage::Models,
             Self::History => AppPage::History,
@@ -106,6 +130,12 @@ impl Fixture {
         let route = match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
             | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => UiRoute::Models,
             Self::History => UiRoute::History,
@@ -136,13 +166,22 @@ impl Fixture {
             Self::ModelsInstalled | Self::SettingsRecording | Self::History => {
                 transcription.phase = TranscriptionPhase::Ready
             }
-            Self::ModelsLifecycle | Self::ModelsCardExpanded => {
+            Self::ModelsLifecycle
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
+            | Self::ModelsCardExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
                 let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
                 partial.installed = false;
                 partial.download_state = ModelDownloadState::Cancelled;
                 partial.downloaded_bytes = 129_000_000;
                 partial.total_bytes = Some(190_000_000);
+                partial.partial_cleanup_available = true;
+                partial.partial_cleanup_enabled = true;
                 partial.description = Some("Resumable local transcription model.".into());
                 partial.languages = vec!["en".into()];
 
@@ -162,6 +201,15 @@ impl Fixture {
                 failed.description = Some("High-accuracy local transcription model.".into());
                 failed.languages = vec!["en".into()];
 
+                let mut failed_with_partial = failed.clone();
+                failed_with_partial.id = "medium-retained.en".into();
+                failed_with_partial.variant_label = "medium-retained.en".into();
+                failed_with_partial.display_name = "Whisper Medium retained".into();
+                failed_with_partial.partial_cleanup_available = true;
+                failed_with_partial.partial_cleanup_enabled = true;
+                failed_with_partial.downloaded_bytes = 241_000_000;
+                failed_with_partial.total_bytes = Some(466_000_000);
+
                 let mut available = model("Whisper Large", "large-v3", false, false, 1_550);
                 available.installed = false;
                 available.download_state = ModelDownloadState::NotInstalled;
@@ -175,7 +223,18 @@ impl Fixture {
                     "fr".into(),
                 ];
 
-                model_catalog = vec![partial, downloading, failed, available];
+                model_catalog = match self {
+                    Self::ModelsDownloadDownloading => vec![downloading],
+                    Self::ModelsDownloadRetained => vec![partial],
+                    Self::ModelsDownloadFailedPartial => vec![failed_with_partial],
+                    Self::ModelsDownloadFailedAlert => vec![failed],
+                    Self::ModelsCardIdle | Self::ModelsCardFocus => Vec::new(),
+                    _ => vec![partial, downloading, failed, available],
+                };
+                if self == Self::ModelsCardFocus {
+                    models[1].primary_action_label = "Use this model".into();
+                    models[1].primary_action_enabled = true;
+                }
                 if self == Self::ModelsCardExpanded {
                     let expanded = models
                         .iter_mut()
@@ -1571,6 +1630,27 @@ mod tests {
                 "Scribe couldn’t access your microphone",
             ),
             (Fixture::ModelsInstalled, "Compare installed models"),
+            (
+                Fixture::ModelsDownloadDownloading,
+                "Pause Whisper Parakeet download",
+            ),
+            (
+                Fixture::ModelsDownloadRetained,
+                "Resume Whisper Moonshine download",
+            ),
+            (
+                Fixture::ModelsDownloadFailedPartial,
+                "Resume Whisper Medium retained download",
+            ),
+            (
+                Fixture::ModelsDownloadFailedAlert,
+                "Show download error for Whisper Medium",
+            ),
+            (Fixture::ModelsCardIdle, "whisper.cpp base.en"),
+            (
+                Fixture::ModelsCardFocus,
+                "Use whisper.cpp tiny.en for future transcriptions",
+            ),
             (Fixture::ModelsCompareExpanded, "No data"),
             (Fixture::SettingsRecording, "Recording behavior"),
         ] {
@@ -1580,6 +1660,50 @@ mod tests {
                     .any(|name| name.contains(expected)),
                 "{fixture:?} missing {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn isolated_download_fixtures_expose_truthful_controls_at_both_native_sizes() {
+        for (fixture, expected_controls) in [
+            (
+                Fixture::ModelsDownloadDownloading,
+                [
+                    "Pause Whisper Parakeet download",
+                    "Discard partial for Whisper Parakeet",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadRetained,
+                [
+                    "Resume Whisper Moonshine download",
+                    "Discard partial for Whisper Moonshine",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadFailedPartial,
+                [
+                    "Resume Whisper Medium retained download",
+                    "Discard partial for Whisper Medium retained",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadFailedAlert,
+                [
+                    "Install Whisper Medium",
+                    "Show download error for Whisper Medium",
+                ],
+            ),
+        ] {
+            for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+                let names = node_names(&render(fixture, width, height));
+                for expected in expected_controls {
+                    assert!(
+                        names.iter().any(|name| name == expected),
+                        "{fixture:?} at {width}x{height} missing {expected}"
+                    );
+                }
+            }
         }
     }
 
@@ -3594,27 +3718,31 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 ScreenAction::InstallModel("lifecycle".into()),
             ),
             (
-                "Retry",
+                "Install",
                 ModelDownloadState::Failed,
                 false,
                 false,
                 false,
+                false,
                 ScreenAction::InstallModel("lifecycle".into()),
             ),
             (
-                "Resume",
+                "Resume Lifecycle download",
                 ModelDownloadState::Cancelled,
+                true,
                 false,
                 false,
                 false,
                 ScreenAction::InstallModel("lifecycle".into()),
             ),
             (
-                "Cancel Lifecycle download",
+                "Pause Lifecycle download",
                 ModelDownloadState::Downloading,
+                false,
                 false,
                 false,
                 false,
@@ -3623,6 +3751,7 @@ mod tests {
             (
                 "Delete",
                 ModelDownloadState::Installed,
+                false,
                 true,
                 false,
                 false,
@@ -3631,6 +3760,7 @@ mod tests {
             (
                 "Upgrade",
                 ModelDownloadState::Installed,
+                false,
                 true,
                 true,
                 false,
@@ -3639,6 +3769,7 @@ mod tests {
             (
                 "Repair",
                 ModelDownloadState::Installed,
+                false,
                 true,
                 false,
                 true,
@@ -3646,7 +3777,7 @@ mod tests {
             ),
         ];
 
-        for (label, download_state, installed, upgrade, repair, expected) in cases {
+        for (label, download_state, partial, installed, upgrade, repair, expected) in cases {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             configure_accessible_style(&ctx);
@@ -3664,6 +3795,7 @@ mod tests {
                 primary_action_installs_upgrade: upgrade,
                 primary_action_repairs_runtime: repair,
                 download_state,
+                partial_cleanup_available: partial,
                 languages: vec!["en".into()],
                 ..Default::default()
             };
@@ -3673,7 +3805,7 @@ mod tests {
             data.models = installed.then_some(model.clone()).into_iter().collect();
             data.model_catalog = (!installed).then_some(model).into_iter().collect();
             let mut page = AppPage::Models;
-            let name = if label == "Cancel Lifecycle download" {
+            let name = if label.ends_with(" download") {
                 label.to_owned()
             } else {
                 format!("{label} Lifecycle")
@@ -3755,9 +3887,15 @@ mod tests {
         assert_bounds_within(track, lifecycle, "download track");
         assert!(track.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
 
-        let cancel = named_node_bounds(&output, "Cancel Progress download");
-        assert_near(cancel.width(), 44.0, "Cancel target width");
-        assert_near(cancel.height(), 44.0, "Cancel target height");
+        let pause_name = "Pause Progress download";
+        let pause = named_node_bounds(&output, pause_name);
+        assert_near(pause.width(), 44.0, "Pause target width");
+        assert_near(pause.height(), 44.0, "Pause target height");
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, pause_name,),
+            ScreenAction::CancelModelInstall("progress".into()),
+            "Pause must retain the partial and win over the selectable card target",
+        );
         assert_eq!(
             click_named_control(
                 &ctx,
@@ -3765,10 +3903,10 @@ mod tests {
                 &mut page,
                 1180.0,
                 815.0,
-                "Cancel Progress download",
+                "Discard partial for Progress",
             ),
-            ScreenAction::CancelModelInstall("progress".into()),
-            "Cancel must win over the selectable full-card target exactly once",
+            ScreenAction::DiscardModelPartial("progress".into()),
+            "X must request the exact partial cleanup without selecting the card",
         );
 
         data.models[0].downloaded_bytes = 42;
@@ -3782,8 +3920,18 @@ mod tests {
         assert_eq!(unknown_meter.max_numeric_value(), None);
         assert_eq!(unknown_meter.numeric_value(), None);
         let names = node_names(&unknown);
-        assert!(names.iter().any(|name| name == "Downloading"));
-        assert!(names.iter().any(|name| name == "42B downloaded"));
+        assert!(names.iter().any(|name| name == "42B / Total unknown"));
+        assert!(
+            !unknown
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::StaticText
+                    && node.name() == Some("Downloading"))
+        );
         assert!(
             !names
                 .iter()
@@ -3883,16 +4031,31 @@ mod tests {
             "remote download fill ratio",
         );
 
-        let cancel_name = "Cancel Compact English";
-        let cancel = named_node_bounds(&output, cancel_name);
-        assert_near(cancel.width(), 44.0, "remote Cancel target width");
-        assert_near(cancel.height(), 44.0, "remote Cancel target height");
-        let action = click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, cancel_name);
+        let pause_name = "Pause Compact English";
+        let pause = named_node_bounds(&output, pause_name);
+        assert_near(pause.width(), 44.0, "remote Pause target width");
+        assert_near(pause.height(), 44.0, "remote Pause target height");
+        let action = click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, pause_name);
         assert_eq!(
             action,
             ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into())
         );
         assert!(!matches!(action, ScreenAction::SelectModel(_)));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                "Discard partial for Compact English",
+            ),
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            },
+            "remote X must request cleanup for the exact trusted artifact",
+        );
     }
 
     #[test]
@@ -4605,7 +4768,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_local_partial_cleanup_keeps_resume_and_dispatches_discard() {
+    fn summary_partial_cleanup_keeps_play_and_dispatches_discard() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
@@ -4625,7 +4788,7 @@ mod tests {
         assert!(
             node_names(&initial)
                 .iter()
-                .any(|name| name == "Resume Whisper Moonshine")
+                .any(|name| name == "Resume Whisper Moonshine download")
         );
         let discard = named_node_id(&initial, "Discard partial for Whisper Moonshine");
         let (_, action) = render_with_input(
@@ -4661,7 +4824,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_partial_cleanup_preserves_disabled_reason_and_remote_ids() {
+    fn summary_partial_cleanup_uses_safe_app_barriers_and_preserves_remote_ids() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_accessible_style(&ctx);
@@ -4682,10 +4845,9 @@ mod tests {
         let discard = node_matching(&output, |node| {
             node.name() == Some("Discard partial for Whisper Moonshine")
         });
-        assert!(discard.is_disabled());
-        assert_eq!(
-            discard.description(),
-            Some("Wait for the active installation to finish.")
+        assert!(
+            !discard.is_disabled(),
+            "the always-available X delegates safety checks to the app mutation barrier"
         );
 
         let mut remote = Fixture::ModelsInstalled.data();
@@ -4700,6 +4862,9 @@ mod tests {
                 enabled: true,
                 disabled_reason: None,
             });
+        remote.remote_catalog.entries[0].variants[0].status_label = Some("Cancelled".into());
+        remote.remote_catalog.entries[0].variants[0].downloaded_bytes = Some(41_000_000);
+        remote.remote_catalog.entries[0].variants[0].total_bytes = Some(82_000_000);
         remote.model_management.expanded_model_card = Some(ModelCardKey::Remote {
             entry_id: "trusted-speech/compact-english".into(),
             variant_id: "compact-english-q5".into(),

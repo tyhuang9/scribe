@@ -545,3 +545,88 @@ viewports.
    frames, then compare each accepted state directly with the source artifact.
 
 final result: blocked
+
+---
+
+# Stable download controls and progress QA - 2026-08-14
+
+## Source and result
+
+The two newest user-provided progress crops are the selected visual source for
+this pass. They are visible in the conversation but have no resolvable local
+attachment path in the workspace, so they cannot be opened beside the native
+captures as a same-input comparison. Older references were not substituted.
+Source-fidelity QA is therefore blocked even though current implementation
+evidence is available.
+
+## Deterministic verification
+
+- The exact job-bound discard flow retains partial bytes on Pause, queues X
+  cleanup only for the matching active job, rejects stale completion events,
+  waits for that worker to exit before deletion, and lets a successful verified
+  activation win without deleting the installed artifact.
+- Local and trusted remote retained-byte metadata is revalidated and projected
+  after restart without persistence or catalog-format changes. Existing regular
+  file, reparse-point, pinned-artifact, mutation-barrier, and remote-snapshot
+  safeguards remain in the deletion path.
+- Model descriptions remain the catalog description in downloading, paused,
+  verifying, failed, and legacy states. No visible lifecycle status or
+  percentage text replaces the description.
+- Known totals render a measured, stable-width `downloaded / total` label.
+  Unknown totals render `downloaded / Total unknown` and an indeterminate Meter
+  without a fabricated fill. The full 6 px track is below the header controls.
+- Active downloads expose named 44 x 44 Pause and X controls. Retained and
+  failed-with-partial states expose Play and X. Failed-without-partial exposes
+  inverse Install plus a separate 44 x 44 Warning popover control. Hover,
+  click, Enter, Space, Escape, outside dismissal, full error content, and
+  full-card activation exclusion are covered deterministically.
+- Desktop 50/24/26 geometry, centered 100 px lifecycle body, fixed chevron rail,
+  responsive second control row, 375 px containment, full-card selection,
+  removal safety/focus restoration, legacy cleanup, and accordion edges remain
+  covered.
+- Final full UI suite: 849 passed, 0 failed, 11 ignored. Final default suite:
+  781 passed, 0 failed, 10 ignored. Strict all-target/all-feature Clippy with
+  warnings denied, all-target/all-feature check, formatting, and diff checks
+  passed under Visual Studio x64, bundled CMake, and the Hostx64 MSVC linker.
+
+## Native implementation evidence
+
+Sixteen current-build client captures were decoded and inspected at original
+resolution. Logical 1180 x 815 captures are 1475 x 1019 physical pixels and
+logical 960 x 680 captures are 1200 x 850 at the current 120-DPI scale. Fourteen
+captures are usable implementation evidence; both paused captures were rejected
+under the harness capture-rejection rules.
+
+- `stable-download-1180x815-downloading-scrolled.png` and
+  `stable-download-960x680-downloading.png` show the retained byte label,
+  Pause/X header, complete track, and proportional fill without visible percent
+  or status copy.
+- `stable-download-1180x815-paused.png` and
+  `stable-download-960x680-paused.png` contain visibly partial, black-framed
+  client content. They are rejected and do not prove the paused state.
+- `stable-download-1180x815-failed-partial.png` and
+  `stable-download-960x680-failed-partial.png` show stable Play/X placement and
+  retained progress for failed-with-partial state.
+- `stable-download-1180x815-failed-alert.png` and
+  `stable-download-960x680-failed-alert.png` show the separate Warning and
+  inverse Install controls without a progress module in the closed state. No
+  accepted native capture shows the warning popover open; its interaction is
+  covered only by deterministic tests in this evidence set.
+- The 1180 and 960 idle, focus, expanded-top, and expanded-scrolled captures
+  confirm unchanged three-zone card geometry and the expanded Features,
+  Requirements, and Maintenance surfaces. The scrolled expanded captures also
+  confirm the duplicate Discard-partial maintenance action is absent.
+
+The captures are implementation evidence only. They do not establish fidelity
+to the selected progress crops because the exact source files cannot be opened
+in the comparison workflow.
+
+## Remaining blocker
+
+Reattach the two selected progress crops or provide their exact local paths,
+produce clean paused captures at both logical viewports and an accepted native
+warning-open capture, then perform the same-state comparison before changing
+this result to passed. Draft PR #38 must remain unchanged while this Product
+Design gate is blocked.
+
+final result: blocked

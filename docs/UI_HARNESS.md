@@ -29,6 +29,15 @@ not runtime assets.
   for whole-card selection and keyboard-focus checks.
 - `models/lifecycle` — active, installed, available/Install, partial,
   downloading, and failed lifecycle rows.
+- `models/download-downloading` — isolated known-total download with Pause and
+  Discard partial controls.
+- `models/download-retained` — cancelled download retaining resumable bytes.
+- `models/download-failed-partial` — failed download retaining resumable bytes.
+- `models/download-failed-alert` — failed-without-partial state; click the
+  named warning control to capture its error alert open and press Escape or
+  click outside to verify dismissal.
+- `models/card-idle` and `models/card-focus` — stable installed-card surfaces
+  for idle, hover, and keyboard-focus captures.
 - `models/card-expanded` — the inline `tiny.en` card expanded with a long
   description, compact English/Spanish/Japanese metadata, all eight internal
   capability flags for verifying the four-feature UI filter, Requirements,
@@ -69,17 +78,16 @@ not runtime assets.
   pointer click, Enter, Space, and AccessKit Default activation. Lifecycle,
   disclosure, maintenance, and partial-cleanup child controls are excluded
   from the card activation hit area and keep their independent behavior.
-- Available Install actions use the inverse-neutral Download glyph treatment
-  with the compact artifact size; Retry and Resume use the same inverse
-  treatment. Stable Delete keeps its destructive outline treatment without
-  changing the underlying action or accessible name. Active downloads replace
-  the lifecycle action body with a truthful progress module: known totals show
-  a clamped percentage, concise downloaded/total bytes, and a full-width 6 px
-  track plus current fill; unknown totals show downloaded bytes and explicitly
-  say the total is unknown without a fake value or fill. The named 44 x 44
-  Cancel target remains beside the progress body. Remote cards show progress
-  only after the live installer supplies byte counts, and the module disappears
-  as soon as the card is no longer downloading.
+- Available Install actions use the inverse-neutral Download glyph treatment.
+  Stable Delete keeps its destructive outline treatment without changing the
+  underlying action or accessible name. Active downloads replace the lifecycle
+  action body with a truthful progress module: known totals show a stable-width
+  downloaded/total byte label and a full-width 6 px track plus current fill;
+  unknown totals show `downloaded / Total unknown` without a fabricated fill.
+  Named 44 x 44 Pause or Play and discard-partial controls remain beside the
+  progress body. Failed downloads expose their complete error through a separate
+  accessible Warning popover. Remote cards show progress only after validated
+  live or retained byte metadata is available.
 - Requirements use responsive RAM, storage, and GPU cells. Optional
   Maintenance appears after Requirements; supported removal, partial-resume,
   discard, and runtime-safety constraints remain unchanged by expansion.
@@ -91,10 +99,15 @@ Capture and inspect original-resolution client-area screenshots at exactly
 
 1. `models/installed`: idle, hover a selectable inactive-card coordinate, and
    keyboard-focus `Use whisper.cpp tiny.en for future transcriptions`.
-2. `models/lifecycle`: inspect inverse Install, Retry, and Resume treatments;
-   verify the determinate percentage, concise byte detail, full 6 px progress
-   track/fill, named 44 x 44 Cancel target, and contained error controls.
-3. `models/card-expanded`: inspect expanded top content, then scroll the
+2. `models/download-downloading`, `models/download-retained`,
+   `models/download-failed-partial`, and `models/download-failed-alert`:
+   inspect the isolated lifecycle states. For the failed-alert fixture, capture
+   both closed and warning-alert-open states.
+3. `models/lifecycle`: inspect inverse Install and the icon-only Play/Pause
+   treatments; verify the stable-width byte detail, full 6 px progress track and
+   fill, named 44 x 44 discard target, and contained error controls. No visible
+   percentage or lifecycle status copy should replace the model description.
+4. `models/card-expanded`: inspect expanded top content, then scroll the
    Models route to inspect the complete feature grid, Requirements, optional
    Maintenance order, and shared card edges.
 

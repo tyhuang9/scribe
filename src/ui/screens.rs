@@ -2697,13 +2697,18 @@ fn render_model_download_module(
                     ui.painter()
                         .rect_filled(track, Rounding::same(3.0), colors.meter_track);
                     if let Some(fraction) = progress.fraction {
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(
-                                track.min,
-                                Vec2::new(track.width() * fraction, track.height()),
-                            ),
-                            Rounding::same(3.0),
-                            colors.accent,
+                        let fill = egui::Rect::from_min_size(
+                            track.min,
+                            Vec2::new(track.width() * fraction, track.height()),
+                        );
+                        ui.painter()
+                            .rect_filled(fill, Rounding::same(3.0), colors.accent);
+                        #[cfg(test)]
+                        register_model_layout_rect(
+                            ui,
+                            &progress.accessible_text,
+                            "download fill",
+                            fill,
                         );
                     }
                     ui.ctx().accesskit_node_builder(meter.id, |builder| {

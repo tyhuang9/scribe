@@ -13222,8 +13222,10 @@ fn key_to_hotkey_token(key: egui::Key) -> Option<&'static str> {
 mod layout_tests {
     use super::*;
     use crate::audio::CaptureMetrics;
+    use crate::installations::DownloadedArtifact;
     use crate::streaming::StreamIdentity;
     use crate::transcription::StreamUpdate;
+    use sha2::{Digest, Sha256};
 
     static NEXT_TEST_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -16397,11 +16399,10 @@ mod layout_tests {
             projected.artifact_filename.as_deref(),
             Some("ggml-base.en.bin")
         );
-        assert!(
-            projected
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains("Legacy GGML"))
+        assert_eq!(
+            projected.description.as_deref(),
+            Some(catalog_model.description.as_str()),
+            "legacy lifecycle state must preserve the catalog description"
         );
         assert_eq!(
             projected.runtime_status_label,
@@ -16462,10 +16463,11 @@ mod layout_tests {
                 && model.primary_action_installs_upgrade
                 && model.primary_action_label == "Upgrade model"
                 && model.removal_supported
-                && model
-                    .description
-                    .as_deref()
-                    .is_some_and(|description| description.contains("retained for cleanup"))
+                && model.description.as_deref().is_some_and(|description| {
+                    !description.is_empty()
+                        && !description.contains("retained for cleanup")
+                        && !description.contains("Legacy GGML")
+                })
         }));
         assert!(legacy_paths.iter().all(|path| path.is_file()));
 
@@ -18177,6 +18179,117 @@ mod layout_tests {
     }
 
     #[test]
+    fn matching_verified_install_done_wins_over_discard_intent_without_deleting_installed_artifact()
+    {
+        let root = partial_cleanup_test_root("success-wins-over-discard");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.model_paths.remove("whisper_cpp_tiny_en");
+        config::normalize_config(&mut app.config);
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .expect("normalized fixture model");
+        let destination = config::downloaded_model_path(&app.config, &model)
+            .expect("normalized model destination");
+        let staged = destination.with_extension("verified.staged");
+        fs::create_dir_all(staged.parent().expect("staged parent")).unwrap();
+        let bytes = b"verified install fixture";
+        fs::write(&staged, bytes).unwrap();
+        let model_sha256 = format!("{:x}", Sha256::digest(bytes));
+        let model_replacement = DownloadedArtifact {
+            id: model_id.as_str().to_owned(),
+            path: staged,
+            destination: destination.clone(),
+            size_bytes: bytes.len() as u64,
+            sha256: model_sha256.clone(),
+        }
+        .activate()
+        .expect("activate fixture artifact");
+        let smoke = test_install_smoke();
+        let manifest = installed_manifest::build_manifest(
+            &model_id,
+            installed_manifest::ArtifactSource::normalized(&model_id).expect("normalized source"),
+            true,
+            &destination,
+            &model_sha256,
+            &smoke,
+        )
+        .expect("build fixture manifest");
+        let manifest_replacement =
+            installed_manifest::stage_manifest(&manifest).expect("activate fixture manifest");
+        let mut journal = ActivationJournal::begin(
+            root.join("activation-journal.json"),
+            destination.clone(),
+            None,
+            false,
+            config::settings::artifact_config_fingerprint(&app.config)
+                .expect("fixture settings fingerprint"),
+        )
+        .expect("begin fixture journal");
+        journal
+            .mark(ActivationPhase::ModelActivated)
+            .expect("record model activation");
+        journal
+            .record_manifest_target(installed_manifest::manifest_path_for(&destination))
+            .expect("record manifest target");
+
+        let job_id = 62;
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (job_id, InstallCancellation::default()),
+        );
+        app.discard_partial_after_install.insert(
+            model_id.as_str().to_owned(),
+            (
+                job_id,
+                RemotePartialProbeSource::Normalized(model_id.clone()),
+            ),
+        );
+        app.tx
+            .send(AppEvent::VerifiedInstallDone {
+                job_id,
+                model_id: model_id.as_str().to_owned(),
+                result: Box::new(VerifiedInstallResult {
+                    model: model_replacement,
+                    manifest: manifest_replacement,
+                    runtime: None,
+                    runtime_id: "fixture-runtime".into(),
+                    runtime_entrypoint: None,
+                    runtime_version: None,
+                    runtime_package_id: None,
+                    runtime_archive_sha256: None,
+                    retain_runtime_as_previous: false,
+                    model_sha256,
+                    smoke,
+                    journal,
+                    remote_install: None,
+                }),
+            })
+            .unwrap();
+
+        app.poll_events();
+
+        assert_eq!(
+            app.model_downloads.get(model_id.as_str()),
+            Some(&ModelInstallStatus::Installed)
+        );
+        assert!(!app.artifact_installations.contains_key(model_id.as_str()));
+        assert!(
+            !app.discard_partial_after_install
+                .contains_key(model_id.as_str())
+        );
+        assert!(
+            destination.exists(),
+            "success must retain the installed artifact"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(app.status, TranscriptionStatus::Idle);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn local_partial_cleanup_survives_restart_and_refreshes_cached_projections() {
         let root = partial_cleanup_test_root("local");
         let mut app = test_app();
@@ -18249,9 +18362,10 @@ mod layout_tests {
         let partial = partial_sidecar(&destination);
         fs::create_dir_all(partial.parent().unwrap()).unwrap();
         fs::write(&partial, b"retained partial").unwrap();
+        let active_cancellation = InstallCancellation::default();
         app.artifact_installations.insert(
             model_id.as_str().to_owned(),
-            (1, InstallCancellation::default()),
+            (1, active_cancellation.clone()),
         );
         app.remote_catalog.invalidate_local_models();
         app.rebuild_model_inventory_projection();
@@ -18266,9 +18380,17 @@ mod layout_tests {
             model_id.as_str().to_owned(),
         ));
         assert_eq!(fs::read(&partial).unwrap(), b"retained partial");
-        assert!(app.status_message.contains("active installation"));
+        assert!(active_cancellation.is_cancelled());
+        assert_eq!(
+            app.discard_partial_after_install
+                .get(model_id.as_str())
+                .map(|(job_id, _)| *job_id),
+            Some(1)
+        );
+        assert!(app.status_message.contains("after it exits"));
 
         app.artifact_installations.remove(model_id.as_str());
+        app.discard_partial_after_install.remove(model_id.as_str());
         app.runtime_jobs
             .insert("queued-runtime".to_owned(), RuntimeInstallJob::default());
         app.remote_catalog.invalidate_local_models();
@@ -18464,8 +18586,9 @@ mod layout_tests {
             "fixture.gguf",
         )
         .unwrap();
+        let active_cancellation = InstallCancellation::default();
         app.artifact_installations
-            .insert(managed_id, (3, InstallCancellation::default()));
+            .insert(managed_id.clone(), (3, active_cancellation.clone()));
         app.refresh_remote_partial_inspection_cache();
         wait_for_remote_partial_inspections(&mut app);
         assert!(
@@ -18482,8 +18605,16 @@ mod layout_tests {
             variant_id: "q4".to_owned(),
         });
         assert_eq!(fs::read(&partial).unwrap(), b"retained again");
-        assert!(app.status_message.contains("active installation"));
+        assert!(active_cancellation.is_cancelled());
+        assert_eq!(
+            app.discard_partial_after_install
+                .get(&managed_id)
+                .map(|(job_id, _)| *job_id),
+            Some(3)
+        );
+        assert!(app.status_message.contains("after it exits"));
         app.artifact_installations.clear();
+        app.discard_partial_after_install.clear();
 
         app.apply_model_management_action(ScreenAction::DiscardRemoteCatalogPartial {
             remote_model_id: "handy-computer/partial-fixture".to_owned(),
