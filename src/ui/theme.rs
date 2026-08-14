@@ -45,6 +45,9 @@ pub(crate) struct ThemePalette {
     pub neutral_notice_text: Color32,
     pub primary_button_bg: Color32,
     pub primary_button_text: Color32,
+    /// A neutral high-contrast inverse control, reserved for stable Install actions.
+    pub inverse_neutral_bg: Color32,
+    pub inverse_neutral_text: Color32,
 }
 
 impl ThemePalette {
@@ -94,6 +97,8 @@ impl ThemePalette {
             neutral_notice_text: Color32::from_rgb(71, 84, 103),
             primary_button_bg: Color32::from_rgb(23, 27, 36),
             primary_button_text: Color32::WHITE,
+            inverse_neutral_bg: Color32::from_rgb(23, 27, 36),
+            inverse_neutral_text: Color32::WHITE,
         }
     }
 
@@ -135,6 +140,8 @@ impl ThemePalette {
             neutral_notice_text: Color32::from_rgb(196, 205, 217),
             primary_button_bg: Color32::from_rgb(37, 99, 235),
             primary_button_text: Color32::WHITE,
+            inverse_neutral_bg: Color32::from_rgb(247, 250, 252),
+            inverse_neutral_text: Color32::from_rgb(17, 19, 24),
         }
     }
 }
@@ -215,6 +222,15 @@ mod tests {
         for palette in [ThemePalette::light(), ThemePalette::dark()] {
             assert!(contrast_ratio(palette.speed_meter, palette.meter_track) >= 3.0);
             assert!(contrast_ratio(palette.accuracy_meter, palette.meter_track) >= 3.0);
+        }
+    }
+
+    #[test]
+    fn inverse_neutral_install_tokens_meet_aa_in_both_themes() {
+        for palette in [ThemePalette::light(), ThemePalette::dark()] {
+            assert!(
+                contrast_ratio(palette.inverse_neutral_text, palette.inverse_neutral_bg) >= 4.5
+            );
         }
     }
 

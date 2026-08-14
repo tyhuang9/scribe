@@ -263,6 +263,9 @@ pub(crate) enum Icon {
     Translation,
     LanguageDetection,
     BatchTranscription,
+    Cancellation,
+    ConfidenceScores,
+    CustomVocabulary,
 }
 
 pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
@@ -298,6 +301,9 @@ pub(crate) fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Translation => regular::TRANSLATE,
         Icon::LanguageDetection => regular::GLOBE,
         Icon::BatchTranscription => regular::LIST_BULLETS,
+        Icon::Cancellation => regular::PROHIBIT,
+        Icon::ConfidenceScores => regular::SEAL_CHECK,
+        Icon::CustomVocabulary => regular::NOTE_PENCIL,
     }
 }
 
@@ -321,6 +327,9 @@ mod tests {
         assert_eq!(icon_glyph(Icon::Translation), regular::TRANSLATE);
         assert_eq!(icon_glyph(Icon::LanguageDetection), regular::GLOBE);
         assert_eq!(icon_glyph(Icon::BatchTranscription), regular::LIST_BULLETS);
+        assert_eq!(icon_glyph(Icon::Cancellation), regular::PROHIBIT);
+        assert_eq!(icon_glyph(Icon::ConfidenceScores), regular::SEAL_CHECK);
+        assert_eq!(icon_glyph(Icon::CustomVocabulary), regular::NOTE_PENCIL);
     }
 
     #[test]

@@ -1925,6 +1925,7 @@ struct ModelLifecyclePresentation<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelLifecycleTone {
     Standard,
+    InverseFilled,
     DestructiveOutline,
 }
 
@@ -2039,7 +2040,9 @@ fn model_lifecycle_presentation<'a>(
                     .total_bytes
                     .map(format_compact_artifact_size)
                     .filter(|_| label == "Install"),
-                tone: ModelLifecycleTone::Standard,
+                tone: (label == "Install")
+                    .then_some(ModelLifecycleTone::InverseFilled)
+                    .unwrap_or(ModelLifecycleTone::Standard),
             }
         }
         ModelCard::Remote(entry, variant) => {
@@ -2068,7 +2071,9 @@ fn model_lifecycle_presentation<'a>(
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
-                tone: ModelLifecycleTone::Standard,
+                tone: (label == "Install")
+                    .then_some(ModelLifecycleTone::InverseFilled)
+                    .unwrap_or(ModelLifecycleTone::Standard),
             }
         }
     }
@@ -2091,11 +2096,21 @@ fn model_summary_features(card: ModelCard<'_>) -> (Vec<(Icon, &'static str)>, bo
     if !capabilities.capabilities_known {
         return (Vec::new(), false);
     }
-    let mut features = [
+    let features = [
+        (
+            capabilities.batch_transcription,
+            Icon::BatchTranscription,
+            "Batch transcription",
+        ),
         (
             capabilities.native_streaming,
             Icon::Streaming,
             "Native streaming",
+        ),
+        (
+            capabilities.cancellation,
+            Icon::Cancellation,
+            "Cancellation",
         ),
         (
             capabilities.timestamps,
@@ -2108,13 +2123,20 @@ fn model_summary_features(card: ModelCard<'_>) -> (Vec<(Icon, &'static str)>, bo
             Icon::LanguageDetection,
             "Automatic language detection",
         ),
+        (
+            capabilities.confidence_scores,
+            Icon::ConfidenceScores,
+            "Confidence scores",
+        ),
+        (
+            capabilities.custom_vocabulary,
+            Icon::CustomVocabulary,
+            "Custom vocabulary",
+        ),
     ]
     .into_iter()
     .filter_map(|(supported, icon, name)| supported.then_some((icon, name)))
     .collect::<Vec<_>>();
-    if features.is_empty() && capabilities.batch_transcription {
-        features.push((Icon::BatchTranscription, "Batch transcription"));
-    }
     (features, true)
 }
 
@@ -2252,12 +2274,25 @@ fn render_model_features(ui: &mut egui::Ui, card: ModelCard<'_>) {
                 .join(", ")
         )
     };
-    let width = (features.len().max(1) as f32 * 20.0).max(44.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 44.0), Sense::hover());
+    const ICON_STEP: f32 = 20.0;
+    const ICON_TARGET: f32 = 44.0;
+    // Keep the complete feature set compact beside metrics and lifecycle controls;
+    // additional supported features wrap rather than disappearing.
+    let max_columns = ((ui.available_width() / ICON_STEP).floor() as usize).clamp(1, 4);
+    let columns = features.len().min(max_columns).max(1);
+    let rows = features.len().div_ceil(columns).max(1);
+    let width = (columns as f32 * ICON_STEP).max(ICON_TARGET);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, rows as f32 * ICON_TARGET), Sense::hover());
     if known {
         for (index, (icon, feature_name)) in features.iter().enumerate() {
+            let column = index % columns;
+            let row = index / columns;
             let icon_rect = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 10.0 + index as f32 * 20.0, rect.center().y),
+                egui::pos2(
+                    rect.left() + ICON_STEP * (column as f32 + 0.5),
+                    rect.top() + ICON_TARGET * (row as f32 + 0.5),
+                ),
                 Vec2::splat(18.0),
             );
             ui.painter().text(
@@ -2365,6 +2400,32 @@ fn model_lifecycle_button(
             enabled,
             egui::Button::new(label).min_size(Vec2::new(44.0, 44.0)),
         ),
+        ModelLifecycleTone::InverseFilled => {
+            let colors = ui_palette(ui);
+            let color = if enabled {
+                colors.inverse_neutral_text
+            } else {
+                colors.muted_text
+            };
+            let galley = ui.painter().layout_no_wrap(
+                label.to_owned(),
+                egui::TextStyle::Button.resolve(ui.style()),
+                color,
+            );
+            let visual_size = Vec2::new(galley.size().x + 24.0, 32.0);
+            let (target, response) =
+                ui.allocate_exact_size(Vec2::new(visual_size.x.max(44.0), 44.0), Sense::click());
+            let visual = egui::Rect::from_center_size(target.center(), visual_size);
+            let fill = if enabled {
+                colors.inverse_neutral_bg
+            } else {
+                colors.disabled_bg
+            };
+            ui.painter().rect_filled(visual, Rounding::same(7.0), fill);
+            ui.painter()
+                .galley(visual.center() - galley.size() * 0.5, galley, color);
+            response
+        }
         ModelLifecycleTone::DestructiveOutline => {
             let colors = ui_palette(ui);
             let text = format!("{}  {label}", icon_glyph(Icon::Trash));
@@ -6272,13 +6333,143 @@ mod tests {
                 download_state: ModelDownloadState::Downloading,
                 ..Default::default()
             },
-            ModelViewModel::default(),
+            ModelViewModel {
+                download_state: ModelDownloadState::Failed,
+                ..Default::default()
+            },
+            ModelViewModel {
+                download_state: ModelDownloadState::Cancelled,
+                ..Default::default()
+            },
         ] {
             assert_eq!(
                 model_lifecycle_presentation(ModelCard::Local(&model), true).tone,
                 ModelLifecycleTone::Standard
             );
         }
+    }
+
+    #[test]
+    fn stable_install_uses_inverse_fill_without_changing_action_or_accessibility() {
+        let install = ModelViewModel {
+            id: "stable-install".into(),
+            display_name: "Stable install".into(),
+            install_supported: true,
+            install_action_enabled: true,
+            total_bytes: Some(1_500_000_000),
+            ..Default::default()
+        };
+        let install = model_lifecycle_presentation(ModelCard::Local(&install), true);
+        assert_eq!(
+            install.action,
+            ScreenAction::InstallModel("stable-install".into())
+        );
+        assert_eq!(install.tone, ModelLifecycleTone::InverseFilled);
+        assert_eq!(install.accessible_name, "Install Stable install");
+        assert_eq!(install.compact_size.as_deref(), Some("1.5 GB"));
+
+        let remote_entry = RemoteCatalogEntryView {
+            id: "trusted/stable".into(),
+            display_name: "Remote stable".into(),
+            ..Default::default()
+        };
+        let remote_variant = RemoteCatalogVariantView {
+            id: "stable-q5".into(),
+            size_bytes: 82_000_000,
+            actions: vec![RemoteCatalogActionView {
+                label: "Install".into(),
+                kind: RemoteCatalogActionKind::Install {
+                    remote_model_id: remote_entry.id.clone(),
+                    variant_id: "stable-q5".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }],
+            ..Default::default()
+        };
+        let remote =
+            model_lifecycle_presentation(ModelCard::Remote(&remote_entry, &remote_variant), true);
+        assert_eq!(remote.tone, ModelLifecycleTone::InverseFilled);
+        assert_eq!(remote.accessible_name, "Install Remote stable");
+        assert_eq!(remote.compact_size.as_deref(), Some("82 MB"));
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&ctx);
+        let mut expected_fill = Color32::PLACEHOLDER;
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                expected_fill = ui_palette(ui).inverse_neutral_bg;
+                model_lifecycle_button(
+                    ui,
+                    &format!("{}  1.5 GB", icon_glyph(Icon::Download)),
+                    &install.accessible_name,
+                    install.enabled,
+                    install.disabled_reason,
+                    install.tone,
+                );
+            });
+        });
+        let install_text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text().contains(icon_glyph(Icon::Download))
+                        && text.galley.text().contains("1.5 GB") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("Install glyph and compact size");
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::epaint::Shape::Rect(rect)
+                    if rect.fill == expected_fill
+                        && rect.rect.contains_rect(install_text.visual_bounding_rect())
+            )
+        }));
+        let node = output
+            .platform_output
+            .accesskit_update
+            .expect("Install accessibility update")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| (node.name() == Some("Install Stable install")).then_some(node))
+            .expect("Install accessibility node");
+        let bounds = node.bounds().expect("Install target bounds");
+        assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+
+        let disabled_ctx = egui::Context::default();
+        disabled_ctx.enable_accesskit();
+        crate::ui::controls::configure_accessible_style(&disabled_ctx);
+        let disabled = disabled_ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                model_lifecycle_button(
+                    ui,
+                    &format!("{}  1.5 GB", icon_glyph(Icon::Download)),
+                    "Install unavailable",
+                    false,
+                    Some("The download is unavailable."),
+                    ModelLifecycleTone::InverseFilled,
+                );
+            });
+        });
+        let disabled_node = disabled
+            .platform_output
+            .accesskit_update
+            .expect("disabled Install accessibility update")
+            .nodes
+            .into_iter()
+            .find_map(|(_, node)| (node.name() == Some("Install unavailable")).then_some(node))
+            .expect("disabled Install accessibility node");
+        assert!(disabled_node.is_disabled());
+        assert_eq!(
+            disabled_node.description(),
+            Some("The download is unavailable.")
+        );
     }
 
     #[test]

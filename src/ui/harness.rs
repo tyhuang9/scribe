@@ -2938,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    fn feature_summary_limits_priority_icons_and_keeps_each_glyph_hover_only() {
+    fn feature_summary_wraps_all_known_icons_and_keeps_each_glyph_hover_only() {
         fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
             match shape {
                 egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
@@ -2975,7 +2975,7 @@ mod tests {
         data.model_catalog.clear();
         let mut page = AppPage::Models;
         let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let feature_name = "Features: Native streaming, Word timestamps, Translation, Automatic language detection";
+        let feature_name = "Features: Batch transcription, Native streaming, Cancellation, Word timestamps, Translation, Automatic language detection, Confidence scores, Custom vocabulary";
         let feature_group = node_matching(&initial, |node| node.name() == Some(feature_name));
         assert_eq!(feature_group.role(), egui::accesskit::Role::Group);
         let nodes = &initial
@@ -2997,18 +2997,30 @@ mod tests {
                 egui::accesskit::Role::Button | egui::accesskit::Role::Link
             ) && [
                 "Native streaming",
+                "Batch transcription",
+                "Cancellation",
                 "Word timestamps",
                 "Translation",
                 "Automatic language detection",
+                "Confidence scores",
+                "Custom vocabulary",
             ]
             .contains(&node.name().unwrap_or_default())
         }));
         let bounds = feature_group.bounds().unwrap();
+        assert!(
+            bounds.height() >= 88.0 - LAYOUT_TOLERANCE,
+            "eight summary icons should wrap within the compact feature group: {bounds:?}"
+        );
         for (index, tooltip) in [
+            "Batch transcription",
             "Native streaming",
+            "Cancellation",
             "Word timestamps",
             "Translation",
             "Automatic language detection",
+            "Confidence scores",
+            "Custom vocabulary",
         ]
         .into_iter()
         .enumerate()
@@ -3024,8 +3036,8 @@ mod tests {
                 Some(time),
             );
             let pointer = egui::pos2(
-                bounds.x0 as f32 + 10.0 + index as f32 * 20.0,
-                (bounds.y0 as f32 + bounds.y1 as f32) / 2.0,
+                bounds.x0 as f32 + 10.0 + (index % 4) as f32 * 20.0,
+                bounds.y0 as f32 + 22.0 + (index / 4) as f32 * 44.0,
             );
             let _ = render_with_input_at_time(
                 &ctx,
