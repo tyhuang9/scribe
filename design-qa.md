@@ -630,3 +630,64 @@ this result to passed. Draft PR #38 must remain unchanged while this Product
 Design gate is blocked.
 
 final result: blocked
+
+---
+
+# Inline progress layout QA - 2026-08-14
+
+## Source and comparison set
+
+This pass uses the three newest local reference attachments directly:
+
+- `C:\Users\huang\.codex\attachments\764e8dcf-4492-46da-b4c5-a76f2267faf2\image-1.png`
+- `C:\Users\huang\.codex\attachments\764e8dcf-4492-46da-b4c5-a76f2267faf2\image-2.png`
+- `C:\Users\huang\.codex\attachments\764e8dcf-4492-46da-b4c5-a76f2267faf2\image-3.png`
+
+The references and current-build captures were opened together at original
+resolution. The newest instruction intentionally supersedes the reference-1
+vertical control stack: the byte label remains above, while the complete 6 px
+track, Pause/Play, and X now share the following row.
+
+## Accepted current-build evidence
+
+- `design-qa-evidence/inline-progress-1180x815-downloading-v3.png`
+- `design-qa-evidence/inline-progress-960x680-downloading.png`
+- `design-qa-evidence/inline-progress-1180x815-same-fixture-collapsed.png`
+- `design-qa-evidence/inline-progress-960x680-same-fixture-collapsed.png`
+- `design-qa-evidence/inline-progress-1180x815-expanded.png`
+- `design-qa-evidence/inline-progress-960x680-expanded.png`
+
+Logical 1180 x 815 captures are 1475 x 1019 physical pixels and logical
+960 x 680 captures are 1200 x 850 at the current 120-DPI scale. A valid but
+off-state 1180 capture that did not show the downloading card was rejected and
+deleted before this report.
+
+## Comparison result
+
+- At both viewports the track, Pause, and X are ordered left-to-right on one
+  line, remain contained, and preserve their full control targets.
+- The byte label has its own stable measured slot above the track/control row.
+  Deterministic early/near-complete fixtures with the same total prove that the
+  label slot, track, Pause, and X bounds do not move as the byte count grows.
+- The full progress module is vertically centered in the fixed lifecycle body.
+  Install and Delete share the same vertical-center contract.
+- Collapsed and expanded cards retain the same title, description, language,
+  metric, lifecycle, and chevron origins for a one-line description. A truly
+  overflowing expanded description keeps the preview baseline and grows only
+  downward; it does not compress or pull the summary upward.
+- The neutral card surface, 50/24/26 zones, feature treatment, meter colors,
+  shadows, and focus treatment remain consistent with the supplied card
+  references. No P0, P1, or P2 visual defect was found.
+
+## Verification
+
+- Focused screen tests: 70 passed, 0 failed.
+- Focused harness tests: 69 passed, 0 failed, 1 pre-existing ignored.
+- Full all-feature suite: 853 passed, 0 failed, 11 ignored.
+- Full default suite: 783 passed, 0 failed, 10 ignored.
+- Strict all-target/all-feature Clippy with warnings denied, all-target/all-
+  feature check, formatting, and diff checks pass in direct Visual Studio
+  Developer PowerShell. No `cmd.exe` wrapper is used by the documented launch
+  or verification workflow.
+
+final result: passed
