@@ -543,6 +543,10 @@ pub(crate) struct RemoteCatalogVariantView {
     pub normalized_model_id: Option<String>,
     pub managed_model_id: Option<String>,
     pub size_bytes: u64,
+    /// Volatile live download bytes, populated only while the installer reports progress.
+    pub downloaded_bytes: Option<u64>,
+    /// Volatile live total, which may remain unknown even when a download is active.
+    pub total_bytes: Option<u64>,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
     pub accuracy_guidance: String,

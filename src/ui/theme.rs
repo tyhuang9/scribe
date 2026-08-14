@@ -21,8 +21,11 @@ pub(crate) struct ThemePalette {
     pub slider_live_above: Color32,
     /// Short model-card meter colors. `meter_track` is intentionally neutral.
     pub meter_track: Color32,
-    pub speed_meter: Color32,
-    pub accuracy_meter: Color32,
+    pub meter_rating_1: Color32,
+    pub meter_rating_2: Color32,
+    pub meter_rating_3: Color32,
+    pub meter_rating_4: Color32,
+    pub meter_rating_5: Color32,
     pub primary: Color32,
     pub accent: Color32,
     /// Theme-coherent blue/neutral track for the compact recording-mode selector.
@@ -79,8 +82,11 @@ impl ThemePalette {
             slider_live_below: Color32::from_rgb(29, 78, 216),
             slider_live_above: Color32::from_rgb(6, 118, 71),
             meter_track: Color32::from_rgb(226, 232, 240),
-            speed_meter: Color32::from_rgb(6, 118, 71),
-            accuracy_meter: Color32::from_rgb(180, 83, 9),
+            meter_rating_1: Color32::from_rgb(220, 38, 38),
+            meter_rating_2: Color32::from_rgb(194, 65, 12),
+            meter_rating_3: Color32::from_rgb(161, 98, 7),
+            meter_rating_4: Color32::from_rgb(77, 124, 15),
+            meter_rating_5: Color32::from_rgb(6, 118, 71),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
             segmented_control_bg: Color32::from_rgb(37, 99, 235),
@@ -122,8 +128,11 @@ impl ThemePalette {
             slider_live_below: Color32::from_rgb(96, 165, 250),
             slider_live_above: Color32::from_rgb(74, 222, 128),
             meter_track: Color32::from_rgb(53, 61, 76),
-            speed_meter: Color32::from_rgb(74, 222, 128),
-            accuracy_meter: Color32::from_rgb(251, 191, 36),
+            meter_rating_1: Color32::from_rgb(248, 113, 113),
+            meter_rating_2: Color32::from_rgb(251, 146, 60),
+            meter_rating_3: Color32::from_rgb(250, 204, 21),
+            meter_rating_4: Color32::from_rgb(163, 230, 53),
+            meter_rating_5: Color32::from_rgb(74, 222, 128),
             primary: Color32::from_rgb(247, 250, 252),
             accent: Color32::from_rgb(96, 165, 250),
             segmented_control_bg: Color32::from_rgb(96, 115, 140),
@@ -142,6 +151,16 @@ impl ThemePalette {
             primary_button_text: Color32::WHITE,
             inverse_neutral_bg: Color32::from_rgb(247, 250, 252),
             inverse_neutral_text: Color32::from_rgb(17, 19, 24),
+        }
+    }
+
+    pub(crate) fn meter_rating(self, rating: u8) -> Color32 {
+        match rating.clamp(1, 5) {
+            1 => self.meter_rating_1,
+            2 => self.meter_rating_2,
+            3 => self.meter_rating_3,
+            4 => self.meter_rating_4,
+            _ => self.meter_rating_5,
         }
     }
 }
@@ -218,10 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn model_card_meter_tokens_contrast_with_their_neutral_track() {
+    fn model_card_meter_tokens_have_five_accessible_bins_in_both_themes() {
         for palette in [ThemePalette::light(), ThemePalette::dark()] {
-            assert!(contrast_ratio(palette.speed_meter, palette.meter_track) >= 3.0);
-            assert!(contrast_ratio(palette.accuracy_meter, palette.meter_track) >= 3.0);
+            let bins = (1..=5)
+                .map(|rating| palette.meter_rating(rating))
+                .collect::<Vec<_>>();
+            assert_eq!(bins.len(), 5);
+            assert!(bins.windows(2).all(|pair| pair[0] != pair[1]));
+            for color in bins {
+                assert!(contrast_ratio(color, palette.meter_track) >= 3.0);
+            }
         }
     }
 

@@ -6214,6 +6214,7 @@ impl LocalTranscriberApp {
                         },
                     );
                     self.update_model_download_progress_projection(&model_id);
+                    self.update_remote_download_progress_projection(&model_id);
                     self.status_message = format!("{stage_label} for {model_id}...");
                 }
                 AppEvent::VerifiedInstallDone {
@@ -8904,11 +8905,22 @@ impl LocalTranscriberApp {
                 };
 
                 let status_label;
+                let mut downloaded_bytes = None;
+                let mut total_bytes = None;
                 let mut actions = Vec::new();
                 if let Some(download_id) = download_id.as_deref()
                     && let Some(status) = self.model_downloads.get(download_id)
                 {
                     status_label = Some(status.label());
+                    if let ModelInstallStatus::Downloading {
+                        downloaded_bytes: progress_downloaded_bytes,
+                        total_bytes: progress_total_bytes,
+                        ..
+                    } = status
+                    {
+                        downloaded_bytes = Some(*progress_downloaded_bytes);
+                        total_bytes = *progress_total_bytes;
+                    }
                     if matches!(
                         status,
                         ModelInstallStatus::Downloading { .. }
@@ -8985,6 +8997,8 @@ impl LocalTranscriberApp {
                     normalized_model_id: normalized_model_id.map(|id| id.to_string()),
                     managed_model_id: remote_id,
                     size_bytes: variant.size_bytes,
+                    downloaded_bytes,
+                    total_bytes,
                     size_tier: size_tier_for_bytes(variant.size_bytes),
                     speed_tier: descriptor
                         .as_ref()
@@ -9229,6 +9243,32 @@ impl LocalTranscriberApp {
             model.downloaded_bytes = downloaded_bytes;
             model.total_bytes = total_bytes.or(model.total_bytes);
             model.error_message = None;
+        }
+    }
+
+    fn update_remote_download_progress_projection(&mut self, model_id: &str) {
+        let Some(ModelInstallStatus::Downloading {
+            downloaded_bytes,
+            total_bytes,
+            ..
+        }) = self.model_downloads.get(model_id)
+        else {
+            return;
+        };
+        let Some(projection) = self.remote_catalog.projection.as_mut() else {
+            return;
+        };
+        for variant in projection
+            .entries
+            .iter_mut()
+            .flat_map(|entry| &mut entry.variants)
+            .filter(|variant| {
+                variant.normalized_model_id.as_deref() == Some(model_id)
+                    || variant.managed_model_id.as_deref() == Some(model_id)
+            })
+        {
+            variant.downloaded_bytes = Some(*downloaded_bytes);
+            variant.total_bytes = *total_bytes;
         }
     }
 

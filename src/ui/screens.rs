@@ -1867,11 +1867,7 @@ fn rating_meter(
                 ui.painter().rect_filled(
                     fill,
                     Rounding::same(3.5),
-                    if name == "Speed" {
-                        colors.speed_meter
-                    } else {
-                        colors.accuracy_meter
-                    },
+                    colors.meter_rating(rating.unwrap().0),
                 );
             }
             response.widget_info(|| {
@@ -1910,10 +1906,14 @@ fn model_row_description(card: ModelCard<'_>) -> String {
             .description
             .clone()
             .unwrap_or_else(|| "Local speech-to-text model.".to_owned()),
-        ModelCard::Remote(entry, variant) => variant
-            .status_label
-            .clone()
-            .filter(|status| !status.trim().is_empty())
+        ModelCard::Remote(entry, variant) => model_download_progress_presentation(card)
+            .map(|progress| progress.display_text)
+            .or_else(|| {
+                variant
+                    .status_label
+                    .clone()
+                    .filter(|status| !status.trim().is_empty())
+            })
             .unwrap_or_else(|| entry.description.clone()),
     }
 }
@@ -2066,7 +2066,7 @@ fn model_lifecycle_presentation<'a>(
                     .total_bytes
                     .map(format_compact_artifact_size)
                     .filter(|_| label == "Install"),
-                tone: if label == "Install" {
+                tone: if matches!(label, "Install" | "Retry" | "Resume") {
                     ModelLifecycleTone::InverseFilled
                 } else {
                     ModelLifecycleTone::Standard
@@ -2080,6 +2080,7 @@ fn model_lifecycle_presentation<'a>(
                 .find(|action| matches!(action.kind, RemoteCatalogActionKind::Cancel { .. }))
                 .or_else(|| remote_primary_action(variant));
             let label = remote.map_or("Install", |action| action.label.as_str());
+            let label = if label == "Remove" { "Delete" } else { label };
             ModelLifecyclePresentation {
                 action: remote.map_or(ScreenAction::None, |action| {
                     screen_action_for_remote_catalog_action(&action.kind)
@@ -2089,20 +2090,16 @@ fn model_lifecycle_presentation<'a>(
                 } else {
                     Icon::Download
                 },
-                label: if label == "Remove" { "Delete" } else { label }.into(),
-                accessible_name: format!(
-                    "{} {}",
-                    if label == "Remove" { "Delete" } else { label },
-                    entry.display_name
-                ),
+                label: label.into(),
+                accessible_name: format!("{label} {}", entry.display_name),
                 enabled: remote.is_some_and(|action| action.enabled),
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
-                tone: if label == "Install" {
-                    ModelLifecycleTone::InverseFilled
-                } else {
-                    ModelLifecycleTone::Standard
+                tone: match label {
+                    "Install" | "Retry" | "Resume" => ModelLifecycleTone::InverseFilled,
+                    "Delete" => ModelLifecycleTone::DestructiveOutline,
+                    _ => ModelLifecycleTone::Standard,
                 },
             }
         }
@@ -3179,6 +3176,9 @@ fn render_unified_model_card(
     ui.ctx().accesskit_node_builder(frame.id, |builder| {
         builder.set_role(egui::accesskit::Role::Group);
         builder.set_name(format!("{name} model"));
+        if let Some(progress) = model_download_progress_presentation(card) {
+            builder.set_description(progress.accessible_text);
+        }
         builder.set_bounds(accesskit_rect(frame.rect));
     });
     ModelCardRenderResult {
@@ -3291,7 +3291,7 @@ fn render_inline_model_details(
                         &removal_name,
                         removal_reason.is_none(),
                         removal_reason,
-                        ModelLifecycleTone::Standard,
+                        ModelLifecycleTone::DestructiveOutline,
                     );
                     *focus_within |= removal.has_focus();
                     activation_exclusions.push(removal.rect);
@@ -4264,13 +4264,12 @@ fn models(
 
 fn model_download_label(model: &ModelViewModel) -> String {
     match model.download_state {
-        ModelDownloadState::Downloading => match model.total_bytes.filter(|total| *total > 0) {
-            Some(total) => format!(
-                "Downloading {:.0}%",
-                model.downloaded_bytes as f64 / total as f64 * 100.0
-            ),
-            None => format!("Downloading {}", format_bytes(model.downloaded_bytes)),
-        },
+        ModelDownloadState::Downloading => {
+            model_download_progress_presentation(ModelCard::Local(model)).map_or_else(
+                || "Downloading".to_owned(),
+                |progress| progress.display_text,
+            )
+        }
         ModelDownloadState::Queued => "Queued".to_owned(),
         ModelDownloadState::Verifying => "Verifying".to_owned(),
         ModelDownloadState::Extracting => "Extracting".to_owned(),
@@ -4282,6 +4281,64 @@ fn model_download_label(model: &ModelViewModel) -> String {
         ModelDownloadState::Cancelled => "Cancelled; partial download can be resumed.".to_owned(),
         ModelDownloadState::NotInstalled => "Not installed".to_owned(),
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ModelDownloadProgressPresentation {
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    fraction: Option<f32>,
+    total_is_unknown: bool,
+    display_text: String,
+    accessible_text: String,
+}
+
+fn model_download_progress_presentation(
+    card: ModelCard<'_>,
+) -> Option<ModelDownloadProgressPresentation> {
+    let (downloaded_bytes, total_bytes) = match card {
+        ModelCard::Local(model) if model.download_state == ModelDownloadState::Downloading => {
+            (model.downloaded_bytes, model.total_bytes)
+        }
+        // Remote progress exists only when the live installer supplied it.
+        ModelCard::Remote(_, variant) => (variant.downloaded_bytes?, variant.total_bytes),
+        _ => return None,
+    };
+    let total_bytes = total_bytes.filter(|total| *total > 0);
+    let fraction =
+        total_bytes.map(|total| (downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32);
+    let (display_text, accessible_text) = match total_bytes {
+        Some(total) => {
+            let percent = fraction.expect("known totals always have a fraction") * 100.0;
+            (
+                format!(
+                    "Downloading {} of {} ({percent:.0}%)",
+                    format_download_bytes(downloaded_bytes),
+                    format_download_bytes(total)
+                ),
+                format!(
+                    "Downloading {} of {}, {percent:.0}% complete",
+                    format_download_bytes(downloaded_bytes),
+                    format_download_bytes(total)
+                ),
+            )
+        }
+        None => (
+            format!("Downloading {}", format_download_bytes(downloaded_bytes)),
+            format!(
+                "Downloading {}; total download size unknown",
+                format_download_bytes(downloaded_bytes)
+            ),
+        ),
+    };
+    Some(ModelDownloadProgressPresentation {
+        downloaded_bytes,
+        total_bytes,
+        fraction,
+        total_is_unknown: total_bytes.is_none(),
+        display_text,
+        accessible_text,
+    })
 }
 
 /// Consume Tab before egui's document-wide navigation sees it, then route it
@@ -6458,6 +6515,18 @@ fn format_bytes(bytes: u64) -> String {
         format!("{}MB", bytes / 1_000_000)
     }
 }
+
+fn format_download_bytes(bytes: u64) -> String {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
 fn placeholder(ui: &mut egui::Ui, title: &str, message: &str) -> ScreenAction {
     header(ui, title, message);
     card(ui, |ui| {
@@ -6602,11 +6671,7 @@ mod tests {
                 ..Default::default()
             },
             ModelViewModel {
-                download_state: ModelDownloadState::Failed,
-                ..Default::default()
-            },
-            ModelViewModel {
-                download_state: ModelDownloadState::Cancelled,
+                download_state: ModelDownloadState::Downloading,
                 ..Default::default()
             },
         ] {
@@ -6615,6 +6680,60 @@ mod tests {
                 ModelLifecycleTone::Standard
             );
         }
+
+        for state in [ModelDownloadState::Failed, ModelDownloadState::Cancelled] {
+            let model = ModelViewModel {
+                download_state: state,
+                ..Default::default()
+            };
+            let presentation = model_lifecycle_presentation(ModelCard::Local(&model), true);
+            assert_eq!(presentation.tone, ModelLifecycleTone::InverseFilled);
+        }
+    }
+
+    #[test]
+    fn model_download_progress_is_local_truthful_and_clamped() {
+        let downloading = ModelViewModel {
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 120,
+            total_bytes: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_download_progress_presentation(ModelCard::Local(&downloading)),
+            Some(ModelDownloadProgressPresentation {
+                downloaded_bytes: 120,
+                total_bytes: Some(100),
+                fraction: Some(1.0),
+                total_is_unknown: false,
+                display_text: "Downloading 120B of 100B (100%)".into(),
+                accessible_text: "Downloading 120B of 100B, 100% complete".into(),
+            })
+        );
+
+        let unknown_total = ModelViewModel {
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 42,
+            total_bytes: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            model_download_progress_presentation(ModelCard::Local(&unknown_total)),
+            Some(ModelDownloadProgressPresentation {
+                downloaded_bytes: 42,
+                total_bytes: None,
+                fraction: None,
+                total_is_unknown: true,
+                display_text: "Downloading 42B".into(),
+                accessible_text: "Downloading 42B; total download size unknown".into(),
+            })
+        );
+        assert_eq!(model_download_label(&unknown_total), "Downloading 42B");
+        let not_downloading = ModelViewModel::default();
+        assert_eq!(
+            model_download_progress_presentation(ModelCard::Local(&not_downloading)),
+            None
+        );
     }
 
     #[test]
