@@ -971,15 +971,17 @@ struct RemoteCatalogProjection {
 enum PartialInspection {
     Unknown,
     Missing,
-    Present,
+    Present(crate::installations::RetainedPartial),
     Error(String),
 }
 
 impl PartialInspection {
-    fn from_result(result: Result<bool, InstallError>) -> Self {
+    fn from_result(
+        result: Result<Option<crate::installations::RetainedPartial>, InstallError>,
+    ) -> Self {
         match result {
-            Ok(true) => Self::Present,
-            Ok(false) => Self::Missing,
+            Ok(Some(partial)) => Self::Present(partial),
+            Ok(None) => Self::Missing,
             Err(error) => Self::Error(format!(
                 "Scribe can't safely manage this partial file. Remove it from model storage, then retry. {error}"
             )),
@@ -2475,6 +2477,9 @@ pub struct LocalTranscriberApp {
     model_downloads: HashMap<String, ModelInstallStatus>,
     runtime_jobs: HashMap<String, RuntimeInstallJob>,
     artifact_installations: HashMap<String, (u64, InstallCancellation)>,
+    discard_partial_after_install: HashMap<String, (u64, RemotePartialProbeSource)>,
+    #[cfg(test)]
+    partial_discard_recovery_error_for_test: Option<String>,
     local_gguf_import: Option<LocalGgufImportJob>,
     local_gguf_import_status: Option<String>,
     artifact_recovery_error: Option<String>,
@@ -2602,6 +2607,9 @@ impl LocalTranscriberApp {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
+            discard_partial_after_install: HashMap::new(),
+            #[cfg(test)]
+            partial_discard_recovery_error_for_test: None,
             local_gguf_import: None,
             local_gguf_import_status: None,
             artifact_recovery_error: None,
@@ -6253,6 +6261,7 @@ impl LocalTranscriberApp {
                         }
                         continue;
                     }
+                    self.take_requested_partial_discard(&model_id, job_id);
                     self.remote_catalog.invalidate_local_models();
                     self.artifact_installations.remove(&model_id);
                     let previous_config = self.config.clone();
@@ -6466,13 +6475,25 @@ impl LocalTranscriberApp {
                     }
                     self.remote_catalog.invalidate_local_models();
                     self.artifact_installations.remove(&model_id);
+                    let discard_result = self
+                        .take_requested_partial_discard(&model_id, job_id)
+                        .map(|source| self.discard_partial_source(&source));
                     if recovery_required {
                         self.artifact_recovery_error = Some(message.clone());
                     }
                     self.model_downloads
-                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
-                    self.status = TranscriptionStatus::Error;
-                    self.status_message = format!("Installation failed: {message}");
+                        .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
+                    if let Some(result) = discard_result {
+                        let cleanup_succeeded = result.is_ok();
+                        self.finish_partial_discard(&model_id, result);
+                        if recovery_required && cleanup_succeeded {
+                            self.status = TranscriptionStatus::Error;
+                            self.status_message = format!("Installation failed: {message}");
+                        }
+                    } else {
+                        self.status = TranscriptionStatus::Error;
+                        self.status_message = format!("Installation failed: {message}");
+                    }
                 }
                 AppEvent::RuntimeInstallDone {
                     runtime_id,
@@ -7313,6 +7334,7 @@ impl LocalTranscriberApp {
         let cancellation = InstallCancellation::default();
         let thread_cancellation = cancellation.clone();
         let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.discard_partial_after_install.remove(&model.id);
         self.artifact_installations
             .insert(model.id.clone(), (job_id, cancellation));
         thread::spawn(move || {
@@ -7387,6 +7409,7 @@ impl LocalTranscriberApp {
         let cancellation = InstallCancellation::default();
         let thread_cancellation = cancellation.clone();
         let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.discard_partial_after_install.remove(&model_id);
         self.artifact_installations
             .insert(model_id.clone(), (job_id, cancellation));
         thread::spawn(move || {
@@ -8530,10 +8553,10 @@ impl LocalTranscriberApp {
     ) -> PartialInspection {
         PartialInspection::from_result(match source {
             RemotePartialProbeSource::Normalized(model_id) => {
-                managed_downloads::normalized_model_has_partial(config, model_id)
+                managed_downloads::normalized_model_retained_partial(config, model_id)
             }
             RemotePartialProbeSource::Trusted(artifact) => {
-                managed_downloads::trusted_gguf_has_partial(config, artifact)
+                managed_downloads::trusted_gguf_retained_partial(config, artifact)
             }
         })
     }
@@ -8850,7 +8873,7 @@ impl LocalTranscriberApp {
                     .get(&(model.id.clone(), variant.id.clone()))
                     .unwrap_or(&PartialInspection::Unknown);
                 let has_partial = !exact_install_active
-                    && matches!(partial_inspection, PartialInspection::Present);
+                    && matches!(partial_inspection, PartialInspection::Present(partial) if partial.bytes > 0);
                 let partial_inspection_block_reason = if exact_install_active || artifact.is_none() {
                     None
                 } else {
@@ -8859,7 +8882,7 @@ impl LocalTranscriberApp {
                             Some("Checking retained download…".to_owned())
                         }
                         PartialInspection::Error(reason) => Some(reason.clone()),
-                        PartialInspection::Missing | PartialInspection::Present => None,
+                        PartialInspection::Missing | PartialInspection::Present(_) => None,
                     }
                 };
                 let partial_inspection_error = match partial_inspection {
@@ -9304,7 +9327,7 @@ impl LocalTranscriberApp {
             });
             if descriptor.is_some() || artifact_present {
                 let partial_inspection = PartialInspection::from_result(
-                    managed_downloads::normalized_model_has_partial(
+                    managed_downloads::normalized_model_retained_partial(
                         &self.config,
                         &ModelId::new(&model.id),
                     ),
@@ -9327,7 +9350,8 @@ impl LocalTranscriberApp {
     ) -> ModelViewModel {
         let (display_name, variant_label) = model_ui_labels(model, descriptor);
         let install_status = self.effective_install_status(model);
-        let has_partial = matches!(partial_inspection, PartialInspection::Present);
+        let has_partial =
+            matches!(partial_inspection, PartialInspection::Present(partial) if partial.bytes > 0);
         let partial_inspection_error = match partial_inspection {
             PartialInspection::Error(reason) => Some(reason.clone()),
             _ => None,
@@ -10085,6 +10109,19 @@ impl LocalTranscriberApp {
     }
 
     fn discard_normalized_model_partial(&mut self, model_id: ModelId) {
+        if let Some((job_id, cancellation)) =
+            self.artifact_installations.get(model_id.as_str()).cloned()
+        {
+            self.discard_partial_after_install.insert(
+                model_id.as_str().to_owned(),
+                (job_id, RemotePartialProbeSource::Normalized(model_id)),
+            );
+            cancellation.cancel();
+            self.status_message =
+                "Cancelling download; retained partial bytes will be discarded after it exits."
+                    .to_owned();
+            return;
+        }
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = format!("Could not discard the retained partial: {reason}");
             return;
@@ -10103,6 +10140,17 @@ impl LocalTranscriberApp {
             self.status_message = "The selected catalog artifact failed Scribe's identity validation. Refresh the catalog and try again. No files were changed.".to_owned();
             return;
         };
+        if let Some((job_id, cancellation)) = self.artifact_installations.get(&model_id).cloned() {
+            self.discard_partial_after_install.insert(
+                model_id,
+                (job_id, RemotePartialProbeSource::Trusted(artifact)),
+            );
+            cancellation.cancel();
+            self.status_message =
+                "Cancelling download; retained partial bytes will be discarded after it exits."
+                    .to_owned();
+            return;
+        }
         if let Some(reason) = self.artifact_mutation_block_reason() {
             self.status_message = format!("Could not discard the retained partial: {reason}");
             return;
@@ -10128,7 +10176,18 @@ impl LocalTranscriberApp {
             }
             Err(error) => {
                 if error.requires_recovery() {
-                    self.artifact_recovery_error = Some(error.to_string());
+                    let recovery_error = error.to_string();
+                    self.artifact_recovery_error = Some(
+                        self.artifact_recovery_error
+                            .take()
+                            .filter(|existing| existing != &recovery_error)
+                            .map(|existing| {
+                                format!(
+                                    "{existing} Cleanup recovery also required: {recovery_error}"
+                                )
+                            })
+                            .unwrap_or(recovery_error),
+                    );
                 }
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
@@ -10137,6 +10196,41 @@ impl LocalTranscriberApp {
         }
         self.remote_catalog.invalidate_local_models();
         self.rebuild_model_inventory_projection();
+    }
+
+    fn take_requested_partial_discard(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+    ) -> Option<RemotePartialProbeSource> {
+        let Some((requested_job_id, source)) = self.discard_partial_after_install.get(model_id)
+        else {
+            return None;
+        };
+        if *requested_job_id != job_id {
+            return None;
+        }
+        let source = source.clone();
+        self.discard_partial_after_install.remove(model_id);
+        Some(source)
+    }
+
+    fn discard_partial_source(
+        &self,
+        source: &RemotePartialProbeSource,
+    ) -> Result<bool, InstallError> {
+        #[cfg(test)]
+        if let Some(error) = self.partial_discard_recovery_error_for_test.as_ref() {
+            return Err(InstallError::RecoveryRequired(error.clone()));
+        }
+        match source {
+            RemotePartialProbeSource::Normalized(model_id) => {
+                managed_downloads::discard_normalized_model_partial(&self.config, model_id)
+            }
+            RemotePartialProbeSource::Trusted(artifact) => {
+                managed_downloads::discard_trusted_gguf_partial(&self.config, artifact)
+            }
+        }
     }
 
     fn ui_playground(&mut self, ui: &mut Ui) {
@@ -17618,6 +17712,8 @@ mod layout_tests {
             model_downloads: HashMap::new(),
             runtime_jobs: HashMap::new(),
             artifact_installations: HashMap::new(),
+            discard_partial_after_install: HashMap::new(),
+            partial_discard_recovery_error_for_test: None,
             local_gguf_import: None,
             local_gguf_import_status: None,
             artifact_recovery_error: None,
@@ -17926,6 +18022,154 @@ mod layout_tests {
     }
 
     #[test]
+    fn pause_cancels_only_the_current_job_and_keeps_discard_intent_empty() {
+        let mut app = test_app();
+        let cancellation = InstallCancellation::default();
+        app.artifact_installations
+            .insert("whisper_cpp_tiny_en".to_owned(), (41, cancellation.clone()));
+
+        app.apply_model_management_action(ScreenAction::CancelModelInstall(
+            "whisper_cpp_tiny_en".to_owned(),
+        ));
+
+        assert!(cancellation.is_cancelled());
+        assert!(app.discard_partial_after_install.is_empty());
+    }
+
+    #[test]
+    fn matching_failed_job_discards_its_retained_normalized_partial() {
+        let root = partial_cleanup_test_root("matching-exit-discard");
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        app.config.general.model_paths.remove("whisper_cpp_tiny_en");
+        config::normalize_config(&mut app.config);
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let model = config::configured_models(&app.config)
+            .into_iter()
+            .find(|model| model.id == model_id.as_str())
+            .unwrap();
+        let destination = config::downloaded_model_path(&app.config, &model).unwrap();
+        let partial = partial_sidecar(&destination);
+        fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        fs::write(&partial, b"retained bytes").unwrap();
+        let cancellation = InstallCancellation::default();
+        app.artifact_installations
+            .insert(model_id.as_str().to_owned(), (42, cancellation.clone()));
+
+        app.discard_normalized_model_partial(model_id.clone());
+        assert!(cancellation.is_cancelled());
+        assert!(partial.exists());
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 42,
+                model_id: model_id.as_str().to_owned(),
+                message: "installation cancelled".to_owned(),
+                recovery_required: false,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert!(!partial.exists());
+        assert!(!app.artifact_installations.contains_key(model_id.as_str()));
+        assert!(
+            !app.discard_partial_after_install
+                .contains_key(model_id.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matching_recovery_failure_preserves_worker_and_partial_cleanup_errors() {
+        let mut app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (43, InstallCancellation::default()),
+        );
+        app.discard_partial_after_install.insert(
+            model_id.as_str().to_owned(),
+            (43, RemotePartialProbeSource::Normalized(model_id.clone())),
+        );
+        app.partial_discard_recovery_error_for_test =
+            Some("partial cleanup durability failed".to_owned());
+
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 43,
+                model_id: model_id.as_str().to_owned(),
+                message: "worker recovery failed".to_owned(),
+                recovery_required: true,
+            })
+            .unwrap();
+        app.poll_events();
+
+        let recovery_error = app.artifact_recovery_error.as_deref().unwrap();
+        assert!(recovery_error.contains("worker recovery failed"));
+        assert!(recovery_error.contains("partial cleanup durability failed"));
+        assert!(app.artifact_mutation_block_reason().is_some());
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("Could not finish discarding"));
+    }
+
+    #[test]
+    fn stale_failure_cannot_consume_intent_or_mutate_a_newer_job() {
+        let mut app = test_app();
+        let current_cancellation = InstallCancellation::default();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        app.artifact_installations.insert(
+            model_id.as_str().to_owned(),
+            (52, current_cancellation.clone()),
+        );
+        app.discard_partial_after_install.insert(
+            model_id.as_str().to_owned(),
+            (51, RemotePartialProbeSource::Normalized(model_id.clone())),
+        );
+
+        app.tx
+            .send(AppEvent::VerifiedInstallFailed {
+                job_id: 51,
+                model_id: model_id.as_str().to_owned(),
+                message: "stale failure".to_owned(),
+                recovery_required: false,
+            })
+            .unwrap();
+        app.poll_events();
+
+        assert_eq!(
+            app.artifact_installations
+                .get(model_id.as_str())
+                .map(|(job_id, _)| *job_id),
+            Some(52)
+        );
+        assert!(!current_cancellation.is_cancelled());
+        assert_eq!(
+            app.discard_partial_after_install
+                .get(model_id.as_str())
+                .map(|(job_id, _)| *job_id),
+            Some(51)
+        );
+    }
+
+    #[test]
+    fn matching_success_clears_discard_intent_without_running_cleanup() {
+        let mut app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        app.discard_partial_after_install.insert(
+            model_id.as_str().to_owned(),
+            (61, RemotePartialProbeSource::Normalized(model_id.clone())),
+        );
+
+        assert!(
+            app.take_requested_partial_discard(model_id.as_str(), 61)
+                .is_some()
+        );
+        assert!(
+            !app.discard_partial_after_install
+                .contains_key(model_id.as_str())
+        );
+    }
+
+    #[test]
     fn local_partial_cleanup_survives_restart_and_refreshes_cached_projections() {
         let root = partial_cleanup_test_root("local");
         let mut app = test_app();
@@ -18138,7 +18382,7 @@ mod layout_tests {
         config::normalize_config(&mut app.config);
         let original = fs::metadata(parent).unwrap().permissions();
         fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
-        if managed_downloads::normalized_model_has_partial(&app.config, &model_id).is_ok() {
+        if managed_downloads::normalized_model_retained_partial(&app.config, &model_id).is_ok() {
             fs::set_permissions(parent, original).unwrap();
             fs::remove_dir_all(root).unwrap();
             return;
@@ -18731,7 +18975,10 @@ mod layout_tests {
             .send(AppEvent::RemotePartialInspectionsFinished {
                 snapshot_revision: revision,
                 generation: 41,
-                results: vec![(key.clone(), PartialInspection::Present)],
+                results: vec![(
+                    key.clone(),
+                    PartialInspection::Present(crate::installations::RetainedPartial { bytes: 1 }),
+                )],
             })
             .unwrap();
 

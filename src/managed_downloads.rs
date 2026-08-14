@@ -13,8 +13,8 @@ use crate::disk_space::DiskSpacePreflight;
 use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
-    StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact,
-    pinned_artifact_disk_space_preflight, pinned_artifact_has_partial, stage_runtime_archive,
+    RetainedPartial, StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact,
+    pinned_artifact_disk_space_preflight, pinned_artifact_retained_partial, stage_runtime_archive,
 };
 use crate::transcription::ModelId;
 
@@ -38,11 +38,11 @@ pub(crate) fn normalized_model_download_space_preflight(
     pinned_artifact_disk_space_preflight(&artifact)
 }
 
-pub(crate) fn normalized_model_has_partial(
+pub(crate) fn normalized_model_retained_partial(
     config: &AppConfig,
     model_id: &ModelId,
-) -> Result<bool, InstallError> {
-    pinned_artifact_has_partial(&normalized_model_download_spec(config, model_id)?)
+) -> Result<Option<RetainedPartial>, InstallError> {
+    pinned_artifact_retained_partial(&normalized_model_download_spec(config, model_id)?)
 }
 
 pub(crate) fn discard_normalized_model_partial(
@@ -101,11 +101,11 @@ pub(crate) fn trusted_gguf_download_space_preflight(
     pinned_artifact_disk_space_preflight(&pinned)
 }
 
-pub(crate) fn trusted_gguf_has_partial(
+pub(crate) fn trusted_gguf_retained_partial(
     config: &AppConfig,
     artifact: &TrustedArtifact,
-) -> Result<bool, InstallError> {
-    pinned_artifact_has_partial(&trusted_gguf_download_spec(config, artifact)?)
+) -> Result<Option<RetainedPartial>, InstallError> {
+    pinned_artifact_retained_partial(&trusted_gguf_download_spec(config, artifact)?)
 }
 
 pub(crate) fn discard_trusted_gguf_partial(
@@ -340,9 +340,15 @@ mod tests {
         std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
         std::fs::write(&partial, b"partial").unwrap();
 
-        assert!(normalized_model_has_partial(&config, &model_id).unwrap());
+        assert_eq!(
+            normalized_model_retained_partial(&config, &model_id).unwrap(),
+            Some(RetainedPartial { bytes: 7 })
+        );
         assert!(discard_normalized_model_partial(&config, &model_id).unwrap());
-        assert!(!normalized_model_has_partial(&config, &model_id).unwrap());
+        assert_eq!(
+            normalized_model_retained_partial(&config, &model_id).unwrap(),
+            None
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -365,9 +371,15 @@ mod tests {
         std::fs::write(&partial, b"partial").unwrap();
         std::fs::write(&spec.destination, b"destination").unwrap();
 
-        assert!(trusted_gguf_has_partial(&config, &artifact).unwrap());
+        assert_eq!(
+            trusted_gguf_retained_partial(&config, &artifact).unwrap(),
+            Some(RetainedPartial { bytes: 7 })
+        );
         assert!(discard_trusted_gguf_partial(&config, &artifact).unwrap());
-        assert!(!trusted_gguf_has_partial(&config, &artifact).unwrap());
+        assert_eq!(
+            trusted_gguf_retained_partial(&config, &artifact).unwrap(),
+            None
+        );
         assert_eq!(std::fs::read(&spec.destination).unwrap(), b"destination");
         std::fs::remove_dir_all(root).unwrap();
     }
