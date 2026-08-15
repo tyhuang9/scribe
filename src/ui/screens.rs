@@ -2849,7 +2849,7 @@ fn download_label_slot_width(ui: &egui::Ui, total_bytes: u64) -> f32 {
     })
 }
 
-fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
+fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) -> egui::Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
     ui.painter().text(
         rect.center(),
@@ -2858,6 +2858,7 @@ fn paint_decorative_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
         egui::FontId::proportional(14.0),
         color,
     );
+    rect
 }
 
 struct ModelIdentityResponse {
@@ -3012,12 +3013,17 @@ fn render_model_metadata(
         // a wrapped row cannot leave the icon orphaned on the following line.
         let _language_row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
+            let _language_icon = paint_decorative_icon(ui, Icon::Globe, colors.muted_text);
             let language = ui.label(
                 RichText::new(&language_summary)
                     .small()
                     .color(colors.muted_text),
             );
+            #[cfg(test)]
+            {
+                register_model_layout_rect(ui, _model_name, "language icon", _language_icon);
+                register_model_layout_rect(ui, _model_name, "language text", language.rect);
+            }
             ui.ctx().accesskit_node_builder(language.id, |builder| {
                 builder.set_name(if language_name == "Languages unavailable" {
                     language_name.to_owned()
@@ -3264,20 +3270,61 @@ fn render_unified_model_card(
                                 expanded,
                             );
                             ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                let cell_width = (identity_width / 2.0).max(0.0);
-                                ui.allocate_ui_with_layout(
-                                    Vec2::new(cell_width, 32.0),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| render_model_metadata(ui, name, languages, false),
-                                );
-                                let features = ui.allocate_ui_with_layout(
-                                    Vec2::new(cell_width, 32.0),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| render_model_features(ui, card, cell_width),
-                                );
-                                activation_exclusions.push(features.inner.rect);
+                            let metadata_group_width = identity_width * 0.60;
+                            let metadata_cell_width = identity_width * 0.30;
+                            let (summary_features, _) = model_summary_features(card);
+                            let (_, _, feature_grid_size) = model_feature_grid_geometry(
+                                summary_features.len(),
+                                metadata_cell_width,
+                            );
+                            let (metadata_group_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(metadata_group_width, feature_grid_size.y),
+                                Sense::hover(),
+                            );
+                            let language_cell_rect = egui::Rect::from_min_size(
+                                metadata_group_rect.min,
+                                Vec2::new(metadata_cell_width, metadata_group_rect.height()),
+                            );
+                            let feature_cell_rect = egui::Rect::from_min_size(
+                                language_cell_rect.right_top(),
+                                Vec2::new(metadata_cell_width, metadata_group_rect.height()),
+                            );
+                            let features = ui.allocate_ui_at_rect(metadata_group_rect, |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.allocate_ui_at_rect(language_cell_rect, |ui| {
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        render_model_metadata(ui, name, languages, false)
+                                    });
+                                });
+                                ui.allocate_ui_at_rect(feature_cell_rect, |ui| {
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        render_model_features(ui, card, metadata_cell_width)
+                                    })
+                                })
+                                .inner
                             });
+                            activation_exclusions.push(features.inner.inner.rect);
+                            #[cfg(test)]
+                            {
+                                register_model_layout_rect(
+                                    ui,
+                                    name,
+                                    "metadata group",
+                                    metadata_group_rect,
+                                );
+                                register_model_layout_rect(
+                                    ui,
+                                    name,
+                                    "language cell",
+                                    language_cell_rect,
+                                );
+                                register_model_layout_rect(
+                                    ui,
+                                    name,
+                                    "feature cell",
+                                    feature_cell_rect,
+                                );
+                            }
                         },
                     );
                     let _metrics_zone = ui.allocate_ui_with_layout(

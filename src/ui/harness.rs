@@ -3404,6 +3404,81 @@ mod tests {
     }
 
     #[test]
+    fn model_card_desktop_metadata_group_uses_fixed_identity_ratio_and_shared_row_geometry() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsCardExpanded, width, height);
+            let card_name = "whisper.cpp tiny.en";
+            let rect =
+                |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+            let identity = rect("identity zone");
+            let metadata_group = rect("metadata group");
+            let language_cell = rect("language cell");
+            let feature_cell = rect("feature cell");
+            let language_icon = rect("language icon");
+            let language_text = named_node_bounds(&output, "Languages: EN,ES,JA");
+            let features = named_node_bounds(
+                &output,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+            );
+
+            assert_near(
+                metadata_group.width(),
+                identity.width() * 0.60,
+                "metadata group is exactly 60% of the identity zone",
+            );
+            assert_near(
+                language_cell.width(),
+                identity.width() * 0.30,
+                "language cell is exactly 30% of the identity zone",
+            );
+            assert_near(
+                feature_cell.width(),
+                identity.width() * 0.30,
+                "feature cell is exactly 30% of the identity zone",
+            );
+            assert_near(
+                language_cell.x0,
+                metadata_group.x0,
+                "language begins the group",
+            );
+            assert_near(feature_cell.x1, metadata_group.x1, "features end the group");
+            assert_near(language_cell.x1, feature_cell.x0, "metadata cells abut");
+            assert_near(
+                language_cell.y0,
+                feature_cell.y0,
+                "metadata cells share a row",
+            );
+            assert_near(
+                language_cell.y1,
+                feature_cell.y1,
+                "metadata cells share a height",
+            );
+            assert_near(
+                (language_icon.y0 + language_icon.y1) / 2.0,
+                (language_text.y0 + language_text.y1) / 2.0,
+                "language globe and text share the vertical text axis",
+            );
+            assert_near(
+                (language_cell.y0 + language_cell.y1) / 2.0,
+                (feature_cell.y0 + feature_cell.y1) / 2.0,
+                "language and feature cells share the row baseline",
+            );
+            assert_near(
+                (language_text.y0 + language_text.y1) / 2.0,
+                (features.y0 + features.y1) / 2.0,
+                "language text and feature group share the row baseline",
+            );
+            assert_bounds_within(language_icon, language_cell, "language globe");
+            assert_bounds_within(language_text, language_cell, "language text");
+            assert!(
+                features.x0 >= feature_cell.x0 - LAYOUT_TOLERANCE
+                    && features.x1 <= feature_cell.x1 + LAYOUT_TOLERANCE,
+                "feature group stays within its fixed-width cell: features={features:?}, cell={feature_cell:?}"
+            );
+        }
+    }
+
+    #[test]
     fn expanded_model_details_keep_compact_section_density() {
         let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
         let card_name = "whisper.cpp tiny.en";
@@ -4867,6 +4942,33 @@ mod tests {
                 &format!("375px {name}"),
             );
         }
+
+        let mut compact_summary_data = Fixture::ModelsCardExpanded.data();
+        compact_summary_data
+            .models
+            .retain(|model| model.id == "tiny.en");
+        compact_summary_data.model_catalog.clear();
+        compact_summary_data.model_management.expanded_model_card = None;
+        let mut compact_summary_page = AppPage::Models;
+        let compact_summary = render_with_input(
+            &ctx,
+            &mut compact_summary_data,
+            &mut compact_summary_page,
+            375.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        let compact_summary_card = named_node_bounds(&compact_summary, "whisper.cpp tiny.en model");
+        let compact_features = named_node_bounds(
+            &compact_summary,
+            "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+        );
+        assert_bounds_within(
+            compact_features,
+            compact_summary_card,
+            "375px compact feature group",
+        );
     }
 
     #[test]
