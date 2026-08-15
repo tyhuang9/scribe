@@ -3998,6 +3998,76 @@ mod tests {
     }
 
     #[test]
+    fn queued_and_waiting_local_installs_have_truthful_named_cancel_controls() {
+        for (state, name) in [
+            (
+                ModelDownloadState::Queued,
+                "Cancel Lifecycle queued download",
+            ),
+            (
+                ModelDownloadState::WaitingForVerification,
+                "Cancel Lifecycle waiting verification",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog = vec![ModelViewModel {
+                id: "lifecycle".into(),
+                display_name: "Lifecycle".into(),
+                download_state: state,
+                cancel_supported: true,
+                install_supported: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }];
+            let mut page = AppPage::Models;
+            assert_eq!(
+                click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, name),
+                ScreenAction::CancelModelInstall("lifecycle".into()),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_and_waiting_remote_installs_have_truthful_named_cancel_controls() {
+        for status in ["Queued for download", "Waiting for verification"] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog.clear();
+            let variant = &mut data.remote_catalog.entries[0].variants[0];
+            variant.status_label = Some(status.into());
+            variant.actions = vec![RemoteCatalogActionView {
+                label: "Cancel".into(),
+                kind: RemoteCatalogActionKind::Cancel {
+                    model_id: "managed-compact-english".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            }];
+            let mut page = AppPage::Models;
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    1180.0,
+                    815.0,
+                    "Cancel Compact English",
+                ),
+                ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into()),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
     fn active_download_progress_is_truthful_clamped_and_isolated_from_card_selection() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();

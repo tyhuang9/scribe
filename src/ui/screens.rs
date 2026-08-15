@@ -1990,9 +1990,38 @@ fn model_lifecycle_presentation<'a>(
         ModelCard::Local(model)
             if matches!(
                 model.download_state,
-                ModelDownloadState::Queued
-                    | ModelDownloadState::Verifying
-                    | ModelDownloadState::Extracting
+                ModelDownloadState::Queued | ModelDownloadState::WaitingForVerification
+            ) =>
+        {
+            let waiting = model.download_state == ModelDownloadState::WaitingForVerification;
+            ModelLifecyclePresentation {
+                action: ScreenAction::CancelModelInstall(model.id.clone()),
+                icon: Icon::Close,
+                label: if waiting {
+                    "Waiting for verification"
+                } else {
+                    "Queued"
+                }
+                .into(),
+                accessible_name: format!(
+                    "Cancel {} {}",
+                    model.display_name,
+                    if waiting {
+                        "waiting verification"
+                    } else {
+                        "queued download"
+                    }
+                ),
+                enabled: model.cancel_supported,
+                disabled_reason: model.primary_action_disabled_reason.as_deref(),
+                compact_size: None,
+                tone: ModelLifecycleTone::Standard,
+            }
+        }
+        ModelCard::Local(model)
+            if matches!(
+                model.download_state,
+                ModelDownloadState::Verifying | ModelDownloadState::Extracting
             ) =>
         {
             ModelLifecyclePresentation {
@@ -2107,6 +2136,10 @@ fn model_lifecycle_presentation<'a>(
                 .or_else(|| remote_primary_action(variant));
             let label = remote.map_or("Install", |action| action.label.as_str());
             let label = if label == "Remove" { "Delete" } else { label };
+            let cancel_waiting = matches!(
+                variant.status_label.as_deref(),
+                Some("Queued for download") | Some("Waiting for verification")
+            );
             ModelLifecyclePresentation {
                 action: remote.map_or(ScreenAction::None, |action| {
                     screen_action_for_remote_catalog_action(&action.kind)
@@ -2125,7 +2158,12 @@ fn model_lifecycle_presentation<'a>(
                     remote.map(|action| &action.kind),
                     Some(RemoteCatalogActionKind::Cancel { .. })
                 ) {
-                    "Pause".into()
+                    if cancel_waiting {
+                        variant.status_label.as_deref().unwrap_or("Cancel")
+                    } else {
+                        "Pause"
+                    }
+                    .into()
                 } else {
                     label.into()
                 },
@@ -2135,7 +2173,7 @@ fn model_lifecycle_presentation<'a>(
                         remote.map(|action| &action.kind),
                         Some(RemoteCatalogActionKind::Cancel { .. })
                     ) {
-                        "Pause"
+                        if cancel_waiting { "Cancel" } else { "Pause" }
                     } else {
                         label
                     },

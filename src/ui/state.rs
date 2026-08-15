@@ -197,6 +197,7 @@ pub(crate) enum ModelDownloadState {
     NotInstalled,
     Queued,
     Downloading,
+    WaitingForVerification,
     Verifying,
     Extracting,
     Installed,
