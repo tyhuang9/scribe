@@ -38,6 +38,13 @@ pub(crate) fn normalized_model_download_space_preflight(
     pinned_artifact_disk_space_preflight(&artifact)
 }
 
+pub(crate) fn normalized_model_download_target(
+    config: &AppConfig,
+    model_id: &ModelId,
+) -> Result<PathBuf, InstallError> {
+    Ok(normalized_model_download_spec(config, model_id)?.destination)
+}
+
 pub(crate) fn normalized_model_retained_partial(
     config: &AppConfig,
     model_id: &ModelId,
@@ -99,6 +106,13 @@ pub(crate) fn trusted_gguf_download_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     let pinned = trusted_gguf_download_spec(config, artifact)?;
     pinned_artifact_disk_space_preflight(&pinned)
+}
+
+pub(crate) fn trusted_gguf_download_target(
+    config: &AppConfig,
+    artifact: &TrustedArtifact,
+) -> Result<PathBuf, InstallError> {
+    Ok(trusted_gguf_download_spec(config, artifact)?.destination)
 }
 
 pub(crate) fn trusted_gguf_retained_partial(
