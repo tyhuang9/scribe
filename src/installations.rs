@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::disk_space::{self, DiskSpacePreflight};
+use crate::disk_space::{self, CanonicalTargetIdentity, DiskSpacePreflight};
 
 const BUFFER_BYTES: usize = 64 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
@@ -146,6 +146,7 @@ pub(crate) struct DownloadedArtifact {
     pub(crate) destination: PathBuf,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
+    pub(crate) target_identity: CanonicalTargetIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -938,12 +939,33 @@ impl DirectoryReplacement {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn download_pinned_artifact(
     artifact: &PinnedArtifact,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
-    download_pinned_artifact_with(&UreqHttpSource, artifact, cancellation, progress)
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    download_pinned_artifact_for_target(artifact, &expected_target_identity, cancellation, progress)
+}
+
+pub(crate) fn download_pinned_artifact_for_target(
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<DownloadedArtifact, InstallError> {
+    download_pinned_artifact_with_target(
+        &UreqHttpSource,
+        artifact,
+        expected_target_identity,
+        cancellation,
+        progress,
+    )
 }
 
 /// Reports the conservative free-space budget for a managed artifact without
@@ -1021,6 +1043,118 @@ fn partial_file_metadata(partial: &Path) -> Result<Option<fs::Metadata>, Install
     }
 }
 
+#[cfg(test)]
+fn cancelled_before_artifact_inspection(
+    artifact: &PinnedArtifact,
+) -> Result<InstallError, InstallError> {
+    Ok(InstallError::Cancelled {
+        partial_path: partial_path(&artifact.destination)?,
+        downloaded_bytes: 0,
+    })
+}
+
+fn artifact_destination_is_regular(destination: &Path) -> Result<bool, InstallError> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_file() && !runtime_metadata_is_link_or_reparse(&metadata) => {
+            Ok(true)
+        }
+        Ok(_) => Err(failed(format!(
+            "managed artifact destination is not a regular non-link file: {}",
+            destination.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failed(format!(
+            "failed to inspect managed artifact destination {}: {error}",
+            destination.display()
+        ))),
+    }
+}
+
+fn revalidate_artifact_target(
+    destination: &Path,
+    expected_target_identity: &CanonicalTargetIdentity,
+) -> Result<(), InstallError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| failed(format!("{} has no parent directory", destination.display())))?;
+    for ancestor in parent.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata)
+                if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(failed(format!(
+                    "managed artifact path crosses a symbolic link, reparse point, or non-directory ancestor: {}",
+                    ancestor.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failed(format!(
+                    "failed to revalidate managed artifact ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    let actual =
+        disk_space::canonical_target_identity(destination).map_err(InstallError::Failed)?;
+    if &actual != expected_target_identity {
+        return Err(failed(format!(
+            "managed artifact target identity changed before filesystem mutation: {}",
+            destination.display()
+        )));
+    }
+    let _ = artifact_destination_is_regular(destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn configure_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_no_follow(_options: &mut OpenOptions) {}
+
+fn validate_opened_regular_file(file: &File, path: &Path) -> Result<fs::Metadata, InstallError> {
+    let metadata = file.metadata().map_err(|error| {
+        failed(format!(
+            "failed to inspect open file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || runtime_metadata_is_link_or_reparse(&metadata) {
+        return Err(failed(format!(
+            "managed artifact file is not a regular non-link file: {}",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn open_regular_file_no_follow(path: &Path) -> Result<(File, fs::Metadata), InstallError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_no_follow(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| failed(format!("failed to open {}: {error}", path.display())))?;
+    let metadata = validate_opened_regular_file(&file, path)?;
+    Ok((file, metadata))
+}
+
 fn additional_download_bytes(
     artifact_size_bytes: u64,
     partial_bytes: u64,
@@ -1055,16 +1189,45 @@ fn require_pinned_artifact_disk_space(
     )))
 }
 
+#[cfg(test)]
 fn download_pinned_artifact_with(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
+    let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    download_pinned_artifact_with_target(
+        source,
+        artifact,
+        &expected_target_identity,
+        cancellation,
+        progress,
+    )
+}
+
+fn download_pinned_artifact_with_target(
+    source: &dyn HttpSource,
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<DownloadedArtifact, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: partial,
+            downloaded_bytes: 0,
+        });
+    }
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     let partial_exists = partial_file_exists(&partial)?;
-    if artifact.destination.exists()
+    if artifact_destination_is_regular(&artifact.destination)?
         && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
     {
         return Ok(DownloadedArtifact {
@@ -1073,6 +1236,7 @@ fn download_pinned_artifact_with(
             destination: artifact.destination.clone(),
             size_bytes: artifact.size_bytes,
             sha256: artifact.sha256.clone(),
+            target_identity: expected_target_identity.clone(),
         });
         // A mismatched destination may be the currently active artifact from
         // an older manifest. It remains untouched until activation has a
@@ -1080,23 +1244,25 @@ fn download_pinned_artifact_with(
     }
 
     if let Some(parent) = artifact.destination.parent() {
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
         fs::create_dir_all(parent)
             .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
+        revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     }
     let mut offset = if partial_exists {
-        fs::metadata(&partial)
-            .map_err(|error| {
-                failed(format!(
-                    "failed to inspect resumable partial {}: {error}",
-                    partial.display()
-                ))
-            })?
+        partial_file_metadata(&partial)?
+            .ok_or_else(|| failed("resumable partial vanished during validated inspection"))?
             .len()
     } else {
         0
     };
     if offset > artifact.size_bytes {
-        let quarantined = quarantine_partial(&partial, "oversized")?;
+        let quarantined = quarantine_partial(
+            &partial,
+            "oversized",
+            &artifact.destination,
+            expected_target_identity,
+        )?;
         return Err(failed(format!(
             "resumable partial for {} exceeds the pinned size; quarantined at {}",
             artifact.id,
@@ -1118,13 +1284,22 @@ fn download_pinned_artifact_with(
             cancellation,
         ) {
             Ok(()) => {
-                return Ok(downloaded_candidate(artifact, partial));
+                return Ok(downloaded_candidate(
+                    artifact,
+                    partial,
+                    expected_target_identity,
+                ));
             }
             Err(error) => {
                 if matches!(error, InstallError::Cancelled { .. }) {
                     return Err(error);
                 }
-                let quarantined = quarantine_partial(&partial, "invalid")?;
+                let quarantined = quarantine_partial(
+                    &partial,
+                    "invalid",
+                    &artifact.destination,
+                    expected_target_identity,
+                )?;
                 offset = 0;
                 eprintln!(
                     "Scribe quarantined checksum-invalid partial {} at {} before a clean retry: {error}",
@@ -1139,6 +1314,7 @@ fn download_pinned_artifact_with(
 
     let mut response = source.get(&artifact.url, (offset > 0).then_some(offset))?;
     let disposition = validate_download_response(&response, offset, artifact.size_bytes)?;
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     if disposition == ResponseDisposition::CompletePartial {
         verify_file_cancellable(
             &partial,
@@ -1146,7 +1322,11 @@ fn download_pinned_artifact_with(
             &artifact.sha256,
             cancellation,
         )?;
-        return Ok(downloaded_candidate(artifact, partial));
+        return Ok(downloaded_candidate(
+            artifact,
+            partial,
+            expected_target_identity,
+        ));
     }
     let append = disposition == ResponseDisposition::Append;
     if !append {
@@ -1154,14 +1334,17 @@ fn download_pinned_artifact_with(
     }
     let mut options = OpenOptions::new();
     options.create(true).write(true);
+    configure_no_follow(&mut options);
     if append {
         options.append(true);
     } else {
         options.truncate(true);
     }
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     let mut file = options
         .open(&partial)
         .map_err(|error| failed(format!("failed to open {}: {error}", partial.display())))?;
+    validate_opened_regular_file(&file, &partial)?;
     let started_at = Instant::now();
     let mut last_progress = started_at;
     emit_progress(
@@ -1245,27 +1428,38 @@ fn download_pinned_artifact_with(
         Instant::now(),
         offset,
     );
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     verify_file_cancellable(
         &partial,
         artifact.size_bytes,
         &artifact.sha256,
         cancellation,
     )?;
-    Ok(downloaded_candidate(artifact, partial))
+    Ok(downloaded_candidate(
+        artifact,
+        partial,
+        expected_target_identity,
+    ))
 }
 
-fn downloaded_candidate(artifact: &PinnedArtifact, path: PathBuf) -> DownloadedArtifact {
+fn downloaded_candidate(
+    artifact: &PinnedArtifact,
+    path: PathBuf,
+    target_identity: &CanonicalTargetIdentity,
+) -> DownloadedArtifact {
     DownloadedArtifact {
         id: artifact.id.clone(),
         path,
         destination: artifact.destination.clone(),
         size_bytes: artifact.size_bytes,
         sha256: artifact.sha256.clone(),
+        target_identity: target_identity.clone(),
     }
 }
 
 impl DownloadedArtifact {
     pub(crate) fn activate(self) -> Result<FileReplacement, InstallError> {
+        revalidate_artifact_target(&self.destination, &self.target_identity)?;
         if self.path == self.destination {
             return Ok(FileReplacement {
                 destination: self.destination,
@@ -1274,8 +1468,10 @@ impl DownloadedArtifact {
         }
         verify_file(&self.path, self.size_bytes, &self.sha256)?;
         let rollback = file_rollback_path(&self.destination)?;
+        revalidate_artifact_target(&self.destination, &self.target_identity)?;
         remove_path_if_exists(&rollback)?;
-        let previous = if self.destination.exists() {
+        let previous = if artifact_destination_is_regular(&self.destination)? {
+            revalidate_artifact_target(&self.destination, &self.target_identity)?;
             durable_rename(&self.destination, &rollback).map_err(|error| {
                 failed(format!(
                     "failed to preserve existing model {}: {error}",
@@ -1292,6 +1488,9 @@ impl DownloadedArtifact {
         } else {
             None
         };
+        revalidate_artifact_target(&self.destination, &self.target_identity)?;
+        partial_file_metadata(&self.path)?
+            .ok_or_else(|| failed("verified artifact partial changed before activation"))?;
         if let Err(error) = durable_rename(&self.path, &self.destination) {
             if let Some(rollback) = previous.as_ref()
                 && let Err(restore) = durable_rename(rollback, &self.destination)
@@ -1333,14 +1532,20 @@ impl DownloadedArtifact {
     }
 }
 
-pub(crate) fn stage_runtime_archive(
+pub(crate) fn stage_runtime_archive_for_target(
     spec: &RuntimeArchiveSpec,
     target_root: &Path,
     entrypoint_relative: &Path,
+    expected_archive_target_identity: &CanonicalTargetIdentity,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<StagedRuntime, InstallError> {
-    let archive = download_pinned_artifact(&spec.artifact, cancellation, progress)?;
+    let archive = download_pinned_artifact_for_target(
+        &spec.artifact,
+        expected_archive_target_identity,
+        cancellation,
+        progress,
+    )?;
     let stage_root = transaction_path(target_root, "installing")?;
     remove_path_if_exists(&stage_root)?;
     fs::create_dir_all(&stage_root).map_err(|error| {
@@ -1831,8 +2036,13 @@ pub(crate) fn verify_file_cancellable(
     cancellation: &InstallCancellation,
 ) -> Result<(), InstallError> {
     validate_sha256(expected_sha256)?;
-    let metadata = fs::metadata(path)
-        .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: path.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
+    let (mut file, metadata) = open_regular_file_no_follow(path)?;
     if !metadata.is_file() || metadata.len() != expected_size {
         return Err(failed(format!(
             "artifact size mismatch for {}: expected {expected_size} bytes, got {}",
@@ -1840,8 +2050,6 @@ pub(crate) fn verify_file_cancellable(
             metadata.len()
         )));
     }
-    let mut file = File::open(path)
-        .map_err(|error| failed(format!("failed to open {}: {error}", path.display())))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; BUFFER_BYTES];
     loop {
@@ -2001,14 +2209,25 @@ fn partial_path(destination: &Path) -> Result<PathBuf, InstallError> {
     Ok(destination.with_file_name(partial_name))
 }
 
-fn quarantine_partial(partial: &Path, reason: &str) -> Result<PathBuf, InstallError> {
+fn quarantine_partial(
+    partial: &Path,
+    reason: &str,
+    destination: &Path,
+    expected_target_identity: &CanonicalTargetIdentity,
+) -> Result<PathBuf, InstallError> {
     let name = partial
         .file_name()
         .ok_or_else(|| failed(format!("{} has no filename", partial.display())))?;
     let mut quarantined_name = name.to_os_string();
     quarantined_name.push(format!(".{reason}"));
     let quarantined = partial.with_file_name(quarantined_name);
+    revalidate_artifact_target(destination, expected_target_identity)?;
+    partial_file_metadata(partial)?
+        .ok_or_else(|| failed("resumable partial vanished before quarantine"))?;
     remove_path_if_exists(&quarantined)?;
+    revalidate_artifact_target(destination, expected_target_identity)?;
+    partial_file_metadata(partial)?
+        .ok_or_else(|| failed("resumable partial changed before quarantine"))?;
     durable_rename(partial, &quarantined).map_err(|error| {
         failed(format!(
             "failed to quarantine invalid partial {}: {error}",
@@ -2591,6 +2810,26 @@ mod tests {
         }
     }
 
+    struct HookHttp {
+        reply: FakeReply,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl HttpSource for HookHttp {
+        fn get(&self, _url: &str, _range_start: Option<u64>) -> Result<HttpResponse, InstallError> {
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            Ok(HttpResponse {
+                status: self.reply.status,
+                content_lengths: vec![self.reply.bytes.len().to_string()],
+                content_ranges: self.reply.content_range.clone().into_iter().collect(),
+                content_encodings: Vec::new(),
+                reader: Box::new(Cursor::new(self.reply.bytes.clone())),
+            })
+        }
+    }
+
     fn unique_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "scribe-installation-{name}-{}-{}",
@@ -2608,6 +2847,132 @@ mod tests {
         assert_eq!(additional_download_bytes(100, 40).unwrap(), 60);
         assert_eq!(additional_download_bytes(100, 100).unwrap(), 0);
         assert_eq!(additional_download_bytes(100, 101).unwrap(), 100);
+    }
+
+    #[test]
+    fn cancellation_precedes_any_download_filesystem_inspection_or_mutation() {
+        let root = unique_root("cancel-before-filesystem");
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+        let source = FakeHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: bytes.to_vec(),
+            },
+            requested_ranges: Mutex::new(Vec::new()),
+        };
+
+        let error =
+            download_pinned_artifact_with(&source, &spec, &cancellation, &|_| {}).unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!root.exists());
+        assert!(source.requested_ranges.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn ancestor_symlink_swap_after_http_admission_is_rejected_before_open() {
+        let root = unique_root("ancestor-swap");
+        let managed = root.join("managed");
+        let moved = root.join("managed-original");
+        let external = root.join("external");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&managed, bytes);
+        let source = HookHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: bytes.to_vec(),
+            },
+            hook: Mutex::new(Some(Box::new({
+                let managed = managed.clone();
+                let moved = moved.clone();
+                let external = external.clone();
+                move || {
+                    fs::rename(&managed, &moved).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&external, &managed).unwrap();
+                    #[cfg(windows)]
+                    if std::os::windows::fs::symlink_dir(&external, &managed).is_err() {
+                        fs::rename(&moved, &managed).unwrap();
+                    }
+                }
+            }))),
+        };
+
+        let result =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {});
+
+        #[cfg(windows)]
+        if managed.is_dir()
+            && !fs::symlink_metadata(&managed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("symbolic link") || error.contains("target identity changed"));
+        assert!(!external.join("fixture.bin.partial").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn partial_symlink_swap_after_response_is_opened_without_following() {
+        let root = unique_root("partial-swap");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        let partial = partial_path(&spec.destination).unwrap();
+        let external = root.join("external.bin");
+        fs::write(&partial, []).unwrap();
+        fs::write(&external, b"do not overwrite").unwrap();
+        let source = HookHttp {
+            reply: FakeReply {
+                status: 200,
+                content_range: None,
+                bytes: bytes.to_vec(),
+            },
+            hook: Mutex::new(Some(Box::new({
+                let partial = partial.clone();
+                let external = external.clone();
+                move || {
+                    fs::remove_file(&partial).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&external, &partial).unwrap();
+                    #[cfg(windows)]
+                    if std::os::windows::fs::symlink_file(&external, &partial).is_err() {
+                        fs::write(&partial, []).unwrap();
+                    }
+                }
+            }))),
+        };
+
+        let result =
+            download_pinned_artifact_with(&source, &spec, &InstallCancellation::default(), &|_| {});
+
+        #[cfg(windows)]
+        if fs::symlink_metadata(&partial)
+            .unwrap()
+            .file_type()
+            .is_file()
+            && !runtime_metadata_is_link_or_reparse(&fs::symlink_metadata(&partial).unwrap())
+        {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        assert!(result.is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"do not overwrite");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn artifact(root: &Path, bytes: &[u8]) -> PinnedArtifact {
@@ -2770,12 +3135,14 @@ mod tests {
         let destination = root.join("model.bin");
         let bytes = b"existing verified model";
         fs::write(&destination, bytes).unwrap();
+        let target_identity = disk_space::canonical_target_identity(&destination).unwrap();
         let replacement = DownloadedArtifact {
             id: "fixture".to_owned(),
             path: destination.clone(),
             destination: destination.clone(),
             size_bytes: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(bytes)),
+            target_identity,
         }
         .activate()
         .unwrap();
@@ -2794,12 +3161,14 @@ mod tests {
         let destination = root.join("model.bin");
         let bytes = b"existing verified model";
         fs::write(&destination, bytes).unwrap();
+        let target_identity = disk_space::canonical_target_identity(&destination).unwrap();
         let replacement = DownloadedArtifact {
             id: "fixture".to_owned(),
             path: destination.clone(),
             destination: destination.clone(),
             size_bytes: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(bytes)),
+            target_identity,
         }
         .activate()
         .unwrap();

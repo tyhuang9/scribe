@@ -13,19 +13,21 @@ use crate::disk_space::{CanonicalTargetIdentity, DiskSpacePreflight};
 use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
-    RetainedPartial, StagedRuntime, discard_pinned_artifact_partial, download_pinned_artifact,
-    pinned_artifact_disk_space_preflight, pinned_artifact_retained_partial, stage_runtime_archive,
+    RetainedPartial, StagedRuntime, discard_pinned_artifact_partial,
+    download_pinned_artifact_for_target, pinned_artifact_disk_space_preflight,
+    pinned_artifact_retained_partial, stage_runtime_archive_for_target,
 };
 use crate::transcription::ModelId;
 
 pub(crate) fn prepare_model(
     config: &AppConfig,
     model_id: &ModelId,
+    expected_target_identity: &CanonicalTargetIdentity,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     let artifact = normalized_model_download_spec(config, model_id)?;
-    download_pinned_artifact(&artifact, cancellation, progress)
+    download_pinned_artifact_for_target(&artifact, expected_target_identity, cancellation, progress)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,11 +91,12 @@ fn normalized_model_download_spec(
 pub(crate) fn prepare_trusted_gguf_model(
     config: &AppConfig,
     artifact: &TrustedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     let pinned = trusted_gguf_download_spec(config, artifact)?;
-    download_pinned_artifact(&pinned, cancellation, progress)
+    download_pinned_artifact_for_target(&pinned, expected_target_identity, cancellation, progress)
 }
 
 pub(crate) fn trusted_gguf_download_admission(
@@ -226,8 +229,34 @@ pub(crate) struct PreparedRuntimeInstall {
     pub(crate) archive_sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePreparationAdmission {
+    pub(crate) archive: ModelDownloadAdmission,
+    pub(crate) staging: DiskSpacePreflight,
+}
+
+pub(crate) fn primary_runtime_preparation_admission(
+    target_root: &Path,
+) -> Result<RuntimePreparationAdmission, InstallError> {
+    let downloads = config::runtime_storage_dir().join(".downloads");
+    let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
+    let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
+        .map_err(InstallError::Failed)?;
+    let expanded_bytes = spec.archive.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size_bytes)
+            .ok_or_else(|| InstallError::Failed("runtime staging size overflowed".to_owned()))
+    })?;
+    Ok(RuntimePreparationAdmission {
+        archive: download_admission(&spec.archive.artifact)?,
+        staging: crate::disk_space::preflight_download_destination(target_root, expanded_bytes)
+            .map_err(InstallError::Failed)?,
+    })
+}
+
 pub(crate) fn prepare_primary_runtime(
     target_root: &Path,
+    expected_archive_target_identity: &CanonicalTargetIdentity,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<PreparedRuntimeInstall, InstallError> {
@@ -235,10 +264,11 @@ pub(crate) fn prepare_primary_runtime(
     let archive_path = downloads.join("whisper-cpp-v1.9.1-windows-x64-cpu.zip");
     let spec = crate::runtime_catalog::primary_runtime_install_spec(archive_path)
         .map_err(InstallError::Failed)?;
-    let staged = stage_runtime_archive(
+    let staged = stage_runtime_archive_for_target(
         &spec.archive,
         target_root,
         &spec.compatibility_entrypoint,
+        expected_archive_target_identity,
         cancellation,
         progress,
     )?;
