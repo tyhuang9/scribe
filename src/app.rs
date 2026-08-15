@@ -20812,8 +20812,7 @@ mod layout_tests {
                 available_bytes,
                 additional_bytes,
                 required_bytes: additional_bytes
-                    .checked_add(crate::disk_space::SAFETY_HEADROOM_BYTES)
-                    .unwrap_or(u64::MAX),
+                    .saturating_add(crate::disk_space::SAFETY_HEADROOM_BYTES),
             },
         }
     }
