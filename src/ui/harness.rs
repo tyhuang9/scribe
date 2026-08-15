@@ -1073,6 +1073,51 @@ mod tests {
         );
     }
 
+    fn painted_text_bounds_in(
+        output: &egui::FullOutput,
+        expected_text: &str,
+        cell: egui::accesskit::Rect,
+    ) -> egui::Rect {
+        fn collect_matching_text_bounds(
+            shape: &egui::epaint::Shape,
+            expected_text: &str,
+            cell: egui::Rect,
+            matches: &mut Vec<egui::Rect>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text() == expected_text
+                        && cell.contains_rect(text.visual_bounding_rect()) =>
+                {
+                    matches.push(text.visual_bounding_rect());
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_matching_text_bounds(shape, expected_text, cell, matches);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(cell.x0 as f32, cell.y0 as f32),
+            egui::pos2(cell.x1 as f32, cell.y1 as f32),
+        );
+        let mut matches = Vec::new();
+        for clipped_shape in &output.shapes {
+            collect_matching_text_bounds(&clipped_shape.shape, expected_text, cell, &mut matches);
+        }
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one painted {expected_text:?} glyph within {cell:?}, found {matches:?}"
+        );
+        matches
+            .pop()
+            .expect("exactly one matching painted text shape")
+    }
+
     fn assert_within_tolerance(actual: f64, expected: f64, tolerance: f64, label: &str) {
         assert!(
             (actual - expected).abs() <= tolerance,
@@ -3463,17 +3508,53 @@ mod tests {
                 (feature_cell.y0 + feature_cell.y1) / 2.0,
                 "language and feature cells share the row baseline",
             );
-            assert_near(
-                (language_text.y0 + language_text.y1) / 2.0,
-                (features.y0 + features.y1) / 2.0,
-                "language text and feature group share the row baseline",
-            );
             assert_bounds_within(language_icon, language_cell, "language globe");
             assert_bounds_within(language_text, language_cell, "language text");
             assert!(
                 features.x0 >= feature_cell.x0 - LAYOUT_TOLERANCE
                     && features.x1 <= feature_cell.x1 + LAYOUT_TOLERANCE,
                 "feature group stays within its fixed-width cell: features={features:?}, cell={feature_cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_card_desktop_metadata_glyphs_align_with_the_first_feature_row() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsCardExpanded, width, height);
+            let card_name = "whisper.cpp tiny.en";
+            let rect =
+                |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+            let language_cell = rect("language cell");
+            let feature_cell = rect("feature cell");
+            let globe = painted_text_bounds_in(
+                &output,
+                crate::ui::controls::icon_glyph(crate::ui::controls::Icon::Globe),
+                language_cell,
+            );
+            let language = painted_text_bounds_in(&output, "EN,ES,JA", language_cell);
+            let native_streaming = painted_text_bounds_in(
+                &output,
+                crate::ui::controls::icon_glyph(crate::ui::controls::Icon::Streaming),
+                feature_cell,
+            );
+            let globe_center = f64::from(globe.center().y);
+            let language_center = f64::from(language.center().y);
+            let native_streaming_center = f64::from(native_streaming.center().y);
+
+            assert_near(
+                globe_center,
+                native_streaming_center,
+                &format!(
+                    "painted globe aligns with the first feature glyph at {width}x{height}; globe={globe_center}, language={language_center}, native streaming={native_streaming_center}"
+                ),
+            );
+            assert_near(
+                language_center,
+                native_streaming_center,
+                &format!(
+                    "painted language text aligns with the first feature glyph at {width}x{height}; globe={globe_center}, language={language_center}, native streaming={native_streaming_center}"
+                ),
             );
         }
     }

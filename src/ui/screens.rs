@@ -1478,6 +1478,7 @@ const MODEL_RATING_METER_WIDTH: f32 = 62.0;
 const MODEL_CARD_COMPACT_BREAKPOINT: f32 = 620.0;
 const MODEL_CARD_SHADOW_GUTTER: f32 = 6.0;
 const MODEL_CARD_SUMMARY_HEIGHT: f32 = 100.0;
+const MODEL_LANGUAGE_OPTICAL_OFFSET_Y: f32 = -6.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelCardVisualState {
@@ -3289,9 +3290,18 @@ fn render_unified_model_card(
                                 language_cell_rect.right_top(),
                                 Vec2::new(metadata_cell_width, metadata_group_rect.height()),
                             );
+                            let language_content_rect = egui::Rect::from_min_size(
+                                language_cell_rect.min,
+                                Vec2::new(
+                                    language_cell_rect.width(),
+                                    feature_grid_size.y.min(32.0),
+                                ),
+                            )
+                            // Align painted small-text and globe centers with the first feature row.
+                            .translate(Vec2::new(0.0, MODEL_LANGUAGE_OPTICAL_OFFSET_Y));
                             let features = ui.allocate_ui_at_rect(metadata_group_rect, |ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.allocate_ui_at_rect(language_cell_rect, |ui| {
+                                ui.allocate_ui_at_rect(language_content_rect, |ui| {
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         render_model_metadata(ui, name, languages, false)
                                     });
