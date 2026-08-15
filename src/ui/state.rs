@@ -217,10 +217,16 @@ impl ModelDownloadState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ModelCapabilities {
-    pub streaming_preview: bool,
-    pub translation: bool,
+    /// False means unsupported only when `capabilities_known` is true.
+    pub capabilities_known: bool,
+    pub batch_transcription: bool,
+    pub native_streaming: bool,
+    pub cancellation: bool,
     pub timestamps: bool,
+    pub translation: bool,
     pub language_detection: bool,
+    pub confidence_scores: bool,
+    pub custom_vocabulary: bool,
     pub cpu: bool,
     pub gpu: bool,
 }
@@ -330,11 +336,6 @@ impl ModelViewModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ModelDialog {
     Add,
-    Details(String),
-    RemoteDetails {
-        entry_id: String,
-        variant_id: String,
-    },
     Remove(String),
 }
 
@@ -347,23 +348,17 @@ pub(crate) enum ModelCardKey {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ModelCardControl {
-    Details,
-    Remove,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelManagementState {
     pub dialog: Option<ModelDialog>,
+    /// The one model card whose inline details are expanded, if any.
+    pub expanded_model_card: Option<ModelCardKey>,
     /// One-frame focus request when a dialog first appears.
     pub focus_dialog_initial: bool,
     pub restore_add_focus: bool,
     /// After removing a model, focus a control which remains in the Models page.
     pub restore_after_removal_focus: bool,
-    pub restore_details_focus: Option<String>,
     pub restore_remove_focus: Option<String>,
-    pub focus_model_card: Option<ModelCardKey>,
     /// The deterministic ready replacement named in an active-model removal confirmation.
     pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
@@ -375,28 +370,15 @@ impl Default for ModelManagementState {
     fn default() -> Self {
         Self {
             dialog: None,
+            expanded_model_card: None,
             focus_dialog_initial: false,
             restore_add_focus: false,
             restore_after_removal_focus: false,
-            restore_details_focus: None,
             restore_remove_focus: None,
-            focus_model_card: None,
             removal_replacement: None,
             mutation_block_reason: None,
             installed_expanded: true,
             available_expanded: true,
-        }
-    }
-}
-
-impl ModelManagementState {
-    pub(crate) fn acknowledge_control_focus(&mut self, model_id: &str, control: ModelCardControl) {
-        let pending = match control {
-            ModelCardControl::Details => &mut self.restore_details_focus,
-            ModelCardControl::Remove => &mut self.restore_remove_focus,
-        };
-        if pending.as_deref() == Some(model_id) {
-            *pending = None;
         }
     }
 }
@@ -561,8 +543,17 @@ pub(crate) struct RemoteCatalogVariantView {
     pub normalized_model_id: Option<String>,
     pub managed_model_id: Option<String>,
     pub size_bytes: u64,
+    /// Volatile live download bytes, populated only while the installer reports progress.
+    pub downloaded_bytes: Option<u64>,
+    /// Volatile live total, which may remain unknown even when a download is active.
+    pub total_bytes: Option<u64>,
+    /// The installer-reported failure retained for the model-card error alert.
+    pub error_message: Option<String>,
     pub size_tier: ModelSizeTier,
     pub speed_tier: ModelSpeedTier,
+    pub accuracy_guidance: String,
+    pub expected_ram_bytes: Option<u64>,
+    pub capabilities: ModelCapabilities,
     pub actions: Vec<RemoteCatalogActionView>,
 }
 

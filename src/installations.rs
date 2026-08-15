@@ -148,6 +148,11 @@ pub(crate) struct DownloadedArtifact {
     pub(crate) sha256: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedPartial {
+    pub(crate) bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFileSpec {
     pub(crate) archive_path: PathBuf,
@@ -948,27 +953,23 @@ pub(crate) fn pinned_artifact_disk_space_preflight(
 ) -> Result<DiskSpacePreflight, InstallError> {
     validate_artifact_spec(artifact)?;
     let partial = partial_path(&artifact.destination)?;
-    let partial_bytes = if partial_file_exists(&partial)? {
-        fs::metadata(&partial)
-            .map_err(|error| {
-                failed(format!(
-                    "failed to inspect resumable partial {}: {error}",
-                    partial.display()
-                ))
-            })?
-            .len()
-    } else {
-        0
-    };
+    let partial_bytes = partial_file_metadata(&partial)?.map_or(0, |metadata| metadata.len());
     let additional_bytes = additional_download_bytes(artifact.size_bytes, partial_bytes)?;
     disk_space::preflight_download_destination(&artifact.destination, additional_bytes)
         .map_err(InstallError::Failed)
 }
 
-/// Checks whether a validated artifact has retained resumable bytes.
-pub(crate) fn pinned_artifact_has_partial(artifact: &PinnedArtifact) -> Result<bool, InstallError> {
+/// Inspects retained resumable bytes for a validated artifact.
+pub(crate) fn pinned_artifact_retained_partial(
+    artifact: &PinnedArtifact,
+) -> Result<Option<RetainedPartial>, InstallError> {
     validate_artifact_spec(artifact)?;
-    partial_file_exists(&partial_path(&artifact.destination)?)
+    let partial = partial_path(&artifact.destination)?;
+    Ok(
+        partial_file_metadata(&partial)?.map(|metadata| RetainedPartial {
+            bytes: metadata.len(),
+        }),
+    )
 }
 
 /// Removes only the resumable sidecar derived from a validated artifact.
@@ -997,18 +998,22 @@ pub(crate) fn discard_pinned_artifact_partial(
 }
 
 fn partial_file_exists(partial: &Path) -> Result<bool, InstallError> {
+    Ok(partial_file_metadata(partial)?.is_some())
+}
+
+fn partial_file_metadata(partial: &Path) -> Result<Option<fs::Metadata>, InstallError> {
     match fs::symlink_metadata(partial) {
         Ok(metadata)
             if metadata.file_type().is_file()
                 && !runtime_metadata_is_link_or_reparse(&metadata) =>
         {
-            Ok(true)
+            Ok(Some(metadata))
         }
         Ok(_) => Err(failed(format!(
             "resumable partial {} is not a regular file",
             partial.display()
         ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(failed(format!(
             "failed to inspect resumable partial {}: {error}",
             partial.display()
@@ -3173,9 +3178,12 @@ mod tests {
         fs::write(&spec.destination, b"complete artifact").unwrap();
         fs::write(&partial, b"resumable bytes").unwrap();
 
-        assert!(pinned_artifact_has_partial(&spec).unwrap());
+        assert_eq!(
+            pinned_artifact_retained_partial(&spec).unwrap(),
+            Some(RetainedPartial { bytes: 15 })
+        );
         assert!(discard_pinned_artifact_partial(&spec).unwrap());
-        assert!(!pinned_artifact_has_partial(&spec).unwrap());
+        assert_eq!(pinned_artifact_retained_partial(&spec).unwrap(), None);
         assert!(!discard_pinned_artifact_partial(&spec).unwrap());
         assert_eq!(fs::read(&spec.destination).unwrap(), b"complete artifact");
 

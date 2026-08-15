@@ -7,17 +7,18 @@ use super::{
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
-        ComparisonPhase, ModelComparisonState, ModelDialog, ModelDownloadState,
-        ModelLanguageFilter, ModelManagementState, ModelSizeTier, ModelSpeedTier, ModelViewModel,
-        RemoteCatalogActionKind, RemoteCatalogActionView, RemoteCatalogEntryView,
-        RemoteCatalogStatusKind, RemoteCatalogStatusView, RemoteCatalogVariantView,
-        RemoteCatalogView, SettingsTab, TranscriptionPhase, TranscriptionState, UiRoute,
+        ComparisonPhase, ModelCapabilities, ModelCardKey, ModelComparisonState, ModelDialog,
+        ModelDownloadState, ModelLanguageFilter, ModelManagementState, ModelSizeTier,
+        ModelSpeedTier, ModelViewModel, RemoteCatalogActionKind, RemoteCatalogActionView,
+        RemoteCatalogEntryView, RemoteCatalogStatusKind, RemoteCatalogStatusView,
+        RemoteCatalogVariantView, RemoteCatalogView, SettingsTab, TranscriptionPhase,
+        TranscriptionState, UiRoute,
     },
     theme_palette,
 };
 
 #[cfg(test)]
-use super::state::{ComparisonResult, ComparisonResultPhase, ModelCardKey};
+use super::state::{ComparisonResult, ComparisonResultPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
@@ -29,7 +30,13 @@ pub(crate) enum Fixture {
     TranscribeMicrophoneError,
     ModelsInstalled,
     ModelsLifecycle,
-    ModelsDetailsDrawer,
+    ModelsDownloadDownloading,
+    ModelsDownloadRetained,
+    ModelsDownloadFailedPartial,
+    ModelsDownloadFailedAlert,
+    ModelsCardIdle,
+    ModelsCardFocus,
+    ModelsCardExpanded,
     ModelsCompareExpanded,
     History,
     SettingsRecording,
@@ -37,7 +44,7 @@ pub(crate) enum Fixture {
 
 impl Fixture {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::TranscribeNoModel,
         Self::TranscribeReady,
         Self::TranscribeListening,
@@ -46,7 +53,13 @@ impl Fixture {
         Self::TranscribeMicrophoneError,
         Self::ModelsInstalled,
         Self::ModelsLifecycle,
-        Self::ModelsDetailsDrawer,
+        Self::ModelsDownloadDownloading,
+        Self::ModelsDownloadRetained,
+        Self::ModelsDownloadFailedPartial,
+        Self::ModelsDownloadFailedAlert,
+        Self::ModelsCardIdle,
+        Self::ModelsCardFocus,
+        Self::ModelsCardExpanded,
         Self::ModelsCompareExpanded,
         Self::History,
         Self::SettingsRecording,
@@ -61,7 +74,13 @@ impl Fixture {
             "transcribe/microphone-error" => Self::TranscribeMicrophoneError,
             "models/installed" => Self::ModelsInstalled,
             "models/lifecycle" => Self::ModelsLifecycle,
-            "models/details-drawer" => Self::ModelsDetailsDrawer,
+            "models/download-downloading" => Self::ModelsDownloadDownloading,
+            "models/download-retained" => Self::ModelsDownloadRetained,
+            "models/download-failed-partial" => Self::ModelsDownloadFailedPartial,
+            "models/download-failed-alert" => Self::ModelsDownloadFailedAlert,
+            "models/card-idle" => Self::ModelsCardIdle,
+            "models/card-focus" => Self::ModelsCardFocus,
+            "models/card-expanded" => Self::ModelsCardExpanded,
             "models/compare-expanded" => Self::ModelsCompareExpanded,
             "history" => Self::History,
             "settings/recording" => Self::SettingsRecording,
@@ -72,7 +91,13 @@ impl Fixture {
         match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
-            | Self::ModelsDetailsDrawer
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
+            | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => AppPage::Models,
             Self::History => AppPage::History,
             Self::SettingsRecording => AppPage::General,
@@ -88,7 +113,7 @@ impl Fixture {
             last_successful_capture_ms: Some(120_000),
             ..Default::default()
         };
-        let models = vec![
+        let mut models = vec![
             model("whisper.cpp base.en", "base.en", true, true, 400),
             model("whisper.cpp tiny.en", "tiny.en", false, false, 75),
         ];
@@ -105,7 +130,13 @@ impl Fixture {
         let route = match self {
             Self::ModelsInstalled
             | Self::ModelsLifecycle
-            | Self::ModelsDetailsDrawer
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
+            | Self::ModelsCardExpanded
             | Self::ModelsCompareExpanded => UiRoute::Models,
             Self::History => UiRoute::History,
             Self::SettingsRecording => UiRoute::Settings(SettingsTab::Recording),
@@ -135,13 +166,22 @@ impl Fixture {
             Self::ModelsInstalled | Self::SettingsRecording | Self::History => {
                 transcription.phase = TranscriptionPhase::Ready
             }
-            Self::ModelsLifecycle | Self::ModelsDetailsDrawer => {
+            Self::ModelsLifecycle
+            | Self::ModelsDownloadDownloading
+            | Self::ModelsDownloadRetained
+            | Self::ModelsDownloadFailedPartial
+            | Self::ModelsDownloadFailedAlert
+            | Self::ModelsCardIdle
+            | Self::ModelsCardFocus
+            | Self::ModelsCardExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
                 let mut partial = model("Whisper Moonshine", "moonshine.base", false, false, 190);
                 partial.installed = false;
                 partial.download_state = ModelDownloadState::Cancelled;
                 partial.downloaded_bytes = 129_000_000;
                 partial.total_bytes = Some(190_000_000);
+                partial.partial_cleanup_available = true;
+                partial.partial_cleanup_enabled = true;
                 partial.description = Some("Resumable local transcription model.".into());
                 partial.languages = vec!["en".into()];
 
@@ -161,6 +201,15 @@ impl Fixture {
                 failed.description = Some("High-accuracy local transcription model.".into());
                 failed.languages = vec!["en".into()];
 
+                let mut failed_with_partial = failed.clone();
+                failed_with_partial.id = "medium-retained.en".into();
+                failed_with_partial.variant_label = "medium-retained.en".into();
+                failed_with_partial.display_name = "Whisper Medium retained".into();
+                failed_with_partial.partial_cleanup_available = true;
+                failed_with_partial.partial_cleanup_enabled = true;
+                failed_with_partial.downloaded_bytes = 241_000_000;
+                failed_with_partial.total_bytes = Some(466_000_000);
+
                 let mut available = model("Whisper Large", "large-v3", false, false, 1_550);
                 available.installed = false;
                 available.download_state = ModelDownloadState::NotInstalled;
@@ -174,7 +223,44 @@ impl Fixture {
                     "fr".into(),
                 ];
 
-                model_catalog = vec![partial, downloading, failed, available];
+                model_catalog = match self {
+                    Self::ModelsDownloadDownloading => vec![downloading],
+                    Self::ModelsDownloadRetained => vec![partial],
+                    Self::ModelsDownloadFailedPartial => vec![failed_with_partial],
+                    Self::ModelsDownloadFailedAlert => vec![failed],
+                    Self::ModelsCardIdle | Self::ModelsCardFocus => Vec::new(),
+                    _ => vec![partial, downloading, failed, available],
+                };
+                if self == Self::ModelsCardFocus {
+                    models[1].primary_action_label = "Use this model".into();
+                    models[1].primary_action_enabled = true;
+                }
+                if self == Self::ModelsCardExpanded {
+                    let expanded = models
+                        .iter_mut()
+                        .find(|model| model.id == "tiny.en")
+                        .expect("expanded fixture includes tiny.en");
+                    expanded.description = Some(
+                        "A compact local model for responsive dictation, long recordings, and offline language-aware transcription."
+                            .into(),
+                    );
+                    expanded.languages = vec!["en".into(), "es".into(), "ja".into()];
+                    expanded.capabilities = ModelCapabilities {
+                        capabilities_known: true,
+                        batch_transcription: true,
+                        native_streaming: true,
+                        cancellation: true,
+                        timestamps: true,
+                        translation: true,
+                        language_detection: true,
+                        confidence_scores: true,
+                        custom_vocabulary: true,
+                        cpu: true,
+                        gpu: true,
+                    };
+                    expanded.runtime_action_label = Some("Repair".into());
+                    expanded.runtime_action_enabled = true;
+                }
             }
             Self::ModelsCompareExpanded => {
                 transcription.phase = TranscriptionPhase::Ready;
@@ -188,10 +274,9 @@ impl Fixture {
             transcription,
             models,
             comparison,
-            model_management: if self == Self::ModelsDetailsDrawer {
+            model_management: if self == Self::ModelsCardExpanded {
                 ModelManagementState {
-                    dialog: Some(ModelDialog::Details("tiny.en".into())),
-                    focus_dialog_initial: true,
+                    expanded_model_card: Some(ModelCardKey::Local("tiny.en".into())),
                     ..Default::default()
                 }
             } else {
@@ -345,12 +430,6 @@ impl UiHarnessApp {
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
-        let clear_returned_details_remove_focus = clear_initial_dialog_focus
-            && matches!(
-                &self.data.model_management.dialog,
-                Some(ModelDialog::Details(id))
-                    if self.data.model_management.restore_remove_focus.as_deref() == Some(id)
-            );
         let clear_add_focus = self.data.model_management.restore_add_focus;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
         let clear_comparison_focus = self.data.comparison.focus_panel;
@@ -372,9 +451,6 @@ impl eframe::App for UiHarnessApp {
         }
         if clear_initial_dialog_focus {
             self.data.model_management.focus_dialog_initial = false;
-        }
-        if clear_returned_details_remove_focus {
-            self.data.model_management.restore_remove_focus = None;
         }
         if clear_add_focus {
             self.data.model_management.restore_add_focus = false;
@@ -511,43 +587,28 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.model_management.dialog = Some(ModelDialog::Add);
             data.model_management.focus_dialog_initial = true;
         }
-        ScreenAction::ShowModelDetails(id) => {
-            data.model_management.dialog = Some(ModelDialog::Details(id));
-            data.model_management.focus_dialog_initial = true;
-        }
-        ScreenAction::ShowRemoteModelDetails {
-            entry_id,
-            variant_id,
-        } => {
-            data.model_management.dialog = Some(ModelDialog::RemoteDetails {
-                entry_id,
-                variant_id,
-            });
-            data.model_management.focus_dialog_initial = true;
+        ScreenAction::ToggleModelCardDetails(key) => {
+            if data.model_management.expanded_model_card.as_ref() == Some(&key) {
+                data.model_management.expanded_model_card = None;
+            } else {
+                data.model_management.expanded_model_card = Some(key);
+            }
         }
         ScreenAction::RequestModelRemoval(id) => {
             data.model_management.restore_remove_focus = matches!(
-                &data.model_management.dialog,
-                Some(ModelDialog::Details(current)) if current == &id
+                &data.model_management.expanded_model_card,
+                Some(ModelCardKey::Local(current)) if current == &id
             )
             .then(|| id.clone());
             data.model_management.dialog = Some(ModelDialog::Remove(id));
             data.model_management.focus_dialog_initial = true;
         }
+        ScreenAction::AcknowledgeModelRemovalFocus => {
+            data.model_management.restore_remove_focus = None;
+        }
         ScreenAction::CloseModelDialog => match data.model_management.dialog.take() {
             Some(ModelDialog::Add) => data.model_management.restore_add_focus = true,
-            Some(ModelDialog::Details(_)) | Some(ModelDialog::RemoteDetails { .. }) => {
-                data.model_management.restore_add_focus = true;
-            }
-            Some(ModelDialog::Remove(id))
-                if data.model_management.restore_remove_focus.as_deref() == Some(&id) =>
-            {
-                data.model_management.dialog = Some(ModelDialog::Details(id));
-                data.model_management.focus_dialog_initial = true;
-            }
-            Some(ModelDialog::Remove(id)) => {
-                data.model_management.restore_remove_focus = Some(id);
-            }
+            Some(ModelDialog::Remove(id)) => data.model_management.restore_remove_focus = Some(id),
             None => {}
         },
         ScreenAction::ConfirmModelRemoval(id) => {
@@ -617,20 +678,17 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         ScreenAction::SetRemoteCatalogQuery(query) => data.remote_catalog.query = query,
         ScreenAction::SetModelLanguageFilter(filter) => data.model_language_filter = filter,
         ScreenAction::ToggleInstalledModels => {
-            data.model_management.installed_expanded = !data.model_management.installed_expanded
-        }
-        ScreenAction::ToggleAvailableModels => {
-            data.model_management.available_expanded = !data.model_management.available_expanded
-        }
-        ScreenAction::FocusModelCard(key) => data.model_management.focus_model_card = Some(key),
-        ScreenAction::AcknowledgeModelCardFocus(key) => {
-            if data.model_management.focus_model_card.as_ref() == Some(&key) {
-                data.model_management.focus_model_card = None;
+            data.model_management.installed_expanded = !data.model_management.installed_expanded;
+            if !data.model_management.installed_expanded {
+                data.model_management.expanded_model_card = None;
             }
         }
-        ScreenAction::AcknowledgeModelControlFocus { model_id, control } => data
-            .model_management
-            .acknowledge_control_focus(&model_id, control),
+        ScreenAction::ToggleAvailableModels => {
+            data.model_management.available_expanded = !data.model_management.available_expanded;
+            if !data.model_management.available_expanded {
+                data.model_management.expanded_model_card = None;
+            }
+        }
         ScreenAction::SetLocalGgufImportPath(path) => data.remote_catalog.local_import.path = path,
         ScreenAction::ValidateAndImportLocalGguf => {
             data.remote_catalog.local_import.in_progress = true;
@@ -827,12 +885,6 @@ mod tests {
         time: Option<f64>,
     ) -> (egui::FullOutput, ScreenAction) {
         let clear_initial_dialog_focus = data.model_management.focus_dialog_initial;
-        let clear_returned_details_remove_focus = clear_initial_dialog_focus
-            && matches!(
-                &data.model_management.dialog,
-                Some(ModelDialog::Details(id))
-                    if data.model_management.restore_remove_focus.as_deref() == Some(id)
-            );
         let clear_add_focus = data.model_management.restore_add_focus;
         let clear_reference_editor_focus = data.comparison.focus_reference_editor;
         let clear_reference_action_focus = data.comparison.restore_reference_action_focus;
@@ -868,43 +920,12 @@ mod tests {
         if clear_initial_dialog_focus {
             data.model_management.focus_dialog_initial = false;
         }
-        if clear_returned_details_remove_focus {
-            data.model_management.restore_remove_focus = None;
-        }
         if clear_add_focus {
             data.model_management.restore_add_focus = false;
         }
         if clear_after_removal_focus {
             data.model_management.restore_after_removal_focus = false;
         }
-        (output, action)
-    }
-
-    fn render_with_input_and_apply(
-        ctx: &egui::Context,
-        data: &mut FixtureData,
-        page: &mut AppPage,
-        width: f32,
-        height: f32,
-        events: Vec<egui::Event>,
-    ) -> (egui::FullOutput, ScreenAction) {
-        let (output, action) = render_with_input(ctx, data, page, width, height, events);
-        apply_action(data, page, action.clone());
-        (output, action)
-    }
-
-    fn render_with_input_and_apply_at_time(
-        ctx: &egui::Context,
-        data: &mut FixtureData,
-        page: &mut AppPage,
-        width: f32,
-        height: f32,
-        events: Vec<egui::Event>,
-        time: f64,
-    ) -> (egui::FullOutput, ScreenAction) {
-        let (output, action) =
-            render_with_input_at_time(ctx, data, page, width, height, events, Some(time));
-        apply_action(data, page, action.clone());
         (output, action)
     }
 
@@ -930,21 +951,6 @@ mod tests {
             .iter()
             .find_map(|(id, node)| (node.name() == Some(name)).then_some(*id))
             .unwrap_or_else(|| panic!("missing AccessKit node for {name}"))
-    }
-
-    fn node_id_matching(
-        output: &egui::FullOutput,
-        predicate: impl Fn(&egui::accesskit::Node) -> bool,
-    ) -> egui::accesskit::NodeId {
-        output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("render should expose an AccessKit update")
-            .nodes
-            .iter()
-            .find_map(|(id, node)| predicate(node).then_some(*id))
-            .expect("expected AccessKit node")
     }
 
     fn click_named_control(
@@ -1015,30 +1021,6 @@ mod tests {
             .expect("expected AccessKit node")
     }
 
-    fn accesskit_descends_from(
-        output: &egui::FullOutput,
-        ancestor: egui::accesskit::NodeId,
-        target: egui::accesskit::NodeId,
-    ) -> bool {
-        let nodes = &output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("render should expose an AccessKit update")
-            .nodes;
-        let mut pending = vec![ancestor];
-        while let Some(id) = pending.pop() {
-            let Some((_, node)) = nodes.iter().find(|(node_id, _)| *node_id == id) else {
-                continue;
-            };
-            if node.children().contains(&target) {
-                return true;
-            }
-            pending.extend(node.children());
-        }
-        false
-    }
-
     fn focused_node(output: &egui::FullOutput) -> &egui::accesskit::Node {
         let update = output
             .platform_output
@@ -1089,6 +1071,51 @@ mod tests {
                 && inner.y1 <= outer.y1 + LAYOUT_TOLERANCE,
             "{label} {inner:?} must remain within {outer:?}"
         );
+    }
+
+    fn painted_text_bounds_in(
+        output: &egui::FullOutput,
+        expected_text: &str,
+        cell: egui::accesskit::Rect,
+    ) -> egui::Rect {
+        fn collect_matching_text_bounds(
+            shape: &egui::epaint::Shape,
+            expected_text: &str,
+            cell: egui::Rect,
+            matches: &mut Vec<egui::Rect>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text() == expected_text
+                        && cell.contains_rect(text.visual_bounding_rect()) =>
+                {
+                    matches.push(text.visual_bounding_rect());
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_matching_text_bounds(shape, expected_text, cell, matches);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(cell.x0 as f32, cell.y0 as f32),
+            egui::pos2(cell.x1 as f32, cell.y1 as f32),
+        );
+        let mut matches = Vec::new();
+        for clipped_shape in &output.shapes {
+            collect_matching_text_bounds(&clipped_shape.shape, expected_text, cell, &mut matches);
+        }
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one painted {expected_text:?} glyph within {cell:?}, found {matches:?}"
+        );
+        matches
+            .pop()
+            .expect("exactly one matching painted text shape")
     }
 
     fn assert_within_tolerance(actual: f64, expected: f64, tolerance: f64, label: &str) {
@@ -1512,19 +1539,6 @@ mod tests {
         assert!(!node_names(&ready).iter().any(|name| name == "Transcript"));
     }
 
-    fn tab_event(backwards: bool) -> egui::Event {
-        egui::Event::Key {
-            key: egui::Key::Tab,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                shift: backwards,
-                ..Default::default()
-            },
-        }
-    }
-
     fn page_event(key: egui::Key) -> egui::Event {
         egui::Event::Key {
             key,
@@ -1533,424 +1547,6 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::default(),
         }
-    }
-
-    #[test]
-    fn model_dialogs_keep_background_controls_inactive() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut page = Fixture::ModelsInstalled.page();
-
-        let mut add = Fixture::ModelsInstalled.data();
-        add.model_management.dialog = Some(ModelDialog::Add);
-        add.model_management.focus_dialog_initial = true;
-        let (output, action) =
-            render_with_input(&ctx, &mut add, &mut page, 1180.0, 815.0, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("GGUF file path"));
-
-        let mut details = Fixture::ModelsInstalled.data();
-        details.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
-        details.model_management.focus_dialog_initial = true;
-        let (output, action) =
-            render_with_input(&ctx, &mut details, &mut page, 1180.0, 815.0, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("Close model details"));
-        let (output, action) = render_with_input(
-            &ctx,
-            &mut details,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![tab_event(false)],
-        );
-        assert_eq!(action, ScreenAction::None);
-        assert!(
-            node_matching(&output, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Expand comparison")
-            })
-            .is_disabled()
-        );
-
-        let mut remove = Fixture::ModelsInstalled.data();
-        remove.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
-        remove.model_management.focus_dialog_initial = true;
-        let (output, action) =
-            render_with_input(&ctx, &mut remove, &mut page, 1180.0, 815.0, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&output).name(), Some("Cancel"));
-    }
-
-    #[test]
-    fn details_drawer_cycles_tab_focus_without_reaching_models_controls() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
-
-        for _ in 0..8 {
-            let (mut output, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![tab_event(false)],
-            );
-            assert_eq!(action, ScreenAction::None);
-            let drawer_control = [
-                "Advanced model information",
-                "Remove model from device",
-                "Use this model",
-                "Close model details",
-            ];
-            if !drawer_control.contains(&focused_node(&output).name().unwrap_or_default()) {
-                let (settled, action) =
-                    render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-                assert_eq!(action, ScreenAction::None);
-                output = settled;
-            }
-            assert!(
-                drawer_control.contains(&focused_node(&output).name().unwrap_or_default()),
-                "Tab focus must stay within a named Details control"
-            );
-            assert!(
-                node_matching(&output, |node| {
-                    node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Import local GGUF")
-                })
-                .is_disabled(),
-                "the Models page must stay inert while the drawer is open"
-            );
-        }
-    }
-
-    #[test]
-    fn local_details_exposes_accessible_partial_cleanup_without_replacing_resume() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsLifecycle.data();
-        let mut page = Fixture::ModelsLifecycle.page();
-        let model = data
-            .model_catalog
-            .iter_mut()
-            .find(|model| model.id == "moonshine.base")
-            .unwrap();
-        model.install_supported = true;
-        model.install_action_enabled = true;
-        model.partial_cleanup_available = true;
-        model.partial_cleanup_enabled = true;
-        data.model_management.dialog = Some(ModelDialog::Details("moonshine.base".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let discard = node_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Discard partial")
-        });
-        assert!(!discard.is_disabled());
-        let dialog_id = node_id_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::Dialog
-                && node
-                    .name()
-                    .is_some_and(|name| name.starts_with("Model details for"))
-        });
-        let modal_resume_id = named_node_id(&initial, "Resume");
-        assert!(accesskit_descends_from(
-            &initial,
-            dialog_id,
-            modal_resume_id
-        ));
-        assert!(
-            initial
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Resume Whisper Moonshine"))
-        );
-
-        let discard_id = named_node_id(&initial, "Discard partial");
-        data.model_management.focus_dialog_initial = false;
-        let (focused, focus_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Focus,
-                    target: discard_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(focus_action, ScreenAction::None);
-        assert_eq!(focused_node(&focused).name(), Some("Discard partial"));
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: discard_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(
-            action,
-            ScreenAction::DiscardModelPartial("moonshine.base".into())
-        );
-        apply_action(&mut data, &mut page, action);
-        let refreshed = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert!(
-            !refreshed
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Discard partial"))
-        );
-        assert_eq!(focused_node(&refreshed).name(), Some("Close model details"));
-    }
-
-    #[test]
-    fn local_details_describes_a_runtime_blocked_partial_cleanup() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let model = data
-            .models
-            .iter_mut()
-            .find(|model| model.id == "tiny.en")
-            .unwrap();
-        model.partial_cleanup_available = true;
-        model.partial_cleanup_enabled = false;
-        model.partial_cleanup_disabled_reason =
-            Some("Wait for the active installation to finish or cancel it first.".into());
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let discard = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Discard partial")
-        });
-        assert!(discard.is_disabled());
-        assert_eq!(
-            discard.description(),
-            Some("Wait for the active installation to finish or cancel it first.")
-        );
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| {
-                    node.name()
-                        == Some("Wait for the active installation to finish or cancel it first.")
-                })
-        );
-    }
-
-    #[test]
-    fn local_details_persistently_explains_an_unsafe_partial() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsLifecycle.data();
-        let mut page = Fixture::ModelsLifecycle.page();
-        let model = data
-            .model_catalog
-            .iter_mut()
-            .find(|model| model.id == "moonshine.base")
-            .unwrap();
-        let reason = "Scribe can't safely manage this partial file. Remove it from model storage, then retry.";
-        model.install_supported = true;
-        model.install_action_enabled = false;
-        model.primary_action_disabled_reason = Some(reason.into());
-        model.download_state = ModelDownloadState::Failed;
-        model.partial_cleanup_available = true;
-        model.partial_cleanup_enabled = false;
-        model.partial_cleanup_disabled_reason = Some(reason.into());
-        data.model_management.dialog = Some(ModelDialog::Details("moonshine.base".into()));
-
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let retry = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Retry")
-        });
-        assert!(retry.is_disabled());
-        assert_eq!(retry.description(), Some(reason));
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some(reason))
-        );
-    }
-
-    #[test]
-    fn remote_details_persistently_explains_pending_partial_inspection() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let entry = &mut data.remote_catalog.entries[0];
-        let variant = &mut entry.variants[0];
-        variant.actions[0].label = "Download".into();
-        variant.actions[0].enabled = false;
-        variant.actions[0].disabled_reason = Some("Checking retained download…".into());
-        data.model_management.dialog = Some(ModelDialog::RemoteDetails {
-            entry_id: entry.id.clone(),
-            variant_id: variant.id.clone(),
-        });
-
-        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let download = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Download")
-        });
-        assert!(download.is_disabled());
-        assert_eq!(download.description(), Some("Checking retained download…"));
-        assert!(
-            output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Checking retained download…"))
-        );
-    }
-
-    #[test]
-    fn trusted_remote_details_exposes_accessible_partial_cleanup_after_resume() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let entry = &mut data.remote_catalog.entries[0];
-        let variant = &mut entry.variants[0];
-        variant.actions[0].label = "Resume".into();
-        variant.actions.push(RemoteCatalogActionView {
-            label: "Discard partial".into(),
-            kind: RemoteCatalogActionKind::DiscardPartial {
-                remote_model_id: entry.id.clone(),
-                variant_id: variant.id.clone(),
-            },
-            enabled: true,
-            disabled_reason: None,
-        });
-        data.model_management.dialog = Some(ModelDialog::RemoteDetails {
-            entry_id: entry.id.clone(),
-            variant_id: variant.id.clone(),
-        });
-
-        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        assert!(
-            initial
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Resume"))
-        );
-        let discard = node_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Discard partial")
-        });
-        assert!(!discard.is_disabled());
-
-        let discard_id = named_node_id(&initial, "Discard partial");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            1180.0,
-            815.0,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: discard_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(
-            action,
-            ScreenAction::DiscardRemoteCatalogPartial {
-                remote_model_id: "trusted-speech/compact-english".into(),
-                variant_id: "compact-english-q5".into(),
-            }
-        );
-        apply_action(&mut data, &mut page, action);
-        let refreshed = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
-        assert!(
-            !refreshed
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Discard partial"))
-        );
-    }
-
-    #[test]
-    fn details_drawer_pins_and_initially_focuses_close_in_the_header_corner() {
-        let (width, height) = (960.0, 680.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let (output, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let drawer = named_node_bounds(&output, "Model details for whisper.cpp tiny.en");
-        let close = named_node_bounds(&output, "Close model details");
-        assert!(
-            close.x1 >= drawer.x1 - 20.0 && close.y0 <= drawer.y0 + 20.0,
-            "Close must stay in the drawer's top-right header corner: drawer={drawer:?}, close={close:?}"
-        );
-        assert_eq!(focused_node(&output).name(), Some("Close model details"));
     }
 
     #[test]
@@ -1978,1194 +1574,6 @@ mod tests {
             vec![page_event(egui::Key::Escape)],
         );
         assert_eq!(action, ScreenAction::CancelLocalGgufImport);
-    }
-
-    #[test]
-    fn details_dialog_escape_restores_the_stable_models_toolbar() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![page_event(egui::Key::Escape)],
-        );
-        assert_eq!(action, ScreenAction::CloseModelDialog);
-        apply_action(&mut data, &mut page, action);
-
-        let (output, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
-        assert_eq!(action, ScreenAction::None);
-    }
-
-    #[test]
-    fn remote_details_drawer_escape_restores_the_stable_models_toolbar() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::RemoteDetails {
-            entry_id: "trusted-speech/compact-english".into(),
-            variant_id: "compact-english-q5".into(),
-        });
-        data.model_management.focus_dialog_initial = true;
-
-        let (initial, initial_action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(initial_action, ScreenAction::None);
-        let close = node_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Close model details")
-        });
-        assert!(
-            !close.is_disabled(),
-            "the drawer close control must stay enabled"
-        );
-        assert_eq!(focused_node(&initial).name(), Some("Close model details"));
-
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![page_event(egui::Key::Escape)],
-        );
-        assert_eq!(action, ScreenAction::CloseModelDialog);
-        apply_action(&mut data, &mut page, action);
-        let (output, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
-        assert_eq!(action, ScreenAction::None);
-    }
-
-    #[test]
-    fn details_drawer_close_restores_the_stable_models_toolbar() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let close = named_node_id(&output, "Close model details");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: close,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::CloseModelDialog);
-        apply_action(&mut data, &mut page, action);
-
-        let (output, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
-        assert_eq!(action, ScreenAction::None);
-    }
-
-    #[test]
-    fn active_badge_is_centered_on_the_model_name() {
-        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
-        let title = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::StaticText
-                && node.name() == Some("whisper.cpp base.en")
-        })
-        .bounds()
-        .expect("model title should expose visual bounds");
-        let badge = node_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::StaticText && node.name() == Some("Active")
-        })
-        .bounds()
-        .expect("Active badge should expose visual bounds");
-        assert_within_tolerance(
-            (badge.y0 + badge.y1) / 2.0,
-            (title.y0 + title.y1) / 2.0 - 3.0,
-            0.5,
-            "Active badge optical vertical center",
-        );
-    }
-
-    #[test]
-    fn clicking_an_inactive_installed_card_selects_the_real_model() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
-        let point = egui::pos2(card.x0 as f32 + 96.0, ((card.y0 + card.y1) / 2.0) as f32);
-        let (_, press_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(press_action, ScreenAction::None);
-        let (_, release_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(release_action, ScreenAction::SelectModel("tiny.en".into()));
-    }
-
-    #[test]
-    fn card_click_target_does_not_steal_details_or_remove_actions() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let details = named_node_bounds(&initial, "Details for whisper.cpp base.en");
-        let details_point = egui::pos2(
-            ((details.x0 + details.x1) / 2.0) as f32,
-            ((details.y0 + details.y1) / 2.0) as f32,
-        );
-        let (_, press_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(details_point),
-                egui::Event::PointerButton {
-                    pos: details_point,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(press_action, ScreenAction::None);
-        let (_, details_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(details_point),
-                egui::Event::PointerButton {
-                    pos: details_point,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(
-            details_action,
-            ScreenAction::ShowModelDetails("base.en".into())
-        );
-
-        let remove = named_node_bounds(&initial, "Remove whisper.cpp tiny.en from device");
-        let remove_point = egui::pos2(
-            ((remove.x0 + remove.x1) / 2.0) as f32,
-            ((remove.y0 + remove.y1) / 2.0) as f32,
-        );
-        let (_, press_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(remove_point),
-                egui::Event::PointerButton {
-                    pos: remove_point,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(press_action, ScreenAction::None);
-        let (_, remove_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(remove_point),
-                egui::Event::PointerButton {
-                    pos: remove_point,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(
-            remove_action,
-            ScreenAction::RequestModelRemoval("tiny.en".into())
-        );
-    }
-
-    #[test]
-    fn clicking_a_legacy_available_card_starts_its_real_upgrade() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let legacy_index = data
-            .models
-            .iter()
-            .position(|model| model.id == "tiny.en")
-            .expect("installed tiny model");
-        let mut legacy = data.models.remove(legacy_index);
-        legacy.installed = false;
-        legacy.legacy_cleanup_pending = true;
-        legacy.ready = false;
-        legacy.selected = true;
-        legacy.download_state = ModelDownloadState::NotInstalled;
-        legacy.primary_action_label = "Upgrade model".into();
-        legacy.primary_action_enabled = true;
-        legacy.primary_action_installs_upgrade = true;
-        legacy.description = Some(
-            "Legacy GGML file retained for cleanup. Upgrade or open Details to remove it.".into(),
-        );
-        data.model_catalog.push(legacy);
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert!(
-            node_names(&initial)
-                .iter()
-                .any(|name| name == "3 model results: 1 installed, 2 available.")
-        );
-        assert!(
-            node_names(&initial)
-                .iter()
-                .any(|name| name == "Upgrade whisper.cpp tiny.en")
-        );
-        let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
-        let point = egui::pos2(card.x0 as f32 + 96.0, ((card.y0 + card.y1) / 2.0) as f32);
-        let (_, press_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(press_action, ScreenAction::None);
-        let (_, release_action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton {
-                    pos: point,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(release_action, ScreenAction::UpgradeModel("tiny.en".into()));
-    }
-
-    #[test]
-    fn legacy_details_accesskit_removal_cancel_returns_to_the_drawer_remove_action() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let legacy_index = data
-            .models
-            .iter()
-            .position(|model| model.id == "tiny.en")
-            .expect("installed tiny model");
-        let mut legacy = data.models.remove(legacy_index);
-        legacy.installed = false;
-        legacy.legacy_cleanup_pending = true;
-        legacy.ready = false;
-        legacy.selected = true;
-        legacy.download_state = ModelDownloadState::NotInstalled;
-        legacy.primary_action_label = "Upgrade model".into();
-        legacy.primary_action_enabled = true;
-        legacy.primary_action_installs_upgrade = true;
-        data.model_catalog.push(legacy);
-
-        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let details_id = named_node_id(&initial, "Details for whisper.cpp tiny.en");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: details_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::ShowModelDetails("tiny.en".into()));
-        apply_action(&mut data, &mut page, action);
-
-        let details = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert_eq!(focused_node(&details).name(), Some("Close model details"));
-        let remove_id = named_node_id(&details, "Remove model from device");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: remove_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::RequestModelRemoval("tiny.en".into()));
-        apply_action(&mut data, &mut page, action);
-
-        let confirmation =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert_eq!(focused_node(&confirmation).name(), Some("Cancel"));
-        let cancel_id = named_node_id(&confirmation, "Cancel");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: cancel_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::CloseModelDialog);
-        apply_action(&mut data, &mut page, action);
-        assert_eq!(
-            data.model_management.dialog,
-            Some(ModelDialog::Details("tiny.en".into()))
-        );
-
-        let returned = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert_eq!(
-            focused_node(&returned).name(),
-            Some("Remove model from device")
-        );
-    }
-
-    #[test]
-    fn remove_dialog_cancel_moves_focus_to_the_models_toolbar() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let initial = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let cancel_id = named_node_id(&initial, "Cancel");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: cancel_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::CloseModelDialog);
-        apply_action(&mut data, &mut page, action);
-
-        let (output, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(focused_node(&output).name(), Some("Import local GGUF"));
-        assert_eq!(
-            action,
-            ScreenAction::AcknowledgeModelControlFocus {
-                model_id: "tiny.en".into(),
-                control: super::super::state::ModelCardControl::Remove,
-            }
-        );
-    }
-
-    #[test]
-    fn model_dialogs_are_modal_and_reject_background_accesskit_actions() {
-        let (width, height) = (1180.0, 815.0);
-        for (dialog, dialog_name, expected_focus) in [
-            (
-                ModelDialog::Add,
-                "Import local GGUF",
-                Some("GGUF file path"),
-            ),
-            (
-                ModelDialog::Details("base.en".into()),
-                "Model details for whisper.cpp base.en",
-                Some("Close model details"),
-            ),
-            (
-                ModelDialog::Remove("tiny.en".into()),
-                "Remove whisper.cpp tiny.en",
-                Some("Cancel"),
-            ),
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_accessible_style(&ctx);
-            let mut data = Fixture::ModelsInstalled.data();
-            let mut page = Fixture::ModelsInstalled.page();
-            data.model_management.dialog = Some(dialog);
-            data.model_management.focus_dialog_initial = true;
-
-            let (initial, action) =
-                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-            assert_eq!(action, ScreenAction::None);
-            let dialog_node = node_matching(&initial, |node| {
-                node.name() == Some(dialog_name) && node.is_modal()
-            });
-            assert!(dialog_node.is_modal(), "{dialog_name} must be modal");
-            let dock = node_matching(&initial, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Expand comparison")
-            });
-            assert!(
-                dock.is_disabled(),
-                "comparison dock must be disabled behind {dialog_name}"
-            );
-            let dock_id = named_node_id(&initial, "Expand comparison");
-
-            assert_eq!(focused_node(&initial).name(), expected_focus);
-            let (_, action) = render_with_input(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![egui::Event::AccessKitActionRequest(
-                    egui::accesskit::ActionRequest {
-                        action: egui::accesskit::Action::Default,
-                        target: dock_id,
-                        data: None,
-                    },
-                )],
-            );
-            assert_eq!(
-                action,
-                ScreenAction::None,
-                "comparison dock must not act while {dialog_name} is open"
-            );
-        }
-    }
-
-    #[test]
-    fn comparison_dock_layer_stays_above_routes_and_below_active_model_dialogs() {
-        let (width, height) = (1180.0, 815.0);
-        for (dialog, dialog_name, expected_order) in [
-            (
-                ModelDialog::Add,
-                "Import local GGUF",
-                egui::Order::Foreground,
-            ),
-            (
-                ModelDialog::Details("base.en".into()),
-                "Model details for whisper.cpp base.en",
-                egui::Order::Foreground,
-            ),
-            (
-                ModelDialog::Remove("tiny.en".into()),
-                "Remove whisper.cpp tiny.en",
-                egui::Order::Foreground,
-            ),
-        ] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_accessible_style(&ctx);
-            let mut data = Fixture::ModelsCompareExpanded.data();
-            let mut page = Fixture::ModelsCompareExpanded.page();
-
-            let (without_dialog, action) =
-                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-            assert_eq!(action, ScreenAction::None);
-            let surface = named_node_bounds(&without_dialog, "Model comparison surface");
-            let dock_probe = egui::pos2(
-                ((surface.x0 + surface.x1) / 2.0) as f32,
-                ((surface.y0 + surface.y1) / 2.0) as f32,
-            );
-            let foreground_dock_layer = ctx
-                .memory(|memory| memory.layer_id_at(dock_probe))
-                .expect("expanded comparison dock should own its visible surface");
-            assert_eq!(foreground_dock_layer.order, egui::Order::Foreground);
-
-            data.model_management.dialog = Some(dialog);
-            data.model_management.focus_dialog_initial = true;
-            let _ = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-            let (with_dialog, action) =
-                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-            assert_eq!(action, ScreenAction::None);
-            let dialog_node = node_matching(&with_dialog, |node| {
-                node.name() == Some(dialog_name) && node.is_modal()
-            });
-            assert!(dialog_node.is_modal(), "{dialog_name} must remain modal");
-            let dialog_bounds = dialog_node
-                .bounds()
-                .expect("model dialog should expose bounds");
-            assert!(
-                dialog_bounds.x0 < surface.x1
-                    && dialog_bounds.x1 > surface.x0
-                    && dialog_bounds.y0 < surface.y1
-                    && dialog_bounds.y1 > surface.y0,
-                "{dialog_name} should overlap the expanded comparison dock in this layer fixture"
-            );
-            let dialog_probe = egui::pos2(
-                ((dialog_bounds.x0 + dialog_bounds.x1) / 2.0) as f32,
-                ((dialog_bounds.y0 + dialog_bounds.y1) / 2.0) as f32,
-            );
-            let dialog_layer = ctx
-                .memory(|memory| memory.layer_id_at(dialog_probe))
-                .expect("active model dialog should own its surface");
-            assert_eq!(dialog_layer.order, expected_order);
-
-            let layers = ctx.memory(|memory| memory.layer_ids().collect::<Vec<_>>());
-            let dock_index = layers
-                .iter()
-                .position(|layer| *layer == foreground_dock_layer)
-                .expect("comparison dock should retain its foreground layer");
-            let dialog_index = layers
-                .iter()
-                .position(|layer| *layer == dialog_layer)
-                .expect("modal frame should contain the model dialog layer");
-            assert!(
-                dock_index < dialog_index,
-                "{dialog_name} must be rendered above the disabled comparison dock"
-            );
-            assert!(
-                node_matching(&with_dialog, |node| {
-                    node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Collapse comparison")
-                })
-                .is_disabled(),
-                "comparison dock must remain inert behind {dialog_name}"
-            );
-        }
-    }
-
-    #[test]
-    fn model_dialog_controls_remain_enabled_and_accesskit_actionable() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
-        data.model_management.focus_dialog_initial = true;
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let dialog_id = node_id_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::AlertDialog
-                && node.name() == Some("Remove whisper.cpp tiny.en")
-        });
-        let update = initial.platform_output.accesskit_update.as_ref().unwrap();
-        let (remove_id, remove) = update
-            .nodes
-            .iter()
-            .find(|(id, node)| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Remove")
-                    && !node.is_disabled()
-                    && accesskit_descends_from(&initial, dialog_id, *id)
-            })
-            .expect("enabled Remove button inside removal dialog");
-        assert_eq!(remove.role(), egui::accesskit::Role::Button);
-        assert!(
-            !remove.is_disabled(),
-            "dialog Remove control must remain enabled"
-        );
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: *remove_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::ConfirmModelRemoval("tiny.en".into()));
-    }
-
-    #[test]
-    fn catalog_only_legacy_cleanup_removal_dialog_is_actionable() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_catalog.push(ModelViewModel {
-            id: "whisper_cpp_base_en".into(),
-            display_name: "Whisper Base — English".into(),
-            legacy_cleanup_pending: true,
-            removal_supported: true,
-            ..Default::default()
-        });
-        data.model_management.dialog = Some(ModelDialog::Remove("whisper_cpp_base_en".into()));
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        let dialog_id = node_id_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::AlertDialog
-                && node.name() == Some("Remove Whisper Base — English")
-        });
-        let update = initial.platform_output.accesskit_update.as_ref().unwrap();
-        let remove_id = update
-            .nodes
-            .iter()
-            .find(|(id, node)| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.name() == Some("Remove")
-                    && !node.is_disabled()
-                    && accesskit_descends_from(&initial, dialog_id, *id)
-            })
-            .map(|(id, _)| *id)
-            .expect("enabled Remove button for catalog-only legacy cleanup");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: remove_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(
-            action,
-            ScreenAction::ConfirmModelRemoval("whisper_cpp_base_en".into())
-        );
-    }
-
-    #[test]
-    fn model_dialog_and_comparison_table_preserve_accessible_hierarchy() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-
-        let dialog_output =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let dialog_id = node_id_matching(&dialog_output, |node| {
-            node.role() == egui::accesskit::Role::Dialog
-                && node.name() == Some("Model details for whisper.cpp tiny.en")
-        });
-        for control in [
-            "Use this model",
-            "Remove model from device",
-            "Close model details",
-        ] {
-            let control_id = node_id_matching(&dialog_output, |node| {
-                node.role() == egui::accesskit::Role::Button && node.name() == Some(control)
-            });
-            assert!(
-                accesskit_descends_from(&dialog_output, dialog_id, control_id),
-                "{control} must descend from the details dialog"
-            );
-        }
-        assert!(
-            node_names(&dialog_output)
-                .iter()
-                .any(|name| name == "Advanced model information"),
-            "details must offer the progressive-disclosure metadata control"
-        );
-
-        let comparison_output = render(Fixture::ModelsCompareExpanded, 1476.0, 1018.0);
-        let table_id = node_id_matching(&comparison_output, |node| {
-            node.role() == egui::accesskit::Role::Table
-                && node.name() == Some("Model comparison results")
-        });
-        let surface_id = named_node_id(&comparison_output, "Model comparison surface");
-        assert!(
-            accesskit_descends_from(&comparison_output, surface_id, table_id),
-            "wide result table must descend from the comparison surface"
-        );
-        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
-            let row_id = node_id_matching(&comparison_output, |node| {
-                node.role() == egui::accesskit::Role::Row
-                    && node.name() == Some(format!("Comparison result for {model}").as_str())
-            });
-            assert!(
-                accesskit_descends_from(&comparison_output, table_id, row_id),
-                "{model} row must descend from the comparison table"
-            );
-            let accuracy_cell_id = node_id_matching(&comparison_output, |node| {
-                node.role() == egui::accesskit::Role::Cell
-                    && node.name() == Some(format!("Accuracy for {model}").as_str())
-            });
-            let accuracy_action_id = node_id_matching(&comparison_output, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.description().is_some_and(|description| {
-                        description
-                            == format!(
-                                "Add a reference transcript to measure accuracy for {model}."
-                            )
-                    })
-            });
-            assert!(
-                accesskit_descends_from(&comparison_output, row_id, accuracy_cell_id),
-                "{model} accuracy cell must descend from its row"
-            );
-            assert!(
-                accesskit_descends_from(&comparison_output, accuracy_cell_id, accuracy_action_id,),
-                "{model} accuracy action must descend from its cell"
-            );
-        }
-
-        let compact_output = render(Fixture::ModelsCompareExpanded, 960.0, 680.0);
-        let compact_surface_id = named_node_id(&compact_output, "Model comparison surface");
-        for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
-            let group_id = node_id_matching(&compact_output, |node| {
-                node.role() == egui::accesskit::Role::Group
-                    && node.name() == Some(format!("Comparison result for {model}").as_str())
-            });
-            let accuracy_action_id = node_id_matching(&compact_output, |node| {
-                node.role() == egui::accesskit::Role::Button
-                    && node.description().is_some_and(|description| {
-                        description
-                            == format!(
-                                "Add a reference transcript to measure accuracy for {model}."
-                            )
-                    })
-            });
-            assert!(
-                accesskit_descends_from(&compact_output, compact_surface_id, group_id),
-                "{model} compact group must descend from the comparison surface"
-            );
-            assert!(
-                accesskit_descends_from(&compact_output, group_id, accuracy_action_id),
-                "{model} compact accuracy action must descend from its result group"
-            );
-        }
-    }
-
-    #[test]
-    fn installed_model_cards_are_compact_and_expose_details_without_row_activation() {
-        let (width, height) = (1180.0, 815.0);
-        let row_name = "whisper.cpp tiny.en model";
-        let details_name = "Details for whisper.cpp tiny.en";
-
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let row = named_node_bounds(&output, row_name);
-        assert!(
-            ((row.y1 - row.y0) - 76.0).abs() <= LAYOUT_TOLERANCE,
-            "installed card height should be 76 px, got {}",
-            row.y1 - row.y0
-        );
-        assert!(
-            !node_names(&output)
-                .iter()
-                .any(|name| name == "Use this model whisper.cpp tiny.en"),
-            "inactive activation must be disclosed only in the Details drawer"
-        );
-        let details_id = named_node_id(&output, details_name);
-        let details = output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("render should expose an AccessKit update")
-            .nodes
-            .iter()
-            .find_map(|(id, node)| (*id == details_id).then(|| node.bounds()).flatten())
-            .expect("tiny model Details control should expose bounds");
-        assert_bounds_within(details, row, "tiny model Details control");
-    }
-
-    #[test]
-    fn installed_model_rows_and_metadata_stay_inside_the_route_inset() {
-        let row_name = "whisper.cpp base.en model";
-        for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
-            let output = render(Fixture::ModelsInstalled, width, height);
-            for header in ["MODEL", "LANGUAGES", "SPEED", "ACCURACY", "SIZE"] {
-                assert!(
-                    node_names(&output).iter().any(|name| name == header),
-                    "{header} header should render at {width}x{height}"
-                );
-            }
-            let surface = named_node_bounds(&output, "Model comparison surface");
-            let row = named_node_bounds(&output, row_name);
-            assert!(
-                row.x0 >= surface.x0 - LAYOUT_TOLERANCE && row.x1 <= surface.x1 + LAYOUT_TOLERANCE,
-                "installed model card {row:?} must remain inside route inset {surface:?}"
-            );
-
-            let row_contents: Vec<_> = output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .expect("render should expose an AccessKit update")
-                .nodes
-                .iter()
-                .filter_map(|(_, node)| {
-                    let name = node.name()?;
-                    let bounds = node.bounds()?;
-                    (name != row_name
-                        && bounds.y0 >= row.y0 - LAYOUT_TOLERANCE
-                        && bounds.y1 <= row.y1 + LAYOUT_TOLERANCE
-                        && bounds.x0 >= surface.x0 - LAYOUT_TOLERANCE
-                        && bounds.y1 > bounds.y0)
-                        .then_some((name, bounds))
-                })
-                .collect();
-            assert!(
-                row_contents
-                    .iter()
-                    .any(|(name, _)| name.contains("English"))
-                    && row_contents
-                        .iter()
-                        .any(|(name, _)| name.contains("Balanced")),
-                "installed card should expose language and speed metadata at {width}x{height}"
-            );
-            for (name, bounds) in row_contents {
-                assert_bounds_within(bounds, row, &format!("installed row content {name:?}"));
-            }
-        }
-    }
-
-    #[test]
-    fn narrow_model_rows_keep_actions_and_metadata_inside_the_viewport() {
-        let output = render(Fixture::ModelsLifecycle, 375.0, 680.0);
-        let nodes = &output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("render should expose an AccessKit update")
-            .nodes;
-        let rows = nodes
-            .iter()
-            .filter_map(|(_, node)| {
-                (node.role() == egui::accesskit::Role::Group
-                    && node.name().is_some_and(|name| name.ends_with(" model")))
-                .then(|| node.bounds())
-                .flatten()
-            })
-            .collect::<Vec<_>>();
-        assert!(!rows.is_empty(), "narrow fixture should render model rows");
-        for row in rows {
-            assert_within_tolerance(
-                row.y1 - row.y0,
-                124.0,
-                LAYOUT_TOLERANCE,
-                "narrow model row height",
-            );
-            assert!(
-                row.x0 >= 0.0 && row.x1 <= 375.0,
-                "row escaped narrow viewport: {row:?}"
-            );
-        }
-        for (_, node) in nodes.iter().filter(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name().is_some_and(|name| {
-                    name.starts_with("Details for ")
-                        || name.starts_with("Download ")
-                        || name.starts_with("Resume ")
-                        || name.starts_with("Retry ")
-                        || name.starts_with("Cancel ")
-                })
-        }) {
-            let bounds = node.bounds().expect("model action should expose bounds");
-            let parent_row = nodes.iter().find_map(|(_, candidate)| {
-                (candidate.role() == egui::accesskit::Role::Group
-                    && candidate.name() == Some("whisper.cpp base.en model"))
-                .then(|| candidate.bounds())
-                .flatten()
-            });
-            assert!(
-                bounds.x0 >= 0.0 && bounds.x1 <= 375.0 && bounds.y1 > bounds.y0,
-                "narrow model action {:?} escaped viewport: {bounds:?}; base row={parent_row:?}",
-                node.name(),
-            );
-            assert!(
-                bounds.x1 - bounds.x0 >= 44.0 - LAYOUT_TOLERANCE
-                    && bounds.y1 - bounds.y0 >= 44.0 - LAYOUT_TOLERANCE,
-                "model action must retain a 44px target: {bounds:?}"
-            );
-        }
-        assert!(
-            nodes
-                .iter()
-                .any(|(_, node)| { node.name().is_some_and(|name| name.contains("MB")) }),
-            "narrow rows must preserve the model size metadata"
-        );
-    }
-
-    #[test]
-    fn model_details_preserve_use_and_remove_actions_with_disabled_reasons() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let dialog_id = node_id_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Dialog
-                && node.name() == Some("Model details for whisper.cpp tiny.en")
-        });
-        let use_id = node_id_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button && node.name() == Some("Use this model")
-        });
-        assert!(accesskit_descends_from(&output, dialog_id, use_id));
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: use_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::SelectModel("tiny.en".into()));
-
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut repair = Fixture::ModelsInstalled.data();
-        let repair_model = repair
-            .models
-            .iter_mut()
-            .find(|model| model.id == "tiny.en")
-            .unwrap();
-        repair_model.primary_action_label = "Repair runtime".into();
-        repair_model.primary_action_enabled = true;
-        repair_model.primary_action_repairs_runtime = true;
-        repair_model.primary_action_disabled_reason = None;
-        repair.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        let mut repair_page = Fixture::ModelsInstalled.page();
-        let initial = render_with_input(
-            &ctx,
-            &mut repair,
-            &mut repair_page,
-            width,
-            height,
-            Vec::new(),
-        )
-        .0;
-        let advanced_id = node_id_matching(&initial, |node| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Advanced model information")
-        });
-        let (output, advanced_action) = render_with_input(
-            &ctx,
-            &mut repair,
-            &mut repair_page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: advanced_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(advanced_action, ScreenAction::None);
-        let repair_id = node_id_matching(&output, |node| {
-            node.role() == egui::accesskit::Role::Button
-                && node.name() == Some("Repair runtime")
-                && !node.is_disabled()
-        });
-        let (_, repair_action) = render_with_input(
-            &ctx,
-            &mut repair,
-            &mut repair_page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: repair_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(
-            repair_action,
-            ScreenAction::RepairModelRuntime("tiny.en".into())
-        );
-
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        let mut page = Fixture::ModelsInstalled.page();
-        data.model_management.dialog = Some(ModelDialog::Details("tiny.en".into()));
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        let remove_id = named_node_id(&output, "Remove model from device");
-        let (_, action) = render_with_input(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Default,
-                    target: remove_id,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::RequestModelRemoval("tiny.en".into()));
-
-        let mut active = Fixture::ModelsInstalled.data();
-        active.models[0].primary_action_disabled_reason =
-            Some("This model is already active.".into());
-        active
-            .models
-            .iter_mut()
-            .find(|model| model.id == "tiny.en")
-            .expect("fixture includes a second installed model")
-            .ready = false;
-        active.model_management.dialog = Some(ModelDialog::Details("base.en".into()));
-        let output = render_with_input(&ctx, &mut active, &mut page, width, height, Vec::new()).0;
-        assert!(
-            node_names(&output)
-                .iter()
-                .any(|name| name == "Active model"),
-            "the active drawer must explain why it does not offer activation"
-        );
-        assert!(
-            !node_names(&output)
-                .iter()
-                .any(|name| name == "Use this model"),
-            "only inactive ready models may expose the drawer activation action"
-        );
-        let has_disabled_remove = output
-            .platform_output
-            .accesskit_update
-            .as_ref()
-            .expect("details drawer exposes an AccessKit update")
-            .nodes
-            .iter()
-            .any(|(_, node)| {
-                node.name() == Some("Remove model from device")
-                    && node.is_disabled()
-                    && node.description()
-                        == Some("Install another ready model before removing the selected model.")
-            });
-        assert!(
-            has_disabled_remove,
-            "missing disabled active-removal action; nodes={:?}",
-            node_names(&output)
-        );
     }
 
     #[test]
@@ -3267,6 +1675,27 @@ mod tests {
                 "Scribe couldn’t access your microphone",
             ),
             (Fixture::ModelsInstalled, "Compare installed models"),
+            (
+                Fixture::ModelsDownloadDownloading,
+                "Pause Whisper Parakeet download",
+            ),
+            (
+                Fixture::ModelsDownloadRetained,
+                "Resume Whisper Moonshine download",
+            ),
+            (
+                Fixture::ModelsDownloadFailedPartial,
+                "Resume Whisper Medium retained download",
+            ),
+            (
+                Fixture::ModelsDownloadFailedAlert,
+                "Show download error for Whisper Medium",
+            ),
+            (Fixture::ModelsCardIdle, "whisper.cpp base.en"),
+            (
+                Fixture::ModelsCardFocus,
+                "Use whisper.cpp tiny.en for future transcriptions",
+            ),
             (Fixture::ModelsCompareExpanded, "No data"),
             (Fixture::SettingsRecording, "Recording behavior"),
         ] {
@@ -3280,6 +1709,50 @@ mod tests {
     }
 
     #[test]
+    fn isolated_download_fixtures_expose_truthful_controls_at_both_native_sizes() {
+        for (fixture, expected_controls) in [
+            (
+                Fixture::ModelsDownloadDownloading,
+                [
+                    "Pause Whisper Parakeet download",
+                    "Discard partial for Whisper Parakeet",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadRetained,
+                [
+                    "Resume Whisper Moonshine download",
+                    "Discard partial for Whisper Moonshine",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadFailedPartial,
+                [
+                    "Resume Whisper Medium retained download",
+                    "Discard partial for Whisper Medium retained",
+                ],
+            ),
+            (
+                Fixture::ModelsDownloadFailedAlert,
+                [
+                    "Install Whisper Medium",
+                    "Show download error for Whisper Medium",
+                ],
+            ),
+        ] {
+            for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+                let names = node_names(&render(fixture, width, height));
+                for expected in expected_controls {
+                    assert!(
+                        names.iter().any(|name| name == expected),
+                        "{fixture:?} at {width}x{height} missing {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn remote_cards_use_unknown_ratings_without_extra_state_badges() {
         let names = node_names(&render(Fixture::ModelsInstalled, 1180.0, 815.0));
 
@@ -3287,6 +1760,157 @@ mod tests {
         assert!(names.iter().any(|name| name.contains("Speed: Not rated")));
         assert!(names.iter().any(|name| name == "Accuracy: Not rated"));
         assert!(!names.iter().any(|name| name == "Trusted publisher"));
+    }
+
+    #[test]
+    fn model_card_ratings_render_all_proportional_bins_and_truthful_unknown_meters() {
+        for (guidance, label, value) in [
+            ("Basic", "Basic", 1_u8),
+            ("Fair", "Fair", 2),
+            ("Good", "Good", 3),
+            ("High", "High", 4),
+            ("Highest", "Highest", 5),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut model = data.models.remove(0);
+            model.accuracy_guidance = guidance.into();
+            data.models = vec![model];
+            data.model_catalog.clear();
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            let name = format!("Accuracy: {label} ({value} of 5)");
+            let meter = node_matching(&output, |node| node.name() == Some(name.as_str()));
+            assert_eq!(meter.role(), egui::accesskit::Role::Meter);
+            assert_eq!(meter.min_numeric_value(), Some(0.0));
+            assert_eq!(meter.max_numeric_value(), Some(5.0));
+            assert_eq!(meter.numeric_value(), Some(f64::from(value)));
+
+            let track = named_node_bounds(&output, &format!("{name} layout rating track"));
+            let fill = named_node_bounds(&output, &format!("{name} layout rating fill"));
+            assert_near(track.height(), 7.0, "rating track height");
+            assert_near(fill.x0, track.x0, "rating fill starts at track origin");
+            assert_near(
+                fill.height(),
+                track.height(),
+                "rating fill uses full track height",
+            );
+            assert_near(
+                fill.width(),
+                track.width() * f64::from(value) / 5.0,
+                "rating fill is proportional to the bin",
+            );
+        }
+
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let unknown = node_matching(&output, |node| node.name() == Some("Accuracy: Not rated"));
+        assert_eq!(unknown.role(), egui::accesskit::Role::Meter);
+        assert_eq!(unknown.min_numeric_value(), None);
+        assert_eq!(unknown.max_numeric_value(), None);
+        assert_eq!(unknown.numeric_value(), None);
+        let track = named_node_bounds(&output, "Accuracy: Not rated layout rating track");
+        assert_near(track.height(), 7.0, "unknown rating keeps an empty track");
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Accuracy: Not rated layout rating fill"),
+            "an unknown rating must not fabricate a filled bin"
+        );
+    }
+
+    #[test]
+    fn install_controls_show_compact_sizes_and_dispatch_local_or_remote_actions() {
+        fn shape_texts(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        shape_texts(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut local = Fixture::ModelsInstalled.data();
+        local.models.clear();
+        let model = ModelViewModel {
+            id: "local-install".into(),
+            display_name: "Local install".into(),
+            total_bytes: Some(1_500_000_000),
+            install_supported: true,
+            install_action_enabled: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        };
+        local.model_catalog = vec![model.clone()];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut local, &mut page, width, height, Vec::new()).0;
+        let install = node_matching(&output, |node| node.name() == Some("Install Local install"));
+        assert!(
+            install
+                .bounds()
+                .is_some_and(|bounds| bounds.width() >= 44.0 && bounds.height() >= 44.0)
+        );
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            shape_texts(&shape.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|text| text.contains("1.5 GB")));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut local,
+                &mut page,
+                width,
+                height,
+                "Install Local install"
+            ),
+            ScreenAction::InstallModel(model.id.clone())
+        );
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut remote = Fixture::ModelsInstalled.data();
+        remote.models.clear();
+        remote.model_catalog.clear();
+        remote.remote_catalog.entries[0].variants[0].size_bytes = 82_000_000;
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut remote, &mut page, width, height, Vec::new()).0;
+        let install = node_matching(&output, |node| {
+            node.name() == Some("Install Compact English")
+        });
+        assert!(
+            install
+                .bounds()
+                .is_some_and(|bounds| bounds.width() >= 44.0 && bounds.height() >= 44.0)
+        );
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            shape_texts(&shape.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|text| text.contains("82 MB")));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut remote,
+                &mut page,
+                width,
+                height,
+                "Install Compact English"
+            ),
+            ScreenAction::InstallRemoteCatalogVariant {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            }
+        );
     }
 
     #[test]
@@ -3380,541 +2004,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shared_route_shell_keeps_titles_and_docks_inside_all_reference_viewports() {
-        for (width, height) in [(1476.0, 1018.0), (1180.0, 815.0), (960.0, 680.0)] {
-            let titles = [
-                (Fixture::TranscribeReady, "Transcribe"),
-                (Fixture::ModelsInstalled, "Models"),
-                (Fixture::SettingsRecording, "Settings"),
-            ]
-            .map(|(fixture, title)| {
-                node_matching(&render(fixture, width, height), |node| {
-                    node.role() == egui::accesskit::Role::Heading && node.name() == Some(title)
-                })
-                .bounds()
-                .expect("route heading should expose bounds")
-            });
-            for title in titles {
-                assert_within_tolerance(title.y0, 28.0, 6.0, "shared route title top inset");
-            }
-
-            for (fixture, expanded) in [
-                (Fixture::ModelsInstalled, false),
-                (Fixture::ModelsCompareExpanded, true),
-            ] {
-                let output = render(fixture, width, height);
-                let surface = named_node_bounds(&output, "Model comparison surface");
-                let header = named_node_bounds(
-                    &output,
-                    if expanded {
-                        "Collapse comparison"
-                    } else {
-                        "Expand comparison"
-                    },
-                );
-                assert_bounds_within(
-                    surface,
-                    egui::accesskit::Rect {
-                        x0: 0.0,
-                        y0: 0.0,
-                        x1: width.into(),
-                        y1: height.into(),
-                    },
-                    "comparison dock",
-                );
-                assert_bounds_within(header, surface, "fixed comparison header");
-                assert_within_tolerance(
-                    surface.y1,
-                    f64::from(height - 24.0),
-                    LAYOUT_TOLERANCE,
-                    "comparison surface bottom gap",
-                );
-                for name in [
-                    "Import local GGUF",
-                    "Refresh trusted model catalog",
-                    "Remove whisper.cpp base.en from device",
-                    "Details for whisper.cpp base.en",
-                ] {
-                    let bounds = node_matching(&output, |node| {
-                        node.role() == egui::accesskit::Role::Button && node.name() == Some(name)
-                    })
-                    .bounds()
-                    .unwrap_or_else(|| panic!("Models action {name:?} should expose bounds"));
-                    assert!(
-                        bounds.x0 >= surface.x0 - LAYOUT_TOLERANCE
-                            && bounds.x1 <= surface.x1 + LAYOUT_TOLERANCE,
-                        "Models control {name:?} must stay within the shared route inset: {bounds:?} vs {surface:?}"
-                    );
-                }
-                if expanded && width >= 1_476.0 {
-                    let table = node_matching(&output, |node| {
-                        node.role() == egui::accesskit::Role::Table
-                            && node.name() == Some("Model comparison results")
-                    })
-                    .bounds()
-                    .expect("wide comparison table should expose bounds");
-                    assert_bounds_within(table, surface, "wide comparison table");
-                    assert!(
-                        surface.y1 - surface.y0 <= f64::from(height) * 0.6 + LAYOUT_TOLERANCE,
-                        "expanded dock must remain below the 60% viewport cap"
-                    );
-                } else if expanded {
-                    for model in ["whisper.cpp base.en", "whisper.cpp tiny.en"] {
-                        let group = node_matching(&output, |node| {
-                            node.role() == egui::accesskit::Role::Group
-                                && node.name()
-                                    == Some(format!("Comparison result for {model}").as_str())
-                        })
-                        .bounds()
-                        .expect("compact comparison group should expose bounds");
-                        assert!(
-                            group.x0 >= surface.x0
-                                && group.x1 <= surface.x1
-                                && group.y0 < surface.y1
-                                && group.y1 > surface.y0,
-                            "compact comparison result group must remain horizontally contained and vertically intersect its scrollable surface: {group:?} vs {surface:?}"
-                        );
-                    }
-                }
-                if expanded {
-                    let start = named_node_bounds(&output, "Start test recording");
-                    assert_bounds_within(start, surface, "comparison recording action");
-                    for (_, accuracy) in output
-                        .platform_output
-                        .accesskit_update
-                        .as_ref()
-                        .unwrap()
-                        .nodes
-                        .iter()
-                        .filter(|(_, node)| {
-                            node.role() == egui::accesskit::Role::Button
-                                && node.name() == Some("Add a reference transcript to measure")
-                        })
-                    {
-                        assert_bounds_within(
-                            accuracy
-                                .bounds()
-                                .expect("accuracy action should expose bounds"),
-                            surface,
-                            "comparison result accuracy action",
-                        );
-                    }
-                } else {
-                    assert_within_tolerance(
-                        surface.y1 - surface.y0,
-                        82.0,
-                        LAYOUT_TOLERANCE,
-                        "collapsed comparison surface height",
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn models_max_scroll_keeps_the_final_model_card_clear_of_the_dock() {
-        for fixture in [Fixture::ModelsInstalled, Fixture::ModelsCompareExpanded] {
-            let (width, height) = (1180.0, 815.0);
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            configure_accessible_style(&ctx);
-            let mut data = fixture.data();
-            data.models.extend((0..24).map(|index| ModelViewModel {
-                id: format!("available-{index:02}"),
-                display_name: format!("Available model {index:02}"),
-                variant_label: format!("available-{index:02}"),
-                install_supported: true,
-                install_action_enabled: true,
-                language_summary: "English".into(),
-                languages: vec!["English".into()],
-                speed_tier: ModelSpeedTier::Balanced,
-                size_tier: ModelSizeTier::Base,
-                ..Default::default()
-            }));
-            let mut page = fixture.page();
-            let _ = render_with_input_at_time(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                Vec::new(),
-                Some(0.0),
-            );
-            let (route_id, _, initial_content_size, initial_viewport) = ctx
-                .data(|data| {
-                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
-                        "route-scroll-diagnostics",
-                    ))
-                })
-                .expect("Models route should expose its scroll state in tests");
-            let mut route_state = egui::scroll_area::State::load(&ctx, route_id)
-                .expect("Models route scroll state should persist");
-            route_state.offset.y = (initial_content_size.y - initial_viewport.height()).max(0.0);
-            route_state.store(&ctx, route_id);
-
-            let settled = render_with_input_at_time(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                Vec::new(),
-                Some(1.0),
-            )
-            .0;
-            let surface = named_node_bounds(&settled, "Model comparison surface");
-            let final_entry = ctx
-                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("models-final-card-rect")))
-                .expect("model list should expose its final card rect in tests");
-            let (_, offset, content_size, viewport) = ctx
-                .data(|data| {
-                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
-                        "route-scroll-diagnostics",
-                    ))
-                })
-                .expect("Models route should expose its settled scroll state");
-            assert_within_tolerance(
-                f64::from(content_size.y),
-                f64::from(initial_content_size.y),
-                1.0,
-                "Models route content height across culling windows",
-            );
-            assert_within_tolerance(
-                f64::from(viewport.height()),
-                f64::from(initial_viewport.height()),
-                1.0,
-                "Models route viewport height across culling windows",
-            );
-            assert_within_tolerance(
-                f64::from(offset.y),
-                (content_size.y - viewport.height()).max(0.0).into(),
-                LAYOUT_TOLERANCE,
-                "Models maximum route offset",
-            );
-            let visible_entry_bottom = f64::from(final_entry.bottom());
-            let layout = ctx
-                .data(|data| {
-                    data.get_temp::<(egui::Rect, egui::Rect, f32, f32)>(egui::Id::new(
-                        "models-layout-diagnostics",
-                    ))
-                })
-                .expect("Models layout diagnostics");
-            let clearance = surface.y0 - visible_entry_bottom;
-            assert!(
-                clearance >= 24.0 - LAYOUT_TOLERANCE,
-                "final model card needs at least 24 points of clearance above comparison dock: got {clearance}; final={final_entry:?}, surface={surface:?}, offset={offset:?}, content={content_size:?}, viewport={viewport:?}, layout={layout:?}",
-            );
-        }
-    }
-
-    #[test]
     #[ignore = "native AccessKit tab traversal stress test hangs on Windows; run manually after accessibility runtime changes"]
-    fn model_culling_reaches_the_final_card_through_accessible_focus_and_paging() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        data.comparison.expanded = true;
-        data.remote_catalog.entries.clear();
-        data.models.extend((0..36).map(|index| ModelViewModel {
-            id: format!("available-{index:02}"),
-            display_name: format!("Available model {index:02}"),
-            variant_label: format!("available-{index:02}"),
-            install_supported: true,
-            install_action_enabled: true,
-            language_summary: "English".into(),
-            languages: vec!["English".into()],
-            speed_tier: ModelSpeedTier::Balanced,
-            size_tier: ModelSizeTier::Base,
-            ..Default::default()
-        }));
-        let mut page = Fixture::ModelsInstalled.page();
-        let first_name = "Install Available model 00";
-        let final_name = "Install Available model 35";
-        let expected_indices = (0..36).collect::<std::collections::BTreeSet<_>>();
-        let collect_visible_indices =
-            |output: &egui::FullOutput, visible: &mut std::collections::BTreeSet<usize>| {
-                for name in node_names(output) {
-                    let Some(rest) = name.strip_prefix("Install Available model ") else {
-                        continue;
-                    };
-                    let Some(index) = rest
-                        .split_whitespace()
-                        .next()
-                        .and_then(|value| value.parse::<usize>().ok())
-                    else {
-                        continue;
-                    };
-                    visible.insert(index);
-                }
-            };
-        let model_index = |key: &ModelCardKey| match key {
-            ModelCardKey::Local(id) => id
-                .strip_prefix("available-")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or_else(|| panic!("unexpected local card key {id}")),
-            ModelCardKey::Remote { .. } => panic!("expected a local available-model card key"),
-        };
-        let assert_focused_card_visible = |output: &egui::FullOutput| {
-            let bounds = focused_node(output)
-                .bounds()
-                .expect("focused model card should expose bounds");
-            let (_, _, _, viewport) = ctx
-                .data(|data| {
-                    data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(egui::Id::new(
-                        "route-scroll-diagnostics",
-                    ))
-                })
-                .expect("Models route should expose its scroll viewport");
-            let dock = ctx
-                .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))
-                })
-                .expect("Models route should expose the expanded comparison dock");
-            let unobscured_bottom = dock.top() - 24.0;
-            assert!(
-                bounds.x0 >= f64::from(viewport.left())
-                    && bounds.x1 <= f64::from(viewport.right())
-                    && bounds.y0 >= f64::from(viewport.top())
-                    && bounds.y1 <= f64::from(unobscured_bottom),
-                "acknowledged focused card must stay above the expanded dock: {bounds:?} vs viewport {viewport:?}, dock {dock:?}"
-            );
-        };
-
-        let (initial, action) =
-            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
-        assert_eq!(action, ScreenAction::None);
-        assert!(!node_names(&initial).iter().any(|name| name == final_name));
-        let mut forward_visible = std::collections::BTreeSet::new();
-        collect_visible_indices(&initial, &mut forward_visible);
-        let available_header = named_node_id(&initial, "Collapse Available models");
-        let (_, action) = render_with_input_and_apply(
-            &ctx,
-            &mut data,
-            &mut page,
-            width,
-            height,
-            vec![egui::Event::AccessKitActionRequest(
-                egui::accesskit::ActionRequest {
-                    action: egui::accesskit::Action::Focus,
-                    target: available_header,
-                    data: None,
-                },
-            )],
-        );
-        assert_eq!(action, ScreenAction::None);
-        let (mut output, _) =
-            render_with_input_and_apply(&ctx, &mut data, &mut page, width, height, Vec::new());
-        collect_visible_indices(&output, &mut forward_visible);
-        let mut forward_targets = Vec::new();
-        let mut frame_time = 1.0;
-
-        for _ in 0..64 {
-            if focused_node(&output).name() == Some(final_name) {
-                break;
-            }
-            let next = output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .find_map(|(id, node)| {
-                    (node.role() == egui::accesskit::Role::Button
-                        && node.name() == Some("Show Next Available models")
-                        && !node.is_disabled())
-                    .then_some(*id)
-                });
-            if let Some(next) = next {
-                let (_, action) = render_with_input_and_apply(
-                    &ctx,
-                    &mut data,
-                    &mut page,
-                    width,
-                    height,
-                    vec![egui::Event::AccessKitActionRequest(
-                        egui::accesskit::ActionRequest {
-                            action: egui::accesskit::Action::Default,
-                            target: next,
-                            data: None,
-                        },
-                    )],
-                );
-                let ScreenAction::FocusModelCard(target) = action else {
-                    panic!("page sentinel should request an exact model card focus");
-                };
-                let target_index = model_index(&target);
-                if let Some(previous) = forward_targets.last() {
-                    assert!(
-                        target_index > *previous,
-                        "forward paging targets must advance monotonically: {forward_targets:?} then {target_index}"
-                    );
-                }
-                forward_targets.push(target_index);
-                let mut acknowledged = false;
-                for _ in 0..4 {
-                    let (focused, action) = render_with_input_and_apply_at_time(
-                        &ctx,
-                        &mut data,
-                        &mut page,
-                        width,
-                        height,
-                        Vec::new(),
-                        frame_time,
-                    );
-                    frame_time += 0.1;
-                    collect_visible_indices(&focused, &mut forward_visible);
-                    match action {
-                        ScreenAction::None => {
-                            assert_eq!(
-                                data.model_management.focus_model_card.as_ref(),
-                                Some(&target),
-                                "card focus must remain pending while its rect is clipped or offscreen"
-                            );
-                            output = focused;
-                        }
-                        ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
-                            assert_eq!(acknowledged_target, target);
-                            assert_focused_card_visible(&focused);
-                            assert!(
-                                data.model_management.focus_model_card.is_none(),
-                                "acknowledgement must clear the completed focus request exactly once"
-                            );
-                            output = focused;
-                            acknowledged = true;
-                            break;
-                        }
-                        unexpected => panic!(
-                            "pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
-                        ),
-                    }
-                }
-                assert!(
-                    acknowledged,
-                    "card focus should settle within four empty-event frames; pending={:?}, focused={:?}, route={:?}, dock={:?}",
-                    data.model_management.focus_model_card,
-                    focused_node(&output).bounds(),
-                    ctx.data(|data| data
-                        .get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(
-                            egui::Id::new("route-scroll-diagnostics")
-                        )),
-                    ctx.data(|data| data
-                        .get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))),
-                );
-            } else {
-                let (focused, action) = render_with_input_and_apply(
-                    &ctx,
-                    &mut data,
-                    &mut page,
-                    width,
-                    height,
-                    vec![tab_event(false)],
-                );
-                assert_eq!(action, ScreenAction::None);
-                output = focused;
-                collect_visible_indices(&output, &mut forward_visible);
-            }
-        }
-
-        assert_eq!(focused_node(&output).name(), Some(final_name));
-        assert!(!node_names(&output).iter().any(|name| name == first_name));
-        assert_eq!(
-            forward_visible, expected_indices,
-            "forward accessible paging must expose every available model without gaps"
-        );
-
-        let mut reverse_visible = std::collections::BTreeSet::new();
-        collect_visible_indices(&output, &mut reverse_visible);
-        let mut reverse_targets = Vec::new();
-        for _ in 0..64 {
-            if focused_node(&output).name() == Some(first_name) {
-                break;
-            }
-            let (_, action) = render_with_input_and_apply(
-                &ctx,
-                &mut data,
-                &mut page,
-                width,
-                height,
-                vec![page_event(egui::Key::PageUp)],
-            );
-            let ScreenAction::FocusModelCard(target) = action else {
-                panic!(
-                    "PageUp from a rendered model primary should request exact previous-page focus"
-                );
-            };
-            let target_index = model_index(&target);
-            if let Some(previous) = reverse_targets.last() {
-                assert!(
-                    target_index < *previous,
-                    "reverse paging targets must retreat monotonically: {reverse_targets:?} then {target_index}"
-                );
-            }
-            reverse_targets.push(target_index);
-
-            let mut acknowledged = false;
-            for _ in 0..4 {
-                let (focused, action) = render_with_input_and_apply_at_time(
-                    &ctx,
-                    &mut data,
-                    &mut page,
-                    width,
-                    height,
-                    Vec::new(),
-                    frame_time,
-                );
-                frame_time += 0.1;
-                collect_visible_indices(&focused, &mut reverse_visible);
-                match action {
-                    ScreenAction::None => {
-                        assert_eq!(
-                            data.model_management.focus_model_card.as_ref(),
-                            Some(&target),
-                            "reverse card focus must remain pending while its rect is clipped or offscreen"
-                        );
-                        output = focused;
-                    }
-                    ScreenAction::AcknowledgeModelCardFocus(acknowledged_target) => {
-                        assert_eq!(acknowledged_target, target);
-                        assert_focused_card_visible(&focused);
-                        assert!(
-                            data.model_management.focus_model_card.is_none(),
-                            "reverse acknowledgement must clear the completed focus request exactly once"
-                        );
-                        output = focused;
-                        acknowledged = true;
-                        break;
-                    }
-                    unexpected => panic!(
-                        "reverse pending card focus should emit only None or its acknowledgement, got {unexpected:?}"
-                    ),
-                }
-            }
-            assert!(
-                acknowledged,
-                "reverse card focus should settle within four empty-event frames; pending={:?}, focused={:?}, route={:?}, dock={:?}",
-                data.model_management.focus_model_card,
-                focused_node(&output).bounds(),
-                ctx.data(
-                    |data| data.get_temp::<(egui::Id, egui::Vec2, egui::Vec2, egui::Rect)>(
-                        egui::Id::new("route-scroll-diagnostics")
-                    )
-                ),
-                ctx.data(|data| data
-                    .get_temp::<egui::Rect>(egui::Id::new("models-comparison-dock-rect"))),
-            );
-        }
-        assert_eq!(focused_node(&output).name(), Some(first_name));
-        assert_eq!(
-            reverse_visible, expected_indices,
-            "reverse accessible paging must expose every available model without gaps"
-        );
-    }
-
     #[test]
     fn comparison_chevron_pointer_and_accesskit_actions_toggle_once() {
         let (width, height) = (1180.0, 815.0);
@@ -4845,30 +2935,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_not_ready_state_stays_out_of_the_compact_row() {
-        let (width, height) = (1180.0, 815.0);
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        configure_accessible_style(&ctx);
-        let mut data = Fixture::ModelsInstalled.data();
-        data.models[1].ready = false;
-        let mut page = Fixture::ModelsInstalled.page();
-
-        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
-        assert!(
-            !node_names(&output)
-                .iter()
-                .any(|name| name == "Runtime not ready"),
-            "compact rows should reserve state details for the Details drawer"
-        );
-        assert!(
-            node_names(&output)
-                .iter()
-                .any(|name| name == "Details for whisper.cpp tiny.en"),
-            "the model remains inspectable through its Details control"
-        );
-    }
-    #[test]
     fn settings_recording_fixture_contains_visible_live_meter_signal() {
         let data = Fixture::SettingsRecording.data();
         assert_eq!(data.settings.input_sensitivity_percent, 38);
@@ -4892,6 +2958,2346 @@ mod tests {
         let names = node_names(&render(Fixture::SettingsRecording, 960.0, 680.0));
         assert!(names.iter().any(|name| name == "Refresh devices"));
     }
+
+    #[test]
+    fn model_cards_expose_accordion_and_semantic_contracts() {
+        let collapsed = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let collapsed_names = node_names(&collapsed);
+        let collapsed_nodes = &collapsed
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let active_count = collapsed_nodes
+            .iter()
+            .filter(|(_, node)| node.name() == Some("Active"))
+            .count();
+        assert_eq!(active_count, 1, "Active must be the sole card badge");
+        assert!(collapsed_nodes.iter().any(|(_, node)| {
+            node.name() == Some("Expand details for whisper.cpp tiny.en")
+                && node.is_expanded() == Some(false)
+        }));
+        for name in ["Speed: Very fast (5 of 5)", "Accuracy: Basic (1 of 5)"] {
+            assert!(
+                collapsed_nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some(name))
+            );
+        }
+        assert!(
+            !collapsed_names
+                .iter()
+                .any(|name| name == "SPEED" || name == "ACCURACY"),
+            "metric labels are painter-only; the Meter remains the single semantic node"
+        );
+        assert!(
+            collapsed_names
+                .iter()
+                .filter(|name| *name == "Languages: EN")
+                .count()
+                >= 2,
+            "collapsed cards should expose compact language semantics"
+        );
+        assert!(
+            !collapsed_names
+                .iter()
+                .any(|name| matches!(name.as_str(), "400MB" | "75MB")),
+            "model size belongs only in the expanded details"
+        );
+
+        let expanded = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let expanded_nodes = &expanded
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert!(expanded_nodes.iter().any(|(_, node)| {
+            node.name() == Some("Collapse details for whisper.cpp tiny.en")
+                && node.is_expanded() == Some(true)
+        }));
+        let description = "A compact local model for responsive dictation, long recordings, and offline language-aware transcription.";
+        assert_eq!(
+            node_names(&expanded)
+                .iter()
+                .filter(|name| name.as_str() == description)
+                .count(),
+            1,
+            "expanded cards expose the full description exactly once"
+        );
+        for detail in [
+            "REQUIREMENTS",
+            "RAM",
+            "75MB",
+            "ON DISK",
+            "GPU",
+            "Supported",
+            "FEATURES",
+            "MAINTENANCE",
+        ] {
+            assert!(node_names(&expanded).iter().any(|name| name == detail));
+        }
+        assert!(
+            node_names(&expanded)
+                .iter()
+                .any(|name| name == "Languages: EN,ES,JA"),
+            "expanded identity metadata should keep the compact language summary"
+        );
+        assert!(
+            !node_names(&expanded)
+                .iter()
+                .any(|name| name == "DESCRIPTION" || name == "LANGUAGES"),
+            "description and languages belong in the identity stack, not duplicate details"
+        );
+        assert_eq!(
+            node_names(&expanded)
+                .iter()
+                .filter(|name| name.as_str() == "Delete whisper.cpp tiny.en")
+                .count(),
+            1,
+            "the summary row owns the single uninstall action"
+        );
+    }
+
+    #[test]
+    fn model_card_languages_stay_compact_with_full_names_in_tooltip_and_a11y_metadata() {
+        fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_shapes(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsCardExpanded.data();
+        let mut page = Fixture::ModelsCardExpanded.page();
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let language_name = "Languages: EN,ES,JA";
+        let language = node_matching(&initial, |node| node.name() == Some(language_name));
+        assert_eq!(language.description(), Some("English, Spanish, Japanese"));
+        let bounds = language.bounds().expect("language metadata bounds");
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            Some(0.0),
+        );
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ))],
+            Some(0.1),
+        );
+        let hovered = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ))],
+            Some(1.0),
+        )
+        .0;
+        let mut texts = Vec::new();
+        for shape in &hovered.shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "English, Spanish, Japanese"),
+            "full language names should remain available in the language tooltip"
+        );
+
+        data.models[0].languages = vec!["klingon".into()];
+        let unavailable =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let unavailable_name = "Languages unavailable";
+        let unavailable_language =
+            node_matching(&unavailable, |node| node.name() == Some(unavailable_name));
+        assert_eq!(unavailable_language.description(), Some(unavailable_name));
+        let unavailable_bounds = unavailable_language.bounds().expect("unavailable bounds");
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            Some(2.0),
+        );
+        render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((unavailable_bounds.x0 + unavailable_bounds.x1) / 2.0) as f32,
+                ((unavailable_bounds.y0 + unavailable_bounds.y1) / 2.0) as f32,
+            ))],
+            Some(2.1),
+        );
+        let unavailable_hovered = render_with_input_at_time(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                ((unavailable_bounds.x0 + unavailable_bounds.x1) / 2.0) as f32,
+                ((unavailable_bounds.y0 + unavailable_bounds.y1) / 2.0) as f32,
+            ))],
+            Some(3.0),
+        )
+        .0;
+        let mut unavailable_texts = Vec::new();
+        for shape in &unavailable_hovered.shapes {
+            text_shapes(&shape.shape, &mut unavailable_texts);
+        }
+        assert!(
+            unavailable_texts
+                .iter()
+                .any(|text| text == unavailable_name),
+            "unavailable languages should expose a truthful tooltip"
+        );
+    }
+
+    #[test]
+    fn expanded_fixture_exposes_all_feature_grid_evidence() {
+        let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let names = node_names(&output);
+        assert!(names.iter().any(|name| {
+            name == "Features: Native streaming, Translation, Word timestamps, Batch transcription"
+        }));
+        for hidden in [
+            "Cancellation",
+            "Automatic language detection",
+            "Confidence scores",
+            "Custom vocabulary",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "hidden feature {hidden}"
+            );
+        }
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Repair runtime for whisper.cpp tiny.en")
+        );
+    }
+
+    #[test]
+    fn expanded_requirements_use_distinct_responsive_cells() {
+        let render_expanded = |width, height| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let model = data
+                .models
+                .iter_mut()
+                .find(|model| model.id == "tiny.en")
+                .expect("expanded fixture includes tiny.en");
+            model.estimated_ram_bytes = Some(150_000_000);
+            model.disk_bytes = Some(75_000_000);
+            model.capabilities = ModelCapabilities {
+                capabilities_known: true,
+                ..Default::default()
+            };
+            let mut page = Fixture::ModelsCardExpanded.page();
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0
+        };
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render_expanded(width, height);
+            let card = named_node_bounds(&output, "whisper.cpp tiny.en model");
+            let ram = named_node_bounds(&output, "RAM");
+            let ram_value = named_node_bounds(&output, "150MB");
+            let disk = named_node_bounds(&output, "ON DISK");
+            let disk_value = named_node_bounds(&output, "75MB");
+            let gpu = named_node_bounds(&output, "GPU");
+            let gpu_value = named_node_bounds(&output, "Not supported");
+            for (label, value, name) in [
+                (ram, ram_value, "RAM cell"),
+                (disk, disk_value, "disk cell"),
+                (gpu, gpu_value, "GPU cell"),
+            ] {
+                assert_bounds_within(label, card, name);
+                assert_bounds_within(value, card, name);
+                assert!(
+                    label.y1 <= value.y0 + LAYOUT_TOLERANCE,
+                    "{name} label must sit above its value"
+                );
+            }
+            assert!(ram.x1 <= disk.x0 + LAYOUT_TOLERANCE);
+            assert!(disk.x1 <= gpu.x0 + LAYOUT_TOLERANCE);
+        }
+
+        let compact = render_expanded(375.0, 680.0);
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        let ram = named_node_bounds(&compact, "RAM");
+        let disk = named_node_bounds(&compact, "ON DISK");
+        let gpu = named_node_bounds(&compact, "GPU");
+        for bounds in [ram, disk, gpu] {
+            assert_bounds_within(bounds, card, "compact requirement cell");
+        }
+        assert!(ram.y1 <= disk.y0 + LAYOUT_TOLERANCE);
+        assert!(disk.y1 <= gpu.y0 + LAYOUT_TOLERANCE);
+    }
+
+    #[test]
+    fn model_metric_labels_sit_above_their_continuous_meters() {
+        for width in [1180.0, 960.0] {
+            let output = render(Fixture::ModelsInstalled, width, 815.0);
+            let speed_meter_name = "Speed: Very fast (5 of 5)";
+            let accuracy_meter_name = "Accuracy: Basic (1 of 5)";
+            let speed_label =
+                named_node_bounds(&output, &format!("{speed_meter_name} visible label"));
+            let accuracy_label =
+                named_node_bounds(&output, &format!("{accuracy_meter_name} visible label"));
+            let speed_meter = named_node_bounds(&output, speed_meter_name);
+            let accuracy_meter = named_node_bounds(&output, accuracy_meter_name);
+            assert!(speed_label.y1 <= speed_meter.y0);
+            assert!(accuracy_label.y1 <= accuracy_meter.y0);
+            assert!(speed_meter.x0 < accuracy_meter.x0);
+            assert!(speed_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+            assert!(accuracy_meter.width() <= 62.0 + LAYOUT_TOLERANCE);
+        }
+    }
+
+    #[test]
+    fn model_card_summary_uses_compact_feature_slots_and_globe_text_axis() {
+        for width in [1180.0, 960.0] {
+            let output = render(Fixture::ModelsCardExpanded, width, 815.0);
+            let features = named_node_bounds(
+                &output,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+            );
+            assert_near(
+                features.x1 - features.x0,
+                64.0,
+                "four feature slots use two 28px columns with one 8px gap",
+            );
+            assert_near(
+                features.y1 - features.y0,
+                72.0,
+                "four feature slots use two 32px rows with one 8px gap",
+            );
+
+            let title = named_node_bounds(&output, "whisper.cpp tiny.en");
+            let description = named_node_bounds(
+                &output,
+                "A compact local model for responsive dictation, long recordings, and offline language-aware transcription.",
+            );
+            let language_row =
+                named_node_bounds(&output, "whisper.cpp tiny.en layout language row");
+            assert_near(
+                language_row.x0,
+                title.x0,
+                "globe left edge must align to the identity text axis",
+            );
+            assert_near(
+                language_row.x0,
+                description.x0,
+                "globe left edge must align to the description text axis",
+            );
+        }
+
+        for (feature_count, expected_name, expected_width, expected_height) in [
+            (1, "Features: Batch transcription", 28.0, 32.0),
+            (
+                2,
+                "Features: Word timestamps, Batch transcription",
+                64.0,
+                32.0,
+            ),
+            (
+                3,
+                "Features: Translation, Word timestamps, Batch transcription",
+                64.0,
+                72.0,
+            ),
+            (
+                4,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+                64.0,
+                72.0,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let tiny = data
+                .models
+                .iter_mut()
+                .find(|model| model.id == "tiny.en")
+                .expect("expanded fixture includes tiny.en");
+            tiny.capabilities = ModelCapabilities {
+                capabilities_known: true,
+                batch_transcription: true,
+                timestamps: feature_count >= 2,
+                translation: feature_count >= 3,
+                native_streaming: feature_count >= 4,
+                ..Default::default()
+            };
+            data.models.retain(|model| model.id == "tiny.en");
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = Fixture::ModelsCardExpanded.page();
+            for width in [1180.0, 960.0] {
+                let output =
+                    render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new()).0;
+                let features = named_node_bounds(&output, expected_name);
+                assert_near(
+                    features.width(),
+                    expected_width,
+                    &format!("{feature_count}-feature group width"),
+                );
+                assert_near(
+                    features.height(),
+                    expected_height,
+                    &format!("{feature_count}-feature group height"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_card_desktop_uses_exact_three_zone_bounds() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            data.models.retain(|model| model.id == "tiny.en");
+            data.model_catalog.clear();
+            data.remote_catalog.entries.clear();
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let card_name = "whisper.cpp tiny.en";
+            let identity = named_node_bounds(&output, &format!("{card_name} layout identity zone"));
+            let metrics = named_node_bounds(&output, &format!("{card_name} layout metrics zone"));
+            let lifecycle =
+                named_node_bounds(&output, &format!("{card_name} layout lifecycle zone"));
+            let chevron_zone =
+                named_node_bounds(&output, &format!("{card_name} layout chevron zone"));
+            let chevron = named_node_bounds(&output, &format!("Collapse details for {card_name}"));
+            let summary_width = identity.width() + metrics.width() + lifecycle.width();
+            assert_near(
+                identity.width(),
+                summary_width * 0.50,
+                "identity zone is exactly 50%",
+            );
+            assert_near(
+                metrics.width(),
+                summary_width * 0.24,
+                "metrics zone is exactly 24%",
+            );
+            assert_near(
+                lifecycle.width(),
+                summary_width * 0.26,
+                "lifecycle zone is exactly 26%",
+            );
+            assert_near(identity.x1, metrics.x0, "identity meets metrics");
+            assert_near(metrics.x1, lifecycle.x0, "metrics meets lifecycle");
+            assert_near(chevron_zone.width(), 44.0, "chevron zone width");
+            assert_near(chevron_zone.height(), 44.0, "chevron zone height");
+            assert_near(
+                chevron_zone.x1,
+                lifecycle.x1,
+                "chevron trails lifecycle zone",
+            );
+            assert_bounds_within(chevron, chevron_zone, "chevron target");
+
+            let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+            let accuracy = named_node_bounds(&output, "Accuracy: Basic (1 of 5)");
+            assert_near(
+                speed.width(),
+                accuracy.width(),
+                "metric meter widths are equal",
+            );
+            assert_near(
+                speed.x0 - metrics.x0,
+                metrics.x1 - accuracy.x1,
+                &format!(
+                    "metric meters are symmetrically inset; metrics={metrics:?}, speed={speed:?}, accuracy={accuracy:?}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn model_card_desktop_metadata_group_uses_fixed_identity_ratio_and_shared_row_geometry() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsCardExpanded, width, height);
+            let card_name = "whisper.cpp tiny.en";
+            let rect =
+                |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+            let identity = rect("identity zone");
+            let metadata_group = rect("metadata group");
+            let language_cell = rect("language cell");
+            let feature_cell = rect("feature cell");
+            let language_icon = rect("language icon");
+            let language_text = named_node_bounds(&output, "Languages: EN,ES,JA");
+            let features = named_node_bounds(
+                &output,
+                "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+            );
+
+            assert_near(
+                metadata_group.width(),
+                identity.width() * 0.60,
+                "metadata group is exactly 60% of the identity zone",
+            );
+            assert_near(
+                language_cell.width(),
+                identity.width() * 0.30,
+                "language cell is exactly 30% of the identity zone",
+            );
+            assert_near(
+                feature_cell.width(),
+                identity.width() * 0.30,
+                "feature cell is exactly 30% of the identity zone",
+            );
+            assert_near(
+                language_cell.x0,
+                metadata_group.x0,
+                "language begins the group",
+            );
+            assert_near(feature_cell.x1, metadata_group.x1, "features end the group");
+            assert_near(language_cell.x1, feature_cell.x0, "metadata cells abut");
+            assert_near(
+                language_cell.y0,
+                feature_cell.y0,
+                "metadata cells share a row",
+            );
+            assert_near(
+                language_cell.y1,
+                feature_cell.y1,
+                "metadata cells share a height",
+            );
+            assert_near(
+                (language_icon.y0 + language_icon.y1) / 2.0,
+                (language_text.y0 + language_text.y1) / 2.0,
+                "language globe and text share the vertical text axis",
+            );
+            assert_near(
+                (language_cell.y0 + language_cell.y1) / 2.0,
+                (feature_cell.y0 + feature_cell.y1) / 2.0,
+                "language and feature cells share the row baseline",
+            );
+            assert_bounds_within(language_icon, language_cell, "language globe");
+            assert_bounds_within(language_text, language_cell, "language text");
+            assert!(
+                features.x0 >= feature_cell.x0 - LAYOUT_TOLERANCE
+                    && features.x1 <= feature_cell.x1 + LAYOUT_TOLERANCE,
+                "feature group stays within its fixed-width cell: features={features:?}, cell={feature_cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_card_desktop_metadata_glyphs_align_with_the_first_feature_row() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let output = render(Fixture::ModelsCardExpanded, width, height);
+            let card_name = "whisper.cpp tiny.en";
+            let rect =
+                |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+            let language_cell = rect("language cell");
+            let feature_cell = rect("feature cell");
+            let globe = painted_text_bounds_in(
+                &output,
+                crate::ui::controls::icon_glyph(crate::ui::controls::Icon::Globe),
+                language_cell,
+            );
+            let language = painted_text_bounds_in(&output, "EN,ES,JA", language_cell);
+            let native_streaming = painted_text_bounds_in(
+                &output,
+                crate::ui::controls::icon_glyph(crate::ui::controls::Icon::Streaming),
+                feature_cell,
+            );
+            let globe_center = f64::from(globe.center().y);
+            let language_center = f64::from(language.center().y);
+            let native_streaming_center = f64::from(native_streaming.center().y);
+
+            assert_near(
+                globe_center,
+                native_streaming_center,
+                &format!(
+                    "painted globe aligns with the first feature glyph at {width}x{height}; globe={globe_center}, language={language_center}, native streaming={native_streaming_center}"
+                ),
+            );
+            assert_near(
+                language_center,
+                native_streaming_center,
+                &format!(
+                    "painted language text aligns with the first feature glyph at {width}x{height}; globe={globe_center}, language={language_center}, native streaming={native_streaming_center}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_model_details_keep_compact_section_density() {
+        let output = render(Fixture::ModelsCardExpanded, 1180.0, 815.0);
+        let card_name = "whisper.cpp tiny.en";
+        let rect = |name: &str| named_node_bounds(&output, &format!("{card_name} layout {name}"));
+        for (name, expected_height) in [
+            ("gap before divider", 6.0),
+            ("gap after divider", 6.0),
+            ("features heading content gap", 6.0),
+            ("expanded feature row gap 1", 4.0),
+            ("features requirements gap", 12.0),
+            ("requirements heading content gap", 6.0),
+            ("requirements maintenance gap", 12.0),
+            ("maintenance heading content gap", 6.0),
+        ] {
+            assert_near(
+                rect(name).height(),
+                expected_height,
+                &format!("{name} height"),
+            );
+        }
+
+        let feature_row_0 = rect("expanded feature row 0");
+        let feature_row_1 = rect("expanded feature row 1");
+        assert_near(feature_row_0.height(), 32.0, "first feature row height");
+        assert_near(feature_row_1.height(), 32.0, "second feature row height");
+        assert_near(
+            rect("expanded feature row gap 1").y0,
+            feature_row_0.y1,
+            "feature row gap starts immediately after first row",
+        );
+        assert_near(
+            rect("expanded feature row gap 1").y1,
+            feature_row_1.y0,
+            "second feature row starts immediately after its gap",
+        );
+
+        let features_heading = rect("features heading");
+        let features_content = rect("features content");
+        let requirements_heading = rect("requirements heading");
+        let requirements_content = rect("requirements content");
+        let maintenance_heading = rect("maintenance heading");
+        assert!(features_heading.y1 <= features_content.y0);
+        assert!(features_content.y1 <= requirements_heading.y0);
+        assert!(requirements_heading.y1 <= requirements_content.y0);
+        assert!(requirements_content.y1 <= maintenance_heading.y0);
+        assert!(
+            requirements_content.height() <= 44.0 + LAYOUT_TOLERANCE,
+            "requirement cells should keep their natural compact height"
+        );
+    }
+
+    #[test]
+    fn expanded_features_render_all_capabilities_as_icon_label_grid() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.id = "full-features".into();
+        model.display_name = "Full features".into();
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            native_streaming: true,
+            cancellation: true,
+            timestamps: true,
+            translation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            cpu: true,
+            gpu: true,
+        };
+        data.models = vec![model.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id.clone()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let names = node_names(&output);
+        for capability in [
+            "Native streaming",
+            "Translation",
+            "Word timestamps",
+            "Batch transcription",
+        ] {
+            assert!(
+                names.iter().any(|name| name == capability),
+                "missing {capability}"
+            );
+        }
+        for hidden in [
+            "Cancellation",
+            "Automatic language detection",
+            "Confidence scores",
+            "Custom vocabulary",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "hidden feature {hidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_tooltip_hit_regions_wrap_and_never_select_the_card() {
+        fn text_shapes(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_shapes(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.id = "priority-features".into();
+        model.display_name = "Priority features".into();
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            native_streaming: true,
+            cancellation: true,
+            timestamps: true,
+            translation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            cpu: true,
+            gpu: true,
+        };
+        data.models = vec![model];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let feature_name =
+            "Features: Native streaming, Translation, Word timestamps, Batch transcription";
+        let feature_group = node_matching(&initial, |node| node.name() == Some(feature_name));
+        assert_eq!(feature_group.role(), egui::accesskit::Role::Group);
+        let nodes = &initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.name() == Some(feature_name))
+                .count(),
+            1
+        );
+        assert!(!nodes.iter().any(|(_, node)| {
+            matches!(
+                node.role(),
+                egui::accesskit::Role::Button | egui::accesskit::Role::Link
+            ) && [
+                "Native streaming",
+                "Translation",
+                "Word timestamps",
+                "Batch transcription",
+            ]
+            .contains(&node.name().unwrap_or_default())
+        }));
+        let bounds = feature_group.bounds().unwrap();
+        assert!(
+            bounds.height() >= 72.0 - LAYOUT_TOLERANCE,
+            "four summary icons should fit within a two-column, two-row group: {bounds:?}"
+        );
+        for (index, tooltip) in [
+            "Native streaming",
+            "Translation",
+            "Word timestamps",
+            "Batch transcription",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let time = index as f64 * 2.0;
+            let (_, move_away_action) = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+                Some(time),
+            );
+            assert_eq!(move_away_action, ScreenAction::None);
+            let pointer = egui::pos2(
+                bounds.x0 as f32 + 14.0 + (index % 2) as f32 * 36.0,
+                bounds.y0 as f32 + 16.0 + (index / 2) as f32 * 40.0,
+            );
+            let (_, hover_start_action) = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(pointer)],
+                Some(time + 0.1),
+            );
+            assert_eq!(hover_start_action, ScreenAction::None);
+            let (hovered, hover_action) = render_with_input_at_time(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                vec![egui::Event::PointerMoved(pointer)],
+                Some(time + 1.0),
+            );
+            assert_eq!(
+                hover_action,
+                ScreenAction::None,
+                "tooltip {tooltip} must not select the card"
+            );
+            let mut texts = Vec::new();
+            for shape in &hovered.shapes {
+                text_shapes(&shape.shape, &mut texts);
+            }
+            assert!(
+                texts.iter().any(|text| text == tooltip),
+                "missing tooltip {tooltip}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_summary_uses_batch_transcription_as_the_known_fallback() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            batch_transcription: true,
+            ..Default::default()
+        };
+        data.models = vec![model];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let feature_name = "Features: Batch transcription";
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.name() == Some(feature_name))
+                .count(),
+            1
+        );
+        assert_eq!(
+            node_matching(&output, |node| node.name() == Some(feature_name)).role(),
+            egui::accesskit::Role::Group
+        );
+    }
+
+    #[test]
+    fn expanded_features_distinguish_known_empty_from_unknown() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut known_empty = data.models.remove(0);
+        known_empty.id = "known-empty".into();
+        known_empty.display_name = "Known empty".into();
+        known_empty.capabilities = ModelCapabilities {
+            capabilities_known: true,
+            cancellation: true,
+            language_detection: true,
+            confidence_scores: true,
+            custom_vocabulary: true,
+            ..Default::default()
+        };
+        let mut unknown = known_empty.clone();
+        unknown.id = "unknown".into();
+        unknown.display_name = "Unknown".into();
+        unknown.capabilities = ModelCapabilities::default();
+        data.models = vec![known_empty.clone(), unknown.clone()];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        for (model, expected) in [
+            (known_empty, "No supported features"),
+            (unknown, "Feature support is unknown"),
+        ] {
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id));
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            assert!(node_names(&output).iter().any(|name| name == expected));
+        }
+    }
+
+    #[test]
+    fn model_card_lifecycle_controls_dispatch_matching_actions() {
+        let (width, height) = (1180.0, 815.0);
+        let cases = [
+            (
+                "Install",
+                ModelDownloadState::NotInstalled,
+                false,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Install",
+                ModelDownloadState::Failed,
+                false,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Resume Lifecycle download",
+                ModelDownloadState::Cancelled,
+                true,
+                false,
+                false,
+                false,
+                ScreenAction::InstallModel("lifecycle".into()),
+            ),
+            (
+                "Pause Lifecycle download",
+                ModelDownloadState::Downloading,
+                false,
+                false,
+                false,
+                false,
+                ScreenAction::CancelModelInstall("lifecycle".into()),
+            ),
+            (
+                "Delete",
+                ModelDownloadState::Installed,
+                false,
+                true,
+                false,
+                false,
+                ScreenAction::RequestModelRemoval("lifecycle".into()),
+            ),
+            (
+                "Upgrade",
+                ModelDownloadState::Installed,
+                false,
+                true,
+                true,
+                false,
+                ScreenAction::UpgradeModel("lifecycle".into()),
+            ),
+            (
+                "Repair",
+                ModelDownloadState::Installed,
+                false,
+                true,
+                false,
+                true,
+                ScreenAction::RepairModelRuntime("lifecycle".into()),
+            ),
+        ];
+
+        for (label, download_state, partial, installed, upgrade, repair, expected) in cases {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut model = ModelViewModel {
+                id: "lifecycle".into(),
+                display_name: "Lifecycle".into(),
+                installed,
+                ready: installed && !upgrade && !repair,
+                install_supported: true,
+                install_action_enabled: true,
+                cancel_supported: true,
+                removal_supported: true,
+                primary_action_enabled: true,
+                primary_action_installs_upgrade: upgrade,
+                primary_action_repairs_runtime: repair,
+                download_state,
+                partial_cleanup_available: partial,
+                languages: vec!["en".into()],
+                ..Default::default()
+            };
+            if label == "Install" {
+                model.download_state = ModelDownloadState::NotInstalled;
+            }
+            data.models = installed.then_some(model.clone()).into_iter().collect();
+            data.model_catalog = (!installed).then_some(model).into_iter().collect();
+            let mut page = AppPage::Models;
+            let name = if label.ends_with(" download") {
+                label.to_owned()
+            } else {
+                format!("{label} Lifecycle")
+            };
+            assert_eq!(
+                click_named_control(&ctx, &mut data, &mut page, width, height, &name),
+                expected,
+                "{label}"
+            );
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog = vec![ModelViewModel {
+            id: "lifecycle".into(),
+            display_name: "Lifecycle".into(),
+            download_state: ModelDownloadState::Verifying,
+            install_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let installing = node_matching(&output, |node| node.name() == Some("Installing Lifecycle"));
+        assert!(installing.is_disabled());
+        assert!(
+            installing
+                .description()
+                .is_some_and(|text| text.contains("cannot cancel"))
+        );
+    }
+
+    #[test]
+    fn active_download_progress_is_truthful_clamped_and_isolated_from_card_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models = vec![ModelViewModel {
+            id: "progress".into(),
+            display_name: "Progress".into(),
+            installed: true,
+            ready: true,
+            download_state: ModelDownloadState::Downloading,
+            downloaded_bytes: 120,
+            total_bytes: Some(100),
+            cancel_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_catalog.clear();
+        data.remote_catalog.entries.clear();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let accessible_progress = "Downloading 120B of 100B, 100% complete";
+        let meter = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(accessible_progress)
+        });
+        assert_eq!(meter.min_numeric_value(), Some(0.0));
+        assert_eq!(meter.max_numeric_value(), Some(1.0));
+        assert_eq!(meter.numeric_value(), Some(1.0));
+        let track = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download track"),
+        );
+        let fill = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download fill"),
+        );
+        let lifecycle = named_node_bounds(&output, "Progress layout lifecycle zone");
+        let chevron = named_node_bounds(&output, "Progress layout chevron zone");
+        assert_near(track.height(), 6.0, "download track height");
+        assert_near(fill.height(), 6.0, "download fill height");
+        assert_near(fill.x0, track.x0, "download fill starts at track origin");
+        assert_near(fill.width(), track.width(), "clamped full download fill");
+        assert_bounds_within(track, lifecycle, "download track");
+        assert!(track.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+
+        let pause_name = "Pause Progress download";
+        let pause = named_node_bounds(&output, pause_name);
+        assert_near(pause.width(), 44.0, "Pause target width");
+        assert_near(pause.height(), 44.0, "Pause target height");
+        assert_eq!(
+            click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, pause_name,),
+            ScreenAction::CancelModelInstall("progress".into()),
+            "Pause must retain the partial and win over the selectable card target",
+        );
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                "Discard partial for Progress",
+            ),
+            ScreenAction::DiscardModelPartial("progress".into()),
+            "X must request the exact partial cleanup without selecting the card",
+        );
+
+        data.models[0].downloaded_bytes = 42;
+        data.models[0].total_bytes = None;
+        let unknown = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let unknown_text = "Downloading 42B; total download size unknown";
+        let unknown_meter = node_matching(&unknown, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(unknown_text)
+        });
+        assert_eq!(unknown_meter.min_numeric_value(), None);
+        assert_eq!(unknown_meter.max_numeric_value(), None);
+        assert_eq!(unknown_meter.numeric_value(), None);
+        let names = node_names(&unknown);
+        assert!(names.iter().any(|name| name == "42B / Total unknown"));
+        assert!(
+            !unknown
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::StaticText
+                    && node.name() == Some("Downloading"))
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == &format!("{unknown_text} layout download fill")),
+            "unknown totals must not fabricate a numeric fill",
+        );
+
+        data.models[0].download_state = ModelDownloadState::Failed;
+        let settled = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !node_names(&settled)
+                .iter()
+                .any(|name| name.starts_with("Downloading 42B")),
+            "progress must disappear once the model is no longer downloading",
+        );
+    }
+
+    #[test]
+    fn remote_download_progress_requires_live_installer_bytes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog.clear();
+        let variant = &mut data.remote_catalog.entries[0].variants[0];
+        variant.status_label = Some("Downloading".into());
+        variant.downloaded_bytes = None;
+        variant.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Meter
+                        && node
+                            .name()
+                            .is_some_and(|name| name.starts_with("Downloading"))
+                }),
+            "a status label without live byte progress must not fabricate a progress meter",
+        );
+    }
+
+    #[test]
+    fn remote_download_progress_uses_live_installer_bytes_and_cancels_without_card_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog.clear();
+        let variant = &mut data.remote_catalog.entries[0].variants[0];
+        variant.status_label = Some("Downloading".into());
+        variant.downloaded_bytes = Some(40);
+        variant.total_bytes = Some(100);
+        variant.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let accessible_progress = "Downloading 40B of 100B, 40% complete";
+        let meter = node_matching(&output, |node| {
+            node.role() == egui::accesskit::Role::Meter && node.name() == Some(accessible_progress)
+        });
+        assert_eq!(meter.min_numeric_value(), Some(0.0));
+        assert_eq!(meter.max_numeric_value(), Some(1.0));
+        assert_eq!(meter.numeric_value(), Some(f64::from(0.4_f32)));
+        let track = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download track"),
+        );
+        let fill = named_node_bounds(
+            &output,
+            &format!("{accessible_progress} layout download fill"),
+        );
+        assert_near(
+            fill.width(),
+            track.width() * 0.4,
+            "remote download fill ratio",
+        );
+
+        let pause_name = "Pause Compact English";
+        let pause = named_node_bounds(&output, pause_name);
+        assert_near(pause.width(), 44.0, "remote Pause target width");
+        assert_near(pause.height(), 44.0, "remote Pause target height");
+        let action = click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, pause_name);
+        assert_eq!(
+            action,
+            ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into())
+        );
+        assert!(!matches!(action, ScreenAction::SelectModel(_)));
+        assert_eq!(
+            click_named_control(
+                &ctx,
+                &mut data,
+                &mut page,
+                1180.0,
+                815.0,
+                "Discard partial for Compact English",
+            ),
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            },
+            "remote X must request cleanup for the exact trusted artifact",
+        );
+    }
+
+    #[test]
+    fn full_card_interaction_exists_only_for_ready_inactive_installed_models() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+        let card_target = node_matching(&output, |node| {
+            node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
+        });
+        assert_eq!(card_target.role(), egui::accesskit::Role::Button);
+        assert!(card_target.supports_action(egui::accesskit::Action::Default));
+        assert!(
+            card_target
+                .bounds()
+                .is_some_and(|bounds| bounds.height() >= 44.0)
+        );
+        let card_target_id =
+            named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
+        assert_eq!(
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Default,
+                        target: card_target_id,
+                        data: None,
+                    }
+                )],
+            )
+            .1,
+            ScreenAction::SelectModel("tiny.en".into())
+        );
+
+        let active = node_matching(&output, |node| {
+            node.name() == Some("whisper.cpp base.en")
+                && node.role() == egui::accesskit::Role::StaticText
+        });
+        assert!(active.bounds().is_some());
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Use whisper.cpp base.en for future transcriptions")
+        );
+
+        for (display_name, model) in [
+            (
+                "Available title",
+                ModelViewModel {
+                    id: "available-title".into(),
+                    display_name: "Available title".into(),
+                    install_supported: true,
+                    install_action_enabled: true,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "Upgrade title",
+                ModelViewModel {
+                    id: "upgrade-title".into(),
+                    display_name: "Upgrade title".into(),
+                    installed: true,
+                    primary_action_enabled: true,
+                    primary_action_installs_upgrade: true,
+                    download_state: ModelDownloadState::Installed,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "Repair title",
+                ModelViewModel {
+                    id: "repair-title".into(),
+                    display_name: "Repair title".into(),
+                    installed: true,
+                    primary_action_enabled: true,
+                    primary_action_repairs_runtime: true,
+                    download_state: ModelDownloadState::Installed,
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut fixture = Fixture::ModelsInstalled.data();
+            if model.installed {
+                fixture.models = vec![model];
+                fixture.model_catalog.clear();
+            } else {
+                fixture.models.clear();
+                fixture.model_catalog = vec![model];
+            }
+            let rendered =
+                render_with_input(&ctx, &mut fixture, &mut page, width, height, Vec::new()).0;
+            assert_eq!(
+                node_matching(&rendered, |node| node.name() == Some(display_name)).role(),
+                egui::accesskit::Role::StaticText,
+            );
+            assert!(
+                !node_names(&rendered).iter().any(|name| {
+                    name == &format!("Use {display_name} for future transcriptions")
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn full_card_background_pointer_keyboard_and_accesskit_activate_once() {
+        let (width, height) = (1180.0, 815.0);
+        let activate_at = |label: &str, node_name: Option<&str>| {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let point = if let Some(node_name) = node_name {
+                let bounds = named_node_bounds(&initial, node_name);
+                egui::pos2(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                )
+            } else {
+                let card = named_node_bounds(&initial, "whisper.cpp tiny.en model");
+                egui::pos2((card.x0 + 8.0) as f32, (card.y1 - 8.0) as f32)
+            };
+            let (_, press) = render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(press, ScreenAction::None, "{label} must wait for release");
+            render_with_input(
+                &ctx,
+                &mut data,
+                &mut page,
+                width,
+                height,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1
+        };
+        for (label, node_name) in [
+            ("identity", Some("whisper.cpp tiny.en")),
+            ("metrics", Some("Speed: Very fast (5 of 5)")),
+            ("expanded whitespace", None),
+        ] {
+            assert_eq!(
+                activate_at(label, node_name),
+                ScreenAction::SelectModel("tiny.en".into()),
+                "{label}"
+            );
+        }
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let initial =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let target = named_node_id(
+                &initial,
+                "Use whisper.cpp tiny.en for future transcriptions",
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Focus,
+                            target,
+                            data: None,
+                        }
+                    ),]
+                )
+                .1,
+                ScreenAction::None,
+            );
+            assert_eq!(
+                render_with_input(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    vec![page_event(key)]
+                )
+                .1,
+                ScreenAction::SelectModel("tiny.en".into()),
+                "{key:?} on the focused card target",
+            );
+        }
+    }
+
+    #[test]
+    fn ready_card_has_one_selectable_sibling_of_its_child_buttons() {
+        let output = render(Fixture::ModelsInstalled, 1180.0, 815.0);
+        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+        let select_id = named_node_id(&output, "Use whisper.cpp tiny.en for future transcriptions");
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.name() == Some("Use whisper.cpp tiny.en for future transcriptions")
+                })
+                .count(),
+            1,
+        );
+        for child_name in [
+            "Delete whisper.cpp tiny.en",
+            "Expand details for whisper.cpp tiny.en",
+        ] {
+            let child_id = named_node_id(&output, child_name);
+            assert_ne!(
+                child_id, select_id,
+                "{child_name} must not reuse the card target"
+            );
+            assert!(
+                !update.nodes.iter().any(|(parent_id, node)| {
+                    *parent_id == select_id && node.children().contains(&child_id)
+                }),
+                "{child_name} must be a sibling, not a nested child of the selectable card",
+            );
+        }
+    }
+
+    #[test]
+    fn removal_focus_restores_to_surviving_uninstall_then_clears() {
+        let (width, height) = (1180.0, 815.0);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut page = AppPage::Models;
+        data.model_management.dialog = Some(ModelDialog::Remove("tiny.en".into()));
+        apply_action(&mut data, &mut page, ScreenAction::CloseModelDialog);
+        assert_eq!(
+            data.model_management.restore_remove_focus.as_deref(),
+            Some("tiny.en")
+        );
+
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::AcknowledgeModelRemovalFocus);
+        assert_eq!(
+            focused_node(&output).name(),
+            Some("Delete whisper.cpp tiny.en")
+        );
+        apply_action(&mut data, &mut page, action);
+        assert!(data.model_management.restore_remove_focus.is_none());
+
+        data.model_management.restore_remove_focus = Some("missing".into());
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new());
+        assert_eq!(action, ScreenAction::AcknowledgeModelRemovalFocus);
+        assert!(
+            focused_node(&output)
+                .name()
+                .is_some_and(|name| name.contains("Import"))
+        );
+        apply_action(&mut data, &mut page, action);
+        assert!(data.model_management.restore_remove_focus.is_none());
+    }
+
+    #[test]
+    fn inline_runtime_and_active_uninstall_reasons_are_exposed() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut active = data.models.remove(0);
+        active.runtime_action_label = Some("Repair".into());
+        active.runtime_action_enabled = false;
+        active.runtime_action_disabled_reason =
+            Some("Runtime maintenance is already running.".into());
+        data.models = vec![active.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(active.id.clone()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let runtime = node_matching(&output, |node| {
+            node.name() == Some(format!("Repair runtime for {}", active.display_name).as_str())
+        });
+        assert!(runtime.is_disabled());
+        assert_eq!(
+            runtime.description(),
+            Some("Runtime maintenance is already running.")
+        );
+        assert!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| {
+                    node.name() == Some(format!("Delete {}", active.display_name).as_str())
+                        && node.description()
+                            == Some(
+                                "Install another ready model before removing the selected model.",
+                            )
+                })
+        );
+    }
+
+    #[test]
+    fn expanded_maintenance_control_participates_in_model_card_focus_within() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let mut model = data.models.remove(0);
+        model.runtime_action_label = Some("Repair".into());
+        model.runtime_action_enabled = true;
+        data.models = vec![model.clone()];
+        data.model_catalog.clear();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local(model.id.clone()));
+        let mut page = AppPage::Models;
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let name = format!("Repair runtime for {}", model.display_name);
+        let target = named_node_id(&initial, &name);
+        let (focused, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(action, ScreenAction::None);
+        assert_eq!(focused_node(&focused).name(), Some(name.as_str()));
+        let card = named_node_bounds(&focused, &format!("{} model", model.display_name));
+        assert_bounds_within(
+            named_node_bounds(&focused, &name),
+            card,
+            "expanded maintenance focus target",
+        );
+    }
+
+    #[test]
+    fn model_card_render_all_and_compact_controls_remain_contained() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.model_catalog
+            .extend((0..100).map(|index| ModelViewModel {
+                id: format!("catalog-{index:03}"),
+                display_name: format!("Catalog model {index:03}"),
+                variant_label: format!("catalog-{index:03}"),
+                install_supported: true,
+                install_action_enabled: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }));
+        let mut page = Fixture::ModelsInstalled.page();
+        let (wide, action) =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        assert!(
+            node_names(&wide)
+                .iter()
+                .any(|name| name == "Install Catalog model 099")
+        );
+
+        let compact = render(Fixture::ModelsCardExpanded, 375.0, 680.0);
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        for name in [
+            "Collapse details for whisper.cpp tiny.en",
+            "Delete whisper.cpp tiny.en",
+        ] {
+            let bounds = named_node_bounds(&compact, name);
+            assert_bounds_within(bounds, card, "compact model control");
+            assert!(bounds.x1 - bounds.x0 >= 44.0 && bounds.y1 - bounds.y0 >= 44.0);
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let long_name =
+            "A deliberately long local speech model name that wraps without covering controls";
+        data.models = vec![ModelViewModel {
+            id: "long-active".into(),
+            display_name: long_name.into(),
+            installed: true,
+            active: true,
+            selected: true,
+            ready: true,
+            removal_supported: true,
+            download_state: ModelDownloadState::Installed,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_catalog.clear();
+        let mut page = AppPage::Models;
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 375.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let card = named_node_bounds(&output, &format!("{long_name} model"));
+        assert_bounds_within(
+            named_node_bounds(&output, long_name),
+            card,
+            "long-name compact model title",
+        );
+        for name in [
+            format!("Delete {long_name}"),
+            format!("Expand details for {long_name}"),
+        ] {
+            let bounds = named_node_bounds(&output, &name);
+            assert_bounds_within(bounds, card, "long-name compact model control");
+            assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+        }
+    }
+
+    #[test]
+    fn lifecycle_accessibility_and_actions_hold_at_viewport_bounds() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 815.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            data.models.clear();
+            data.model_catalog = vec![ModelViewModel {
+                id: "viewport-install".into(),
+                display_name: "Viewport install".into(),
+                install_supported: true,
+                install_action_enabled: true,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }];
+            let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let install = node_matching(&output, |node| {
+                node.name() == Some("Install Viewport install")
+                    && node.role() == egui::accesskit::Role::Button
+            });
+            let install_bounds = install.bounds().expect("Install bounds");
+            assert!(
+                install_bounds.width() >= 44.0 && install_bounds.height() >= 44.0,
+                "Install must retain a named 44px target at {width}px"
+            );
+            if width >= 620.0 {
+                let lifecycle =
+                    named_node_bounds(&output, "Viewport install layout lifecycle zone");
+                assert_near(
+                    (install_bounds.y0 + install_bounds.y1) / 2.0,
+                    (lifecycle.y0 + lifecycle.y1) / 2.0,
+                    &format!("Install vertical center at {width}px"),
+                );
+            }
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    "Install Viewport install",
+                ),
+                ScreenAction::InstallModel("viewport-install".into()),
+                "Install action at {width}px"
+            );
+
+            data.model_catalog.clear();
+            data.models = vec![ModelViewModel {
+                id: "viewport-delete".into(),
+                display_name: "Viewport delete".into(),
+                installed: true,
+                ready: true,
+                removal_supported: true,
+                download_state: ModelDownloadState::Installed,
+                languages: vec!["en".into()],
+                ..Default::default()
+            }];
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let delete = node_matching(&output, |node| {
+                node.name() == Some("Delete Viewport delete")
+                    && node.role() == egui::accesskit::Role::Button
+            });
+            let delete_bounds = delete.bounds().expect("Delete bounds");
+            assert!(
+                delete_bounds.width() >= 44.0 && delete_bounds.height() >= 44.0,
+                "Delete must retain a named 44px target at {width}px"
+            );
+            if width >= 620.0 {
+                let lifecycle = named_node_bounds(&output, "Viewport delete layout lifecycle zone");
+                assert_near(
+                    (delete_bounds.y0 + delete_bounds.y1) / 2.0,
+                    (lifecycle.y0 + lifecycle.y1) / 2.0,
+                    &format!("Delete vertical center at {width}px"),
+                );
+            }
+            assert_eq!(
+                click_named_control(
+                    &ctx,
+                    &mut data,
+                    &mut page,
+                    width,
+                    height,
+                    "Delete Viewport delete",
+                ),
+                ScreenAction::RequestModelRemoval("viewport-delete".into()),
+                "Delete action at {width}px"
+            );
+        }
+    }
+
+    #[test]
+    fn model_cards_remain_inside_supported_route_widths() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            let mut page = Fixture::ModelsCardExpanded.page();
+            let output = render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let route_viewport = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new(("route-viewport", UiRoute::Models)))
+                })
+                .expect("Models route viewport diagnostic");
+            let route_left = node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Heading && node.name() == Some("Models")
+            })
+            .bounds()
+            .expect("Models heading should expose bounds")
+            .x0;
+            let route_right = f64::from(route_viewport.right() - 28.0);
+            for name in ["whisper.cpp base.en model", "whisper.cpp tiny.en model"] {
+                let bounds = named_node_bounds(&output, name);
+                assert_near(
+                    bounds.x0,
+                    route_left,
+                    "supported-width model card must align to the route's left usable edge",
+                );
+                assert_near(
+                    bounds.x1,
+                    route_right,
+                    "supported-width model card must align to the route's right usable edge",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_card_summary_stacks_below_and_uses_three_zones_at_the_620px_breakpoint() {
+        let compact = render(Fixture::ModelsInstalled, 785.0, 680.0);
+        let compact_card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        let compact_title = named_node_bounds(&compact, "whisper.cpp tiny.en");
+        let compact_lifecycle = named_node_bounds(&compact, "Delete whisper.cpp tiny.en");
+        assert_near(
+            compact_card.x1 - compact_card.x0 - 44.0,
+            619.0,
+            "the compact breakpoint's 619px content width",
+        );
+        assert!(
+            compact_title.y1 <= compact_lifecycle.y0 + LAYOUT_TOLERANCE,
+            "619px card content must use the stacked summary branch: title={compact_title:?}, lifecycle={compact_lifecycle:?}"
+        );
+
+        let desktop = render(Fixture::ModelsInstalled, 786.0, 680.0);
+        let desktop_card = named_node_bounds(&desktop, "whisper.cpp tiny.en model");
+        let desktop_title = named_node_bounds(&desktop, "whisper.cpp tiny.en");
+        let desktop_lifecycle = named_node_bounds(&desktop, "Delete whisper.cpp tiny.en");
+        let identity = named_node_bounds(&desktop, "whisper.cpp tiny.en layout identity zone");
+        let metrics = named_node_bounds(&desktop, "whisper.cpp tiny.en layout metrics zone");
+        let lifecycle_zone =
+            named_node_bounds(&desktop, "whisper.cpp tiny.en layout lifecycle zone");
+        let desktop_chevron = named_node_bounds(&desktop, "Expand details for whisper.cpp tiny.en");
+        assert_near(
+            desktop_card.x1 - desktop_card.x0 - 44.0,
+            620.0,
+            "the desktop breakpoint's 620px content width",
+        );
+        let summary_width = identity.width() + metrics.width() + lifecycle_zone.width();
+        assert_near(
+            identity.width(),
+            summary_width * 0.50,
+            "breakpoint identity zone",
+        );
+        assert_near(
+            metrics.width(),
+            summary_width * 0.24,
+            "breakpoint metrics zone",
+        );
+        assert_near(
+            lifecycle_zone.width(),
+            summary_width * 0.26,
+            "breakpoint lifecycle zone",
+        );
+        assert!(
+            desktop_title.x1 <= metrics.x0 + LAYOUT_TOLERANCE
+                && desktop_lifecycle.x1 <= desktop_chevron.x0 + LAYOUT_TOLERANCE
+                && desktop_chevron.x1 <= lifecycle_zone.x1 + LAYOUT_TOLERANCE,
+            "620px card content must keep identity, metrics, lifecycle, and chevron in three-zone order: title={desktop_title:?}, metrics={metrics:?}, lifecycle={desktop_lifecycle:?}, chevron={desktop_chevron:?}"
+        );
+    }
+
+    #[test]
+    fn expanding_model_details_preserves_the_card_width() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0), (375.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsCardExpanded.data();
+            data.model_management.expanded_model_card = None;
+            let mut page = Fixture::ModelsCardExpanded.page();
+            let collapsed =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+            let expanded =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
+            let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
+
+            assert_near(
+                expanded_card.x0,
+                collapsed_card.x0,
+                "expanding details must preserve the card's left edge",
+            );
+            assert_near(
+                expanded_card.x1,
+                collapsed_card.x1,
+                "expanding details must preserve the card's right edge",
+            );
+        }
+    }
+
+    #[test]
+    fn model_card_expansion_keeps_metadata_in_place_and_compact_stacking() {
+        let long_description = "A deliberately long model description that must wrap when details are expanded while preserving the identity stack origin.";
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let model = data
+            .models
+            .iter_mut()
+            .find(|model| model.id == "tiny.en")
+            .expect("tiny model fixture");
+        model.description = Some(long_description.into());
+        let mut page = AppPage::Models;
+        let (collapsed, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let collapsed_card = named_node_bounds(&collapsed, "whisper.cpp tiny.en model");
+        let collapsed_description = named_node_bounds(&collapsed, long_description);
+        let collapsed_language =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout language row");
+        let collapsed_metrics =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout metrics zone");
+        let collapsed_lifecycle =
+            named_node_bounds(&collapsed, "whisper.cpp tiny.en layout lifecycle zone");
+
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+        let (expanded, action) =
+            render_with_input(&ctx, &mut data, &mut page, 960.0, 680.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let expanded_card = named_node_bounds(&expanded, "whisper.cpp tiny.en model");
+        let expanded_description = named_node_bounds(&expanded, long_description);
+        let expanded_language =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout language row");
+        let expanded_metrics =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout metrics zone");
+        let expanded_lifecycle =
+            named_node_bounds(&expanded, "whisper.cpp tiny.en layout lifecycle zone");
+        assert_near(
+            expanded_description.x0,
+            collapsed_description.x0,
+            "expanded description must keep the collapsed identity x origin",
+        );
+        assert_near(
+            expanded_description.y0,
+            collapsed_description.y0,
+            "wrapped description must keep the collapsed identity y origin",
+        );
+        assert_near(
+            expanded_language.x0,
+            collapsed_language.x0,
+            "expanded languages must stay in the identity metadata row",
+        );
+        for (collapsed_zone, expanded_zone, name) in [
+            (collapsed_metrics, expanded_metrics, "metrics"),
+            (collapsed_lifecycle, expanded_lifecycle, "lifecycle"),
+        ] {
+            assert_near(
+                expanded_zone.y0,
+                collapsed_zone.y0,
+                &format!("expanded {name} zone must retain its summary y origin"),
+            );
+        }
+        assert!(
+            expanded_card.y1 > collapsed_card.y1,
+            "wrapping expanded metadata and details must grow the card naturally"
+        );
+
+        let compact = render(Fixture::ModelsInstalled, 375.0, 680.0);
+        let title = named_node_bounds(&compact, "whisper.cpp tiny.en");
+        let lifecycle = named_node_bounds(&compact, "Delete whisper.cpp tiny.en");
+        assert!(
+            title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE,
+            "below 620px the summary must stack identity before controls"
+        );
+    }
+
+    #[test]
+    fn one_line_expansion_preserves_desktop_summary_geometry_and_compact_containment() {
+        for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::ModelsInstalled.data();
+            let mut page = AppPage::Models;
+            let collapsed =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+            let expanded =
+                render_with_input(&ctx, &mut data, &mut page, width, height, Vec::new()).0;
+            for name in [
+                "whisper.cpp tiny.en",
+                "More accurate for longer recordings.",
+                "whisper.cpp tiny.en layout language row",
+                "whisper.cpp tiny.en layout metrics zone",
+                "whisper.cpp tiny.en layout lifecycle zone",
+                "whisper.cpp tiny.en layout chevron zone",
+            ] {
+                let collapsed_bounds = named_node_bounds(&collapsed, name);
+                let expanded_bounds = named_node_bounds(&expanded, name);
+                assert_near(
+                    expanded_bounds.x0,
+                    collapsed_bounds.x0,
+                    &format!("{name} x origin"),
+                );
+                assert_near(
+                    expanded_bounds.y0,
+                    collapsed_bounds.y0,
+                    &format!("{name} y origin"),
+                );
+                assert_near(
+                    expanded_bounds.y1,
+                    collapsed_bounds.y1,
+                    &format!("{name} height"),
+                );
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("tiny.en".into()));
+        let mut page = AppPage::Models;
+        let compact = render_with_input(&ctx, &mut data, &mut page, 375.0, 680.0, Vec::new()).0;
+        let card = named_node_bounds(&compact, "whisper.cpp tiny.en model");
+        for name in [
+            "whisper.cpp tiny.en",
+            "More accurate for longer recordings.",
+            "whisper.cpp tiny.en layout language row",
+            "Delete whisper.cpp tiny.en",
+            "Collapse details for whisper.cpp tiny.en",
+        ] {
+            assert_bounds_within(
+                named_node_bounds(&compact, name),
+                card,
+                &format!("375px {name}"),
+            );
+        }
+
+        let mut compact_summary_data = Fixture::ModelsCardExpanded.data();
+        compact_summary_data
+            .models
+            .retain(|model| model.id == "tiny.en");
+        compact_summary_data.model_catalog.clear();
+        compact_summary_data.model_management.expanded_model_card = None;
+        let mut compact_summary_page = AppPage::Models;
+        let compact_summary = render_with_input(
+            &ctx,
+            &mut compact_summary_data,
+            &mut compact_summary_page,
+            375.0,
+            680.0,
+            Vec::new(),
+        )
+        .0;
+        let compact_summary_card = named_node_bounds(&compact_summary, "whisper.cpp tiny.en model");
+        let compact_features = named_node_bounds(
+            &compact_summary,
+            "Features: Native streaming, Translation, Word timestamps, Batch transcription",
+        );
+        assert_bounds_within(
+            compact_features,
+            compact_summary_card,
+            "375px compact feature group",
+        );
+    }
+
+    #[test]
+    fn model_card_controls_keep_trailing_chevron_order_without_decorative_nodes() {
+        for (width, height) in [(1180.0, 815.0), (375.0, 680.0)] {
+            let output = render(Fixture::ModelsInstalled, width, height);
+            let title = named_node_bounds(&output, "whisper.cpp tiny.en");
+            let lifecycle = named_node_bounds(&output, "Delete whisper.cpp tiny.en");
+            let chevron = named_node_bounds(&output, "Expand details for whisper.cpp tiny.en");
+            if width > 430.0 {
+                let speed = named_node_bounds(&output, "Speed: Very fast (5 of 5)");
+                let metrics = named_node_bounds(&output, "whisper.cpp tiny.en layout metrics zone");
+                let lifecycle_zone =
+                    named_node_bounds(&output, "whisper.cpp tiny.en layout lifecycle zone");
+                let description =
+                    named_node_bounds(&output, "More accurate for longer recordings.");
+                let language = named_node_bounds(&output, "Languages: EN");
+                assert!(title.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
+                assert!(description.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
+                assert!(language.x1 <= metrics.x0 + LAYOUT_TOLERANCE);
+                assert_near(
+                    description.x0,
+                    title.x0,
+                    "description should align with identity title text",
+                );
+                assert_near(
+                    language.x0 - 20.0,
+                    title.x0,
+                    "globe should align with identity title text",
+                );
+                assert_bounds_within(speed, metrics, "speed meter");
+                assert_bounds_within(lifecycle, lifecycle_zone, "lifecycle control");
+                assert_bounds_within(chevron, lifecycle_zone, "chevron control");
+                assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+            } else {
+                assert!(title.y1 <= lifecycle.y0 + LAYOUT_TOLERANCE);
+                assert!(lifecycle.x1 <= chevron.x0 + LAYOUT_TOLERANCE);
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_remote_card_exposes_fallback_details_inline() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        let entry = &data.remote_catalog.entries[0];
+        let variant = &entry.variants[0];
+        data.model_management.expanded_model_card = Some(ModelCardKey::Remote {
+            entry_id: entry.id.clone(),
+            variant_id: variant.id.clone(),
+        });
+        let mut page = Fixture::ModelsInstalled.page();
+        let (output, action) =
+            render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new());
+        assert_eq!(action, ScreenAction::None);
+        let names = node_names(&output);
+        for detail in [
+            "REQUIREMENTS",
+            "RAM",
+            "DOWNLOAD SIZE",
+            "82 MB",
+            "GPU",
+            "FEATURES",
+        ] {
+            assert!(names.iter().any(|name| name == detail), "missing {detail}");
+        }
+        assert!(
+            names.iter().any(|name| name == "Languages: EN"),
+            "expanded remote identity should expose its compact language summary"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "Unknown")
+                .count(),
+            2,
+            "the remote RAM and GPU requirement cells each expose Unknown"
+        );
+    }
+
+    #[test]
+    fn summary_partial_cleanup_keeps_play_and_dispatches_discard() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsLifecycle.data();
+        let model = data
+            .model_catalog
+            .iter_mut()
+            .find(|model| model.id == "moonshine.base")
+            .expect("lifecycle fixture includes Moonshine");
+        model.partial_cleanup_available = true;
+        model.partial_cleanup_enabled = true;
+        data.model_management.expanded_model_card =
+            Some(ModelCardKey::Local("moonshine.base".into()));
+        let mut page = Fixture::ModelsLifecycle.page();
+
+        let initial = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            node_names(&initial)
+                .iter()
+                .any(|name| name == "Resume Whisper Moonshine download")
+        );
+        let discard = named_node_id(&initial, "Discard partial for Whisper Moonshine");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut data,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: discard,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::DiscardModelPartial("moonshine.base".into())
+        );
+        apply_action(&mut data, &mut page, action);
+        let refreshed = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            !node_names(&refreshed)
+                .iter()
+                .any(|name| name == "Discard partial for Whisper Moonshine")
+        );
+        assert!(
+            node_names(&refreshed)
+                .iter()
+                .any(|name| name == "Collapse details for Whisper Moonshine")
+        );
+    }
+
+    #[test]
+    fn summary_partial_cleanup_uses_safe_app_barriers_and_preserves_remote_ids() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut local = Fixture::ModelsLifecycle.data();
+        let model = local
+            .model_catalog
+            .iter_mut()
+            .find(|model| model.id == "moonshine.base")
+            .expect("lifecycle fixture includes Moonshine");
+        model.partial_cleanup_available = true;
+        model.partial_cleanup_enabled = false;
+        model.partial_cleanup_disabled_reason =
+            Some("Wait for the active installation to finish.".into());
+        local.model_management.expanded_model_card =
+            Some(ModelCardKey::Local("moonshine.base".into()));
+        let mut page = Fixture::ModelsLifecycle.page();
+        let output = render_with_input(&ctx, &mut local, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let discard = node_matching(&output, |node| {
+            node.name() == Some("Discard partial for Whisper Moonshine")
+        });
+        assert!(
+            !discard.is_disabled(),
+            "the always-available X delegates safety checks to the app mutation barrier"
+        );
+
+        let mut remote = Fixture::ModelsInstalled.data();
+        remote.remote_catalog.entries[0].variants[0]
+            .actions
+            .push(RemoteCatalogActionView {
+                label: "Discard partial".into(),
+                kind: RemoteCatalogActionKind::DiscardPartial {
+                    remote_model_id: "trusted-speech/compact-english".into(),
+                    variant_id: "compact-english-q5".into(),
+                },
+                enabled: true,
+                disabled_reason: None,
+            });
+        remote.remote_catalog.entries[0].variants[0].status_label = Some("Cancelled".into());
+        remote.remote_catalog.entries[0].variants[0].downloaded_bytes = Some(41_000_000);
+        remote.remote_catalog.entries[0].variants[0].total_bytes = Some(82_000_000);
+        remote.model_management.expanded_model_card = Some(ModelCardKey::Remote {
+            entry_id: "trusted-speech/compact-english".into(),
+            variant_id: "compact-english-q5".into(),
+        });
+        let mut page = Fixture::ModelsInstalled.page();
+        let initial = render_with_input(&ctx, &mut remote, &mut page, 1180.0, 815.0, Vec::new()).0;
+        let discard = named_node_id(&initial, "Discard partial for Compact English");
+        let (_, action) = render_with_input(
+            &ctx,
+            &mut remote,
+            &mut page,
+            1180.0,
+            815.0,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Default,
+                    target: discard,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            action,
+            ScreenAction::DiscardRemoteCatalogPartial {
+                remote_model_id: "trusted-speech/compact-english".into(),
+                variant_id: "compact-english-q5".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn expanded_legacy_cleanup_uses_upgrade_and_explicit_uninstall() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog = vec![ModelViewModel {
+            id: "legacy".into(),
+            display_name: "Legacy model".into(),
+            legacy_cleanup_pending: true,
+            selected: true,
+            primary_action_installs_upgrade: true,
+            primary_action_enabled: true,
+            removal_supported: true,
+            languages: vec!["en".into()],
+            ..Default::default()
+        }];
+        data.model_management.expanded_model_card = Some(ModelCardKey::Local("legacy".into()));
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Upgrade Legacy model")
+        );
+        assert!(
+            node_names(&output)
+                .iter()
+                .any(|name| name == "Delete Legacy model")
+        );
+        assert!(
+            !node_names(&output)
+                .iter()
+                .any(|name| name == "Install Legacy model")
+        );
+    }
+
     #[test]
     fn harness_parser_is_exact_and_fail_closed() {
         assert_eq!(
