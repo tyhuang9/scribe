@@ -306,12 +306,15 @@ pub(crate) fn stage_manifest_at(
     })?;
     drop(file);
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let target_identity =
+        crate::disk_space::canonical_target_identity(&destination).map_err(InstallError::Failed)?;
     DownloadedArtifact {
         id: format!("installed-manifest:{}", manifest.model_id),
         path: stage_path,
         destination,
         size_bytes: bytes.len() as u64,
         sha256,
+        target_identity,
     }
     .activate()
 }

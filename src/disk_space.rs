@@ -5,6 +5,7 @@
 //! fail-closed before starting a managed download so Scribe can explain a
 //! known shortage without disturbing an installed artifact or its runtime.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,7 @@ pub(crate) const SAFETY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) struct DiskSpacePreflight {
     pub(crate) volume: String,
     pub(crate) available_bytes: u64,
+    pub(crate) additional_bytes: u64,
     pub(crate) required_bytes: u64,
 }
 
@@ -28,6 +30,25 @@ impl DiskSpacePreflight {
 pub(crate) struct DiskSpaceAvailability {
     pub(crate) volume: String,
     pub(crate) available_bytes: u64,
+}
+
+#[cfg(windows)]
+type CanonicalTargetIdentityValue = Vec<u16>;
+
+#[cfg(not(windows))]
+type CanonicalTargetIdentityValue = PathBuf;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CanonicalTargetIdentity(CanonicalTargetIdentityValue);
+
+impl std::fmt::Display for CanonicalTargetIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(windows)]
+        return formatter.write_str(&String::from_utf16_lossy(&self.0));
+
+        #[cfg(not(windows))]
+        self.0.display().fmt(formatter)
+    }
 }
 
 trait SpaceProbe {
@@ -64,8 +85,82 @@ fn preflight_with(
     Ok(DiskSpacePreflight {
         volume: volume.volume,
         available_bytes: volume.available_bytes,
+        additional_bytes,
         required_bytes,
     })
+}
+
+/// Resolves aliases through the nearest existing ancestor without creating
+/// the destination. This lets the install coordinator reject two logical jobs
+/// that would mutate the same path through symlink or junction aliases.
+pub(crate) fn canonical_target_identity(
+    destination: &Path,
+) -> Result<CanonicalTargetIdentity, String> {
+    let mut candidate = destination.to_path_buf();
+    let mut suffix = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = candidate.file_name().ok_or_else(|| {
+                    format!(
+                        "could not resolve a canonical target identity for {}",
+                        destination.display()
+                    )
+                })?;
+                suffix.push(name.to_os_string());
+                if !candidate.pop() {
+                    return Err(format!(
+                        "could not find an existing ancestor for {}",
+                        destination.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect target ancestor {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let mut canonical = fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "could not canonicalize target ancestor {}: {error}",
+            candidate.display()
+        )
+    })?;
+    for component in suffix.into_iter().rev() {
+        canonical.push(component);
+    }
+    #[cfg(windows)]
+    {
+        Ok(CanonicalTargetIdentity(normalize_windows_identity(
+            &canonical,
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(CanonicalTargetIdentity(canonical))
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows_identity(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'\\') {
+                u16::from(b'/')
+            } else if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+                unit + u16::from(b'a' - b'A')
+            } else {
+                unit
+            }
+        })
+        .collect()
 }
 
 fn availability_with(
@@ -234,6 +329,7 @@ mod tests {
         let preflight = preflight_with(&probe, &existing_destination(), 100).unwrap();
 
         assert_eq!(preflight.volume, "test-volume");
+        assert_eq!(preflight.additional_bytes, 100);
         assert_eq!(preflight.required_bytes, SAFETY_HEADROOM_BYTES + 100);
         assert!(preflight.has_sufficient_space());
     }
@@ -263,5 +359,108 @@ mod tests {
                 .unwrap_err()
                 .contains("probe failed")
         );
+    }
+
+    #[test]
+    fn canonical_target_identity_collapses_existing_directory_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-canonical-target-test-{}",
+            std::process::id()
+        ));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        #[cfg(target_os = "windows")]
+        if std::os::windows::fs::symlink_dir(&real, &alias).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        assert_eq!(
+            canonical_target_identity(&real.join("model.gguf")).unwrap(),
+            canonical_target_identity(&alias.join("model.gguf")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_target_identity_normalization_is_lossless_and_alias_aware() {
+        use std::os::windows::ffi::OsStringExt;
+
+        assert_eq!(
+            normalize_windows_identity(Path::new(r"C:\Models\MODEL.GGUF")),
+            normalize_windows_identity(Path::new("c:/models/model.gguf"))
+        );
+
+        let first = PathBuf::from(OsString::from_wide(&[b'C' as u16, b':' as u16, 0xd800]));
+        let second = PathBuf::from(OsString::from_wide(&[b'C' as u16, b':' as u16, 0xd801]));
+        assert_ne!(
+            normalize_windows_identity(&first),
+            normalize_windows_identity(&second)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_target_identity_preserves_backslashes_in_unix_names() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-canonical-backslash-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let separator_path = root.join("models").join("model.gguf");
+        let backslash_path = root.join("models\\model.gguf");
+        assert_ne!(
+            canonical_target_identity(&separator_path).unwrap(),
+            canonical_target_identity(&backslash_path).unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_target_identity_preserves_distinct_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "scribe-canonical-non-utf8-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let first = root.join(OsString::from_vec(vec![b'm', 0x80]));
+        let second = root.join(OsString::from_vec(vec![b'm', 0x81]));
+        assert_ne!(
+            canonical_target_identity(&first).unwrap(),
+            canonical_target_identity(&second).unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_target_identity_rejects_a_dangling_symlink_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-canonical-dangling-link-test-{}",
+            std::process::id()
+        ));
+        let dangling = root.join("dangling");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), &dangling).unwrap();
+
+        let error = canonical_target_identity(&dangling.join("model.gguf")).unwrap_err();
+        assert!(error.contains("could not canonicalize target ancestor"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -197,6 +197,7 @@ pub(crate) enum ModelDownloadState {
     NotInstalled,
     Queued,
     Downloading,
+    WaitingForVerification,
     Verifying,
     Extracting,
     Installed,
@@ -362,6 +363,8 @@ pub(crate) struct ModelManagementState {
     /// The deterministic ready replacement named in an active-model removal confirmation.
     pub removal_replacement: Option<String>,
     pub mutation_block_reason: Option<String>,
+    /// Quiet aggregate lifecycle summary; byte progress is intentionally excluded.
+    pub install_status_summary: Option<String>,
     pub installed_expanded: bool,
     pub available_expanded: bool,
 }
@@ -377,6 +380,7 @@ impl Default for ModelManagementState {
             restore_remove_focus: None,
             removal_replacement: None,
             mutation_block_reason: None,
+            install_status_summary: None,
             installed_expanded: true,
             available_expanded: true,
         }
