@@ -8814,9 +8814,14 @@ impl LocalTranscriberApp {
                 entries: Vec::new(),
             };
         };
+        // The local model projection is rebuilt only at durable lifecycle
+        // boundaries. Reusing it here keeps catalog browsing and painting free
+        // of filesystem/configured-model probes while still requiring a
+        // runnable artifact before a remote variant is treated as installed.
+        let installed_model_ids = installed_model_ids(&self.remote_catalog.local_models);
         let matching = filtered_remote_models(
             snapshot.models(),
-            &self.config,
+            &installed_model_ids,
             &key.search,
             key.filters,
             key.sort,
@@ -8826,7 +8831,7 @@ impl LocalTranscriberApp {
         let entries = matching
             .into_iter()
             .take(REMOTE_CATALOG_VISIBLE_LIMIT)
-            .map(|model| self.remote_catalog_entry_view(model))
+            .map(|model| self.remote_catalog_entry_view(model, &installed_model_ids))
             .collect();
         RemoteCatalogProjection {
             key,
@@ -8836,7 +8841,11 @@ impl LocalTranscriberApp {
         }
     }
 
-    fn remote_catalog_entry_view(&self, model: &RemoteModel) -> RemoteCatalogEntryView {
+    fn remote_catalog_entry_view(
+        &self,
+        model: &RemoteModel,
+        installed_model_ids: &HashSet<String>,
+    ) -> RemoteCatalogEntryView {
         let mutation_block_reason = self.artifact_mutation_block_reason();
         let variants = model
             .variants
@@ -8891,22 +8900,18 @@ impl LocalTranscriberApp {
                     }
                     _ => None,
                 };
-                let installed_id = remote_id.as_ref().and_then(|id| {
-                    self.config
-                        .general
-                        .managed_remote_models
-                        .contains_key(id)
-                        .then(|| id.clone())
-                });
+                let installed_id = remote_variant_installed_id(model, variant, installed_model_ids)
+                    .map(|id| id.to_string());
                 let previous_revision = artifact.as_ref().is_some_and(|artifact| {
                     self.config
                         .general
                         .managed_remote_models
-                        .values()
-                        .any(|install| {
+                        .iter()
+                        .any(|(id, install)| {
                             install.repository == artifact.model_id
                                 && install.filename == artifact.filename
                                 && install.revision != artifact.revision
+                                && installed_model_ids.contains(id)
                         })
                 });
                 let install_disabled_reason = partial_inspection_block_reason
@@ -11338,17 +11343,41 @@ fn remote_model_smallest_variant_size(model: &RemoteModel) -> Option<u64> {
         .min()
 }
 
-fn remote_model_is_installed(model: &RemoteModel, app_config: &AppConfig) -> bool {
-    model.variants.iter().any(|variant| {
-        config::managed_remote_model_id(&model.id, &model.revision, &variant.filename).is_some_and(
-            |model_id| {
-                app_config
-                    .general
-                    .managed_remote_models
-                    .contains_key(&model_id)
-            },
-        )
-    })
+fn installed_model_ids(models: &[ModelViewModel]) -> HashSet<String> {
+    models
+        .iter()
+        .filter(|model| model.installed)
+        .map(|model| model.id.clone())
+        .collect()
+}
+
+fn remote_model_is_installed(model: &RemoteModel, installed_model_ids: &HashSet<String>) -> bool {
+    model
+        .variants
+        .iter()
+        .any(|variant| remote_variant_installed_id(model, variant, installed_model_ids).is_some())
+}
+
+fn remote_variant_installed_id(
+    model: &RemoteModel,
+    variant: &crate::huggingface_catalog::RemoteModelVariant,
+    installed_model_ids: &HashSet<String>,
+) -> Option<ModelId> {
+    let artifact = model.artifact_for(&variant.id)?;
+    let normalized_model_id = crate::model_catalog::normalized_model_id_for_pinned_artifact(
+        &artifact.model_id,
+        &artifact.revision,
+        &artifact.filename,
+    );
+    if normalized_model_id
+        .as_ref()
+        .is_some_and(|id| installed_model_ids.contains(id.as_str()))
+    {
+        return normalized_model_id;
+    }
+    config::managed_remote_model_id(&artifact.model_id, &artifact.revision, &artifact.filename)
+        .filter(|id| installed_model_ids.contains(id))
+        .map(ModelId::new)
 }
 
 fn remote_model_is_multilingual(model: &RemoteModel) -> bool {
@@ -11366,10 +11395,10 @@ fn remote_model_is_multilingual(model: &RemoteModel) -> bool {
 
 fn remote_model_matches_catalog_filters(
     model: &RemoteModel,
-    app_config: &AppConfig,
+    installed_model_ids: &HashSet<String>,
     filters: RemoteCatalogFilters,
 ) -> bool {
-    (!filters.installed_only || remote_model_is_installed(model, app_config))
+    (!filters.installed_only || remote_model_is_installed(model, installed_model_ids))
         && (!filters.recommended_only || model.recommended)
         && (!filters.multilingual_only || remote_model_is_multilingual(model))
         && filters
@@ -11379,7 +11408,7 @@ fn remote_model_matches_catalog_filters(
 
 fn filtered_remote_models<'model>(
     models: &'model [RemoteModel],
-    app_config: &AppConfig,
+    installed_model_ids: &HashSet<String>,
     search: &str,
     filters: RemoteCatalogFilters,
     sort: RemoteCatalogSort,
@@ -11388,7 +11417,7 @@ fn filtered_remote_models<'model>(
     let mut matching = models
         .iter()
         .filter(|model| remote_model_matches_search(model, search))
-        .filter(|model| remote_model_matches_catalog_filters(model, app_config, filters))
+        .filter(|model| remote_model_matches_catalog_filters(model, installed_model_ids, filters))
         .filter(|model| language_filter.matches(&model.languages))
         .collect::<Vec<_>>();
 
@@ -18733,7 +18762,7 @@ mod layout_tests {
             }],
         };
 
-        let mut exact_view = app.remote_catalog_entry_view(&exact);
+        let mut exact_view = app.remote_catalog_entry_view(&exact, &HashSet::new());
         let enriched = exact_view.variants.remove(0);
         assert_eq!(
             enriched.normalized_model_id.as_deref(),
@@ -18755,7 +18784,7 @@ mod layout_tests {
             false,
             1,
         );
-        let mut arbitrary_view = app.remote_catalog_entry_view(&arbitrary);
+        let mut arbitrary_view = app.remote_catalog_entry_view(&arbitrary, &HashSet::new());
         let unknown = arbitrary_view.variants.remove(0);
         assert!(unknown.normalized_model_id.is_none());
         assert_eq!(unknown.speed_tier, ModelSpeedTier::Unknown);
@@ -18790,26 +18819,16 @@ mod layout_tests {
                 2 * 1024 * MIB,
             ),
         ];
-        let mut config = AppConfig::default();
-        let installed = config::ManagedRemoteModelInstall {
-            repository: "handy-computer/compact".to_owned(),
-            revision: "a".repeat(40),
-            filename: "fixture.gguf".to_owned(),
-            ..Default::default()
-        };
-        config.general.managed_remote_models.insert(
-            config::managed_remote_model_id(
-                &installed.repository,
-                &installed.revision,
-                &installed.filename,
-            )
-            .unwrap(),
-            installed,
-        );
+        let installed_model_ids = HashSet::from([config::managed_remote_model_id(
+            "handy-computer/compact",
+            &"a".repeat(40),
+            "fixture.gguf",
+        )
+        .unwrap()]);
 
         let installed_only = filtered_remote_models(
             &models,
-            &config,
+            &installed_model_ids,
             "",
             RemoteCatalogFilters {
                 installed_only: true,
@@ -18828,7 +18847,7 @@ mod layout_tests {
 
         let multilingual_standard = filtered_remote_models(
             &models,
-            &config,
+            &installed_model_ids,
             "es",
             RemoteCatalogFilters {
                 multilingual_only: true,
@@ -18848,7 +18867,7 @@ mod layout_tests {
 
         let recommended_first = filtered_remote_models(
             &models,
-            &config,
+            &installed_model_ids,
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Recommended,
@@ -18868,7 +18887,7 @@ mod layout_tests {
 
         let smallest_first = filtered_remote_models(
             &models,
-            &config,
+            &installed_model_ids,
             "",
             RemoteCatalogFilters::default(),
             RemoteCatalogSort::Smallest,
@@ -18884,6 +18903,201 @@ mod layout_tests {
                 "handy-computer/multilingual",
                 "handy-computer/large"
             ]
+        );
+    }
+
+    #[test]
+    fn remote_catalog_installed_state_requires_an_artifact_backed_cached_model() {
+        let root = partial_cleanup_test_root("remote-installed-cache");
+        let _ = fs::remove_dir_all(&root);
+        let mut app = test_app();
+        app.config.general.model_storage_dir = root.clone();
+        let model = remote_catalog_model(
+            "handy-computer/installed-cache-fixture",
+            "Installed cache fixture",
+            &["en"],
+            false,
+            8,
+        );
+        let artifact = model.artifact_for("q4").unwrap();
+        let id = config::managed_remote_model_id(
+            &artifact.model_id,
+            &artifact.revision,
+            &artifact.filename,
+        )
+        .unwrap();
+        let path = trusted_fixture_destination(&app.config, &model, "q4");
+        app.config.general.managed_remote_models.insert(
+            id.clone(),
+            config::ManagedRemoteModelInstall {
+                repository: artifact.model_id.clone(),
+                revision: artifact.revision.clone(),
+                filename: artifact.filename.clone(),
+                expected_size_bytes: artifact.size_bytes,
+                expected_sha256: artifact.expected_sha256.clone(),
+                path: path.clone(),
+                display_name: model.display_name.clone(),
+                description: model.description.clone(),
+                languages: model.languages.clone(),
+                recommended: model.recommended,
+                installed_at_unix_seconds: None,
+            },
+        );
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+        app.remote_catalog.partial_inspections.insert(
+            (model.id.clone(), "q4".to_owned()),
+            PartialInspection::Missing,
+        );
+
+        let stale_ids = installed_model_ids(&app.remote_catalog.local_models);
+        assert!(!stale_ids.contains(&id));
+        assert!(
+            filtered_remote_models(
+                std::slice::from_ref(&model),
+                &stale_ids,
+                "",
+                RemoteCatalogFilters {
+                    installed_only: true,
+                    ..Default::default()
+                },
+                RemoteCatalogSort::Name,
+                ModelLanguageFilter::All,
+            )
+            .is_empty()
+        );
+        let stale = app.remote_catalog_entry_view(&model, &stale_ids);
+        let stale_variant = &stale.variants[0];
+        assert_ne!(
+            stale_variant.status_label.as_deref(),
+            Some("Installed and verified")
+        );
+        assert!(!stale_variant.actions.iter().any(|action| {
+            matches!(
+                action.kind,
+                RemoteCatalogActionKind::Use { .. } | RemoteCatalogActionKind::Remove { .. }
+            )
+        }));
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0_u8; 8]).unwrap();
+        app.remote_catalog.invalidate_local_models();
+        app.rebuild_model_inventory_projection();
+
+        let installed_ids = installed_model_ids(&app.remote_catalog.local_models);
+        assert!(installed_ids.contains(&id));
+        assert_eq!(
+            filtered_remote_models(
+                std::slice::from_ref(&model),
+                &installed_ids,
+                "",
+                RemoteCatalogFilters {
+                    installed_only: true,
+                    ..Default::default()
+                },
+                RemoteCatalogSort::Name,
+                ModelLanguageFilter::All,
+            )
+            .len(),
+            1
+        );
+        let installed = app.remote_catalog_entry_view(&model, &installed_ids);
+        let installed_variant = &installed.variants[0];
+        assert_eq!(
+            installed_variant.status_label.as_deref(),
+            Some("Installed and verified")
+        );
+        assert!(installed_variant.actions.iter().any(|action| {
+            matches!(action.kind, RemoteCatalogActionKind::Use { ref model_id } if model_id == &id)
+        }));
+        assert!(installed_variant.actions.iter().any(|action| {
+            matches!(action.kind, RemoteCatalogActionKind::Remove { ref model_id } if model_id == &id)
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_normalized_catalog_artifact_remains_installed_after_restart() {
+        let mut app = test_app();
+        let model_id = ModelId::new("whisper_cpp_tiny_en");
+        let manifest = crate::model_catalog::runtime_model_manifest(&model_id).unwrap();
+        let model = RemoteModel {
+            id: manifest.artifact_repository.to_owned(),
+            revision: manifest.artifact_revision.to_owned(),
+            display_name: "Normalized cached fixture".to_owned(),
+            description: "fixture".to_owned(),
+            languages: vec!["en".to_owned()],
+            recommended: false,
+            trust: crate::huggingface_catalog::ModelTrust::TrustedPublisher,
+            compatibility: crate::huggingface_catalog::ModelCompatibility::Experimental(
+                "fixture".to_owned(),
+            ),
+            variants: vec![crate::huggingface_catalog::RemoteModelVariant {
+                id: "exact".to_owned(),
+                filename: manifest.artifact_filename.to_owned(),
+                size_bytes: manifest.artifact_size_bytes,
+                expected_sha256: manifest.artifact_sha256.to_owned(),
+            }],
+        };
+        app.remote_catalog.partial_inspections.insert(
+            (model.id.clone(), "exact".to_owned()),
+            PartialInspection::Missing,
+        );
+
+        // After restart, catalog cards consume this already rebuilt local
+        // projection rather than probing the model filesystem again.
+        let installed_ids = HashSet::from([model_id.to_string()]);
+        let view = app.remote_catalog_entry_view(&model, &installed_ids);
+        let variant = &view.variants[0];
+        assert_eq!(
+            variant.status_label.as_deref(),
+            Some("Installed and verified")
+        );
+        assert!(variant.actions.iter().any(|action| {
+            matches!(action.kind, RemoteCatalogActionKind::Use { model_id: ref installed } if installed == model_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn remote_catalog_update_requires_a_runnable_cached_previous_revision() {
+        let mut app = test_app();
+        let mut model = remote_catalog_model(
+            "handy-computer/previous-revision-fixture",
+            "Previous revision fixture",
+            &["en"],
+            false,
+            8,
+        );
+        let previous_revision = model.revision.clone();
+        model.revision = "c".repeat(40);
+        let previous_id =
+            config::managed_remote_model_id(&model.id, &previous_revision, "fixture.gguf").unwrap();
+        app.config.general.managed_remote_models.insert(
+            previous_id.clone(),
+            config::ManagedRemoteModelInstall {
+                repository: model.id.clone(),
+                revision: previous_revision,
+                filename: "fixture.gguf".to_owned(),
+                ..Default::default()
+            },
+        );
+        app.remote_catalog.partial_inspections.insert(
+            (model.id.clone(), "q4".to_owned()),
+            PartialInspection::Missing,
+        );
+
+        let stale = app.remote_catalog_entry_view(&model, &HashSet::new());
+        assert_ne!(
+            stale.variants[0].status_label.as_deref(),
+            Some("Update available")
+        );
+
+        let runnable_previous = HashSet::from([previous_id]);
+        let update = app.remote_catalog_entry_view(&model, &runnable_previous);
+        assert_eq!(
+            update.variants[0].status_label.as_deref(),
+            Some("Update available")
         );
     }
 
