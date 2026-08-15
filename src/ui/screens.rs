@@ -1944,6 +1944,13 @@ fn local_model_primary_action(model: &ModelViewModel) -> ScreenAction {
     }
 }
 
+fn remote_variant_accessible_name(
+    entry: &RemoteCatalogEntryView,
+    variant: &RemoteCatalogVariantView,
+) -> String {
+    format!("{} ({})", entry.display_name, variant.filename)
+}
+
 struct ModelLifecyclePresentation<'a> {
     action: ScreenAction,
     icon: Icon,
@@ -1951,6 +1958,7 @@ struct ModelLifecyclePresentation<'a> {
     accessible_name: String,
     enabled: bool,
     disabled_reason: Option<&'a str>,
+    visible_status: Option<String>,
     compact_size: Option<String>,
     tone: ModelLifecycleTone,
 }
@@ -1983,6 +1991,7 @@ fn model_lifecycle_presentation<'a>(
                 accessible_name: format!("Pause {} download", model.display_name),
                 enabled: model.cancel_supported,
                 disabled_reason: model.primary_action_disabled_reason.as_deref(),
+                visible_status: None,
                 compact_size: None,
                 tone: ModelLifecycleTone::Standard,
             }
@@ -1997,12 +2006,7 @@ fn model_lifecycle_presentation<'a>(
             ModelLifecyclePresentation {
                 action: ScreenAction::CancelModelInstall(model.id.clone()),
                 icon: Icon::Close,
-                label: if waiting {
-                    "Waiting for verification"
-                } else {
-                    "Queued"
-                }
-                .into(),
+                label: "Cancel".into(),
                 accessible_name: format!(
                     "Cancel {} {}",
                     model.display_name,
@@ -2013,7 +2017,17 @@ fn model_lifecycle_presentation<'a>(
                     }
                 ),
                 enabled: model.cancel_supported,
-                disabled_reason: model.primary_action_disabled_reason.as_deref(),
+                disabled_reason: (!model.cancel_supported)
+                    .then_some(model.primary_action_disabled_reason.as_deref())
+                    .flatten(),
+                visible_status: Some(
+                    if waiting {
+                        "Waiting for verification"
+                    } else {
+                        "Queued"
+                    }
+                    .to_owned(),
+                ),
                 compact_size: None,
                 tone: ModelLifecycleTone::Standard,
             }
@@ -2031,6 +2045,7 @@ fn model_lifecycle_presentation<'a>(
                 accessible_name: format!("Installing {}", model.display_name),
                 enabled: false,
                 disabled_reason: Some("Scribe is preparing the model and cannot cancel this step."),
+                visible_status: None,
                 compact_size: None,
                 tone: ModelLifecycleTone::Standard,
             }
@@ -2053,6 +2068,7 @@ fn model_lifecycle_presentation<'a>(
                     ),
                     enabled: model.primary_action_enabled,
                     disabled_reason: model.primary_action_disabled_reason.as_deref(),
+                    visible_status: None,
                     compact_size: None,
                     tone: ModelLifecycleTone::Standard,
                 }
@@ -2074,6 +2090,7 @@ fn model_lifecycle_presentation<'a>(
                     accessible_name: format!("Delete {}", model.display_name),
                     enabled: reason.is_none(),
                     disabled_reason: reason,
+                    visible_status: None,
                     compact_size: None,
                     tone: ModelLifecycleTone::DestructiveOutline,
                 }
@@ -2117,6 +2134,7 @@ fn model_lifecycle_presentation<'a>(
                     (!model.install_supported)
                         .then_some("This model has no supported managed download in this build.")
                 }),
+                visible_status: None,
                 compact_size: model
                     .total_bytes
                     .map(format_compact_artifact_size)
@@ -2129,6 +2147,7 @@ fn model_lifecycle_presentation<'a>(
             }
         }
         ModelCard::Remote(entry, variant) => {
+            let variant_name = remote_variant_accessible_name(entry, variant);
             let remote = variant
                 .actions
                 .iter()
@@ -2148,7 +2167,11 @@ fn model_lifecycle_presentation<'a>(
                     remote.map(|action| &action.kind),
                     Some(RemoteCatalogActionKind::Cancel { .. })
                 ) {
-                    Icon::Pause
+                    if cancel_waiting {
+                        Icon::Close
+                    } else {
+                        Icon::Pause
+                    }
                 } else if label == "Delete" || label == "Remove" {
                     Icon::Trash
                 } else {
@@ -2158,12 +2181,7 @@ fn model_lifecycle_presentation<'a>(
                     remote.map(|action| &action.kind),
                     Some(RemoteCatalogActionKind::Cancel { .. })
                 ) {
-                    if cancel_waiting {
-                        variant.status_label.as_deref().unwrap_or("Cancel")
-                    } else {
-                        "Pause"
-                    }
-                    .into()
+                    if cancel_waiting { "Cancel" } else { "Pause" }.into()
                 } else {
                     label.into()
                 },
@@ -2177,10 +2195,15 @@ fn model_lifecycle_presentation<'a>(
                     } else {
                         label
                     },
-                    entry.display_name
+                    variant_name
                 ),
                 enabled: remote.is_some_and(|action| action.enabled),
                 disabled_reason: remote.and_then(|action| action.disabled_reason.as_deref()),
+                visible_status: if cancel_waiting {
+                    variant.status_label.clone()
+                } else {
+                    None
+                },
                 compact_size: (label == "Install")
                     .then(|| format_compact_artifact_size(variant.size_bytes)),
                 tone: match label {
@@ -2240,7 +2263,10 @@ fn model_lifecycle_controls<'a>(
     };
     let discard_name = discard.as_ref().map(|_| match card {
         ModelCard::Local(model) => format!("Discard partial for {}", model.display_name),
-        ModelCard::Remote(entry, _) => format!("Discard partial for {}", entry.display_name),
+        ModelCard::Remote(entry, variant) => format!(
+            "Discard partial for {}",
+            remote_variant_accessible_name(entry, variant)
+        ),
     });
     if discard.is_some()
         && matches!(primary.label.as_str(), "Install" | "Retry" | "Resume")
@@ -2251,13 +2277,11 @@ fn model_lifecycle_controls<'a>(
     {
         primary.icon = Icon::Play;
         primary.label = "Resume".into();
-        primary.accessible_name = format!(
-            "Resume {} download",
-            match card {
-                ModelCard::Local(model) => model.display_name.as_str(),
-                ModelCard::Remote(entry, _) => entry.display_name.as_str(),
-            }
-        );
+        let model_name = match card {
+            ModelCard::Local(model) => model.display_name.clone(),
+            ModelCard::Remote(entry, variant) => remote_variant_accessible_name(entry, variant),
+        };
+        primary.accessible_name = format!("Resume {model_name} download");
     }
     ModelLifecycleControls {
         primary,
@@ -2266,8 +2290,11 @@ fn model_lifecycle_controls<'a>(
         error_message: model_download_error(card),
         error_accessible_name: model_download_error(card).map(|_| match card {
             ModelCard::Local(model) => format!("Show download error for {}", model.display_name),
-            ModelCard::Remote(entry, _) => {
-                format!("Show download error for {}", entry.display_name)
+            ModelCard::Remote(entry, variant) => {
+                format!(
+                    "Show download error for {}",
+                    remote_variant_accessible_name(entry, variant)
+                )
             }
         }),
     }
@@ -3102,6 +3129,10 @@ fn render_unified_model_card(
             model_row_description(card),
         ),
     };
+    let accessible_card_name = match card {
+        ModelCard::Local(model) => model.display_name.clone(),
+        ModelCard::Remote(entry, variant) => remote_variant_accessible_name(entry, variant),
+    };
     let lifecycle = model_lifecycle_controls(card, can_replace_active);
     let title_selects_model =
         matches!(card, ModelCard::Local(model) if model.installed && model.ready && !model.active);
@@ -3138,7 +3169,7 @@ fn render_unified_model_card(
         ui.set_min_width(card_content_width);
         let compact = card_content_width < MODEL_CARD_COMPACT_BREAKPOINT;
         let details_name = format!(
-            "{} details for {name}",
+            "{} details for {accessible_card_name}",
             if expanded { "Collapse" } else { "Expand" }
         );
         let render_details =
@@ -3167,6 +3198,13 @@ fn render_unified_model_card(
                                 action: &mut ScreenAction,
                                 restored_remove_focus: &mut bool,
                                 focus_within: &mut bool| {
+            if let Some(status) = lifecycle.primary.visible_status.as_deref() {
+                let response = ui.label(RichText::new(status).small().color(colors.muted_text));
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_name(status);
+                });
+                ui.add_space(6.0);
+            }
             if (matches!(
                 lifecycle.primary.action,
                 ScreenAction::CancelModelInstall(_) | ScreenAction::CancelRemoteCatalogInstall(_)
@@ -3206,7 +3244,7 @@ fn render_unified_model_card(
                     |size| format!("{}  {size}", icon_glyph(lifecycle.primary.icon)),
                 )
             };
-            let lifecycle_response = model_lifecycle_button(
+            let mut lifecycle_response = model_lifecycle_button(
                 ui,
                 &label,
                 &lifecycle.primary.accessible_name,
@@ -3226,6 +3264,18 @@ fn render_unified_model_card(
             }
             if lifecycle_response.clicked() && lifecycle.primary.enabled {
                 *action = lifecycle.primary.action.clone();
+            }
+            if let (Some(discard), Some(discard_name)) = (
+                lifecycle.discard.as_ref(),
+                lifecycle.discard_name.as_deref(),
+            ) {
+                let discard_response =
+                    compact_model_icon_action(ui, Icon::Close, discard_name, true, None, None);
+                *focus_within |= discard_response.has_focus();
+                if discard_response.clicked() {
+                    *action = discard.clone();
+                }
+                lifecycle_response = lifecycle_response.union(discard_response);
             }
             if let (Some(error_name), Some(error_message)) = (
                 lifecycle.error_accessible_name.as_deref(),
@@ -3604,7 +3654,7 @@ fn render_unified_model_card(
     };
     ui.ctx().accesskit_node_builder(frame.id, |builder| {
         builder.set_role(egui::accesskit::Role::Group);
-        builder.set_name(format!("{name} model"));
+        builder.set_name(format!("{accessible_card_name} model"));
         if let Some(progress) = model_download_progress_presentation(card) {
             builder.set_description(progress.accessible_text);
         }
@@ -3965,6 +4015,21 @@ fn models(
         builder.set_live(egui::accesskit::Live::Polite);
         builder.set_live_atomic();
     });
+    if let Some(summary) = management.install_status_summary.as_deref() {
+        ui.add_space(6.0);
+        let aggregate_status = ui
+            .push_id("aggregate-model-install-status", |ui| {
+                ui.label(RichText::new(summary).small().color(colors.muted_text))
+            })
+            .inner;
+        ui.ctx()
+            .accesskit_node_builder(aggregate_status.id, |builder| {
+                builder.set_role(egui::accesskit::Role::Status);
+                builder.set_name(summary);
+                builder.set_live(egui::accesskit::Live::Polite);
+                builder.set_live_atomic();
+            });
+    }
     let (mut installed_cards, available_cards) = build_model_card_lists(
         models,
         model_catalog,
@@ -4665,8 +4730,11 @@ fn model_download_progress_presentation(
         {
             (model.downloaded_bytes, model.total_bytes)
         }
-        // Remote progress exists only when the live installer supplied it.
-        ModelCard::Remote(_, variant) => (variant.downloaded_bytes?, variant.total_bytes),
+        // Retained byte counts can exist while queued or waiting; only an
+        // actively transferring variant owns a truthful progress meter.
+        ModelCard::Remote(_, variant) if variant.status_label.as_deref() == Some("Downloading") => {
+            (variant.downloaded_bytes?, variant.total_bytes)
+        }
         _ => return None,
     };
     let total_bytes = total_bytes.filter(|total| *total > 0);
@@ -7485,7 +7553,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_retained_partial_bytes_project_after_failed_and_cancelled_restarts() {
+    fn remote_retained_partial_bytes_do_not_create_inactive_download_meters() {
         for status_label in ["Failed", "Cancelled"] {
             let entry = RemoteCatalogEntryView {
                 display_name: "Remote retained partial".into(),
@@ -7497,12 +7565,11 @@ mod tests {
                 total_bytes: Some(100_000_000),
                 ..Default::default()
             };
-            let progress =
-                model_download_progress_presentation(ModelCard::Remote(&entry, &variant))
-                    .expect("retained remote partial projects after restart");
-            assert_eq!(progress.downloaded_bytes, 82_000_000);
-            assert_eq!(progress.total_bytes, Some(100_000_000));
-            assert_eq!(progress.display_text, "82.0MB / 100.0MB");
+            assert_eq!(
+                model_download_progress_presentation(ModelCard::Remote(&entry, &variant)),
+                None,
+                "{status_label} is not an active transfer"
+            );
         }
     }
 
@@ -7659,6 +7726,7 @@ mod tests {
         };
         let remote_variant = RemoteCatalogVariantView {
             id: "stable-q5".into(),
+            filename: "stable-q5.gguf".into(),
             size_bytes: 82_000_000,
             actions: vec![RemoteCatalogActionView {
                 label: "Install".into(),
@@ -7674,7 +7742,10 @@ mod tests {
         let remote =
             model_lifecycle_presentation(ModelCard::Remote(&remote_entry, &remote_variant), true);
         assert_eq!(remote.tone, ModelLifecycleTone::InverseFilled);
-        assert_eq!(remote.accessible_name, "Install Remote stable");
+        assert_eq!(
+            remote.accessible_name,
+            "Install Remote stable (stable-q5.gguf)"
+        );
         assert_eq!(remote.compact_size.as_deref(), Some("82 MB"));
 
         let ctx = egui::Context::default();

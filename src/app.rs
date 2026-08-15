@@ -8301,11 +8301,33 @@ impl LocalTranscriberApp {
     }
 
     fn cancel_artifact_install(&mut self, model_id: &str) {
+        let display_name = self
+            .remote_catalog
+            .local_models
+            .iter()
+            .find(|model| model.id == model_id)
+            .map(|model| model.display_name.clone())
+            .or_else(|| {
+                self.remote_catalog
+                    .projection
+                    .as_ref()?
+                    .entries
+                    .iter()
+                    .find_map(|entry| {
+                        entry.variants.iter().find_map(|variant| {
+                            (variant.normalized_model_id.as_deref() == Some(model_id)
+                                || variant.managed_model_id.as_deref() == Some(model_id))
+                            .then(|| format!("{} ({})", entry.display_name, variant.filename))
+                        })
+                    })
+            })
+            .unwrap_or_else(|| "selected model".to_owned());
         match self.artifact_installations.cancel(model_id) {
             ArtifactCancellationOutcome::Missing => {}
             ArtifactCancellationOutcome::SignalledTransfer { .. } => {
-                self.status_message =
-                    format!("Cancelling {model_id}. Downloaded partials will be kept for Resume.");
+                self.status_message = format!(
+                    "Cancelling {display_name}. Downloaded partials will be kept for Resume."
+                );
             }
             ArtifactCancellationOutcome::SettledBeforeFinalizer { .. } => {
                 self.discard_partial_after_install.remove(model_id);
@@ -8319,7 +8341,7 @@ impl LocalTranscriberApp {
                 self.remote_catalog.invalidate_local_models();
                 self.status = TranscriptionStatus::Idle;
                 self.status_message =
-                    format!("Cancelled {model_id}. Downloaded partials were kept for Resume.");
+                    format!("Cancelled {display_name}. Downloaded partials were kept for Resume.");
                 self.launch_ready_artifact_transfers();
                 self.launch_next_artifact_finalizer();
             }
@@ -9430,6 +9452,8 @@ impl LocalTranscriberApp {
             self.request_remote_catalog();
         }
         self.model_management.mutation_block_reason = self.artifact_mutation_block_reason();
+        self.model_management.install_status_summary =
+            self.artifact_installations.aggregate_status();
         self.model_comparison.start_disabled_reason =
             self.comparison_start_block_reason().map(str::to_owned);
         let catalog = Arc::clone(&self.remote_catalog.local_models);
@@ -19062,6 +19086,12 @@ mod layout_tests {
         assert!(cancellation.is_cancelled());
         assert!(!sibling.is_cancelled());
         assert!(app.discard_partial_after_install.is_empty());
+        assert!(
+            app.status_message.starts_with("Cancelling Whisper Tiny"),
+            "cancellation status should identify the visible model name: {}",
+            app.status_message
+        );
+        assert!(!app.status_message.contains("whisper_cpp_tiny_en"));
     }
 
     #[test]

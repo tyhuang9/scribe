@@ -1884,8 +1884,9 @@ mod tests {
         remote.remote_catalog.entries[0].variants[0].size_bytes = 82_000_000;
         let mut page = AppPage::Models;
         let output = render_with_input(&ctx, &mut remote, &mut page, width, height, Vec::new()).0;
+        let remote_name = "Compact English (compact-english-q5.gguf)";
         let install = node_matching(&output, |node| {
-            node.name() == Some("Install Compact English")
+            node.name() == Some(format!("Install {remote_name}").as_str())
         });
         assert!(
             install
@@ -1904,7 +1905,7 @@ mod tests {
                 &mut page,
                 width,
                 height,
-                "Install Compact English"
+                &format!("Install {remote_name}")
             ),
             ScreenAction::InstallRemoteCatalogVariant {
                 remote_model_id: "trusted-speech/compact-english".into(),
@@ -3999,13 +4000,15 @@ mod tests {
 
     #[test]
     fn queued_and_waiting_local_installs_have_truthful_named_cancel_controls() {
-        for (state, name) in [
+        for (state, status, name) in [
             (
                 ModelDownloadState::Queued,
+                "Queued",
                 "Cancel Lifecycle queued download",
             ),
             (
                 ModelDownloadState::WaitingForVerification,
+                "Waiting for verification",
                 "Cancel Lifecycle waiting verification",
             ),
         ] {
@@ -4024,6 +4027,11 @@ mod tests {
                 ..Default::default()
             }];
             let mut page = AppPage::Models;
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            let cancel = node_matching(&output, |node| node.name() == Some(name));
+            assert!(!cancel.is_disabled(), "{state:?}");
+            assert_eq!(cancel.description(), None, "{state:?}");
+            node_matching(&output, |node| node.name() == Some(status));
             assert_eq!(
                 click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, name),
                 ScreenAction::CancelModelInstall("lifecycle".into()),
@@ -4043,6 +4051,8 @@ mod tests {
             data.model_catalog.clear();
             let variant = &mut data.remote_catalog.entries[0].variants[0];
             variant.status_label = Some(status.into());
+            variant.downloaded_bytes = Some(0);
+            variant.total_bytes = Some(82_000_000);
             variant.actions = vec![RemoteCatalogActionView {
                 label: "Cancel".into(),
                 kind: RemoteCatalogActionKind::Cancel {
@@ -4052,19 +4062,109 @@ mod tests {
                 disabled_reason: None,
             }];
             let mut page = AppPage::Models;
+            let cancel_name = "Cancel Compact English (compact-english-q5.gguf)";
+            let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+            let cancel = node_matching(&output, |node| node.name() == Some(cancel_name));
+            assert!(!cancel.is_disabled(), "{status}");
+            assert_eq!(cancel.description(), None, "{status}");
+            node_matching(&output, |node| node.name() == Some(status));
+            node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some("Compact English (compact-english-q5.gguf) model")
+            });
+            assert!(
+                !output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| {
+                        node.role() == egui::accesskit::Role::Meter
+                            && node
+                                .name()
+                                .is_some_and(|name| name.starts_with("Downloading"))
+                    }),
+                "{status} must not expose a download meter",
+            );
             assert_eq!(
-                click_named_control(
-                    &ctx,
-                    &mut data,
-                    &mut page,
-                    1180.0,
-                    815.0,
-                    "Cancel Compact English",
-                ),
+                click_named_control(&ctx, &mut data, &mut page, 1180.0, 815.0, cancel_name,),
                 ScreenAction::CancelRemoteCatalogInstall("managed-compact-english".into()),
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn remote_variants_have_unique_group_and_cancel_names() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.models.clear();
+        data.model_catalog.clear();
+        let first = &mut data.remote_catalog.entries[0].variants[0];
+        first.status_label = Some("Queued for download".into());
+        first.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english-q5".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        let mut second = first.clone();
+        second.id = "compact-english-q4".into();
+        second.filename = "compact-english-q4.gguf".into();
+        second.actions = vec![RemoteCatalogActionView {
+            label: "Cancel".into(),
+            kind: RemoteCatalogActionKind::Cancel {
+                model_id: "managed-compact-english-q4".into(),
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        data.remote_catalog.entries[0].variants.push(second);
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+
+        for filename in ["compact-english-q5.gguf", "compact-english-q4.gguf"] {
+            let qualified = format!("Compact English ({filename})");
+            node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Group
+                    && node.name() == Some(format!("{qualified} model").as_str())
+            });
+            node_matching(&output, |node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some(format!("Cancel {qualified}").as_str())
+            });
+        }
+    }
+
+    #[test]
+    fn concurrent_install_summary_is_one_atomic_polite_status() {
+        let summary = "Installing 3 models: 2 downloading, 1 queued, 0 waiting for verification, 0 verifying.";
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        configure_accessible_style(&ctx);
+        let mut data = Fixture::ModelsInstalled.data();
+        data.model_management.install_status_summary = Some(summary.into());
+        let mut page = AppPage::Models;
+        let output = render_with_input(&ctx, &mut data, &mut page, 1180.0, 815.0, Vec::new()).0;
+        assert_polite_atomic_notice(&output, summary);
+        assert_eq!(
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.name() == Some(summary))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4257,7 +4357,7 @@ mod tests {
             "remote download fill ratio",
         );
 
-        let pause_name = "Pause Compact English";
+        let pause_name = "Pause Compact English (compact-english-q5.gguf)";
         let pause = named_node_bounds(&output, pause_name);
         assert_near(pause.width(), 44.0, "remote Pause target width");
         assert_near(pause.height(), 44.0, "remote Pause target height");
@@ -4274,7 +4374,7 @@ mod tests {
                 &mut page,
                 1180.0,
                 815.0,
-                "Discard partial for Compact English",
+                "Discard partial for Compact English (compact-english-q5.gguf)",
             ),
             ScreenAction::DiscardRemoteCatalogPartial {
                 remote_model_id: "trusted-speech/compact-english".into(),
@@ -5306,7 +5406,10 @@ mod tests {
         });
         let mut page = Fixture::ModelsInstalled.page();
         let initial = render_with_input(&ctx, &mut remote, &mut page, 1180.0, 815.0, Vec::new()).0;
-        let discard = named_node_id(&initial, "Discard partial for Compact English");
+        let discard = named_node_id(
+            &initial,
+            "Discard partial for Compact English (compact-english-q5.gguf)",
+        );
         let (_, action) = render_with_input(
             &ctx,
             &mut remote,
