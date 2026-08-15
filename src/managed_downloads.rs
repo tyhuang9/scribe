@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::config::AppConfig;
-use crate::disk_space::DiskSpacePreflight;
+use crate::disk_space::{CanonicalTargetIdentity, DiskSpacePreflight};
 use crate::huggingface_catalog::TrustedArtifact;
 use crate::installations::{
     DownloadedArtifact, InstallCancellation, InstallError, InstallProgress, PinnedArtifact,
@@ -28,21 +28,19 @@ pub(crate) fn prepare_model(
     download_pinned_artifact(&artifact, cancellation, progress)
 }
 
-/// Reads the conservative free-space requirement for a normalized catalog
-/// model without starting a download or changing any model state.
-pub(crate) fn normalized_model_download_space_preflight(
-    config: &AppConfig,
-    model_id: &ModelId,
-) -> Result<DiskSpacePreflight, InstallError> {
-    let artifact = normalized_model_download_spec(config, model_id)?;
-    pinned_artifact_disk_space_preflight(&artifact)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ModelDownloadAdmission {
+    pub(crate) target: PathBuf,
+    pub(crate) target_identity: CanonicalTargetIdentity,
+    pub(crate) disk: DiskSpacePreflight,
 }
 
-pub(crate) fn normalized_model_download_target(
+pub(crate) fn normalized_model_download_admission(
     config: &AppConfig,
     model_id: &ModelId,
-) -> Result<PathBuf, InstallError> {
-    Ok(normalized_model_download_spec(config, model_id)?.destination)
+) -> Result<ModelDownloadAdmission, InstallError> {
+    let artifact = normalized_model_download_spec(config, model_id)?;
+    download_admission(&artifact)
 }
 
 pub(crate) fn normalized_model_retained_partial(
@@ -98,21 +96,21 @@ pub(crate) fn prepare_trusted_gguf_model(
     download_pinned_artifact(&pinned, cancellation, progress)
 }
 
-/// Reads the conservative free-space requirement for a backend-validated
-/// trusted GGUF artifact without starting a download or changing model state.
-pub(crate) fn trusted_gguf_download_space_preflight(
+pub(crate) fn trusted_gguf_download_admission(
     config: &AppConfig,
     artifact: &TrustedArtifact,
-) -> Result<DiskSpacePreflight, InstallError> {
+) -> Result<ModelDownloadAdmission, InstallError> {
     let pinned = trusted_gguf_download_spec(config, artifact)?;
-    pinned_artifact_disk_space_preflight(&pinned)
+    download_admission(&pinned)
 }
 
-pub(crate) fn trusted_gguf_download_target(
-    config: &AppConfig,
-    artifact: &TrustedArtifact,
-) -> Result<PathBuf, InstallError> {
-    Ok(trusted_gguf_download_spec(config, artifact)?.destination)
+fn download_admission(artifact: &PinnedArtifact) -> Result<ModelDownloadAdmission, InstallError> {
+    Ok(ModelDownloadAdmission {
+        target: artifact.destination.clone(),
+        target_identity: crate::disk_space::canonical_target_identity(&artifact.destination)
+            .map_err(InstallError::Failed)?,
+        disk: pinned_artifact_disk_space_preflight(artifact)?,
+    })
 }
 
 pub(crate) fn trusted_gguf_retained_partial(

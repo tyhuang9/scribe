@@ -1474,8 +1474,15 @@ struct ArtifactInstallJob {
     source: Option<VerifiedInstallSource>,
     download_config: Option<AppConfig>,
     force_runtime_package: bool,
-    target_identity: Option<PathBuf>,
+    target_identity: Option<crate::disk_space::CanonicalTargetIdentity>,
+    reservation: Option<ArtifactDiskReservation>,
     prepared: Option<PreparedVerifiedInstall>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactDiskReservation {
+    volume: String,
+    remaining_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -1503,12 +1510,18 @@ struct ArtifactInstallCoordinator {
     finalizer_queue: VecDeque<String>,
     active_transfers: usize,
     active_finalizer: Option<u64>,
-    target_owners: HashMap<PathBuf, u64>,
+    target_owners: HashMap<crate::disk_space::CanonicalTargetIdentity, u64>,
+    reserved_by_volume: HashMap<String, u64>,
+    recovery_frozen: bool,
 }
 
 impl ArtifactInstallCoordinator {
     fn is_empty(&self) -> bool {
         self.jobs.is_empty()
+    }
+
+    fn recovery_is_frozen(&self) -> bool {
+        self.recovery_frozen
     }
 
     fn contains_key(&self, model_id: &str) -> bool {
@@ -1517,6 +1530,16 @@ impl ArtifactInstallCoordinator {
 
     fn get(&self, model_id: &str) -> Option<&(u64, InstallCancellation)> {
         self.jobs.get(model_id).map(|job| &job.handle)
+    }
+
+    fn accepts_progress(&self, model_id: &str, job_id: u64) -> bool {
+        self.jobs.get(model_id).is_some_and(|job| {
+            job.handle.0 == job_id
+                && matches!(
+                    job.phase,
+                    ArtifactInstallPhase::Transferring | ArtifactInstallPhase::Finalizing
+                )
+        })
     }
 
     #[cfg(test)]
@@ -1544,6 +1567,7 @@ impl ArtifactInstallCoordinator {
                 download_config: None,
                 force_runtime_package: false,
                 target_identity: None,
+                reservation: None,
                 prepared: None,
             },
         );
@@ -1553,22 +1577,50 @@ impl ArtifactInstallCoordinator {
     fn admit(
         &mut self,
         model_id: String,
-        target_identity: PathBuf,
+        admission: managed_downloads::ModelDownloadAdmission,
         config: AppConfig,
         source: VerifiedInstallSource,
         force_runtime_package: bool,
     ) -> Result<u64, String> {
+        if self.recovery_frozen {
+            return Err(
+                "Artifact recovery is required before another installation can start.".to_owned(),
+            );
+        }
         if self.jobs.contains_key(&model_id) {
             return Err(format!("{model_id} is already being installed."));
         }
-        if self.target_owners.contains_key(&target_identity) {
+        if self.target_owners.contains_key(&admission.target_identity) {
             return Err(format!(
                 "Another installation already owns the target {}.",
-                target_identity.display()
+                admission.target.display()
+            ));
+        }
+        let already_reserved = self
+            .reserved_by_volume
+            .get(&admission.disk.volume)
+            .copied()
+            .unwrap_or(0);
+        let required = already_reserved
+            .checked_add(admission.disk.additional_bytes)
+            .and_then(|bytes| bytes.checked_add(crate::disk_space::SAFETY_HEADROOM_BYTES))
+            .ok_or_else(|| "aggregate download-space reservation overflowed".to_owned())?;
+        if required > admission.disk.available_bytes {
+            return Err(format!(
+                "Install disabled: {} free is required on {} for active downloads (including Scribe's {} safety headroom); only {} is available.",
+                format_bytes(required),
+                admission.disk.volume,
+                format_bytes(crate::disk_space::SAFETY_HEADROOM_BYTES),
+                format_bytes(admission.disk.available_bytes),
             ));
         }
         let job_id = INSTALL_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.target_owners.insert(target_identity.clone(), job_id);
+        self.target_owners
+            .insert(admission.target_identity.clone(), job_id);
+        self.reserved_by_volume.insert(
+            admission.disk.volume.clone(),
+            already_reserved + admission.disk.additional_bytes,
+        );
         self.jobs.insert(
             model_id.clone(),
             ArtifactInstallJob {
@@ -1577,7 +1629,11 @@ impl ArtifactInstallCoordinator {
                 source: Some(source),
                 download_config: Some(config),
                 force_runtime_package,
-                target_identity: Some(target_identity),
+                target_identity: Some(admission.target_identity),
+                reservation: Some(ArtifactDiskReservation {
+                    volume: admission.disk.volume,
+                    remaining_bytes: admission.disk.additional_bytes,
+                }),
                 prepared: None,
             },
         );
@@ -1587,6 +1643,9 @@ impl ArtifactInstallCoordinator {
 
     fn take_ready_transfers(&mut self) -> Vec<ArtifactTransferLaunch> {
         let mut launches = Vec::new();
+        if self.recovery_frozen {
+            return launches;
+        }
         while self.active_transfers < MAX_CONCURRENT_MODEL_TRANSFERS {
             let Some(model_id) = self.transfer_queue.pop_front() else {
                 break;
@@ -1617,6 +1676,46 @@ impl ArtifactInstallCoordinator {
         launches
     }
 
+    fn update_transfer_reservation(
+        &mut self,
+        model_id: &str,
+        job_id: u64,
+        remaining_bytes: u64,
+    ) -> bool {
+        let Some(job) = self.jobs.get_mut(model_id) else {
+            return false;
+        };
+        if job.handle.0 != job_id || job.phase != ArtifactInstallPhase::Transferring {
+            return false;
+        }
+        let Some(reservation) = job.reservation.as_mut() else {
+            return false;
+        };
+        let remaining_bytes = remaining_bytes.min(reservation.remaining_bytes);
+        let released = reservation.remaining_bytes - remaining_bytes;
+        reservation.remaining_bytes = remaining_bytes;
+        let mut remove_volume = false;
+        if let Some(total) = self.reserved_by_volume.get_mut(&reservation.volume) {
+            *total = total.saturating_sub(released);
+            remove_volume = *total == 0;
+        }
+        if remove_volume {
+            self.reserved_by_volume.remove(&reservation.volume);
+        }
+        true
+    }
+
+    fn release_reservation(&mut self, reservation: ArtifactDiskReservation) {
+        let mut remove_volume = false;
+        if let Some(total) = self.reserved_by_volume.get_mut(&reservation.volume) {
+            *total = total.saturating_sub(reservation.remaining_bytes);
+            remove_volume = *total == 0;
+        }
+        if remove_volume {
+            self.reserved_by_volume.remove(&reservation.volume);
+        }
+    }
+
     fn mark_prepared(
         &mut self,
         model_id: &str,
@@ -1630,14 +1729,18 @@ impl ArtifactInstallCoordinator {
             return false;
         }
         self.active_transfers = self.active_transfers.saturating_sub(1);
+        let reservation = job.reservation.take();
         job.phase = ArtifactInstallPhase::WaitingForFinalizer;
         job.prepared = Some(prepared);
         self.finalizer_queue.push_back(model_id.to_owned());
+        if let Some(reservation) = reservation {
+            self.release_reservation(reservation);
+        }
         true
     }
 
     fn take_next_finalizer(&mut self) -> Option<ArtifactFinalizerLaunch> {
-        if self.active_finalizer.is_some() {
+        if self.recovery_frozen || self.active_finalizer.is_some() {
             return None;
         }
         while let Some(model_id) = self.finalizer_queue.pop_front() {
@@ -1670,6 +1773,7 @@ impl ArtifactInstallCoordinator {
         let was_transfer = job.phase == ArtifactInstallPhase::Transferring;
         let was_finalizer = job.phase == ArtifactInstallPhase::Finalizing;
         let target = job.target_identity.clone();
+        let reservation = job.reservation.clone();
         self.jobs.remove(model_id);
         self.transfer_queue.retain(|queued| queued != model_id);
         self.finalizer_queue.retain(|queued| queued != model_id);
@@ -1682,7 +1786,39 @@ impl ArtifactInstallCoordinator {
         if let Some(target) = target {
             self.target_owners.remove(&target);
         }
+        if let Some(reservation) = reservation {
+            self.release_reservation(reservation);
+        }
         true
+    }
+
+    fn freeze_for_recovery(&mut self, failing_job_id: Option<u64>) -> Vec<(String, bool)> {
+        self.recovery_frozen = true;
+        let siblings = self
+            .jobs
+            .iter()
+            .filter_map(|(model_id, job)| {
+                if Some(job.handle.0) == failing_job_id {
+                    return None;
+                }
+                job.handle.1.cancel();
+                let settled = matches!(
+                    job.phase,
+                    ArtifactInstallPhase::QueuedTransfer
+                        | ArtifactInstallPhase::WaitingForFinalizer
+                );
+                Some((model_id.clone(), job.handle.0, settled))
+            })
+            .collect::<Vec<_>>();
+        for (model_id, job_id, settled) in &siblings {
+            if *settled {
+                self.finish(model_id, *job_id);
+            }
+        }
+        siblings
+            .into_iter()
+            .map(|(model_id, _, settled)| (model_id, settled))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1700,6 +1836,8 @@ impl ArtifactInstallCoordinator {
         self.active_transfers = 0;
         self.active_finalizer = None;
         self.target_owners.clear();
+        self.reserved_by_volume.clear();
+        self.recovery_frozen = false;
     }
 }
 
@@ -6518,12 +6656,23 @@ impl LocalTranscriberApp {
                     model_id,
                     progress,
                 } => {
-                    if self
+                    if !self
                         .artifact_installations
-                        .get(&model_id)
-                        .is_none_or(|(active_job, _)| *active_job != job_id)
+                        .accepts_progress(&model_id, job_id)
                     {
                         continue;
+                    }
+                    if matches!(
+                        progress.stage,
+                        InstallStage::Downloading | InstallStage::Verifying
+                    ) {
+                        self.artifact_installations.update_transfer_reservation(
+                            &model_id,
+                            job_id,
+                            progress
+                                .total_bytes
+                                .saturating_sub(progress.completed_bytes),
+                        );
                     }
                     let stage_label = match progress.stage {
                         InstallStage::Downloading => "Downloading",
@@ -6559,6 +6708,17 @@ impl LocalTranscriberApp {
                         .artifact_installations
                         .mark_prepared(&model_id, job_id, *prepared)
                     {
+                        continue;
+                    }
+                    if self.artifact_installations.recovery_is_frozen() {
+                        self.model_downloads.insert(
+                            model_id.clone(),
+                            ModelInstallStatus::Error(
+                                "Installation cancelled because artifact recovery is required. Resumable partial bytes were retained."
+                                    .to_owned(),
+                            ),
+                        );
+                        self.finish_artifact_install(&model_id, job_id);
                         continue;
                     }
                     self.model_downloads
@@ -6601,6 +6761,7 @@ impl LocalTranscriberApp {
                             let message = "A stale installation result could not be rolled back; startup recovery is required."
                                 .to_owned();
                             self.artifact_recovery_error = Some(message.clone());
+                            self.freeze_artifact_installs_for_recovery(None);
                             self.status = TranscriptionStatus::Error;
                             self.status_message = message;
                         }
@@ -6714,6 +6875,7 @@ impl LocalTranscriberApp {
                             .unwrap_or_default();
                         if recovery_required {
                             self.artifact_recovery_error = Some(message.clone());
+                            self.freeze_artifact_installs_for_recovery(Some(job_id));
                         }
                         self.model_downloads
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
@@ -6729,6 +6891,7 @@ impl LocalTranscriberApp {
                             "Could not confirm the verified installation settings commit: {message}. Artifacts and the activation journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
                         );
                         self.artifact_recovery_error = Some(message.clone());
+                        self.freeze_artifact_installs_for_recovery(Some(job_id));
                         self.model_downloads
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                         self.status = TranscriptionStatus::Error;
@@ -6741,6 +6904,7 @@ impl LocalTranscriberApp {
                             "Could not advance the installation journal after settings persistence: {error}. Artifacts and the journal were retained unchanged; restart Scribe to reconcile against the durable settings fingerprint."
                         );
                         self.artifact_recovery_error = Some(message.clone());
+                        self.freeze_artifact_installs_for_recovery(Some(job_id));
                         self.model_downloads
                             .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
                         self.status = TranscriptionStatus::Error;
@@ -6800,6 +6964,7 @@ impl LocalTranscriberApp {
                             "{message} Artifact cleanup is incomplete; restart Scribe to reconcile the retained transaction before another install, update, repair, removal, or runtime switch."
                         );
                         self.artifact_recovery_error = Some(message.clone());
+                        self.freeze_artifact_installs_for_recovery(Some(job_id));
                         self.status = TranscriptionStatus::Error;
                         self.status_message = message;
                     } else {
@@ -6827,6 +6992,7 @@ impl LocalTranscriberApp {
                         .map(|source| self.discard_partial_source(&source));
                     if recovery_required {
                         self.artifact_recovery_error = Some(message.clone());
+                        self.freeze_artifact_installs_for_recovery(Some(job_id));
                     }
                     self.model_downloads
                         .insert(model_id.clone(), ModelInstallStatus::Error(message.clone()));
@@ -6837,7 +7003,7 @@ impl LocalTranscriberApp {
                             self.status = TranscriptionStatus::Error;
                             self.status_message = format!("Installation failed: {message}");
                         }
-                    } else {
+                    } else if self.artifact_recovery_error.is_none() {
                         self.status = TranscriptionStatus::Error;
                         self.status_message = format!("Installation failed: {message}");
                     }
@@ -7641,10 +7807,6 @@ impl LocalTranscriberApp {
         }
 
         let model_id = ModelId::new(&model.id);
-        if let Some(reason) = normalized_model_install_space_error(&self.config, &model_id) {
-            self.fail_model_install(&model.id, reason);
-            return;
-        }
         if let Err(error) = self.transcription_service.installation_binding(&model_id) {
             self.fail_model_install(
                 &model.id,
@@ -7652,13 +7814,13 @@ impl LocalTranscriberApp {
             );
             return;
         }
-        let target =
-            match managed_downloads::normalized_model_download_target(&self.config, &model_id) {
-                Ok(target) => target,
+        let admission =
+            match managed_downloads::normalized_model_download_admission(&self.config, &model_id) {
+                Ok(admission) => admission,
                 Err(error) => {
                     self.fail_model_install(
                         &model.id,
-                        format!("Could not resolve the verified model target: {error}"),
+                        format!("Could not admit the verified model download: {error}"),
                     );
                     return;
                 }
@@ -7679,7 +7841,7 @@ impl LocalTranscriberApp {
         self.discard_partial_after_install.remove(&model.id);
         if let Err(message) = self.artifact_installations.admit(
             model.id.clone(),
-            target,
+            admission,
             self.config.clone(),
             VerifiedInstallSource::NormalizedCatalog,
             force_runtime_package,
@@ -7713,20 +7875,15 @@ impl LocalTranscriberApp {
                 "That verified model variant is already being installed.".to_owned();
             return;
         }
-        if let Some(reason) = trusted_model_install_space_error(&self.config, &request.artifact) {
-            self.status = TranscriptionStatus::Error;
-            self.status_message = reason;
-            return;
-        }
-        let target = match managed_downloads::trusted_gguf_download_target(
+        let admission = match managed_downloads::trusted_gguf_download_admission(
             &self.config,
             &request.artifact,
         ) {
-            Ok(target) => target,
+            Ok(admission) => admission,
             Err(error) => {
                 self.status = TranscriptionStatus::Error;
                 self.status_message =
-                    format!("Could not resolve the verified model target: {error}");
+                    format!("Could not admit the verified model download: {error}");
                 return;
             }
         };
@@ -7746,7 +7903,7 @@ impl LocalTranscriberApp {
         self.discard_partial_after_install.remove(&model_id);
         if let Err(message) = self.artifact_installations.admit(
             model_id.clone(),
-            target,
+            admission,
             self.config.clone(),
             VerifiedInstallSource::TrustedRemote(request),
             false,
@@ -7807,6 +7964,25 @@ impl LocalTranscriberApp {
             self.launch_ready_artifact_transfers();
             self.launch_next_artifact_finalizer();
         }
+    }
+
+    fn freeze_artifact_installs_for_recovery(&mut self, failing_job_id: Option<u64>) {
+        for (model_id, settled) in self
+            .artifact_installations
+            .freeze_for_recovery(failing_job_id)
+        {
+            self.discard_partial_after_install.remove(&model_id);
+            if settled {
+                self.model_downloads.insert(
+                    model_id,
+                    ModelInstallStatus::Error(
+                        "Installation cancelled because artifact recovery is required. Resumable partial bytes were retained."
+                            .to_owned(),
+                    ),
+                );
+            }
+        }
+        self.remote_catalog.invalidate_local_models();
     }
 
     /// Validates a user-chosen GGUF in place. This is deliberately separate
@@ -8146,10 +8322,6 @@ impl LocalTranscriberApp {
 
     fn request_runtime_install(&mut self, model: &SttModelInfo, intent: RuntimeJobIntent) {
         self.remote_catalog.invalidate_local_models();
-        if let Some(reason) = self.artifact_mutation_block_reason() {
-            self.status_message = reason;
-            return;
-        }
         if self
             .transcription_service
             .installation_binding(&ModelId::new(&model.id))
@@ -8185,24 +8357,6 @@ impl LocalTranscriberApp {
             return;
         }
 
-        let Some(source) = runtime_install_source(&self.config, model) else {
-            let message = missing_runtime_source_message();
-            match intent {
-                RuntimeJobIntent::DownloadModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
-                }
-                RuntimeJobIntent::RepairModel(model_id) => {
-                    self.model_downloads
-                        .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
-                }
-                RuntimeJobIntent::Maintenance => {}
-            }
-            self.status = TranscriptionStatus::Error;
-            self.status_message = message;
-            return;
-        };
-
         if let Some(job) = self.runtime_jobs.get_mut(provider.id()) {
             let queued_model_id = match intent {
                 RuntimeJobIntent::DownloadModel(model_id) => {
@@ -8221,6 +8375,29 @@ impl LocalTranscriberApp {
             }
             return;
         }
+
+        if let Some(reason) = self.artifact_mutation_block_reason() {
+            self.status_message = reason;
+            return;
+        }
+
+        let Some(source) = runtime_install_source(&self.config, model) else {
+            let message = missing_runtime_source_message();
+            match intent {
+                RuntimeJobIntent::DownloadModel(model_id) => {
+                    self.model_downloads
+                        .insert(model_id, ModelInstallStatus::Error(message.clone()));
+                }
+                RuntimeJobIntent::RepairModel(model_id) => {
+                    self.model_downloads
+                        .insert(model_id, ModelInstallStatus::RuntimeError(message.clone()));
+                }
+                RuntimeJobIntent::Maintenance => {}
+            }
+            self.status = TranscriptionStatus::Error;
+            self.status_message = message;
+            return;
+        };
 
         let mut job = RuntimeInstallJob::default();
         let queued_model_id = match intent {
@@ -11951,39 +12128,6 @@ fn ui_model_capabilities(descriptor: Option<&ModelDescriptor>) -> ModelCapabilit
         cpu: capabilities.cpu,
         gpu: capabilities.gpu,
     }
-}
-
-fn disk_space_preflight_error(
-    preflight: Result<crate::disk_space::DiskSpacePreflight, InstallError>,
-) -> Option<String> {
-    match preflight {
-        Ok(preflight) if preflight.has_sufficient_space() => None,
-        Ok(preflight) => Some(format!(
-            "Install disabled: {} free is required on {} (including Scribe's {} safety headroom); only {} is available.",
-            format_bytes(preflight.required_bytes),
-            preflight.volume,
-            format_bytes(crate::disk_space::SAFETY_HEADROOM_BYTES),
-            format_bytes(preflight.available_bytes),
-        )),
-        Err(error) => Some(format!(
-            "Install disabled because Scribe could not safely verify available disk space: {error}"
-        )),
-    }
-}
-
-fn normalized_model_install_space_error(config: &AppConfig, model_id: &ModelId) -> Option<String> {
-    disk_space_preflight_error(
-        managed_downloads::normalized_model_download_space_preflight(config, model_id),
-    )
-}
-
-fn trusted_model_install_space_error(
-    config: &AppConfig,
-    artifact: &TrustedArtifact,
-) -> Option<String> {
-    disk_space_preflight_error(managed_downloads::trusted_gguf_download_space_preflight(
-        config, artifact,
-    ))
 }
 
 fn trusted_remote_install_request(
@@ -20522,6 +20666,45 @@ mod layout_tests {
         install
     }
 
+    fn coordinator_admission(
+        target_name: &str,
+        volume: &str,
+        available_bytes: u64,
+        additional_bytes: u64,
+    ) -> managed_downloads::ModelDownloadAdmission {
+        let target = std::env::temp_dir().join(target_name);
+        managed_downloads::ModelDownloadAdmission {
+            target_identity: crate::disk_space::canonical_target_identity(&target).unwrap(),
+            target,
+            disk: crate::disk_space::DiskSpacePreflight {
+                volume: volume.to_owned(),
+                available_bytes,
+                additional_bytes,
+                required_bytes: additional_bytes
+                    .checked_add(crate::disk_space::SAFETY_HEADROOM_BYTES)
+                    .unwrap_or(u64::MAX),
+            },
+        }
+    }
+
+    fn coordinator_prepared(model_id: &str) -> PreparedVerifiedInstall {
+        let model_id = ModelId::new(model_id);
+        PreparedVerifiedInstall {
+            model: crate::installations::DownloadedArtifact {
+                id: model_id.as_str().to_owned(),
+                path: PathBuf::from("fixture.gguf.partial"),
+                destination: PathBuf::from("fixture.gguf"),
+                size_bytes: 100,
+                sha256: "0".repeat(64),
+            },
+            model_uses_embedded_runtime: true,
+            manifest_source: installed_manifest::ArtifactSource::normalized(&model_id).unwrap(),
+            model_id,
+            remote_install_request: None,
+            force_runtime_package: false,
+        }
+    }
+
     #[test]
     fn installation_failures_preserve_recovery_required_classification() {
         let normal = InstallJobFailure::from(InstallError::Failed("retryable".to_owned()));
@@ -20540,7 +20723,12 @@ mod layout_tests {
             coordinator
                 .admit(
                     format!("model-{index}"),
-                    PathBuf::from(format!("target-{index}.gguf")),
+                    coordinator_admission(
+                        &format!("target-{index}.gguf"),
+                        "test-volume",
+                        crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                        100,
+                    ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
                     false,
@@ -20573,7 +20761,12 @@ mod layout_tests {
         coordinator
             .admit(
                 "first".to_owned(),
-                PathBuf::from("shared.gguf"),
+                coordinator_admission(
+                    "shared.gguf",
+                    "test-volume",
+                    crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                    100,
+                ),
                 AppConfig::default(),
                 VerifiedInstallSource::NormalizedCatalog,
                 false,
@@ -20584,7 +20777,12 @@ mod layout_tests {
             coordinator
                 .admit(
                     "first".to_owned(),
-                    PathBuf::from("other.gguf"),
+                    coordinator_admission(
+                        "other.gguf",
+                        "test-volume",
+                        crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                        100,
+                    ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
                     false,
@@ -20596,7 +20794,12 @@ mod layout_tests {
             coordinator
                 .admit(
                     "second".to_owned(),
-                    PathBuf::from("shared.gguf"),
+                    coordinator_admission(
+                        "shared.gguf",
+                        "test-volume",
+                        crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000,
+                        100,
+                    ),
                     AppConfig::default(),
                     VerifiedInstallSource::NormalizedCatalog,
                     false,
@@ -20604,6 +20807,110 @@ mod layout_tests {
                 .unwrap_err()
                 .contains("already owns the target")
         );
+    }
+
+    #[test]
+    fn artifact_coordinator_aggregates_updates_and_releases_volume_reservations() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 100;
+        let first_id = coordinator
+            .admit(
+                "first".to_owned(),
+                coordinator_admission("reserve-first.gguf", "volume", available, 100),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap();
+        assert!(
+            coordinator
+                .admit(
+                    "blocked".to_owned(),
+                    coordinator_admission("reserve-blocked.gguf", "volume", available, 1),
+                    AppConfig::default(),
+                    VerifiedInstallSource::NormalizedCatalog,
+                    false,
+                )
+                .unwrap_err()
+                .contains("active downloads")
+        );
+
+        coordinator.take_ready_transfers();
+        assert!(coordinator.update_transfer_reservation("first", first_id, 20));
+        coordinator
+            .admit(
+                "second".to_owned(),
+                coordinator_admission("reserve-second.gguf", "volume", available, 80),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap();
+        assert_eq!(coordinator.reserved_by_volume.get("volume"), Some(&100));
+
+        assert!(coordinator.mark_prepared(
+            "first",
+            first_id,
+            coordinator_prepared("whisper_cpp_tiny_en"),
+        ));
+        assert_eq!(coordinator.reserved_by_volume.get("volume"), Some(&80));
+        let second_id = coordinator.get("second").unwrap().0;
+        assert!(coordinator.finish("second", second_id));
+        assert!(!coordinator.reserved_by_volume.contains_key("volume"));
+    }
+
+    #[test]
+    fn artifact_coordinator_rejects_aggregate_reservation_overflow() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let error = coordinator
+            .admit(
+                "overflow".to_owned(),
+                coordinator_admission("overflow.gguf", "overflow-volume", u64::MAX, u64::MAX),
+                AppConfig::default(),
+                VerifiedInstallSource::NormalizedCatalog,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.contains("overflowed"));
+        assert!(coordinator.is_empty());
+    }
+
+    #[test]
+    fn recovery_freeze_cancels_active_siblings_and_settles_queued_jobs() {
+        let mut coordinator = ArtifactInstallCoordinator::default();
+        let available = crate::disk_space::SAFETY_HEADROOM_BYTES + 1_000;
+        for index in 0..4 {
+            coordinator
+                .admit(
+                    format!("freeze-{index}"),
+                    coordinator_admission(
+                        &format!("freeze-{index}.gguf"),
+                        "freeze-volume",
+                        available,
+                        100,
+                    ),
+                    AppConfig::default(),
+                    VerifiedInstallSource::NormalizedCatalog,
+                    false,
+                )
+                .unwrap();
+        }
+        let launches = coordinator.take_ready_transfers();
+        let siblings = coordinator.freeze_for_recovery(Some(launches[0].job_id));
+
+        assert!(coordinator.recovery_is_frozen());
+        assert!(!coordinator.contains_key("freeze-3"));
+        assert!(
+            siblings
+                .iter()
+                .any(|(model_id, settled)| model_id == "freeze-3" && *settled)
+        );
+        for launch in &launches[1..] {
+            assert!(launch.cancellation.is_cancelled());
+            assert!(coordinator.contains_key(&launch.model_id));
+        }
+        assert!(coordinator.take_ready_transfers().is_empty());
+        assert!(coordinator.take_next_finalizer().is_none());
     }
 
     #[test]
