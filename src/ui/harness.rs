@@ -1183,21 +1183,12 @@ mod tests {
                 );
             }
             assert_within_tolerance(model.y0, 118.0, 3.0, "selector row start");
-            if width <= 960.0 {
-                assert!(
-                    model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE,
-                    "compact selector cards must stack: {model:?} and {hotkey:?}"
-                );
-                assert_within_tolerance(hotkey.y0, 178.0, 3.0, "stacked hotkey row start");
-                assert_within_tolerance(panel.y0, 242.0, 6.0, "compact transcript panel top");
-            } else {
-                assert!(
-                    model.x1 <= hotkey.x0 + LAYOUT_TOLERANCE,
-                    "selector cards overlap: {model:?} and {hotkey:?}"
-                );
-                assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
-                assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
-            }
+            assert!(
+                model.x1 <= hotkey.x0 + LAYOUT_TOLERANCE,
+                "selector cards overlap: {model:?} and {hotkey:?}"
+            );
+            assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
+            assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
 
             let inline_transcript = format!("{committed} {provisional}");
             let bounds = node_matching(&output, |node| {
@@ -1278,6 +1269,59 @@ mod tests {
     }
 
     #[test]
+    fn selector_wraps_only_after_long_model_and_hotkey_content_no_longer_fit() {
+        let long_model_name = "Whisper Large v3 Turbo English — high accuracy dictation";
+        for (width, should_stack) in [(900.0, false), (600.0, true)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::TranscribeReady.data();
+            let mut page = Fixture::TranscribeReady.page();
+            data.models[0].display_name = long_model_name.into();
+            data.transcription.hotkey = "Ctrl + Shift + Alt + Space".into();
+
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, width, 815.0, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+
+            let model = named_node_bounds(&output, "Selected model");
+            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            let change = node_matching(&output, |node| node.name() == Some("Change"))
+                .bounds()
+                .expect("Change action should remain exposed");
+            assert_bounds_within(change, model, "Change action");
+            assert_within_tolerance(change.y1 - change.y0, 44.0, 3.0, "Change target height");
+            assert_bounds_within(
+                node_matching(&output, |node| node.name() == Some(long_model_name))
+                    .bounds()
+                    .expect("long selected model name should remain visible"),
+                model,
+                "long selected model name",
+            );
+            for key in ["Ctrl", "Shift", "Alt", "Space"] {
+                assert_bounds_within(
+                    node_matching(&output, |node| node.name() == Some(key))
+                        .bounds()
+                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap")),
+                    hotkey,
+                    "hotkey keycap",
+                );
+            }
+            if should_stack {
+                assert!(
+                    model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE,
+                    "selector should stack after content no longer fits: {model:?} {hotkey:?}"
+                );
+            } else {
+                assert!(
+                    model.x1 <= hotkey.x0 + LAYOUT_TOLERANCE,
+                    "selector should remain inline while its content fits: {model:?} {hotkey:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn no_model_layout_keeps_the_bordered_empty_state_and_hides_transcript_controls() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
             let ctx = egui::Context::default();
@@ -1315,33 +1359,21 @@ mod tests {
                     && selector.x1 <= panel.x1 + LAYOUT_TOLERANCE,
                 "selected model card {selector:?} must fit transcript panel {panel:?}"
             );
-            if width <= 960.0 {
-                assert!(selector.y1 <= hotkey.y0 + LAYOUT_TOLERANCE);
-                assert_within_tolerance(hotkey.y0, 178.0, 3.0, "stacked hotkey row start");
-                assert_within_tolerance(panel.y0, 242.0, 6.0, "compact model-required panel top");
-                assert_within_tolerance(
-                    panel.y1 - panel.y0,
-                    406.0,
-                    8.0,
-                    "compact model-required panel height",
-                );
-            } else {
-                assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
-                assert_within_tolerance(panel.y0, 185.0, 6.0, "wide model-required panel top");
-                assert_within_tolerance(
-                    panel.y1 - panel.y0,
-                    565.0,
-                    6.0,
-                    "wide model-required panel height",
-                );
-                let helper = node_matching(&output, |node| {
-                    node.name()
-                        .is_some_and(|name| name.contains("Silence is ignored"))
-                })
-                .bounds()
-                .expect("Silence helper should expose bounds");
-                assert_bounds_within(helper, viewport, "Silence helper");
-            }
+            assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
+            assert_within_tolerance(panel.y0, 185.0, 6.0, "wide model-required panel top");
+            assert_within_tolerance(
+                panel.y1 - panel.y0,
+                565.0,
+                6.0,
+                "wide model-required panel height",
+            );
+            let helper = node_matching(&output, |node| {
+                node.name()
+                    .is_some_and(|name| name.contains("Silence is ignored"))
+            })
+            .bounds()
+            .expect("Silence helper should expose bounds");
+            assert_bounds_within(helper, viewport, "Silence helper");
             assert_within_tolerance(selector.x1 - select.x1, 16.0, 1.0, "Select right inset");
 
             let panel_midpoint = (panel.y0 + panel.y1) / 2.0;

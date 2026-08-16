@@ -26,7 +26,6 @@ use super::{
 const TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT: f32 = 565.0;
 const TRANSCRIPT_PANEL_MIN_HEIGHT: f32 = 272.0;
 const MODEL_REQUIRED_CONTENT_HEIGHT: f32 = 176.0;
-const COMPACT_SELECTOR_BREAKPOINT: f32 = 880.0;
 const SELECTOR_CARD_VERTICAL_MARGIN: f32 = 0.0;
 const SELECTOR_CONTROL_HEIGHT: f32 = 44.0;
 const SELECTOR_VISUAL_HEIGHT: f32 = 36.0;
@@ -121,6 +120,55 @@ fn current_content_width(ui: &egui::Ui) -> f32 {
     (available.max.x.min(clip.max.x).min(viewport.max.x)
         - available.min.x.max(clip.min.x).max(viewport.min.x))
     .max(0.0)
+}
+
+fn selector_text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, ui_palette(ui).text)
+        .size()
+        .x
+}
+
+fn hotkey_content_width(ui: &egui::Ui, hotkey: &str) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    let mut item_widths = vec![
+        selector_text_width(
+            ui,
+            &icon_glyph(Icon::Keyboard),
+            egui::FontId::proportional(18.0),
+        ),
+        selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
+    ];
+    let keys = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            item_widths.push(selector_text_width(
+                ui,
+                "+",
+                egui::TextStyle::Body.resolve(ui.style()),
+            ));
+        }
+        item_widths.push(
+            selector_text_width(
+                ui,
+                key,
+                egui::FontId::monospace(egui::TextStyle::Small.resolve(ui.style()).size),
+            ) + 14.0,
+        );
+    }
+    32.0 + item_widths.iter().sum::<f32>() + gap * item_widths.len().saturating_sub(1) as f32
+}
+
+fn model_content_width(ui: &egui::Ui, name: &str) -> f32 {
+    32.0 + selector_text_width(ui, &icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0))
+        + ui.spacing().item_spacing.x
+        + selector_text_width(ui, name, egui::TextStyle::Body.resolve(ui.style()))
+        + ui.spacing().item_spacing.x
+        + SELECTOR_ACTION_WIDTH
 }
 
 fn transcript_panel_height(ui: &egui::Ui) -> f32 {
@@ -512,10 +560,19 @@ fn selector_row(
     let disabled_reason = model_selector_disabled_reason(state.phase);
     let mut action = ScreenAction::None;
     let available_width = current_content_width(ui);
-    let hotkey_width = (available_width * 0.28).clamp(220.0, 280.0);
     let gap = ui.spacing().item_spacing.x;
-    let model_width = available_width - hotkey_width - gap;
-    let compact = available_width < COMPACT_SELECTOR_BREAKPOINT;
+    let hotkey_width = (available_width * 0.28)
+        .clamp(220.0, 280.0)
+        .max(hotkey_content_width(ui, &state.hotkey));
+    // Keep the established wide layout until the model field would cut into either
+    // its full label or the Change action. At that precise point the hotkey moves
+    // intact to a second row rather than allowing its keycaps to paint outside.
+    let compact = available_width < model_content_width(ui, name) + hotkey_width + gap;
+    let model_width = if compact {
+        available_width
+    } else {
+        available_width - hotkey_width - gap
+    };
     ui.allocate_ui_with_layout(
         Vec2::new(available_width, 0.0),
         if compact {
@@ -524,11 +581,6 @@ fn selector_row(
             Layout::left_to_right(Align::TOP)
         },
         |ui| {
-            let model_width = if compact {
-                available_width
-            } else {
-                model_width
-            };
             let model_card_id = ui.make_persistent_id("selected-model-card");
             let card_height = SELECTOR_CONTROL_HEIGHT + SELECTOR_CARD_VERTICAL_MARGIN * 2.0;
             let (model_card_rect, _) =
