@@ -192,6 +192,8 @@ No P0, P1, or P2 visual issue remains in the reviewed supported-width evidence. 
 
 final result: passed
 
+---
+
 ## Accordion width follow-up — 2026-08-13
 
 - Source truth: the user-directed requirement that expanding a model must not change the card's horizontal bounds, applied to the three model-card references listed above.
@@ -691,3 +693,38 @@ deleted before this report.
   or verification workflow.
 
 final result: passed
+
+---
+
+# Transcribe selector hotkey wrap - Product Design QA - 2026-08-15
+
+## Review scope and source
+
+- Reviewed head: `82b708e`.
+- Source visual truth: `C:\Users\huang\.codex\attachments\e11279a4-7377-4a61-b924-44310d219c48\image-1.png` (1207 x 226 source pixels).
+- Targeted states: `transcribe/ready` at 1180 x 815 and 960 x 680, plus the 375 px component state.
+- Implementation screenshot path is unavailable because the Windows Computer Use Sky runtime was unavailable. No same-viewport/density screenshot or combined comparison exists.
+
+## Verification and findings
+
+- Automated evidence passed for the exact threshold, long-model/chord containment, the 72 x 44 Change target, AccessKit groups, and focused selector coverage (10/10).
+- Full suite: 882 passed, 11 ignored. `fmt`, `check`, and `clippy` passed.
+- Accessibility and UI/UX code/test reviews passed.
+- Native screenshot, full-view comparison, and focused-region comparison are blocked and must not be claimed as verified.
+
+## Comparison history
+
+1. Initial fixed 220-280 hotkey overflow.
+2. Intrinsic hotkey narrow fallback.
+3. Long-model 375 px reflow.
+4. Duplicate 8 px gap/repaint regression.
+
+## Required fidelity surfaces
+
+- Typography and full name: unchanged.
+- Spacing and layout: unchanged outside the requested wrap behavior.
+- Colors: unchanged.
+- Imagery: not applicable.
+- Copy: unchanged.
+
+final result: blocked
