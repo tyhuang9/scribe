@@ -138,7 +138,7 @@ fn hotkey_content_width(ui: &egui::Ui, hotkey: &str) -> f32 {
     let mut item_widths = vec![
         selector_text_width(
             ui,
-            &icon_glyph(Icon::Keyboard),
+            icon_glyph(Icon::Keyboard),
             egui::FontId::proportional(18.0),
         ),
         selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
@@ -189,7 +189,7 @@ fn hotkey_wrapped_row_count(ui: &egui::Ui, hotkey: &str, content_width: f32) -> 
     let mut item_widths = vec![
         selector_text_width(
             ui,
-            &icon_glyph(Icon::Keyboard),
+            icon_glyph(Icon::Keyboard),
             egui::FontId::proportional(18.0),
         ),
         selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
@@ -270,7 +270,7 @@ fn render_wrapped_hotkey(ui: &mut egui::Ui, hotkey: &str) {
 }
 
 fn model_content_width(ui: &egui::Ui, name: &str) -> f32 {
-    32.0 + selector_text_width(ui, &icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0))
+    32.0 + selector_text_width(ui, icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0))
         + ui.spacing().item_spacing.x
         + selector_text_width(ui, name, egui::TextStyle::Body.resolve(ui.style()))
         + ui.spacing().item_spacing.x
@@ -690,7 +690,7 @@ fn selector_row(
             let model_card_id = ui.make_persistent_id("selected-model-card");
             let model_reflows = compact && model_width < model_content_width(ui, name);
             let model_icon_width =
-                selector_text_width(ui, &icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0));
+                selector_text_width(ui, icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0));
             let model_name_width = (model_width
                 - 32.0
                 - SELECTOR_ACTION_WIDTH
@@ -851,8 +851,6 @@ fn selector_row(
             });
             if compact {
                 ui.add_space(ui.spacing().item_spacing.y);
-            } else {
-                ui.add_space(gap);
             }
             let hotkey_width = if compact {
                 available_width
