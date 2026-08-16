@@ -1318,9 +1318,14 @@ mod tests {
 
     #[test]
     fn narrow_selector_wraps_hotkey_contents_inside_the_second_row_card() {
-        for (hotkey_value, should_wrap_contents) in [
-            ("Ctrl + Space", false),
-            ("Ctrl + Shift + Alt + Super + Space", true),
+        let long_model_name = "Whisper Large v3 Turbo English — high accuracy dictation";
+        for (hotkey_value, model_name, should_reflow) in [
+            ("Ctrl + Space", None, false),
+            (
+                "Ctrl + Shift + Alt + Super + Space",
+                Some(long_model_name),
+                true,
+            ),
         ] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
@@ -1328,6 +1333,9 @@ mod tests {
             let mut data = Fixture::TranscribeReady.data();
             let mut page = Fixture::TranscribeReady.page();
             data.transcription.hotkey = hotkey_value.into();
+            if let Some(model_name) = model_name {
+                data.models[0].display_name = model_name.into();
+            }
 
             let (output, action) =
                 render_with_input(&ctx, &mut data, &mut page, 375.0, 815.0, Vec::new());
@@ -1342,7 +1350,28 @@ mod tests {
             let model = named_node_bounds(&output, "Selected model");
             let hotkey = named_node_bounds(&output, "Recording hotkey");
             assert!(model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE);
+            assert_bounds_within(model, viewport, "narrow selected model card");
             assert_bounds_within(hotkey, viewport, "narrow hotkey card");
+            let change = node_matching(&output, |node| node.name() == Some("Change"))
+                .bounds()
+                .expect("narrow Change target should expose bounds");
+            assert_bounds_within(change, model, "narrow Change target");
+            assert_within_tolerance(change.x1 - change.x0, 72.0, 1.0, "Change target width");
+            assert_within_tolerance(change.y1 - change.y0, 44.0, 1.0, "Change target height");
+            if let Some(model_name) = model_name {
+                let model_label = node_matching(&output, |node| node.name() == Some(model_name))
+                    .bounds()
+                    .expect("long selected model name should remain visible");
+                assert_bounds_within(model_label, model, "long selected model name");
+                assert_bounds_within(model_label, viewport, "long selected model name");
+            }
+            assert_bounds_within(
+                node_matching(&output, |node| node.name() == Some("Hotkey:"))
+                    .bounds()
+                    .expect("Hotkey label should remain visible"),
+                hotkey,
+                "Hotkey label",
+            );
             for key in hotkey_value.split('+').map(str::trim) {
                 assert_bounds_within(
                     node_matching(&output, |node| node.name() == Some(key))
@@ -1352,7 +1381,44 @@ mod tests {
                     "narrow hotkey keycap",
                 );
             }
-            if should_wrap_contents {
+            let separators = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| (node.name() == Some("+")).then(|| node.bounds()).flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                separators.len(),
+                hotkey_value.matches('+').count(),
+                "every chord separator should remain exposed"
+            );
+            let following_key_bounds = hotkey_value
+                .split('+')
+                .map(str::trim)
+                .skip(1)
+                .map(|key| {
+                    node_matching(&output, |node| node.name().is_some_and(|name| name == key))
+                        .bounds()
+                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap"))
+                })
+                .collect::<Vec<_>>();
+            for separator in separators {
+                assert_bounds_within(separator, hotkey, "hotkey separator");
+                assert!(
+                    following_key_bounds
+                        .iter()
+                        .any(|key| separator.y0 < key.y1 && key.y0 < separator.y1),
+                    "separator must remain on the same row as its following key: {separator:?}"
+                );
+            }
+            if should_reflow {
+                assert!(
+                    model.y1 - model.y0 > 44.0 + LAYOUT_TOLERANCE,
+                    "below-intrinsic model card should grow for wrapped identity: {model:?}"
+                );
                 assert!(
                     hotkey.y1 - hotkey.y0 > 44.0 + LAYOUT_TOLERANCE,
                     "below-intrinsic hotkey card should grow for wrapped content: {hotkey:?}"

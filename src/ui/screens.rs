@@ -199,14 +199,14 @@ fn hotkey_wrapped_row_count(ui: &egui::Ui, hotkey: &str, content_width: f32) -> 
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .collect::<Vec<_>>();
-    for (index, key) in keys.iter().enumerate() {
-        item_widths.push(keycap_width(ui, key));
-        if index + 1 < keys.len() {
-            item_widths.push(selector_text_width(
-                ui,
-                "+",
-                egui::TextStyle::Body.resolve(ui.style()),
-            ));
+    if let Some((first, remaining)) = keys.split_first() {
+        item_widths.push(keycap_width(ui, first));
+        for key in remaining {
+            item_widths.push(
+                selector_text_width(ui, "+", egui::TextStyle::Body.resolve(ui.style()))
+                    + ui.spacing().item_spacing.x
+                    + keycap_width(ui, key),
+            );
         }
     }
 
@@ -227,6 +227,46 @@ fn hotkey_wrapped_row_count(ui: &egui::Ui, hotkey: &str, content_width: f32) -> 
         }
     }
     rows
+}
+
+fn model_name_layout(ui: &egui::Ui, name: &str, width: f32) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout(
+        name.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui_palette(ui).text,
+        width.max(1.0),
+    )
+}
+
+fn render_wrapped_hotkey(ui: &mut egui::Ui, hotkey: &str) {
+    ui.label(
+        RichText::new(icon_glyph(Icon::Keyboard))
+            .size(18.0)
+            .color(ui_palette(ui).muted_text),
+    );
+    ui.label("Hotkey:");
+    let keys = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if let Some((first, remaining)) = keys.split_first() {
+        keycap(ui, first);
+        for key in remaining {
+            let pair_width =
+                selector_text_width(ui, "+", egui::TextStyle::Body.resolve(ui.style()))
+                    + ui.spacing().item_spacing.x
+                    + keycap_width(ui, key);
+            ui.allocate_ui_with_layout(
+                Vec2::new(pair_width, SELECTOR_HOTKEY_ROW_HEIGHT),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.label(RichText::new("+").color(ui_palette(ui).muted_text));
+                    keycap(ui, key);
+                },
+            );
+        }
+    }
 }
 
 fn model_content_width(ui: &egui::Ui, name: &str) -> f32 {
@@ -648,12 +688,31 @@ fn selector_row(
         },
         |ui| {
             let model_card_id = ui.make_persistent_id("selected-model-card");
-            let card_height = SELECTOR_CONTROL_HEIGHT + SELECTOR_CARD_VERTICAL_MARGIN * 2.0;
-            let (model_card_rect, _) =
-                ui.allocate_exact_size(Vec2::new(model_width, card_height), egui::Sense::hover());
+            let model_reflows = compact && model_width < model_content_width(ui, name);
+            let model_icon_width =
+                selector_text_width(ui, &icon_glyph(Icon::Cpu), egui::FontId::proportional(20.0));
+            let model_name_width = (model_width
+                - 32.0
+                - SELECTOR_ACTION_WIDTH
+                - model_icon_width
+                - ui.spacing().item_spacing.x * 2.0)
+                .max(1.0);
+            let model_name_galley = model_name_layout(ui, name, model_name_width);
+            let model_visual_height = if model_reflows {
+                SELECTOR_VISUAL_HEIGHT
+                    .max(model_name_galley.size().y + SELECTOR_HOTKEY_VERTICAL_INSET * 2.0)
+            } else {
+                SELECTOR_VISUAL_HEIGHT
+            };
+            let model_card_height =
+                model_visual_height + (SELECTOR_CONTROL_HEIGHT - SELECTOR_VISUAL_HEIGHT);
+            let (model_card_rect, _) = ui.allocate_exact_size(
+                Vec2::new(model_width, model_card_height),
+                egui::Sense::hover(),
+            );
             let model_card_visual_rect = egui::Rect::from_center_size(
                 model_card_rect.center(),
-                Vec2::new(model_card_rect.width(), SELECTOR_VISUAL_HEIGHT),
+                Vec2::new(model_card_rect.width(), model_visual_height),
             );
             let model_card_frame = Frame::none()
                 .fill(ui_palette(ui).card_bg)
@@ -664,11 +723,21 @@ fn selector_row(
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(
                     model_card_visual_rect.min.x + 16.0,
-                    model_card_visual_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                    model_card_visual_rect.min.y
+                        + if model_reflows {
+                            SELECTOR_HOTKEY_VERTICAL_INSET
+                        } else {
+                            SELECTOR_CARD_VERTICAL_MARGIN
+                        },
                 ),
                 egui::pos2(
                     model_card_visual_rect.max.x - 16.0,
-                    model_card_visual_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                    model_card_visual_rect.max.y
+                        - if model_reflows {
+                            SELECTOR_HOTKEY_VERTICAL_INSET
+                        } else {
+                            SELECTOR_CARD_VERTICAL_MARGIN
+                        },
                 ),
             );
             let action_visual_slot = egui::Rect::from_min_max(
@@ -678,9 +747,9 @@ fn selector_row(
                 ),
                 content_rect.max,
             );
-            let action_rect = egui::Rect::from_min_max(
-                egui::pos2(action_visual_slot.left(), model_card_rect.top()),
-                egui::pos2(action_visual_slot.right(), model_card_rect.bottom()),
+            let action_rect = egui::Rect::from_center_size(
+                egui::pos2(action_visual_slot.center().x, model_card_rect.center().y),
+                Vec2::new(SELECTOR_ACTION_WIDTH, SELECTOR_CONTROL_HEIGHT),
             );
             let label_rect = egui::Rect::from_min_max(
                 content_rect.min,
@@ -692,7 +761,14 @@ fn selector_row(
                     .size(20.0)
                     .color(ui_palette(&label_ui).muted_text),
             );
-            label_ui.label(RichText::new(name).strong());
+            if model_reflows {
+                label_ui.add_sized(
+                    Vec2::new(model_name_width, model_name_galley.size().y),
+                    egui::Label::new(RichText::new(name).strong()).wrap(true),
+                );
+            } else {
+                label_ui.label(RichText::new(name).strong());
+            }
             let action_label = if no_model { "Select" } else { "Change" };
             let was_enabled = ui.is_enabled();
             ui.set_enabled(was_enabled && disabled_reason.is_none());
@@ -857,7 +933,7 @@ fn selector_row(
             );
             hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
                 if wraps_hotkey {
-                    ui.horizontal_wrapped(render_hotkey);
+                    ui.horizontal_wrapped(|ui| render_wrapped_hotkey(ui, &state.hotkey));
                 } else {
                     render_hotkey(ui);
                 }
