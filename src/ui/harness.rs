@@ -1231,25 +1231,22 @@ mod tests {
             })
             .bounds()
             .expect("Silence helper should expose bounds");
-            let (panel_top, panel_height, footer_top) = if width <= 960.0 {
-                (242.0, 406.0, 590.0)
+            assert_bounds_within(normal_panel, viewport, "reference transcript panel");
+            if height >= 815.0 {
+                assert_within_tolerance(
+                    normal_panel.y1 - normal_panel.y0,
+                    565.0,
+                    8.0,
+                    "preferred transcript panel height",
+                );
             } else {
-                (185.0, 565.0, 695.0)
-            };
-            assert_within_tolerance(
-                normal_panel.y0,
-                panel_top,
-                6.0,
-                "reference transcript panel top",
-            );
-            assert_within_tolerance(
-                normal_panel.y1 - normal_panel.y0,
-                panel_height,
-                8.0,
-                "reference transcript panel height",
-            );
+                assert!(
+                    normal_panel.y1 - normal_panel.y0 < 565.0,
+                    "short viewport must reduce the transcript panel height: {normal_panel:?}"
+                );
+            }
             for action_bounds in [clear, copy] {
-                assert_within_tolerance(action_bounds.y0, footer_top, 7.0, "transcript footer top");
+                assert_bounds_within(action_bounds, normal_panel, "transcript footer action");
                 assert_within_tolerance(
                     normal_panel.y1 - action_bounds.y1,
                     14.0,
@@ -1258,20 +1255,18 @@ mod tests {
                 );
             }
             assert_within_tolerance(normal_panel.x1 - copy.x1, 16.0, 3.0, "Copy right inset");
-            if width > 960.0 {
-                assert_bounds_within(helper, viewport, "Silence helper");
-                assert!(
-                    helper.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
-                    "Silence helper must remain within the central viewport: {helper:?}"
-                );
-            }
+            assert_bounds_within(helper, viewport, "Silence helper");
+            assert!(
+                helper.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
+                "Silence helper must remain within the central viewport: {helper:?}"
+            );
         }
     }
 
     #[test]
     fn selector_wraps_only_after_long_model_and_hotkey_content_no_longer_fit() {
         let long_model_name = "Whisper Large v3 Turbo English — high accuracy dictation";
-        for (width, should_stack) in [(900.0, false), (600.0, true)] {
+        for (width, should_stack) in [(1_180.0, false), (600.0, true)] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             configure_accessible_style(&ctx);
@@ -1322,6 +1317,58 @@ mod tests {
     }
 
     #[test]
+    fn narrow_selector_wraps_hotkey_contents_inside_the_second_row_card() {
+        for (hotkey_value, should_wrap_contents) in [
+            ("Ctrl + Space", false),
+            ("Ctrl + Shift + Alt + Super + Space", true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_accessible_style(&ctx);
+            let mut data = Fixture::TranscribeReady.data();
+            let mut page = Fixture::TranscribeReady.page();
+            data.transcription.hotkey = hotkey_value.into();
+
+            let (output, action) =
+                render_with_input(&ctx, &mut data, &mut page, 375.0, 815.0, Vec::new());
+            assert_eq!(action, ScreenAction::None);
+
+            let viewport = egui::accesskit::Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 375.0,
+                y1: 815.0,
+            };
+            let model = named_node_bounds(&output, "Selected model");
+            let hotkey = named_node_bounds(&output, "Recording hotkey");
+            assert!(model.y1 <= hotkey.y0 + LAYOUT_TOLERANCE);
+            assert_bounds_within(hotkey, viewport, "narrow hotkey card");
+            for key in hotkey_value.split('+').map(str::trim) {
+                assert_bounds_within(
+                    node_matching(&output, |node| node.name() == Some(key))
+                        .bounds()
+                        .unwrap_or_else(|| panic!("missing {key} hotkey keycap")),
+                    hotkey,
+                    "narrow hotkey keycap",
+                );
+            }
+            if should_wrap_contents {
+                assert!(
+                    hotkey.y1 - hotkey.y0 > 44.0 + LAYOUT_TOLERANCE,
+                    "below-intrinsic hotkey card should grow for wrapped content: {hotkey:?}"
+                );
+            } else {
+                assert_within_tolerance(
+                    hotkey.y1 - hotkey.y0,
+                    44.0,
+                    3.0,
+                    "single-line narrow hotkey card height",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn no_model_layout_keeps_the_bordered_empty_state_and_hides_transcript_controls() {
         for (width, height) in [(1180.0, 815.0), (960.0, 680.0)] {
             let ctx = egui::Context::default();
@@ -1361,12 +1408,23 @@ mod tests {
             );
             assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
             assert_within_tolerance(panel.y0, 185.0, 6.0, "wide model-required panel top");
-            assert_within_tolerance(
-                panel.y1 - panel.y0,
-                565.0,
-                6.0,
-                "wide model-required panel height",
+            assert!(
+                panel.y1 <= viewport.y1 + LAYOUT_TOLERANCE,
+                "model-required panel must honor the remaining viewport height: {panel:?}"
             );
+            if height >= 815.0 {
+                assert_within_tolerance(
+                    panel.y1 - panel.y0,
+                    565.0,
+                    6.0,
+                    "preferred model-required panel height",
+                );
+            } else {
+                assert!(
+                    panel.y1 - panel.y0 < 565.0,
+                    "short viewport must reduce the model-required panel height: {panel:?}"
+                );
+            }
             let helper = node_matching(&output, |node| {
                 node.name()
                     .is_some_and(|name| name.contains("Silence is ignored"))

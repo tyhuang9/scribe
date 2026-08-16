@@ -10,7 +10,8 @@ use eframe::egui::{
 use super::{
     about_page,
     controls::{
-        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, paint_focus_ring,
+        ButtonTone, Icon, button, card, focus_tooltip, icon_glyph, keycap, keycap_width,
+        paint_focus_ring,
     },
     state::{
         ComparisonPhase, ComparisonResultPhase, ModelCardKey, ModelComparisonState, ModelDialog,
@@ -34,6 +35,8 @@ const SELECTOR_ACTION_WIDTH: f32 = 72.0;
 // makes the two surfaces read as one oversized control. Keep the 44px target
 // while reducing this particular button's painted height.
 const SELECTOR_ACTION_VISUAL_HEIGHT: f32 = 28.0;
+const SELECTOR_HOTKEY_ROW_HEIGHT: f32 = 28.0;
+const SELECTOR_HOTKEY_VERTICAL_INSET: f32 = 4.0;
 const TRANSCRIPT_FOOTER_INSET: f32 = 16.0;
 const TRANSCRIPT_BODY_PADDING: f32 = 26.0;
 const TRANSCRIPT_BODY_VERTICAL_PADDING: f32 = 24.0;
@@ -41,6 +44,7 @@ const TRANSCRIPT_STATUS_VERTICAL_PADDING: f32 = 13.0;
 const TRANSCRIPT_STATUS_CONTENT_HEIGHT: f32 = 54.0;
 const TRANSCRIPT_STATUS_SPINNER_SLOT: f32 = 44.0;
 const TRANSCRIPT_STATUS_SPINNER_SIZE: f32 = 26.0;
+const TRANSCRIPT_HELPER_VIEWPORT_GUARD: f32 = 14.0;
 const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.";
 
 const ROUTE_TOP_INSET: f32 = 28.0;
@@ -152,15 +156,77 @@ fn hotkey_content_width(ui: &egui::Ui, hotkey: &str) -> f32 {
                 egui::TextStyle::Body.resolve(ui.style()),
             ));
         }
-        item_widths.push(
-            selector_text_width(
-                ui,
-                key,
-                egui::FontId::monospace(egui::TextStyle::Small.resolve(ui.style()).size),
-            ) + 14.0,
-        );
+        item_widths.push(keycap_width(ui, key));
     }
     32.0 + item_widths.iter().sum::<f32>() + gap * item_widths.len().saturating_sub(1) as f32
+}
+
+fn selector_hotkey_width(available_width: f32, intrinsic_width: f32) -> f32 {
+    (available_width * 0.28)
+        .clamp(220.0, 280.0)
+        .max(intrinsic_width)
+}
+
+fn selector_inline_width_threshold(ui: &egui::Ui, name: &str, hotkey: &str) -> f32 {
+    let model_width = model_content_width(ui, name);
+    let hotkey_intrinsic_width = hotkey_content_width(ui, hotkey);
+    let gap = ui.spacing().item_spacing.x;
+    let mut lower = 0.0;
+    let mut upper = model_width + hotkey_intrinsic_width.max(280.0) + gap;
+    for _ in 0..24 {
+        let width = (lower + upper) * 0.5;
+        let required = model_width + selector_hotkey_width(width, hotkey_intrinsic_width) + gap;
+        if width < required {
+            lower = width;
+        } else {
+            upper = width;
+        }
+    }
+    upper
+}
+
+fn hotkey_wrapped_row_count(ui: &egui::Ui, hotkey: &str, content_width: f32) -> usize {
+    let mut item_widths = vec![
+        selector_text_width(
+            ui,
+            &icon_glyph(Icon::Keyboard),
+            egui::FontId::proportional(18.0),
+        ),
+        selector_text_width(ui, "Hotkey:", egui::TextStyle::Body.resolve(ui.style())),
+    ];
+    let keys = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    for (index, key) in keys.iter().enumerate() {
+        item_widths.push(keycap_width(ui, key));
+        if index + 1 < keys.len() {
+            item_widths.push(selector_text_width(
+                ui,
+                "+",
+                egui::TextStyle::Body.resolve(ui.style()),
+            ));
+        }
+    }
+
+    let gap = ui.spacing().item_spacing.x;
+    let mut rows = 1;
+    let mut used = 0.0;
+    for item_width in item_widths {
+        let required = if used == 0.0 {
+            item_width
+        } else {
+            used + gap + item_width
+        };
+        if used > 0.0 && required > content_width {
+            rows += 1;
+            used = item_width;
+        } else {
+            used = required;
+        }
+    }
+    rows
 }
 
 fn model_content_width(ui: &egui::Ui, name: &str) -> f32 {
@@ -177,9 +243,10 @@ fn transcript_panel_height(ui: &egui::Ui) -> f32 {
         - ui.available_rect_before_wrap().min.y
         - ui.spacing().item_spacing.y
         - helper_height
-        - 8.0;
+        - TRANSCRIPT_HELPER_VIEWPORT_GUARD;
+    let remaining_height = remaining_height.max(0.0);
     remaining_height.clamp(
-        TRANSCRIPT_PANEL_MIN_HEIGHT,
+        TRANSCRIPT_PANEL_MIN_HEIGHT.min(remaining_height),
         TRANSCRIPT_PANEL_PREFERRED_MIN_HEIGHT,
     )
 }
@@ -561,13 +628,12 @@ fn selector_row(
     let mut action = ScreenAction::None;
     let available_width = current_content_width(ui);
     let gap = ui.spacing().item_spacing.x;
-    let hotkey_width = (available_width * 0.28)
-        .clamp(220.0, 280.0)
-        .max(hotkey_content_width(ui, &state.hotkey));
+    let hotkey_intrinsic_width = hotkey_content_width(ui, &state.hotkey);
+    let hotkey_width = selector_hotkey_width(available_width, hotkey_intrinsic_width);
     // Keep the established wide layout until the model field would cut into either
     // its full label or the Change action. At that precise point the hotkey moves
     // intact to a second row rather than allowing its keycaps to paint outside.
-    let compact = available_width < model_content_width(ui, name) + hotkey_width + gap;
+    let compact = available_width < selector_inline_width_threshold(ui, name, &state.hotkey);
     let model_width = if compact {
         available_width
     } else {
@@ -717,12 +783,29 @@ fn selector_row(
             } else {
                 hotkey_width
             };
+            let wraps_hotkey = compact && hotkey_width < hotkey_intrinsic_width;
+            let hotkey_rows = if wraps_hotkey {
+                hotkey_wrapped_row_count(ui, &state.hotkey, (hotkey_width - 32.0).max(0.0))
+            } else {
+                1
+            };
+            let hotkey_visual_height = if wraps_hotkey {
+                SELECTOR_HOTKEY_VERTICAL_INSET * 2.0
+                    + hotkey_rows as f32
+                        * (SELECTOR_HOTKEY_ROW_HEIGHT + ui.spacing().item_spacing.y)
+            } else {
+                SELECTOR_VISUAL_HEIGHT
+            };
+            let hotkey_card_height =
+                hotkey_visual_height + (SELECTOR_CONTROL_HEIGHT - SELECTOR_VISUAL_HEIGHT);
             let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
-            let (hotkey_card_rect, _) =
-                ui.allocate_exact_size(Vec2::new(hotkey_width, card_height), egui::Sense::hover());
+            let (hotkey_card_rect, _) = ui.allocate_exact_size(
+                Vec2::new(hotkey_width, hotkey_card_height),
+                egui::Sense::hover(),
+            );
             let hotkey_card_visual_rect = egui::Rect::from_center_size(
                 hotkey_card_rect.center(),
-                Vec2::new(hotkey_card_rect.width(), SELECTOR_VISUAL_HEIGHT),
+                Vec2::new(hotkey_card_rect.width(), hotkey_visual_height),
             );
             let hotkey_card_frame = Frame::none()
                 .fill(if no_model {
@@ -737,16 +820,14 @@ fn selector_row(
             let hotkey_content_rect = egui::Rect::from_min_max(
                 egui::pos2(
                     hotkey_card_visual_rect.min.x + 16.0,
-                    hotkey_card_visual_rect.min.y + SELECTOR_CARD_VERTICAL_MARGIN,
+                    hotkey_card_visual_rect.min.y + SELECTOR_HOTKEY_VERTICAL_INSET,
                 ),
                 egui::pos2(
                     hotkey_card_visual_rect.max.x - 16.0,
-                    hotkey_card_visual_rect.max.y - SELECTOR_CARD_VERTICAL_MARGIN,
+                    hotkey_card_visual_rect.max.y - SELECTOR_HOTKEY_VERTICAL_INSET,
                 ),
             );
-            let mut hotkey_content_ui =
-                ui.child_ui(hotkey_content_rect, Layout::left_to_right(Align::Center));
-            hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
+            let render_hotkey = |ui: &mut egui::Ui| {
                 ui.label(
                     RichText::new(icon_glyph(Icon::Keyboard))
                         .size(18.0)
@@ -764,6 +845,21 @@ fn selector_row(
                     if keys.peek().is_some() {
                         ui.label(RichText::new("+").color(ui_palette(ui).muted_text));
                     }
+                }
+            };
+            let mut hotkey_content_ui = ui.child_ui(
+                hotkey_content_rect,
+                if wraps_hotkey {
+                    Layout::top_down(Align::LEFT)
+                } else {
+                    Layout::left_to_right(Align::Center)
+                },
+            );
+            hotkey_content_ui.add_enabled_ui(!no_model, |ui| {
+                if wraps_hotkey {
+                    ui.horizontal_wrapped(render_hotkey);
+                } else {
+                    render_hotkey(ui);
                 }
             });
             ui.ctx().accesskit_node_builder(hotkey_card_id, |builder| {
@@ -8217,6 +8313,91 @@ mod tests {
         assert!(nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Group && node.name() == Some("Recording hotkey")
         }));
+    }
+
+    #[test]
+    fn selector_switches_layout_at_its_measured_content_threshold() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("large-v3-turbo.en".into()),
+            hotkey: "Ctrl + Shift + Alt + Space".into(),
+            ..Default::default()
+        };
+        let models = vec![ModelViewModel {
+            id: "large-v3-turbo.en".into(),
+            display_name: "Whisper Large v3 Turbo English — high accuracy dictation".into(),
+            variant_label: "large-v3-turbo.en".into(),
+            ..Default::default()
+        }];
+
+        let measurement_ctx = egui::Context::default();
+        crate::ui::controls::configure_accessible_style(&measurement_ctx);
+        let mut threshold = 0.0;
+        let _ = measurement_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1_600.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    threshold = selector_inline_width_threshold(
+                        ui,
+                        selected_model_name(&state, &models),
+                        &state.hotkey,
+                    );
+                });
+            },
+        );
+
+        for (width, should_stack) in [
+            (threshold + 1.0, false),
+            (threshold, false),
+            (threshold - 1.0, true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::controls::configure_accessible_style(&ctx);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width + 16.0, 240.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 0.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                selector_row(ui, &state, &models);
+                            },
+                        );
+                    });
+                },
+            );
+            let update = output.platform_output.accesskit_update.unwrap();
+            let bounds = |name: &str| {
+                update
+                    .nodes
+                    .iter()
+                    .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()))
+                    .flatten()
+                    .unwrap_or_else(|| panic!("missing {name} bounds"))
+            };
+            let model = bounds("Selected model");
+            let hotkey = bounds("Recording hotkey");
+            if should_stack {
+                assert!(model.y1 <= hotkey.y0);
+            } else {
+                assert!(model.x1 <= hotkey.x0);
+                assert!((model.y0 - hotkey.y0).abs() <= f64::EPSILON);
+            }
+        }
     }
 
     #[test]

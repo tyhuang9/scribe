@@ -7,6 +7,7 @@ use super::theme::ui_palette;
 
 const PRIMARY_TARGET_HEIGHT: f32 = 44.0;
 const COMPACT_BUTTON_HEIGHT: f32 = 32.0;
+const KEYCAP_HORIZONTAL_PADDING: f32 = 7.0;
 const KEYCAP_VERTICAL_PADDING: f32 = 7.0;
 
 pub(crate) fn minimum_primary_target_height() -> f32 {
@@ -178,7 +179,10 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
         .fill(colors.card_bg)
         .stroke(Stroke::new(1.0, colors.border_strong))
         .rounding(Rounding::same(3.0))
-        .inner_margin(Margin::symmetric(7.0, KEYCAP_VERTICAL_PADDING))
+        .inner_margin(Margin::symmetric(
+            KEYCAP_HORIZONTAL_PADDING,
+            KEYCAP_VERTICAL_PADDING,
+        ))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(text)
@@ -187,6 +191,18 @@ pub(crate) fn keycap(ui: &mut Ui, text: &str) {
                     .color(colors.text),
             );
         });
+}
+
+pub(crate) fn keycap_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            FontId::monospace(TextStyle::Small.resolve(ui.style()).size),
+            ui_palette(ui).text,
+        )
+        .size()
+        .x
+        + KEYCAP_HORIZONTAL_PADDING * 2.0
 }
 
 #[allow(dead_code)]
