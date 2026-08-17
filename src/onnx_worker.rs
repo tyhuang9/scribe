@@ -22,10 +22,11 @@ use sherpa_onnx::{
     OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
+use crate::silero_vad_native::{SileroVadModel, VadThreshold, WINDOW_SAMPLES};
 use crate::transcription::{AccelerationPreference, ComputeDevice, ResolvedAcceleration};
 
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCON";
-pub(crate) const PROTOCOL_VERSION: u8 = 1;
+pub(crate) const PROTOCOL_VERSION: u8 = 2;
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
@@ -415,6 +416,15 @@ enum Control {
     StartStream,
     AudioChunk,
     EndStream,
+    LoadVad {
+        num_threads: u16,
+    },
+    StartVad {
+        threshold: f32,
+    },
+    VadWindow,
+    ResetVad,
+    EndVad,
     Cancel {
         target_session_id: u64,
         target_request_id: u64,
@@ -426,6 +436,10 @@ enum Control {
     Text {
         text: String,
         final_result: bool,
+    },
+    VadDecision {
+        probability: f32,
+        speech: bool,
     },
     Ok,
     Error {
@@ -443,6 +457,11 @@ impl Control {
                 | Self::StartStream
                 | Self::AudioChunk
                 | Self::EndStream
+                | Self::LoadVad { .. }
+                | Self::StartVad { .. }
+                | Self::VadWindow
+                | Self::ResetVad
+                | Self::EndVad
                 | Self::Cancel { .. }
                 | Self::Unload
                 | Self::Health
@@ -453,7 +472,11 @@ impl Control {
     fn is_worker_response(&self) -> bool {
         matches!(
             self,
-            Self::Ready | Self::Text { .. } | Self::Ok | Self::Error { .. }
+            Self::Ready
+                | Self::Text { .. }
+                | Self::VadDecision { .. }
+                | Self::Ok
+                | Self::Error { .. }
         )
     }
 }
@@ -1532,6 +1555,278 @@ impl OnnxWorkerSupervisor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SileroVadDecision {
+    pub(crate) probability: f32,
+    pub(crate) speech: bool,
+}
+
+/// Dedicated VAD-only supervisor. Each instance owns a separate hidden worker
+/// process and cannot submit transcription commands through this API.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct SileroVadWorkerSupervisor {
+    transport: OnnxWorkerSupervisor,
+}
+
+#[allow(dead_code)]
+impl SileroVadWorkerSupervisor {
+    pub(crate) fn spawn() -> Result<Self> {
+        Ok(Self {
+            transport: OnnxWorkerSupervisor::spawn()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: OnnxWorkerSupervisor) -> Self {
+        Self { transport }
+    }
+
+    pub(crate) fn load(&self, session_id: u64, request_id: u64, num_threads: u16) -> Result<bool> {
+        if num_threads == 0 || num_threads > 64 {
+            bail!("Silero VAD thread count must be within [1, 64]");
+        }
+        let identity = format!(
+            "silero-vad:{}:{num_threads}",
+            crate::support_assets::SILERO_VAD_SHA256
+        );
+        let generation = self.transport.ensure_generation()?;
+        let reused = self
+            .transport
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .active_model
+            .as_ref()
+            .is_some_and(|(loaded_generation, loaded_identity)| {
+                *loaded_generation == generation && loaded_identity == &identity
+            });
+        if reused {
+            return Ok(true);
+        }
+        let frame = control_frame(session_id, request_id, &Control::LoadVad { num_threads })?;
+        if let Err(error) = self
+            .transport
+            .active_round_trip_with_timeout(
+                generation,
+                session_id,
+                request_id,
+                &[frame],
+                self.transport.inner.deadlines.load,
+            )
+            .and_then(expect_ok)
+        {
+            self.transport
+                .invalidate_generation(generation, "Silero VAD load failed", true)?;
+            return Err(error);
+        }
+        let mut state = self
+            .transport
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            state.active_model = Some((generation, identity));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn start_session(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        threshold: VadThreshold,
+    ) -> Result<()> {
+        let generation = self.transport.ensure_generation()?;
+        if self
+            .transport
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .active_stream
+            .is_some()
+        {
+            bail!("a Silero VAD session is already active");
+        }
+        let frame = control_frame(
+            session_id,
+            request_id,
+            &Control::StartVad {
+                threshold: threshold.value(),
+            },
+        )?;
+        match self
+            .transport
+            .active_round_trip(generation, session_id, request_id, &[frame])?
+        {
+            Control::Ok => {
+                let mut state = self
+                    .transport
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                if state
+                    .current
+                    .as_ref()
+                    .is_none_or(|current| current.generation != generation)
+                {
+                    bail!("Silero VAD worker generation {generation} is unavailable");
+                }
+                state.active_stream = Some(SupervisorStream {
+                    generation,
+                    session_id,
+                    last_request_id: request_id,
+                });
+                Ok(())
+            }
+            Control::Error { message } => bail!("Silero VAD worker: {message}"),
+            _ => {
+                self.transport.invalidate_generation(
+                    generation,
+                    "unexpected Silero VAD start response",
+                    true,
+                )?;
+                bail!("unexpected Silero VAD start response")
+            }
+        }
+    }
+
+    pub(crate) fn compute(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> Result<SileroVadDecision> {
+        if samples.len() != WINDOW_SAMPLES {
+            bail!("Silero VAD input must contain exactly {WINDOW_SAMPLES} samples");
+        }
+        let pcm = encode_pcm(samples)?;
+        let stream = self.transport.require_stream(session_id)?;
+        let generation = stream.generation;
+        let frames = [
+            control_frame(session_id, request_id, &Control::VadWindow)?,
+            Frame {
+                kind: FrameKind::Pcm,
+                session_id,
+                request_id,
+                body: pcm,
+            },
+        ];
+        let response = match self
+            .transport
+            .active_round_trip(generation, session_id, request_id, &frames)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.retire_failed_session(stream, "Silero VAD compute transport failed")?;
+                return Err(error);
+            }
+        };
+        match response {
+            Control::VadDecision {
+                probability,
+                speech,
+            } if probability.is_finite() && (0.0..=1.0).contains(&probability) => {
+                if let Ok(mut state) = self.transport.inner.state.lock()
+                    && let Some(active) = state.active_stream.as_mut()
+                    && active.generation == generation
+                    && active.session_id == session_id
+                {
+                    active.last_request_id = request_id;
+                }
+                Ok(SileroVadDecision {
+                    probability,
+                    speech,
+                })
+            }
+            Control::Error { message } => {
+                self.transport.clear_stream(generation, session_id);
+                bail!("Silero VAD worker: {message}")
+            }
+            _ => {
+                self.transport.invalidate_generation(
+                    generation,
+                    "unexpected Silero VAD decision response",
+                    true,
+                )?;
+                bail!("unexpected Silero VAD decision response")
+            }
+        }
+    }
+
+    pub(crate) fn reset(&self, session_id: u64, request_id: u64) -> Result<()> {
+        let stream = self.transport.require_stream(session_id)?;
+        let result = self.transport.round_trip_on_generation(
+            stream.generation,
+            session_id,
+            request_id,
+            Control::ResetVad,
+            self.transport.inner.deadlines.control,
+        );
+        if let Err(error) = result {
+            self.retire_failed_session(stream, "Silero VAD reset failed")?;
+            return Err(error);
+        }
+        if let Ok(mut state) = self.transport.inner.state.lock()
+            && let Some(active) = state.active_stream.as_mut()
+            && active.generation == stream.generation
+            && active.session_id == session_id
+        {
+            active.last_request_id = request_id;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn end_session(&self, session_id: u64, request_id: u64) -> Result<()> {
+        let stream = self.transport.require_stream(session_id)?;
+        let result = self.transport.round_trip_on_generation(
+            stream.generation,
+            session_id,
+            request_id,
+            Control::EndVad,
+            self.transport.inner.deadlines.control,
+        );
+        self.transport
+            .clear_stream(stream.generation, stream.session_id);
+        if let Err(error) = result {
+            self.transport.invalidate_generation(
+                stream.generation,
+                "Silero VAD end failed",
+                true,
+            )?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_session(&self, session_id: u64, request_id: u64) -> Result<()> {
+        self.transport.cancel_stream(session_id, request_id)
+    }
+
+    pub(crate) fn abandon_session(&self, session_id: u64) {
+        self.transport.abandon_stream(session_id);
+    }
+
+    pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
+        self.transport.health(session_id, request_id)
+    }
+
+    fn retire_failed_session(&self, stream: SupervisorStream, reason: &str) -> Result<()> {
+        self.transport
+            .clear_stream(stream.generation, stream.session_id);
+        self.transport
+            .invalidate_generation(stream.generation, reason, true)
+    }
+}
+
 fn expect_ok(response: Control) -> Result<()> {
     match response {
         Control::Ok => Ok(()),
@@ -1606,7 +1901,12 @@ pub(crate) fn maybe_run_worker() -> Option<i32> {
 }
 
 fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
-    worker_loop_with_factory(&mut input, &mut output, &NativeRecognizerFactory)
+    worker_loop_with_factories(
+        &mut input,
+        &mut output,
+        &NativeRecognizerFactory,
+        &NativeVadFactory,
+    )
 }
 
 trait WorkerRecognizerFactory {
@@ -1626,6 +1926,17 @@ trait WorkerRecognizer {
     fn stream_result(&self, stream: &Self::Stream) -> Result<String>;
 }
 
+trait WorkerVadFactory {
+    type Vad: WorkerVad;
+
+    fn create(&self, num_threads: u16) -> Result<Self::Vad>;
+}
+
+trait WorkerVad {
+    fn compute(&mut self, samples: &[f32]) -> Result<f32>;
+    fn reset(&mut self) -> Result<()>;
+}
+
 struct LoadedWorkerRecognizer<R> {
     identity: String,
     family: OnnxModelFamily,
@@ -1639,16 +1950,34 @@ struct ActiveWorkerStream<S> {
     stream: S,
 }
 
+struct ActiveWorkerVad {
+    session_id: u64,
+    last_request_id: u64,
+    threshold: VadThreshold,
+}
+
+#[cfg(test)]
 fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
     mut input: impl Read,
     mut output: impl Write,
     factory: &F,
+) -> Result<()> {
+    worker_loop_with_factories(&mut input, &mut output, factory, &NativeVadFactory)
+}
+
+fn worker_loop_with_factories<F: WorkerRecognizerFactory, V: WorkerVadFactory>(
+    mut input: impl Read,
+    mut output: impl Write,
+    factory: &F,
+    vad_factory: &V,
 ) -> Result<()> {
     // This declaration order makes the stream drop before its recognizer on
     // structural protocol failure. Normal replacement paths clear it explicitly.
     let mut loaded: Option<LoadedWorkerRecognizer<F::Recognizer>> = None;
     let mut active_stream: Option<ActiveWorkerStream<<F::Recognizer as WorkerRecognizer>::Stream>> =
         None;
+    let mut loaded_vad: Option<V::Vad> = None;
+    let mut active_vad: Option<ActiveWorkerVad> = None;
     loop {
         let frame = read_frame(&mut input)?;
         let (session_id, request_id, control) = parse_parent_control(frame)?;
@@ -1658,6 +1987,9 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
             }
             Control::Load { model } => {
                 let result = (|| {
+                    if loaded_vad.is_some() {
+                        bail!("cannot load a transcription model in a VAD worker");
+                    }
                     let model = model.validated()?;
                     let identity = model.fingerprint()?;
                     if loaded
@@ -1686,6 +2018,8 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
             Control::Unload => {
                 active_stream = None;
                 loaded = None;
+                active_vad = None;
+                loaded_vad = None;
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
             }
             Control::Cancel {
@@ -1701,20 +2035,34 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
                         active_stream = None;
                         Ok(Control::Ok)
                     }
-                    _ => Err(anyhow!("no matching ONNX stream is active")),
+                    _ => match active_vad.as_ref() {
+                        Some(vad)
+                            if session_id == target_session_id
+                                && vad.session_id == target_session_id
+                                && vad.last_request_id == target_request_id =>
+                        {
+                            active_vad = None;
+                            if let Some(vad) = loaded_vad.as_mut() {
+                                vad.reset()?;
+                            }
+                            Ok(Control::Ok)
+                        }
+                        _ => Err(anyhow!("no matching ONNX stream is active")),
+                    },
                 };
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
             Control::Shutdown => {
                 drop(active_stream.take());
                 drop(loaded.take());
+                drop(loaded_vad.take());
                 write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
                 return Ok(());
             }
             Control::Transcribe => {
                 let samples = read_correlated_pcm(&mut input, session_id, request_id);
                 let result = samples.and_then(|samples| {
-                    if active_stream.is_some() {
+                    if active_stream.is_some() || loaded_vad.is_some() {
                         bail!("cannot run batch transcription while an ONNX stream is active");
                     }
                     let recognizer = loaded
@@ -1732,6 +2080,9 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
             }
             Control::StartStream => {
                 let result = (|| {
+                    if loaded_vad.is_some() {
+                        bail!("cannot start transcription in a VAD worker");
+                    }
                     let recognizer = loaded
                         .as_ref()
                         .ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
@@ -1785,7 +2136,116 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
                     });
                 write_worker_result(&mut output, session_id, request_id, result)?;
             }
-            Control::Ready | Control::Text { .. } | Control::Ok | Control::Error { .. } => {
+            Control::LoadVad { num_threads } => {
+                let result = (|| {
+                    if !(1..=64).contains(&num_threads) {
+                        bail!("Silero VAD thread count must be within [1, 64]");
+                    }
+                    if loaded.is_some() || active_stream.is_some() {
+                        bail!("cannot load VAD in a transcription worker");
+                    }
+                    if active_vad.is_some() {
+                        bail!("cannot replace VAD while a session is active");
+                    }
+                    loaded_vad = None;
+                    loaded_vad = Some(vad_factory.create(num_threads)?);
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::StartVad { threshold } => {
+                let result = (|| {
+                    let threshold = VadThreshold::new(threshold)?;
+                    let vad = loaded_vad
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no Silero VAD model is loaded"))?;
+                    if active_vad.is_some() {
+                        bail!("a Silero VAD session is already active");
+                    }
+                    vad.reset()?;
+                    active_vad = Some(ActiveWorkerVad {
+                        session_id,
+                        last_request_id: request_id,
+                        threshold,
+                    });
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::VadWindow => {
+                let samples = read_correlated_pcm(&mut input, session_id, request_id);
+                let result = samples.and_then(|samples| {
+                    let active = active_vad
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no Silero VAD session is active"))?;
+                    if active.session_id != session_id {
+                        bail!("Silero VAD session belongs to a different recording");
+                    }
+                    if samples.len() != WINDOW_SAMPLES {
+                        bail!("Silero VAD input must contain exactly {WINDOW_SAMPLES} samples");
+                    }
+                    let vad = loaded_vad
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no Silero VAD model is loaded"))?;
+                    let probability = vad.compute(&samples)?;
+                    let speech = active.threshold.detects(probability)?;
+                    active.last_request_id = request_id;
+                    Ok(Control::VadDecision {
+                        probability,
+                        speech,
+                    })
+                });
+                if result.is_err()
+                    && active_vad
+                        .as_ref()
+                        .is_some_and(|active| active.session_id == session_id)
+                {
+                    active_vad = None;
+                    if let Some(vad) = loaded_vad.as_mut() {
+                        let _ = vad.reset();
+                    }
+                }
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::ResetVad => {
+                let result = (|| {
+                    let active = active_vad
+                        .as_mut()
+                        .filter(|active| active.session_id == session_id)
+                        .ok_or_else(|| {
+                            anyhow!("no Silero VAD session is active for recording {session_id}")
+                        })?;
+                    loaded_vad
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no Silero VAD model is loaded"))?
+                        .reset()?;
+                    active.last_request_id = request_id;
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::EndVad => {
+                let result = (|| {
+                    if active_vad
+                        .as_ref()
+                        .is_none_or(|active| active.session_id != session_id)
+                    {
+                        bail!("no Silero VAD session is active for recording {session_id}");
+                    }
+                    loaded_vad
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no Silero VAD model is loaded"))?
+                        .reset()?;
+                    active_vad = None;
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::Ready
+            | Control::Text { .. }
+            | Control::VadDecision { .. }
+            | Control::Ok
+            | Control::Error { .. } => {
                 bail!("parent sent worker response")
             }
         }
@@ -1897,6 +2357,26 @@ fn write_worker_result(
 /// Real sherpa recognizers stay entirely inside the child process so a native
 /// failure cannot take down the eframe process.
 struct NativeRecognizerFactory;
+
+struct NativeVadFactory;
+
+impl WorkerVadFactory for NativeVadFactory {
+    type Vad = SileroVadModel;
+
+    fn create(&self, num_threads: u16) -> Result<Self::Vad> {
+        SileroVadModel::load_bundled(i32::from(num_threads))
+    }
+}
+
+impl WorkerVad for SileroVadModel {
+    fn compute(&mut self, samples: &[f32]) -> Result<f32> {
+        SileroVadModel::compute(self, samples)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        SileroVadModel::reset(self)
+    }
+}
 
 enum NativeRecognizer {
     Offline { recognizer: OfflineRecognizer },
@@ -2279,6 +2759,75 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct FakeVadState {
+        creates: usize,
+        computes: usize,
+        resets: usize,
+        drops: usize,
+    }
+
+    struct FakeVadFactory {
+        state: Arc<Mutex<FakeVadState>>,
+    }
+
+    impl FakeVadFactory {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeVadState::default())),
+            }
+        }
+
+        fn snapshot(&self) -> FakeVadState {
+            self.state.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeVad {
+        state: Arc<Mutex<FakeVadState>>,
+        window_index: usize,
+    }
+
+    impl WorkerVadFactory for FakeVadFactory {
+        type Vad = FakeVad;
+
+        fn create(&self, num_threads: u16) -> Result<Self::Vad> {
+            if !(1..=64).contains(&num_threads) {
+                bail!("invalid fake VAD thread count");
+            }
+            self.state.lock().unwrap().creates += 1;
+            Ok(FakeVad {
+                state: Arc::clone(&self.state),
+                window_index: 0,
+            })
+        }
+    }
+
+    impl WorkerVad for FakeVad {
+        fn compute(&mut self, samples: &[f32]) -> Result<f32> {
+            validate_pcm_samples(samples)?;
+            if samples.len() != WINDOW_SAMPLES {
+                bail!("fake VAD requires an exact window");
+            }
+            let probability = [0.4, 0.7][self.window_index.min(1)];
+            self.window_index += 1;
+            self.state.lock().unwrap().computes += 1;
+            Ok(probability)
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.window_index = 0;
+            self.state.lock().unwrap().resets += 1;
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeVad {
+        fn drop(&mut self) {
+            self.state.lock().unwrap().drops += 1;
+        }
+    }
+
     struct TestProcess {
         running: AtomicBool,
         input: TestSender<PipeChunk>,
@@ -2352,6 +2901,10 @@ mod tests {
         InvalidResponse {
             pcm_kind: bool,
         },
+        VadNormal,
+        VadCrashOnWindow,
+        VadCrashOnReset,
+        VadCrashOnEnd,
         FailChangedLoad,
         FailChangedLoadWithActiveStream,
     }
@@ -2481,7 +3034,35 @@ mod tests {
                         message: "streaming unavailable".to_owned(),
                     },
                 ),
-                Control::Ready | Control::Text { .. } | Control::Ok | Control::Error { .. } => {
+                Control::VadWindow => {
+                    let pcm = read_frame(input).unwrap();
+                    assert_eq!(pcm.kind, FrameKind::Pcm);
+                    assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                    respond(
+                        output,
+                        session_id,
+                        request_id,
+                        Control::Error {
+                            message: "VAD unavailable".to_owned(),
+                        },
+                    );
+                }
+                Control::LoadVad { .. }
+                | Control::StartVad { .. }
+                | Control::ResetVad
+                | Control::EndVad => respond(
+                    output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "VAD unavailable".to_owned(),
+                    },
+                ),
+                Control::Ready
+                | Control::Text { .. }
+                | Control::VadDecision { .. }
+                | Control::Ok
+                | Control::Error { .. } => {
                     panic!("test parent sent response-only control")
                 }
             }
@@ -2492,6 +3073,18 @@ mod tests {
         handshake(&mut input, &mut output);
         match mode {
             TestMode::Normal => run_normal_worker(&mut input, &mut output),
+            TestMode::VadNormal => {
+                run_vad_test_worker(&mut input, &mut output, false, false, false)
+            }
+            TestMode::VadCrashOnWindow => {
+                run_vad_test_worker(&mut input, &mut output, true, false, false)
+            }
+            TestMode::VadCrashOnReset => {
+                run_vad_test_worker(&mut input, &mut output, false, true, false)
+            }
+            TestMode::VadCrashOnEnd => {
+                run_vad_test_worker(&mut input, &mut output, false, false, true)
+            }
             TestMode::BlockedDecode { started } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::Transcribe));
@@ -2628,6 +3221,69 @@ mod tests {
         }
     }
 
+    fn run_vad_test_worker(
+        input: &mut impl Read,
+        output: &mut impl Write,
+        crash_on_window: bool,
+        crash_on_reset: bool,
+        crash_on_end: bool,
+    ) {
+        let mut window_index = 0_usize;
+        loop {
+            let Ok(frame) = read_frame(input) else {
+                return;
+            };
+            let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+            match control {
+                Control::LoadVad { .. } | Control::Health | Control::Unload => {
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::StartVad { .. } => {
+                    window_index = 0;
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::ResetVad => {
+                    if crash_on_reset {
+                        return;
+                    }
+                    window_index = 0;
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::EndVad => {
+                    if crash_on_end {
+                        return;
+                    }
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::VadWindow => {
+                    let pcm = read_frame(input).unwrap();
+                    assert_eq!(pcm.kind, FrameKind::Pcm);
+                    assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                    assert_eq!(decode_pcm(&pcm.body).unwrap().len(), WINDOW_SAMPLES);
+                    if crash_on_window {
+                        return;
+                    }
+                    let probability = [0.4, 0.7][window_index.min(1)];
+                    window_index += 1;
+                    respond(
+                        output,
+                        session_id,
+                        request_id,
+                        Control::VadDecision {
+                            probability,
+                            speech: probability > 0.5,
+                        },
+                    );
+                }
+                Control::Shutdown => {
+                    respond(output, session_id, request_id, Control::Ok);
+                    return;
+                }
+                other => panic!("unexpected VAD test-worker command: {other:?}"),
+            }
+        }
+    }
+
     fn test_supervisor(launcher: Arc<TestLauncher>) -> OnnxWorkerSupervisor {
         OnnxWorkerSupervisor::with_launcher(launcher).unwrap()
     }
@@ -2727,6 +3383,27 @@ mod tests {
         responses
     }
 
+    fn run_framed_fake_vad_worker(
+        recognizer_factory: &FakeRecognizerFactory,
+        vad_factory: &FakeVadFactory,
+        input: Vec<u8>,
+    ) -> Vec<(u64, u64, Control)> {
+        let mut output = Vec::new();
+        worker_loop_with_factories(
+            Cursor::new(input),
+            &mut output,
+            recognizer_factory,
+            vad_factory,
+        )
+        .unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        responses
+    }
+
     fn assert_error(response: &(u64, u64, Control), text: &str) {
         match &response.2 {
             Control::Error { message } => assert!(
@@ -2800,6 +3477,117 @@ mod tests {
             responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
         }
         responses
+    }
+
+    #[test]
+    fn framed_vad_worker_applies_threshold_and_resets_recurrent_state() {
+        let recognizer_factory = FakeRecognizerFactory::new();
+        let vad_factory = FakeVadFactory::new();
+        let window = [0.1; WINDOW_SAMPLES];
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 1 });
+        append_control(&mut input, 41, 3, Control::StartVad { threshold: 0.5 });
+        append_control(&mut input, 41, 4, Control::VadWindow);
+        append_pcm(&mut input, 41, 4, &window);
+        append_control(&mut input, 41, 5, Control::VadWindow);
+        append_pcm(&mut input, 41, 5, &window);
+        append_control(&mut input, 41, 6, Control::ResetVad);
+        append_control(&mut input, 41, 7, Control::VadWindow);
+        append_pcm(&mut input, 41, 7, &window);
+        append_control(&mut input, 41, 8, Control::EndVad);
+        append_control(&mut input, 42, 9, Control::StartVad { threshold: 0.3 });
+        append_control(&mut input, 42, 10, Control::VadWindow);
+        append_pcm(&mut input, 42, 10, &window);
+        append_control(&mut input, 42, 11, Control::EndVad);
+        append_control(&mut input, 0, 12, Control::Shutdown);
+
+        let responses = run_framed_fake_vad_worker(&recognizer_factory, &vad_factory, input);
+        assert_eq!(responses.len(), 12);
+        for (index, probability, speech) in [
+            (3, 0.4, false),
+            (4, 0.7, true),
+            (6, 0.4, false),
+            (9, 0.4, true),
+        ] {
+            match responses[index].2 {
+                Control::VadDecision {
+                    probability: actual,
+                    speech: actual_speech,
+                } => {
+                    assert_eq!(actual, probability);
+                    assert_eq!(actual_speech, speech);
+                }
+                ref other => panic!("expected VAD decision, got {other:?}"),
+            }
+        }
+        let state = vad_factory.snapshot();
+        assert_eq!(state.creates, 1);
+        assert_eq!(state.computes, 4);
+        assert_eq!(state.resets, 5);
+        assert_eq!(state.drops, 1);
+        assert_eq!(recognizer_factory.snapshot().create_attempts, 0);
+    }
+
+    #[test]
+    fn framed_vad_worker_rejects_invalid_controls_and_loses_failed_session() {
+        let recognizer_factory = FakeRecognizerFactory::new();
+        let vad_factory = FakeVadFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 0 });
+        append_control(&mut input, 0, 3, Control::LoadVad { num_threads: 1 });
+        append_control(&mut input, 51, 4, Control::StartVad { threshold: 0.19 });
+        append_control(&mut input, 51, 5, Control::StartVad { threshold: 0.5 });
+        append_control(&mut input, 51, 6, Control::VadWindow);
+        append_pcm(&mut input, 51, 6, &[0.0; WINDOW_SAMPLES - 1]);
+        append_control(&mut input, 51, 7, Control::VadWindow);
+        append_pcm(&mut input, 51, 7, &[0.0; WINDOW_SAMPLES]);
+        append_control(&mut input, 0, 8, Control::Shutdown);
+
+        let responses = run_framed_fake_vad_worker(&recognizer_factory, &vad_factory, input);
+        assert_error(&responses[1], "thread count");
+        assert_error(&responses[3], "threshold");
+        assert_error(&responses[5], "exactly 512");
+        assert_error(&responses[6], "no Silero VAD session is active");
+        let state = vad_factory.snapshot();
+        assert_eq!(state.creates, 1);
+        assert_eq!(state.computes, 0);
+        assert_eq!(state.resets, 2);
+    }
+
+    #[test]
+    fn real_native_vad_runs_through_worker_protocol_and_resets_exactly() {
+        let window = (0..WINDOW_SAMPLES)
+            .map(|index| ((index as f32 * 0.071).sin() * 0.25).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 2, Control::LoadVad { num_threads: 1 });
+        append_control(&mut input, 61, 3, Control::StartVad { threshold: 0.2 });
+        append_control(&mut input, 61, 4, Control::VadWindow);
+        append_pcm(&mut input, 61, 4, &window);
+        append_control(&mut input, 61, 5, Control::VadWindow);
+        append_pcm(&mut input, 61, 5, &window);
+        append_control(&mut input, 61, 6, Control::ResetVad);
+        append_control(&mut input, 61, 7, Control::VadWindow);
+        append_pcm(&mut input, 61, 7, &window);
+        append_control(&mut input, 61, 8, Control::EndVad);
+        append_control(&mut input, 0, 9, Control::Shutdown);
+
+        let responses = run_native_worker(input);
+        let probability = |index: usize| match responses[index].2 {
+            Control::VadDecision { probability, .. } => probability,
+            ref other => panic!("expected VAD decision, got {other:?}"),
+        };
+        let first = probability(3);
+        let second = probability(4);
+        let after_reset = probability(6);
+        println!(
+            "worker_first_probability={first:.9} worker_second_probability={second:.9} worker_after_reset_probability={after_reset:.9}"
+        );
+        assert!(first.is_finite() && second.is_finite());
+        assert_eq!(after_reset, first);
     }
 
     #[test]
@@ -2893,9 +3681,15 @@ mod tests {
         for (request_id, control, expected) in [
             (1, Control::Hello, "ready"),
             (2, Control::Health, "ok"),
-            (3, Control::Shutdown, "ok"),
+            (3, Control::LoadVad { num_threads: 1 }, "ok"),
+            (4, Control::StartVad { threshold: 0.5 }, "ok"),
         ] {
-            write_frame(&mut input, &control_frame(0, request_id, &control).unwrap()).unwrap();
+            let session_id = if request_id >= 4 { 71 } else { 0 };
+            write_frame(
+                &mut input,
+                &control_frame(session_id, request_id, &control).unwrap(),
+            )
+            .unwrap();
             let (_, received_request, response) =
                 parse_worker_control(read_frame(&mut output).unwrap()).unwrap();
             assert_eq!(received_request, request_id);
@@ -2904,6 +3698,63 @@ mod tests {
                 "ok" => assert!(matches!(response, Control::Ok)),
                 _ => unreachable!(),
             }
+        }
+        let window = (0..WINDOW_SAMPLES)
+            .map(|index| ((index as f32 * 0.071).sin() * 0.25).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let mut probabilities = Vec::new();
+        for request_id in [5, 7] {
+            write_frame(
+                &mut input,
+                &control_frame(71, request_id, &Control::VadWindow).unwrap(),
+            )
+            .unwrap();
+            write_frame(
+                &mut input,
+                &Frame {
+                    kind: FrameKind::Pcm,
+                    session_id: 71,
+                    request_id,
+                    body: encode_pcm(&window).unwrap(),
+                },
+            )
+            .unwrap();
+            let (_, received_request, response) =
+                parse_worker_control(read_frame(&mut output).unwrap()).unwrap();
+            assert_eq!(received_request, request_id);
+            match response {
+                Control::VadDecision { probability, .. } => probabilities.push(probability),
+                other => panic!("expected native VAD decision, got {other:?}"),
+            }
+            if request_id == 5 {
+                write_frame(
+                    &mut input,
+                    &control_frame(71, 6, &Control::ResetVad).unwrap(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    parse_worker_control(read_frame(&mut output).unwrap())
+                        .unwrap()
+                        .2,
+                    Control::Ok
+                ));
+            }
+        }
+        assert_eq!(probabilities[0], probabilities[1]);
+        for (session_id, request_id, control) in
+            [(71, 8, Control::EndVad), (0, 9, Control::Shutdown)]
+        {
+            write_frame(
+                &mut input,
+                &control_frame(session_id, request_id, &control).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                parse_worker_control(read_frame(&mut output).unwrap())
+                    .unwrap()
+                    .2,
+                Control::Ok
+            ));
         }
         assert!(child.wait().unwrap().success());
     }
@@ -3274,6 +4125,85 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn vad_and_transcription_supervisors_own_independent_transports() {
+        let transcription_launcher = Arc::new(TestLauncher::new([TestMode::Normal]));
+        let vad_launcher = Arc::new(TestLauncher::new([TestMode::VadNormal]));
+        let transcription = test_supervisor(transcription_launcher.clone());
+        let vad_transport = test_supervisor(vad_launcher.clone());
+        assert!(!Arc::ptr_eq(&transcription.inner, &vad_transport.inner));
+        let vad = SileroVadWorkerSupervisor::with_transport(vad_transport);
+
+        transcription.health(1, 1).unwrap();
+        vad.health(2, 1).unwrap();
+        assert_eq!(transcription_launcher.launches.load(Ordering::Acquire), 1);
+        assert_eq!(vad_launcher.launches.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn crashed_vad_window_loses_current_session_and_recovers_on_new_generation() {
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::VadCrashOnWindow,
+            TestMode::VadNormal,
+        ]));
+        let transport =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let vad = SileroVadWorkerSupervisor::with_transport(transport);
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let window = [0.1; WINDOW_SAMPLES];
+
+        vad.load(0, 1, 1).unwrap();
+        vad.start_session(101, 2, threshold).unwrap();
+        assert!(vad.compute(101, 3, &window).is_err());
+        assert!(vad.compute(101, 4, &window).is_err());
+
+        assert!(!vad.load(0, 5, 1).unwrap());
+        vad.start_session(202, 6, threshold).unwrap();
+        let decision = vad.compute(202, 7, &window).unwrap();
+        assert_eq!(decision.probability, 0.4);
+        assert!(!decision.speech);
+        assert!(vad.compute(101, 8, &window).is_err());
+        vad.end_session(202, 9).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
+    fn assert_vad_control_crash_retires_generation(mode: TestMode, fail_end: bool) {
+        let launcher = Arc::new(TestLauncher::new([mode, TestMode::VadNormal]));
+        let transport =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let vad = SileroVadWorkerSupervisor::with_transport(transport);
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let window = [0.1; WINDOW_SAMPLES];
+
+        vad.load(0, 1, 1).unwrap();
+        vad.start_session(301, 2, threshold).unwrap();
+        let failed = if fail_end {
+            vad.end_session(301, 3)
+        } else {
+            vad.reset(301, 3)
+        };
+        assert!(failed.is_err());
+        assert!(vad.compute(301, 4, &window).is_err());
+
+        vad.load(0, 5, 1).unwrap();
+        vad.start_session(302, 6, threshold).unwrap();
+        assert_eq!(vad.compute(302, 7, &window).unwrap().probability, 0.4);
+        vad.end_session(302, 8).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn reset_transport_failure_retires_vad_generation() {
+        assert_vad_control_crash_retires_generation(TestMode::VadCrashOnReset, false);
+    }
+
+    #[test]
+    fn end_transport_failure_retires_vad_generation() {
+        assert_vad_control_crash_retires_generation(TestMode::VadCrashOnEnd, true);
     }
 
     #[test]
