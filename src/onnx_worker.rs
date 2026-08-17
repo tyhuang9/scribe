@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use sherpa_onnx::{
     OfflineCanaryModelConfig, OfflineMoonshineModelConfig, OfflineNemoEncDecCtcModelConfig,
     OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, OnlineRecognizer,
-    OnlineRecognizerConfig, OnlineTransducerModelConfig,
+    OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
 use crate::transcription::{AccelerationPreference, ComputeDevice, ResolvedAcceleration};
@@ -350,6 +350,7 @@ enum Control {
     },
     Transcribe,
     StartStream,
+    AudioChunk,
     EndStream,
     Cancel {
         target_session_id: u64,
@@ -377,6 +378,7 @@ impl Control {
                 | Self::Load { .. }
                 | Self::Transcribe
                 | Self::StartStream
+                | Self::AudioChunk
                 | Self::EndStream
                 | Self::Cancel { .. }
                 | Self::Unload
@@ -536,11 +538,19 @@ struct CurrentGeneration {
     process: Arc<dyn WorkerProcess>,
 }
 
+#[derive(Clone, Copy)]
+struct SupervisorStream {
+    generation: u64,
+    session_id: u64,
+    last_request_id: u64,
+}
+
 #[derive(Default)]
 struct SupervisorState {
     next_generation: u64,
     current: Option<CurrentGeneration>,
     active_request: Option<Correlation>,
+    active_stream: Option<SupervisorStream>,
     active_model: Option<(u64, String)>,
 }
 
@@ -631,43 +641,7 @@ impl OnnxWorkerSupervisor {
     ) -> Result<String> {
         let pcm = encode_pcm(samples)?;
         let generation = self.ensure_generation()?;
-        let correlation = Correlation {
-            generation,
-            session_id,
-            request_id,
-        };
-        let response = self.register(correlation)?;
-        let active_error = match self.inner.state.lock() {
-            Ok(mut state)
-                if state
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.generation == generation) =>
-            {
-                if state.active_request.is_some() {
-                    Some(anyhow!("an ONNX transcription request is already active"))
-                } else {
-                    state.active_request = Some(correlation);
-                    None
-                }
-            }
-            Ok(_) => Some(anyhow!(
-                "ONNX worker generation {generation} is unavailable"
-            )),
-            Err(_) => Some(anyhow!("ONNX supervisor state lock was poisoned")),
-        };
-        if let Some(error) = active_error {
-            self.unregister(correlation);
-            return Err(error);
-        }
-        let control = match control_frame(session_id, request_id, &Control::Transcribe) {
-            Ok(control) => control,
-            Err(error) => {
-                self.unregister(correlation);
-                self.clear_active(correlation);
-                return Err(error);
-            }
-        };
+        let control = control_frame(session_id, request_id, &Control::Transcribe)?;
         let frames = [
             control,
             Frame {
@@ -677,12 +651,7 @@ impl OnnxWorkerSupervisor {
                 body: pcm,
             },
         ];
-        if let Err(error) = self.write_frames(generation, &frames) {
-            self.invalidate_generation(generation, &error.to_string(), true);
-        }
-        let result = self.await_response(response);
-        self.clear_active(correlation);
-        match result? {
+        match self.active_round_trip(generation, session_id, request_id, &frames)? {
             Control::Text {
                 text,
                 final_result: true,
@@ -697,6 +666,156 @@ impl OnnxWorkerSupervisor {
                 bail!("unexpected ONNX worker transcription response")
             }
         }
+    }
+
+    pub(crate) fn start_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
+        let generation = self.ensure_generation()?;
+        if self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .active_stream
+            .is_some()
+        {
+            bail!("an ONNX stream is already active");
+        }
+        let frame = control_frame(session_id, request_id, &Control::StartStream)?;
+        match self.active_round_trip(generation, session_id, request_id, &[frame])? {
+            Control::Ok => {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                if !state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+                {
+                    bail!("ONNX worker generation {generation} is unavailable");
+                }
+                state.active_stream = Some(SupervisorStream {
+                    generation,
+                    session_id,
+                    last_request_id: request_id,
+                });
+                Ok(())
+            }
+            Control::Error { message } => bail!("ONNX worker: {message}"),
+            _ => {
+                self.invalidate_generation(
+                    generation,
+                    "unexpected ONNX worker start-stream response",
+                    true,
+                );
+                bail!("unexpected ONNX worker start-stream response")
+            }
+        }
+    }
+
+    pub(crate) fn audio_chunk(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        samples: &[f32],
+    ) -> Result<String> {
+        let pcm = encode_pcm(samples)?;
+        let generation = self.ensure_generation()?;
+        self.require_stream(generation, session_id)?;
+        let frames = [
+            control_frame(session_id, request_id, &Control::AudioChunk)?,
+            Frame {
+                kind: FrameKind::Pcm,
+                session_id,
+                request_id,
+                body: pcm,
+            },
+        ];
+        match self.active_round_trip(generation, session_id, request_id, &frames)? {
+            Control::Text {
+                text,
+                final_result: false,
+            } => {
+                if let Ok(mut state) = self.inner.state.lock()
+                    && let Some(stream) = state.active_stream.as_mut()
+                    && stream.generation == generation
+                    && stream.session_id == session_id
+                {
+                    stream.last_request_id = request_id;
+                }
+                Ok(text)
+            }
+            Control::Error { message } => {
+                self.clear_stream(generation, session_id);
+                bail!("ONNX worker: {message}")
+            }
+            _ => {
+                self.invalidate_generation(
+                    generation,
+                    "unexpected ONNX worker audio-chunk response",
+                    true,
+                );
+                bail!("unexpected ONNX worker audio-chunk response")
+            }
+        }
+    }
+
+    pub(crate) fn end_stream(&self, session_id: u64, request_id: u64) -> Result<String> {
+        let generation = self.ensure_generation()?;
+        self.require_stream(generation, session_id)?;
+        let frame = control_frame(session_id, request_id, &Control::EndStream)?;
+        let response = self.active_round_trip(generation, session_id, request_id, &[frame]);
+        self.clear_stream(generation, session_id);
+        match response? {
+            Control::Text {
+                text,
+                final_result: true,
+            } => Ok(text),
+            Control::Error { message } => bail!("ONNX worker: {message}"),
+            _ => {
+                self.invalidate_generation(
+                    generation,
+                    "unexpected ONNX worker end-stream response",
+                    true,
+                );
+                bail!("unexpected ONNX worker end-stream response")
+            }
+        }
+    }
+
+    pub(crate) fn cancel_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
+        let (stream, active_request) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            let stream = state
+                .active_stream
+                .filter(|stream| stream.session_id == session_id)
+                .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))?;
+            (stream, state.active_request)
+        };
+        if let Some(active_request) = active_request {
+            if active_request.generation == stream.generation
+                && active_request.session_id == stream.session_id
+            {
+                return self.cancel_active();
+            }
+            bail!("another ONNX request is active");
+        }
+        self.round_trip_on_generation(
+            stream.generation,
+            session_id,
+            request_id,
+            Control::Cancel {
+                target_session_id: stream.session_id,
+                target_request_id: stream.last_request_id,
+            },
+        )?;
+        self.clear_stream(stream.generation, stream.session_id);
+        Ok(())
     }
 
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
@@ -718,6 +837,7 @@ impl OnnxWorkerSupervisor {
             .is_some_and(|current| current.generation == generation)
         {
             state.active_model = None;
+            state.active_stream = None;
         }
         Ok(())
     }
@@ -818,6 +938,7 @@ impl OnnxWorkerSupervisor {
                 generation,
                 process: Arc::clone(&process),
             });
+            state.active_stream = None;
             state.active_model = None;
             generation
         };
@@ -939,6 +1060,70 @@ impl OnnxWorkerSupervisor {
         }
     }
 
+    fn active_round_trip(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        frames: &[Frame],
+    ) -> Result<Control> {
+        let correlation = Correlation {
+            generation,
+            session_id,
+            request_id,
+        };
+        let response = self.register(correlation)?;
+        let active_error = match self.inner.state.lock() {
+            Ok(mut state)
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation) =>
+            {
+                if state.active_request.is_some() {
+                    Some(anyhow!("an ONNX transcription request is already active"))
+                } else {
+                    state.active_request = Some(correlation);
+                    None
+                }
+            }
+            Ok(_) => Some(anyhow!(
+                "ONNX worker generation {generation} is unavailable"
+            )),
+            Err(_) => Some(anyhow!("ONNX supervisor state lock was poisoned")),
+        };
+        if let Some(error) = active_error {
+            self.unregister(correlation);
+            return Err(error);
+        }
+        if let Err(error) = self.write_frames(generation, frames) {
+            self.invalidate_generation(generation, &error.to_string(), true);
+        }
+        let result = self.await_response(response);
+        self.clear_active(correlation);
+        result
+    }
+
+    fn require_stream(&self, generation: u64, session_id: u64) -> Result<SupervisorStream> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .active_stream
+            .filter(|stream| stream.generation == generation && stream.session_id == session_id)
+            .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))
+    }
+
+    fn clear_stream(&self, generation: u64, session_id: u64) {
+        if let Ok(mut state) = self.inner.state.lock()
+            && state.active_stream.is_some_and(|stream| {
+                stream.generation == generation && stream.session_id == session_id
+            })
+        {
+            state.active_stream = None;
+        }
+    }
+
     fn round_trip_on_generation(
         &self,
         generation: u64,
@@ -1026,6 +1211,7 @@ impl OnnxWorkerSupervisor {
             let process = Arc::clone(&current.process);
             state.current = None;
             state.active_request = None;
+            state.active_stream = None;
             state.active_model = None;
             process
         };
@@ -1069,6 +1255,7 @@ impl OnnxWorkerSupervisor {
             let current = state.current.take().unwrap();
             assert_eq!(current.generation, generation);
             state.active_request = None;
+            state.active_stream = None;
             state.active_model = None;
             current.process
         };
@@ -1168,64 +1355,410 @@ pub(crate) fn maybe_run_worker() -> Option<i32> {
 }
 
 fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
-    let mut loaded: Option<OnnxModelSpec> = None;
+    worker_loop_with_factory(&mut input, &mut output, &NativeRecognizerFactory)
+}
+
+trait WorkerRecognizerFactory {
+    type Recognizer: WorkerRecognizer;
+
+    fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer>;
+}
+
+trait WorkerRecognizer {
+    type Stream;
+
+    fn transcribe(&self, samples: &[f32]) -> Result<String>;
+    fn start_stream(&self) -> Result<Self::Stream>;
+    fn accept_chunk(&self, stream: &mut Self::Stream, samples: &[f32]) -> Result<()>;
+    fn input_finished(&self, stream: &mut Self::Stream) -> Result<()>;
+    fn drain_ready(&self, stream: &mut Self::Stream) -> Result<()>;
+    fn stream_result(&self, stream: &Self::Stream) -> Result<String>;
+}
+
+struct LoadedWorkerRecognizer<R> {
+    identity: String,
+    family: OnnxModelFamily,
+    recognizer: R,
+}
+
+struct ActiveWorkerStream<S> {
+    session_id: u64,
+    last_request_id: u64,
+    sample_count: usize,
+    stream: S,
+}
+
+fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
+    mut input: impl Read,
+    mut output: impl Write,
+    factory: &F,
+) -> Result<()> {
+    // This declaration order makes the stream drop before its recognizer on
+    // structural protocol failure. Normal replacement paths clear it explicitly.
+    let mut loaded: Option<LoadedWorkerRecognizer<F::Recognizer>> = None;
+    let mut active_stream: Option<ActiveWorkerStream<<F::Recognizer as WorkerRecognizer>::Stream>> =
+        None;
     loop {
         let frame = read_frame(&mut input)?;
         let (session_id, request_id, control) = parse_parent_control(frame)?;
         match control {
-            Control::Hello => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ready)?)?,
-            Control::Load { model } => { model.validate()?; loaded = Some(model); write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; }
-            Control::Health => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?,
-            Control::Unload => { loaded = None; write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; }
-            Control::Cancel { .. } => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?,
-            Control::Shutdown => { write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; return Ok(()); }
-            Control::Transcribe => match loaded.as_ref() {
-                None => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: "no ONNX model is loaded".into() })?)?,
-                Some(model) => {
-                    let pcm = read_frame(&mut input)?;
-                    if pcm.kind != FrameKind::Pcm || pcm.session_id != session_id || pcm.request_id != request_id {
-                        bail!("invalid or mis-correlated ONNX PCM frame");
+            Control::Hello => {
+                write_worker_response(&mut output, session_id, request_id, Control::Ready)?;
+            }
+            Control::Load { model } => {
+                let result = (|| {
+                    let identity = model.fingerprint()?;
+                    if loaded
+                        .as_ref()
+                        .is_some_and(|loaded| loaded.identity == identity)
+                    {
+                        return Ok(Control::Ok);
                     }
-                    match decode_pcm(&pcm.body).and_then(|samples| native_transcribe(model, &samples)) {
-                        Ok(text) => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Text { text, final_result: true })?)?,
-                        Err(error) => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: error.to_string() })?)?,
+                    if active_stream.is_some() {
+                        bail!("cannot replace an ONNX recognizer while a stream is active");
                     }
-                }
-            },
-            Control::StartStream | Control::EndStream => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: "streaming lifecycle is unavailable until an online ONNX variant is admitted".into() })?)?,
-            Control::Ready | Control::Text { .. } | Control::Ok | Control::Error { .. } => bail!("parent sent worker response"),
+                    let recognizer = factory.create(&model)?;
+                    loaded = Some(LoadedWorkerRecognizer {
+                        identity,
+                        family: model.family,
+                        recognizer,
+                    });
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::Health => {
+                write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
+            }
+            Control::Unload => {
+                active_stream = None;
+                loaded = None;
+                write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
+            }
+            Control::Cancel {
+                target_session_id,
+                target_request_id,
+            } => {
+                let result = match active_stream.as_ref() {
+                    Some(stream)
+                        if session_id == target_session_id
+                            && stream.session_id == target_session_id
+                            && stream.last_request_id == target_request_id =>
+                    {
+                        active_stream = None;
+                        Ok(Control::Ok)
+                    }
+                    _ => Err(anyhow!("no matching ONNX stream is active")),
+                };
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::Shutdown => {
+                drop(active_stream.take());
+                drop(loaded.take());
+                write_worker_response(&mut output, session_id, request_id, Control::Ok)?;
+                return Ok(());
+            }
+            Control::Transcribe => {
+                let samples = read_correlated_pcm(&mut input, session_id, request_id);
+                let result = samples.and_then(|samples| {
+                    if active_stream.is_some() {
+                        bail!("cannot run batch transcription while an ONNX stream is active");
+                    }
+                    let recognizer = loaded
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
+                    recognizer
+                        .recognizer
+                        .transcribe(&samples)
+                        .map(|text| Control::Text {
+                            text,
+                            final_result: true,
+                        })
+                });
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::StartStream => {
+                let result = (|| {
+                    let recognizer = loaded
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
+                    if recognizer.family != OnnxModelFamily::OnlineTransducer {
+                        bail!("streaming requires an online ONNX transducer");
+                    }
+                    if active_stream.is_some() {
+                        bail!("an ONNX stream is already active");
+                    }
+                    active_stream = Some(ActiveWorkerStream {
+                        session_id,
+                        last_request_id: request_id,
+                        sample_count: 0,
+                        stream: recognizer.recognizer.start_stream()?,
+                    });
+                    Ok(Control::Ok)
+                })();
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::AudioChunk => {
+                let samples = read_correlated_pcm(&mut input, session_id, request_id);
+                let result = match samples {
+                    Ok(samples) => handle_audio_chunk(
+                        loaded.as_ref(),
+                        &mut active_stream,
+                        session_id,
+                        request_id,
+                        &samples,
+                    )
+                    .map(|text| Control::Text {
+                        text,
+                        final_result: false,
+                    }),
+                    Err(error) => {
+                        if active_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.session_id == session_id)
+                        {
+                            active_stream = None;
+                        }
+                        Err(error)
+                    }
+                };
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::EndStream => {
+                let result = finish_worker_stream(loaded.as_ref(), &mut active_stream, session_id)
+                    .map(|text| Control::Text {
+                        text,
+                        final_result: true,
+                    });
+                write_worker_result(&mut output, session_id, request_id, result)?;
+            }
+            Control::Ready | Control::Text { .. } | Control::Ok | Control::Error { .. } => {
+                bail!("parent sent worker response")
+            }
         }
     }
 }
 
-/// Creates real sherpa-onnx safe API recognizers. This is intentionally kept
-/// in the child process: a native failure cannot take down the eframe process.
-fn native_transcribe(model: &OnnxModelSpec, samples: &[f32]) -> Result<String> {
-    validate_pcm_samples(samples)?;
-    if model.family == OnnxModelFamily::OnlineTransducer {
-        let mut config = OnlineRecognizerConfig::default();
-        config.model_config.provider = Some("cpu".into());
-        config.model_config.num_threads = i32::from(model.num_threads);
-        config.model_config.tokens = Some(model.path(OnnxFileRole::Tokens)?);
-        config.model_config.transducer = OnlineTransducerModelConfig {
-            encoder: Some(model.path(OnnxFileRole::Encoder)?),
-            decoder: Some(model.path(OnnxFileRole::Decoder)?),
-            joiner: Some(model.path(OnnxFileRole::Joiner)?),
-        };
-        let recognizer = OnlineRecognizer::create(&config)
-            .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU online recognizer"))?;
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(16_000, samples);
-        stream.input_finished();
-        while recognizer.is_ready(&stream) {
-            recognizer.decode(&stream);
+fn read_correlated_pcm(
+    input: &mut impl Read,
+    session_id: u64,
+    request_id: u64,
+) -> Result<Vec<f32>> {
+    let pcm = read_frame(input)?;
+    if pcm.kind != FrameKind::Pcm || pcm.session_id != session_id || pcm.request_id != request_id {
+        bail!("invalid or mis-correlated ONNX PCM frame");
+    }
+    decode_pcm(&pcm.body)
+}
+
+fn handle_audio_chunk<R: WorkerRecognizer>(
+    loaded: Option<&LoadedWorkerRecognizer<R>>,
+    active_stream: &mut Option<ActiveWorkerStream<R::Stream>>,
+    session_id: u64,
+    request_id: u64,
+    samples: &[f32],
+) -> Result<String> {
+    let recognizer = loaded.ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
+    if recognizer.family != OnnxModelFamily::OnlineTransducer {
+        bail!("streaming requires an online ONNX transducer");
+    }
+    let stream = active_stream
+        .as_mut()
+        .ok_or_else(|| anyhow!("no ONNX stream is active"))?;
+    if stream.session_id != session_id {
+        bail!("ONNX stream belongs to a different session");
+    }
+    let Some(sample_count) = stream.sample_count.checked_add(samples.len()) else {
+        *active_stream = None;
+        bail!("ONNX stream sample count overflowed");
+    };
+    if sample_count > MAX_AUDIO_SAMPLES {
+        *active_stream = None;
+        bail!("ONNX stream exceeds the {MAX_AUDIO_BYTES}-byte cumulative limit");
+    }
+    let result = recognizer
+        .recognizer
+        .accept_chunk(&mut stream.stream, samples)
+        .and_then(|()| recognizer.recognizer.drain_ready(&mut stream.stream))
+        .and_then(|()| recognizer.recognizer.stream_result(&stream.stream));
+    match result {
+        Ok(text) => {
+            stream.sample_count = sample_count;
+            stream.last_request_id = request_id;
+            Ok(text)
         }
-        return recognizer
-            .get_result(&stream)
-            .map(|result| result.text)
-            .ok_or_else(|| anyhow!("sherpa-onnx online recognizer returned no result"));
+        Err(error) => {
+            *active_stream = None;
+            Err(error)
+        }
+    }
+}
+
+fn finish_worker_stream<R: WorkerRecognizer>(
+    loaded: Option<&LoadedWorkerRecognizer<R>>,
+    active_stream: &mut Option<ActiveWorkerStream<R::Stream>>,
+    session_id: u64,
+) -> Result<String> {
+    let recognizer = loaded.ok_or_else(|| anyhow!("no ONNX model is loaded"))?;
+    if recognizer.family != OnnxModelFamily::OnlineTransducer {
+        bail!("streaming requires an online ONNX transducer");
+    }
+    if !active_stream
+        .as_ref()
+        .is_some_and(|stream| stream.session_id == session_id)
+    {
+        bail!("no ONNX stream is active for session {session_id}");
+    }
+    let mut stream = active_stream.take().expect("stream checked above");
+    recognizer
+        .recognizer
+        .input_finished(&mut stream.stream)
+        .and_then(|()| recognizer.recognizer.drain_ready(&mut stream.stream))
+        .and_then(|()| recognizer.recognizer.stream_result(&stream.stream))
+}
+
+fn write_worker_response(
+    output: &mut impl Write,
+    session_id: u64,
+    request_id: u64,
+    response: Control,
+) -> Result<()> {
+    write_frame(output, &control_frame(session_id, request_id, &response)?)
+}
+
+fn write_worker_result(
+    output: &mut impl Write,
+    session_id: u64,
+    request_id: u64,
+    result: Result<Control>,
+) -> Result<()> {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => Control::Error {
+            message: error.to_string(),
+        },
+    };
+    write_worker_response(output, session_id, request_id, response)
+}
+
+/// Real sherpa recognizers stay entirely inside the child process so a native
+/// failure cannot take down the eframe process.
+struct NativeRecognizerFactory;
+
+enum NativeRecognizer {
+    Offline { recognizer: OfflineRecognizer },
+    Online { recognizer: OnlineRecognizer },
+}
+
+impl WorkerRecognizerFactory for NativeRecognizerFactory {
+    type Recognizer = NativeRecognizer;
+
+    fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer> {
+        if model.family == OnnxModelFamily::OnlineTransducer {
+            let config = online_recognizer_config(model)?;
+            return OnlineRecognizer::create(&config)
+                .map(|recognizer| NativeRecognizer::Online { recognizer })
+                .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU online recognizer"));
+        }
+
+        let config = offline_recognizer_config(model)?;
+        OfflineRecognizer::create(&config)
+            .map(|recognizer| NativeRecognizer::Offline { recognizer })
+            .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU offline recognizer"))
+    }
+}
+
+impl WorkerRecognizer for NativeRecognizer {
+    type Stream = OnlineStream;
+
+    fn transcribe(&self, samples: &[f32]) -> Result<String> {
+        validate_pcm_samples(samples)?;
+        match self {
+            Self::Offline { recognizer } => {
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(16_000, samples);
+                recognizer.decode(&stream);
+                stream
+                    .get_result()
+                    .map(|result| result.text)
+                    .ok_or_else(|| anyhow!("sherpa-onnx offline recognizer returned no result"))
+            }
+            Self::Online { recognizer } => {
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(16_000, samples);
+                stream.input_finished();
+                decode_online_ready(recognizer, &stream);
+                Ok(recognizer
+                    .get_result(&stream)
+                    .map(|result| result.text)
+                    .unwrap_or_default())
+            }
+        }
     }
 
+    fn start_stream(&self) -> Result<Self::Stream> {
+        match self {
+            Self::Online { recognizer } => Ok(recognizer.create_stream()),
+            Self::Offline { .. } => bail!("streaming requires an online ONNX transducer"),
+        }
+    }
+
+    fn accept_chunk(&self, stream: &mut Self::Stream, samples: &[f32]) -> Result<()> {
+        validate_pcm_samples(samples)?;
+        let Self::Online { .. } = self else {
+            bail!("streaming requires an online ONNX transducer");
+        };
+        stream.accept_waveform(16_000, samples);
+        Ok(())
+    }
+
+    fn input_finished(&self, stream: &mut Self::Stream) -> Result<()> {
+        let Self::Online { .. } = self else {
+            bail!("streaming requires an online ONNX transducer");
+        };
+        stream.input_finished();
+        Ok(())
+    }
+
+    fn drain_ready(&self, stream: &mut Self::Stream) -> Result<()> {
+        let Self::Online { recognizer } = self else {
+            bail!("streaming requires an online ONNX transducer");
+        };
+        decode_online_ready(recognizer, stream);
+        Ok(())
+    }
+
+    fn stream_result(&self, stream: &Self::Stream) -> Result<String> {
+        let Self::Online { recognizer } = self else {
+            bail!("streaming requires an online ONNX transducer");
+        };
+        Ok(recognizer
+            .get_result(stream)
+            .map(|result| result.text)
+            .unwrap_or_default())
+    }
+}
+
+fn decode_online_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
+    while recognizer.is_ready(stream) {
+        recognizer.decode(stream);
+    }
+}
+
+fn online_recognizer_config(model: &OnnxModelSpec) -> Result<OnlineRecognizerConfig> {
+    let mut config = OnlineRecognizerConfig::default();
+    config.model_config.provider = Some("cpu".into());
+    config.model_config.num_threads = i32::from(model.num_threads);
+    config.model_config.tokens = Some(model.path(OnnxFileRole::Tokens)?);
+    config.model_config.transducer = OnlineTransducerModelConfig {
+        encoder: Some(model.path(OnnxFileRole::Encoder)?),
+        decoder: Some(model.path(OnnxFileRole::Decoder)?),
+        joiner: Some(model.path(OnnxFileRole::Joiner)?),
+    };
+    Ok(config)
+}
+
+fn offline_recognizer_config(model: &OnnxModelSpec) -> Result<OfflineRecognizerConfig> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.provider = Some("cpu".into());
     config.model_config.num_threads = i32::from(model.num_threads);
@@ -1278,17 +1811,11 @@ fn native_transcribe(model: &OnnxModelSpec, samples: &[f32]) -> Result<String> {
             };
             config.model_config.model_type = Some("nemo_transducer".into());
         }
-        OnnxModelFamily::OnlineTransducer => unreachable!(),
+        OnnxModelFamily::OnlineTransducer => {
+            bail!("online transducers require the online recognizer")
+        }
     }
-    let recognizer = OfflineRecognizer::create(&config)
-        .ok_or_else(|| anyhow!("sherpa-onnx failed to create CPU offline recognizer"))?;
-    let stream = recognizer.create_stream();
-    stream.accept_waveform(16_000, samples);
-    recognizer.decode(&stream);
-    stream
-        .get_result()
-        .map(|result| result.text)
-        .ok_or_else(|| anyhow!("sherpa-onnx offline recognizer returned no result"))
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1354,6 +1881,150 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct FakeRecognizerState {
+        create_attempts: usize,
+        recognizers_created: usize,
+        recognizer_drops: usize,
+        transcriptions: usize,
+        stream_starts: usize,
+        chunks_accepted: usize,
+        input_finished: usize,
+        drains: usize,
+        result_reads: usize,
+        stream_drops: usize,
+        offline_stream_backend_calls: usize,
+        events: Vec<String>,
+    }
+
+    struct FakeRecognizerFactory {
+        state: Arc<Mutex<FakeRecognizerState>>,
+    }
+
+    impl FakeRecognizerFactory {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeRecognizerState::default())),
+            }
+        }
+
+        fn snapshot(&self) -> FakeRecognizerState {
+            self.state.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeRecognizer {
+        id: String,
+        family: OnnxModelFamily,
+        state: Arc<Mutex<FakeRecognizerState>>,
+    }
+
+    struct FakeOnlineStream {
+        chunks: usize,
+        finished: bool,
+        state: Arc<Mutex<FakeRecognizerState>>,
+    }
+
+    impl Drop for FakeRecognizer {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.recognizer_drops += 1;
+            state.events.push(format!("drop-recognizer:{}", self.id));
+        }
+    }
+
+    impl Drop for FakeOnlineStream {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.stream_drops += 1;
+            state.events.push("drop-stream".to_owned());
+        }
+    }
+
+    impl WorkerRecognizerFactory for FakeRecognizerFactory {
+        type Recognizer = FakeRecognizer;
+
+        fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer> {
+            let mut state = self.state.lock().unwrap();
+            state.create_attempts += 1;
+            state.events.push(format!("create-attempt:{}", model.id));
+            if model.id.starts_with("fail-") {
+                bail!("fake recognizer construction failed for {}", model.id);
+            }
+            state.recognizers_created += 1;
+            state.events.push(format!("create:{}", model.id));
+            drop(state);
+            Ok(FakeRecognizer {
+                id: model.id.clone(),
+                family: model.family,
+                state: Arc::clone(&self.state),
+            })
+        }
+    }
+
+    impl FakeRecognizer {
+        fn require_online(&self) -> Result<()> {
+            if self.family == OnnxModelFamily::OnlineTransducer {
+                return Ok(());
+            }
+            self.state.lock().unwrap().offline_stream_backend_calls += 1;
+            bail!("fake offline recognizer cannot stream")
+        }
+    }
+
+    impl WorkerRecognizer for FakeRecognizer {
+        type Stream = FakeOnlineStream;
+
+        fn transcribe(&self, samples: &[f32]) -> Result<String> {
+            validate_pcm_samples(samples)?;
+            let mut state = self.state.lock().unwrap();
+            state.transcriptions += 1;
+            state.events.push(format!("transcribe:{}", self.id));
+            Ok(format!("batch:{}:{}", self.id, state.transcriptions))
+        }
+
+        fn start_stream(&self) -> Result<Self::Stream> {
+            self.require_online()?;
+            let mut state = self.state.lock().unwrap();
+            state.stream_starts += 1;
+            state.events.push("start-stream".to_owned());
+            drop(state);
+            Ok(FakeOnlineStream {
+                chunks: 0,
+                finished: false,
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn accept_chunk(&self, stream: &mut Self::Stream, samples: &[f32]) -> Result<()> {
+            self.require_online()?;
+            validate_pcm_samples(samples)?;
+            stream.chunks += 1;
+            self.state.lock().unwrap().chunks_accepted += 1;
+            Ok(())
+        }
+
+        fn input_finished(&self, stream: &mut Self::Stream) -> Result<()> {
+            self.require_online()?;
+            stream.finished = true;
+            self.state.lock().unwrap().input_finished += 1;
+            Ok(())
+        }
+
+        fn drain_ready(&self, _stream: &mut Self::Stream) -> Result<()> {
+            self.require_online()?;
+            self.state.lock().unwrap().drains += 1;
+            Ok(())
+        }
+
+        fn stream_result(&self, stream: &Self::Stream) -> Result<String> {
+            self.require_online()?;
+            self.state.lock().unwrap().result_reads += 1;
+            let stage = if stream.finished { "final" } else { "partial" };
+            Ok(format!("{stage}-{}", stream.chunks))
+        }
+    }
+
     struct TestProcess {
         running: AtomicBool,
         input: TestSender<PipeChunk>,
@@ -1398,6 +2069,10 @@ mod tests {
     enum TestMode {
         Normal,
         BlockedDecode {
+            started: TestSender<()>,
+        },
+        BlockedStreamOperation {
+            end_stream: bool,
             started: TestSender<()>,
         },
         HoldOne {
@@ -1535,7 +2210,7 @@ mod tests {
                 | Control::Cancel { .. }
                 | Control::Unload
                 | Control::Health => respond(output, session_id, request_id, Control::Ok),
-                Control::StartStream | Control::EndStream => respond(
+                Control::StartStream | Control::AudioChunk | Control::EndStream => respond(
                     output,
                     session_id,
                     request_id,
@@ -1559,6 +2234,29 @@ mod tests {
                 assert!(matches!(control, Control::Transcribe));
                 let pcm = read_frame(&mut input).unwrap();
                 assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                started.send(()).unwrap();
+                let _ = read_frame(&mut input);
+            }
+            TestMode::BlockedStreamOperation {
+                end_stream,
+                started,
+            } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::StartStream));
+                respond(&mut output, session_id, request_id, Control::Ok);
+
+                let (operation_session, operation_request, control) =
+                    read_parent_control(&mut input);
+                if end_stream {
+                    assert!(matches!(control, Control::EndStream));
+                } else {
+                    assert!(matches!(control, Control::AudioChunk));
+                    let pcm = read_frame(&mut input).unwrap();
+                    assert_eq!(
+                        (pcm.session_id, pcm.request_id),
+                        (operation_session, operation_request)
+                    );
+                }
                 started.send(()).unwrap();
                 let _ = read_frame(&mut input);
             }
@@ -1664,6 +2362,417 @@ mod tests {
         bytes
     }
 
+    fn append_control(input: &mut Vec<u8>, session_id: u64, request_id: u64, control: Control) {
+        write_frame(
+            input,
+            &control_frame(session_id, request_id, &control).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn append_pcm(input: &mut Vec<u8>, session_id: u64, request_id: u64, samples: &[f32]) {
+        write_frame(
+            input,
+            &Frame {
+                kind: FrameKind::Pcm,
+                session_id,
+                request_id,
+                body: samples
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn run_framed_fake_worker(
+        factory: &FakeRecognizerFactory,
+        input: Vec<u8>,
+    ) -> Vec<(u64, u64, Control)> {
+        let mut output = Vec::new();
+        worker_loop_with_factory(Cursor::new(input), &mut output, factory).unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        responses
+    }
+
+    fn assert_error(response: &(u64, u64, Control), text: &str) {
+        match &response.2 {
+            Control::Error { message } => assert!(
+                message.contains(text),
+                "expected error containing {text:?}, got {message:?}"
+            ),
+            other => panic!("expected worker error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn framed_worker_reuses_loaded_offline_recognizer_and_replaces_on_change() {
+        let root = test_root("worker-offline-reuse");
+        let first = spec_with_roles(&root, OnnxModelFamily::OfflineTransducer, TRANSDUCER_ROLES);
+        let first_id = first.id.clone();
+        let mut second = first.clone();
+        second.id = "second-offline".to_owned();
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::Load {
+                model: first.clone(),
+            },
+        );
+        append_control(
+            &mut input,
+            1,
+            2,
+            Control::Load {
+                model: first.clone(),
+            },
+        );
+        append_control(&mut input, 1, 3, Control::Transcribe);
+        append_pcm(&mut input, 1, 3, &[0.1]);
+        append_control(&mut input, 1, 4, Control::Transcribe);
+        append_pcm(&mut input, 1, 4, &[-0.1]);
+        append_control(
+            &mut input,
+            1,
+            5,
+            Control::Load {
+                model: second.clone(),
+            },
+        );
+        append_control(&mut input, 0, 6, Control::Unload);
+        append_control(&mut input, 1, 7, Control::Load { model: first });
+        append_control(&mut input, 0, 8, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert_eq!(responses.len(), 9);
+        assert!(matches!(responses[0].2, Control::Ready));
+        assert!(matches!(responses[1].2, Control::Ok));
+        assert!(matches!(responses[2].2, Control::Ok));
+        assert!(matches!(
+            responses[3].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            responses[4].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        assert!(responses[3].0 == 1 && responses[3].1 == 3);
+        assert!(responses[4].0 == 1 && responses[4].1 == 4);
+
+        let state = factory.snapshot();
+        assert_eq!(state.create_attempts, 3);
+        assert_eq!(state.recognizers_created, 3);
+        assert_eq!(state.transcriptions, 2);
+        assert_eq!(state.recognizer_drops, 3);
+        let create_second = state
+            .events
+            .iter()
+            .position(|event| event == "create:second-offline")
+            .unwrap();
+        let drop_first = state
+            .events
+            .iter()
+            .position(|event| event == &format!("drop-recognizer:{first_id}"))
+            .unwrap();
+        assert!(create_second < drop_first);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_changed_load_preserves_previous_recognizer_without_claiming_success() {
+        let root = test_root("worker-failed-load");
+        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let mut failing = first.clone();
+        failing.id = "fail-replacement".to_owned();
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(
+            &mut input,
+            1,
+            1,
+            Control::Load {
+                model: first.clone(),
+            },
+        );
+        append_control(&mut input, 1, 2, Control::Load { model: failing });
+        append_control(&mut input, 1, 3, Control::Transcribe);
+        append_pcm(&mut input, 1, 3, &[0.2]);
+        append_control(&mut input, 0, 4, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert_error(&responses[2], "construction failed");
+        match &responses[3].2 {
+            Control::Text {
+                text,
+                final_result: true,
+            } => assert!(text.contains(&first.id)),
+            other => panic!("expected retained recognizer transcription, got {other:?}"),
+        }
+        let state = factory.snapshot();
+        assert_eq!(state.create_attempts, 2);
+        assert_eq!(state.recognizers_created, 1);
+        assert_eq!(state.transcriptions, 1);
+        assert_eq!(state.recognizer_drops, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn framed_worker_rejects_all_stream_commands_for_offline_models() {
+        let root = test_root("worker-offline-stream");
+        let model = spec_with_roles(&root, OnnxModelFamily::Moonshine, MOONSHINE_MERGED_ROLES);
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 1, 1, Control::Load { model });
+        append_control(&mut input, 7, 2, Control::StartStream);
+        append_control(&mut input, 7, 3, Control::AudioChunk);
+        append_pcm(&mut input, 7, 3, &[0.1]);
+        append_control(&mut input, 7, 4, Control::EndStream);
+        append_control(&mut input, 0, 5, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert_error(&responses[2], "online ONNX transducer");
+        assert_error(&responses[3], "online ONNX transducer");
+        assert_error(&responses[4], "online ONNX transducer");
+        let state = factory.snapshot();
+        assert_eq!(state.offline_stream_backend_calls, 0);
+        assert_eq!(state.stream_starts, 0);
+        assert_eq!(state.chunks_accepted, 0);
+        assert_eq!(state.input_finished, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn framed_worker_runs_true_online_chunks_and_finalizes_once() {
+        let root = test_root("worker-online-stream");
+        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 2, 1, Control::Load { model });
+        append_control(&mut input, 9, 2, Control::StartStream);
+        append_control(&mut input, 9, 3, Control::AudioChunk);
+        append_pcm(&mut input, 9, 3, &[0.1, 0.2]);
+        append_control(&mut input, 9, 4, Control::AudioChunk);
+        append_pcm(&mut input, 9, 4, &[-0.1]);
+        append_control(&mut input, 9, 5, Control::EndStream);
+        append_control(&mut input, 2, 6, Control::Transcribe);
+        append_pcm(&mut input, 2, 6, &[0.3]);
+        append_control(&mut input, 0, 7, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert!(matches!(responses[2].2, Control::Ok));
+        for (response, expected) in [(&responses[3], "partial-1"), (&responses[4], "partial-2")] {
+            match &response.2 {
+                Control::Text {
+                    text,
+                    final_result: false,
+                } => assert_eq!(text, expected),
+                other => panic!("expected non-final partial, got {other:?}"),
+            }
+        }
+        match &responses[5].2 {
+            Control::Text {
+                text,
+                final_result: true,
+            } => assert_eq!(text, "final-2"),
+            other => panic!("expected final stream result, got {other:?}"),
+        }
+        assert!(matches!(
+            responses[6].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        let state = factory.snapshot();
+        assert_eq!(state.stream_starts, 1);
+        assert_eq!(state.chunks_accepted, 2);
+        assert_eq!(state.input_finished, 1);
+        assert_eq!(state.drains, 3);
+        assert_eq!(state.result_reads, 3);
+        assert_eq!(state.stream_drops, 1);
+        assert_eq!(state.transcriptions, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn framed_worker_rejects_bad_stream_order_without_corrupting_valid_stream() {
+        let root = test_root("worker-stream-order");
+        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 1, 1, Control::Load { model });
+        append_control(&mut input, 10, 2, Control::AudioChunk);
+        append_pcm(&mut input, 10, 2, &[0.1]);
+        append_control(&mut input, 10, 3, Control::EndStream);
+        append_control(&mut input, 10, 4, Control::StartStream);
+        append_control(&mut input, 11, 5, Control::StartStream);
+        append_control(&mut input, 11, 6, Control::AudioChunk);
+        append_pcm(&mut input, 11, 6, &[0.1]);
+        append_control(&mut input, 11, 7, Control::EndStream);
+        append_control(
+            &mut input,
+            10,
+            8,
+            Control::Cancel {
+                target_session_id: 10,
+                target_request_id: 999,
+            },
+        );
+        append_control(&mut input, 10, 9, Control::AudioChunk);
+        append_pcm(&mut input, 10, 9, &[0.2]);
+        append_control(&mut input, 10, 10, Control::EndStream);
+        append_control(&mut input, 0, 11, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert_error(&responses[2], "no ONNX stream");
+        assert_error(&responses[3], "no ONNX stream");
+        assert!(matches!(responses[4].2, Control::Ok));
+        assert_error(&responses[5], "already active");
+        assert_error(&responses[6], "different session");
+        assert_error(&responses[7], "session 11");
+        assert_error(&responses[8], "no matching");
+        assert!(matches!(
+            responses[9].2,
+            Control::Text {
+                final_result: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            responses[10].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        let state = factory.snapshot();
+        assert_eq!(state.stream_starts, 1);
+        assert_eq!(state.chunks_accepted, 1);
+        assert_eq!(state.input_finished, 1);
+        assert_eq!(state.stream_drops, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn framed_worker_cancel_matches_latest_stream_request_and_clears_stream() {
+        let root = test_root("worker-stream-cancel");
+        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 1, 1, Control::Load { model });
+        append_control(&mut input, 12, 2, Control::StartStream);
+        append_control(&mut input, 12, 3, Control::AudioChunk);
+        append_pcm(&mut input, 12, 3, &[0.1]);
+        append_control(
+            &mut input,
+            12,
+            4,
+            Control::Cancel {
+                target_session_id: 12,
+                target_request_id: 3,
+            },
+        );
+        append_control(&mut input, 12, 5, Control::EndStream);
+        append_control(&mut input, 0, 6, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert!(matches!(responses[4].2, Control::Ok));
+        assert_error(&responses[5], "no ONNX stream");
+        let state = factory.snapshot();
+        assert_eq!(state.stream_drops, 1);
+        assert_eq!(state.input_finished, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn framed_worker_rejects_invalid_pcm_before_fake_backend() {
+        let root = test_root("worker-invalid-pcm");
+        let model = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 1, 1, Control::Load { model });
+        append_control(&mut input, 14, 2, Control::StartStream);
+        append_control(&mut input, 14, 3, Control::AudioChunk);
+        append_pcm(&mut input, 14, 3, &[f32::NAN]);
+        append_control(&mut input, 1, 4, Control::Transcribe);
+        append_pcm(&mut input, 1, 4, &[1.01]);
+        append_control(&mut input, 0, 5, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert_error(&responses[3], "non-finite or outside");
+        assert_error(&responses[4], "non-finite or outside");
+        let state = factory.snapshot();
+        assert_eq!(state.chunks_accepted, 0);
+        assert_eq!(state.transcriptions, 0);
+        assert_eq!(state.stream_drops, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unload_and_shutdown_drop_stream_before_owning_recognizer() {
+        let root = test_root("worker-drop-order");
+        let first = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        let first_id = first.id.clone();
+        let mut second = first.clone();
+        second.id = "second-online".to_owned();
+        let factory = FakeRecognizerFactory::new();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 0, Control::Hello);
+        append_control(&mut input, 1, 1, Control::Load { model: first });
+        append_control(&mut input, 20, 2, Control::StartStream);
+        append_control(&mut input, 0, 3, Control::Unload);
+        append_control(&mut input, 1, 4, Control::Load { model: second });
+        append_control(&mut input, 21, 5, Control::StartStream);
+        append_control(&mut input, 0, 6, Control::Shutdown);
+
+        let responses = run_framed_fake_worker(&factory, input);
+        assert!(
+            responses
+                .iter()
+                .all(|response| !matches!(response.2, Control::Error { .. }))
+        );
+        let state = factory.snapshot();
+        assert_eq!(state.stream_drops, 2);
+        assert_eq!(state.recognizer_drops, 2);
+        let relevant = state
+            .events
+            .iter()
+            .filter(|event| event.starts_with("drop-"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant,
+            vec![
+                "drop-stream".to_owned(),
+                format!("drop-recognizer:{first_id}"),
+                "drop-stream".to_owned(),
+                "drop-recognizer:second-online".to_owned(),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn blocked_transcription_is_cancelled_within_250_milliseconds() {
         let (started_tx, started_rx) = channel();
@@ -1705,6 +2814,54 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
         drop(writer_guard);
         supervisor.health(42, 92).unwrap();
+    }
+
+    #[test]
+    fn blocked_stream_chunk_and_end_are_cancelled_and_reaped_within_250_milliseconds() {
+        for end_stream in [false, true] {
+            let (started_tx, started_rx) = channel();
+            let (kill_started_tx, kill_started_rx) = channel();
+            let (reaped_tx, reaped_rx) = channel();
+            let launcher = Arc::new(
+                TestLauncher::new([
+                    TestMode::BlockedStreamOperation {
+                        end_stream,
+                        started: started_tx,
+                    },
+                    TestMode::Normal,
+                ])
+                .with_process_events(kill_started_tx, reaped_tx),
+            );
+            let supervisor = test_supervisor(launcher);
+            supervisor.start_stream(33, 1).unwrap();
+
+            let operation_supervisor = supervisor.clone();
+            let operation = std::thread::spawn(move || {
+                if end_stream {
+                    operation_supervisor.end_stream(33, 2)
+                } else {
+                    operation_supervisor.audio_chunk(33, 2, &[0.1])
+                }
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let cancel_started = Instant::now();
+            supervisor.cancel_stream(33, 3).unwrap();
+            let error = operation.join().unwrap().unwrap_err();
+            kill_started_rx
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap();
+            let remaining = Duration::from_millis(250).saturating_sub(cancel_started.elapsed());
+            reaped_rx.recv_timeout(remaining).unwrap();
+            let cancel_and_reap_duration = cancel_started.elapsed();
+
+            assert!(
+                cancel_and_reap_duration <= Duration::from_millis(250),
+                "stream cancellation and reaping took {cancel_and_reap_duration:?}"
+            );
+            assert!(error.to_string().contains("cancelled"));
+            supervisor.health(34, 4).unwrap();
+        }
     }
 
     #[test]
