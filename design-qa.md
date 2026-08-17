@@ -216,7 +216,7 @@ final result: passed
 - Accessibility tests verify exact cancel naming, a contained 44 x 44 logical target, DPI-derived physical desktop bounds for every visible native node, non-live elapsed/tentative text, no phantom Compact timer, single-owner Compact/root announcements, and Live precedence of notice/error, committed transcript delta, then phase.
 - Foreground policy, stale-session rejection, pending/active abandonment, nonblocking worker drain, target retirement, and absence of final transcription/history/output are covered by automated tests.
 - Native tests cover ordered fail-closed presentation, atomic reset of both AccessKit trees before both HWNDs hide, pass-through/control profile separation, DIB sizing, fallible extreme-dimension allocation, premultiplication, real Phosphor glyph output, tooltip/control capability gating, WndProc panic containment/cleanup, AccessKit tree integrity, and session binding. Remediation-focused gates passed at `6d5492c`: native 31/31, overlay view 25/25, formatting, `git diff --check`, and strict all-target/all-feature Clippy.
-- The pre-remediation full branch gate at `f5dbdc0` discovered 954 tests, passed 943, failed 0, and ignored 11 explicit local runtime/fixture tests. A full-suite rerun at the remediated head remains the final integration gate; this design verdict relies on the focused regression gates and direct native evidence below.
+- The final clean-head gate at `6eae6b1` passed formatting, all-target/all-feature check, strict Clippy, base-to-head diff hygiene, and the Astro documentation check with 0 diagnostics. Its serialized all-target/all-feature suite discovered 963 tests, passed 952, failed 0, and ignored 11 explicit local runtime/fixture tests.
 
 ## Native Windows capture and interaction evidence
 
@@ -237,7 +237,7 @@ The same live fixture then had `WS_EX_LAYERED` removed from the display HWND to 
 
 ## Remaining physical release gates
 
-The deterministic fixture does not open a microphone, issue a real abandon action, or prove taskbar/Alt+Tab enumeration, Narrator/NVDA speech, tooltip dwell, physical pointer routing into an underlying third-party app, every top/bottom monitor edge, or a full mixed-DPI monitor matrix. Those checks remain required through UI-06, UI-08, UI-10, UI-11, REC-04, and the applicable output-target rows in `docs/MANUAL_TEST_MATRIX.md`. The full automated suite must also be rerun at `6d5492c` or its reviewed descendant before merge. These caveats do not block the native visual-fidelity verdict, but they remain release gates for the complete feature.
+The deterministic fixture does not open a microphone, issue a real abandon action, or prove taskbar/Alt+Tab enumeration, Narrator/NVDA speech, tooltip dwell, physical pointer routing into an underlying third-party app, every top/bottom monitor edge, or a full mixed-DPI monitor matrix. Those checks remain required through UI-06, UI-08, UI-10, UI-11, REC-04, and the applicable output-target rows in `docs/MANUAL_TEST_MATRIX.md`. These caveats do not block the native visual-fidelity verdict, but they remain release gates for the complete feature.
 
 final result: passed
 

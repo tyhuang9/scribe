@@ -1089,6 +1089,14 @@ impl Drop for Font {
 
 struct StringFormat(*mut GpStringFormat);
 
+fn configure_owned_resource<T, E>(
+    resource: T,
+    configure: impl FnOnce(&T) -> Result<(), E>,
+) -> Result<T, E> {
+    configure(&resource)?;
+    Ok(resource)
+}
+
 impl StringFormat {
     fn new() -> Result<Self, RasterError> {
         let mut format = null_mut();
@@ -1096,16 +1104,17 @@ impl StringFormat {
             unsafe { GdipStringFormatGetGenericTypographic(&mut format) },
             "create string format",
         )?;
-        status(
-            unsafe {
-                GdipSetStringFormatFlags(
-                    format,
-                    StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces,
-                )
-            },
-            "configure string format",
-        )?;
-        Ok(Self(format))
+        configure_owned_resource(Self(format), |format| {
+            status(
+                unsafe {
+                    GdipSetStringFormatFlags(
+                        format.0,
+                        StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces,
+                    )
+                },
+                "configure string format",
+            )
+        })
     }
 }
 
@@ -1293,7 +1302,7 @@ pub(super) enum RasterError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{cell::Cell, sync::Mutex};
 
     use super::*;
     use crate::{overlay::controller::OverlayAudioLevel, transcription::SessionId};
@@ -1440,6 +1449,22 @@ mod tests {
             LayeredFrame::transparent(i32::MAX, i32::MAX),
             Err(RasterError::InvalidDimensions)
         ));
+    }
+
+    #[test]
+    fn owned_resource_is_dropped_when_configuration_fails() {
+        struct DropProbe<'a>(&'a Cell<usize>);
+
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Cell::new(0);
+        let result = configure_owned_resource(DropProbe(&drops), |_| Err::<(), _>("injected"));
+        assert_eq!(result.err(), Some("injected"));
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]
