@@ -250,11 +250,9 @@ fn migrate_legacy_flat(
         config.recording.vad_enabled,
         diagnostics,
     );
-    config.recording.manual_activation_rms = take(
+    config.recording.speech_probability_threshold = take_speech_probability_threshold(
         &mut root,
-        "manual_activation_rms",
-        &[],
-        config.recording.manual_activation_rms,
+        config.recording.speech_probability_threshold,
         diagnostics,
     );
     config.recording.speech_confirmation_ms = take(
@@ -459,6 +457,30 @@ fn parse_general(
     }
 }
 
+fn take_speech_probability_threshold(
+    section: &mut Map<String, Value>,
+    default: f32,
+    diagnostics: &mut ParseDiagnostics,
+) -> f32 {
+    let has_current_value = section.contains_key("speech_probability_threshold");
+    let threshold = take(
+        section,
+        "speech_probability_threshold",
+        &[],
+        default,
+        diagnostics,
+    );
+    // Legacy RMS values have no meaningful probability conversion. Their
+    // presence migrates to the recommended threshold unless the new field is
+    // explicitly present.
+    section.remove("manual_activation_rms");
+    if has_current_value {
+        threshold
+    } else {
+        default
+    }
+}
+
 fn parse_recording(
     mut section: Map<String, Value>,
     diagnostics: &mut ParseDiagnostics,
@@ -494,11 +516,9 @@ fn parse_recording(
             defaults.vad_enabled,
             diagnostics,
         ),
-        manual_activation_rms: take(
+        speech_probability_threshold: take_speech_probability_threshold(
             &mut section,
-            "manual_activation_rms",
-            &[],
-            defaults.manual_activation_rms,
+            defaults.speech_probability_threshold,
             diagnostics,
         ),
         speech_confirmation_ms: take(
@@ -826,6 +846,7 @@ mod tests {
             "enabled_models": ["whisper_cpp_base_en"],
             "hotkey": "Alt+Space",
             "vad_enabled": false,
+            "manual_activation_rms": 0.031,
             "speech_confirmation_ms": 180,
             "internal_pause_ms": 520,
             "endpoint_silence_ms": 980,
@@ -843,6 +864,7 @@ mod tests {
         );
         assert_eq!(config.recording.hotkey, "Alt+Space");
         assert!(!config.recording.vad_enabled);
+        assert_eq!(config.recording.speech_probability_threshold, 0.5);
         assert_eq!(config.recording.speech_confirmation_ms, 180);
         assert_eq!(config.recording.internal_pause_ms, 520);
         assert_eq!(config.recording.endpoint_silence_ms, 980);
@@ -873,8 +895,8 @@ mod tests {
         assert_eq!(config.recording.pre_roll_ms, 250);
         assert_eq!(config.recording.post_roll_ms, 200);
         assert_eq!(
-            config.recording.manual_activation_rms,
-            RecordingSettings::default().manual_activation_rms
+            config.recording.speech_probability_threshold,
+            RecordingSettings::default().speech_probability_threshold
         );
         assert_eq!(config.output.paste_delay_ms, 75);
         assert_eq!(config.overlay.mode, OverlayMode::Live);
@@ -891,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_sensitivity_salvages_invalid_values_and_preserves_legacy_fields() {
+    fn legacy_rms_sensitivity_migrates_to_recommended_probability_threshold() {
         let (config, diagnostics) = parse_settings_value_with_diagnostics(json!({
             "schema_version": CURRENT_SCHEMA_VERSION,
             "recording": {
@@ -901,10 +923,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(
-            config.recording.manual_activation_rms,
-            RecordingSettings::default().manual_activation_rms
-        );
+        assert_eq!(config.recording.speech_probability_threshold, 0.5);
         assert_eq!(
             config.recording.unknown["future_microphone_option"],
             json!({"kept": true})
@@ -913,10 +932,37 @@ mod tests {
             config.recording.unknown["sensitivity_mode"],
             json!("not-a-mode")
         );
-        assert!(diagnostics.invalid_values_salvaged);
+        assert!(!diagnostics.invalid_values_salvaged);
         assert_eq!(
             serde_json::to_value(config).unwrap()["recording"]["future_microphone_option"],
             json!({"kept": true})
+        );
+    }
+
+    #[test]
+    fn current_probability_threshold_wins_over_legacy_rms_and_round_trips() {
+        let config = parse_settings_value(json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "recording": {
+                "speech_probability_threshold": 0.35,
+                "manual_activation_rms": 0.99
+            }
+        }));
+
+        assert_eq!(config.recording.speech_probability_threshold, 0.35);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert!(
+            (serialized["recording"]["speech_probability_threshold"]
+                .as_f64()
+                .unwrap()
+                - 0.35)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            serialized["recording"]
+                .get("manual_activation_rms")
+                .is_none()
         );
     }
 
@@ -1094,7 +1140,7 @@ mod tests {
         }));
 
         assert!(!config.recording.vad_enabled);
-        assert_eq!(config.recording.manual_activation_rms, 0.02);
+        assert_eq!(config.recording.speech_probability_threshold, 0.5);
         assert_eq!(config.recording.speech_confirmation_ms, 200);
         assert_eq!(config.recording.internal_pause_ms, 500);
         assert_eq!(config.recording.endpoint_silence_ms, 1000);
@@ -1106,13 +1152,14 @@ mod tests {
             json!({"mode": "adaptive"})
         );
         assert_eq!(serialized["recording"]["sensitivity_mode"], json!("manual"));
+        assert_eq!(
+            serialized["recording"]["speech_probability_threshold"],
+            json!(0.5)
+        );
         assert!(
-            (serialized["recording"]["manual_activation_rms"]
-                .as_f64()
-                .unwrap()
-                - 0.02)
-                .abs()
-                < 1e-8
+            serialized["recording"]
+                .get("manual_activation_rms")
+                .is_none()
         );
     }
 

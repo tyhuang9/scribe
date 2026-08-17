@@ -123,7 +123,7 @@ impl Fixture {
             duration_label: "30 seconds".into(),
             provisional_feedback: true,
             device_label: "Microphone (fifine Microphone)".into(),
-            input_sensitivity_percent: 38,
+            speech_detection_sensitivity_percent: 38,
             input_level_percent: 68,
             ..Default::default()
         };
@@ -780,8 +780,8 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
             data.settings.selected_audio_device = device.clone();
             data.settings.device_label = device.unwrap_or_else(|| "OS default".into());
         }
-        ScreenAction::SetInputSensitivity(percent) => {
-            data.settings.input_sensitivity_percent = percent;
+        ScreenAction::SetSpeechDetectionSensitivity(percent) => {
+            data.settings.speech_detection_sensitivity_percent = percent;
         }
         ScreenAction::RefreshDevices | ScreenAction::ChangeShortcut => {}
         ScreenAction::SetAutoInsertTranscript(value) => {
@@ -3094,10 +3094,10 @@ mod tests {
     #[test]
     fn settings_recording_fixture_contains_visible_live_meter_signal() {
         let data = Fixture::SettingsRecording.data();
-        assert_eq!(data.settings.input_sensitivity_percent, 38);
+        assert_eq!(data.settings.speech_detection_sensitivity_percent, 38);
         assert_eq!(data.settings.input_level_percent, 68);
         assert!(
-            data.settings.input_level_percent > data.settings.input_sensitivity_percent,
+            data.settings.input_level_percent > data.settings.speech_detection_sensitivity_percent,
             "the deterministic fixture should visibly cross the configured threshold"
         );
     }

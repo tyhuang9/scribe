@@ -883,13 +883,15 @@ pub fn normalize_config(config: &mut AppConfig) {
         .min(MAX_RECORDING_SECONDS);
     config.recording.speech_confirmation_ms =
         config.recording.speech_confirmation_ms.clamp(50, 1_000);
-    if !config.recording.manual_activation_rms.is_finite() {
-        config.recording.manual_activation_rms = settings::DEFAULT_MANUAL_ACTIVATION_RMS;
+    if !config.recording.speech_probability_threshold.is_finite() {
+        config.recording.speech_probability_threshold =
+            settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD;
     }
-    config.recording.manual_activation_rms = config.recording.manual_activation_rms.clamp(
-        settings::MIN_MANUAL_ACTIVATION_RMS,
-        settings::MAX_MANUAL_ACTIVATION_RMS,
-    );
+    config.recording.speech_probability_threshold =
+        config.recording.speech_probability_threshold.clamp(
+            settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
+            settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
+        );
     config.recording.internal_pause_ms = config
         .recording
         .internal_pause_ms
@@ -1367,20 +1369,27 @@ mod tests {
     }
 
     #[test]
-    fn manual_voice_activation_threshold_normalizes_to_the_supported_range() {
+    fn speech_probability_threshold_normalizes_to_the_supported_range() {
         let mut config = AppConfig::default();
-        config.recording.manual_activation_rms = f32::INFINITY;
+        config.recording.speech_probability_threshold = f32::INFINITY;
         normalize_config(&mut config);
         assert_eq!(
-            config.recording.manual_activation_rms,
-            settings::DEFAULT_MANUAL_ACTIVATION_RMS
+            config.recording.speech_probability_threshold,
+            settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
         );
 
-        config.recording.manual_activation_rms = 10.0;
+        config.recording.speech_probability_threshold = 10.0;
         normalize_config(&mut config);
         assert_eq!(
-            config.recording.manual_activation_rms,
-            settings::MAX_MANUAL_ACTIVATION_RMS
+            config.recording.speech_probability_threshold,
+            settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+        );
+
+        config.recording.speech_probability_threshold = -10.0;
+        normalize_config(&mut config);
+        assert_eq!(
+            config.recording.speech_probability_threshold,
+            settings::MIN_SPEECH_PROBABILITY_THRESHOLD
         );
     }
 

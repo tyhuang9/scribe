@@ -13,9 +13,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounde
 use thiserror::Error;
 
 use crate::config;
-use crate::config::settings::{
-    DEFAULT_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS, MIN_MANUAL_ACTIVATION_RMS,
-};
 use crate::prepared_audio::PreparedAudio;
 use crate::streaming::PreviewAudioPublisher;
 
@@ -34,6 +31,9 @@ pub(super) const MIN_INPUT_SAMPLE_RATE: u32 = 8_000;
 pub(super) const MAX_INPUT_SAMPLE_RATE: u32 = 384_000;
 pub(super) const MAX_INPUT_CHANNELS: u16 = 32;
 pub(crate) const MIN_SPEECH_ACTIVATION_RMS: f32 = 0.012;
+pub(crate) const DEFAULT_MANUAL_ACTIVATION_RMS: f32 = 0.007_943_282;
+pub(super) const MIN_MANUAL_ACTIVATION_RMS: f32 = 0.000_251_188_64;
+pub(super) const MAX_MANUAL_ACTIVATION_RMS: f32 = 1.0;
 const FAULT_NONE: u8 = 0;
 const FAULT_OVERFLOW: u8 = 1;
 const FAULT_STREAM: u8 = 2;
@@ -127,7 +127,10 @@ pub enum CaptureIntent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sensitivity {
     Automatic,
-    Manual { activation_rms: f32 },
+    #[allow(dead_code)]
+    Manual {
+        activation_rms: f32,
+    },
 }
 
 impl Sensitivity {
@@ -293,6 +296,7 @@ pub struct RecordingSession {
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
     level_revision: Arc<AtomicU64>,
+    #[allow(dead_code)]
     manual_activation_threshold_bits: Arc<AtomicU32>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -329,6 +333,7 @@ impl RecordingSession {
         self.level_revision.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)]
     pub fn set_manual_activation_threshold(&self, activation_rms: f32) {
         if activation_rms.is_finite() {
             self.manual_activation_threshold_bits.store(

@@ -6,12 +6,10 @@ use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW_MS};
 
 use super::{
-    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LevelSnapshot,
-    MAX_CAPTURE_PREPARED_FRAMES, MIN_SPEECH_ACTIVATION_RMS, Sensitivity, VadOptions,
+    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, DEFAULT_MANUAL_ACTIVATION_RMS,
+    LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES, MAX_MANUAL_ACTIVATION_RMS,
+    MIN_MANUAL_ACTIVATION_RMS, MIN_SPEECH_ACTIVATION_RMS, Sensitivity, VadOptions,
     input_format_is_credible,
-};
-use crate::config::settings::{
-    DEFAULT_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS, MIN_MANUAL_ACTIVATION_RMS,
 };
 
 const VAD_FRAME_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
