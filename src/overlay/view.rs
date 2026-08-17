@@ -95,12 +95,13 @@ pub fn show_overlay_viewport(
             control_visible && control_hardened,
         ),
         |control_context, viewport_class| {
-            if control_visible && control_hardened && viewport_class == ViewportClass::Immediate {
-                if render_cancel_control(control_context) {
-                    if let Some(session_id) = state.session_id {
-                        action.set(Some(OverlayAction::Abandon(session_id)));
-                    }
-                }
+            if control_visible
+                && control_hardened
+                && viewport_class == ViewportClass::Immediate
+                && render_cancel_control(control_context)
+                && let Some(session_id) = state.session_id
+            {
+                action.set(Some(OverlayAction::Abandon(session_id)));
             }
         },
     );
