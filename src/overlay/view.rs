@@ -68,7 +68,13 @@ pub fn show_overlay_viewport(
     }
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg_attr(
+    target_os = "windows",
+    expect(
+        dead_code,
+        reason = "Windows dispatches to the native layered renderer; this fallback remains compiled for cross-platform contract tests"
+    )
+)]
 fn show_eframe_overlay_viewport(
     context: &egui::Context,
     state: &OverlayViewState,

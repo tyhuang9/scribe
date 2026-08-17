@@ -199,7 +199,7 @@ final result: passed
 ## Source and implementation scope
 
 - Visual source of truth: `C:\Users\huang\.codex\attachments\1262dc67-8414-4589-960b-16e952d23970\image-1.png` (1142 x 137 source pixels).
-- Reviewed implementation head: `69372d1` (`Remove obsolete native overlay seam helpers`), including native renderer commits `b208f1b`, `6507543`, `62b6d50`, and `bbc3994`.
+- Reviewed implementation source head: `69372d1` (`Remove obsolete native overlay seam helpers`), including native renderer commits `b208f1b`, `6507543`, `62b6d50`, and `bbc3994`.
 - Live target: a 600 x 62 logical-point bottom/top-center capsule with waveform, elapsed time, one divider, a one-line Unicode-grapheme-safe transcript/status tail, and a separately hardened 44 x 44 cancel viewport.
 - Compact target: a 320 x 52 logical-point status capsule without transcript preview.
 - Windows paints two UI-thread-owned top-level layered HWNDs from a premultiplied BGRA DIB through `UpdateLayeredWindow(ULW_ALPHA)`. The display is pass-through and nonactivating; only the separate cancel HWND accepts pointer input, without activation.
