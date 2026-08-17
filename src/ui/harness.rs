@@ -1194,20 +1194,19 @@ mod tests {
             assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
             assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
 
-            let inline_transcript = format!("{committed} {provisional}");
-            let bounds = node_matching(&output, |node| {
-                node.name() == Some(inline_transcript.as_str())
-            })
-            .bounds()
-            .expect("inline transcript label should expose bounds");
+            let bounds = node_matching(&output, |node| node.name() == Some(committed.as_str()))
+                .bounds()
+                .expect("inline transcript label should expose bounds");
             assert_bounds_within(bounds, panel, "wrapped inline transcript text");
             assert!(
                 bounds.y1 - bounds.y0 > 32.0,
                 "inline transcript label did not wrap: {bounds:?}"
             );
             assert!(
-                !node_names(&output).iter().any(|name| name == &provisional),
-                "provisional text should be appended to the committed transcript"
+                !node_names(&output)
+                    .iter()
+                    .any(|name| name.contains(&provisional)),
+                "provisional text should remain visual-only and outside live accessibility names"
             );
             for name in ["Clear", "Copy"] {
                 let bounds = node_matching(&output, |node| {

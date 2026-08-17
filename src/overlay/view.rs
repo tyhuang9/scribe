@@ -275,15 +275,24 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                 .stroke(Stroke::new(1.0, Color32::from_rgb(59, 70, 88)))
                 .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
-                    ui.set_min_size(ui.available_size());
-                    ui.set_max_width(
-                        (ui.available_width() - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
+                    let available = ui.available_size();
+                    let content_size = egui::vec2(
+                        (available.x - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
+                        available.y,
                     );
-                    render_status_row(ui, state);
-                    if state.mode == OverlayMode::Live {
-                        ui.add_space(8.0);
-                        render_live_content(ui, state);
-                    }
+                    ui.allocate_ui_with_layout(
+                        content_size,
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |content| {
+                            content.set_min_size(content_size);
+                            content.set_max_width(content_size.x);
+                            render_status_row(content, state);
+                            if state.mode == OverlayMode::Live {
+                                content.add_space(8.0);
+                                render_live_content(content, state);
+                            }
+                        },
+                    );
                 });
         });
 }
@@ -690,6 +699,48 @@ mod tests {
         );
         assert_eq!(control.x + control.width, 420);
         assert_eq!((control.width, control.height), (44, 44));
+    }
+
+    #[test]
+    fn display_content_stays_left_of_reserved_control_slot() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let state = OverlayViewState {
+            session_id: Some(SessionId(9)),
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Listening,
+            elapsed: Some(Duration::from_secs(5)),
+            transcript: super::super::controller::OverlayTranscript {
+                committed: "committed text".into(),
+                tentative: "tentative text".into(),
+                revision: 1,
+            },
+            ..Default::default()
+        };
+        let output = context.run(input, |context| render_overlay(context, &state));
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let boundary = f64::from(LIVE_WIDTH - CONTROL_SIZE - CONTROL_CONTENT_GAP);
+        for name in [
+            "Scribe is recording",
+            "0:05",
+            "Committed transcript: committed text. Tentative transcript: tentative text",
+        ] {
+            let bounds = nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()).flatten())
+                .unwrap_or_else(|| panic!("missing overlay node {name}"));
+            assert!(
+                bounds.x1 <= boundary,
+                "{name} overlaps control slot: {bounds:?}"
+            );
+        }
     }
 
     #[test]
