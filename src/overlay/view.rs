@@ -181,9 +181,14 @@ fn render_cancel_control(context: &egui::Context) -> bool {
         .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
         .show(context, |ui| {
             ui.centered_and_justified(|ui| {
-                let response = ui.add(
-                    egui::Button::new(egui::RichText::new(egui_phosphor::regular::X).size(20.0))
-                        .frame(false),
+                let response = ui.add_sized(
+                    ui.available_size(),
+                    egui::Button::new(
+                        egui::RichText::new(egui_phosphor::regular::X)
+                            .size(20.0)
+                            .color(Color32::WHITE),
+                    )
+                    .frame(false),
                 );
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(
@@ -283,10 +288,7 @@ fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
         ui.painter()
             .circle_filled(dot_rect.center(), 4.0, status_color);
 
-        let label = if matches!(
-            state.phase,
-            OverlayPhase::Preparing | OverlayPhase::Listening
-        ) {
+        let label = if state.phase == OverlayPhase::Listening {
             "Scribe is recording"
         } else {
             state.phase.label()
@@ -502,6 +504,10 @@ mod tests {
         assert_eq!(builder.title.as_deref(), Some(OVERLAY_CONTROL_WINDOW_TITLE));
         assert_eq!(builder.mouse_passthrough, Some(false));
         assert_eq!(builder.active, Some(false));
+        assert_eq!(
+            builder.inner_size,
+            Some(egui::vec2(CONTROL_SIZE, CONTROL_SIZE))
+        );
         let preparing = OverlayViewState {
             session_id: Some(SessionId(4)),
             phase: OverlayPhase::Preparing,

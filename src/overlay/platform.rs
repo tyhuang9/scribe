@@ -75,6 +75,21 @@ pub enum OverlayHardeningProfile {
     NonActivatingControl,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn hardened_overlay_ex_style(
+    current: isize,
+    no_activate: isize,
+    tool_window: isize,
+    transparent: isize,
+    profile: OverlayHardeningProfile,
+) -> isize {
+    let base = current | no_activate | tool_window;
+    match profile {
+        OverlayHardeningProfile::PassThroughDisplay => base | transparent,
+        OverlayHardeningProfile::NonActivatingControl => base & !transparent,
+    }
+}
+
 pub fn calculate_window_bounds(
     work_area: PhysicalWorkArea,
     dpi: u32,
@@ -456,18 +471,31 @@ mod imp {
         };
 
         let current_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-        let base_style = current_style | WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize;
-        let hardened_style = match profile {
-            OverlayHardeningProfile::PassThroughDisplay => base_style | WS_EX_TRANSPARENT as isize,
-            OverlayHardeningProfile::NonActivatingControl => base_style,
-        };
+        let hardened_style = hardened_overlay_ex_style(
+            current_style,
+            WS_EX_NOACTIVATE as isize,
+            WS_EX_TOOLWINDOW as isize,
+            WS_EX_TRANSPARENT as isize,
+            profile,
+        );
         if hardened_style != current_style {
             unsafe {
                 SetWindowLongPtrW(window, GWL_EXSTYLE, hardened_style);
             }
         }
         let applied_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-        if applied_style & hardened_style != hardened_style {
+        let profile_applied = match profile {
+            OverlayHardeningProfile::PassThroughDisplay => {
+                applied_style & WS_EX_TRANSPARENT as isize != 0
+            }
+            OverlayHardeningProfile::NonActivatingControl => {
+                applied_style & WS_EX_TRANSPARENT as isize == 0
+            }
+        };
+        if applied_style & (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            != (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            || !profile_applied
+        {
             return false;
         }
 
@@ -1031,6 +1059,33 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_hardening_clears_existing_transparency() {
+        let no_activate = 0b001;
+        let tool_window = 0b010;
+        let transparent = 0b100;
+        assert_eq!(
+            hardened_overlay_ex_style(
+                transparent,
+                no_activate,
+                tool_window,
+                transparent,
+                OverlayHardeningProfile::NonActivatingControl,
+            ),
+            no_activate | tool_window,
+        );
+        assert_eq!(
+            hardened_overlay_ex_style(
+                0,
+                no_activate,
+                tool_window,
+                transparent,
+                OverlayHardeningProfile::PassThroughDisplay,
+            ),
+            no_activate | tool_window | transparent,
+        );
+    }
 
     #[test]
     fn positions_top_center_with_negative_monitor_coordinates() {

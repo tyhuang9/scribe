@@ -4337,6 +4337,7 @@ impl LocalTranscriberApp {
             && pending.session_id == session_id
         {
             pending.abandon.store(true, Ordering::Release);
+            pending.cancellation.cancel();
             self.record_session_diagnostic(
                 session_id,
                 &pending.latency,
