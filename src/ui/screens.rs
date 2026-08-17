@@ -7279,10 +7279,12 @@ mod tests {
     };
 
     type AccessKitNodes = std::collections::HashMap<egui::accesskit::NodeId, egui::accesskit::Node>;
+    type OrphanedNodes = Vec<(egui::accesskit::NodeId, Option<String>)>;
     type IncrementalUpdateResult = (
         AccessKitNodes,
         egui::accesskit::NodeId,
-        Vec<(egui::accesskit::NodeId, Option<String>)>,
+        OrphanedNodes,
+        OrphanedNodes,
     );
 
     /// Mirrors the orphan-removal pass in AccessKit consumer 0.16.1. This is
@@ -7297,8 +7299,13 @@ mod tests {
             .iter()
             .cloned()
             .collect::<std::collections::HashMap<_, _>>();
+        let initial_ids = nodes
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         let mut orphans = std::collections::HashSet::new();
         let mut updated = std::collections::HashSet::new();
+        let mut added = std::collections::HashSet::new();
         let old_root = initial
             .tree
             .as_ref()
@@ -7316,8 +7323,13 @@ mod tests {
             for child in data.children() {
                 orphans.remove(child);
             }
-            if let Some(old) = nodes.insert(*id, data.clone()) {
+            let old = nodes.insert(*id, data.clone());
+            if initial_ids.contains(id) {
                 updated.insert(*id);
+            } else {
+                added.insert(*id);
+            }
+            if let Some(old) = old {
                 for child in old.children() {
                     if !data.children().contains(child) {
                         orphans.insert(*child);
@@ -7335,23 +7347,27 @@ mod tests {
                 pending.extend(node.children());
             }
         }
-        let orphaned_updated = updated
-            .intersection(&removed)
-            .map(|id| {
-                (
-                    *id,
-                    nodes
-                        .get(id)
-                        .and_then(|node| node.name())
-                        .map(str::to_owned),
-                )
-            })
-            .collect();
+        let named_orphans = |candidates: &std::collections::HashSet<egui::accesskit::NodeId>| {
+            candidates
+                .intersection(&removed)
+                .map(|id| {
+                    (
+                        *id,
+                        nodes
+                            .get(id)
+                            .and_then(|node| node.name())
+                            .map(str::to_owned),
+                    )
+                })
+                .collect::<OrphanedNodes>()
+        };
+        let orphaned_updated = named_orphans(&updated);
+        let orphaned_added = named_orphans(&added);
         for id in removed {
             nodes.remove(&id);
         }
         let root = update.tree.as_ref().map_or(old_root, |tree| tree.root);
-        (nodes, root, orphaned_updated)
+        (nodes, root, orphaned_updated, orphaned_added)
     }
 
     fn accesskit_is_descendant(
@@ -9418,9 +9434,10 @@ mod tests {
 
         let recording = render(SettingsTab::Recording);
         let advanced = render(SettingsTab::Advanced);
-        let (nodes, root, orphaned_updated) =
+        let (nodes, root, orphaned_updated, orphaned_added) =
             apply_accesskit_incremental_update(&recording, &advanced);
         assert_eq!(orphaned_updated, Vec::new());
+        assert_eq!(orphaned_added, Vec::new());
         let panel = nodes
             .iter()
             .find_map(|(id, node)| {
@@ -9552,21 +9569,48 @@ mod tests {
             ctx.run(raw_input(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show_route_scroll(ui, UiRoute::History, |ui| {
-                        history_page(
-                            ui,
-                            HistoryPageState {
-                                search: &mut search,
-                                records,
-                                has_more: false,
-                                loading,
-                                error: None,
-                                confirm_delete: None,
-                                work_active: false,
-                                playing: None,
-                                playback_stopping: false,
-                                armed_repaste: None,
-                                focus_search: false,
-                                focus_delete_confirmation: false,
+                        // Match the production History route's page header,
+                        // status slot, and body order before rendering cards.
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(ui.available_width(), 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.horizontal_top(|ui| {
+                                    let heading =
+                                        ui.label(RichText::new("History").size(30.0).strong());
+                                    ui.ctx().accesskit_node_builder(heading.id, |builder| {
+                                        builder.set_role(egui::accesskit::Role::Heading);
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label("Ready");
+                                        },
+                                    );
+                                });
+                                ui.add_space(2.0);
+                                let status = ui.label("Ready");
+                                ui.ctx().accesskit_node_builder(status.id, |builder| {
+                                    builder.set_live(egui::accesskit::Live::Polite);
+                                });
+                                ui.add_space(14.0);
+                                history_page(
+                                    ui,
+                                    HistoryPageState {
+                                        search: &mut search,
+                                        records,
+                                        has_more: false,
+                                        loading,
+                                        error: None,
+                                        confirm_delete: None,
+                                        work_active: false,
+                                        playing: None,
+                                        playback_stopping: false,
+                                        armed_repaste: None,
+                                        focus_search: false,
+                                        focus_delete_confirmation: false,
+                                    },
+                                );
                             },
                         );
                     });
@@ -9600,12 +9644,16 @@ mod tests {
                 ctx.enable_accesskit();
                 let source = render_source_route(&ctx, source_route);
                 let history = render_history(&ctx, records, loading);
-                let (nodes, _root, orphaned_updated) =
+                let (nodes, _root, orphaned_updated, orphaned_added) =
                     apply_accesskit_incremental_update(&source, &history);
 
                 assert!(
                     orphaned_updated.is_empty(),
                     "{source_route:?} -> {state_name} History reparented an updated AccessKit node: {orphaned_updated:?}"
+                );
+                assert!(
+                    orphaned_added.is_empty(),
+                    "{source_route:?} -> {state_name} History added and removed an AccessKit node in one update: {orphaned_added:?}"
                 );
                 assert!(
                     nodes
