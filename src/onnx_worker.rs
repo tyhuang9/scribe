@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sherpa_onnx::{
     OfflineCanaryModelConfig, OfflineMoonshineModelConfig, OfflineNemoEncDecCtcModelConfig,
     OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, OnlineRecognizer,
@@ -23,7 +24,6 @@ pub(crate) const PROTOCOL_VERSION: u8 = 1;
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
-const CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +63,9 @@ impl OnnxModelSpec {
         if self.id.trim().is_empty() || self.num_threads == 0 {
             bail!("ONNX model id and thread count must be non-empty/non-zero");
         }
+        let root = std::fs::canonicalize(&self.root)
+            .map_err(|error| anyhow!("ONNX model root is unavailable: {error}"))?;
+        reject_link_components(&self.root)?;
         let required: &[OnnxFileRole] = match self.family {
             OnnxModelFamily::Moonshine => &[OnnxFileRole::Encoder, OnnxFileRole::Tokens],
             OnnxModelFamily::NemoCtc => &[OnnxFileRole::Model, OnnxFileRole::Tokens],
@@ -94,11 +97,34 @@ impl OnnxModelSpec {
                 );
             }
             let path = self.root.join(relative);
-            if !path.is_file() {
+            reject_link_components(&path)?;
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|error| anyhow!("ONNX model {} file is unavailable: {error}", self.id))?;
+            if !canonical.starts_with(&root) || !canonical.is_file() {
                 bail!("ONNX model {} file is missing: {}", self.id, path.display());
             }
         }
+        if self.family == OnnxModelFamily::Moonshine {
+            let merged = self.files.contains_key(&OnnxFileRole::MergedDecoder);
+            let v1 = [
+                OnnxFileRole::Preprocessor,
+                OnnxFileRole::UncachedDecoder,
+                OnnxFileRole::CachedDecoder,
+            ]
+            .into_iter()
+            .all(|role| self.files.contains_key(&role));
+            if !merged && !v1 {
+                bail!(
+                    "Moonshine requires merged_decoder or preprocessor + uncached_decoder + cached_decoder"
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn fingerprint(&self) -> Result<String> {
+        self.validate()?;
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
 
     fn path(&self, role: OnnxFileRole) -> Result<String> {
@@ -107,6 +133,21 @@ impl OnnxModelSpec {
             .map(|path| self.root.join(path).to_string_lossy().into_owned())
             .ok_or_else(|| anyhow!("ONNX model {} missing {role:?}", self.id))
     }
+}
+
+fn reject_link_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.exists()
+            && std::fs::symlink_metadata(&current)?
+                .file_type()
+                .is_symlink()
+        {
+            bail!("ONNX path contains a symbolic link: {}", current.display());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +276,19 @@ pub(crate) struct OnnxWorkerClient {
 
 impl OnnxWorkerClient {
     pub(crate) fn spawn() -> Result<Self> {
+        let (child, stdin, stdout) = Self::spawn_process()?;
+        let mut client = Self {
+            child,
+            stdin,
+            stdout,
+            generation: 1,
+            active_model: None,
+        };
+        client.round_trip(0, 0, Control::Hello)?;
+        Ok(client)
+    }
+
+    fn spawn_process() -> Result<(Child, ChildStdin, ChildStdout)> {
         let executable = std::env::current_exe()?;
         let mut child = Command::new(executable)
             .arg("--onnx-worker")
@@ -250,15 +304,20 @@ impl OnnxWorkerClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ONNX worker stdout unavailable"))?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout,
-            generation: 1,
-            active_model: None,
-        };
-        client.round_trip(0, 0, Control::Hello)?;
-        Ok(client)
+        Ok((child, stdin, stdout))
+    }
+
+    fn ensure_worker(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            return Ok(());
+        }
+        let (child, stdin, stdout) = Self::spawn_process()?;
+        self.child = child;
+        self.stdin = stdin;
+        self.stdout = stdout;
+        self.generation = self.generation.saturating_add(1);
+        self.active_model = None;
+        self.round_trip(0, 0, Control::Hello)
     }
 
     pub(crate) fn load(
@@ -267,8 +326,9 @@ impl OnnxWorkerClient {
         request_id: u64,
         model: OnnxModelSpec,
     ) -> Result<bool> {
-        model.validate()?;
-        let reused = self.active_model.as_deref() == Some(&model.id);
+        self.ensure_worker()?;
+        let identity = model.fingerprint()?;
+        let reused = self.active_model.as_deref() == Some(&identity);
         if !reused {
             self.round_trip(
                 session_id,
@@ -277,7 +337,7 @@ impl OnnxWorkerClient {
                     model: model.clone(),
                 },
             )?;
-            self.active_model = Some(model.id);
+            self.active_model = Some(identity);
         }
         Ok(reused)
     }
@@ -288,29 +348,23 @@ impl OnnxWorkerClient {
         request_id: u64,
         samples: &[f32],
     ) -> Result<String> {
+        self.ensure_worker()?;
         self.send(session_id, request_id, Control::Transcribe)?;
         self.send_pcm(session_id, request_id, samples)?;
         self.await_text(session_id, request_id)
     }
 
     pub(crate) fn cancel(&mut self, session_id: u64, request_id: u64) -> Result<()> {
-        let deadline = Instant::now() + CANCEL_GRACE;
-        self.send(session_id, request_id, Control::Cancel)?;
-        while Instant::now() < deadline {
-            if let Ok((received_session, received_request, Control::Ok)) = self.receive() {
-                if received_session == session_id && received_request == request_id {
-                    return Ok(());
-                }
-            }
-        }
+        // Native offline decode is not interruptible. The process boundary is
+        // the cancellation mechanism: terminate without attempting a blocking
+        // receive, then lazily respawn on the next use.
         self.kill();
-        bail!(
-            "ONNX worker did not acknowledge cancellation within {} ms",
-            CANCEL_GRACE.as_millis()
-        )
+        let _ = (session_id, request_id);
+        Ok(())
     }
 
     pub(crate) fn unload(&mut self) -> Result<()> {
+        self.ensure_worker()?;
         self.round_trip(0, 0, Control::Unload)?;
         self.active_model = None;
         Ok(())

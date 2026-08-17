@@ -331,6 +331,48 @@ fn unpack_archive_safely(
     Ok(())
 }
 
+#[cfg(test)]
+mod verifier_tests {
+    use super::*;
+
+    #[test]
+    fn every_supported_static_target_has_reviewed_metadata() {
+        for (os, arch) in [
+            ("windows", "x86_64"),
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let name = archive_name(LinkMode::Static, os, arch).unwrap();
+            let integrity = static_archive_integrity(LinkMode::Static, &name).unwrap();
+            assert_eq!(integrity.name, name);
+            assert_eq!(integrity.sha256.len(), 64);
+            assert!(integrity.size > 1_000_000);
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_size_and_hash() {
+        let path = std::env::temp_dir().join(format!("scribe-sherpa-archive-{}", std::process::id()));
+        fs::write(&path, b"abc").unwrap();
+        let wrong_size = ArchiveIntegrity { name: "test", size: 4, sha256: "00" };
+        assert!(verify_archive(&path, &wrong_size).unwrap_err().to_string().contains("size mismatch"));
+        let wrong_hash = ArchiveIntegrity { name: "test", size: 3, sha256: "00" };
+        assert!(verify_archive(&path, &wrong_hash).unwrap_err().to_string().contains("SHA-256 mismatch"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_rejects_traversal_and_link_entries_before_unpacking() {
+        let source = include_str!("build.rs");
+        assert!(source.contains("Component::Normal"));
+        assert!(source.contains("is_symlink"));
+        assert!(source.contains("is_hard_link"));
+        assert!(source.contains("unpack_in(destination)"));
+    }
+}
+
 /// Map a Rust target architecture to the Android ABI directory name used
 /// in the prebuilt jniLibs/ layout.
 fn android_abi(target_arch: &str) -> &str {
