@@ -440,8 +440,7 @@ fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors
         } else {
             state.phase.label()
         };
-        let status = ui.label(RichText::new(label).strong().size(13.0).color(colors.text));
-        mark_polite_live_region(ui.ctx(), status.id);
+        ui.label(RichText::new(label).strong().size(13.0).color(colors.text));
         render_level_meter(ui, state, COMPACT_METER_WIDTH, colors);
 
         if let Some(elapsed) = state.elapsed {
@@ -846,12 +845,6 @@ fn is_left_binding_punctuation(character: char) -> bool {
         character,
         '.' | ',' | '!' | '?' | ':' | ';' | '%' | ')' | ']' | '}' | '…'
     )
-}
-
-fn mark_polite_live_region(context: &egui::Context, id: egui::Id) {
-    context.accesskit_node_builder(id, |builder| {
-        builder.set_live(egui::accesskit::Live::Polite);
-    });
 }
 
 fn phase_color(phase: OverlayPhase) -> Color32 {
@@ -1453,6 +1446,46 @@ mod tests {
                     .is_some_and(|name| name.contains("tentative words"))
             );
         }
+    }
+
+    #[test]
+    fn compact_overlay_defers_all_live_announcements_to_root() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let state = OverlayViewState {
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Listening,
+            transcript: super::super::controller::OverlayTranscript {
+                committed: "committed words".to_owned(),
+                revision: 1,
+                ..Default::default()
+            },
+            transcript_announcement: Some("Committed transcript: committed words".to_owned()),
+            ..OverlayViewState::default()
+        };
+
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| render_overlay(context, &state),
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("compact overlay should expose AccessKit");
+
+        assert!(update.nodes.iter().all(|(_, node)| node.live().is_none()));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Scribe is recording"))
+        );
     }
 
     #[test]

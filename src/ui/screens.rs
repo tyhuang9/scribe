@@ -8597,7 +8597,7 @@ mod tests {
     }
 
     #[test]
-    fn root_owns_live_transcript_when_overlay_does_not() {
+    fn enabled_root_announces_phase_and_committed_transcript() {
         let state = TranscriptionState {
             phase: TranscriptionPhase::Listening,
             selected_model_id: Some("base.en".into()),
@@ -8608,22 +8608,25 @@ mod tests {
         };
         let output = render_transcribe(&state, &[]);
         let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
-        let transcript_live_nodes = nodes
+        let polite_nodes = nodes
             .iter()
-            .filter(|(_, node)| {
-                node.live().is_some()
-                    && node
-                        .name()
-                        .is_some_and(|name| name.contains("committed words"))
-            })
-            .count();
+            .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+            .collect::<Vec<_>>();
 
-        assert_eq!(transcript_live_nodes, 1);
-        assert!(!nodes.iter().any(|(_, node)| {
-            node.live().is_some()
-                && node
-                    .name()
-                    .is_some_and(|name| name.contains("tentative words"))
+        assert_eq!(polite_nodes.len(), 2);
+        assert!(
+            polite_nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording"))
+        );
+        assert!(polite_nodes.iter().any(|(_, node)| {
+            node.name()
+                .is_some_and(|name| name.contains("committed words"))
+        }));
+        assert!(polite_nodes.iter().all(|(_, node)| {
+            !node
+                .name()
+                .is_some_and(|name| name.contains("tentative words"))
         }));
     }
 
