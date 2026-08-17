@@ -243,8 +243,8 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
     let palette = theme_palette(context);
     if context.style().visuals.dark_mode {
         OverlayColors {
-            // This tint is app-owned and deterministic; the optional DWM
-            // backdrop only contributes the frosted background behind it.
+            // This app-owned tint remains deterministic while its alpha lets
+            // the underlying desktop content show through.
             surface: Color32::from_rgba_unmultiplied(25, 31, 42, 218),
             border: Color32::from_rgba_unmultiplied(220, 229, 242, 76),
             inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 42),
@@ -369,7 +369,7 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                         );
                     });
             });
-            // The frosted surface must be painted before this subtle top edge;
+            // The translucent surface must be painted before this subtle top edge;
             // otherwise the frame fill would cover the highlight entirely.
             paint_capsule_inner_highlight(ui, capsule_rect, rounding, colors.inner_highlight);
         });
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn inner_highlight_is_painted_after_the_frosted_surface() {
+    fn inner_highlight_is_painted_after_the_translucent_surface() {
         let context = egui::Context::default();
         let colors = overlay_colors(&context);
         let output = context.run(
@@ -1087,7 +1087,7 @@ mod tests {
             .expect("overlay should paint its inner highlight");
         assert!(
             Some(highlight_index) == output.shapes.len().checked_sub(1),
-            "the inner highlight must be painted after the frosted surface and overlay content"
+            "the inner highlight must be painted after the translucent surface and overlay content"
         );
     }
 

@@ -90,15 +90,12 @@ fn hardened_overlay_ex_style(
     }
 }
 
-/// Acrylic is visual polish only: style hardening and non-activating placement
-/// remain authoritative even when the compositor does not support it.
-fn request_transient_backdrop_if_display<F, R>(profile: OverlayHardeningProfile, request: F)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn present_after_hardening<F>(hardening_applied: bool, present: F) -> bool
 where
-    F: FnOnce() -> R,
+    F: FnOnce() -> bool,
 {
-    if profile == OverlayHardeningProfile::PassThroughDisplay {
-        let _ = request();
-    }
+    hardening_applied && present()
 }
 
 pub fn calculate_window_bounds(
@@ -234,9 +231,6 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         BOOL, CloseHandle, FILETIME, HWND, LPARAM, POINT, RECT, STILL_ACTIVE,
     };
-    use windows_sys::Win32::Graphics::Dwm::{
-        DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
-    };
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
     };
@@ -256,7 +250,7 @@ mod imp {
     use super::{
         CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
         OverlayWindowSpec, PhysicalWorkArea, TargetIdentity, calculate_window_bounds,
-        hardened_overlay_ex_style, request_transient_backdrop_if_display,
+        hardened_overlay_ex_style, present_after_hardening,
     };
 
     trait CapturedTargetProbe {
@@ -507,31 +501,17 @@ mod imp {
                 applied_style & WS_EX_TRANSPARENT as isize == 0
             }
         };
-        if applied_style & (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
-            != (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
-            || !profile_applied
-        {
-            return false;
-        }
-
-        request_transient_backdrop_if_display(profile, || {
-            let backdrop = DWMSBT_TRANSIENTWINDOW;
-            let _ = unsafe {
-                DwmSetWindowAttribute(
-                    window,
-                    DWMWA_SYSTEMBACKDROP_TYPE as u32,
-                    (&backdrop as *const i32).cast::<c_void>(),
-                    size_of::<i32>() as u32,
-                )
-            };
-        });
+        let hardening_applied = applied_style
+            & (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            == (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            && profile_applied;
 
         let visibility_flag = if visible {
             SWP_SHOWWINDOW
         } else {
             SWP_HIDEWINDOW
         };
-        unsafe {
+        present_after_hardening(hardening_applied, || unsafe {
             SetWindowPos(
                 window,
                 HWND_TOPMOST,
@@ -541,7 +521,7 @@ mod imp {
                 bounds.height,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED | visibility_flag,
             ) != 0
-        }
+        })
     }
 
     pub(super) fn reduced_motion_preferred() -> bool {
@@ -1088,37 +1068,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_backdrop_failure_is_display_only_and_fail_soft() {
-        let mut display_attempted = false;
-        request_transient_backdrop_if_display(OverlayHardeningProfile::PassThroughDisplay, || {
-            display_attempted = true;
-            Err::<(), ()>(())
-        });
-        assert!(display_attempted);
+    fn painted_overlay_presentation_is_gated_only_by_hardening_and_placement() {
+        let mut placement_attempted = false;
+        assert!(!present_after_hardening(false, || {
+            placement_attempted = true;
+            true
+        }));
+        assert!(!placement_attempted);
 
-        let mut control_attempted = false;
-        request_transient_backdrop_if_display(
-            OverlayHardeningProfile::NonActivatingControl,
-            || {
-                control_attempted = true;
-                Err::<(), ()>(())
-            },
-        );
-        assert!(!control_attempted);
+        assert!(!present_after_hardening(true, || false));
+        assert!(present_after_hardening(true, || true));
+    }
 
-        let no_activate = 0b001;
-        let tool_window = 0b010;
-        let transparent = 0b100;
-        assert_eq!(
-            hardened_overlay_ex_style(
-                0,
-                no_activate,
-                tool_window,
-                transparent,
-                OverlayHardeningProfile::PassThroughDisplay,
-            ),
-            no_activate | tool_window | transparent,
-        );
+    #[test]
+    fn native_overlay_path_does_not_request_a_system_backdrop() {
+        let platform_source = include_str!("platform.rs");
+        let manifest = include_str!("../../Cargo.toml");
+
+        assert!(!platform_source.contains(concat!("Dwm", "SetWindowAttribute")));
+        assert!(!platform_source.contains(concat!("DWMWA_", "SYSTEMBACKDROP_TYPE")));
+        assert!(!manifest.contains(concat!("Win32_Graphics_", "Dwm")));
     }
 
     #[test]
