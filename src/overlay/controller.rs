@@ -271,6 +271,7 @@ impl OverlayController {
             return false;
         }
         self.state.phase = OverlayPhase::Error;
+        self.state.transcript_announcement = None;
         self.state.error = Some(OverlayError {
             message: message.into(),
             recovery,
@@ -398,6 +399,18 @@ mod tests {
             controller.state().notice.as_deref(),
             Some("Live preview stopped; final transcription continues.")
         );
+        assert!(controller.state().transcript_announcement.is_none());
+    }
+
+    #[test]
+    fn error_clears_stale_transcript_announcement() {
+        let mut controller = OverlayController::new(false);
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+        controller.update_transcript(SessionId(7), "stable", " draft", 1);
+        assert!(controller.state().transcript_announcement.is_some());
+
+        assert!(controller.show_error(SessionId(7), "Preview failed", OverlayRecovery::None));
+
         assert!(controller.state().transcript_announcement.is_none());
     }
 
