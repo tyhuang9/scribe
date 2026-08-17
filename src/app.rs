@@ -133,9 +133,9 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
             Duration::from_millis(config.recording.pre_roll_ms.into()),
             Duration::from_millis(config.recording.post_roll_ms.into()),
         ),
-        sensitivity: Sensitivity::Manual {
-            activation_rms: config.recording.manual_activation_rms,
-        },
+        // The persisted speech-probability threshold is not wired into capture
+        // until the Silero classifier replaces this legacy energy gate.
+        sensitivity: Sensitivity::Automatic,
         intent: CaptureIntent::Dictation,
     }
 }
@@ -147,30 +147,45 @@ fn rms_to_dbfs(rms: f32) -> f32 {
     (20.0 * rms.log10()).clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
 }
 
-fn dbfs_to_rms(dbfs: f32) -> f32 {
-    let dbfs = if dbfs.is_finite() {
-        dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS)
-    } else {
-        INPUT_LEVEL_MIN_DBFS
-    };
-    10.0_f32.powf(dbfs / 20.0).clamp(
-        config::settings::MIN_MANUAL_ACTIVATION_RMS,
-        config::settings::MAX_MANUAL_ACTIVATION_RMS,
-    )
-}
-
 fn dbfs_to_slider_position(dbfs: f32) -> f32 {
     ((dbfs.clamp(INPUT_LEVEL_MIN_DBFS, INPUT_LEVEL_MAX_DBFS) - INPUT_LEVEL_MIN_DBFS)
         / (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS))
         .clamp(0.0, 1.0)
 }
 
-fn slider_position_to_dbfs(position: f32) -> f32 {
-    INPUT_LEVEL_MIN_DBFS + position.clamp(0.0, 1.0) * (INPUT_LEVEL_MAX_DBFS - INPUT_LEVEL_MIN_DBFS)
-}
-
 fn rms_to_slider_position(rms: f32) -> f32 {
     dbfs_to_slider_position(rms_to_dbfs(rms))
+}
+
+fn sensitivity_fraction_to_speech_probability_threshold(fraction: f32) -> f32 {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+        - fraction
+            * (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+                - config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD))
+        .clamp(
+            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
+            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
+        )
+}
+
+fn speech_probability_threshold_to_sensitivity_fraction(threshold: f32) -> f32 {
+    let threshold = if threshold.is_finite() {
+        threshold.clamp(
+            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD,
+            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD,
+        )
+    } else {
+        config::settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
+    };
+    ((config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD - threshold)
+        / (config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
+            - config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD))
+        .clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug)]
@@ -288,8 +303,8 @@ fn no_speech_feedback_for_capture(
     )
 }
 
-fn diagnostic_activation_floor(config: &AppConfig) -> f32 {
-    config.recording.manual_activation_rms
+fn diagnostic_activation_floor(_config: &AppConfig) -> f32 {
+    audio::MIN_SPEECH_ACTIVATION_RMS
 }
 
 fn discard_recording_async(session: RecordingSession) {
@@ -4121,20 +4136,6 @@ impl LocalTranscriberApp {
             })
     }
 
-    fn apply_input_sensitivity_threshold(&mut self) {
-        let threshold = self.config.recording.manual_activation_rms;
-        if let Some(active) = self.active_recording.as_mut() {
-            active.session.set_manual_activation_threshold(threshold);
-            active.capture_diagnostics.activation_floor = threshold;
-        }
-        if let Some(pending) = self.pending_recording.as_mut() {
-            pending.capture_diagnostics.activation_floor = threshold;
-        }
-        if let Some(session) = self.microphone_test.session() {
-            session.set_manual_activation_threshold(threshold);
-        }
-    }
-
     fn microphone_test_is_active(&self) -> bool {
         !matches!(self.microphone_test, MicrophoneTest::Idle)
     }
@@ -6266,9 +6267,6 @@ impl LocalTranscriberApp {
                                 self.microphone_test = MicrophoneTest::Stopping { session };
                             }
                             Ok(session) => {
-                                session.set_manual_activation_threshold(
-                                    self.config.recording.manual_activation_rms,
-                                );
                                 self.microphone_level_envelope.reset_source();
                                 self.microphone_test = MicrophoneTest::Active { session };
                             }
@@ -6307,9 +6305,6 @@ impl LocalTranscriberApp {
                     }
                     match result {
                         Ok(session) => {
-                            let threshold = self.config.recording.manual_activation_rms;
-                            session.set_manual_activation_threshold(threshold);
-                            pending.capture_diagnostics.activation_floor = threshold;
                             if let Err(err) = self.session_coordinator.capture_started(session_id) {
                                 session.stop();
                                 self.abandoned_capture_cleanups.push(
@@ -9561,7 +9556,7 @@ impl LocalTranscriberApp {
             | ScreenAction::SetDurationSeconds(_)
             | ScreenAction::ToggleProvisionalFeedback
             | ScreenAction::SetAudioDevice(_)
-            | ScreenAction::SetInputSensitivity(_)
+            | ScreenAction::SetSpeechDetectionSensitivity(_)
             | ScreenAction::RepairModelRuntime(_)
             | ScreenAction::MaintainModelRuntime(_)
             | ScreenAction::SetRemoteCatalogQuery(_)
@@ -11954,10 +11949,11 @@ impl LocalTranscriberApp {
                 .audio_input_device_name
                 .clone()
                 .unwrap_or_else(|| "OS default".to_owned()),
-            input_sensitivity_percent: (rms_to_slider_position(
-                self.config.recording.manual_activation_rms,
-            ) * 100.0)
-                .round() as u8,
+            speech_detection_sensitivity_percent:
+                (speech_probability_threshold_to_sensitivity_fraction(
+                    self.config.recording.speech_probability_threshold,
+                ) * 100.0)
+                    .round() as u8,
             input_level_percent,
             microphone_error: self.microphone_test_error.clone(),
             auto_insert_transcript: self.config.output.auto_insert_transcript,
@@ -12112,10 +12108,11 @@ impl LocalTranscriberApp {
                 self.microphone_level_envelope.reset_source();
                 self.save_config();
             }
-            ScreenAction::SetInputSensitivity(percent) => {
-                self.config.recording.manual_activation_rms =
-                    dbfs_to_rms(slider_position_to_dbfs(f32::from(percent) / 100.0));
-                self.apply_input_sensitivity_threshold();
+            ScreenAction::SetSpeechDetectionSensitivity(percent) => {
+                self.config.recording.speech_probability_threshold =
+                    sensitivity_fraction_to_speech_probability_threshold(
+                        f32::from(percent) / 100.0,
+                    );
                 self.save_config();
             }
             ScreenAction::RefreshDevices => self.refresh_audio_devices(),
@@ -15282,29 +15279,47 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_uses_its_threshold_for_low_input_feedback() {
+    fn speech_probability_setting_does_not_change_low_input_diagnostics() {
         let mut config = AppConfig::default();
-        config.recording.manual_activation_rms = 0.03;
+        config.recording.speech_probability_threshold = 0.2;
 
         let feedback = no_speech_feedback(
-            Some(0.02),
+            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 2.0),
             Some("Microphone Array"),
             diagnostic_activation_floor(&config),
         );
 
         assert!(feedback.status_message.contains("silent or too low"));
+        config.recording.speech_probability_threshold = 0.8;
+        assert_eq!(
+            diagnostic_activation_floor(&config),
+            audio::MIN_SPEECH_ACTIVATION_RMS
+        );
     }
 
     #[test]
-    fn sensitivity_slider_endpoints_remain_valid_capture_thresholds() {
-        assert!(
-            (dbfs_to_rms(INPUT_LEVEL_MIN_DBFS) - config::settings::MIN_MANUAL_ACTIVATION_RMS).abs()
-                < 1e-9
+    fn sensitivity_slider_inversely_maps_to_probability_threshold() {
+        assert_eq!(
+            sensitivity_fraction_to_speech_probability_threshold(0.0),
+            config::settings::MAX_SPEECH_PROBABILITY_THRESHOLD
         );
         assert_eq!(
-            dbfs_to_rms(INPUT_LEVEL_MAX_DBFS),
-            config::settings::MAX_MANUAL_ACTIVATION_RMS
+            sensitivity_fraction_to_speech_probability_threshold(0.5),
+            config::settings::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
         );
+        assert_eq!(
+            sensitivity_fraction_to_speech_probability_threshold(1.0),
+            config::settings::MIN_SPEECH_PROBABILITY_THRESHOLD
+        );
+        assert!(
+            sensitivity_fraction_to_speech_probability_threshold(0.75)
+                < sensitivity_fraction_to_speech_probability_threshold(0.25)
+        );
+        for fraction in [0.0_f32, 0.2, 0.5, 0.8, 1.0] {
+            let threshold = sensitivity_fraction_to_speech_probability_threshold(fraction);
+            let round_trip = speech_probability_threshold_to_sensitivity_fraction(threshold);
+            assert!((round_trip - fraction).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -15315,10 +15330,8 @@ mod layout_tests {
         assert_eq!(dbfs_to_slider_position(INPUT_LEVEL_MIN_DBFS), 0.0);
         assert_eq!(dbfs_to_slider_position(INPUT_LEVEL_MAX_DBFS), 1.0);
 
-        for position in [0.0_f32, 0.2, 0.5, 0.8, 1.0] {
-            let round_trip = dbfs_to_slider_position(slider_position_to_dbfs(position));
-            assert!((round_trip - position).abs() < 1e-6);
-        }
+        assert_eq!(rms_to_slider_position(0.0), 0.0);
+        assert_eq!(rms_to_slider_position(1.0), 1.0);
     }
 
     #[test]
@@ -15768,23 +15781,29 @@ mod layout_tests {
     }
 
     #[test]
-    fn no_speech_feedback_uses_capture_start_device_and_threshold_after_settings_drift() {
+    fn no_speech_feedback_uses_capture_start_device_and_fixed_level_floor() {
         let mut config = AppConfig::default();
-        config.recording.manual_activation_rms = 0.03;
+        config.recording.speech_probability_threshold = 0.2;
         config.recording.audio_input_device_name = Some("FIFINE A8".to_owned());
         let diagnostics = CaptureDiagnosticContext::from_config(&config);
 
-        config.recording.manual_activation_rms = 0.001;
+        config.recording.speech_probability_threshold = 0.8;
         config.recording.audio_input_device_name = Some("Different microphone".to_owned());
-        let feedback = no_speech_feedback_for_capture(Some(0.02), &diagnostics);
+        let feedback = no_speech_feedback_for_capture(
+            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 2.0),
+            &diagnostics,
+        );
 
-        assert_eq!(diagnostics.activation_floor, 0.03);
+        assert_eq!(
+            diagnostics.activation_floor,
+            audio::MIN_SPEECH_ACTIVATION_RMS
+        );
         assert_eq!(diagnostics.input_device_name.as_deref(), Some("FIFINE A8"));
         assert!(feedback.status_message.starts_with("FIFINE microphone"));
     }
 
     #[test]
-    fn live_input_sensitivity_updates_capture_diagnostics() {
+    fn speech_sensitivity_update_does_not_mutate_level_diagnostics() {
         let mut app = test_app();
         app.active_recording = Some(ActiveRecording {
             session_id: SessionId(901),
@@ -15806,8 +15825,7 @@ mod layout_tests {
             cancellation: CaptureCancellation::new(),
         });
 
-        app.config.recording.manual_activation_rms = 0.025;
-        app.apply_input_sensitivity_threshold();
+        app.apply_settings_screen_action(ScreenAction::SetSpeechDetectionSensitivity(100));
 
         assert_eq!(
             app.active_recording
@@ -15815,7 +15833,7 @@ mod layout_tests {
                 .unwrap()
                 .capture_diagnostics
                 .activation_floor,
-            0.025
+            audio::MIN_SPEECH_ACTIVATION_RMS
         );
         assert_eq!(
             app.pending_recording
@@ -15823,12 +15841,13 @@ mod layout_tests {
                 .unwrap()
                 .capture_diagnostics
                 .activation_floor,
-            0.025
+            audio::MIN_SPEECH_ACTIVATION_RMS
         );
+        assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
     }
 
     #[test]
-    fn capture_ready_adopts_the_latest_input_sensitivity() {
+    fn capture_ready_keeps_probability_setting_out_of_legacy_rms_gate() {
         let mut app = test_app();
         let session_id = app
             .session_coordinator
@@ -15843,7 +15862,7 @@ mod layout_tests {
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
             cancellation: CaptureCancellation::new(),
         });
-        app.config.recording.manual_activation_rms = 0.025;
+        app.config.recording.speech_probability_threshold = 0.2;
         app.tx
             .send(AppEvent::CaptureReady {
                 session_id,
@@ -15857,8 +15876,14 @@ mod layout_tests {
         app.poll_events();
 
         let active = app.active_recording.as_ref().unwrap();
-        assert_eq!(active.session.manual_activation_threshold(), 0.025);
-        assert_eq!(active.capture_diagnostics.activation_floor, 0.025);
+        assert_eq!(
+            active.session.manual_activation_threshold(),
+            audio::DEFAULT_MANUAL_ACTIVATION_RMS
+        );
+        assert_eq!(
+            active.capture_diagnostics.activation_floor,
+            audio::MIN_SPEECH_ACTIVATION_RMS
+        );
         app.stop_and_discard_active_recording();
     }
 
@@ -15886,14 +15911,9 @@ mod layout_tests {
         assert_eq!(options.vad.post_roll, Duration::from_millis(225));
         assert_eq!(options.intent, CaptureIntent::Dictation);
 
-        config.recording.manual_activation_rms = 0.025;
-        let manual = capture_options_from_config(&config);
-        assert_eq!(
-            manual.sensitivity,
-            Sensitivity::Manual {
-                activation_rms: 0.025
-            }
-        );
+        config.recording.speech_probability_threshold = 0.2;
+        let unchanged = capture_options_from_config(&config);
+        assert_eq!(unchanged.sensitivity, Sensitivity::Automatic);
     }
 
     #[test]
@@ -23279,14 +23299,14 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_is_the_only_accessible_microphone_testing_control() {
+    fn speech_detection_sensitivity_has_accessible_label_help_and_value_semantics() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         configure_stitch_style(&ctx);
         ctx.set_visuals(stitch_visuals(ThemeMode::Light));
         let mut app = test_app();
         app.current_tab = Tab::General;
-        app.settings_tab = SettingsTab::Recording;
+        app.settings_tab = SettingsTab::Advanced;
         app.playing_history_id = Some(1);
 
         let output = ctx.run(
@@ -23304,66 +23324,32 @@ mod layout_tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        assert!(
-            update
-                .nodes
-                .iter()
-                .any(|(_, node)| node.name() == Some("Recording input"))
-        );
-
-        let microphone_label_id = update
-            .nodes
-            .iter()
-            .find(|(_, node)| node.name() == Some("Device"))
-            .map(|(id, _)| *id)
-            .expect("missing Device label");
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::ComboBox
-                && node.labelled_by().contains(&microphone_label_id)
-        }));
-
         let sensitivity_label_id = update
             .nodes
             .iter()
             .find(|(_, node)| {
                 node.role() == egui::accesskit::Role::StaticText
-                    && node.name() == Some("Input level")
+                    && node.name() == Some("Speech detection sensitivity")
             })
             .map(|(id, _)| *id)
-            .expect("missing Input level label");
+            .expect("missing speech detection sensitivity label");
         let slider = update
             .nodes
             .iter()
             .map(|(_, node)| node)
             .find(|node| {
                 node.role() == egui::accesskit::Role::Slider
-                    && node.name() == Some("Input level sensitivity")
+                    && node.name() == Some("Speech detection sensitivity")
             })
-            .expect("missing accessible input sensitivity slider");
+            .expect("missing accessible speech detection sensitivity slider");
         assert!(slider.labelled_by().contains(&sensitivity_label_id));
         assert_eq!(slider.min_numeric_value(), Some(0.0));
         assert_eq!(slider.max_numeric_value(), Some(100.0));
         assert!(slider.numeric_value().is_some());
-        assert!(
-            slider
-                .description()
-                .is_some_and(|description| description.contains("Left and Right arrow keys"))
-        );
-
-        for forbidden in [
-            "Test microphone",
-            "Voice activation",
-            "Microphone input level",
-            "Voice detected",
-            "Clipping",
-        ] {
-            assert!(
-                !update
-                    .nodes
-                    .iter()
-                    .any(|(_, node)| node.name() == Some(forbidden))
-            );
-        }
+        assert!(slider.description().is_some_and(|description| {
+            description.contains("Left and Right arrow keys")
+                && description.contains("speech probability threshold")
+        }));
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name()
                 .is_some_and(|name| name.contains("dBFS") || name.contains("RMS"))
@@ -23371,7 +23357,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn input_sensitivity_avoids_live_meter_announcements_and_remains_usable() {
+    fn live_rms_meter_is_not_announced_as_speech_detection() {
         fn render(
             ctx: &egui::Context,
             app: &mut LocalTranscriberApp,
@@ -23404,18 +23390,18 @@ mod layout_tests {
             peak: 0.15,
         });
         let mut app = test_app();
-        app.settings_tab = SettingsTab::Recording;
+        app.settings_tab = SettingsTab::Advanced;
         app.microphone_test = MicrophoneTest::Active { session };
         let update = render(&ctx, &mut app);
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Slider
-                && node.name() == Some("Input level sensitivity")
+                && node.name() == Some("Speech detection sensitivity")
         }));
         assert!(update.nodes.iter().any(|(_, node)| {
             node.role() == egui::accesskit::Role::Slider
                 && node
                     .description()
-                    .is_some_and(|description| description.contains("Input detected"))
+                    .is_some_and(|description| description.contains("speech probability threshold"))
         }));
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.live().is_some()
@@ -23435,16 +23421,12 @@ mod layout_tests {
         app.microphone_test_error = Some("Microphone permission denied".to_owned());
         app.microphone_monitor_retry_required = true;
         let update = render(&ctx, &mut app);
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider
-                && node.name() == Some("Input level sensitivity")
-        }));
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider
-                && node
-                    .description()
-                    .is_some_and(|description| description.contains("No input detected"))
-        }));
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+        );
         assert!(!update.nodes.iter().any(|(_, node)| {
             node.name() == Some("Voice detected") || node.name() == Some("Clipping")
         }));

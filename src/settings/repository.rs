@@ -489,10 +489,10 @@ mod tests {
         let mut store = SettingsStore::new(path.clone(), Duration::from_secs(60));
         let mut first = AppConfig::default();
         first.recording.hotkey = "First".to_owned();
-        first.recording.manual_activation_rms = 0.01;
+        first.recording.speech_probability_threshold = 0.7;
         let mut latest = first.clone();
         latest.recording.hotkey = "Latest".to_owned();
-        latest.recording.manual_activation_rms = 0.025;
+        latest.recording.speech_probability_threshold = 0.35;
 
         store.schedule(&first);
         store.schedule(&latest);
@@ -503,7 +503,7 @@ mod tests {
 
         let persisted = load_from_path(&path).unwrap();
         assert_eq!(persisted.recording.hotkey, "Latest");
-        assert!((persisted.recording.manual_activation_rms - 0.025).abs() < f32::EPSILON);
+        assert!((persisted.recording.speech_probability_threshold - 0.35).abs() < f32::EPSILON);
         assert!(!store.flush().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
