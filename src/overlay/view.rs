@@ -2,30 +2,45 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 
-use super::controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState};
+use super::controller::{
+    OverlayMode, OverlayPhase, OverlayPresentation, OverlayRecovery, OverlayViewState,
+};
 use super::platform::{
     CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec, harden_overlay_window,
     overlay_window_bounds,
 };
+use crate::transcription::SessionId;
 
 pub const OVERLAY_VIEWPORT_KEY: &str = "scribe-dictation-overlay";
 pub const OVERLAY_WINDOW_TITLE: &str = "Scribe Dictation Overlay";
 
 const LIVE_WIDTH: f32 = 440.0;
 const LIVE_HEIGHT: f32 = 140.0;
-const MINIMAL_WIDTH: f32 = 276.0;
+const MINIMAL_WIDTH: f32 = 320.0;
 const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayAction {
+    Abandon(SessionId),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OverlayViewportOutput {
+    pub presented: bool,
+    pub action: Option<OverlayAction>,
+}
 
 pub fn show_overlay_viewport(
     context: &egui::Context,
     state: &OverlayViewState,
     target: Option<&CapturedTarget>,
     position: OverlayPosition,
-) {
+    presentation: OverlayPresentation,
+) -> OverlayViewportOutput {
     let spec = window_spec(state.mode);
     let bounds = overlay_window_bounds(target, spec, position);
-    let requested_visible = state.is_visible();
+    let requested_visible = state.is_visible() && presentation.permits_background_overlay();
     // A hidden viewport is created first. It is allowed to become visible only
     // after the native adapter verifies the no-activate/tool-window styles and
     // non-activating placement on the actual HWND.
@@ -51,8 +66,13 @@ pub fn show_overlay_viewport(
 
     let post_creation_hardened =
         harden_overlay_window(OVERLAY_WINDOW_TITLE, target, spec, position, visible);
+    let presented = visible && post_creation_hardened;
     if visible && !post_creation_hardened {
         context.send_viewport_cmd_to(overlay_viewport_id(), egui::ViewportCommand::Visible(false));
+    }
+    OverlayViewportOutput {
+        presented,
+        action: None,
     }
 }
 
@@ -138,11 +158,15 @@ fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
         ui.painter()
             .circle_filled(dot_rect.center(), 4.0, status_color);
 
-        let status = ui.label(
-            RichText::new(state.phase.label())
-                .strong()
-                .color(Color32::WHITE),
-        );
+        let label = if matches!(
+            state.phase,
+            OverlayPhase::Preparing | OverlayPhase::Listening
+        ) {
+            "Scribe is recording"
+        } else {
+            state.phase.label()
+        };
+        let status = ui.label(RichText::new(label).strong().color(Color32::WHITE));
         mark_polite_live_region(ui.ctx(), status.id);
 
         ui.add_space(6.0);
@@ -329,7 +353,7 @@ mod tests {
         let minimal = window_spec(OverlayMode::Minimal);
 
         assert_eq!((live.width_points, live.height_points), (440.0, 140.0));
-        assert_eq!((minimal.width_points, minimal.height_points), (276.0, 52.0));
+        assert_eq!((minimal.width_points, minimal.height_points), (320.0, 52.0));
     }
 
     #[test]

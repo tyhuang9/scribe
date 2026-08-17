@@ -4300,6 +4300,71 @@ impl LocalTranscriberApp {
         }
     }
 
+    /// Records the first *actually hardened and visible* background overlay.
+    /// Suppressed foreground renders deliberately leave the metric unset.
+    fn record_overlay_presented(&mut self, session_id: Option<SessionId>) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if let Some(pending) = self.pending_recording.as_mut()
+            && pending.session_id == session_id
+            && pending.latency.overlay_visible_at.is_none()
+        {
+            pending.latency.overlay_visible_at = Some(Instant::now());
+        }
+        if let Some(active) = self.active_recording.as_mut()
+            && active.session_id == session_id
+            && active.latency.overlay_visible_at.is_none()
+        {
+            active.latency.overlay_visible_at = Some(Instant::now());
+        }
+    }
+
+    /// Cancels only the current capture phase.  Unlike `stop_recording`, this
+    /// path never dispatches final transcription or output.
+    fn abandon_recording(&mut self, session_id: SessionId) {
+        if self.session_coordinator.active_session_id() != Some(session_id)
+            || !matches!(
+                self.session_coordinator.phase(),
+                DictationPhase::StartingCapture | DictationPhase::Capturing
+            )
+        {
+            return;
+        }
+        if let Some(pending) = self.pending_recording.take()
+            && pending.session_id == session_id
+        {
+            pending.abandon.store(true, Ordering::Release);
+            self.record_session_diagnostic(
+                session_id,
+                &pending.latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
+        } else if let Some(active) = self.active_recording.take()
+            && active.session_id == session_id
+        {
+            self.record_session_diagnostic(
+                session_id,
+                &active.latency,
+                DiagnosticSessionOutcome::Cancelled,
+                None,
+            );
+            discard_recording_async(active.session);
+        } else {
+            return;
+        }
+        self.pending_output = None;
+        self.transcription_service.cancel_active();
+        let _ = self.begin_preview_drain(session_id, PreviewDrainAction::Cancel { session_id });
+        let _ = self.session_coordinator.cancel_active();
+        self.retire_captured_target(session_id);
+        let _ = self.overlay_controller.hide(session_id);
+        self.overlay_hide_at = None;
+        self.status = TranscriptionStatus::Idle;
+        self.status_message = "Recording discarded.".to_owned();
+    }
+
     fn finish_overlay_success(&mut self, session_id: SessionId) {
         if self
             .overlay_controller
@@ -4800,9 +4865,6 @@ impl LocalTranscriberApp {
             NativeOverlayMode::Off
         };
         self.begin_overlay_session(session_id, overlay_mode, captured_target);
-        if overlay_mode != NativeOverlayMode::Off {
-            latency.overlay_visible_at = Some(Instant::now());
-        }
 
         let max_duration_seconds = self.config.recording.max_recording_seconds;
         let input_device_name = self.config.recording.audio_input_device_name.clone();
@@ -9171,12 +9233,23 @@ impl eframe::App for LocalTranscriberApp {
         self.sync_overlay_state();
         let overlay_session_id = self.overlay_controller.state().session_id;
         let target = overlay_session_id.and_then(|id| self.captured_targets.get(&id));
-        overlay::show_overlay_viewport(
+        let overlay_output = overlay::show_overlay_viewport(
             ctx,
             self.overlay_controller.state(),
             target,
             native_overlay_position(self.config.overlay.position),
+            crate::overlay::OverlayPresentation {
+                focused: ctx.input(|input| input.viewport().focused),
+                minimized: ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+                hidden_to_tray: self.window_hidden_to_tray,
+            },
         );
+        if overlay_output.presented {
+            self.record_overlay_presented(overlay_session_id);
+        }
+        if let Some(overlay::OverlayAction::Abandon(session_id)) = overlay_output.action {
+            self.abandon_recording(session_id);
+        }
 
         let repaint_delay = self.next_repaint_delay();
         if self.window_hidden_to_tray

@@ -69,6 +69,12 @@ pub struct OverlayWindowBounds {
     pub height: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayHardeningProfile {
+    PassThroughDisplay,
+    NonActivatingControl,
+}
+
 pub fn calculate_window_bounds(
     work_area: PhysicalWorkArea,
     dpi: u32,
@@ -148,7 +154,25 @@ pub fn harden_overlay_window(
     position: OverlayPosition,
     visible: bool,
 ) -> bool {
-    imp::harden_overlay_window(exact_title, target, spec, position, visible)
+    harden_overlay_window_with_profile(
+        exact_title,
+        target,
+        spec,
+        position,
+        visible,
+        OverlayHardeningProfile::PassThroughDisplay,
+    )
+}
+
+pub fn harden_overlay_window_with_profile(
+    exact_title: &str,
+    target: Option<&CapturedTarget>,
+    spec: OverlayWindowSpec,
+    position: OverlayPosition,
+    visible: bool,
+    profile: OverlayHardeningProfile,
+) -> bool {
+    imp::harden_overlay_window(exact_title, target, spec, position, visible, profile)
 }
 
 pub fn reduced_motion_preferred() -> bool {
@@ -192,8 +216,8 @@ mod imp {
     };
 
     use super::{
-        CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec, PhysicalWorkArea,
-        TargetIdentity, calculate_window_bounds,
+        CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
+        OverlayWindowSpec, PhysicalWorkArea, TargetIdentity, calculate_window_bounds,
     };
 
     trait CapturedTargetProbe {
@@ -404,16 +428,18 @@ mod imp {
         spec: OverlayWindowSpec,
         position: OverlayPosition,
         visible: bool,
+        profile: OverlayHardeningProfile,
     ) -> bool {
         let Some(window) = find_current_process_window_by_exact_title(exact_title) else {
             return false;
         };
 
         let current_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-        let hardened_style = current_style
-            | WS_EX_NOACTIVATE as isize
-            | WS_EX_TOOLWINDOW as isize
-            | WS_EX_TRANSPARENT as isize;
+        let base_style = current_style | WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize;
+        let hardened_style = match profile {
+            OverlayHardeningProfile::PassThroughDisplay => base_style | WS_EX_TRANSPARENT as isize,
+            OverlayHardeningProfile::NonActivatingControl => base_style,
+        };
         if hardened_style != current_style {
             unsafe {
                 SetWindowLongPtrW(window, GWL_EXSTYLE, hardened_style);
@@ -920,7 +946,10 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
-    use super::{CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec};
+    use super::{
+        CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
+        OverlayWindowSpec,
+    };
 
     pub(super) fn capture_foreground_target() -> Option<CapturedTarget> {
         None
@@ -958,6 +987,7 @@ mod imp {
         _spec: OverlayWindowSpec,
         _position: OverlayPosition,
         _visible: bool,
+        _profile: OverlayHardeningProfile,
     ) -> bool {
         false
     }

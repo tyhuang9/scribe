@@ -6,11 +6,11 @@ mod view;
 // integration currently names only the controller, mode, and phase directly.
 #[allow(unused_imports)]
 pub use controller::{
-    OverlayAudioLevel, OverlayController, OverlayError, OverlayMode, OverlayPhase, OverlayRecovery,
-    OverlayTranscript, OverlayViewState,
+    OverlayAudioLevel, OverlayController, OverlayError, OverlayMode, OverlayPhase,
+    OverlayPresentation, OverlayRecovery, OverlayTranscript, OverlayViewState,
 };
 pub use platform::{
     CapturedTarget, OverlayPosition, capture_foreground_target,
     captured_target_application_identity, overlay_focus_safety_available, reduced_motion_preferred,
 };
-pub use view::show_overlay_viewport;
+pub use view::{OverlayAction, OverlayViewportOutput, show_overlay_viewport};
