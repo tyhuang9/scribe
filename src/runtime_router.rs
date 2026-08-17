@@ -104,6 +104,7 @@ pub(crate) struct RuntimeModel {
 pub(crate) enum RuntimeArtifact {
     Gguf(RuntimeModel),
     LegacyCompatibility(RuntimeModel),
+    #[allow(dead_code)]
     OnnxBundle(OnnxModelSpec),
 }
 
@@ -262,6 +263,7 @@ fn is_gguf_model(model: &RuntimeModel) -> bool {
 /// router deliberately keys the safe embedded route on the concrete GGUF
 /// artifact rather than on a display/catalog ID, so dynamic catalog entries
 /// use the same in-process engine as the bundled default.
+#[cfg(test)]
 fn runtime_kind_for_runtime_model(model: &RuntimeModel) -> Option<RuntimeKind> {
     is_gguf_model(model)
         .then_some(RuntimeKind::TranscribeCpp)
@@ -916,27 +918,25 @@ impl RuntimeRouter {
     pub(crate) fn unload_all(&self) -> Result<(), RuntimeError> {
         let mut state = self.inner.lock().map_err(|_| RuntimeError::Poisoned)?;
         let mut first_error = None;
-        if let Some(runtime) = state.transcribe_cpp.as_mut() {
-            if let Err(error) = SpeechEngine::unload(runtime) {
-                first_error = Some(RuntimeError::Engine(format!("{error:#}")));
-            }
+        if let Some(runtime) = state.transcribe_cpp.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
         }
         state.transcribe_cpp = None;
-        if let Some(runtime) = state.embedded.as_mut() {
-            if let Err(error) = SpeechEngine::unload(runtime)
-                && first_error.is_none()
-            {
-                first_error = Some(RuntimeError::Engine(format!("{error:#}")));
-            }
+        if let Some(runtime) = state.embedded.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+            && first_error.is_none()
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
         }
         state.embedded = None;
         state.embedded_model = None;
-        if let Some(runtime) = state.onnx.as_mut() {
-            if let Err(error) = SpeechEngine::unload(runtime)
-                && first_error.is_none()
-            {
-                first_error = Some(RuntimeError::Engine(format!("{error:#}")));
-            }
+        if let Some(runtime) = state.onnx.as_mut()
+            && let Err(error) = SpeechEngine::unload(runtime)
+            && first_error.is_none()
+        {
+            first_error = Some(RuntimeError::Engine(format!("{error:#}")));
         }
         state.onnx = None;
         match self.embedded_cancellation.lock() {
@@ -1174,6 +1174,7 @@ impl RouterState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transcribe_onnx(
         &mut self,
         model: OnnxModelSpec,

@@ -372,7 +372,7 @@ fn decode_pcm(body: &[u8]) -> Result<Vec<f32>> {
     if body.is_empty() {
         bail!("ONNX PCM must contain at least one sample");
     }
-    if body.len() % size_of::<f32>() != 0 {
+    if !body.len().is_multiple_of(size_of::<f32>()) {
         bail!("ONNX PCM byte length must be a multiple of four");
     }
     if body.len() > MAX_AUDIO_BYTES {
@@ -570,12 +570,11 @@ impl WorkerProcess for OsWorkerProcess {
             .child
             .lock()
             .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?;
-        if child.try_wait()?.is_none() {
-            if let Err(kill_error) = child.kill()
-                && child.try_wait()?.is_none()
-            {
-                return Err(anyhow!("could not terminate ONNX worker: {kill_error}"));
-            }
+        if child.try_wait()?.is_none()
+            && let Err(kill_error) = child.kill()
+            && child.try_wait()?.is_none()
+        {
+            return Err(anyhow!("could not terminate ONNX worker: {kill_error}"));
         }
         Ok(())
     }
@@ -772,10 +771,10 @@ impl OnnxWorkerSupervisor {
                     .state
                     .lock()
                     .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
-                if !state
+                if state
                     .current
                     .as_ref()
-                    .is_some_and(|current| current.generation == generation)
+                    .is_none_or(|current| current.generation != generation)
                 {
                     bail!("ONNX worker generation {generation} is unavailable");
                 }
@@ -993,12 +992,11 @@ impl OnnxWorkerSupervisor {
                 .filter(|stream| stream.session_id == session_id)
                 .map(|stream| stream.generation)
         });
-        if let Some(generation) = generation {
-            if let Err(error) =
+        if let Some(generation) = generation
+            && let Err(error) =
                 self.invalidate_generation(generation, "ONNX stream was abandoned", true)
-            {
-                eprintln!("could not retire abandoned ONNX stream generation: {error:#}");
-            }
+        {
+            eprintln!("could not retire abandoned ONNX stream generation: {error:#}");
         }
     }
 
@@ -1578,14 +1576,12 @@ impl Drop for SupervisorInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .current
             .take()
-        {
-            if let Err(error) = current
+            && let Err(error) = current
                 .process
                 .terminate()
                 .and_then(|()| current.process.wait())
-            {
-                eprintln!("ONNX worker shutdown failed: {error:#}");
-            }
+        {
+            eprintln!("ONNX worker shutdown failed: {error:#}");
         }
     }
 }
@@ -1860,9 +1856,9 @@ fn finish_worker_stream<R: WorkerRecognizer>(
     if recognizer.family != OnnxModelFamily::OnlineTransducer {
         bail!("streaming requires an online ONNX transducer");
     }
-    if !active_stream
+    if active_stream
         .as_ref()
-        .is_some_and(|stream| stream.session_id == session_id)
+        .is_none_or(|stream| stream.session_id != session_id)
     {
         bail!("no ONNX stream is active for session {session_id}");
     }

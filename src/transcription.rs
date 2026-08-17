@@ -2720,9 +2720,9 @@ mod tests {
 
         fn cancel_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
             let mut state = self.state.lock().unwrap();
-            if !state
+            if state
                 .stream
-                .is_some_and(|(active_session, _)| active_session == session_id)
+                .is_none_or(|(active_session, _)| active_session != session_id)
             {
                 anyhow::bail!("no matching fake ONNX stream");
             }
