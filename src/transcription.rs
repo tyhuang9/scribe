@@ -2758,6 +2758,20 @@ mod tests {
             self.changed.notify_all();
             Ok(())
         }
+
+        fn abandon_stream(&self, session_id: u64) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .stream
+                .is_some_and(|(active_session, _)| active_session == session_id)
+            {
+                state.stream = None;
+                state.stream_cancels += 1;
+            }
+        }
     }
 
     fn onnx_spec(label: &str, family: OnnxModelFamily) -> (PathBuf, OnnxModelSpec) {

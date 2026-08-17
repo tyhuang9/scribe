@@ -2,15 +2,15 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, ffi::OsString};
 
 #[path = "src/archive_verifier.rs"]
 mod archive_verifier;
 use archive_verifier::{
-    reviewed_static_archive_integrity, static_archive_name, unpack_archive_safely, verify_archive,
-    DynError,
+    activate_verified_archive, debug_escape_allowed, reviewed_static_archive_integrity,
+    static_archive_name, validate_static_library_layout, verify_archive, DynError,
 };
 
 const RELEASE_BASE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download";
@@ -57,6 +57,9 @@ fn try_main() -> Result<(), DynError> {
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
     let link_mode = resolve_link_mode()?;
+    if link_mode != LinkMode::Static {
+        return Err("Scribe's sherpa-onnx patch supports statically linked native archives only; the `shared` feature is rejected".into());
+    }
     let lib_dir = resolve_lib_dir(link_mode, &target_os, &target_arch)?;
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -89,7 +92,7 @@ fn resolve_link_mode() -> Result<LinkMode, DynError> {
     }
 
     if shared_enabled {
-        Ok(LinkMode::Shared)
+        Err("Scribe's sherpa-onnx patch rejects the `shared` feature; enable `static` only".into())
     } else {
         Ok(LinkMode::Static)
     }
@@ -102,6 +105,9 @@ fn resolve_lib_dir(
 ) -> Result<PathBuf, DynError> {
     if let Some(path) = env::var_os("SHERPA_ONNX_LIB_DIR") {
         let path = PathBuf::from(path);
+        if !debug_profile_escape_allowed(true) {
+            return Err("SHERPA_ONNX_LIB_DIR is an unverified developer override and is rejected in release builds".into());
+        }
         if !path.is_dir() {
             return Err(format!(
                 "SHERPA_ONNX_LIB_DIR does not exist or is not a directory: {}",
@@ -109,6 +115,11 @@ fn resolve_lib_dir(
             )
             .into());
         }
+        validate_static_library_layout(&path, target_os, SHERPA_ONNX_STATIC_LIBS)?;
+        println!(
+            "cargo:warning=Using unverified debug-only SHERPA_ONNX_LIB_DIR override: {}",
+            path.display()
+        );
         return Ok(path);
     }
 
@@ -126,19 +137,6 @@ fn download_prebuilt_libs(
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let cache_root = target_dir_from_out_dir(&out_dir)?.join("sherpa-onnx-prebuilt");
-    let extracted_dir = cache_root.join(archive_stem);
-    let lib_dir = extracted_dir.join("lib");
-
-    if lib_dir.is_dir() {
-        return Ok(lib_dir);
-    }
-
-    // Android archives use jniLibs/{abi}/ instead of lib/. Check both.
-    let android_lib_dir = extracted_dir.join("jniLibs").join(android_abi(target_arch));
-    if android_lib_dir.is_dir() {
-        return Ok(android_lib_dir);
-    }
-
     fs::create_dir_all(&cache_root)?;
 
     let archive_path = cache_root.join(&archive_name);
@@ -160,14 +158,21 @@ fn download_prebuilt_libs(
             let url = format!("{RELEASE_BASE_URL}/v{version}/{archive_name}");
             eprintln!("Downloading sherpa-onnx libs from {url}");
 
-            let response = ureq::builder()
-                .try_proxy_from_env(true)
-                .build()
-                .get(&url)
-                .call()
-                .map_err(|e| format!("Failed to download sherpa-onnx archive from {url}: {e}"))?;
+            let response = get_with_allowlisted_redirects(&url)?;
+            if let Some(length) = response.header("Content-Length") {
+                let length = length.parse::<u64>().map_err(|_| {
+                    format!("Invalid Content-Length for sherpa-onnx archive from {url}")
+                })?;
+                if length > integrity.size {
+                    return Err(format!(
+                        "sherpa-onnx download is larger than reviewed size: expected at most {}, got {length}",
+                        integrity.size
+                    )
+                    .into());
+                }
+            }
             let mut reader = response.into_reader();
-            write_reader_atomically(&mut reader, &archive_path)?;
+            write_reader_atomically_limited(&mut reader, &archive_path, integrity.size)?;
         } else {
             return Err(format!(
                 "sherpa-onnx archive {archive_name} is not cached; set SHERPA_ONNX_ARCHIVE_DIR to a reviewed local archive. Release builds never download native archives (debug-only downloads require SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD=1)."
@@ -183,58 +188,66 @@ fn download_prebuilt_libs(
         return Err(err);
     }
 
-    if extracted_dir.exists() {
-        fs::remove_dir_all(&extracted_dir)?;
-    }
-
-    let unpack_result = unpack_archive_safely(&archive_path, &cache_root, archive_stem);
-    if let Err(err) = unpack_result {
-        let _ = fs::remove_file(&archive_path);
-        let _ = fs::remove_dir_all(&extracted_dir);
-        return Err(format!(
-            "Failed to unpack cached archive {}: {err}",
-            archive_path.display()
-        )
-        .into());
-    }
-
-    if !lib_dir.is_dir() {
-        // Android archives use jniLibs/{abi}/ instead of lib/.
-        let android_lib_dir = extracted_dir.join("jniLibs").join(android_abi(target_arch));
-        if android_lib_dir.is_dir() {
-            eprintln!(
-                "Downloaded sherpa-onnx Android libs to {}",
-                android_lib_dir.display()
-            );
-            return Ok(android_lib_dir);
-        }
-        return Err(format!(
-            "Downloaded archive did not contain a lib directory: {}",
-            lib_dir.display()
-        )
-        .into());
-    }
-
-    eprintln!("Downloaded sherpa-onnx libs to {}", extracted_dir.display());
-
-    Ok(lib_dir)
+    activate_verified_archive(
+        &archive_path,
+        integrity,
+        &cache_root,
+        archive_stem,
+        target_os,
+        SHERPA_ONNX_STATIC_LIBS,
+    )
 }
 
 fn allow_debug_network_download() -> bool {
-    cfg!(debug_assertions)
-        && env::var("SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD").ok().as_deref() == Some("1")
+    debug_profile_escape_allowed(
+        env::var("SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD")
+            .ok()
+            .as_deref()
+            == Some("1"),
+    )
 }
 
-/// Map a Rust target architecture to the Android ABI directory name used
-/// in the prebuilt jniLibs/ layout.
-fn android_abi(target_arch: &str) -> &str {
-    match target_arch {
-        "aarch64" => "arm64-v8a",
-        "arm" => "armeabi-v7a",
-        "x86" => "x86",
-        "x86_64" => "x86_64",
-        _ => "arm64-v8a",
+fn debug_profile_escape_allowed(explicitly_enabled: bool) -> bool {
+    debug_escape_allowed(
+        &env::var("PROFILE").unwrap_or_default(),
+        cfg!(debug_assertions),
+        explicitly_enabled,
+    )
+}
+
+fn get_with_allowlisted_redirects(url: &str) -> Result<ureq::Response, DynError> {
+    let agent = ureq::builder()
+        .try_proxy_from_env(true)
+        .redirects(0)
+        .build();
+    let mut current = url.to_owned();
+    for _ in 0..=3 {
+        let response = agent
+            .get(&current)
+            .call()
+            .map_err(|error| format!("Failed to download sherpa-onnx archive from {current}: {error}"))?;
+        if !(300..400).contains(&response.status()) {
+            return Ok(response);
+        }
+        let location = response
+            .header("Location")
+            .ok_or("sherpa-onnx download redirect omitted Location")?;
+        if !is_allowlisted_release_url(location) {
+            return Err(format!("Rejected sherpa-onnx download redirect to {location}").into());
+        }
+        current = location.to_owned();
     }
+    Err("sherpa-onnx download exceeded three allowlisted redirects".into())
+}
+
+fn is_allowlisted_release_url(url: &str) -> bool {
+    [
+        "https://github.com/",
+        "https://objects.githubusercontent.com/",
+        "https://release-assets.githubusercontent.com/",
+    ]
+    .iter()
+    .any(|prefix| url.starts_with(prefix))
 }
 
 fn archive_name(
@@ -409,7 +422,7 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .file_name()
         .map(OsStr::to_os_string)
         .unwrap_or_else(|| OsString::from("tmp"));
-    temp_name.push(".part");
+    temp_name.push(format!(".part-{}", std::process::id()));
     path.with_file_name(temp_name)
 }
 
@@ -419,11 +432,21 @@ fn copy_file_atomically(src: &Path, dst: &Path) -> Result<(), DynError> {
         let _ = fs::remove_file(&temp_path);
     }
     fs::copy(src, &temp_path)?;
-    fs::rename(&temp_path, dst)?;
+    if let Err(error) = fs::rename(&temp_path, dst) {
+        let _ = fs::remove_file(&temp_path);
+        if dst.is_file() {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     Ok(())
 }
 
-fn write_reader_atomically(reader: &mut dyn io::Read, dst: &Path) -> Result<(), DynError> {
+fn write_reader_atomically_limited(
+    reader: &mut dyn io::Read,
+    dst: &Path,
+    expected_size: u64,
+) -> Result<(), DynError> {
     let temp_path = temp_path_for(dst);
     if temp_path.exists() {
         let _ = fs::remove_file(&temp_path);
@@ -431,11 +454,33 @@ fn write_reader_atomically(reader: &mut dyn io::Read, dst: &Path) -> Result<(), 
 
     {
         let mut file = File::create(&temp_path)?;
-        io::copy(reader, &mut file)?;
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.saturating_add(read as u64);
+            if copied > expected_size {
+                drop(file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(
+                    format!("sherpa-onnx download exceeded reviewed size {expected_size}").into(),
+                );
+            }
+            file.write_all(&buffer[..read])?;
+        }
         file.sync_all()?;
     }
 
-    fs::rename(&temp_path, dst)?;
+    if let Err(error) = fs::rename(&temp_path, dst) {
+        let _ = fs::remove_file(&temp_path);
+        if dst.is_file() {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     Ok(())
 }
 

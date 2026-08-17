@@ -17,6 +17,7 @@ build = "build.rs"
 links = "sherpa-onnx"
 include = [
     "src/**",
+    "tests/**",
     "build.rs",
     "Cargo.toml",
     "README.md",
