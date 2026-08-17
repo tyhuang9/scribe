@@ -175,6 +175,15 @@ pub fn harden_overlay_window_with_profile(
     imp::harden_overlay_window(exact_title, target, spec, position, visible, profile)
 }
 
+pub fn harden_overlay_window_at(
+    exact_title: &str,
+    bounds: OverlayWindowBounds,
+    visible: bool,
+    profile: OverlayHardeningProfile,
+) -> bool {
+    imp::harden_overlay_window_at(exact_title, bounds, visible, profile)
+}
+
 pub fn reduced_motion_preferred() -> bool {
     imp::reduced_motion_preferred()
 }
@@ -430,6 +439,18 @@ mod imp {
         visible: bool,
         profile: OverlayHardeningProfile,
     ) -> bool {
+        let Some(bounds) = overlay_window_bounds(target, spec, position) else {
+            return false;
+        };
+        harden_overlay_window_at(exact_title, bounds, visible, profile)
+    }
+
+    pub(super) fn harden_overlay_window_at(
+        exact_title: &str,
+        bounds: OverlayWindowBounds,
+        visible: bool,
+        profile: OverlayHardeningProfile,
+    ) -> bool {
         let Some(window) = find_current_process_window_by_exact_title(exact_title) else {
             return false;
         };
@@ -450,9 +471,6 @@ mod imp {
             return false;
         }
 
-        let Some(bounds) = overlay_window_bounds(target, spec, position) else {
-            return false;
-        };
         let visibility_flag = if visible {
             SWP_SHOWWINDOW
         } else {
@@ -986,6 +1004,15 @@ mod imp {
         _target: Option<&CapturedTarget>,
         _spec: OverlayWindowSpec,
         _position: OverlayPosition,
+        _visible: bool,
+        _profile: OverlayHardeningProfile,
+    ) -> bool {
+        false
+    }
+
+    pub(super) fn harden_overlay_window_at(
+        _exact_title: &str,
+        _bounds: OverlayWindowBounds,
         _visible: bool,
         _profile: OverlayHardeningProfile,
     ) -> bool {

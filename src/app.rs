@@ -477,6 +477,7 @@ struct PendingRecording {
     latency: LatencyTrace,
     capture_diagnostics: CaptureDiagnosticContext,
     abandon: Arc<AtomicBool>,
+    cancellation: CaptureCancellation,
 }
 
 #[derive(Default)]
@@ -3927,6 +3928,7 @@ impl LocalTranscriberApp {
         }
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
+            pending.cancellation.cancel();
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -4906,6 +4908,7 @@ impl LocalTranscriberApp {
             }
         }
         let abandon = Arc::new(AtomicBool::new(false));
+        let cancellation = CaptureCancellation::new();
         let capture_diagnostics = latency
             .capture_diagnostics
             .as_ref()
@@ -4919,6 +4922,7 @@ impl LocalTranscriberApp {
             latency,
             capture_diagnostics,
             abandon: abandon.clone(),
+            cancellation: cancellation.clone(),
         });
         self.status = TranscriptionStatus::Listening;
         self.status_message =
@@ -4935,7 +4939,7 @@ impl LocalTranscriberApp {
                 input_device_name,
                 capture_options,
                 preview_publisher,
-                CaptureCancellation::new(),
+                cancellation,
             );
             if abandon.load(Ordering::Acquire) {
                 if let Ok(session) = result {
@@ -5011,6 +5015,7 @@ impl LocalTranscriberApp {
         }
         if let Some(pending) = self.pending_recording.take() {
             pending.abandon.store(true, Ordering::Release);
+            pending.cancellation.cancel();
             self.record_session_diagnostic(
                 pending.session_id,
                 &pending.latency,
@@ -11949,8 +11954,8 @@ impl LocalTranscriberApp {
             }
             ScreenAction::SetOverlayMode(value) => {
                 self.config.overlay.mode = match value.as_str() {
-                    "Live" => OverlayMode::Live,
-                    "Minimal" => OverlayMode::Minimal,
+                    "Live preview" => OverlayMode::Live,
+                    "Compact status" => OverlayMode::Minimal,
                     "Off" => OverlayMode::Off,
                     _ => return,
                 };
@@ -14794,6 +14799,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -14806,6 +14812,33 @@ mod layout_tests {
             Some(StopReason::Explicit)
         );
         assert_eq!(app.status_message, "Cancelling microphone startup");
+    }
+
+    #[test]
+    fn abandon_pending_capture_is_session_correlated_and_cancels_startup() {
+        let mut app = test_app();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let cancellation = CaptureCancellation::new();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: cancellation.clone(),
+        });
+        app.abandon_recording(SessionId(session_id.0 + 1));
+        assert!(!cancellation.is_cancelled());
+        app.abandon_recording(session_id);
+        assert!(cancellation.is_cancelled());
+        assert!(app.pending_recording.is_none());
+        assert_eq!(app.status_message, "Recording discarded.");
+        assert_eq!(app.session_coordinator.active_session_id(), None);
     }
 
     #[test]
@@ -14823,6 +14856,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
             capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
 
         app.stop_recording();
@@ -14879,6 +14913,7 @@ mod layout_tests {
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
                 abandon: Arc::new(AtomicBool::new(false)),
+                cancellation: CaptureCancellation::new(),
             });
             app.tx
                 .send(AppEvent::CaptureReady {
@@ -15094,6 +15129,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
         assert!(!app.passive_microphone_monitor_needed());
         app.pending_recording = None;
@@ -15168,6 +15204,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
         assert_fake_monitor_stops(capture);
     }
@@ -15193,6 +15230,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::default(),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
         assert_eq!(app.next_repaint_delay(), METER_REPAINT_DELAY);
     }
@@ -15474,6 +15512,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
 
         app.config.recording.manual_activation_rms = 0.025;
@@ -15512,6 +15551,7 @@ mod layout_tests {
             latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
             capture_diagnostics: CaptureDiagnosticContext::from_config(&app.config),
             abandon: Arc::new(AtomicBool::new(false)),
+            cancellation: CaptureCancellation::new(),
         });
         app.config.recording.manual_activation_rms = 0.025;
         app.tx
@@ -15605,6 +15645,7 @@ mod layout_tests {
                 latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
                 capture_diagnostics: CaptureDiagnosticContext::default(),
                 abandon: Arc::new(AtomicBool::new(false)),
+                cancellation: CaptureCancellation::new(),
             });
             let preload_event = AppEvent::ModelPreloadFinished {
                 session_id,

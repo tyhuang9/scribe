@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{cell::Cell, time::Duration};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
 
@@ -6,19 +6,22 @@ use super::controller::{
     OverlayMode, OverlayPhase, OverlayPresentation, OverlayRecovery, OverlayViewState,
 };
 use super::platform::{
-    CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec, harden_overlay_window,
-    overlay_window_bounds,
+    CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
+    OverlayWindowSpec, harden_overlay_window, harden_overlay_window_at, overlay_window_bounds,
 };
 use crate::transcription::SessionId;
 
 pub const OVERLAY_VIEWPORT_KEY: &str = "scribe-dictation-overlay";
 pub const OVERLAY_WINDOW_TITLE: &str = "Scribe Dictation Overlay";
+pub const OVERLAY_CONTROL_VIEWPORT_KEY: &str = "scribe-dictation-overlay-cancel";
+pub const OVERLAY_CONTROL_WINDOW_TITLE: &str = "Scribe Dictation Overlay Cancel";
 
 const LIVE_WIDTH: f32 = 440.0;
 const LIVE_HEIGHT: f32 = 140.0;
 const MINIMAL_WIDTH: f32 = 320.0;
 const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
+const CONTROL_SIZE: f32 = 44.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -70,14 +73,133 @@ pub fn show_overlay_viewport(
     if visible && !post_creation_hardened {
         context.send_viewport_cmd_to(overlay_viewport_id(), egui::ViewportCommand::Visible(false));
     }
+    let action = Cell::new(None);
+    let control_visible = presented && is_cancellable(state);
+    let control_bounds = bounds.map(control_window_bounds);
+    let control_hardened = control_bounds.is_some_and(|bounds| {
+        harden_overlay_window_at(
+            OVERLAY_CONTROL_WINDOW_TITLE,
+            bounds,
+            control_visible,
+            OverlayHardeningProfile::NonActivatingControl,
+        )
+    });
+    context.show_viewport_immediate(
+        control_viewport_id(),
+        control_viewport_builder(
+            control_bounds,
+            context.pixels_per_point(),
+            control_visible && control_hardened,
+        ),
+        |control_context, viewport_class| {
+            if control_visible && control_hardened && viewport_class == ViewportClass::Immediate {
+                if render_cancel_control(control_context) {
+                    if let Some(session_id) = state.session_id {
+                        action.set(Some(OverlayAction::Abandon(session_id)));
+                    }
+                }
+            }
+        },
+    );
+    let control_presented = control_visible
+        && control_hardened
+        && control_bounds.is_some_and(|bounds| {
+            harden_overlay_window_at(
+                OVERLAY_CONTROL_WINDOW_TITLE,
+                bounds,
+                true,
+                OverlayHardeningProfile::NonActivatingControl,
+            )
+        });
+    if control_visible && !control_presented {
+        context.send_viewport_cmd_to(control_viewport_id(), egui::ViewportCommand::Visible(false));
+    }
     OverlayViewportOutput {
         presented,
-        action: None,
+        action: action.get(),
     }
 }
 
 pub fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(OVERLAY_VIEWPORT_KEY)
+}
+
+pub fn control_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(OVERLAY_CONTROL_VIEWPORT_KEY)
+}
+
+fn is_cancellable(state: &OverlayViewState) -> bool {
+    state.session_id.is_some()
+        && matches!(
+            state.phase,
+            OverlayPhase::Preparing | OverlayPhase::Listening
+        )
+}
+
+fn control_window_bounds(display: OverlayWindowBounds) -> OverlayWindowBounds {
+    let scale = display.width as f32 / window_spec(OverlayMode::Minimal).width_points;
+    let size = (CONTROL_SIZE * scale).round() as i32;
+    OverlayWindowBounds {
+        x: display.x + display.width - size,
+        y: display.y + (display.height - size) / 2,
+        width: size,
+        height: size,
+    }
+}
+
+fn control_viewport_builder(
+    bounds: Option<OverlayWindowBounds>,
+    pixels_per_point: f32,
+    visible: bool,
+) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(OVERLAY_CONTROL_WINDOW_TITLE)
+        .with_inner_size(egui::vec2(CONTROL_SIZE, CONTROL_SIZE))
+        .with_min_inner_size(egui::vec2(CONTROL_SIZE, CONTROL_SIZE))
+        .with_max_inner_size(egui::vec2(CONTROL_SIZE, CONTROL_SIZE))
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_active(false)
+        .with_visible(visible)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_mouse_passthrough(false);
+    if let Some(bounds) = bounds {
+        let ppp = pixels_per_point.max(0.1);
+        builder = builder.with_position(egui::pos2(bounds.x as f32 / ppp, bounds.y as f32 / ppp));
+    }
+    builder
+}
+
+fn render_cancel_control(context: &egui::Context) -> bool {
+    let mut clicked = false;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+        .show(context, |ui| {
+            ui.centered_and_justified(|ui| {
+                let response = ui.add(
+                    egui::Button::new(egui::RichText::new(egui_phosphor::regular::X).size(20.0))
+                        .frame(false),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        "Cancel recording and discard it.",
+                    )
+                });
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_name("Cancel recording and discard it.");
+                });
+                if response
+                    .on_hover_text("Cancel recording and discard it.")
+                    .clicked()
+                {
+                    clicked = true;
+                }
+            });
+        });
+    clicked
 }
 
 fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
@@ -238,11 +360,9 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
         return;
     }
 
-    let text = transcript_layout(
-        &state.transcript.committed,
-        &state.transcript.tentative,
-        ui.available_width(),
-    );
+    let committed = preview_tail(&state.transcript.committed, 2, 240);
+    let tentative = preview_tail(&state.transcript.tentative, 2, 120);
+    let text = transcript_layout(&committed, &tentative, ui.available_width());
     let response = ui.label(text);
     let accessible_text = if state.transcript.tentative.is_empty() {
         format!("Committed transcript: {}", state.transcript.committed)
@@ -263,6 +383,23 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
             builder.set_live(egui::accesskit::Live::Polite);
         });
     }
+}
+
+/// Keeps rendered preview bounded without mutating the authoritative
+/// controller transcript. `char_indices` makes the truncation Unicode-safe.
+fn preview_tail(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
+    let joined = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let char_count = joined.chars().count();
+    if char_count <= max_chars {
+        return joined;
+    }
+    let start = joined
+        .char_indices()
+        .nth(char_count - max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    format!("…{}", &joined[start..])
 }
 
 fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::text::LayoutJob {
@@ -357,8 +494,45 @@ mod tests {
     }
 
     #[test]
+    fn cancel_control_is_interactive_and_only_available_while_capturing() {
+        let builder = control_viewport_builder(None, 1.0, true);
+        assert_eq!(builder.title.as_deref(), Some(OVERLAY_CONTROL_WINDOW_TITLE));
+        assert_eq!(builder.mouse_passthrough, Some(false));
+        assert_eq!(builder.active, Some(false));
+        let preparing = OverlayViewState {
+            session_id: Some(SessionId(4)),
+            phase: OverlayPhase::Preparing,
+            ..Default::default()
+        };
+        assert!(is_cancellable(&preparing));
+        assert!(!is_cancellable(&OverlayViewState {
+            phase: OverlayPhase::Finalizing,
+            ..preparing
+        }));
+    }
+
+    #[test]
+    fn control_bounds_cover_the_display_right_edge() {
+        let control = control_window_bounds(OverlayWindowBounds {
+            x: 100,
+            y: 20,
+            width: 320,
+            height: 52,
+        });
+        assert_eq!(control.x + control.width, 420);
+        assert_eq!((control.width, control.height), (44, 44));
+    }
+
+    #[test]
     fn elapsed_format_does_not_depend_on_wall_clock() {
         assert_eq!(format_elapsed(Duration::from_secs(65)), "1:05");
+    }
+
+    #[test]
+    fn preview_tail_keeps_two_unicode_safe_lines() {
+        assert_eq!(preview_tail("one\ntwo\nthree", 2, 240), "two\nthree");
+        let tail = preview_tail("éééé", 2, 3);
+        assert_eq!(tail, "…ééé");
     }
 
     #[test]

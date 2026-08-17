@@ -6222,7 +6222,7 @@ fn general_settings_panel(
                     ComboBox::from_id_source("overlay-mode")
                         .selected_text(&overlay)
                         .show_ui(ui, |ui| {
-                            for value in ["Live", "Minimal", "Off"] {
+                            for value in ["Live preview", "Compact status", "Off"] {
                                 ui.selectable_value(&mut overlay, value.to_owned(), value);
                             }
                         })
