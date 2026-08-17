@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::{
-    configure_accessible_style,
+    ThemePalette, configure_accessible_style,
     screens::{RecordingSettingsView, ScreenAction, ScreenView, render_screen, show_route_scroll},
     shell::{AppPage, show_navigation},
     state::{
@@ -502,6 +502,12 @@ impl UiHarnessApp {
     }
 }
 impl eframe::App for UiHarnessApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        ThemePalette::from_visuals(visuals)
+            .content_bg
+            .to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(overlay) = &self.overlay {
             show_overlay_fixture_host(ctx, self.overlay_presented);
@@ -1058,6 +1064,27 @@ mod tests {
         let dark_ctx = egui::Context::default();
         configure_harness_style(&dark_ctx, true);
         assert!(dark_ctx.style().visuals.dark_mode);
+    }
+
+    #[test]
+    fn harness_root_clear_color_is_opaque_in_both_themes() {
+        let app = UiHarnessApp {
+            page: Fixture::TranscribeReady.page(),
+            data: Fixture::TranscribeReady.data(),
+            overlay: None,
+            overlay_presented: false,
+        };
+
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let clear_color = eframe::App::clear_color(&app, &visuals);
+            assert_eq!(
+                clear_color,
+                ThemePalette::from_visuals(&visuals)
+                    .content_bg
+                    .to_normalized_gamma_f32()
+            );
+            assert_eq!(clear_color[3], 1.0);
+        }
     }
 
     fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {

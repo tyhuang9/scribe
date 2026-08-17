@@ -74,12 +74,18 @@ fn native_options() -> eframe::NativeOptions {
             .with_inner_size(inner_size)
             .with_min_inner_size([960.0, 680.0])
             .with_resizable(true)
-            .with_transparent(false),
+            .with_transparent(root_viewport_requests_transparency(cfg!(
+                target_os = "windows"
+            ))),
         follow_system_theme: true,
         default_theme: eframe::Theme::Light,
         event_loop_builder: Some(Box::new(configure_event_loop_backend)),
         ..Default::default()
     }
+}
+
+const fn root_viewport_requests_transparency(target_is_windows: bool) -> bool {
+    target_is_windows
 }
 
 fn initial_window_size() -> [f32; 2] {
@@ -216,7 +222,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_window_is_resizable_opaque_and_minimum_sized() {
+    fn native_window_is_resizable_and_minimum_sized() {
         let options = native_options();
 
         assert_eq!(options.viewport.inner_size, Some(egui::vec2(1180.0, 815.0)));
@@ -225,8 +231,17 @@ mod tests {
             Some(egui::vec2(960.0, 680.0))
         );
         assert_eq!(options.viewport.resizable, Some(true));
-        assert_eq!(options.viewport.transparent, Some(false));
+        assert_eq!(
+            options.viewport.transparent,
+            Some(cfg!(target_os = "windows"))
+        );
         assert!(options.follow_system_theme);
+    }
+
+    #[test]
+    fn root_requests_alpha_capable_config_only_on_windows() {
+        assert!(root_viewport_requests_transparency(true));
+        assert!(!root_viewport_requests_transparency(false));
     }
 
     #[cfg(all(feature = "ui-harness", debug_assertions))]
