@@ -10,10 +10,10 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sherpa_onnx::{
@@ -508,7 +508,7 @@ struct Correlation {
 
 trait WorkerProcess: Send + Sync {
     fn is_running(&self) -> Result<bool>;
-    fn kill_and_wait(&self) -> Result<()>;
+    fn terminate(&self) -> Result<()>;
     fn wait(&self) -> Result<()>;
 }
 
@@ -565,7 +565,7 @@ impl WorkerProcess for OsWorkerProcess {
             .is_none())
     }
 
-    fn kill_and_wait(&self) -> Result<()> {
+    fn terminate(&self) -> Result<()> {
         let mut child = self
             .child
             .lock()
@@ -577,7 +577,6 @@ impl WorkerProcess for OsWorkerProcess {
                 return Err(anyhow!("could not terminate ONNX worker: {kill_error}"));
             }
         }
-        child.wait()?;
         Ok(())
     }
 
@@ -612,6 +611,7 @@ struct SupervisorStream {
 struct SupervisorState {
     next_generation: u64,
     current: Option<CurrentGeneration>,
+    retiring_generations: BTreeSet<u64>,
     active_request: Option<Correlation>,
     active_stream: Option<SupervisorStream>,
     active_model: Option<(u64, String)>,
@@ -624,8 +624,8 @@ struct SupervisorInner {
     // termination never depends on pipe progress.
     launcher: Arc<dyn WorkerLauncher>,
     deadlines: SupervisorDeadlines,
-    reaper: std::sync::mpsc::Sender<ReapRequest>,
     spawn_gate: Mutex<()>,
+    retirement_changed: Condvar,
     state: Mutex<SupervisorState>,
     writer: Mutex<Option<WriterSlot>>,
     pending: Mutex<HashMap<Correlation, SyncSender<PendingResult>>>,
@@ -652,13 +652,12 @@ impl OnnxWorkerSupervisor {
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
     ) -> Result<Self> {
-        let reaper = start_reaper()?;
         let supervisor = Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
                 deadlines,
-                reaper,
                 spawn_gate: Mutex::new(()),
+                retirement_changed: Condvar::new(),
                 state: Mutex::new(SupervisorState::default()),
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -700,7 +699,7 @@ impl OnnxWorkerSupervisor {
             )
             .and_then(expect_ok)
         {
-            self.invalidate_generation(generation, "ONNX model load failed", true);
+            self.invalidate_generation(generation, "ONNX model load failed", true)?;
             return Err(error);
         }
         let mut state = self
@@ -747,7 +746,7 @@ impl OnnxWorkerSupervisor {
                     generation,
                     "unexpected ONNX worker transcription response",
                     true,
-                );
+                )?;
                 bail!("unexpected ONNX worker transcription response")
             }
         }
@@ -793,7 +792,7 @@ impl OnnxWorkerSupervisor {
                     generation,
                     "unexpected ONNX worker start-stream response",
                     true,
-                );
+                )?;
                 bail!("unexpected ONNX worker start-stream response")
             }
         }
@@ -806,8 +805,7 @@ impl OnnxWorkerSupervisor {
         samples: &[f32],
     ) -> Result<String> {
         let pcm = encode_pcm(samples)?;
-        let generation = self.ensure_generation()?;
-        self.require_stream(generation, session_id)?;
+        let generation = self.require_stream(session_id)?.generation;
         let frames = [
             control_frame(session_id, request_id, &Control::AudioChunk)?,
             Frame {
@@ -840,15 +838,14 @@ impl OnnxWorkerSupervisor {
                     generation,
                     "unexpected ONNX worker audio-chunk response",
                     true,
-                );
+                )?;
                 bail!("unexpected ONNX worker audio-chunk response")
             }
         }
     }
 
     pub(crate) fn end_stream(&self, session_id: u64, request_id: u64) -> Result<String> {
-        let generation = self.ensure_generation()?;
-        self.require_stream(generation, session_id)?;
+        let generation = self.require_stream(session_id)?.generation;
         let frame = control_frame(session_id, request_id, &Control::EndStream)?;
         let response = self.active_round_trip(generation, session_id, request_id, &[frame]);
         self.clear_stream(generation, session_id);
@@ -863,7 +860,7 @@ impl OnnxWorkerSupervisor {
                     generation,
                     "unexpected ONNX worker end-stream response",
                     true,
-                );
+                )?;
                 bail!("unexpected ONNX worker end-stream response")
             }
         }
@@ -983,7 +980,7 @@ impl OnnxWorkerSupervisor {
             // generation after its request has completed.
             return Ok(());
         }
-        self.invalidate_generation(target.generation, "ONNX request cancelled", true);
+        self.invalidate_generation(target.generation, "ONNX request cancelled", true)?;
         Ok(())
     }
 
@@ -997,8 +994,35 @@ impl OnnxWorkerSupervisor {
                 .map(|stream| stream.generation)
         });
         if let Some(generation) = generation {
-            self.invalidate_generation(generation, "ONNX stream was abandoned", true);
+            if let Err(error) =
+                self.invalidate_generation(generation, "ONNX stream was abandoned", true)
+            {
+                eprintln!("could not retire abandoned ONNX stream generation: {error:#}");
+            }
         }
+    }
+
+    /// Retires the current generation without depending on which operation
+    /// failed. This is the router's fail-closed boundary for alternate and test
+    /// supervisor implementations whose `load` errors do not invalidate their
+    /// own process generation.
+    pub(crate) fn terminate_current(&self) -> Result<()> {
+        let generation = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .current
+            .as_ref()
+            .map(|current| current.generation);
+        if let Some(generation) = generation {
+            self.invalidate_generation(
+                generation,
+                "ONNX worker generation was explicitly retired",
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     fn ensure_generation(&self) -> Result<u64> {
@@ -1022,14 +1046,14 @@ impl OnnxWorkerSupervisor {
             match process.is_running() {
                 Ok(true) => return Ok(generation),
                 Ok(false) => {
-                    self.invalidate_generation(generation, "ONNX worker exited", false);
+                    self.invalidate_generation(generation, "ONNX worker exited", false)?;
                 }
                 Err(error) => {
                     self.invalidate_generation(
                         generation,
                         "could not inspect ONNX worker process",
                         true,
-                    );
+                    )?;
                     return Err(anyhow!("could not inspect ONNX worker process: {error}"));
                 }
             }
@@ -1063,7 +1087,7 @@ impl OnnxWorkerSupervisor {
             .map_err(|_| anyhow!("ONNX writer lock was poisoned"))? =
             Some(WriterSlot { generation, stdin });
         if let Err(error) = Self::start_reader(&self.inner, generation, stdout) {
-            self.invalidate_generation(generation, &error.to_string(), true);
+            self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
         if let Err(error) = self.round_trip_on_generation(
@@ -1073,7 +1097,7 @@ impl OnnxWorkerSupervisor {
             Control::Hello,
             self.inner.deadlines.hello,
         ) {
-            self.invalidate_generation(generation, &error.to_string(), true);
+            self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
         Ok(generation)
@@ -1096,11 +1120,16 @@ impl OnnxWorkerSupervisor {
                     let (session_id, request_id, control) = match response {
                         Ok(response) => response,
                         Err(error) => {
-                            OnnxWorkerSupervisor::from_inner(inner).invalidate_generation(
+                            if let Err(retire_error) = OnnxWorkerSupervisor::from_inner(inner)
+                                .invalidate_generation(
                                 generation,
                                 &format!("ONNX worker stdout failed: {error}"),
                                 true,
-                            );
+                            ) {
+                                eprintln!(
+                                    "could not retire failed ONNX worker generation {generation}: {retire_error:#}"
+                                );
+                            }
                             break;
                         }
                     };
@@ -1114,14 +1143,24 @@ impl OnnxWorkerSupervisor {
                         Err(_) => None,
                     };
                     if let Some(waiter) = waiter {
+                        // Release the reader's transient strong supervisor
+                        // reference before waking the request thread. If that
+                        // request owns the last public supervisor handle, its
+                        // subsequent drop must synchronously reach shutdown.
+                        drop(inner);
                         let _ = waiter.send(Ok(control));
                         continue;
                     }
-                    OnnxWorkerSupervisor::from_inner(inner).invalidate_generation(
+                    if let Err(error) = OnnxWorkerSupervisor::from_inner(inner)
+                        .invalidate_generation(
                         generation,
                         "stale or mis-correlated ONNX worker response",
                         true,
-                    );
+                    ) {
+                        eprintln!(
+                            "could not retire mis-correlated ONNX worker generation {generation}: {error:#}"
+                        );
+                    }
                     break;
                 }
             })
@@ -1234,20 +1273,22 @@ impl OnnxWorkerSupervisor {
             return Err(error);
         }
         if let Err(error) = self.write_frames(generation, frames) {
-            self.invalidate_generation(generation, &error.to_string(), true);
+            self.unregister(correlation);
+            self.invalidate_generation(generation, &error.to_string(), true)?;
+            return Err(error);
         }
         let result = self.await_response(correlation, response, timeout);
         self.clear_active(correlation);
         result
     }
 
-    fn require_stream(&self, generation: u64, session_id: u64) -> Result<SupervisorStream> {
+    fn require_stream(&self, session_id: u64) -> Result<SupervisorStream> {
         self.inner
             .state
             .lock()
             .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
             .active_stream
-            .filter(|stream| stream.generation == generation && stream.session_id == session_id)
+            .filter(|stream| stream.session_id == session_id)
             .ok_or_else(|| anyhow!("no ONNX stream is active for session {session_id}"))
     }
 
@@ -1287,7 +1328,9 @@ impl OnnxWorkerSupervisor {
             }
         };
         if let Err(error) = self.write_frames(generation, &[frame]) {
-            self.invalidate_generation(generation, &error.to_string(), true);
+            self.unregister(correlation);
+            self.invalidate_generation(generation, &error.to_string(), true)?;
+            return Err(error);
         }
         match self.await_response(correlation, response, timeout)? {
             Control::Ready if expects_ready => Ok(()),
@@ -1298,7 +1341,7 @@ impl OnnxWorkerSupervisor {
                     generation,
                     "unexpected ONNX worker control response",
                     true,
-                );
+                )?;
                 bail!("unexpected ONNX worker control response")
             }
         }
@@ -1334,7 +1377,7 @@ impl OnnxWorkerSupervisor {
                     correlation.generation,
                     "ONNX worker response deadline exceeded",
                     true,
-                );
+                )?;
                 bail!(
                     "ONNX worker response deadline exceeded after {} ms",
                     timeout.as_millis()
@@ -1354,24 +1397,70 @@ impl OnnxWorkerSupervisor {
         }
     }
 
-    fn invalidate_generation(&self, generation: u64, reason: &str, force_kill: bool) {
+    fn invalidate_generation(&self, generation: u64, reason: &str, force_kill: bool) -> Result<()> {
         let process = {
-            let Ok(mut state) = self.inner.state.lock() else {
-                return;
-            };
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            loop {
+                let Some(current) = state.current.as_ref() else {
+                    return Ok(());
+                };
+                if current.generation != generation {
+                    return Ok(());
+                }
+                let process = Arc::clone(&current.process);
+                if state.retiring_generations.insert(generation) {
+                    break process;
+                }
+                let (next_state, timeout) = self
+                    .inner
+                    .retirement_changed
+                    .wait_timeout(state, self.inner.deadlines.cancel)
+                    .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+                state = next_state;
+                if timeout.timed_out() && state.retiring_generations.contains(&generation) {
+                    bail!(
+                        "ONNX worker generation {generation} termination did not complete within {} ms",
+                        self.inner.deadlines.cancel.as_millis()
+                    );
+                }
+            }
+        };
+        if force_kill && let Err(error) = process.terminate() {
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.retiring_generations.remove(&generation);
+            }
+            self.inner.retirement_changed.notify_all();
+            return Err(error).with_context(|| {
+                format!("could not initiate termination of ONNX worker generation {generation}")
+            });
+        }
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
             let Some(current) = state.current.as_ref() else {
-                return;
+                state.retiring_generations.remove(&generation);
+                self.inner.retirement_changed.notify_all();
+                return Ok(());
             };
             if current.generation != generation {
-                return;
+                state.retiring_generations.remove(&generation);
+                self.inner.retirement_changed.notify_all();
+                return Ok(());
             }
-            let process = Arc::clone(&current.process);
             state.current = None;
             state.active_request = None;
             state.active_stream = None;
             state.active_model = None;
-            process
-        };
+            state.retiring_generations.remove(&generation);
+        }
+        self.inner.retirement_changed.notify_all();
         let failed = if let Ok(mut pending) = self.inner.pending.lock() {
             let correlations = pending
                 .keys()
@@ -1388,10 +1477,7 @@ impl OnnxWorkerSupervisor {
         for waiter in failed {
             let _ = waiter.send(Err(reason.to_owned()));
         }
-        let _ = self.inner.reaper.send(ReapRequest {
-            process,
-            force_kill,
-        });
+        reap_process(process, generation)?;
         // Invalidation, especially cancellation, must never wait for a pipe
         // writer that is blocked in an OS write. Killing the process releases
         // that writer; a later generation replaces the stale slot. Clear it
@@ -1403,6 +1489,7 @@ impl OnnxWorkerSupervisor {
         {
             *writer = None;
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1455,29 +1542,28 @@ fn expect_ok(response: Control) -> Result<()> {
     }
 }
 
-struct ReapRequest {
-    process: Arc<dyn WorkerProcess>,
-    force_kill: bool,
-}
-
-fn start_reaper() -> Result<std::sync::mpsc::Sender<ReapRequest>> {
-    let (requests, receiver) = std::sync::mpsc::channel::<ReapRequest>();
-    std::thread::Builder::new()
-        .name("scribe-onnx-reaper".to_owned())
+fn reap_process(process: Arc<dyn WorkerProcess>, generation: u64) -> Result<()> {
+    // Termination, when needed, has already been initiated by the caller.
+    // Waiting happens on a generation-local thread, so an indefinitely stalled
+    // wait can never delay termination of a later generation.
+    let reaper_process = Arc::clone(&process);
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("scribe-onnx-reaper-{generation}"))
         .spawn(move || {
-            while let Ok(request) = receiver.recv() {
-                let result = if request.force_kill {
-                    request.process.kill_and_wait()
-                } else {
-                    request.process.wait()
-                };
-                if let Err(error) = result {
-                    eprintln!("ONNX worker reaper failed: {error:#}");
-                }
+            if let Err(error) = reaper_process.wait() {
+                eprintln!("ONNX worker generation {generation} reaper failed: {error:#}");
             }
         })
-        .map(|_| requests)
-        .map_err(|error| anyhow!("could not start ONNX worker reaper: {error}"))
+    {
+        // Thread creation failure is exceptional, but the child must still be
+        // reaped before this process can safely forget it.
+        process.wait().with_context(|| {
+            format!(
+                "could not start ONNX worker generation {generation} reaper ({error}) and synchronous reaping failed"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 impl Drop for SupervisorInner {
@@ -1493,7 +1579,11 @@ impl Drop for SupervisorInner {
             .current
             .take()
         {
-            if let Err(error) = current.process.kill_and_wait() {
+            if let Err(error) = current
+                .process
+                .terminate()
+                .and_then(|()| current.process.wait())
+            {
                 eprintln!("ONNX worker shutdown failed: {error:#}");
             }
         }
@@ -2207,17 +2297,13 @@ mod tests {
             Ok(self.running.load(Ordering::Acquire))
         }
 
-        fn kill_and_wait(&self) -> Result<()> {
+        fn terminate(&self) -> Result<()> {
             if let Some(kill_started) = &self.kill_started {
                 let _ = kill_started.send(());
             }
             self.running.store(false, Ordering::Release);
             let _ = self.input.send(PipeChunk::Eof);
             let _ = self.output.send(PipeChunk::Eof);
-            self.wait()?;
-            if let Some(reaped) = &self.reaped {
-                let _ = reaped.send(());
-            }
             Ok(())
         }
 
@@ -2229,6 +2315,9 @@ mod tests {
                 .take()
             {
                 let _ = worker.join();
+            }
+            if let Some(reaped) = &self.reaped {
+                let _ = reaped.send(());
             }
             Ok(())
         }
@@ -2268,6 +2357,7 @@ mod tests {
             pcm_kind: bool,
         },
         FailChangedLoad,
+        FailChangedLoadWithActiveStream,
     }
 
     struct TestLauncher {
@@ -2516,6 +2606,25 @@ mod tests {
                     request_id,
                     Control::Error {
                         message: "replacement failed".to_owned(),
+                    },
+                );
+                let _ = read_frame(&mut input);
+            }
+            TestMode::FailChangedLoadWithActiveStream => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Load { .. }));
+                respond(&mut output, session_id, request_id, Control::Ok);
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::StartStream));
+                respond(&mut output, session_id, request_id, Control::Ok);
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Load { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "cannot replace a model while a stream is active".to_owned(),
                     },
                 );
                 let _ = read_frame(&mut input);
@@ -3335,6 +3444,64 @@ mod tests {
     }
 
     #[test]
+    fn blocked_old_generation_reap_cannot_delay_new_generation_termination() {
+        let (first_started_tx, first_started_rx) = channel();
+        let (first_release_tx, first_release_rx) = channel();
+        let (second_started_tx, second_started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::HoldCancel {
+                    started: first_started_tx,
+                    release: first_release_rx,
+                },
+                TestMode::BlockedDecode {
+                    started: second_started_tx,
+                },
+            ])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher, short_deadlines()).unwrap();
+
+        supervisor.start_stream(100, 1).unwrap();
+        let first_cancel_supervisor = supervisor.clone();
+        let first_cancel =
+            std::thread::spawn(move || first_cancel_supervisor.cancel_stream(100, 2));
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(first_cancel.join().unwrap().is_err());
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+
+        let second_request_supervisor = supervisor.clone();
+        let second_request =
+            std::thread::spawn(move || second_request_supervisor.transcribe(101, 3, &[0.0, 0.1]));
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let cancel_started = Instant::now();
+        supervisor.cancel_active().unwrap();
+        assert!(
+            cancel_started.elapsed() <= Duration::from_millis(250),
+            "second-generation cancellation took {:?}",
+            cancel_started.elapsed()
+        );
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("the blocked first-generation wait must not serialize the second kill");
+        assert!(second_request.join().unwrap().is_err());
+
+        first_release_tx.send(()).unwrap();
+        for _ in 0..2 {
+            reaped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+    }
+
+    #[test]
     fn abandoning_stream_returns_without_waiting_for_worker_io() {
         let (kill_started_tx, kill_started_rx) = channel();
         let (reaped_tx, _reaped_rx) = channel();
@@ -3478,6 +3645,42 @@ mod tests {
 
         assert!(!supervisor.load(3, 3, first.clone()).unwrap());
         assert!(supervisor.load(4, 4, first).unwrap());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_load_during_stream_retires_generation_and_stale_stream_never_spawns_worker() {
+        let root = test_root("supervisor-stream-replacement");
+        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let mut changed = first.clone();
+        changed.id = "changed-stream-model".to_owned();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, _reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::FailChangedLoadWithActiveStream, TestMode::Normal])
+                .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(Arc::clone(&launcher));
+
+        assert!(!supervisor.load(110, 1, first).unwrap());
+        supervisor.start_stream(111, 2).unwrap();
+        let error = supervisor.load(112, 3, changed).unwrap_err();
+        assert!(error.to_string().contains("stream is active"));
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
+
+        assert!(supervisor.audio_chunk(111, 4, &[0.1]).is_err());
+        assert!(supervisor.end_stream(111, 5).is_err());
+        assert_eq!(
+            launcher.launches.load(Ordering::Acquire),
+            1,
+            "a stale stream must not create an empty replacement generation"
+        );
+        supervisor.health(113, 6).unwrap();
         assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
 
         std::fs::remove_dir_all(root).unwrap();

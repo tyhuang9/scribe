@@ -2597,6 +2597,7 @@ mod tests {
         unload_calls: usize,
         unloaded_active_streams: usize,
         cancel_active_calls: usize,
+        termination_calls: usize,
         stream: Option<(u64, usize)>,
         stream_cancels: usize,
         batch_started: bool,
@@ -2771,6 +2772,17 @@ mod tests {
                 state.stream = None;
                 state.stream_cancels += 1;
             }
+        }
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.termination_calls += 1;
+            state.events.push("terminate:onnx".to_owned());
+            state.stream = None;
+            state.loaded = None;
+            state.batch_cancelled = true;
+            self.changed.notify_all();
+            Ok(())
         }
     }
 
@@ -2962,6 +2974,61 @@ mod tests {
             .unwrap();
         assert!(!recovered.diagnostics.warm_reused);
         assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_model_replacement_during_stream_terminates_before_discard_and_recovers() {
+        let (first_root, first) = onnx_spec(
+            "stream-replacement-first",
+            OnnxModelFamily::OnlineTransducer,
+        );
+        let (second_root, second) = onnx_spec(
+            "stream-replacement-second",
+            OnnxModelFamily::OnlineTransducer,
+        );
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        let mut stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(first.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        control.fail_next_load();
+
+        let error = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX load failure")
+        );
+        {
+            let state = control.state.lock().unwrap();
+            assert_eq!(state.termination_calls, 1);
+            assert!(state.loaded.is_none());
+            assert!(state.stream.is_none());
+            assert_eq!(state.maximum_loaded_models, 1);
+            assert_eq!(state.events.last().unwrap(), "terminate:onnx");
+        }
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert!(stream.push_audio(&[0.1]).is_err());
+        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+
+        let recovered = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+        drop(stream);
 
         service.unload_runtime_artifacts().unwrap();
         drop(service);
