@@ -1086,9 +1086,10 @@ impl RouterState {
                         .map_err(|error| RuntimeError::Engine(format!("{error:#}")))?;
                 }
                 self.onnx = None;
-                *onnx_cancellation
-                    .lock()
-                    .map_err(|_| RuntimeError::Poisoned)? = None;
+                match onnx_cancellation.lock() {
+                    Ok(mut cancellation) => *cancellation = None,
+                    Err(poisoned) => *poisoned.into_inner() = None,
+                }
                 runtime_activity.force_release_streams();
             }
         }
@@ -2978,6 +2979,83 @@ mod tests {
                 "load:gguf",
             ]
         );
+    }
+
+    #[test]
+    fn poisoned_onnx_cancellation_does_not_strand_lease_or_heavy_owner() {
+        let control = Arc::new(TestOnnxControl {
+            loads: AtomicU64::new(0),
+            unloads: AtomicU64::new(0),
+            fail_unload: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let router = RuntimeRouter::with_test_onnx_factory({
+            let control = Arc::clone(&control);
+            move || Ok(Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>)
+        });
+        let supervisor = Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>;
+        {
+            let mut state = router.inner.lock().unwrap();
+            state.onnx = Some(OnnxSpeechRuntime::new(
+                Arc::clone(&supervisor),
+                Arc::new(AtomicU64::new(0)),
+                router.runtime_activity(),
+            ));
+            state
+                .heavy_ownership
+                .activate(HeavyRuntimeOwner::OnnxSpeech);
+        }
+        *router.onnx_cancellation.lock().unwrap() = Some(supervisor);
+        let stale_stream_lease = router.runtime_activity.acquire_stream().unwrap();
+
+        let cancellation = Arc::clone(&router.onnx_cancellation);
+        std::thread::spawn(move || {
+            let _guard = cancellation.lock().unwrap();
+            panic!("poison the deterministic ONNX cancellation lock");
+        })
+        .join()
+        .expect_err("the poisoner thread must panic");
+
+        {
+            let mut state = router.inner.lock().unwrap();
+            state
+                .prepare_heavy_runtime(
+                    HeavyRuntimeOwner::EmbeddedGguf,
+                    &router.embedded_cancellation,
+                    &router.onnx_cancellation,
+                    &router.runtime_activity,
+                )
+                .unwrap();
+
+            assert!(state.onnx.is_none());
+            assert_eq!(state.heavy_ownership.current, None);
+
+            state
+                .heavy_ownership
+                .activate(HeavyRuntimeOwner::EmbeddedGguf);
+            state
+                .prepare_heavy_runtime(
+                    HeavyRuntimeOwner::OnnxSpeech,
+                    &router.embedded_cancellation,
+                    &router.onnx_cancellation,
+                    &router.runtime_activity,
+                )
+                .unwrap();
+            assert_eq!(state.heavy_ownership.current, None);
+            assert!(state.onnx.is_none());
+            assert!(state.embedded.is_none());
+        }
+
+        assert_eq!(router.runtime_activity.active_streams(), 0);
+        assert!(
+            router
+                .onnx_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+        drop(stale_stream_lease);
+        assert_eq!(router.runtime_activity.active_streams(), 0);
     }
 
     #[test]
