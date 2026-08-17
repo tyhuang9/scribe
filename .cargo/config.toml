@@ -1,0 +1,9 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# sherpa-onnx's reviewed Windows archive uses the static MSVC runtime. Keep
+# transcribe-cpp's Visual Studio CMake build on the same ABI because compiler
+# flags alone do not override that generator's runtime choice. This is inert
+# off MSVC and can be overridden explicitly for dependency diagnostics.
+TRANSCRIBE_CMAKE_ARGS = { value = "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded", force = false }
