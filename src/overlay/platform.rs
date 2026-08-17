@@ -242,6 +242,7 @@ mod imp {
     use super::{
         CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
         OverlayWindowSpec, PhysicalWorkArea, TargetIdentity, calculate_window_bounds,
+        hardened_overlay_ex_style,
     };
 
     trait CapturedTargetProbe {
