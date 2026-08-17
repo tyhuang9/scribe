@@ -188,6 +188,7 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
+        "silero_vad_native.rs",
         "transcription.rs",
     ];
     let family_terms = [
