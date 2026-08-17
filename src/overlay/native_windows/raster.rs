@@ -20,18 +20,19 @@ use windows_sys::Win32::Graphics::GdiPlus::{
     TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
 
-use super::super::controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState};
+use super::{
+    super::{
+        controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
+        platform::OverlayWindowBounds,
+        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH},
+    },
+    layout::DisplayLayout,
+};
 use crate::ui::ThemePalette;
 
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const MAX_MESSAGE_GRAPHEMES: usize = 256;
-
-const LIVE_WIDTH: f32 = 600.0;
-const LIVE_HEIGHT: f32 = 62.0;
-const COMPACT_WIDTH: f32 = 320.0;
-const COMPACT_HEIGHT: f32 = 52.0;
-const CONTROL_SIZE: f32 = 44.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Argb(u32);
@@ -120,13 +121,22 @@ impl LayeredFrame {
         }
         let length = usize::try_from(width)
             .ok()
-            .and_then(|width| usize::try_from(height).ok().map(|height| width * height))
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or(RasterError::InvalidDimensions)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(length)
+            .map_err(|_| RasterError::InvalidDimensions)?;
+        pixels.resize(length, 0);
         Ok(Self {
             width,
             height,
-            pixels: vec![0; length],
+            pixels,
         })
     }
 
@@ -214,20 +224,24 @@ impl NativeRasterizer {
         height: i32,
     ) -> Result<LayeredFrame, RasterError> {
         let mut frame = LayeredFrame::transparent(width, height)?;
-        let logical_size = match state.mode {
-            OverlayMode::Live => (LIVE_WIDTH, LIVE_HEIGHT),
-            OverlayMode::Minimal | OverlayMode::Off => (COMPACT_WIDTH, COMPACT_HEIGHT),
-        };
-        let scale = (width as f32 / logical_size.0)
-            .min(height as f32 / logical_size.1)
-            .max(0.1);
+        let layout = DisplayLayout::from_bounds(
+            state.mode,
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        )
+        .ok_or(RasterError::InvalidDimensions)?;
+        let scale = layout.scale;
         let mut canvas = Canvas::new(self, &mut frame.pixels, width, height)?;
         let colors = NativeColors::for_theme(dark_mode);
         draw_capsule(&mut canvas, state.mode, scale, colors)?;
         match state.mode {
-            OverlayMode::Live => draw_live(&mut canvas, state, scale, colors)?,
+            OverlayMode::Live => draw_live(&mut canvas, state, &layout, colors)?,
             OverlayMode::Minimal | OverlayMode::Off => {
-                draw_compact(&mut canvas, state, scale, colors)?
+                draw_compact(&mut canvas, state, &layout, colors)?
             }
         }
         drop(canvas);
@@ -269,7 +283,7 @@ fn draw_capsule(
 ) -> Result<(), RasterError> {
     let (logical_width, logical_height, vertical_inset, shadow_extent, shadow_offset) = match mode {
         OverlayMode::Live => (LIVE_WIDTH, LIVE_HEIGHT, 8.0, 5.0, 2.0),
-        OverlayMode::Minimal | OverlayMode::Off => (COMPACT_WIDTH, COMPACT_HEIGHT, 4.0, 2.0, 1.0),
+        OverlayMode::Minimal | OverlayMode::Off => (MINIMAL_WIDTH, MINIMAL_HEIGHT, 4.0, 2.0, 1.0),
     };
     let x = 8.0 * scale;
     let y = vertical_inset * scale;
@@ -303,13 +317,14 @@ fn draw_capsule(
 fn draw_live(
     canvas: &mut Canvas<'_>,
     state: &OverlayViewState,
-    scale: f32,
+    layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let center_y = LIVE_HEIGHT * scale / 2.0;
+    let scale = layout.scale;
+    let center_y = layout.recording_mark.center_y();
     let level = normalized_level(state);
     let visual_level = if state.reduced_motion { 0.55 } else { level };
-    let center_x = 31.0 * scale;
+    let center_x = layout.recording_mark.center_x();
     let halo_radius = (2.5 + visual_level * 3.5) * scale;
     let waveform_alpha = (16.0 + visual_level * 48.0).round() as u8;
     let waveform_rgb = colors.waveform.0;
@@ -323,9 +338,9 @@ fn draw_live(
     canvas.draw_centered_text(
         egui_phosphor::regular::WAVEFORM,
         center_x,
-        (center_y - 15.0 * scale) - 1.0 * scale,
-        30.0 * scale,
-        30.0 * scale,
+        layout.recording_mark.y0,
+        layout.recording_mark.width(),
+        layout.recording_mark.height(),
         27.0 * scale,
         TextStyle::Phosphor,
         colors.waveform,
@@ -337,10 +352,10 @@ fn draw_live(
         .unwrap_or_else(|| "00:00".to_owned());
     canvas.draw_text(
         &elapsed,
-        56.0 * scale,
-        20.5 * scale,
-        48.0 * scale,
-        23.0 * scale,
+        layout.elapsed.x0,
+        layout.elapsed.y0,
+        layout.elapsed.width(),
+        layout.elapsed.height(),
         13.0 * scale,
         TextStyle::Monospace,
         colors.muted_text,
@@ -354,7 +369,8 @@ fn draw_live(
         colors.border,
     )?;
 
-    let max_width = 426.0 * scale;
+    let preview = layout.preview.expect("live layout includes preview bounds");
+    let max_width = preview.width();
     let line = live_line(state, colors);
     let line = if state.error.is_some() || state.notice.is_some() {
         fit_head(
@@ -375,10 +391,10 @@ fn draw_live(
     };
     canvas.draw_styled_line(
         &line,
-        123.0 * scale,
-        20.5 * scale,
+        preview.x0,
+        preview.y0,
         max_width,
-        23.0 * scale,
+        preview.height(),
         13.0 * scale,
     )?;
     Ok(())
@@ -387,16 +403,17 @@ fn draw_live(
 fn draw_compact(
     canvas: &mut Canvas<'_>,
     state: &OverlayViewState,
-    scale: f32,
+    layout: &DisplayLayout,
     colors: NativeColors,
 ) -> Result<(), RasterError> {
-    let center_y = COMPACT_HEIGHT * scale / 2.0;
+    let scale = layout.scale;
+    let center_y = layout.recording_mark.center_y();
     let phase = phase_color(state.phase);
     canvas.fill_ellipse(
-        20.0 * scale,
-        center_y - 4.0 * scale,
-        8.0 * scale,
-        8.0 * scale,
+        layout.recording_mark.x0,
+        layout.recording_mark.y0,
+        layout.recording_mark.width(),
+        layout.recording_mark.height(),
         phase,
     )?;
     let label = if state.phase == OverlayPhase::Listening {
@@ -404,12 +421,15 @@ fn draw_compact(
     } else {
         state.phase.label()
     };
+    let status_text = layout
+        .status_text
+        .expect("compact layout includes status text bounds");
     canvas.draw_text(
         label,
-        34.0 * scale,
-        16.0 * scale,
-        126.0 * scale,
-        22.0 * scale,
+        status_text.x0,
+        status_text.y0,
+        status_text.width(),
+        status_text.height(),
         13.0 * scale,
         TextStyle::Bold,
         colors.text,
@@ -420,8 +440,8 @@ fn draw_compact(
         let threshold = (index + 1) as f32 / 4.0;
         let active = level >= threshold * 0.78;
         let normalized_height = if active { threshold } else { 0.22 };
-        let height = (20.0 * normalized_height).max(4.0) * scale;
-        let x = (164.0 + index as f32 * 9.0) * scale;
+        let height = (layout.meter.height() * normalized_height).max(4.0 * scale);
+        let x = layout.meter.x0 + index as f32 * 9.0 * scale;
         canvas.fill_rounded_rect(
             x,
             center_y - height / 2.0,
@@ -438,10 +458,10 @@ fn draw_compact(
     if let Some(elapsed) = state.elapsed {
         canvas.draw_text(
             &format_elapsed(elapsed),
-            207.0 * scale,
-            16.5 * scale,
-            53.0 * scale,
-            21.0 * scale,
+            layout.elapsed.x0,
+            layout.elapsed.y0,
+            layout.elapsed.width(),
+            layout.elapsed.height(),
             12.0 * scale,
             TextStyle::Monospace,
             colors.muted_text,
@@ -621,7 +641,7 @@ fn phase_color(phase: OverlayPhase) -> Argb {
     }
 }
 
-fn format_elapsed(elapsed: Duration) -> String {
+pub(super) fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
@@ -1412,5 +1432,25 @@ mod tests {
                 Err(RasterError::InvalidDimensions)
             ));
         });
+    }
+
+    #[test]
+    fn extreme_frame_dimensions_fail_before_allocation() {
+        assert!(matches!(
+            LayeredFrame::transparent(i32::MAX, i32::MAX),
+            Err(RasterError::InvalidDimensions)
+        ));
+    }
+
+    #[test]
+    fn native_waveform_colors_follow_the_shared_theme_contract() {
+        assert_eq!(
+            NativeColors::for_theme(false).waveform,
+            Argb::from_color(ThemePalette::light().recording_waveform)
+        );
+        assert_eq!(
+            NativeColors::for_theme(true).waveform,
+            Argb::from_color(ThemePalette::dark().recording_waveform)
+        );
     }
 }

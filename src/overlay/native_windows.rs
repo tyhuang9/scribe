@@ -1,10 +1,12 @@
 mod accessibility;
+mod layout;
 mod raster;
 
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     mem::{offset_of, size_of, zeroed},
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -206,13 +208,14 @@ impl NativeWindow {
         state: Option<&OverlayViewState>,
         visible: bool,
         control_enabled: bool,
+        bounds: Option<OverlayWindowBounds>,
     ) -> bool {
         let updated = {
             let accessibility = self._procedure_state.accessibility.borrow();
             let Some(accessibility) = accessibility.as_ref() else {
                 return false;
             };
-            accessibility.update(state, visible, control_enabled)
+            accessibility.update(state, visible, control_enabled, bounds)
         };
         if !updated {
             self._procedure_state.accessibility.borrow_mut().take();
@@ -251,7 +254,6 @@ impl NativeWindow {
 
     fn show_no_activate(&mut self, bounds: OverlayWindowBounds) -> bool {
         if !self.is_hardened() {
-            self.hide();
             return false;
         }
         if self.role == WindowRole::Control
@@ -260,7 +262,6 @@ impl NativeWindow {
                 .as_mut()
                 .is_some_and(|tooltip| tooltip.update_bounds(bounds.width, bounds.height))
         {
-            self.hide();
             return false;
         }
         unsafe {
@@ -277,11 +278,7 @@ impl NativeWindow {
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
             ) != 0
         };
-        let visible = placed && unsafe { IsWindowVisible(self.hwnd) != 0 };
-        if !visible {
-            self.hide();
-        }
-        visible
+        placed && unsafe { IsWindowVisible(self.hwnd) != 0 }
     }
 
     fn hide(&self) {
@@ -493,41 +490,90 @@ impl NativeOverlayHost {
         control_frame: &LayeredFrame,
         session_id: Option<SessionId>,
     ) -> NativePresentationResult {
-        let display_presented = present_transaction(&mut WindowPresentation {
+        let display_presented = try_present_transaction(&mut WindowPresentation {
             window: &mut self.display,
             bounds: display_bounds,
             frame: display_frame,
         });
-        if !display_presented {
-            self.action_bridge.bind(None);
-            self.control.hide();
+        if !finish_display_presentation(display_presented, self) {
             return NativePresentationResult::default();
         }
 
         let control_presented = if control_requested {
-            let presented = present_transaction(&mut WindowPresentation {
+            let presented = try_present_transaction(&mut WindowPresentation {
                 window: &mut self.control,
                 bounds: control_bounds,
                 frame: control_frame,
             });
             self.action_bridge
                 .bind(presented.then_some(session_id).flatten());
+            if !presented {
+                self.hide_control();
+            }
             presented
         } else {
-            self.action_bridge.bind(None);
-            self.control.hide();
+            self.hide_control();
             false
         };
         combine_presentation_results(display_presented, control_requested, control_presented)
     }
 
-    fn hide(&mut self) {
+    fn hide_control(&mut self) {
         self.action_bridge.bind(None);
-        self.display.update_accessibility(None, false, false);
-        self.control.update_accessibility(None, false, false);
+        self.control.update_accessibility(None, false, false, None);
         self.control.hide();
+    }
+
+    fn hide(&mut self) {
+        hide_overlay_fail_closed(self);
+    }
+}
+
+trait FailClosedOverlay {
+    fn unbind_action(&mut self);
+    fn reset_display_accessibility_hidden(&mut self);
+    fn reset_control_accessibility_hidden(&mut self);
+    fn hide_control_window(&mut self);
+    fn hide_display_window(&mut self);
+}
+
+impl FailClosedOverlay for NativeOverlayHost {
+    fn unbind_action(&mut self) {
+        self.action_bridge.bind(None);
+    }
+
+    fn reset_display_accessibility_hidden(&mut self) {
+        self.display.update_accessibility(None, false, false, None);
+    }
+
+    fn reset_control_accessibility_hidden(&mut self) {
+        self.control.update_accessibility(None, false, false, None);
+    }
+
+    fn hide_control_window(&mut self) {
+        self.control.hide();
+    }
+
+    fn hide_display_window(&mut self) {
         self.display.hide();
     }
+}
+
+fn hide_overlay_fail_closed(overlay: &mut impl FailClosedOverlay) {
+    overlay.unbind_action();
+    // Reset both provider trees before hiding either HWND so a failed presentation can never
+    // leave a visible semantic tree behind a hidden surface.
+    overlay.reset_display_accessibility_hidden();
+    overlay.reset_control_accessibility_hidden();
+    overlay.hide_control_window();
+    overlay.hide_display_window();
+}
+
+fn finish_display_presentation(presented: bool, overlay: &mut impl FailClosedOverlay) -> bool {
+    if !presented {
+        hide_overlay_fail_closed(overlay);
+    }
+    presented
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -541,7 +587,6 @@ trait PresentationTransaction {
     fn submit_pixels(&mut self) -> bool;
     fn show_no_activate(&mut self) -> bool;
     fn is_visible(&mut self) -> bool;
-    fn hide(&mut self);
 }
 
 struct WindowPresentation<'a> {
@@ -566,21 +611,13 @@ impl PresentationTransaction for WindowPresentation<'_> {
     fn is_visible(&mut self) -> bool {
         unsafe { IsWindowVisible(self.window.hwnd) != 0 }
     }
-
-    fn hide(&mut self) {
-        self.window.hide();
-    }
 }
 
-fn present_transaction(transaction: &mut impl PresentationTransaction) -> bool {
-    let presented = transaction.verify_hardening()
+fn try_present_transaction(transaction: &mut impl PresentationTransaction) -> bool {
+    transaction.verify_hardening()
         && transaction.submit_pixels()
         && transaction.show_no_activate()
-        && transaction.is_visible();
-    if !presented {
-        transaction.hide();
-    }
-    presented
+        && transaction.is_visible()
 }
 
 fn combine_presentation_results(
@@ -795,6 +832,61 @@ unsafe extern "system" fn native_overlay_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    contain_wnd_proc_dispatch(
+        || unsafe { native_overlay_wnd_proc_inner(hwnd, message, wparam, lparam) },
+        || unsafe { native_overlay_wnd_proc_panic_fallback(hwnd, message, wparam, lparam) },
+    )
+}
+
+fn contain_wnd_proc_dispatch(
+    dispatch: impl FnOnce() -> LRESULT,
+    fallback: impl FnOnce() -> LRESULT,
+) -> LRESULT {
+    match catch_unwind(AssertUnwindSafe(dispatch)) {
+        Ok(result) => result,
+        Err(_) => catch_unwind(AssertUnwindSafe(fallback)).unwrap_or(0),
+    }
+}
+
+unsafe fn native_overlay_wnd_proc_panic_fallback(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // A Rust panic must never cross the system ABI. Hide the affected overlay surface before
+    // returning control to Windows, and revoke its action/UIA bridges so the hidden surface
+    // cannot remain operable. The outer containment also catches any panic in this cleanup.
+    let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowProcedureState;
+    if !state.is_null() {
+        fail_closed_window_state(unsafe { &*state });
+    }
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    if message == WM_NCCREATE {
+        0
+    } else {
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+}
+
+fn fail_closed_window_state(state: &WindowProcedureState) {
+    state.cancel_press();
+    if let Some(bridge) = &state.action_bridge {
+        bridge.bind(None);
+    }
+    if let Ok(mut accessibility) = state.accessibility.try_borrow_mut() {
+        accessibility.take();
+    }
+}
+
+unsafe fn native_overlay_wnd_proc_inner(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if message == WM_NCCREATE {
         let create = lparam as *const CREATESTRUCTW;
         if create.is_null() {
@@ -963,7 +1055,9 @@ pub(super) fn show_overlay_viewport(
             .ok()
             .flatten();
         let control_rendered = control_frame.is_some();
-        let display_accessible = host.display.update_accessibility(Some(state), true, false);
+        let display_accessible =
+            host.display
+                .update_accessibility(Some(state), true, false, Some(display_bounds));
         if !display_prerequisites_ready(true, display_accessible) {
             host.hide();
             return OverlayViewportOutput {
@@ -971,10 +1065,15 @@ pub(super) fn show_overlay_viewport(
                 action,
             };
         }
-        let control_accessible = host.control.control_capabilities_ready()
-            && host
-                .control
-                .update_accessibility(Some(state), control_requested, control_requested);
+        let control_candidate =
+            control_requested && control_rendered && host.control.control_capabilities_ready();
+        let control_accessible = if control_candidate {
+            host.control
+                .update_accessibility(Some(state), true, true, Some(control_bounds))
+        } else {
+            host.control.update_accessibility(None, false, false, None);
+            false
+        };
         let transparent_control = LayeredFrame {
             width: control_bounds.width,
             height: control_bounds.height,
@@ -986,7 +1085,7 @@ pub(super) fn show_overlay_viewport(
         let result = host.present(
             display_bounds,
             &display_frame,
-            control_requested && control_rendered && control_accessible,
+            control_candidate && control_accessible,
             control_bounds,
             control_frame.as_ref().unwrap_or(&transparent_control),
             state.session_id,
@@ -1009,7 +1108,11 @@ mod tests {
         Submit,
         Show,
         Visible,
-        Hide,
+        Unbind,
+        ResetDisplayAccessibility,
+        ResetControlAccessibility,
+        HideControlWindow,
+        HideDisplayWindow,
     }
 
     struct FakeTransaction {
@@ -1047,9 +1150,51 @@ mod tests {
         fn is_visible(&mut self) -> bool {
             self.step(Step::Visible)
         }
+    }
 
-        fn hide(&mut self) {
-            self.steps.push(Step::Hide);
+    struct FakeOverlay {
+        display_accessibility_visible: bool,
+        control_accessibility_visible: bool,
+        display_window_visible: bool,
+        control_window_visible: bool,
+        steps: Vec<Step>,
+    }
+
+    impl FakeOverlay {
+        fn visible() -> Self {
+            Self {
+                display_accessibility_visible: true,
+                control_accessibility_visible: true,
+                display_window_visible: true,
+                control_window_visible: true,
+                steps: Vec::new(),
+            }
+        }
+    }
+
+    impl FailClosedOverlay for FakeOverlay {
+        fn unbind_action(&mut self) {
+            self.steps.push(Step::Unbind);
+        }
+
+        fn reset_display_accessibility_hidden(&mut self) {
+            self.steps.push(Step::ResetDisplayAccessibility);
+            self.display_accessibility_visible = false;
+        }
+
+        fn reset_control_accessibility_hidden(&mut self) {
+            self.steps.push(Step::ResetControlAccessibility);
+            self.control_accessibility_visible = false;
+        }
+
+        fn hide_control_window(&mut self) {
+            self.steps.push(Step::HideControlWindow);
+            self.control_window_visible = false;
+        }
+
+        fn hide_display_window(&mut self) {
+            self.steps.push(Step::HideDisplayWindow);
+            self.display_window_visible = false;
         }
     }
 
@@ -1070,7 +1215,7 @@ mod tests {
     #[test]
     fn presentation_requires_every_ordered_native_step() {
         let mut transaction = FakeTransaction::new(None);
-        assert!(present_transaction(&mut transaction));
+        assert!(try_present_transaction(&mut transaction));
         assert_eq!(
             transaction.steps,
             vec![Step::Verify, Step::Submit, Step::Show, Step::Visible]
@@ -1078,12 +1223,79 @@ mod tests {
     }
 
     #[test]
-    fn every_required_presentation_failure_hides_fail_closed() {
+    fn window_procedure_dispatch_contains_panics_and_uses_the_fallback() {
+        let fallback_called = Cell::new(false);
+        let result = contain_wnd_proc_dispatch(
+            || panic!("simulated window procedure panic"),
+            || {
+                fallback_called.set(true);
+                73
+            },
+        );
+
+        assert_eq!(result, 73);
+        assert!(fallback_called.get());
+
+        fallback_called.set(false);
+        let result = contain_wnd_proc_dispatch(
+            || 29,
+            || {
+                fallback_called.set(true);
+                73
+            },
+        );
+        assert_eq!(result, 29);
+        assert!(!fallback_called.get());
+
+        assert_eq!(
+            contain_wnd_proc_dispatch(|| panic!("dispatch"), || panic!("fallback")),
+            0
+        );
+    }
+
+    #[test]
+    fn panic_cleanup_revokes_the_control_action_and_adapter() {
+        let (tx, rx) = bounded(1);
+        let bridge = Arc::new(ControlActionBridge {
+            session_id: Mutex::new(Some(SessionId(91))),
+            tx,
+        });
+        let state = WindowProcedureState {
+            role: WindowRole::Control,
+            action_bridge: Some(Arc::clone(&bridge)),
+            pressed: Cell::new(true),
+            accessibility: RefCell::new(None),
+        };
+
+        fail_closed_window_state(&state);
+        assert!(!state.pressed.get());
+        bridge.emit_abandon();
+        assert!(rx.try_recv().is_err());
+        assert!(state.accessibility.borrow().is_none());
+    }
+
+    #[test]
+    fn every_post_accessibility_presentation_failure_resets_both_trees_before_hiding() {
         for failure in [Step::Verify, Step::Submit, Step::Show, Step::Visible] {
             let mut transaction = FakeTransaction::new(Some(failure));
-            assert!(!present_transaction(&mut transaction));
-            assert_eq!(transaction.steps.last(), Some(&Step::Hide));
+            let presented = try_present_transaction(&mut transaction);
+            let mut overlay = FakeOverlay::visible();
+            assert!(!finish_display_presentation(presented, &mut overlay));
             assert!(!transaction.steps.contains(&Step::Visible) || failure == Step::Visible);
+            assert!(!overlay.display_accessibility_visible);
+            assert!(!overlay.control_accessibility_visible);
+            assert!(!overlay.display_window_visible);
+            assert!(!overlay.control_window_visible);
+            assert_eq!(
+                overlay.steps,
+                vec![
+                    Step::Unbind,
+                    Step::ResetDisplayAccessibility,
+                    Step::ResetControlAccessibility,
+                    Step::HideControlWindow,
+                    Step::HideDisplayWindow,
+                ]
+            );
         }
     }
 

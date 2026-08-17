@@ -6,12 +6,17 @@ use std::{
 use accesskit_windows::{Adapter, UiaInitMarker};
 use eframe::egui::accesskit::{
     Action, ActionHandler, ActionRequest, DefaultActionVerb, Live, NodeBuilder, NodeClassSet,
-    NodeId, Role, Tree, TreeUpdate,
+    NodeId, Rect, Role, Tree, TreeUpdate,
 };
 
-use super::{ControlActionBridge, WindowRole};
+use super::{
+    ControlActionBridge, WindowRole,
+    layout::{ControlLayout, DisplayLayout, PhysicalRect},
+    raster::format_elapsed,
+};
 use crate::overlay::{
     controller::{OverlayMode, OverlayPhase, OverlayViewState},
+    platform::OverlayWindowBounds,
     view::{live_accessible_text, live_overlay_announcement},
 };
 
@@ -20,6 +25,7 @@ const DISPLAY_STATUS_ID: NodeId = NodeId(0xD101);
 const DISPLAY_METER_ID: NodeId = NodeId(0xD102);
 const DISPLAY_PREVIEW_ID: NodeId = NodeId(0xD103);
 const DISPLAY_ANNOUNCEMENT_ID: NodeId = NodeId(0xD104);
+const DISPLAY_ELAPSED_ID: NodeId = NodeId(0xD105);
 const CONTROL_ROOT_ID: NodeId = NodeId(0xC100);
 pub(super) const CONTROL_BUTTON_ID: NodeId = NodeId(0xC101);
 
@@ -85,10 +91,11 @@ impl NativeAccessibility {
         state: Option<&OverlayViewState>,
         visible: bool,
         control_enabled: bool,
+        bounds: Option<OverlayWindowBounds>,
     ) -> bool {
         let update = match (self.role, state) {
-            (WindowRole::Display, Some(state)) => display_tree(state, visible),
-            (WindowRole::Control, _) => control_tree(visible && control_enabled),
+            (WindowRole::Display, Some(state)) => display_tree(state, visible, bounds),
+            (WindowRole::Control, _) => control_tree(visible && control_enabled, bounds),
             (_, None) => hidden_tree(self.role),
         };
         if let Ok(mut latest) = self.latest_tree.lock() {
@@ -140,13 +147,34 @@ fn hidden_tree(role: WindowRole) -> TreeUpdate {
     }
 }
 
-fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
+fn accesskit_rect(rect: PhysicalRect) -> Rect {
+    Rect::new(
+        f64::from(rect.x0),
+        f64::from(rect.y0),
+        f64::from(rect.x1),
+        f64::from(rect.y1),
+    )
+}
+
+fn display_tree(
+    state: &OverlayViewState,
+    visible: bool,
+    bounds: Option<OverlayWindowBounds>,
+) -> TreeUpdate {
+    let Some(layout) = bounds.and_then(|bounds| DisplayLayout::from_bounds(state.mode, bounds))
+    else {
+        return hidden_tree(WindowRole::Display);
+    };
     if !visible {
         return hidden_tree(WindowRole::Display);
     }
     let mut classes = NodeClassSet::new();
-    let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_METER_ID];
     let preview_visible = state.mode == OverlayMode::Live;
+    let elapsed_visible = preview_visible || state.elapsed.is_some();
+    let mut children = vec![DISPLAY_STATUS_ID, DISPLAY_METER_ID];
+    if elapsed_visible {
+        children.push(DISPLAY_ELAPSED_ID);
+    }
     if preview_visible {
         children.push(DISPLAY_PREVIEW_ID);
     }
@@ -158,6 +186,7 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
     let mut root = NodeBuilder::new(Role::Window);
     root.set_name("Scribe recording overlay");
     root.set_children(children);
+    root.set_bounds(accesskit_rect(layout.root));
 
     let status_name = if state.phase == OverlayPhase::Listening {
         "Scribe is recording"
@@ -166,6 +195,7 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
     };
     let mut status = NodeBuilder::new(Role::StaticText);
     status.set_name(status_name);
+    status.set_bounds(accesskit_rect(layout.status));
 
     let level = state
         .audio_level
@@ -178,15 +208,28 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
     meter.set_numeric_value((level * 100.0).round() as f64);
     meter.set_min_numeric_value(0.0);
     meter.set_max_numeric_value(100.0);
+    meter.set_bounds(accesskit_rect(layout.meter));
 
     let mut nodes = vec![
         (DISPLAY_ROOT_ID, root.build(&mut classes)),
         (DISPLAY_STATUS_ID, status.build(&mut classes)),
         (DISPLAY_METER_ID, meter.build(&mut classes)),
     ];
+    if elapsed_visible {
+        let mut elapsed = NodeBuilder::new(Role::StaticText);
+        elapsed.set_name(format!(
+            "Elapsed time {}",
+            format_elapsed(state.elapsed.unwrap_or_default())
+        ));
+        elapsed.set_bounds(accesskit_rect(layout.elapsed));
+        nodes.push((DISPLAY_ELAPSED_ID, elapsed.build(&mut classes)));
+    }
     if preview_visible {
         let mut preview = NodeBuilder::new(Role::StaticText);
         preview.set_name(live_accessible_text(state));
+        preview.set_bounds(accesskit_rect(
+            layout.preview.expect("live layout includes preview bounds"),
+        ));
         if state.error.is_some() || state.notice.is_some() {
             preview.set_live(Live::Polite);
         }
@@ -196,6 +239,11 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
         let mut live = NodeBuilder::new(Role::StaticText);
         live.set_name(announcement);
         live.set_live(Live::Polite);
+        live.set_bounds(accesskit_rect(
+            layout
+                .preview
+                .expect("live layout includes announcement bounds"),
+        ));
         nodes.push((DISPLAY_ANNOUNCEMENT_ID, live.build(&mut classes)));
     }
     TreeUpdate {
@@ -205,7 +253,10 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
     }
 }
 
-fn control_tree(visible: bool) -> TreeUpdate {
+fn control_tree(visible: bool, bounds: Option<OverlayWindowBounds>) -> TreeUpdate {
+    let Some(layout) = bounds.and_then(ControlLayout::from_bounds) else {
+        return hidden_tree(WindowRole::Control);
+    };
     if !visible {
         return hidden_tree(WindowRole::Control);
     }
@@ -213,12 +264,14 @@ fn control_tree(visible: bool) -> TreeUpdate {
     let mut root = NodeBuilder::new(Role::Window);
     root.set_name(CANCEL_RECORDING_LABEL);
     root.set_children(vec![CONTROL_BUTTON_ID]);
+    root.set_bounds(accesskit_rect(layout.root));
 
     let mut button = NodeBuilder::new(Role::Button);
     button.set_name(CANCEL_RECORDING_LABEL);
     button.set_description(CANCEL_RECORDING_LABEL);
     button.set_default_action_verb(DefaultActionVerb::Press);
     button.add_action(Action::Default);
+    button.set_bounds(accesskit_rect(layout.button));
 
     TreeUpdate {
         nodes: vec![
@@ -235,6 +288,32 @@ mod tests {
     use super::*;
     use crate::overlay::controller::OverlayTranscript;
 
+    fn display_bounds(mode: OverlayMode) -> OverlayWindowBounds {
+        match mode {
+            OverlayMode::Live => OverlayWindowBounds {
+                x: -1120,
+                y: 1119,
+                width: 750,
+                height: 78,
+            },
+            OverlayMode::Minimal | OverlayMode::Off => OverlayWindowBounds {
+                x: 905,
+                y: 1272,
+                width: 400,
+                height: 65,
+            },
+        }
+    }
+
+    fn control_bounds() -> OverlayWindowBounds {
+        OverlayWindowBounds {
+            x: 1590,
+            y: 1283,
+            width: 55,
+            height: 55,
+        }
+    }
+
     #[test]
     fn hidden_trees_expose_no_live_region_or_cancel_button() {
         for role in [WindowRole::Display, WindowRole::Control] {
@@ -248,7 +327,13 @@ mod tests {
 
     #[test]
     fn visible_control_has_exact_name_and_default_action() {
-        let tree = control_tree(true);
+        let tree = control_tree(true, Some(control_bounds()));
+        let root = tree
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == CONTROL_ROOT_ID)
+            .map(|(_, node)| node)
+            .expect("control root");
         let button = tree
             .nodes
             .iter()
@@ -258,6 +343,9 @@ mod tests {
         assert_eq!(button.name(), Some(CANCEL_RECORDING_LABEL));
         assert_eq!(button.description(), Some(CANCEL_RECORDING_LABEL));
         assert!(button.supports_action(Action::Default));
+        let expected = Rect::new(0.0, 0.0, 55.0, 55.0);
+        assert_eq!(root.bounds(), Some(expected));
+        assert_eq!(button.bounds(), Some(expected));
     }
 
     #[test]
@@ -273,7 +361,7 @@ mod tests {
             transcript_announcement: Some("Committed transcript: committed".to_owned()),
             ..OverlayViewState::default()
         };
-        let tree = display_tree(&state, true);
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Live)));
         let live_nodes: Vec<_> = tree
             .nodes
             .iter()
@@ -289,6 +377,11 @@ mod tests {
                 && node.name()
                     == Some("Committed transcript: committed. Tentative transcript:  tentative")
         }));
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == DISPLAY_ELAPSED_ID
+                && node.name() == Some("Elapsed time 00:00")
+                && node.live().is_none()
+        }));
     }
 
     #[test]
@@ -299,7 +392,7 @@ mod tests {
             transcript_announcement: Some("Committed transcript: hidden compact text".to_owned()),
             ..OverlayViewState::default()
         };
-        let tree = display_tree(&state, true);
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Minimal)));
         let root = tree
             .nodes
             .iter()
@@ -313,5 +406,80 @@ mod tests {
                 .iter()
                 .all(|(id, _)| *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID)
         );
+        assert!(tree.nodes.iter().all(|(id, _)| *id != DISPLAY_ELAPSED_ID));
+    }
+
+    #[test]
+    fn visible_live_nodes_use_current_physical_layout_bounds() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Live,
+            phase: OverlayPhase::Listening,
+            elapsed: Some(std::time::Duration::from_secs(12)),
+            transcript_announcement: Some("Committed transcript: test".to_owned()),
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Live)));
+        let node = |id| {
+            tree.nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == id)
+                .map(|(_, node)| node)
+                .expect("expected accessibility node")
+        };
+        assert_eq!(
+            node(DISPLAY_ROOT_ID).bounds(),
+            Some(Rect::new(0.0, 0.0, 750.0, 78.0))
+        );
+        assert_eq!(
+            node(DISPLAY_STATUS_ID).bounds(),
+            Some(Rect::new(20.0, 18.75, 57.5, 56.25))
+        );
+        assert_eq!(
+            node(DISPLAY_METER_ID).bounds(),
+            node(DISPLAY_STATUS_ID).bounds()
+        );
+        assert_eq!(node(DISPLAY_ELAPSED_ID).name(), Some("Elapsed time 00:12"));
+        assert_eq!(
+            node(DISPLAY_ELAPSED_ID).bounds(),
+            Some(Rect::new(70.0, 25.625, 130.0, 54.375))
+        );
+        assert_eq!(
+            node(DISPLAY_PREVIEW_ID).bounds(),
+            Some(Rect::new(153.75, 25.625, 686.25, 54.375))
+        );
+        assert_eq!(
+            node(DISPLAY_ANNOUNCEMENT_ID).bounds(),
+            node(DISPLAY_PREVIEW_ID).bounds()
+        );
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .filter(|(_, node)| node.live() == Some(Live::Polite))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn compact_elapsed_semantics_are_bounded_and_not_live() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Listening,
+            elapsed: Some(std::time::Duration::from_secs(65)),
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true, Some(display_bounds(OverlayMode::Minimal)));
+        let elapsed = tree
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == DISPLAY_ELAPSED_ID)
+            .map(|(_, node)| node)
+            .expect("elapsed node");
+        assert_eq!(elapsed.name(), Some("Elapsed time 01:05"));
+        assert_eq!(
+            elapsed.bounds(),
+            Some(Rect::new(258.75, 20.625, 325.0, 46.875))
+        );
+        assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
     }
 }

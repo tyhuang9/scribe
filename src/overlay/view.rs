@@ -18,12 +18,12 @@ pub const OVERLAY_CONTROL_VIEWPORT_KEY: &str = "scribe-dictation-overlay-cancel"
 pub const OVERLAY_CONTROL_WINDOW_TITLE: &str = "Scribe Dictation Overlay Cancel";
 const CANCEL_RECORDING_LABEL: &str = "Cancel recording and discard it";
 
-const LIVE_WIDTH: f32 = 600.0;
-const LIVE_HEIGHT: f32 = 62.0;
-const MINIMAL_WIDTH: f32 = 320.0;
-const MINIMAL_HEIGHT: f32 = 52.0;
+pub(super) const LIVE_WIDTH: f32 = 600.0;
+pub(super) const LIVE_HEIGHT: f32 = 62.0;
+pub(super) const MINIMAL_WIDTH: f32 = 320.0;
+pub(super) const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
-const CONTROL_SIZE: f32 = 44.0;
+pub(super) const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
 const CAPSULE_HORIZONTAL_INSET: f32 = 8.0;
 const LIVE_CAPSULE_VERTICAL_INSET: f32 = 8.0;
