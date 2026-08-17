@@ -64,8 +64,10 @@ pub(crate) struct SileroVadModel {
 
 impl SileroVadModel {
     pub(crate) fn load_bundled(num_threads: i32) -> Result<Self> {
-        let model_path = crate::support_assets::materialize_bundled_support_assets()?;
-        Self::load_verified(&model_path, num_threads)
+        let asset = crate::support_assets::materialize_bundled_support_assets()?;
+        let model = Self::load_verified(asset.path(), num_threads);
+        drop(asset);
+        model
     }
 
     fn load_verified(model_path: &Path, num_threads: i32) -> Result<Self> {
