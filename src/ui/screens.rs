@@ -50,6 +50,10 @@ const MICROPHONE_ACCESS_ERROR: &str = "Scribe couldn’t access your microphone.
 const ROUTE_TOP_INSET: f32 = 28.0;
 const ROUTE_HORIZONTAL_INSET: f32 = 28.0;
 const ROUTE_BOTTOM_INSET: f32 = 16.0;
+// egui 0.27 does not salt automatic widget IDs when a scope is pushed. Keep
+// each top-level route in its own range so a route transition cannot reparent
+// an automatic ID while AccessKit removes the previous route's subtree.
+const ROUTE_AUTO_ID_STRIDE: usize = 100_000;
 const SETTINGS_COMPACT_BREAKPOINT: f32 = 620.0;
 const SETTINGS_LABEL_COLUMN_WIDTH: f32 = 270.0;
 const LIVE_TRANSCRIPTION_PREVIEW_SWITCH_ID: &str = "live-transcription-preview-switch";
@@ -540,6 +544,7 @@ pub(crate) fn show_route_scroll<T>(
                 .inner_margin(Margin::symmetric(ROUTE_HORIZONTAL_INSET, 0.0))
                 .show(ui, |ui| {
                     ui.set_width((route_width - ROUTE_HORIZONTAL_INSET * 2.0).max(0.0));
+                    ui.skip_ahead_auto_ids(route_auto_id_offset(route));
                     let content = add_contents(ui);
                     ui.add_space(ROUTE_BOTTOM_INSET);
                     content
@@ -602,6 +607,19 @@ pub(crate) fn show_route_scroll<T>(
         );
     });
     scroll.inner
+}
+
+fn route_auto_id_offset(route: UiRoute) -> usize {
+    match route {
+        UiRoute::Transcribe => 0,
+        UiRoute::Models => ROUTE_AUTO_ID_STRIDE,
+        // Settings reserves its own 10,000-ID ranges for each tab inside this
+        // route-level range.
+        UiRoute::Settings(_) => ROUTE_AUTO_ID_STRIDE * 2,
+        UiRoute::History => ROUTE_AUTO_ID_STRIDE * 3,
+        UiRoute::About => ROUTE_AUTO_ID_STRIDE * 4,
+        UiRoute::Debug => ROUTE_AUTO_ID_STRIDE * 5,
+    }
 }
 
 pub(crate) fn screen_action_for_remote_catalog_action(
@@ -7255,6 +7273,98 @@ fn size_label(tier: ModelSizeTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        history::{HistoryMetrics, HistoryRecord, HistoryStatus},
+        ui::{HistoryPageState, history_page},
+    };
+
+    type AccessKitNodes = std::collections::HashMap<egui::accesskit::NodeId, egui::accesskit::Node>;
+    type IncrementalUpdateResult = (
+        AccessKitNodes,
+        egui::accesskit::NodeId,
+        Vec<(egui::accesskit::NodeId, Option<String>)>,
+    );
+
+    /// Mirrors the orphan-removal pass in AccessKit consumer 0.16.1. This is
+    /// intentionally exercised against egui's real consecutive TreeUpdates:
+    /// an updated node must never also be removed as an orphan.
+    fn apply_accesskit_incremental_update(
+        initial: &egui::accesskit::TreeUpdate,
+        update: &egui::accesskit::TreeUpdate,
+    ) -> IncrementalUpdateResult {
+        let mut nodes = initial
+            .nodes
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut orphans = std::collections::HashSet::new();
+        let mut updated = std::collections::HashSet::new();
+        let old_root = initial
+            .tree
+            .as_ref()
+            .expect("initial AccessKit update should define the tree")
+            .root;
+        if update
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.root != old_root)
+        {
+            orphans.insert(old_root);
+        }
+        for (id, data) in &update.nodes {
+            orphans.remove(id);
+            for child in data.children() {
+                orphans.remove(child);
+            }
+            if let Some(old) = nodes.insert(*id, data.clone()) {
+                updated.insert(*id);
+                for child in old.children() {
+                    if !data.children().contains(child) {
+                        orphans.insert(*child);
+                    }
+                }
+            }
+        }
+
+        let mut removed = std::collections::HashSet::new();
+        let mut pending = orphans.into_iter().collect::<Vec<_>>();
+        while let Some(id) = pending.pop() {
+            if removed.insert(id)
+                && let Some(node) = nodes.get(&id)
+            {
+                pending.extend(node.children());
+            }
+        }
+        let orphaned_updated = updated
+            .intersection(&removed)
+            .map(|id| {
+                (
+                    *id,
+                    nodes
+                        .get(id)
+                        .and_then(|node| node.name())
+                        .map(str::to_owned),
+                )
+            })
+            .collect();
+        for id in removed {
+            nodes.remove(&id);
+        }
+        let root = update.tree.as_ref().map_or(old_root, |tree| tree.root);
+        (nodes, root, orphaned_updated)
+    }
+
+    fn accesskit_is_descendant(
+        nodes: &AccessKitNodes,
+        ancestor: egui::accesskit::NodeId,
+        target: egui::accesskit::NodeId,
+    ) -> bool {
+        nodes.get(&ancestor).is_some_and(|node| {
+            node.children()
+                .iter()
+                .any(|child| *child == target || accesskit_is_descendant(nodes, *child, target))
+        })
+    }
 
     #[test]
     fn active_badge_follows_first_title_row_and_stays_bounded() {
@@ -9275,92 +9385,6 @@ mod tests {
 
     #[test]
     fn recording_to_advanced_accesskit_update_keeps_updated_nodes_attached() {
-        type AccessKitNodes =
-            std::collections::HashMap<egui::accesskit::NodeId, egui::accesskit::Node>;
-        type IncrementalUpdateResult = (
-            AccessKitNodes,
-            egui::accesskit::NodeId,
-            Vec<(egui::accesskit::NodeId, Option<String>)>,
-        );
-
-        fn apply_incremental_update(
-            initial: &egui::accesskit::TreeUpdate,
-            update: &egui::accesskit::TreeUpdate,
-        ) -> IncrementalUpdateResult {
-            let mut nodes = initial
-                .nodes
-                .iter()
-                .cloned()
-                .collect::<std::collections::HashMap<_, _>>();
-            let mut orphans = std::collections::HashSet::new();
-            let mut updated = std::collections::HashSet::new();
-            let old_root = initial
-                .tree
-                .as_ref()
-                .expect("initial AccessKit update should define the tree")
-                .root;
-            if update
-                .tree
-                .as_ref()
-                .is_some_and(|tree| tree.root != old_root)
-            {
-                orphans.insert(old_root);
-            }
-            for (id, data) in &update.nodes {
-                orphans.remove(id);
-                for child in data.children() {
-                    orphans.remove(child);
-                }
-                if let Some(old) = nodes.insert(*id, data.clone()) {
-                    updated.insert(*id);
-                    for child in old.children() {
-                        if !data.children().contains(child) {
-                            orphans.insert(*child);
-                        }
-                    }
-                }
-            }
-
-            let mut removed = std::collections::HashSet::new();
-            let mut pending = orphans.into_iter().collect::<Vec<_>>();
-            while let Some(id) = pending.pop() {
-                if removed.insert(id)
-                    && let Some(node) = nodes.get(&id)
-                {
-                    pending.extend(node.children());
-                }
-            }
-            let orphaned_updated = updated
-                .intersection(&removed)
-                .map(|id| {
-                    (
-                        *id,
-                        nodes
-                            .get(id)
-                            .and_then(|node| node.name())
-                            .map(str::to_owned),
-                    )
-                })
-                .collect();
-            for id in removed {
-                nodes.remove(&id);
-            }
-            let root = update.tree.as_ref().map_or(old_root, |tree| tree.root);
-            (nodes, root, orphaned_updated)
-        }
-
-        fn is_descendant(
-            nodes: &AccessKitNodes,
-            ancestor: egui::accesskit::NodeId,
-            target: egui::accesskit::NodeId,
-        ) -> bool {
-            nodes.get(&ancestor).is_some_and(|node| {
-                node.children()
-                    .iter()
-                    .any(|child| *child == target || is_descendant(nodes, *child, target))
-            })
-        }
-
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let state = TranscriptionState::default();
@@ -9394,7 +9418,8 @@ mod tests {
 
         let recording = render(SettingsTab::Recording);
         let advanced = render(SettingsTab::Advanced);
-        let (nodes, root, orphaned_updated) = apply_incremental_update(&recording, &advanced);
+        let (nodes, root, orphaned_updated) =
+            apply_accesskit_incremental_update(&recording, &advanced);
         assert_eq!(orphaned_updated, Vec::new());
         let panel = nodes
             .iter()
@@ -9408,7 +9433,7 @@ mod tests {
             .iter()
             .find_map(|(id, node)| (node.name() == Some("Stop after speech ends")).then_some(*id))
             .expect("Advanced should expose the Stop after speech ends row");
-        assert!(is_descendant(&nodes, panel, automatic_stop));
+        assert!(accesskit_is_descendant(&nodes, panel, automatic_stop));
         assert!(
             !nodes
                 .get(&root)
@@ -9416,6 +9441,188 @@ mod tests {
                 .children()
                 .contains(&automatic_stop)
         );
+    }
+
+    #[test]
+    fn route_auto_id_ranges_are_disjoint_and_leave_room_for_settings_tabs() {
+        assert!(ROUTE_AUTO_ID_STRIDE >= 100_000);
+        assert!(SETTINGS_TAB_AUTO_ID_STRIDE * 4 < ROUTE_AUTO_ID_STRIDE);
+
+        let routes = [
+            UiRoute::Transcribe,
+            UiRoute::Models,
+            UiRoute::Settings(SettingsTab::General),
+            UiRoute::History,
+            UiRoute::About,
+            UiRoute::Debug,
+        ];
+        for (index, route) in routes.iter().enumerate() {
+            for other_route in routes.iter().skip(index + 1) {
+                assert_ne!(
+                    route_auto_id_offset(*route),
+                    route_auto_id_offset(*other_route),
+                    "{route:?} and {other_route:?} must use distinct automatic ID ranges"
+                );
+            }
+        }
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::Recording,
+            SettingsTab::Advanced,
+            SettingsTab::About,
+        ] {
+            assert_eq!(
+                route_auto_id_offset(UiRoute::Settings(tab)),
+                route_auto_id_offset(UiRoute::Settings(SettingsTab::General))
+            );
+        }
+    }
+
+    #[test]
+    fn every_route_transition_to_history_keeps_accesskit_nodes_attached() {
+        fn history_record() -> HistoryRecord {
+            HistoryRecord {
+                id: 7,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                completed_at_ms: Some(1),
+                status: HistoryStatus::Completed,
+                raw_text: "raw transcription".into(),
+                final_text: Some("final transcription".into()),
+                model_id: "whisper_cpp_base_en".into(),
+                metrics: HistoryMetrics::default(),
+                pinned: false,
+                source_app: None,
+                audio_path: None,
+                failure: None,
+                retry_count: 0,
+                output_outcome: None,
+            }
+        }
+
+        fn raw_input() -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 815.0),
+                )),
+                focused: true,
+                ..Default::default()
+            }
+        }
+
+        fn render_source_route(ctx: &egui::Context, route: UiRoute) -> egui::accesskit::TreeUpdate {
+            let state = TranscriptionState {
+                phase: TranscriptionPhase::Ready,
+                ..Default::default()
+            };
+            let settings = RecordingSettingsView::default();
+            let comparison = ModelComparisonState::default();
+            ctx.run(raw_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_route_scroll(ui, route, |ui| {
+                        render_screen(
+                            ui,
+                            &ScreenView {
+                                route,
+                                transcription: &state,
+                                models: &[],
+                                model_catalog: &[],
+                                comparison: &comparison,
+                                model_management: &Default::default(),
+                                model_language_filter: ModelLanguageFilter::default(),
+                                remote_catalog: &Default::default(),
+                                recording_settings: &settings,
+                            },
+                        )
+                    });
+                });
+            })
+            .platform_output
+            .accesskit_update
+            .expect("source route should expose AccessKit")
+        }
+
+        fn render_history(
+            ctx: &egui::Context,
+            records: &[HistoryRecord],
+            loading: bool,
+        ) -> egui::accesskit::TreeUpdate {
+            let mut search = String::new();
+            ctx.run(raw_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_route_scroll(ui, UiRoute::History, |ui| {
+                        history_page(
+                            ui,
+                            HistoryPageState {
+                                search: &mut search,
+                                records,
+                                has_more: false,
+                                loading,
+                                error: None,
+                                confirm_delete: None,
+                                work_active: false,
+                                playing: None,
+                                playback_stopping: false,
+                                armed_repaste: None,
+                                focus_search: false,
+                                focus_delete_confirmation: false,
+                            },
+                        );
+                    });
+                });
+            })
+            .platform_output
+            .accesskit_update
+            .expect("history should expose AccessKit")
+        }
+
+        let record = history_record();
+        let history_states = [
+            ("empty", &[][..], false, "No matching history entries"),
+            ("loading", &[][..], true, "Loading local history"),
+            (
+                "populated",
+                std::slice::from_ref(&record),
+                false,
+                "1 history entries loaded",
+            ),
+        ];
+        for source_route in [
+            UiRoute::Transcribe,
+            UiRoute::Models,
+            UiRoute::Settings(SettingsTab::Advanced),
+            UiRoute::About,
+            UiRoute::Debug,
+        ] {
+            for (state_name, records, loading, expected_status) in history_states {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let source = render_source_route(&ctx, source_route);
+                let history = render_history(&ctx, records, loading);
+                let (nodes, _root, orphaned_updated) =
+                    apply_accesskit_incremental_update(&source, &history);
+
+                assert!(
+                    orphaned_updated.is_empty(),
+                    "{source_route:?} -> {state_name} History reparented an updated AccessKit node: {orphaned_updated:?}"
+                );
+                assert!(
+                    nodes
+                        .values()
+                        .any(|node| node.name() == Some(expected_status)),
+                    "{source_route:?} -> {state_name} History should retain its status node"
+                );
+                if state_name == "populated" {
+                    assert!(nodes.values().any(|node| {
+                        node.role() == egui::accesskit::Role::Group
+                            && node
+                                .name()
+                                .is_some_and(|name| name.contains("history entry"))
+                    }));
+                }
+            }
+        }
     }
 
     #[test]
