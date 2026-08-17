@@ -1,6 +1,12 @@
 // Exact ABI-relevant declarations from sherpa-onnx v1.13.5.
-// See PROVENANCE.md. The upstream include graph is reduced to the declarations
-// needed by Scribe's bridge; member order and method signatures are unchanged.
+//
+// Copyright (c)  2023  Xiaomi Corporation
+// Copyright (c)  2025  Xiaomi Corporation
+//
+// Modified by Scribe to reduce the upstream include graph to the declarations
+// required by its bridge. Member order and method signatures are unchanged.
+// Licensed under the Apache License, Version 2.0; see PROVENANCE.md and
+// vendor/sherpa-onnx-sys/LICENSE.
 
 #ifndef SCRIBE_SHERPA_ONNX_V1_13_5_VOICE_ACTIVITY_DETECTOR_ABI_H_
 #define SCRIBE_SHERPA_ONNX_V1_13_5_VOICE_ACTIVITY_DETECTOR_ABI_H_
