@@ -9383,6 +9383,7 @@ impl eframe::App for LocalTranscriberApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.quit_requested = true;
+        overlay::shutdown_overlay_viewport();
         self.deferred_recording_start = None;
         self.deferred_history_playback = None;
         self.stop_microphone_test();

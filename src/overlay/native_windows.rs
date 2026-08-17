@@ -1,39 +1,57 @@
 #![allow(dead_code)]
 
+mod accessibility;
 mod raster;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
-    mem::size_of,
+    mem::{size_of, zeroed},
     ptr::{null, null_mut},
     sync::{Arc, Mutex, OnceLock},
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
         HGDIOBJ, RGBQUAD, SelectObject,
     },
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::{
-        CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
-        GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATE,
-        RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW,
-        SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-        WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    UI::{
+        Controls::{
+            TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTS_ALWAYSTIP,
+            TTS_NOPREFIX, TTTOOLINFOW,
+        },
+        Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
+        WindowsAndMessaging::{
+            CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE,
+            GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
+            IsWindowVisible, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
+            SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+            SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_CANCELMODE, WM_CAPTURECHANGED,
+            WM_DESTROY, WM_GETOBJECT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE,
+            WM_NCDESTROY, WM_NCHITTEST, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        },
     },
 };
 
-use super::{OverlayAction, platform::OverlayWindowBounds};
+use super::{
+    OverlayAction,
+    controller::{OverlayPresentation, OverlayViewState},
+    platform::{CapturedTarget, OverlayPosition, OverlayWindowBounds, overlay_window_bounds},
+    view::{OverlayViewportOutput, control_window_bounds, is_cancellable, window_spec},
+};
 use crate::transcription::SessionId;
 
-use self::raster::LayeredFrame;
+use self::{
+    accessibility::{CANCEL_RECORDING_LABEL, NativeAccessibility},
+    raster::{LayeredFrame, NativeRasterizer},
+};
 
 const DISPLAY_CLASS_NAME: &str = "Scribe.NativeOverlay.Display";
 const CONTROL_CLASS_NAME: &str = "Scribe.NativeOverlay.Control";
@@ -102,6 +120,8 @@ impl ControlActionBridge {
 struct WindowProcedureState {
     role: WindowRole,
     action_bridge: Option<Arc<ControlActionBridge>>,
+    pressed: Cell<bool>,
+    accessibility: RefCell<Option<NativeAccessibility>>,
 }
 
 impl WindowProcedureState {
@@ -112,12 +132,17 @@ impl WindowProcedureState {
             bridge.emit_abandon();
         }
     }
+
+    fn cancel_press(&self) {
+        self.pressed.set(false);
+    }
 }
 
 struct NativeWindow {
     hwnd: HWND,
     role: WindowRole,
     surface: Option<LayeredSurface>,
+    tooltip: Option<NativeTooltip>,
     _procedure_state: Box<WindowProcedureState>,
 }
 
@@ -129,9 +154,12 @@ impl NativeWindow {
         register_window_classes()?;
         let class_name = wide_null(role.class_name());
         let title = wide_null(role.title());
+        let accessibility_bridge = action_bridge.clone();
         let mut procedure_state = Box::new(WindowProcedureState {
             role,
             action_bridge,
+            pressed: Cell::new(false),
+            accessibility: RefCell::new(None),
         });
         let module = unsafe { GetModuleHandleW(null()) };
         if module.is_null() {
@@ -156,16 +184,47 @@ impl NativeWindow {
         if hwnd.is_null() {
             return Err(NativeOverlayError::CreateWindow(role));
         }
-        let window = Self {
+        let mut window = Self {
             hwnd,
             role,
             surface: None,
+            tooltip: None,
             _procedure_state: procedure_state,
         };
         if !window.is_hardened() {
             return Err(NativeOverlayError::Hardening(role));
         }
+        *window._procedure_state.accessibility.borrow_mut() =
+            NativeAccessibility::install(hwnd, role, accessibility_bridge);
+        if role == WindowRole::Control {
+            window.tooltip = NativeTooltip::create(hwnd);
+        }
         Ok(window)
+    }
+
+    fn update_accessibility(
+        &mut self,
+        state: Option<&OverlayViewState>,
+        visible: bool,
+        control_enabled: bool,
+    ) -> bool {
+        let updated = {
+            let accessibility = self._procedure_state.accessibility.borrow();
+            let Some(accessibility) = accessibility.as_ref() else {
+                return false;
+            };
+            accessibility.update(state, visible, control_enabled)
+        };
+        if !updated {
+            self._procedure_state.accessibility.borrow_mut().take();
+        }
+        updated
+    }
+
+    fn control_capabilities_ready(&self) -> bool {
+        self.role == WindowRole::Control
+            && self._procedure_state.accessibility.borrow().is_some()
+            && self.tooltip.is_some()
     }
 
     fn is_hardened(&self) -> bool {
@@ -233,6 +292,12 @@ impl NativeWindow {
     }
 
     fn hide(&self) {
+        self._procedure_state.cancel_press();
+        if unsafe { GetCapture() } == self.hwnd {
+            unsafe {
+                ReleaseCapture();
+            }
+        }
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -255,8 +320,91 @@ impl NativeWindow {
 
 impl Drop for NativeWindow {
     fn drop(&mut self) {
+        self.tooltip.take();
+        self._procedure_state.accessibility.borrow_mut().take();
         self.hide();
         unsafe {
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+struct NativeTooltip {
+    hwnd: HWND,
+    tool_hwnd: HWND,
+    text: Vec<u16>,
+}
+
+impl NativeTooltip {
+    fn create(tool_hwnd: HWND) -> Option<Self> {
+        let module = unsafe { GetModuleHandleW(null()) };
+        if module.is_null() {
+            return None;
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                null(),
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                0,
+                0,
+                0,
+                0,
+                tool_hwnd,
+                null_mut(),
+                module,
+                null_mut(),
+            )
+        };
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut tooltip = Self {
+            hwnd,
+            tool_hwnd,
+            text: wide_null(CANCEL_RECORDING_LABEL),
+        };
+        let tool = tooltip.tool_info();
+        let added =
+            unsafe { SendMessageW(hwnd, TTM_ADDTOOLW, 0, (&raw const tool) as LPARAM) != 0 };
+        let positioned = unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            ) != 0
+        };
+        if !added || !positioned {
+            return None;
+        }
+        Some(tooltip)
+    }
+
+    fn tool_info(&mut self) -> TTTOOLINFOW {
+        TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: self.tool_hwnd,
+            uId: self.tool_hwnd as usize,
+            rect: unsafe { zeroed() },
+            hinst: null_mut(),
+            lpszText: self.text.as_mut_ptr(),
+            lParam: 0,
+            lpReserved: null_mut(),
+        }
+    }
+}
+
+impl Drop for NativeTooltip {
+    fn drop(&mut self) {
+        let tool = self.tool_info();
+        unsafe {
+            SendMessageW(self.hwnd, TTM_DELTOOLW, 0, (&raw const tool) as LPARAM);
             DestroyWindow(self.hwnd);
         }
     }
@@ -265,6 +413,7 @@ impl Drop for NativeWindow {
 struct NativeOverlayHost {
     display: NativeWindow,
     control: NativeWindow,
+    rasterizer: NativeRasterizer,
     action_bridge: Arc<ControlActionBridge>,
     action_rx: Receiver<OverlayAction>,
 }
@@ -278,9 +427,11 @@ impl NativeOverlayHost {
         });
         let display = NativeWindow::create(WindowRole::Display, None)?;
         let control = NativeWindow::create(WindowRole::Control, Some(Arc::clone(&action_bridge)))?;
+        let rasterizer = NativeRasterizer::new()?;
         Ok(Self {
             display,
             control,
+            rasterizer,
             action_bridge,
             action_rx,
         })
@@ -336,8 +487,10 @@ impl NativeOverlayHost {
         combine_presentation_results(display_presented, control_requested, control_presented)
     }
 
-    fn hide(&self) {
+    fn hide(&mut self) {
         self.action_bridge.bind(None);
+        self.display.update_accessibility(None, false, false);
+        self.control.update_accessibility(None, false, false);
         self.control.hide();
         self.display.hide();
     }
@@ -405,6 +558,10 @@ fn combine_presentation_results(
         display_presented,
         control_presented: display_presented && control_requested && control_presented,
     }
+}
+
+fn display_prerequisites_ready(rendered: bool, accessible: bool) -> bool {
+    rendered && accessible
 }
 
 struct LayeredSurface {
@@ -557,6 +714,8 @@ enum NativeOverlayError {
     CreateSurfaceBitmap,
     #[error("could not select the native overlay DIB section")]
     SelectSurfaceBitmap,
+    #[error("could not initialize native overlay rasterization: {0}")]
+    Raster(#[from] raster::RasterError),
 }
 
 static WINDOW_CLASSES_REGISTERED: OnceLock<Result<(), NativeOverlayError>> = OnceLock::new();
@@ -623,14 +782,48 @@ unsafe extern "system" fn native_overlay_wnd_proc(
     }
     let state = unsafe { &*state };
     match message {
+        WM_GETOBJECT => {
+            let result = state
+                .accessibility
+                .borrow()
+                .as_ref()
+                .and_then(|accessibility| accessibility.handle_wm_getobject(wparam, lparam));
+            result.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, message, wparam, lparam) })
+        }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_NCHITTEST => match state.role {
             WindowRole::Display => HTTRANSPARENT as LRESULT,
             WindowRole::Control => HTCLIENT as LRESULT,
         },
-        WM_LBUTTONUP => {
-            state.on_cancel();
+        WM_LBUTTONDOWN if state.role == WindowRole::Control => {
+            state.pressed.set(true);
+            unsafe {
+                SetCapture(hwnd);
+            }
             0
+        }
+        WM_LBUTTONUP => {
+            let was_pressed = state.pressed.replace(false);
+            if unsafe { GetCapture() } == hwnd {
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+            if was_pressed && point_is_in_client(hwnd, lparam) {
+                state.on_cancel();
+            }
+            0
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            state.cancel_press();
+            0
+        }
+        WM_DESTROY => {
+            state.cancel_press();
+            if let Some(bridge) = &state.action_bridge {
+                bridge.bind(None);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_NCDESTROY => unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -640,12 +833,135 @@ unsafe extern "system" fn native_overlay_wnd_proc(
     }
 }
 
+fn point_is_in_client(hwnd: HWND, lparam: LPARAM) -> bool {
+    let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+    let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+    let mut client: RECT = unsafe { zeroed() };
+    (unsafe { GetClientRect(hwnd, &mut client) != 0 })
+        && x >= client.left
+        && x < client.right
+        && y >= client.top
+        && y < client.bottom
+}
+
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 thread_local! {
     static NATIVE_OVERLAY_HOST: RefCell<Option<NativeOverlayHost>> = const { RefCell::new(None) };
+}
+
+pub(super) fn shutdown_overlay_viewport() {
+    NATIVE_OVERLAY_HOST.with(|slot| {
+        if let Some(mut host) = slot.borrow_mut().take() {
+            host.hide();
+        }
+    });
+}
+
+pub(super) fn show_overlay_viewport(
+    context: &eframe::egui::Context,
+    state: &OverlayViewState,
+    target: Option<&CapturedTarget>,
+    position: OverlayPosition,
+    presentation: OverlayPresentation,
+) -> OverlayViewportOutput {
+    NATIVE_OVERLAY_HOST.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let requested_visible = state.is_visible() && presentation.permits_background_overlay();
+        if !requested_visible {
+            let action = slot.as_ref().and_then(NativeOverlayHost::next_action);
+            if let Some(host) = slot.as_mut() {
+                host.hide();
+            }
+            return OverlayViewportOutput {
+                presented: false,
+                action,
+            };
+        }
+
+        let spec = window_spec(state.mode);
+        let Some(display_bounds) = overlay_window_bounds(target, spec, position) else {
+            let action = slot.as_ref().and_then(NativeOverlayHost::next_action);
+            if let Some(host) = slot.as_mut() {
+                host.hide();
+            }
+            return OverlayViewportOutput {
+                presented: false,
+                action,
+            };
+        };
+
+        if slot.is_none() {
+            let Ok(host) = NativeOverlayHost::new() else {
+                return OverlayViewportOutput::default();
+            };
+            *slot = Some(host);
+        }
+        let host = slot.as_mut().expect("native overlay host initialized");
+        let action = host.next_action();
+        let dark_mode = context.style().visuals.dark_mode;
+        let Ok(display_frame) = host.rasterizer.render_display(
+            state,
+            dark_mode,
+            display_bounds.width,
+            display_bounds.height,
+        ) else {
+            host.hide();
+            return OverlayViewportOutput {
+                presented: false,
+                action,
+            };
+        };
+
+        let control_bounds = control_window_bounds(display_bounds, spec);
+        let control_requested = is_cancellable(state);
+        let control_frame = control_requested
+            .then(|| {
+                host.rasterizer.render_control(
+                    dark_mode,
+                    control_bounds.width,
+                    control_bounds.height,
+                )
+            })
+            .transpose()
+            .ok()
+            .flatten();
+        let control_rendered = control_frame.is_some();
+        let display_accessible = host.display.update_accessibility(Some(state), true, false);
+        if !display_prerequisites_ready(true, display_accessible) {
+            host.hide();
+            return OverlayViewportOutput {
+                presented: false,
+                action,
+            };
+        }
+        let control_accessible = host.control.control_capabilities_ready()
+            && host
+                .control
+                .update_accessibility(Some(state), control_requested, control_requested);
+        let transparent_control = LayeredFrame {
+            width: control_bounds.width,
+            height: control_bounds.height,
+            pixels: vec![
+                0;
+                frame_byte_len(control_bounds.width, control_bounds.height).unwrap_or(0)
+            ],
+        };
+        let result = host.present(
+            display_bounds,
+            &display_frame,
+            control_requested && control_rendered && control_accessible,
+            control_bounds,
+            control_frame.as_ref().unwrap_or(&transparent_control),
+            state.session_id,
+        );
+        OverlayViewportOutput {
+            presented: result.display_presented,
+            action,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -750,6 +1066,14 @@ mod tests {
             combine_presentation_results(false, true, true),
             NativePresentationResult::default()
         );
+    }
+
+    #[test]
+    fn display_requires_both_pixels_and_accessibility_ownership() {
+        assert!(display_prerequisites_ready(true, true));
+        assert!(!display_prerequisites_ready(false, true));
+        assert!(!display_prerequisites_ready(true, false));
+        assert!(!display_prerequisites_ready(false, false));
     }
 
     #[test]

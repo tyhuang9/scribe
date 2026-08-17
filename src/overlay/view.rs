@@ -57,6 +57,25 @@ pub fn show_overlay_viewport(
     position: OverlayPosition,
     presentation: OverlayPresentation,
 ) -> OverlayViewportOutput {
+    #[cfg(target_os = "windows")]
+    {
+        super::native_windows::show_overlay_viewport(context, state, target, position, presentation)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        show_eframe_overlay_viewport(context, state, target, position, presentation)
+    }
+}
+
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn show_eframe_overlay_viewport(
+    context: &egui::Context,
+    state: &OverlayViewState,
+    target: Option<&CapturedTarget>,
+    position: OverlayPosition,
+    presentation: OverlayPresentation,
+) -> OverlayViewportOutput {
     let spec = window_spec(state.mode);
     let bounds = overlay_window_bounds(target, spec, position);
     let requested_visible = state.is_visible() && presentation.permits_background_overlay();
@@ -145,7 +164,7 @@ pub fn control_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(OVERLAY_CONTROL_VIEWPORT_KEY)
 }
 
-fn is_cancellable(state: &OverlayViewState) -> bool {
+pub(super) fn is_cancellable(state: &OverlayViewState) -> bool {
     state.session_id.is_some()
         && matches!(
             state.phase,
@@ -153,7 +172,7 @@ fn is_cancellable(state: &OverlayViewState) -> bool {
         )
 }
 
-fn control_window_bounds(
+pub(super) fn control_window_bounds(
     display: OverlayWindowBounds,
     display_spec: OverlayWindowSpec,
 ) -> OverlayWindowBounds {
@@ -276,7 +295,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
     }
 }
 
-fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
+pub(super) fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
     match mode {
         OverlayMode::Live => OverlayWindowSpec {
             width_points: LIVE_WIDTH,
@@ -489,7 +508,7 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
     });
 }
 
-fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
+pub(super) fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
     if state.error.is_some() || state.notice.is_some() {
         return None;
     }
@@ -651,7 +670,7 @@ fn live_preview_layout(
     )
 }
 
-fn live_accessible_text(state: &OverlayViewState) -> String {
+pub(super) fn live_accessible_text(state: &OverlayViewState) -> String {
     if let Some(error) = &state.error {
         return error_message(error);
     }
