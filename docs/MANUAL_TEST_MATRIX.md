@@ -448,22 +448,23 @@ manual row above to PASS.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Repository gates | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test --all-targets --all-features -- --test-threads=1`. Native renderer focused gate: native 22/22, overlay view 25/25, and theme 8/8. | **PASS** - the final branch suite discovered 954 tests, passed 943, failed 0, and ignored 11 explicit local runtime/fixture tests |
+| Repository gates | Baseline full gate at `f5dbdc0`: formatting, check, strict Clippy, and serialized full suite (954 discovered; 943 passed; 0 failed; 11 ignored). Remediation gate at `6d5492c`: native 31/31, overlay view 25/25, formatting, diff check, and strict all-target/all-feature Clippy. | **PASS focused remediation / full rerun required** - run the complete suite at the reviewed descendant before merge |
 | Presentation policy | Focused/unfocused/minimized/tray-hidden/unknown-focus, Off/Hidden/non-Windows, state preservation, and first-successful-presentation timing tests; WGC manifests record unchanged foreground HWNDs across actual presentation | **PASS automated/native fixture policy** - physical focus transitions between Scribe and arbitrary third-party apps remain NOT VERIFIED |
-| Display and control separation | Distinct layered HWNDs; WGC-visible/uncloaked style and 96/120-DPI geometry evidence; display `HTTRANSPARENT`, control `HTCLIENT`, both `MA_NOACTIVATE`; 320 x 52 Compact and 600 x 62 Live logical geometry; contained 44 x 44 AccessKit button | **PASS native fixture contracts** - taskbar/Alt+Tab enumeration, physical underlying-app clicks, and the full mixed-DPI matrix remain NOT VERIFIED |
+| Display and control separation | Distinct layered HWNDs; final WGC-visible/uncloaked 120-DPI geometry plus automated 96/120/144/192-DPI layout contracts; display `HTTRANSPARENT`, control `HTCLIENT`, both `MA_NOACTIVATE`; 320 x 52 Compact and 600 x 62 Live logical geometry; UIA reports the 44 x 44 logical control as an exact 55 x 55 desktop target at 120 DPI | **PASS native fixture contracts** - taskbar/Alt+Tab enumeration, physical underlying-app clicks, and the full mixed-DPI matrix remain NOT VERIFIED |
 | Discard lifecycle | Session-correlated pending/active discard, stale action rejection, startup cancellation, app-owned worker draining, capture-admission blocking, preview cancellation, audio release, and zero transcript/history/output tests | **PASS automated lifecycle** - physical microphone startup/driver shutdown remains NOT VERIFIED |
-| Preview and accessibility | Grapheme-safe one-rendered-row tail, committed/tentative styling, bounded notices, exclusive foreground/background live-region ownership, exact cancel name/tooltip, and foreground keyboard-equivalent discard; native probe confirms both server-side UIA providers, exact cancel button name, Invoke support, and no keyboard focusability | **PASS automated/native provider semantics** - Narrator/Accessibility Insights speech and tooltip dwell remain NOT VERIFIED |
-| Native visual fidelity | Hardware `Windows.Graphics.Capture` output for Live/Compact in light/dark at 96 and 120 DPI, plus the inspected same-state source comparison in `design-qa-evidence/overlay-native/` | **PASS deterministic native visual gate** - no missing display, black X tile, seam, clipping, or focus change; painted translucency intentionally omits native blur |
+| Preview and accessibility | Grapheme-safe one-rendered-row tail, committed/tentative styling, bounded notices, exclusive foreground/background live-region ownership, exact cancel name/tooltip, static elapsed semantics in both modes, and DPI-derived physical bounds for root/status/meter/elapsed/preview/announcement/button. The native probe confirms ElementFromPoint resolves the X and a forced post-AccessKit Verify failure leaves both HWNDs hidden with empty UIA subtrees. | **PASS automated/native provider semantics** - Narrator/Accessibility Insights speech and tooltip dwell remain NOT VERIFIED |
+| Native visual fidelity | Hardware `Windows.Graphics.Capture` output from exact head `6d5492c` for Live/Compact in light/dark at 120 DPI, automated scaling contracts at 96/120/144/192 DPI, plus the rebuilt same-state source comparison in `design-qa-evidence/overlay-native/` | **PASS deterministic native visual gate** - no missing display, black X tile, seam, clipping, or focus change; painted translucency intentionally omits native blur |
 | Security review | Specialist review of external-target isolation, native hardening profiles, stale action handling, cancellation ordering, privacy, and configuration compatibility | **PASS / GO** - no reportable security findings |
 
 Reproduce the deterministic overlay gate from the repository root with:
 
 ```powershell
-$env:PATH = 'C:\Program Files\CMake\bin;' + $env:PATH
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation
+$env:CMAKE = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
 $env:CARGO_TARGET_DIR = "$PWD\target\native-layered"
-cargo fmt --all -- --check
+cargo fmt --all --check
 cargo test --all-features overlay::native_windows --no-fail-fast
-cargo test --all-features overlay::view::tests --no-fail-fast
+cargo test --all-features overlay::view --no-fail-fast
 cargo test --all-features ui::theme::tests --no-fail-fast
 cargo clippy --all-targets --all-features -- -D warnings
 ```

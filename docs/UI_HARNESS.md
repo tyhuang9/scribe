@@ -57,7 +57,8 @@ Run these fixtures only from a debug build with the `ui-harness` feature. For
 example:
 
 ```powershell
-$env:PATH = 'C:\Program Files\CMake\bin;' + $env:PATH
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation
+$env:CMAKE = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
 $env:CARGO_TARGET_DIR = "$PWD\target\native-layered"
 $env:SCRIBE_UI_HARNESS_VIEWPORT = '960x680'
 $env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
@@ -86,11 +87,21 @@ display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
 WS_EX_TOOLWINDOW`; the cancel control has the same profile without
 `WS_EX_TRANSPARENT`. Both are submitted as top-down premultiplied BGRA DIBs by
 `UpdateLayeredWindow(ULW_ALPHA)` and shown topmost without activation. The
-display exposes the current phase/preview through its native AccessKit adapter;
-the control exposes the exact `Cancel recording and discard it` button and a
-standard Windows tooltip. If display accessibility or pixel presentation
-fails, both windows hide. If only the cancel tooltip/control capability fails,
-the passive display remains and the X hides.
+display exposes the current phase, microphone meter, elapsed time, and preview
+through its native AccessKit adapter; the control exposes the exact `Cancel
+recording and discard it` button and a standard Windows tooltip. If display
+accessibility or pixel presentation fails, both AccessKit trees reset hidden
+before both windows hide. If only the cancel tooltip/control capability fails,
+the passive display remains and the X hides. Elapsed time is a static semantic
+node rather than a live region: Live always exposes its visible timer, while
+Compact exposes one only when it is painted.
+
+AccessKit node bounds and GDI+ paint placement share the same physical layout
+derived from the actual `OverlayWindowBounds`. AccessKit supplies physical
+client coordinates and its Windows adapter translates them through the HWND
+origin to UIA desktop `BoundingRectangle` values. Thus the 44 x 44 logical
+cancel target is 55 x 55 physical pixels on a 120-DPI monitor without using a
+stale fixed rectangle.
 
 The surface is deliberately painted translucent glass, not a native backdrop
 blur. This keeps light/dark output deterministic and fail-soft on Windows
@@ -133,6 +144,16 @@ Repeat with `overlay/live-light`,
 `overlay/compact-light`, and `overlay/compact-dark`. The helper is local QA
 instrumentation rather than a shipped Scribe executable; the four fixture
 routes themselves are checked-in and reproducible without it.
+
+The accepted `6d5492c` evidence is tracked in
+`design-qa-evidence/overlay-native/`. Its native UIA probe records the desktop
+bounds for display root/status/meter/elapsed/preview/announcement and control
+root/button, verifies ElementFromPoint at the X, and then removes
+`WS_EX_LAYERED` from the exact fixture display HWND. That forced Verify failure
+runs after visible semantic updates; the captured result has both HWNDs hidden,
+both UIA subtrees empty, and no cancel element at the former control center.
+The style mutation is confined to the disposable fixture process and is not a
+production test hook.
 
 ## Model-card contract
 

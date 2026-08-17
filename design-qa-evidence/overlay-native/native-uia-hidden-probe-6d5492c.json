@@ -1,0 +1,145 @@
+{
+    "fixturePid":  28620,
+    "fixtureExe":  "C:\\Users\\huang\\Documents\\Projects\\scribe-native-layered-overlay\\target\\native-layered\\debug\\local-transcriber.exe",
+    "commit":  "6d5492c",
+    "foregroundBefore":  "0x660130",
+    "foregroundAfter":  "0x660130",
+    "foregroundStable":  true,
+    "visible":  {
+                    "displayHwnd":  "0x9B05F2",
+                    "controlHwnd":  "0x2B097A",
+                    "displayHitTest":  -1,
+                    "controlHitTest":  1,
+                    "displayMouseActivate":  3,
+                    "controlMouseActivate":  3,
+                    "elementFromControlCenter":  "Cancel recording and discard it",
+                    "displayNodes":  [
+                                         {
+                                             "name":  "Scribe recording overlay",
+                                             "controlType":  "ControlType.Window",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  905,
+                                                            "top":  1272,
+                                                            "right":  1655,
+                                                            "bottom":  1350,
+                                                            "width":  750,
+                                                            "height":  78
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Scribe is recording",
+                                             "controlType":  "ControlType.Text",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  925,
+                                                            "top":  1290,
+                                                            "right":  962,
+                                                            "bottom":  1327,
+                                                            "width":  37,
+                                                            "height":  37
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Microphone input level",
+                                             "controlType":  "ControlType.ProgressBar",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  925,
+                                                            "top":  1290,
+                                                            "right":  962,
+                                                            "bottom":  1327,
+                                                            "width":  37,
+                                                            "height":  37
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Elapsed time 00:12",
+                                             "controlType":  "ControlType.Text",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  975,
+                                                            "top":  1297,
+                                                            "right":  1035,
+                                                            "bottom":  1325,
+                                                            "width":  60,
+                                                            "height":  28
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Committed transcript: Clicking the settings icon in the top. Tentative transcript: right opens recording preferences.",
+                                             "controlType":  "ControlType.Text",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  1058,
+                                                            "top":  1297,
+                                                            "right":  1590,
+                                                            "bottom":  1325,
+                                                            "width":  532,
+                                                            "height":  28
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Recording",
+                                             "controlType":  "ControlType.Text",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  1058,
+                                                            "top":  1297,
+                                                            "right":  1590,
+                                                            "bottom":  1325,
+                                                            "width":  532,
+                                                            "height":  28
+                                                        }
+                                         }
+                                     ],
+                    "controlNodes":  [
+                                         {
+                                             "name":  "Cancel recording and discard it",
+                                             "controlType":  "ControlType.Window",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  1590,
+                                                            "top":  1283,
+                                                            "right":  1645,
+                                                            "bottom":  1338,
+                                                            "width":  55,
+                                                            "height":  55
+                                                        }
+                                         },
+                                         {
+                                             "name":  "Cancel recording and discard it",
+                                             "controlType":  "ControlType.Button",
+                                             "isOffscreen":  false,
+                                             "isKeyboardFocusable":  false,
+                                             "bounds":  {
+                                                            "left":  1590,
+                                                            "top":  1283,
+                                                            "right":  1645,
+                                                            "bottom":  1338,
+                                                            "width":  55,
+                                                            "height":  55
+                                                        }
+                                         }
+                                     ]
+                },
+    "hiddenAfterInjectedPresentationFailure":  {
+                                                   "injectedFailure":  "display WS_EX_LAYERED removed before presentation verification",
+                                                   "displayWindowVisible":  false,
+                                                   "controlWindowVisible":  false,
+                                                   "displayNodes":  [
+
+                                                                    ],
+                                                   "controlNodes":  [
+
+                                                                    ],
+                                                   "elementFromFormerControlCenter":  "Preparing the hardened overlay capture fixture..."
+                                               }
+}
