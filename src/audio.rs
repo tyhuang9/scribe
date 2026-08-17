@@ -13,7 +13,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounde
 use thiserror::Error;
 
 use crate::config;
+use crate::onnx_worker::{SileroVadDecision, SileroVadWorkerSupervisor};
 use crate::prepared_audio::PreparedAudio;
+use crate::silero_vad_native::{VadThreshold, WINDOW_SAMPLES};
 use crate::streaming::PreviewAudioPublisher;
 
 use self::pipeline::Pipeline;
@@ -30,10 +32,7 @@ const MAX_CAPTURE_PREPARED_FRAMES: usize = 16_000 * (config::MAX_RECORDING_SECON
 pub(super) const MIN_INPUT_SAMPLE_RATE: u32 = 8_000;
 pub(super) const MAX_INPUT_SAMPLE_RATE: u32 = 384_000;
 pub(super) const MAX_INPUT_CHANNELS: u16 = 32;
-pub(crate) const MIN_SPEECH_ACTIVATION_RMS: f32 = 0.012;
-pub(crate) const DEFAULT_MANUAL_ACTIVATION_RMS: f32 = 0.007_943_282;
-pub(super) const MIN_MANUAL_ACTIVATION_RMS: f32 = 0.000_251_188_64;
-pub(super) const MAX_MANUAL_ACTIVATION_RMS: f32 = 1.0;
+pub(crate) const LOW_INPUT_DIAGNOSTIC_RMS: f32 = 0.012;
 const FAULT_NONE: u8 = 0;
 const FAULT_OVERFLOW: u8 = 1;
 const FAULT_STREAM: u8 = 2;
@@ -114,7 +113,7 @@ pub struct CaptureOptions {
     pub vad_enabled: bool,
     pub endpointing_enabled: bool,
     pub vad: VadOptions,
-    pub sensitivity: Sensitivity,
+    pub speech_probability_threshold: f32,
     pub intent: CaptureIntent,
 }
 
@@ -124,34 +123,13 @@ pub enum CaptureIntent {
     MeterOnly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Sensitivity {
-    Automatic,
-    #[allow(dead_code)]
-    Manual {
-        activation_rms: f32,
-    },
-}
-
-impl Sensitivity {
-    fn validate(self) -> Result<(), CaptureError> {
-        if matches!(self, Self::Manual { activation_rms } if !activation_rms.is_finite() || !(MIN_MANUAL_ACTIVATION_RMS..=MAX_MANUAL_ACTIVATION_RMS).contains(&activation_rms))
-        {
-            return Err(CaptureError::InvalidOptions(
-                "manual voice activation threshold must be between 0.000251 and 1.0 RMS",
-            ));
-        }
-        Ok(())
-    }
-}
-
 impl CaptureOptions {
     pub fn new(vad: VadOptions) -> Self {
         Self {
             vad_enabled: true,
             endpointing_enabled: true,
             vad,
-            sensitivity: Sensitivity::Automatic,
+            speech_probability_threshold: config::DEFAULT_SPEECH_PROBABILITY_THRESHOLD,
             intent: CaptureIntent::Dictation,
         }
     }
@@ -287,6 +265,129 @@ pub enum CaptureError {
     WorkerDisconnected,
     #[error("failed to spawn audio recorder worker: {0}")]
     WorkerSpawn(String),
+    #[error(
+        "Silero speech detection is unavailable; repair the bundled support asset or restart Scribe: {0}"
+    )]
+    SpeechDetection(String),
+}
+
+trait SpeechDetector: Send {
+    fn compute(
+        &mut self,
+        samples: &[f32; WINDOW_SAMPLES],
+    ) -> Result<SileroVadDecision, CaptureError>;
+    fn finish(&mut self) -> Result<(), CaptureError>;
+    fn cancel(&mut self) -> Result<(), CaptureError>;
+}
+
+trait SpeechDetectorFactory: Send + Sync {
+    fn acquire(&self, threshold: VadThreshold) -> Result<Box<dyn SpeechDetector>, CaptureError>;
+}
+
+struct WorkerSpeechDetectorFactory;
+
+struct WorkerSpeechDetector {
+    supervisor: SileroVadWorkerSupervisor,
+    session_id: u64,
+    next_request_id: u64,
+    active: bool,
+}
+
+static NEXT_VAD_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+impl WorkerSpeechDetector {
+    fn request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    fn vad_error(error: impl std::fmt::Display) -> CaptureError {
+        CaptureError::SpeechDetection(error.to_string())
+    }
+}
+
+impl SpeechDetectorFactory for WorkerSpeechDetectorFactory {
+    fn acquire(&self, threshold: VadThreshold) -> Result<Box<dyn SpeechDetector>, CaptureError> {
+        let supervisor =
+            SileroVadWorkerSupervisor::spawn().map_err(WorkerSpeechDetector::vad_error)?;
+        let session_id = NEXT_VAD_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut detector = WorkerSpeechDetector {
+            supervisor,
+            session_id,
+            next_request_id: 1,
+            active: false,
+        };
+        let load_request = detector.request_id();
+        detector
+            .supervisor
+            .load(session_id, load_request, 1)
+            .map_err(WorkerSpeechDetector::vad_error)?;
+        let health_request = detector.request_id();
+        detector
+            .supervisor
+            .health(session_id, health_request)
+            .map_err(WorkerSpeechDetector::vad_error)?;
+        let start_request = detector.request_id();
+        detector
+            .supervisor
+            .start_session(session_id, start_request, threshold)
+            .map_err(WorkerSpeechDetector::vad_error)?;
+        detector.active = true;
+        let ready_request = detector.request_id();
+        detector
+            .supervisor
+            .health(session_id, ready_request)
+            .map_err(WorkerSpeechDetector::vad_error)?;
+        Ok(Box::new(detector))
+    }
+}
+
+impl SpeechDetector for WorkerSpeechDetector {
+    fn compute(
+        &mut self,
+        samples: &[f32; WINDOW_SAMPLES],
+    ) -> Result<SileroVadDecision, CaptureError> {
+        let request_id = self.request_id();
+        self.supervisor
+            .compute(self.session_id, request_id, samples)
+            .map_err(Self::vad_error)
+    }
+
+    fn finish(&mut self) -> Result<(), CaptureError> {
+        if !self.active {
+            return Ok(());
+        }
+        let request_id = self.request_id();
+        let result = self
+            .supervisor
+            .end_session(self.session_id, request_id)
+            .map_err(Self::vad_error);
+        self.active = false;
+        result
+    }
+
+    fn cancel(&mut self) -> Result<(), CaptureError> {
+        if !self.active {
+            return Ok(());
+        }
+        let request_id = self.request_id();
+        let result = self
+            .supervisor
+            .cancel_session(self.session_id, request_id)
+            .map_err(Self::vad_error);
+        self.active = false;
+        result
+    }
+}
+
+impl Drop for WorkerSpeechDetector {
+    fn drop(&mut self) {
+        if self.active {
+            self.supervisor.abandon_session(self.session_id);
+            self.active = false;
+        }
+    }
 }
 
 pub struct RecordingSession {
@@ -296,8 +397,6 @@ pub struct RecordingSession {
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
     level_revision: Arc<AtomicU64>,
-    #[allow(dead_code)]
-    manual_activation_threshold_bits: Arc<AtomicU32>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -331,26 +430,6 @@ impl RecordingSession {
 
     pub fn latest_level_revision(&self) -> u64 {
         self.level_revision.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn set_manual_activation_threshold(&self, activation_rms: f32) {
-        if activation_rms.is_finite() {
-            self.manual_activation_threshold_bits.store(
-                activation_rms
-                    .clamp(MIN_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS)
-                    .to_bits(),
-                Ordering::Release,
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn manual_activation_threshold(&self) -> f32 {
-        f32::from_bits(
-            self.manual_activation_threshold_bits
-                .load(Ordering::Acquire),
-        )
     }
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<(), CaptureError> {
@@ -449,9 +528,6 @@ impl RecordingSession {
             peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             level_observed: Arc::new(AtomicBool::new(false)),
             level_revision: Arc::new(AtomicU64::new(0)),
-            manual_activation_threshold_bits: Arc::new(AtomicU32::new(
-                DEFAULT_MANUAL_ACTIVATION_RMS.to_bits(),
-            )),
             worker: Mutex::new(Some(worker)),
         }
     }
@@ -489,21 +565,13 @@ pub fn start_recording(
     cancellation: CaptureCancellation,
 ) -> Result<RecordingSession, CaptureError> {
     options.vad.validate()?;
-    options.sensitivity.validate()?;
+    VadThreshold::new(options.speech_probability_threshold)
+        .map_err(WorkerSpeechDetector::vad_error)?;
     let stop_requested = Arc::clone(&cancellation.stop_requested);
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let level_observed = Arc::new(AtomicBool::new(false));
     let level_revision = Arc::new(AtomicU64::new(0));
-    let vad_threshold_bits = Arc::new(AtomicU32::new(MIN_SPEECH_ACTIVATION_RMS.to_bits()));
-    let manual_activation_threshold_bits = Arc::new(AtomicU32::new(
-        match options.sensitivity {
-            Sensitivity::Automatic => DEFAULT_MANUAL_ACTIVATION_RMS,
-            Sensitivity::Manual { activation_rms } => activation_rms,
-        }
-        .to_bits(),
-    ));
-    let speech_detected = Arc::new(AtomicBool::new(false));
     let (started_tx, started_rx) = bounded(1);
     let (finished_tx, finished_rx) = bounded(1);
 
@@ -512,9 +580,6 @@ pub fn start_recording(
     let worker_peak = Arc::clone(&peak_bits);
     let worker_observed = Arc::clone(&level_observed);
     let worker_level_revision = Arc::clone(&level_revision);
-    let worker_vad_threshold = Arc::clone(&vad_threshold_bits);
-    let worker_manual_activation_threshold = Arc::clone(&manual_activation_threshold_bits);
-    let worker_speech_detected = Arc::clone(&speech_detected);
     let worker_cancellation = cancellation.clone();
     let worker = thread::Builder::new()
         .name("scribe-audio-capture".to_owned())
@@ -529,9 +594,6 @@ pub fn start_recording(
                 worker_peak,
                 worker_observed,
                 worker_level_revision,
-                worker_vad_threshold,
-                worker_manual_activation_threshold,
-                worker_speech_detected,
                 worker_cancellation,
                 &started_tx,
             );
@@ -550,7 +612,6 @@ pub fn start_recording(
             peak_bits,
             level_observed,
             level_revision,
-            manual_activation_threshold_bits,
             worker: Mutex::new(Some(worker)),
         }),
         Err(error) => Err(error),
@@ -593,9 +654,6 @@ fn capture_worker(
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
     level_revision: Arc<AtomicU64>,
-    vad_threshold_bits: Arc<AtomicU32>,
-    manual_activation_threshold_bits: Arc<AtomicU32>,
-    speech_detected: Arc<AtomicBool>,
     cancellation: CaptureCancellation,
     started_tx: &Sender<Result<(), CaptureError>>,
 ) -> Result<CaptureCompletion, CaptureError> {
@@ -634,30 +692,36 @@ fn capture_worker(
         Arc::clone(&fault),
         Arc::clone(&dropped_samples),
     )?);
-    cancellation.ensure_startup_active()?;
-    cancellation.commit_play()?;
-    stream
-        .as_ref()
-        .expect("stream was just built")
-        .play()
-        .map_err(|error| CaptureError::PlayStream(error.to_string()))?;
-    let _ = started_tx.send(Ok(()));
-
+    let detector = acquire_speech_detector(&options, &WorkerSpeechDetectorFactory)?;
     let mut pipeline = Pipeline::new(
         format.sample_rate,
         format.channels,
         options,
+        detector,
         rms_bits,
         peak_bits,
         level_observed,
         level_revision,
     )?
-    .with_vad_telemetry(
-        vad_threshold_bits,
-        manual_activation_threshold_bits,
-        speech_detected,
-    )
     .with_preview_publisher(preview_publisher);
+    if let Err(error) = cancellation.ensure_startup_active() {
+        pipeline.cancel_speech_detector()?;
+        return Err(error);
+    }
+    if let Err(error) = cancellation.commit_play() {
+        pipeline.cancel_speech_detector()?;
+        return Err(error);
+    }
+    stream
+        .as_ref()
+        .expect("stream was just built")
+        .play()
+        .map_err(|error| CaptureError::PlayStream(error.to_string()))
+        .or_else(|error| {
+            pipeline.cancel_speech_detector()?;
+            Err(error)
+        })?;
+    let _ = started_tx.send(Ok(()));
     let capture_started = Instant::now();
     let maximum_duration = Duration::from_secs(
         max_duration_seconds
@@ -668,7 +732,7 @@ fn capture_worker(
     let mut restart_policy = RestartPolicy::new(MAX_STREAM_RESTARTS);
 
     let (stop_reason, stop_trigger_elapsed) = loop {
-        drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK);
+        drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK)?;
         pipeline.publish_due_previews();
         if pipeline.limit_exceeded() {
             return Err(CaptureError::PreparedAudioLimit {
@@ -742,7 +806,7 @@ fn capture_worker(
     };
 
     drop(stream.take());
-    drain_ring_all(&mut consumer, &mut pipeline);
+    drain_ring_all(&mut consumer, &mut pipeline)?;
     pipeline.publish_due_previews();
     if fault.load(Ordering::Acquire) == FAULT_OVERFLOW {
         return Err(CaptureError::BufferOverflow {
@@ -774,19 +838,36 @@ fn capture_worker(
     })
 }
 
-fn drain_ring_bounded(consumer: &mut Consumer, pipeline: &mut Pipeline, maximum: usize) -> usize {
+fn drain_ring_bounded(
+    consumer: &mut Consumer,
+    pipeline: &mut Pipeline,
+    maximum: usize,
+) -> Result<usize, CaptureError> {
     let mut drained = 0;
     while drained < maximum
         && let Some(sample) = consumer.pop()
     {
-        pipeline.push_interleaved(sample);
+        pipeline.push_interleaved(sample)?;
         drained += 1;
     }
-    drained
+    Ok(drained)
 }
 
-fn drain_ring_all(consumer: &mut Consumer, pipeline: &mut Pipeline) {
-    while drain_ring_bounded(consumer, pipeline, MAX_DRAIN_SAMPLES_PER_TICK) != 0 {}
+fn drain_ring_all(consumer: &mut Consumer, pipeline: &mut Pipeline) -> Result<(), CaptureError> {
+    while drain_ring_bounded(consumer, pipeline, MAX_DRAIN_SAMPLES_PER_TICK)? != 0 {}
+    Ok(())
+}
+
+fn acquire_speech_detector(
+    options: &CaptureOptions,
+    factory: &dyn SpeechDetectorFactory,
+) -> Result<Option<Box<dyn SpeechDetector>>, CaptureError> {
+    if options.intent == CaptureIntent::MeterOnly || !options.vad_enabled {
+        return Ok(None);
+    }
+    let threshold = VadThreshold::new(options.speech_probability_threshold)
+        .map_err(WorkerSpeechDetector::vad_error)?;
+    factory.acquire(threshold).map(Some)
 }
 
 fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
@@ -1059,6 +1140,94 @@ fn recording_dir() -> Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    struct CountingDetectorFactory {
+        calls: AtomicUsize,
+        threshold_bits: AtomicU32,
+    }
+
+    struct NoopDetector;
+
+    impl SpeechDetectorFactory for CountingDetectorFactory {
+        fn acquire(
+            &self,
+            threshold: VadThreshold,
+        ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.threshold_bits
+                .store(threshold.value().to_bits(), Ordering::Relaxed);
+            Ok(Box::new(NoopDetector))
+        }
+    }
+
+    impl SpeechDetector for NoopDetector {
+        fn compute(
+            &mut self,
+            _samples: &[f32; WINDOW_SAMPLES],
+        ) -> Result<SileroVadDecision, CaptureError> {
+            Ok(SileroVadDecision {
+                probability: 0.0,
+                speech: false,
+            })
+        }
+
+        fn finish(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn meter_only_capture_makes_zero_speech_detector_factory_calls() {
+        let factory = CountingDetectorFactory {
+            calls: AtomicUsize::new(0),
+            threshold_bits: AtomicU32::new(f32::NAN.to_bits()),
+        };
+        let options = CaptureOptions {
+            intent: CaptureIntent::MeterOnly,
+            ..CaptureOptions::default()
+        };
+
+        assert!(
+            acquire_speech_detector(&options, &factory)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
+
+        let detector = acquire_speech_detector(&CaptureOptions::default(), &factory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
+            config::DEFAULT_SPEECH_PROBABILITY_THRESHOLD
+        );
+        drop(detector);
+    }
+
+    #[test]
+    fn configured_probability_threshold_is_passed_to_the_detector_factory() {
+        let factory = CountingDetectorFactory {
+            calls: AtomicUsize::new(0),
+            threshold_bits: AtomicU32::new(f32::NAN.to_bits()),
+        };
+        let options = CaptureOptions {
+            speech_probability_threshold: 0.73,
+            ..CaptureOptions::default()
+        };
+
+        drop(acquire_speech_detector(&options, &factory).unwrap());
+
+        assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
+            0.73
+        );
+    }
+
     #[test]
     fn sample_formats_convert_to_finite_unit_range() {
         assert_eq!(normalize_f32(f32::NAN), 0.0);
@@ -1251,31 +1420,6 @@ mod tests {
 
         session.set_simulated_telemetry(LevelSnapshot::default());
         assert_eq!(session.latest_level_revision(), 2);
-        session.stop_and_discard(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn session_manual_threshold_updates_are_bounded_and_ignore_non_finite_values() {
-        let session = RecordingSession::simulated(None, CaptureStopReason::Explicit);
-        session.set_manual_activation_threshold(f32::INFINITY);
-        assert_eq!(
-            f32::from_bits(
-                session
-                    .manual_activation_threshold_bits
-                    .load(Ordering::Acquire)
-            ),
-            DEFAULT_MANUAL_ACTIVATION_RMS
-        );
-
-        session.set_manual_activation_threshold(MAX_MANUAL_ACTIVATION_RMS * 2.0);
-        assert_eq!(
-            f32::from_bits(
-                session
-                    .manual_activation_threshold_bits
-                    .load(Ordering::Acquire)
-            ),
-            MAX_MANUAL_ACTIVATION_RMS
-        );
         session.stop_and_discard(Duration::from_secs(1)).unwrap();
     }
 

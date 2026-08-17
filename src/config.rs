@@ -22,9 +22,10 @@ pub mod settings;
 
 #[allow(unused_imports)]
 pub use settings::{
-    AppConfig, CURRENT_SCHEMA_VERSION, DeveloperSettings, GeneralSettings, HistoryMode,
-    HistorySettings, OutputSettings, OverlayMode, OverlayPosition, OverlaySettings,
-    PerformanceSettings, RecordingSettings, SettingsStore, StreamingMode, StreamingSettings,
+    AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_SPEECH_PROBABILITY_THRESHOLD, DeveloperSettings,
+    GeneralSettings, HistoryMode, HistorySettings, OutputSettings, OverlayMode, OverlayPosition,
+    OverlaySettings, PerformanceSettings, RecordingSettings, SettingsStore, StreamingMode,
+    StreamingSettings,
 };
 
 pub const MAX_RECORDING_SECONDS: u32 = 600;

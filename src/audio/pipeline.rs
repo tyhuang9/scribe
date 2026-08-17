@@ -2,18 +2,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::onnx_worker::SileroVadDecision;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
+use crate::silero_vad_native::WINDOW_SAMPLES;
 use crate::streaming::{DECODE_INTERVAL_MS, PreviewAudioPublisher, ROLLING_WINDOW_MS};
 
 use super::{
-    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, DEFAULT_MANUAL_ACTIVATION_RMS,
-    LevelSnapshot, MAX_CAPTURE_PREPARED_FRAMES, MAX_MANUAL_ACTIVATION_RMS,
-    MIN_MANUAL_ACTIVATION_RMS, MIN_SPEECH_ACTIVATION_RMS, Sensitivity, VadOptions,
-    input_format_is_credible,
+    CaptureError, CaptureIntent, CaptureOptions, CaptureStopReason, LevelSnapshot,
+    MAX_CAPTURE_PREPARED_FRAMES, SpeechDetector, VadOptions, input_format_is_credible,
 };
 
-const VAD_FRAME_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
 const LEVEL_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) * 30 / 1_000;
+const SIGNAL_DIAGNOSTIC_WINDOW_SAMPLES: usize = (PREPARED_SAMPLE_RATE as usize) / 100;
 const TARGET_RMS: f32 = 0.1;
 const TARGET_PEAK_CEILING: f32 = 0.95;
 const MAX_NORMALIZATION_GAIN: f32 = 8.0;
@@ -41,10 +41,12 @@ pub(super) struct Pipeline {
 }
 
 impl Pipeline {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         source_sample_rate: u32,
         source_channels: u16,
         options: CaptureOptions,
+        detector: Option<Box<dyn SpeechDetector>>,
         level_bits: Arc<AtomicU32>,
         peak_bits: Arc<AtomicU32>,
         level_observed: Arc<AtomicBool>,
@@ -57,6 +59,12 @@ impl Pipeline {
             });
         }
         options.vad.validate()?;
+        let vad_enabled = options.vad_enabled && options.intent == CaptureIntent::Dictation;
+        if vad_enabled != detector.is_some() {
+            return Err(CaptureError::InvalidOptions(
+                "speech-classifying capture requires exactly one Silero VAD session",
+            ));
+        }
         Ok(Self {
             source_sample_rate,
             source_channels,
@@ -68,12 +76,8 @@ impl Pipeline {
             retain_audio: options.intent == CaptureIntent::Dictation,
             limit_exceeded: false,
             levels: LevelTracker::new(level_bits, peak_bits, level_observed, level_revision),
-            vad_enabled: options.vad_enabled,
-            vad: VadTracker::new(
-                options.vad,
-                options.endpointing_enabled,
-                options.sensitivity,
-            ),
+            vad_enabled,
+            vad: VadTracker::new(options.vad, options.endpointing_enabled, detector),
             preview_publisher: None,
             next_preview_frame: PREVIEW_INTERVAL_FRAMES,
         })
@@ -87,25 +91,11 @@ impl Pipeline {
         self
     }
 
-    pub(super) fn with_vad_telemetry(
-        mut self,
-        activation_threshold_bits: Arc<AtomicU32>,
-        manual_activation_threshold_bits: Arc<AtomicU32>,
-        speech_detected: Arc<AtomicBool>,
-    ) -> Self {
-        self.vad.set_telemetry(
-            activation_threshold_bits,
-            manual_activation_threshold_bits,
-            speech_detected,
-        );
-        self
-    }
-
-    pub(super) fn push_interleaved(&mut self, sample: f32) {
+    pub(super) fn push_interleaved(&mut self, sample: f32) -> Result<(), CaptureError> {
         self.channel_sum += finite_unit(sample) as f64;
         self.channel_samples += 1;
         if self.channel_samples != self.source_channels as usize {
-            return;
+            return Ok(());
         }
 
         let mono = (self.channel_sum / self.source_channels as f64).clamp(-1.0, 1.0) as f32;
@@ -119,6 +109,7 @@ impl Pipeline {
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
         let retain_audio = self.retain_audio;
+        let mut vad_result = Ok(());
         self.resampler.push(mono, |output| {
             if retain_audio {
                 push_bounded(
@@ -129,10 +120,11 @@ impl Pipeline {
                 );
             }
             levels.push(output);
-            if vad_enabled {
-                vad.push(output);
+            if vad_enabled && vad_result.is_ok() {
+                vad_result = vad.push(output);
             }
         });
+        vad_result
     }
 
     pub(super) fn source_frames(&self) -> usize {
@@ -191,6 +183,7 @@ impl Pipeline {
         let vad = &mut self.vad;
         let vad_enabled = self.vad_enabled;
         let retain_audio = self.retain_audio;
+        let mut vad_result = Ok(());
         self.resampler.finish(|output| {
             if retain_audio {
                 push_bounded(
@@ -201,11 +194,13 @@ impl Pipeline {
                 );
             }
             levels.push(output);
-            if vad_enabled {
-                vad.push(output);
+            if vad_enabled && vad_result.is_ok() {
+                vad_result = vad.push(output);
             }
         });
+        vad_result?;
         self.levels.finish_windows();
+        self.vad.finish_detector()?;
 
         if self.limit_exceeded {
             return Err(CaptureError::PreparedAudioLimit {
@@ -267,6 +262,10 @@ impl Pipeline {
 
     pub(super) fn maximum_levels(&self) -> LevelSnapshot {
         self.levels.maximum()
+    }
+
+    pub(super) fn cancel_speech_detector(&mut self) -> Result<(), CaptureError> {
+        self.vad.cancel_detector()
     }
 }
 
@@ -436,7 +435,7 @@ impl LevelTracker {
         self.count += 1;
         self.signal_sum_squares += f64::from(sample) * f64::from(sample);
         self.signal_count += 1;
-        if self.signal_count == VAD_FRAME_SAMPLES {
+        if self.signal_count == SIGNAL_DIAGNOSTIC_WINDOW_SAMPLES {
             self.finish_signal_window();
         }
         if self.count == LEVEL_WINDOW_SAMPLES {
@@ -498,114 +497,75 @@ struct VadTracker {
     options: VadOptions,
     endpointing_enabled: bool,
     state: VadState,
-    sum_squares: f64,
-    frame_samples: usize,
+    window: [f32; WINDOW_SAMPLES],
+    window_samples: usize,
     processed_samples: usize,
-    noise_floor: f32,
     candidate_start_frame: Option<usize>,
     candidate_samples: usize,
     speech_start_frame: Option<usize>,
     speech_trigger_frame: Option<usize>,
     last_voice_frame: usize,
     endpoint_frame: Option<usize>,
-    sensitivity: Sensitivity,
-    activation_threshold_bits: Arc<AtomicU32>,
-    manual_activation_threshold_bits: Arc<AtomicU32>,
-    speech_detected: Arc<AtomicBool>,
+    detector: Option<Box<dyn SpeechDetector>>,
+    last_probability: f32,
 }
 
 impl VadTracker {
-    fn new(options: VadOptions, endpointing_enabled: bool, sensitivity: Sensitivity) -> Self {
-        let threshold = match sensitivity {
-            Sensitivity::Automatic => MIN_SPEECH_ACTIVATION_RMS,
-            Sensitivity::Manual { activation_rms } => activation_rms,
-        };
+    fn new(
+        options: VadOptions,
+        endpointing_enabled: bool,
+        detector: Option<Box<dyn SpeechDetector>>,
+    ) -> Self {
         Self {
             options,
             endpointing_enabled,
             state: VadState::Waiting,
-            sum_squares: 0.0,
-            frame_samples: 0,
+            window: [0.0; WINDOW_SAMPLES],
+            window_samples: 0,
             processed_samples: 0,
-            noise_floor: 0.003,
             candidate_start_frame: None,
             candidate_samples: 0,
             speech_start_frame: None,
             speech_trigger_frame: None,
             last_voice_frame: 0,
             endpoint_frame: None,
-            sensitivity,
-            activation_threshold_bits: Arc::new(AtomicU32::new(threshold.to_bits())),
-            manual_activation_threshold_bits: Arc::new(AtomicU32::new(threshold.to_bits())),
-            speech_detected: Arc::new(AtomicBool::new(false)),
+            detector,
+            last_probability: 0.0,
         }
     }
 
-    fn set_telemetry(
-        &mut self,
-        activation_threshold_bits: Arc<AtomicU32>,
-        manual_activation_threshold_bits: Arc<AtomicU32>,
-        speech_detected: Arc<AtomicBool>,
-    ) {
-        activation_threshold_bits.store(
-            self.activation_threshold_bits.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.activation_threshold_bits = activation_threshold_bits;
-        if matches!(self.sensitivity, Sensitivity::Manual { .. }) {
-            self.manual_activation_threshold_bits = manual_activation_threshold_bits;
-        }
-        self.speech_detected = speech_detected;
-    }
-
-    fn push(&mut self, sample: f32) {
+    fn push(&mut self, sample: f32) -> Result<(), CaptureError> {
         let sample = finite_unit(sample);
-        self.sum_squares += f64::from(sample) * f64::from(sample);
-        self.frame_samples += 1;
+        self.window[self.window_samples] = sample;
+        self.window_samples += 1;
         self.processed_samples += 1;
-        if self.frame_samples == VAD_FRAME_SAMPLES {
-            let rms = (self.sum_squares / self.frame_samples as f64).sqrt() as f32;
-            self.process_frame(rms);
-            self.sum_squares = 0.0;
-            self.frame_samples = 0;
+        if self.window_samples == WINDOW_SAMPLES {
+            let decision = self
+                .detector
+                .as_mut()
+                .ok_or(CaptureError::InvalidOptions(
+                    "Silero VAD session disappeared during capture",
+                ))?
+                .compute(&self.window)?;
+            self.process_window(decision);
+            self.window_samples = 0;
         }
+        Ok(())
     }
 
-    fn process_frame(&mut self, rms: f32) {
+    fn process_window(&mut self, decision: SileroVadDecision) {
         if self.endpoint_frame.is_some() {
             return;
         }
+        self.last_probability = decision.probability;
         let frame_end = self.processed_samples;
-        // Production pushes reach this method only after a full VAD frame,
-        // but saturating here also keeps direct/unit-test frame processing
-        // fail-safe at the beginning of a capture.
-        let frame_start = frame_end.saturating_sub(VAD_FRAME_SAMPLES);
-        let (activation_threshold, release_threshold) = match self.sensitivity {
-            Sensitivity::Automatic => (
-                (self.noise_floor * 3.0).max(MIN_SPEECH_ACTIVATION_RMS),
-                (self.noise_floor * 1.8).max(0.008),
-            ),
-            Sensitivity::Manual { .. } => {
-                let activation_rms = f32::from_bits(
-                    self.manual_activation_threshold_bits
-                        .load(Ordering::Acquire),
-                );
-                let activation_rms = if activation_rms.is_finite() {
-                    activation_rms.clamp(MIN_MANUAL_ACTIVATION_RMS, MAX_MANUAL_ACTIVATION_RMS)
-                } else {
-                    DEFAULT_MANUAL_ACTIVATION_RMS
-                };
-                (activation_rms, activation_rms * 0.67)
-            }
-        };
-        self.activation_threshold_bits
-            .store(activation_threshold.to_bits(), Ordering::Relaxed);
+        let frame_start = frame_end.saturating_sub(WINDOW_SAMPLES);
 
         match self.state {
             VadState::Waiting => {
-                if rms >= activation_threshold {
+                if decision.speech {
                     self.candidate_start_frame.get_or_insert(frame_start);
-                    self.candidate_samples += VAD_FRAME_SAMPLES;
+                    self.candidate_samples += WINDOW_SAMPLES;
                     if self.candidate_samples
                         >= duration_to_prepared_frames(self.options.speech_confirmation)
                     {
@@ -613,16 +573,14 @@ impl VadTracker {
                         self.speech_start_frame = self.candidate_start_frame;
                         self.speech_trigger_frame = Some(frame_end);
                         self.last_voice_frame = frame_end;
-                        self.speech_detected.store(true, Ordering::Release);
                     }
                 } else {
-                    self.update_noise_floor(rms);
                     self.candidate_start_frame = None;
                     self.candidate_samples = 0;
                 }
             }
             VadState::Active => {
-                if rms >= release_threshold {
+                if decision.speech {
                     self.last_voice_frame = frame_end;
                 } else if frame_end.saturating_sub(self.last_voice_frame)
                     >= duration_to_prepared_frames(self.options.pause)
@@ -631,11 +589,10 @@ impl VadTracker {
                 }
             }
             VadState::Paused => {
-                if rms >= activation_threshold {
+                if decision.speech {
                     self.state = VadState::Active;
                     self.last_voice_frame = frame_end;
                 } else {
-                    self.update_noise_floor(rms);
                     if self.endpointing_enabled
                         && frame_end.saturating_sub(self.last_voice_frame)
                             >= duration_to_prepared_frames(self.options.endpoint)
@@ -647,18 +604,86 @@ impl VadTracker {
         }
     }
 
-    fn update_noise_floor(&mut self, rms: f32) {
-        self.noise_floor = (self.noise_floor * 0.98 + rms.min(0.05) * 0.02).clamp(0.000_1, 0.05);
+    fn finish_detector(&mut self) -> Result<(), CaptureError> {
+        if let Some(detector) = self.detector.as_mut() {
+            detector.finish()?;
+        }
+        self.detector = None;
+        Ok(())
+    }
+
+    fn cancel_detector(&mut self) -> Result<(), CaptureError> {
+        if let Some(detector) = self.detector.as_mut() {
+            detector.cancel()?;
+        }
+        self.detector = None;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::mpsc;
 
     use crate::streaming::RollingPreviewSession;
     use crate::transcription::{ModelId, RequestId, SessionId, StreamUpdate};
+
+    #[derive(Default)]
+    struct FakeDetectorState {
+        windows: Vec<Vec<f32>>,
+        decisions: VecDeque<Result<SileroVadDecision, CaptureError>>,
+        finish_calls: usize,
+        cancel_calls: usize,
+    }
+
+    struct FakeDetector {
+        state: Arc<Mutex<FakeDetectorState>>,
+    }
+
+    impl SpeechDetector for FakeDetector {
+        fn compute(
+            &mut self,
+            samples: &[f32; WINDOW_SAMPLES],
+        ) -> Result<SileroVadDecision, CaptureError> {
+            let mut state = self.state.lock().unwrap();
+            state.windows.push(samples.to_vec());
+            if let Some(decision) = state.decisions.pop_front() {
+                return decision;
+            }
+            let speech = samples.iter().all(|sample| sample.abs() >= 0.1);
+            Ok(SileroVadDecision {
+                probability: if speech { 0.9 } else { 0.1 },
+                speech,
+            })
+        }
+
+        fn finish(&mut self) -> Result<(), CaptureError> {
+            self.state.lock().unwrap().finish_calls += 1;
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), CaptureError> {
+            self.state.lock().unwrap().cancel_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn fake_detector() -> (Box<dyn SpeechDetector>, Arc<Mutex<FakeDetectorState>>) {
+        let state = Arc::new(Mutex::new(FakeDetectorState::default()));
+        (
+            Box::new(FakeDetector {
+                state: Arc::clone(&state),
+            }),
+            state,
+        )
+    }
+
+    fn default_detector() -> Option<Box<dyn SpeechDetector>> {
+        Some(fake_detector().0)
+    }
 
     fn level_state() -> (
         Arc<AtomicU32>,
@@ -680,6 +705,7 @@ mod tests {
             source_rate,
             channels,
             CaptureOptions::default(),
+            default_detector(),
             rms,
             peak,
             observed,
@@ -691,7 +717,7 @@ mod tests {
     fn push_mono_ms(pipeline: &mut Pipeline, milliseconds: usize, value: f32) {
         let frames = pipeline.source_sample_rate as usize * milliseconds / 1_000;
         for _ in 0..frames {
-            pipeline.push_interleaved(value);
+            pipeline.push_interleaved(value).unwrap();
         }
     }
 
@@ -699,7 +725,7 @@ mod tests {
     fn stereo_downmixes_before_resampling() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 2);
         for sample in [1.0, -1.0, 0.25, 0.75] {
-            pipeline.push_interleaved(sample);
+            pipeline.push_interleaved(sample).unwrap();
         }
         pipeline.vad.speech_start_frame = Some(0);
         pipeline.vad.last_voice_frame = 2;
@@ -810,6 +836,7 @@ mod tests {
             PREPARED_SAMPLE_RATE,
             1,
             disabled_vad,
+            None,
             preview_rms,
             preview_peak,
             preview_observed,
@@ -822,6 +849,7 @@ mod tests {
             PREPARED_SAMPLE_RATE,
             1,
             disabled_vad,
+            None,
             final_rms,
             final_peak,
             final_observed,
@@ -832,8 +860,8 @@ mod tests {
         for interval in 1..=13 {
             for frame in 0..PREVIEW_INTERVAL_FRAMES {
                 let sample = ((interval * PREVIEW_INTERVAL_FRAMES + frame) % 97) as f32 / 97.0;
-                with_preview.push_interleaved(sample);
-                final_only.push_interleaved(sample);
+                with_preview.push_interleaved(sample).unwrap();
+                final_only.push_interleaved(sample).unwrap();
             }
             with_preview.publish_due_previews();
             let (sequence, start, end, samples) = snapshot_rx
@@ -889,6 +917,7 @@ mod tests {
                 endpointing_enabled: false,
                 ..CaptureOptions::default()
             },
+            None,
             rms,
             peak,
             observed,
@@ -898,7 +927,7 @@ mod tests {
         .with_preview_publisher(Some(publisher));
 
         for _ in 0..(8 * PREVIEW_INTERVAL_FRAMES) {
-            pipeline.push_interleaved(0.1);
+            pipeline.push_interleaved(0.1).unwrap();
         }
         pipeline.publish_due_previews();
 
@@ -930,6 +959,7 @@ mod tests {
             PREPARED_SAMPLE_RATE,
             1,
             CaptureOptions::default(),
+            default_detector(),
             Arc::clone(&rms),
             Arc::clone(&peak),
             Arc::clone(&observed),
@@ -937,10 +967,10 @@ mod tests {
         )
         .unwrap();
         for _ in 0..LEVEL_WINDOW_SAMPLES - 1 {
-            pipeline.push_interleaved(0.5);
+            pipeline.push_interleaved(0.5).unwrap();
         }
         assert!(!observed.load(Ordering::Acquire));
-        pipeline.push_interleaved(1.0);
+        pipeline.push_interleaved(1.0).unwrap();
 
         assert!(observed.load(Ordering::Acquire));
         assert_eq!(revision.load(Ordering::Acquire), 1);
@@ -952,7 +982,7 @@ mod tests {
         assert!((actual_rms - expected_rms).abs() < 1e-6);
 
         for _ in 0..LEVEL_WINDOW_SAMPLES {
-            pipeline.push_interleaved(0.25);
+            pipeline.push_interleaved(0.25).unwrap();
         }
         assert_eq!(revision.load(Ordering::Acquire), 2);
     }
@@ -961,10 +991,10 @@ mod tests {
     fn capture_maximum_levels_include_full_and_partial_signal_and_meter_windows() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
         for _ in 0..LEVEL_WINDOW_SAMPLES {
-            pipeline.push_interleaved(0.2);
+            pipeline.push_interleaved(0.2).unwrap();
         }
         for _ in 0..LEVEL_WINDOW_SAMPLES / 2 {
-            pipeline.push_interleaved(0.6);
+            pipeline.push_interleaved(0.6).unwrap();
         }
 
         let _ = pipeline.finish(CaptureStopReason::Explicit).unwrap();
@@ -980,6 +1010,7 @@ mod tests {
             PREPARED_SAMPLE_RATE,
             1,
             CaptureOptions::default(),
+            default_detector(),
             Arc::clone(&rms_bits),
             peak_bits,
             observed,
@@ -998,9 +1029,9 @@ mod tests {
     }
 
     #[test]
-    fn one_meter_window_non_speech_burst_reaches_the_diagnostic_activation_floor() {
+    fn one_meter_window_non_speech_burst_reaches_the_low_input_diagnostic_floor() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        push_mono_ms(&mut pipeline, 30, MIN_SPEECH_ACTIVATION_RMS);
+        push_mono_ms(&mut pipeline, 30, super::super::LOW_INPUT_DIAGNOSTIC_RMS);
         push_mono_ms(&mut pipeline, 100, 0.0);
 
         assert!(
@@ -1009,96 +1040,199 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(pipeline.maximum_levels().rms >= MIN_SPEECH_ACTIVATION_RMS);
+        assert!(pipeline.maximum_levels().rms >= super::super::LOW_INPUT_DIAGNOSTIC_RMS);
     }
 
     #[test]
-    fn automatic_activation_threshold_preserves_the_existing_noise_floor_rule() {
-        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        pipeline.vad.noise_floor = 0.01;
-        pipeline.vad.process_frame(0.0);
-
-        assert!(
-            (f32::from_bits(
-                pipeline
-                    .vad
-                    .activation_threshold_bits
-                    .load(Ordering::Relaxed)
-            ) - 0.03)
-                .abs()
-                < 1e-6
-        );
-    }
-
-    #[test]
-    fn manual_activation_threshold_changes_apply_to_subsequent_vad_frames() {
+    fn silero_receives_only_exact_sequential_post_resample_windows() {
         let (rms, peak, observed, revision) = level_state();
-        let reported_threshold = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let manual_threshold = Arc::new(AtomicU32::new(0.03_f32.to_bits()));
-        let speech_detected = Arc::new(AtomicBool::new(false));
+        let (detector, state) = fake_detector();
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
-            CaptureOptions {
-                sensitivity: Sensitivity::Manual {
-                    activation_rms: 0.03,
-                },
-                ..CaptureOptions::default()
-            },
+            CaptureOptions::default(),
+            Some(detector),
             rms,
             peak,
             observed,
             revision,
         )
-        .unwrap()
-        .with_vad_telemetry(
-            Arc::clone(&reported_threshold),
-            Arc::clone(&manual_threshold),
-            Arc::clone(&speech_detected),
-        );
+        .unwrap();
+        let samples = (0..(WINDOW_SAMPLES * 2 + 17))
+            .map(|index| index as f32 / (WINDOW_SAMPLES * 4) as f32)
+            .collect::<Vec<_>>();
+        for sample in &samples {
+            pipeline.push_interleaved(*sample).unwrap();
+        }
+        let _ = pipeline.finish(CaptureStopReason::Explicit).unwrap();
 
-        push_mono_ms(&mut pipeline, 10, 0.02);
-        assert_eq!(pipeline.vad.state, VadState::Waiting);
-        manual_threshold.store(0.01_f32.to_bits(), Ordering::Release);
-        push_mono_ms(&mut pipeline, 150, 0.02);
-
-        assert!(speech_detected.load(Ordering::Acquire));
+        let state = state.lock().unwrap();
         assert_eq!(
-            f32::from_bits(reported_threshold.load(Ordering::Relaxed)),
-            0.01
+            state.windows.len(),
+            2,
+            "the final partial window is not padded"
         );
+        assert_eq!(state.windows[0], samples[..WINDOW_SAMPLES]);
+        assert_eq!(
+            state.windows[1],
+            samples[WINDOW_SAMPLES..WINDOW_SAMPLES * 2]
+        );
+        assert_eq!(state.finish_calls, 1);
     }
 
     #[test]
-    fn manual_meter_only_capture_detects_voice_without_retaining_audio() {
+    fn callback_ring_enqueue_performs_zero_vad_inference_until_worker_drain() {
+        let (rms, peak, observed, revision) = level_state();
+        let (detector, state) = fake_detector();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        let (mut producer, mut consumer) = super::super::ring_buffer::ring_buffer(WINDOW_SAMPLES);
+
+        for _ in 0..WINDOW_SAMPLES {
+            producer.push(0.2).unwrap();
+        }
+        assert!(state.lock().unwrap().windows.is_empty());
+
+        super::super::drain_ring_bounded(&mut consumer, &mut pipeline, WINDOW_SAMPLES).unwrap();
+        assert_eq!(state.lock().unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn equal_silero_decisions_produce_identical_speech_state_at_different_rms_levels() {
+        fn run(level: f32) -> (VadState, Option<usize>, Option<usize>, LevelSnapshot) {
+            let (rms, peak, observed, revision) = level_state();
+            let (detector, state) = fake_detector();
+            let decisions = std::iter::repeat_n(true, 5)
+                .chain(std::iter::repeat_n(false, 29))
+                .map(|speech| {
+                    Ok(SileroVadDecision {
+                        probability: if speech { 0.9 } else { 0.1 },
+                        speech,
+                    })
+                });
+            state.lock().unwrap().decisions.extend(decisions);
+            let mut pipeline = Pipeline::new(
+                PREPARED_SAMPLE_RATE,
+                1,
+                CaptureOptions::default(),
+                Some(detector),
+                rms,
+                peak,
+                observed,
+                revision,
+            )
+            .unwrap();
+            for _ in 0..WINDOW_SAMPLES * 34 {
+                pipeline.push_interleaved(level).unwrap();
+            }
+            (
+                pipeline.vad.state,
+                pipeline.vad.speech_start_frame,
+                pipeline.vad.endpoint_frame,
+                pipeline.maximum_levels(),
+            )
+        }
+
+        let quiet = run(0.001);
+        let loud = run(0.9);
+        assert_eq!((quiet.0, quiet.1, quiet.2), (loud.0, loud.1, loud.2));
+        assert!(quiet.3.rms < loud.3.rms);
+    }
+
+    #[test]
+    fn silero_compute_failure_stops_the_pipeline_without_an_rms_fallback() {
+        let (rms, peak, observed, revision) = level_state();
+        let (detector, state) = fake_detector();
+        state
+            .lock()
+            .unwrap()
+            .decisions
+            .push_back(Err(CaptureError::SpeechDetection(
+                "simulated worker crash".to_owned(),
+            )));
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+
+        for _ in 0..WINDOW_SAMPLES - 1 {
+            pipeline.push_interleaved(0.9).unwrap();
+        }
+        let error = pipeline.push_interleaved(0.9).unwrap_err();
+        assert!(matches!(error, CaptureError::SpeechDetection(_)));
+        assert!(pipeline.vad.speech_start_frame.is_none());
+        assert_eq!(state.lock().unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn cancelling_capture_retires_the_detector_before_more_windows_can_run() {
+        let (rms, peak, observed, revision) = level_state();
+        let (detector, state) = fake_detector();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
+        for _ in 0..WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+
+        pipeline.cancel_speech_detector().unwrap();
+        for _ in 0..WINDOW_SAMPLES - 1 {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+        assert!(matches!(
+            pipeline.push_interleaved(0.2),
+            Err(CaptureError::InvalidOptions(_))
+        ));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.cancel_calls, 1);
+        assert_eq!(state.finish_calls, 0);
+    }
+
+    #[test]
+    fn meter_only_capture_tracks_levels_without_a_detector_or_retained_audio() {
         let (rms_bits, peak_bits, observed, revision) = level_state();
-        let threshold_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let speech_detected = Arc::new(AtomicBool::new(false));
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
             CaptureOptions {
-                sensitivity: Sensitivity::Manual {
-                    activation_rms: 0.02,
-                },
                 intent: CaptureIntent::MeterOnly,
                 ..CaptureOptions::default()
             },
+            None,
             Arc::clone(&rms_bits),
             Arc::clone(&peak_bits),
             Arc::clone(&observed),
             Arc::clone(&revision),
         )
-        .unwrap()
-        .with_vad_telemetry(
-            Arc::clone(&threshold_bits),
-            Arc::new(AtomicU32::new(0.02_f32.to_bits())),
-            Arc::clone(&speech_detected),
-        );
+        .unwrap();
         push_mono_ms(&mut pipeline, 150, 0.03);
 
-        assert!(speech_detected.load(Ordering::Acquire));
-        assert_eq!(f32::from_bits(threshold_bits.load(Ordering::Relaxed)), 0.02);
         assert!(observed.load(Ordering::Acquire));
         assert!(revision.load(Ordering::Acquire) > 0);
         assert!(f32::from_bits(rms_bits.load(Ordering::Relaxed)) > 0.0);
@@ -1119,23 +1253,46 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_vad_confirms_pauses_and_endpoints_at_configured_times() {
-        let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        push_mono_ms(&mut pipeline, 300, 0.001);
-        assert!(pipeline.vad.noise_floor < 0.003);
-        push_mono_ms(&mut pipeline, 140, 0.2);
-        assert!(pipeline.vad.speech_start_frame.is_none());
-        push_mono_ms(&mut pipeline, 10, 0.2);
-        assert_eq!(pipeline.vad.speech_start_frame, Some(4_800));
-        assert_eq!(pipeline.vad.speech_trigger_frame, Some(7_200));
+    fn silero_decisions_drive_confirmation_pause_and_endpoint_timers() {
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                vad: VadOptions::new(
+                    Duration::from_millis(64),
+                    Duration::from_millis(64),
+                    Duration::from_millis(128),
+                    Duration::from_millis(250),
+                    Duration::from_millis(200),
+                ),
+                ..CaptureOptions::default()
+            },
+            default_detector(),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap();
 
-        push_mono_ms(&mut pipeline, 440, 0.0);
-        assert_eq!(pipeline.vad.state, VadState::Active);
-        push_mono_ms(&mut pipeline, 10, 0.0);
+        for _ in 0..WINDOW_SAMPLES * 2 {
+            pipeline.push_interleaved(0.2).unwrap();
+        }
+        assert_eq!(pipeline.vad.speech_start_frame, Some(0));
+        assert_eq!(pipeline.vad.speech_trigger_frame, Some(WINDOW_SAMPLES * 2));
+
+        for _ in 0..WINDOW_SAMPLES * 2 {
+            pipeline.push_interleaved(0.0).unwrap();
+        }
         assert_eq!(pipeline.vad.state, VadState::Paused);
-        push_mono_ms(&mut pipeline, 440, 0.0);
+        for _ in 0..WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.0).unwrap();
+        }
         assert!(!pipeline.endpoint_triggered());
-        push_mono_ms(&mut pipeline, 10, 0.0);
+        for _ in 0..WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.0).unwrap();
+        }
         assert!(pipeline.endpoint_triggered());
     }
 
@@ -1149,15 +1306,16 @@ mod tests {
                 endpointing_enabled: false,
                 ..CaptureOptions::default()
             },
+            default_detector(),
             rms,
             peak,
             observed,
             revision,
         )
         .unwrap();
-        push_mono_ms(&mut pipeline, 150, 0.2);
-        push_mono_ms(&mut pipeline, 900, 0.0);
-        push_mono_ms(&mut pipeline, 200, 0.3);
+        push_mono_ms(&mut pipeline, 160, 0.2);
+        push_mono_ms(&mut pipeline, 928, 0.0);
+        push_mono_ms(&mut pipeline, 224, 0.3);
 
         assert!(pipeline.vad.speech_start_frame.is_some());
         assert!(pipeline.vad.endpoint_frame.is_none());
@@ -1166,21 +1324,21 @@ mod tests {
             .finish(CaptureStopReason::MaximumDuration)
             .unwrap()
             .unwrap();
-        assert!(prepared.duration_ms() >= 1_200);
+        assert!(prepared.duration_ms() >= 1_280);
     }
 
     #[test]
     fn paused_speech_can_resume_before_a_later_endpoint() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        push_mono_ms(&mut pipeline, 150, 0.2);
-        push_mono_ms(&mut pipeline, 450, 0.0);
+        push_mono_ms(&mut pipeline, 160, 0.2);
+        push_mono_ms(&mut pipeline, 480, 0.0);
         assert_eq!(pipeline.vad.state, VadState::Paused);
 
-        push_mono_ms(&mut pipeline, 100, 0.2);
+        push_mono_ms(&mut pipeline, 96, 0.2);
         assert_eq!(pipeline.vad.state, VadState::Active);
         assert!(!pipeline.endpoint_triggered());
 
-        push_mono_ms(&mut pipeline, 900, 0.0);
+        push_mono_ms(&mut pipeline, 928, 0.0);
         assert!(pipeline.endpoint_triggered());
     }
 
@@ -1198,11 +1356,10 @@ mod tests {
     }
 
     #[test]
-    fn sustained_background_below_activation_adapts_without_false_speech() {
+    fn sustained_non_speech_decisions_do_not_start_speech() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
         push_mono_ms(&mut pipeline, 3_000, 0.01);
 
-        assert!(pipeline.vad.noise_floor > 0.003);
         assert_eq!(pipeline.vad.state, VadState::Waiting);
         assert!(pipeline.vad.speech_start_frame.is_none());
     }
@@ -1210,21 +1367,28 @@ mod tests {
     #[test]
     fn endpoint_completion_keeps_pre_roll_and_post_roll() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        push_mono_ms(&mut pipeline, 300, 0.0);
-        push_mono_ms(&mut pipeline, 200, 0.2);
-        push_mono_ms(&mut pipeline, 900, 0.0);
+        push_mono_ms(&mut pipeline, 320, 0.0);
+        push_mono_ms(&mut pipeline, 160, 0.2);
+        push_mono_ms(&mut pipeline, 928, 0.0);
         assert!(pipeline.endpoint_triggered());
+
+        let expected_start = pipeline
+            .vad
+            .speech_start_frame
+            .unwrap()
+            .saturating_sub(duration_to_prepared_frames(pipeline.vad.options.pre_roll));
+        let expected_end = pipeline
+            .vad
+            .last_voice_frame
+            .saturating_add(duration_to_prepared_frames(pipeline.vad.options.post_roll));
 
         let prepared = pipeline
             .finish(CaptureStopReason::Endpoint)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            prepared.samples.len(),
-            650 * PREPARED_SAMPLE_RATE as usize / 1_000
-        );
+        assert_eq!(prepared.samples.len(), expected_end - expected_start);
         assert_eq!(prepared.samples[0], 0.0);
-        assert!(prepared.samples[250 * PREPARED_SAMPLE_RATE as usize / 1_000] > 0.1);
+        assert!(prepared.samples[duration_to_prepared_frames(pipeline.vad.options.pre_roll)] > 0.1);
         assert_eq!(*prepared.samples.last().unwrap(), 0.0);
         assert_eq!(prepared.source_duration_ms(), prepared.duration_ms());
     }
@@ -1232,18 +1396,21 @@ mod tests {
     #[test]
     fn explicit_completion_keeps_audio_captured_during_post_roll() {
         let mut pipeline = pipeline(PREPARED_SAMPLE_RATE, 1);
-        push_mono_ms(&mut pipeline, 300, 0.0);
-        push_mono_ms(&mut pipeline, 200, 0.2);
-        push_mono_ms(&mut pipeline, 200, 0.0);
+        push_mono_ms(&mut pipeline, 320, 0.0);
+        push_mono_ms(&mut pipeline, 160, 0.2);
+        push_mono_ms(&mut pipeline, 224, 0.0);
+        let expected_start = pipeline
+            .vad
+            .speech_start_frame
+            .unwrap()
+            .saturating_sub(duration_to_prepared_frames(pipeline.vad.options.pre_roll));
+        let expected_len = pipeline.prepared.len() - expected_start;
 
         let prepared = pipeline
             .finish(CaptureStopReason::Explicit)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            prepared.samples.len(),
-            650 * PREPARED_SAMPLE_RATE as usize / 1_000
-        );
+        assert_eq!(prepared.samples.len(), expected_len);
     }
 
     #[test]
@@ -1270,6 +1437,7 @@ mod tests {
                 endpointing_enabled: false,
                 ..CaptureOptions::default()
             },
+            None,
             rms,
             peak,
             observed,

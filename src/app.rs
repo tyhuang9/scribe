@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::audio::{
     self, CaptureCancellation, CaptureCompletion, CaptureError, CaptureIntent, CaptureMetrics,
-    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, Sensitivity, VadOptions,
+    CaptureOptions, CaptureStopReason, LevelSnapshot, RecordingSession, VadOptions,
 };
 use crate::benchmark::{
     self, BenchmarkMetric, BenchmarkModelInput, BenchmarkModelResult, RankingMode,
@@ -133,9 +133,7 @@ fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
             Duration::from_millis(config.recording.pre_roll_ms.into()),
             Duration::from_millis(config.recording.post_roll_ms.into()),
         ),
-        // The persisted speech-probability threshold is not wired into capture
-        // until the Silero classifier replaces this legacy energy gate.
-        sensitivity: Sensitivity::Automatic,
+        speech_probability_threshold: config.recording.speech_probability_threshold,
         intent: CaptureIntent::Dictation,
     }
 }
@@ -304,7 +302,7 @@ fn no_speech_feedback_for_capture(
 }
 
 fn diagnostic_activation_floor(_config: &AppConfig) -> f32 {
-    audio::MIN_SPEECH_ACTIVATION_RMS
+    audio::LOW_INPUT_DIAGNOSTIC_RMS
 }
 
 fn discard_recording_async(session: RecordingSession) {
@@ -538,7 +536,7 @@ impl CaptureDiagnosticContext {
 impl Default for CaptureDiagnosticContext {
     fn default() -> Self {
         Self {
-            activation_floor: audio::MIN_SPEECH_ACTIVATION_RMS,
+            activation_floor: audio::LOW_INPUT_DIAGNOSTIC_RMS,
             input_device_name: None,
         }
     }
@@ -14850,9 +14848,9 @@ mod layout_tests {
     #[test]
     fn no_speech_feedback_distinguishes_low_input_from_short_non_speech_audio() {
         let low = no_speech_feedback(
-            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 10.0),
+            Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 10.0),
             Some("Microphone (fifine  Microphone)"),
-            audio::MIN_SPEECH_ACTIVATION_RMS,
+            audio::LOW_INPUT_DIAGNOSTIC_RMS,
         );
         assert_eq!(
             low.status_message,
@@ -14864,9 +14862,9 @@ mod layout_tests {
         );
 
         let non_silent = no_speech_feedback(
-            Some(audio::MIN_SPEECH_ACTIVATION_RMS),
+            Some(audio::LOW_INPUT_DIAGNOSTIC_RMS),
             Some("Microphone Array"),
-            audio::MIN_SPEECH_ACTIVATION_RMS,
+            audio::LOW_INPUT_DIAGNOSTIC_RMS,
         );
         assert_eq!(
             non_silent.status_message,
@@ -14881,7 +14879,7 @@ mod layout_tests {
         config.recording.speech_probability_threshold = 0.2;
 
         let feedback = no_speech_feedback(
-            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 2.0),
+            Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 2.0),
             Some("Microphone Array"),
             diagnostic_activation_floor(&config),
         );
@@ -14890,7 +14888,7 @@ mod layout_tests {
         config.recording.speech_probability_threshold = 0.8;
         assert_eq!(
             diagnostic_activation_floor(&config),
-            audio::MIN_SPEECH_ACTIVATION_RMS
+            audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
     }
 
@@ -15387,13 +15385,13 @@ mod layout_tests {
         config.recording.speech_probability_threshold = 0.8;
         config.recording.audio_input_device_name = Some("Different microphone".to_owned());
         let feedback = no_speech_feedback_for_capture(
-            Some(audio::MIN_SPEECH_ACTIVATION_RMS / 2.0),
+            Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 2.0),
             &diagnostics,
         );
 
         assert_eq!(
             diagnostics.activation_floor,
-            audio::MIN_SPEECH_ACTIVATION_RMS
+            audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(diagnostics.input_device_name.as_deref(), Some("FIFINE A8"));
         assert!(feedback.status_message.starts_with("FIFINE microphone"));
@@ -15430,7 +15428,7 @@ mod layout_tests {
                 .unwrap()
                 .capture_diagnostics
                 .activation_floor,
-            audio::MIN_SPEECH_ACTIVATION_RMS
+            audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(
             app.pending_recording
@@ -15438,13 +15436,13 @@ mod layout_tests {
                 .unwrap()
                 .capture_diagnostics
                 .activation_floor,
-            audio::MIN_SPEECH_ACTIVATION_RMS
+            audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
     }
 
     #[test]
-    fn capture_ready_keeps_probability_setting_out_of_legacy_rms_gate() {
+    fn capture_ready_preserves_probability_setting_and_rms_diagnostic_separation() {
         let mut app = test_app();
         let session_id = app
             .session_coordinator
@@ -15473,13 +15471,10 @@ mod layout_tests {
         app.poll_events();
 
         let active = app.active_recording.as_ref().unwrap();
-        assert_eq!(
-            active.session.manual_activation_threshold(),
-            audio::DEFAULT_MANUAL_ACTIVATION_RMS
-        );
+        assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
         assert_eq!(
             active.capture_diagnostics.activation_floor,
-            audio::MIN_SPEECH_ACTIVATION_RMS
+            audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         app.stop_and_discard_active_recording();
     }
@@ -15510,7 +15505,7 @@ mod layout_tests {
 
         config.recording.speech_probability_threshold = 0.2;
         let unchanged = capture_options_from_config(&config);
-        assert_eq!(unchanged.sensitivity, Sensitivity::Automatic);
+        assert_eq!(unchanged.speech_probability_threshold, 0.2);
     }
 
     #[test]
