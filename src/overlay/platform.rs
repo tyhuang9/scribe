@@ -90,6 +90,17 @@ fn hardened_overlay_ex_style(
     }
 }
 
+/// Acrylic is visual polish only: style hardening and non-activating placement
+/// remain authoritative even when the compositor does not support it.
+fn request_transient_backdrop_if_display<F, R>(profile: OverlayHardeningProfile, request: F)
+where
+    F: FnOnce() -> R,
+{
+    if profile == OverlayHardeningProfile::PassThroughDisplay {
+        let _ = request();
+    }
+}
+
 pub fn calculate_window_bounds(
     work_area: PhysicalWorkArea,
     dpi: u32,
@@ -223,6 +234,9 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         BOOL, CloseHandle, FILETIME, HWND, LPARAM, POINT, RECT, STILL_ACTIVE,
     };
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
+    };
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
     };
@@ -242,7 +256,7 @@ mod imp {
     use super::{
         CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
         OverlayWindowSpec, PhysicalWorkArea, TargetIdentity, calculate_window_bounds,
-        hardened_overlay_ex_style,
+        hardened_overlay_ex_style, request_transient_backdrop_if_display,
     };
 
     trait CapturedTargetProbe {
@@ -499,6 +513,18 @@ mod imp {
         {
             return false;
         }
+
+        request_transient_backdrop_if_display(profile, || {
+            let backdrop = DWMSBT_TRANSIENTWINDOW;
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    window,
+                    DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                    (&backdrop as *const i32).cast::<c_void>(),
+                    size_of::<i32>() as u32,
+                )
+            };
+        });
 
         let visibility_flag = if visible {
             SWP_SHOWWINDOW
@@ -1060,6 +1086,40 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_backdrop_failure_is_display_only_and_fail_soft() {
+        let mut display_attempted = false;
+        request_transient_backdrop_if_display(OverlayHardeningProfile::PassThroughDisplay, || {
+            display_attempted = true;
+            Err::<(), ()>(())
+        });
+        assert!(display_attempted);
+
+        let mut control_attempted = false;
+        request_transient_backdrop_if_display(
+            OverlayHardeningProfile::NonActivatingControl,
+            || {
+                control_attempted = true;
+                Err::<(), ()>(())
+            },
+        );
+        assert!(!control_attempted);
+
+        let no_activate = 0b001;
+        let tool_window = 0b010;
+        let transparent = 0b100;
+        assert_eq!(
+            hardened_overlay_ex_style(
+                0,
+                no_activate,
+                tool_window,
+                transparent,
+                OverlayHardeningProfile::PassThroughDisplay,
+            ),
+            no_activate | tool_window | transparent,
+        );
+    }
 
     #[test]
     fn control_hardening_clears_existing_transparency() {

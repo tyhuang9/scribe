@@ -9,24 +9,28 @@ use super::platform::{
     CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
     OverlayWindowSpec, harden_overlay_window, harden_overlay_window_at, overlay_window_bounds,
 };
-use crate::transcription::SessionId;
+use crate::{transcription::SessionId, ui::theme_palette};
 
 pub const OVERLAY_VIEWPORT_KEY: &str = "scribe-dictation-overlay";
 pub const OVERLAY_WINDOW_TITLE: &str = "Scribe Dictation Overlay";
 pub const OVERLAY_CONTROL_VIEWPORT_KEY: &str = "scribe-dictation-overlay-cancel";
 pub const OVERLAY_CONTROL_WINDOW_TITLE: &str = "Scribe Dictation Overlay Cancel";
 
-const LIVE_WIDTH: f32 = 440.0;
-const LIVE_HEIGHT: f32 = 140.0;
+const LIVE_WIDTH: f32 = 600.0;
+const LIVE_HEIGHT: f32 = 62.0;
 const MINIMAL_WIDTH: f32 = 320.0;
 const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
 const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
+const CAPSULE_HORIZONTAL_INSET: f32 = 8.0;
+const CAPSULE_VERTICAL_INSET: f32 = 8.0;
+const CAPSULE_SHADOW_BLUR: f32 = 6.0;
+const CAPSULE_SHADOW_OFFSET_Y: f32 = 2.0;
 const COMPACT_METER_WIDTH: f32 = 38.0;
-const LIVE_METER_WIDTH: f32 = 74.0;
+const LIVE_WAVEFORM_SIZE: f32 = 30.0;
 const MAX_PREVIEW_CHARS: usize = 512;
-const MAX_PREVIEW_ROWS: usize = 2;
+const LIVE_PREVIEW_ROWS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -183,6 +187,7 @@ fn control_viewport_builder(
 
 fn render_cancel_control(context: &egui::Context) -> bool {
     let mut clicked = false;
+    let colors = overlay_colors(context);
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
         .show(context, |ui| {
@@ -192,7 +197,7 @@ fn render_cancel_control(context: &egui::Context) -> bool {
                     egui::Button::new(
                         egui::RichText::new(egui_phosphor::regular::X)
                             .size(20.0)
-                            .color(Color32::WHITE),
+                            .color(colors.text),
                     )
                     .frame(false),
                 );
@@ -214,6 +219,54 @@ fn render_cancel_control(context: &egui::Context) -> bool {
             });
         });
     clicked
+}
+
+#[derive(Clone, Copy)]
+struct OverlayColors {
+    surface: Color32,
+    border: Color32,
+    text: Color32,
+    muted_text: Color32,
+    tentative_text: Color32,
+    waveform: Color32,
+    meter_active: Color32,
+    meter_inactive: Color32,
+    error: Color32,
+    warning: Color32,
+    shadow: Color32,
+}
+
+fn overlay_colors(context: &egui::Context) -> OverlayColors {
+    let palette = theme_palette(context);
+    if context.style().visuals.dark_mode {
+        OverlayColors {
+            surface: Color32::from_rgba_unmultiplied(24, 29, 38, 230),
+            border: Color32::from_rgba_unmultiplied(220, 229, 242, 76),
+            text: palette.text,
+            muted_text: Color32::from_rgb(202, 211, 224),
+            tentative_text: Color32::from_rgb(166, 180, 202),
+            waveform: palette.accent,
+            meter_active: palette.success,
+            meter_inactive: Color32::from_rgb(128, 142, 162),
+            error: palette.error,
+            warning: palette.warning,
+            shadow: Color32::from_black_alpha(96),
+        }
+    } else {
+        OverlayColors {
+            surface: Color32::from_rgba_unmultiplied(247, 249, 252, 238),
+            border: Color32::from_rgba_unmultiplied(35, 47, 66, 64),
+            text: palette.text,
+            muted_text: Color32::from_rgb(65, 75, 90),
+            tentative_text: Color32::from_rgb(82, 96, 116),
+            waveform: palette.accent,
+            meter_active: palette.success_text,
+            meter_inactive: Color32::from_rgb(100, 112, 132),
+            error: palette.error_text,
+            warning: palette.warning,
+            shadow: Color32::from_black_alpha(54),
+        }
+    }
 }
 
 fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
@@ -267,44 +320,55 @@ fn viewport_builder(
 }
 
 fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
-    let background = Color32::from_rgba_unmultiplied(20, 25, 34, 245);
+    let colors = overlay_colors(context);
+    let rounding = (window_spec(state.mode).height_points - CAPSULE_VERTICAL_INSET * 2.0) / 2.0;
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
         .show(context, |ui| {
-            egui::Frame::none()
-                .fill(background)
-                .rounding(egui::Rounding::same(14.0))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(59, 70, 88)))
-                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                .show(ui, |ui| {
-                    let available = ui.available_size();
-                    let content_size = egui::vec2(
-                        (available.x - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
-                        available.y,
-                    );
-                    ui.allocate_ui_with_layout(
-                        content_size,
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |content| {
-                            content.set_min_size(content_size);
-                            content.set_max_width(content_size.x);
-                            render_status_row(content, state);
-                            if state.mode == OverlayMode::Live {
-                                content.add_space(8.0);
-                                render_live_content(content, state);
-                            }
-                        },
-                    );
-                });
+            let capsule_rect = painted_capsule_bounds(ui.max_rect());
+            ui.allocate_ui_at_rect(capsule_rect, |ui| {
+                egui::Frame::none()
+                    .fill(colors.surface)
+                    .rounding(egui::Rounding::same(rounding))
+                    .stroke(Stroke::new(1.0, colors.border))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, CAPSULE_SHADOW_OFFSET_Y),
+                        blur: CAPSULE_SHADOW_BLUR,
+                        spread: 0.0,
+                        color: colors.shadow,
+                    })
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                    .show(ui, |ui| {
+                        let available = ui.available_size();
+                        let content_size = egui::vec2(
+                            (available.x - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
+                            available.y,
+                        );
+                        ui.allocate_ui_with_layout(
+                            content_size,
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |content| {
+                                content.set_min_size(content_size);
+                                content.set_max_width(content_size.x);
+                                if state.mode == OverlayMode::Live {
+                                    render_live_status_row(content, state, colors);
+                                } else {
+                                    render_compact_status_row(content, state, colors);
+                                }
+                            },
+                        );
+                    });
+            });
         });
 }
 
-fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
+fn painted_capsule_bounds(viewport: egui::Rect) -> egui::Rect {
+    viewport.shrink2(egui::vec2(CAPSULE_HORIZONTAL_INSET, CAPSULE_VERTICAL_INSET))
+}
+
+fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
     ui.horizontal(|ui| {
-        let compact = state.mode == OverlayMode::Minimal;
-        if compact {
-            ui.spacing_mut().item_spacing.x = 4.0;
-        }
+        ui.spacing_mut().item_spacing.x = 4.0;
         let status_color = phase_color(state.phase);
         let (dot_rect, dot_response) =
             ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
@@ -319,43 +383,69 @@ fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
         } else {
             state.phase.label()
         };
-        let mut status_text = RichText::new(label).strong().color(Color32::WHITE);
-        if compact {
-            status_text = status_text.size(13.0);
-        }
-        let status = ui.label(status_text);
+        let status = ui.label(RichText::new(label).strong().size(13.0).color(colors.text));
         mark_polite_live_region(ui.ctx(), status.id);
-
-        if !compact {
-            ui.add_space(6.0);
-        }
-        render_level_meter(
-            ui,
-            state,
-            if compact {
-                COMPACT_METER_WIDTH
-            } else {
-                LIVE_METER_WIDTH
-            },
-        );
+        render_level_meter(ui, state, COMPACT_METER_WIDTH, colors);
 
         if let Some(elapsed) = state.elapsed {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut elapsed_text =
-                    RichText::new(format_elapsed(elapsed)).color(Color32::LIGHT_GRAY);
-                if compact {
-                    elapsed_text = elapsed_text.size(12.0).monospace();
-                }
-                ui.label(elapsed_text);
+                ui.label(
+                    RichText::new(format_elapsed(elapsed))
+                        .color(colors.muted_text)
+                        .size(12.0)
+                        .monospace(),
+                );
             });
         }
     });
 }
 
-fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState, width: f32) {
-    let compact = width <= COMPACT_METER_WIDTH;
+fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
+    ui.horizontal_centered(|ui| {
+        render_waveform_meter(ui, state, colors);
+        ui.add_space(8.0);
+        let elapsed = state
+            .elapsed
+            .map(format_elapsed)
+            .unwrap_or_else(|| "0:00".into());
+        ui.label(
+            RichText::new(elapsed)
+                .size(13.0)
+                .monospace()
+                .color(colors.muted_text),
+        );
+        render_divider(ui, colors);
+        let response = ui.label(live_preview_layout(ui, state, colors, ui.available_width()));
+        ui.ctx().accesskit_node_builder(response.id, |builder| {
+            builder.set_name(live_accessible_text(state));
+            if state.error.is_some() || state.notice.is_some() {
+                builder.set_live(egui::accesskit::Live::Polite);
+            }
+        });
+        if let Some(announcement_text) = &state.transcript_announcement {
+            let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
+            ui.ctx().accesskit_node_builder(announcement.id, |builder| {
+                builder.set_role(egui::accesskit::Role::StaticText);
+                builder.set_name(announcement_text.as_str());
+                builder.set_live(egui::accesskit::Live::Polite);
+            });
+        }
+    });
+}
+
+fn render_divider(ui: &mut egui::Ui, colors: OverlayColors) {
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 24.0), Sense::hover());
+    ui.painter().line_segment(
+        [rect.center_top(), rect.center_bottom()],
+        Stroke::new(1.0, colors.border),
+    );
+    ui.add_space(6.0);
+}
+
+fn render_waveform_meter(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, if compact { 20.0 } else { 24.0 }),
+        egui::vec2(LIVE_WAVEFORM_SIZE, LIVE_WAVEFORM_SIZE),
         Sense::hover(),
     );
     let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
@@ -367,8 +457,52 @@ fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState, width: f32) {
         info.value = Some((level * 100.0).round() as f64);
         info
     });
-    let bars = if compact { 4 } else { 7 };
-    let gap = if compact { 2.0 } else { 3.0 };
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_role(egui::accesskit::Role::ProgressIndicator);
+        builder.set_name("Microphone input level");
+        builder.set_description(if state.phase == OverlayPhase::Listening {
+            "Scribe is recording"
+        } else {
+            state.phase.label()
+        });
+    });
+    let waveform = waveform_color(level, colors);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        egui_phosphor::regular::WAVEFORM,
+        egui::FontId::proportional(27.0),
+        waveform,
+    );
+}
+
+fn waveform_color(level: f32, colors: OverlayColors) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        colors.waveform.r(),
+        colors.waveform.g(),
+        colors.waveform.b(),
+        (96.0 + level * 159.0).round() as u8,
+    )
+}
+
+fn render_level_meter(
+    ui: &mut egui::Ui,
+    state: &OverlayViewState,
+    width: f32,
+    colors: OverlayColors,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 20.0), Sense::hover());
+    let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(
+            egui::WidgetType::ProgressIndicator,
+            "Microphone input level",
+        );
+        info.value = Some((level * 100.0).round() as f64);
+        info
+    });
+    let bars = 4;
+    let gap = 2.0;
     let bar_width = (rect.width() - gap * (bars - 1) as f32) / bars as f32;
 
     for index in 0..bars {
@@ -382,75 +516,76 @@ fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState, width: f32) {
             egui::pos2(left + bar_width, rect.bottom()),
         );
         let color = if active {
-            Color32::from_rgb(91, 201, 158)
+            colors.meter_active
         } else {
-            Color32::from_rgb(100, 112, 132)
+            colors.meter_inactive
         };
         ui.painter().rect_filled(bar, 2.0, color);
     }
 }
 
-fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
+fn live_preview_layout(
+    ui: &egui::Ui,
+    state: &OverlayViewState,
+    colors: OverlayColors,
+    max_width: f32,
+) -> egui::text::LayoutJob {
     if let Some(error) = &state.error {
-        let suffix = match error.recovery {
-            OverlayRecovery::None => "",
-            OverlayRecovery::Retry => " You can retry.",
-            OverlayRecovery::WaitForPreview => " Wait for the current preview worker to exit.",
-        };
-        let message = format!("{}{suffix}", error.message);
-        let response = ui.label(message_layout_for_rows(
-            ui,
-            &message,
-            Color32::from_rgb(255, 174, 168),
-            ui.available_width(),
-            2,
-        ));
-        mark_polite_live_region(ui.ctx(), response.id);
-        return;
+        let message = error_message(error);
+        return message_layout_for_rows(ui, &message, colors.error, max_width, LIVE_PREVIEW_ROWS);
     }
 
     if let Some(notice) = &state.notice {
-        let response = ui.label(message_layout_for_rows(
-            ui,
-            notice,
-            Color32::from_rgb(255, 211, 132),
-            ui.available_width(),
-            2,
-        ));
-        mark_polite_live_region(ui.ctx(), response.id);
+        return message_layout_for_rows(ui, notice, colors.warning, max_width, LIVE_PREVIEW_ROWS);
     }
 
     if state.transcript.committed.is_empty() && state.transcript.tentative.is_empty() {
-        return;
+        return message_layout_for_rows(
+            ui,
+            state.phase.label(),
+            colors.muted_text,
+            max_width,
+            LIVE_PREVIEW_ROWS,
+        );
     }
 
-    let text = transcript_layout_for_rows(
+    transcript_layout_for_rows(
         ui,
         &state.transcript.committed,
         &state.transcript.tentative,
-        ui.available_width(),
-        MAX_PREVIEW_ROWS,
-    );
-    let response = ui.label(text);
-    let accessible_text = if state.transcript.tentative.is_empty() {
+        max_width,
+        LIVE_PREVIEW_ROWS,
+        colors,
+    )
+}
+
+fn live_accessible_text(state: &OverlayViewState) -> String {
+    if let Some(error) = &state.error {
+        return error_message(error);
+    }
+    if let Some(notice) = &state.notice {
+        return notice.clone();
+    }
+    if state.transcript.committed.is_empty() && state.transcript.tentative.is_empty() {
+        return state.phase.label().to_owned();
+    }
+    if state.transcript.tentative.is_empty() {
         format!("Committed transcript: {}", state.transcript.committed)
     } else {
         format!(
             "Committed transcript: {}. Tentative transcript: {}",
             state.transcript.committed, state.transcript.tentative
         )
-    };
-    ui.ctx().accesskit_node_builder(response.id, |builder| {
-        builder.set_name(accessible_text);
-    });
-    if let Some(announcement) = &state.transcript_announcement {
-        let response = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
-        ui.ctx().accesskit_node_builder(response.id, |builder| {
-            builder.set_role(egui::accesskit::Role::StaticText);
-            builder.set_name(announcement.as_str());
-            builder.set_live(egui::accesskit::Live::Polite);
-        });
     }
+}
+
+fn error_message(error: &super::controller::OverlayError) -> String {
+    let suffix = match error.recovery {
+        OverlayRecovery::None => "",
+        OverlayRecovery::Retry => " You can retry.",
+        OverlayRecovery::WaitForPreview => " Wait for the current preview worker to exit.",
+    };
+    format!("{}{suffix}", error.message)
 }
 
 fn transcript_layout_for_rows(
@@ -459,8 +594,9 @@ fn transcript_layout_for_rows(
     tentative: &str,
     max_width: f32,
     max_rows: usize,
+    colors: OverlayColors,
 ) -> egui::text::LayoutJob {
-    let full = transcript_layout(committed, tentative, max_width);
+    let full = transcript_layout(committed, tentative, max_width, colors);
     let total_chars = full.text.chars().count();
     let mut low = 0;
     let mut high = total_chars.min(MAX_PREVIEW_CHARS);
@@ -576,13 +712,18 @@ fn tail_layout_job(full: &egui::text::LayoutJob, keep_chars: usize) -> egui::tex
     result
 }
 
-fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::text::LayoutJob {
+fn transcript_layout(
+    committed: &str,
+    tentative: &str,
+    max_width: f32,
+    colors: OverlayColors,
+) -> egui::text::LayoutJob {
     let mut text = egui::text::LayoutJob::default();
     text.append(
         committed,
         0.0,
         egui::TextFormat {
-            color: Color32::WHITE,
+            color: colors.text,
             ..Default::default()
         },
     );
@@ -598,7 +739,7 @@ fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::
         tentative,
         0.0,
         egui::TextFormat {
-            color: Color32::from_rgb(162, 173, 190),
+            color: colors.tentative_text,
             italics: true,
             ..Default::default()
         },
@@ -663,7 +804,9 @@ mod tests {
         let live = window_spec(OverlayMode::Live);
         let minimal = window_spec(OverlayMode::Minimal);
 
-        assert_eq!((live.width_points, live.height_points), (440.0, 140.0));
+        assert_eq!((live.width_points, live.height_points), (600.0, 62.0));
+        assert!((560.0..=640.0).contains(&live.width_points));
+        assert!((56.0..=64.0).contains(&live.height_points));
         assert_eq!((minimal.width_points, minimal.height_points), (320.0, 52.0));
     }
 
@@ -735,6 +878,44 @@ mod tests {
     }
 
     #[test]
+    fn painted_capsule_keeps_shadow_room_and_encloses_the_cancel_control() {
+        let viewport =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(LIVE_WIDTH, LIVE_HEIGHT));
+        let capsule = painted_capsule_bounds(viewport);
+        assert_eq!(capsule.left(), CAPSULE_HORIZONTAL_INSET);
+        assert_eq!(capsule.right(), LIVE_WIDTH - CAPSULE_HORIZONTAL_INSET);
+        assert_eq!(capsule.top(), CAPSULE_VERTICAL_INSET);
+        assert_eq!(capsule.bottom(), LIVE_HEIGHT - CAPSULE_VERTICAL_INSET);
+        let shadow_bounds = capsule
+            .expand(CAPSULE_SHADOW_BLUR)
+            .translate(egui::vec2(0.0, CAPSULE_SHADOW_OFFSET_Y));
+        assert!(
+            viewport.contains_rect(shadow_bounds),
+            "the painted capsule shadow must stay inside its transparent viewport"
+        );
+
+        let control = control_window_bounds(
+            OverlayWindowBounds {
+                x: 0,
+                y: 0,
+                width: LIVE_WIDTH as i32,
+                height: LIVE_HEIGHT as i32,
+            },
+            window_spec(OverlayMode::Live),
+        );
+        assert!(control.x >= capsule.left() as i32);
+        assert!(control.x + control.width / 2 <= capsule.right() as i32);
+        assert!(control.y >= capsule.top() as i32);
+        assert!(control.y + control.height <= capsule.bottom() as i32);
+    }
+
+    #[test]
+    fn waveform_opacity_tracks_microphone_activity() {
+        let colors = overlay_colors(&egui::Context::default());
+        assert!(waveform_color(1.0, colors).a() > waveform_color(0.0, colors).a());
+    }
+
+    #[test]
     fn display_content_stays_left_of_reserved_control_slot() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -761,7 +942,7 @@ mod tests {
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let boundary = f64::from(LIVE_WIDTH - CONTROL_SIZE - CONTROL_CONTENT_GAP);
         for name in [
-            "Scribe is recording",
+            "Microphone input level",
             "0:05",
             "Committed transcript: committed text. Tentative transcript: tentative text",
         ] {
@@ -852,6 +1033,7 @@ mod tests {
                     "tentative-unbroken-text-that-must-wrap",
                     72.0,
                     2,
+                    overlay_colors(context),
                 );
                 let rows = ui.fonts(|fonts| fonts.layout_job(layout.clone()).rows.len());
                 result = Some((layout, rows));
@@ -868,17 +1050,24 @@ mod tests {
 
     #[test]
     fn stabilizer_shaped_transcript_has_exactly_one_boundary_space() {
-        let layout = transcript_layout("Schedule a meeting with", "Alex tomorrow", LIVE_WIDTH);
+        let colors = overlay_colors(&egui::Context::default());
+        let layout = transcript_layout(
+            "Schedule a meeting with",
+            "Alex tomorrow",
+            LIVE_WIDTH,
+            colors,
+        );
         assert_eq!(layout.text, "Schedule a meeting with Alex tomorrow");
 
-        let already_spaced = transcript_layout("hello ", "world", LIVE_WIDTH);
+        let already_spaced = transcript_layout("hello ", "world", LIVE_WIDTH, colors);
         assert_eq!(already_spaced.text, "hello world");
     }
 
     #[test]
     fn standalone_closing_punctuation_binds_to_the_committed_prefix() {
+        let colors = overlay_colors(&egui::Context::default());
         for punctuation in [".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "…"] {
-            let layout = transcript_layout("hello", punctuation, LIVE_WIDTH);
+            let layout = transcript_layout("hello", punctuation, LIVE_WIDTH, colors);
             assert_eq!(layout.text, format!("hello{punctuation}"));
         }
     }
@@ -898,9 +1087,18 @@ mod tests {
             ..OverlayViewState::default()
         };
 
-        let output = context.run(egui::RawInput::default(), |context| {
-            render_overlay(context, &state);
-        });
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                render_overlay(context, &state);
+            },
+        );
         let update = output.platform_output.accesskit_update.unwrap();
 
         assert!(update.nodes.iter().any(|(_, node)| {
@@ -943,9 +1141,18 @@ mod tests {
             ..OverlayViewState::default()
         };
 
-        let output = context.run(egui::RawInput::default(), |context| {
-            render_overlay(context, &state);
-        });
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                render_overlay(context, &state);
+            },
+        );
         let update = output.platform_output.accesskit_update.unwrap();
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live() == Some(egui::accesskit::Live::Polite)
@@ -957,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_meter_bars_meet_three_to_one_non_text_contrast() {
+    fn glass_overlay_tokens_meet_contrast_requirements_in_both_themes() {
         fn linear(channel: u8) -> f32 {
             let value = f32::from(channel) / 255.0;
             if value <= 0.04045 {
@@ -969,9 +1176,41 @@ mod tests {
         fn luminance(color: Color32) -> f32 {
             0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
         }
-        let foreground = luminance(Color32::from_rgb(100, 112, 132));
-        let background = luminance(Color32::from_rgb(20, 25, 34));
-
-        assert!((foreground + 0.05) / (background + 0.05) >= 3.0);
+        fn composite_over(foreground: Color32, background: Color32) -> Color32 {
+            let remaining_alpha = u16::from(255 - foreground.a());
+            Color32::from_rgb(
+                ((u16::from(foreground.r()) * u16::from(foreground.a())
+                    + u16::from(background.r()) * remaining_alpha)
+                    / 255) as u8,
+                ((u16::from(foreground.g()) * u16::from(foreground.a())
+                    + u16::from(background.g()) * remaining_alpha)
+                    / 255) as u8,
+                ((u16::from(foreground.b()) * u16::from(foreground.a())
+                    + u16::from(background.b()) * remaining_alpha)
+                    / 255) as u8,
+            )
+        }
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let context = egui::Context::default();
+            context.set_visuals(visuals);
+            let colors = overlay_colors(&context);
+            for background in [Color32::BLACK, Color32::WHITE] {
+                let surface = composite_over(colors.surface, background);
+                let contrast = |foreground: Color32| {
+                    let foreground = luminance(foreground);
+                    let background = luminance(surface);
+                    let (light, dark) = if foreground >= background {
+                        (foreground, background)
+                    } else {
+                        (background, foreground)
+                    };
+                    (light + 0.05) / (dark + 0.05)
+                };
+                assert!(contrast(colors.text) >= 4.5);
+                assert!(contrast(colors.muted_text) >= 4.5);
+                assert!(contrast(colors.tentative_text) >= 4.5);
+                assert!(contrast(colors.meter_inactive) >= 3.0);
+            }
+        }
     }
 }
