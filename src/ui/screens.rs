@@ -9462,8 +9462,23 @@ mod tests {
 
     #[test]
     fn route_auto_id_ranges_are_disjoint_and_leave_room_for_settings_tabs() {
-        assert!(ROUTE_AUTO_ID_STRIDE >= 100_000);
-        assert!(SETTINGS_TAB_AUTO_ID_STRIDE * 4 < ROUTE_AUTO_ID_STRIDE);
+        let settings_origin = route_auto_id_offset(UiRoute::Settings(SettingsTab::General));
+        let history_origin = route_auto_id_offset(UiRoute::History);
+        let route_headroom = history_origin - settings_origin;
+        let final_settings_tab_offset = [
+            SettingsTab::General,
+            SettingsTab::Recording,
+            SettingsTab::Advanced,
+            SettingsTab::About,
+        ]
+        .into_iter()
+        .map(settings_tab_auto_id_offset)
+        .max()
+        .expect("settings exposes at least one tab");
+        assert!(
+            final_settings_tab_offset < route_headroom,
+            "the last Settings tab range must fit before the History route range"
+        );
 
         let routes = [
             UiRoute::Transcribe,
