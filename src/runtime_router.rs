@@ -315,6 +315,7 @@ pub(crate) trait OnnxSupervisorControl: Send + Sync {
     fn unload(&self) -> anyhow::Result<()>;
     fn cancel_active(&self) -> anyhow::Result<()>;
     fn abandon_stream(&self, session_id: u64);
+    fn terminate_current(&self) -> anyhow::Result<()>;
 }
 
 impl OnnxSupervisorControl for OnnxWorkerSupervisor {
@@ -366,6 +367,10 @@ impl OnnxSupervisorControl for OnnxWorkerSupervisor {
 
     fn abandon_stream(&self, session_id: u64) {
         OnnxWorkerSupervisor::abandon_stream(self, session_id)
+    }
+
+    fn terminate_current(&self) -> anyhow::Result<()> {
+        OnnxWorkerSupervisor::terminate_current(self)
     }
 }
 
@@ -857,8 +862,11 @@ impl RuntimeRouter {
             runtime.load_model(model, preference)
         };
         if let Err(error) = loaded {
-            state.discard_onnx_runtime(&self.onnx_cancellation, &self.runtime_activity);
-            return Err(error);
+            return Err(state.fail_onnx_runtime(
+                &self.onnx_cancellation,
+                &self.runtime_activity,
+                error,
+            ));
         }
         state
             .heavy_ownership
@@ -872,10 +880,11 @@ impl RuntimeRouter {
         );
         match started {
             Ok(stream) => Ok(stream),
-            Err(error) => {
-                state.discard_onnx_runtime(&self.onnx_cancellation, &self.runtime_activity);
-                Err(RuntimeError::Engine(format!("{error:#}")))
-            }
+            Err(error) => Err(state.fail_onnx_runtime(
+                &self.onnx_cancellation,
+                &self.runtime_activity,
+                RuntimeError::Engine(format!("{error:#}")),
+            )),
         }
     }
 
@@ -996,6 +1005,27 @@ impl RouterState {
         }
         self.heavy_ownership.clear(HeavyRuntimeOwner::OnnxSpeech);
         runtime_activity.force_release_streams();
+    }
+
+    fn fail_onnx_runtime(
+        &mut self,
+        cancellation: &Arc<Mutex<Option<Arc<dyn OnnxSupervisorControl>>>>,
+        runtime_activity: &RuntimeActivity,
+        failure: RuntimeError,
+    ) -> RuntimeError {
+        if let Some(runtime) = self.onnx.as_ref()
+            && let Err(termination_error) = runtime.supervisor.terminate_current()
+        {
+            // A failed termination is still a potential heavy native owner.
+            // Preserve that ownership so a later GGUF request must pass
+            // through unload instead of beginning a second heavy load.
+            self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+            return RuntimeError::Engine(format!(
+                "{failure}; failed to retire the ONNX worker after the error: {termination_error:#}"
+            ));
+        }
+        self.discard_onnx_runtime(cancellation, runtime_activity);
+        failure
     }
 
     fn discard_embedded_runtime(&mut self, cancellation: &Arc<Mutex<Option<CancelToken>>>) {
@@ -1123,8 +1153,7 @@ impl RouterState {
         {
             Ok(loaded) => loaded,
             Err(error) => {
-                self.discard_onnx_runtime(&cancellation, &runtime_activity);
-                return Err(error);
+                return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
             }
         };
         self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
@@ -1177,8 +1206,7 @@ impl RouterState {
         let (warm_reused, resolved_acceleration) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
-                self.discard_onnx_runtime(&cancellation, &runtime_activity);
-                return Err(error);
+                return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
             }
         };
         self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
@@ -1198,8 +1226,11 @@ impl RouterState {
         let transcript = match transcript {
             Ok(transcript) => transcript,
             Err(error) => {
-                self.discard_onnx_runtime(&cancellation, &runtime_activity);
-                return Err(RuntimeError::Engine(format!("{error:#}")));
+                return Err(self.fail_onnx_runtime(
+                    &cancellation,
+                    &runtime_activity,
+                    RuntimeError::Engine(format!("{error:#}")),
+                ));
             }
         };
         Ok(RuntimeExecution {
@@ -1233,8 +1264,7 @@ impl RouterState {
             runtime.load_model(model, preference)
         };
         if let Err(error) = loaded {
-            self.discard_onnx_runtime(&cancellation, &runtime_activity);
-            return Err(error);
+            return Err(self.fail_onnx_runtime(&cancellation, &runtime_activity, error));
         }
         self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
         let health = SpeechEngine::health_check(
@@ -1244,10 +1274,11 @@ impl RouterState {
         );
         match health {
             Ok(()) => Ok(()),
-            Err(error) => {
-                self.discard_onnx_runtime(&cancellation, &runtime_activity);
-                Err(RuntimeError::Engine(format!("{error:#}")))
-            }
+            Err(error) => Err(self.fail_onnx_runtime(
+                &cancellation,
+                &runtime_activity,
+                RuntimeError::Engine(format!("{error:#}")),
+            )),
         }
     }
 
@@ -2512,6 +2543,10 @@ mod tests {
         }
 
         fn abandon_stream(&self, _session_id: u64) {}
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -2634,6 +2669,11 @@ mod tests {
             if state.active_session == Some(session_id) {
                 state.active_session = None;
             }
+        }
+
+        fn terminate_current(&self) -> anyhow::Result<()> {
+            self.state.lock().unwrap().active_session = None;
+            Ok(())
         }
     }
 
