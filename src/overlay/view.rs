@@ -1,6 +1,7 @@
 use std::{cell::Cell, time::Duration};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, ViewportClass};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::controller::{
     OverlayMode, OverlayPhase, OverlayPresentation, OverlayRecovery, OverlayViewState,
@@ -29,7 +30,7 @@ const CAPSULE_SHADOW_BLUR: f32 = 6.0;
 const CAPSULE_SHADOW_OFFSET_Y: f32 = 2.0;
 const COMPACT_METER_WIDTH: f32 = 38.0;
 const LIVE_WAVEFORM_SIZE: f32 = 30.0;
-const MAX_PREVIEW_CHARS: usize = 512;
+const MAX_PREVIEW_GRAPHEMES: usize = 512;
 const LIVE_PREVIEW_ROWS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,8 +153,9 @@ fn control_window_bounds(
 ) -> OverlayWindowBounds {
     let scale = display.width as f32 / display_spec.width_points;
     let size = (CONTROL_SIZE * scale).round() as i32;
+    let horizontal_inset = (CAPSULE_HORIZONTAL_INSET * scale).round() as i32;
     OverlayWindowBounds {
-        x: display.x + display.width - size,
+        x: display.x + display.width - horizontal_inset - size,
         y: display.y + (display.height - size) / 2,
         width: size,
         height: size,
@@ -225,6 +227,7 @@ fn render_cancel_control(context: &egui::Context) -> bool {
 struct OverlayColors {
     surface: Color32,
     border: Color32,
+    inner_highlight: Color32,
     text: Color32,
     muted_text: Color32,
     tentative_text: Color32,
@@ -240,8 +243,11 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
     let palette = theme_palette(context);
     if context.style().visuals.dark_mode {
         OverlayColors {
-            surface: Color32::from_rgba_unmultiplied(24, 29, 38, 230),
+            // This tint is app-owned and deterministic; the optional DWM
+            // backdrop only contributes the frosted background behind it.
+            surface: Color32::from_rgba_unmultiplied(25, 31, 42, 218),
             border: Color32::from_rgba_unmultiplied(220, 229, 242, 76),
+            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 42),
             text: palette.text,
             muted_text: Color32::from_rgb(202, 211, 224),
             tentative_text: Color32::from_rgb(166, 180, 202),
@@ -254,11 +260,12 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
         }
     } else {
         OverlayColors {
-            surface: Color32::from_rgba_unmultiplied(247, 249, 252, 238),
+            surface: Color32::from_rgba_unmultiplied(248, 250, 253, 228),
             border: Color32::from_rgba_unmultiplied(35, 47, 66, 64),
+            inner_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 156),
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
-            tentative_text: Color32::from_rgb(82, 96, 116),
+            tentative_text: Color32::from_rgb(72, 84, 102),
             waveform: palette.accent,
             meter_active: palette.success_text,
             meter_inactive: Color32::from_rgb(100, 112, 132),
@@ -341,7 +348,7 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                     .show(ui, |ui| {
                         let available = ui.available_size();
                         let content_size = egui::vec2(
-                            (available.x - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
+                            (available.x - reserved_control_width()).max(1.0),
                             available.y,
                         );
                         ui.allocate_ui_with_layout(
@@ -359,11 +366,35 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                         );
                     });
             });
+            // The frosted surface must be painted before this subtle top edge;
+            // otherwise the frame fill would cover the highlight entirely.
+            paint_capsule_inner_highlight(ui, capsule_rect, rounding, colors.inner_highlight);
         });
 }
 
 fn painted_capsule_bounds(viewport: egui::Rect) -> egui::Rect {
     viewport.shrink2(egui::vec2(CAPSULE_HORIZONTAL_INSET, CAPSULE_VERTICAL_INSET))
+}
+
+fn reserved_control_width() -> f32 {
+    CONTROL_SIZE + CONTROL_CONTENT_GAP + CAPSULE_HORIZONTAL_INSET
+}
+
+fn paint_capsule_inner_highlight(
+    ui: &egui::Ui,
+    capsule: egui::Rect,
+    rounding: f32,
+    color: Color32,
+) {
+    let horizontal_inset = (rounding * 0.45).min(capsule.width() / 4.0);
+    let y = capsule.top() + 1.5;
+    ui.painter().line_segment(
+        [
+            egui::pos2(capsule.left() + horizontal_inset, y),
+            egui::pos2(capsule.right() - horizontal_inset, y),
+        ],
+        Stroke::new(1.0, color),
+    );
 }
 
 fn render_compact_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: OverlayColors) {
@@ -467,6 +498,11 @@ fn render_waveform_meter(ui: &mut egui::Ui, state: &OverlayViewState, colors: Ov
         });
     });
     let waveform = waveform_color(level, colors);
+    ui.painter().circle_filled(
+        rect.center(),
+        waveform_halo_radius(level),
+        waveform_halo_color(level, colors),
+    );
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -481,7 +517,20 @@ fn waveform_color(level: f32, colors: OverlayColors) -> Color32 {
         colors.waveform.r(),
         colors.waveform.g(),
         colors.waveform.b(),
-        (96.0 + level * 159.0).round() as u8,
+        (112.0 + level * 143.0).round() as u8,
+    )
+}
+
+fn waveform_halo_radius(level: f32) -> f32 {
+    2.5 + level.clamp(0.0, 1.0) * 3.5
+}
+
+fn waveform_halo_color(level: f32, colors: OverlayColors) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        colors.waveform.r(),
+        colors.waveform.g(),
+        colors.waveform.b(),
+        (16.0 + level.clamp(0.0, 1.0) * 48.0).round() as u8,
     )
 }
 
@@ -597,9 +646,9 @@ fn transcript_layout_for_rows(
     colors: OverlayColors,
 ) -> egui::text::LayoutJob {
     let full = transcript_layout(committed, tentative, max_width, colors);
-    let total_chars = full.text.chars().count();
+    let total_graphemes = full.text.graphemes(true).count();
     let mut low = 0;
-    let mut high = total_chars.min(MAX_PREVIEW_CHARS);
+    let mut high = total_graphemes.min(MAX_PREVIEW_GRAPHEMES);
     let mut best = tail_layout_job(&full, 0);
     while low <= high {
         let keep = low + (high - low) / 2;
@@ -679,15 +728,15 @@ fn head_layout_job(full: &egui::text::LayoutJob, keep_chars: usize) -> egui::tex
     result
 }
 
-fn tail_layout_job(full: &egui::text::LayoutJob, keep_chars: usize) -> egui::text::LayoutJob {
-    let total_chars = full.text.chars().count();
-    if keep_chars >= total_chars {
+fn tail_layout_job(full: &egui::text::LayoutJob, keep_graphemes: usize) -> egui::text::LayoutJob {
+    let total_graphemes = full.text.graphemes(true).count();
+    if keep_graphemes >= total_graphemes {
         return full.clone();
     }
     let start = full
         .text
-        .char_indices()
-        .nth(total_chars.saturating_sub(keep_chars))
+        .grapheme_indices(true)
+        .nth(total_graphemes.saturating_sub(keep_graphemes))
         .map_or(full.text.len(), |(index, _)| index);
     let mut result = full.clone();
     result.text.clear();
@@ -772,7 +821,7 @@ fn phase_color(phase: OverlayPhase) -> Color32 {
 
 fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
-    format!("{}:{:02}", seconds / 60, seconds % 60)
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 #[cfg(test)]
@@ -863,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn control_bounds_cover_the_display_right_edge() {
+    fn control_bounds_are_inset_from_the_display_right_edge() {
         let control = control_window_bounds(
             OverlayWindowBounds {
                 x: 100,
@@ -873,7 +922,7 @@ mod tests {
             },
             window_spec(OverlayMode::Minimal),
         );
-        assert_eq!(control.x + control.width, 420);
+        assert_eq!(control.x + control.width, 412);
         assert_eq!((control.width, control.height), (44, 44));
     }
 
@@ -904,15 +953,78 @@ mod tests {
             window_spec(OverlayMode::Live),
         );
         assert!(control.x >= capsule.left() as i32);
-        assert!(control.x + control.width / 2 <= capsule.right() as i32);
+        assert!(control.x + control.width <= capsule.right() as i32);
         assert!(control.y >= capsule.top() as i32);
         assert!(control.y + control.height <= capsule.bottom() as i32);
+    }
+
+    #[test]
+    fn cancel_hit_rect_stays_inside_the_painted_capsule_at_each_dpi() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let display = OverlayWindowBounds {
+                x: -240,
+                y: 80,
+                width: (LIVE_WIDTH * scale).round() as i32,
+                height: (LIVE_HEIGHT * scale).round() as i32,
+            };
+            let control = control_window_bounds(display, window_spec(OverlayMode::Live));
+            let horizontal_inset = (CAPSULE_HORIZONTAL_INSET * scale).round() as i32;
+            let vertical_inset = (CAPSULE_VERTICAL_INSET * scale).round() as i32;
+            let capsule = OverlayWindowBounds {
+                x: display.x + horizontal_inset,
+                y: display.y + vertical_inset,
+                width: display.width - horizontal_inset * 2,
+                height: display.height - vertical_inset * 2,
+            };
+
+            assert!(
+                control.x >= capsule.x && control.x + control.width <= capsule.x + capsule.width,
+                "control must remain inside the capsule horizontally at {scale}x: {control:?}, {capsule:?}"
+            );
+            assert!(
+                control.y >= capsule.y && control.y + control.height <= capsule.y + capsule.height,
+                "control must remain inside the capsule vertically at {scale}x: {control:?}, {capsule:?}"
+            );
+        }
     }
 
     #[test]
     fn waveform_opacity_tracks_microphone_activity() {
         let colors = overlay_colors(&egui::Context::default());
         assert!(waveform_color(1.0, colors).a() > waveform_color(0.0, colors).a());
+        assert!(waveform_halo_radius(1.0) > waveform_halo_radius(0.0));
+        assert!(waveform_halo_color(1.0, colors).a() > waveform_halo_color(0.0, colors).a());
+    }
+
+    #[test]
+    fn inner_highlight_is_painted_after_the_frosted_surface() {
+        let context = egui::Context::default();
+        let colors = overlay_colors(&context);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |context| render_overlay(context, &OverlayViewState::default()),
+        );
+        let highlight_index = output
+            .shapes
+            .iter()
+            .rposition(|shape| {
+                matches!(
+                    shape.shape,
+                    egui::epaint::Shape::LineSegment { stroke, .. }
+                        if stroke.color == colors.inner_highlight
+                )
+            })
+            .expect("overlay should paint its inner highlight");
+        assert!(
+            Some(highlight_index) == output.shapes.len().checked_sub(1),
+            "the inner highlight must be painted after the frosted surface and overlay content"
+        );
     }
 
     #[test]
@@ -940,10 +1052,10 @@ mod tests {
         };
         let output = context.run(input, |context| render_overlay(context, &state));
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-        let boundary = f64::from(LIVE_WIDTH - CONTROL_SIZE - CONTROL_CONTENT_GAP);
+        let boundary = f64::from(LIVE_WIDTH - reserved_control_width());
         for name in [
             "Microphone input level",
-            "0:05",
+            "00:05",
             "Committed transcript: committed text. Tentative transcript: tentative text",
         ] {
             let bounds = nodes
@@ -982,12 +1094,12 @@ mod tests {
 
         let output = context.run(input, |context| render_overlay(context, &state));
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-        let boundary = f64::from(MINIMAL_WIDTH - CONTROL_SIZE - CONTROL_CONTENT_GAP);
+        let boundary = f64::from(MINIMAL_WIDTH - reserved_control_width());
         let element_bounds = [
             "Recording indicator",
             "Scribe is recording",
             "Microphone input level",
-            "1:05",
+            "01:05",
         ]
         .map(|name| {
             let bounds = nodes
@@ -1018,11 +1130,12 @@ mod tests {
 
     #[test]
     fn elapsed_format_does_not_depend_on_wall_clock() {
-        assert_eq!(format_elapsed(Duration::from_secs(65)), "1:05");
+        assert_eq!(format_elapsed(Duration::from_secs(12)), "00:12");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
     }
 
     #[test]
-    fn preview_tail_is_unicode_safe_and_limited_to_two_rendered_rows() {
+    fn preview_tail_is_unicode_safe_and_limited_to_one_rendered_row() {
         let context = egui::Context::default();
         let mut result = None;
         let _ = context.run(egui::RawInput::default(), |context| {
@@ -1032,7 +1145,7 @@ mod tests {
                     "one two three four five six seven éééééé",
                     "tentative-unbroken-text-that-must-wrap",
                     72.0,
-                    2,
+                    LIVE_PREVIEW_ROWS,
                     overlay_colors(context),
                 );
                 let rows = ui.fonts(|fonts| fonts.layout_job(layout.clone()).rows.len());
@@ -1040,12 +1153,71 @@ mod tests {
             });
         });
         let (layout, rows) = result.unwrap();
-        assert!(rows <= 2);
+        assert!(rows <= LIVE_PREVIEW_ROWS);
         assert!(layout.text.is_char_boundary(layout.text.len()));
         assert!(
             layout.sections.len() >= 2,
             "styled tail should retain formatting"
         );
+    }
+
+    #[test]
+    fn one_row_preview_tail_starts_at_a_grapheme_boundary() {
+        let context = egui::Context::default();
+        let original = concat!(
+            "prefix prefix prefix prefix prefix prefix ",
+            "e\u{301} \u{6f22}\u{5b57} \u{1f1fa}\u{1f1f8} \u{1f44d}\u{1f3fd} \u{1f469}\u{200d}\u{1f4bb}"
+        );
+        let mut result = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                result = Some(transcript_layout_for_rows(
+                    ui,
+                    original,
+                    "",
+                    96.0,
+                    LIVE_PREVIEW_ROWS,
+                    overlay_colors(context),
+                ));
+            });
+        });
+        let layout = result.expect("preview layout should render");
+        let retained = layout.text.strip_prefix('\u{2026}').unwrap_or(&layout.text);
+        assert!(!retained.is_empty(), "one-row preview should retain text");
+        assert!(original.ends_with(retained));
+        assert!(
+            original
+                .grapheme_indices(true)
+                .any(|(index, _)| &original[index..] == retained),
+            "preview tail must start at a grapheme-cluster boundary: {retained:?}"
+        );
+    }
+
+    #[test]
+    fn tail_layout_never_splits_combining_or_emoji_graphemes() {
+        let colors = overlay_colors(&egui::Context::default());
+        for sample in [
+            "e\u{301}",
+            "\u{6f22}",
+            "\u{1f1fa}\u{1f1f8}",
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f469}\u{200d}\u{1f4bb}",
+        ] {
+            let original = format!("before {sample}");
+            let full = transcript_layout(&original, "", LIVE_WIDTH, colors);
+            for keep in 0..=original.graphemes(true).count() {
+                let tail = tail_layout_job(&full, keep);
+                let retained = tail.text.strip_prefix('\u{2026}').unwrap_or(&tail.text);
+                assert!(original.ends_with(retained));
+                assert!(
+                    retained.is_empty()
+                        || original
+                            .grapheme_indices(true)
+                            .any(|(index, _)| &original[index..] == retained),
+                    "{sample:?} was split at {keep} retained graphemes: {retained:?}"
+                );
+            }
+        }
     }
 
     #[test]
