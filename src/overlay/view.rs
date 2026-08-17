@@ -23,6 +23,8 @@ const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
 const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
+const COMPACT_METER_WIDTH: f32 = 38.0;
+const LIVE_METER_WIDTH: f32 = 74.0;
 const MAX_PREVIEW_CHARS: usize = 512;
 const MAX_PREVIEW_ROWS: usize = 2;
 
@@ -299,8 +301,16 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
 
 fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
     ui.horizontal(|ui| {
+        let compact = state.mode == OverlayMode::Minimal;
+        if compact {
+            ui.spacing_mut().item_spacing.x = 4.0;
+        }
         let status_color = phase_color(state.phase);
-        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+        let (dot_rect, dot_response) =
+            ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+        dot_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, "Recording indicator")
+        });
         ui.painter()
             .circle_filled(dot_rect.center(), 4.0, status_color);
 
@@ -309,22 +319,45 @@ fn render_status_row(ui: &mut egui::Ui, state: &OverlayViewState) {
         } else {
             state.phase.label()
         };
-        let status = ui.label(RichText::new(label).strong().color(Color32::WHITE));
+        let mut status_text = RichText::new(label).strong().color(Color32::WHITE);
+        if compact {
+            status_text = status_text.size(13.0);
+        }
+        let status = ui.label(status_text);
         mark_polite_live_region(ui.ctx(), status.id);
 
-        ui.add_space(6.0);
-        render_level_meter(ui, state);
+        if !compact {
+            ui.add_space(6.0);
+        }
+        render_level_meter(
+            ui,
+            state,
+            if compact {
+                COMPACT_METER_WIDTH
+            } else {
+                LIVE_METER_WIDTH
+            },
+        );
 
         if let Some(elapsed) = state.elapsed {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format_elapsed(elapsed)).color(Color32::LIGHT_GRAY));
+                let mut elapsed_text =
+                    RichText::new(format_elapsed(elapsed)).color(Color32::LIGHT_GRAY);
+                if compact {
+                    elapsed_text = elapsed_text.size(12.0).monospace();
+                }
+                ui.label(elapsed_text);
             });
         }
     });
 }
 
-fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(74.0, 24.0), Sense::hover());
+fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState, width: f32) {
+    let compact = width <= COMPACT_METER_WIDTH;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, if compact { 20.0 } else { 24.0 }),
+        Sense::hover(),
+    );
     let level = state.audio_level.rms.max(state.audio_level.peak * 0.7);
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::labeled(
@@ -334,8 +367,8 @@ fn render_level_meter(ui: &mut egui::Ui, state: &OverlayViewState) {
         info.value = Some((level * 100.0).round() as f64);
         info
     });
-    let bars = 7;
-    let gap = 3.0;
+    let bars = if compact { 4 } else { 7 };
+    let gap = if compact { 2.0 } else { 3.0 };
     let bar_width = (rect.width() - gap * (bars - 1) as f32) / bars as f32;
 
     for index in 0..bars {
@@ -739,6 +772,65 @@ mod tests {
             assert!(
                 bounds.x1 <= boundary,
                 "{name} overlaps control slot: {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_status_elements_fit_left_of_reserved_control_slot() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(MINIMAL_WIDTH, MINIMAL_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let state = OverlayViewState {
+            session_id: Some(SessionId(10)),
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Listening,
+            elapsed: Some(Duration::from_secs(65)),
+            audio_level: super::super::controller::OverlayAudioLevel {
+                rms: 0.5,
+                peak: 0.75,
+            },
+            ..Default::default()
+        };
+
+        let output = context.run(input, |context| render_overlay(context, &state));
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let boundary = f64::from(MINIMAL_WIDTH - CONTROL_SIZE - CONTROL_CONTENT_GAP);
+        let element_bounds = [
+            "Recording indicator",
+            "Scribe is recording",
+            "Microphone input level",
+            "1:05",
+        ]
+        .map(|name| {
+            let bounds = nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some(name)).then(|| node.bounds()).flatten())
+                .unwrap_or_else(|| panic!("missing compact overlay node {name}"));
+            assert!(
+                bounds.x1 <= boundary,
+                "{name} overlaps control slot: {bounds:?}"
+            );
+            assert!(
+                bounds.y0 >= 0.0 && bounds.y1 <= f64::from(MINIMAL_HEIGHT),
+                "{name} exceeds compact overlay height: {bounds:?}"
+            );
+            (name, bounds)
+        });
+        for adjacent in element_bounds.windows(2) {
+            assert!(
+                adjacent[0].1.x1 <= adjacent[1].1.x0,
+                "{} overlaps {}: {:?} and {:?}",
+                adjacent[0].0,
+                adjacent[1].0,
+                adjacent[0].1,
+                adjacent[1].1
             );
         }
     }

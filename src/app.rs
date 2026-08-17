@@ -4367,6 +4367,8 @@ impl LocalTranscriberApp {
         let Some(session_id) = session_id else {
             return;
         };
+        self.overlay_first_presented_at
+            .retain(|stored_session_id, _| *stored_session_id == session_id);
         let presented_at = *self
             .overlay_first_presented_at
             .entry(session_id)
@@ -4489,8 +4491,9 @@ impl LocalTranscriberApp {
             && previous_session_id != session_id
         {
             self.retire_captured_target(previous_session_id);
-            self.overlay_first_presented_at.remove(&previous_session_id);
         }
+        self.overlay_first_presented_at
+            .retain(|stored_session_id, _| *stored_session_id == session_id);
         if let Some(target) = target {
             self.captured_targets.insert(session_id, target);
         }
@@ -15101,6 +15104,27 @@ mod layout_tests {
             .unwrap();
         assert_eq!(merged.overlay_visible_at, Some(first));
         assert!(first >= activation);
+    }
+
+    #[test]
+    fn new_overlay_session_discards_hidden_session_presentation_timing() {
+        let mut app = test_app();
+        let first_session = SessionId(77);
+        let current_session = SessionId(78);
+        app.begin_overlay_session(first_session, NativeOverlayMode::Live, None);
+        app.record_overlay_presented(Some(first_session));
+        assert_eq!(app.overlay_first_presented_at.len(), 1);
+        assert!(app.overlay_controller.hide(first_session));
+
+        app.begin_overlay_session(current_session, NativeOverlayMode::Minimal, None);
+
+        assert!(app.overlay_first_presented_at.is_empty());
+        app.record_overlay_presented(Some(current_session));
+        assert_eq!(app.overlay_first_presented_at.len(), 1);
+        assert!(
+            app.overlay_first_presented_at
+                .contains_key(&current_session)
+        );
     }
 
     #[test]
