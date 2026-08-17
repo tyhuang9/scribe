@@ -194,6 +194,39 @@ final result: passed
 
 ---
 
+# Foreground-aware recording overlay QA - 2026-08-17
+
+## Source and implementation scope
+
+- Visual source of truth: `C:\Users\huang\.codex\attachments\1262dc67-8414-4589-960b-16e952d23970\image-1.png` (1142 x 137 source pixels).
+- Reviewed implementation head: `2640f64` (`Keep compact announcements in root viewport`).
+- Live target: a 600 x 62 logical-point bottom/top-center capsule with waveform, elapsed time, one divider, a one-line Unicode-grapheme-safe transcript/status tail, and a separately hardened 44 x 44 cancel viewport.
+- Compact target: a 320 x 52 logical-point status capsule without transcript preview.
+- The implementation reuses the checked-in Phosphor waveform icon, existing theme palette, serialized `Minimal`/`Live`/`Off` values, and existing overlay controller instead of introducing a parallel component or settings migration.
+
+## Verified design and behavior evidence
+
+- Deterministic geometry tests cover Live and Compact capsule/control containment at 100%, 125%, 150%, and 200% DPI.
+- The visual hierarchy matches the selected source order: waveform, timer, divider, one-line rolling text, cancel.
+- Light and dark theme tokens include a translucent painted surface, border, top highlight, contained shadow, and contrast checks against conservative black/white composited backgrounds. The experimental DWM system backdrop was removed because native capture did not prove a safe translucent result; the painted surface is the fail-soft production path.
+- The waveform base glyph remains contrast-safe while its decorative halo reflects actual microphone level and freezes when reduced motion is requested.
+- Unicode tests cover combining marks, CJK, flags, skin-tone modifiers, and ZWJ emoji at the production one-line limit.
+- Accessibility tests verify exact cancel naming, a contained 44 x 44 target, non-live tentative text, single-owner Compact/root announcements, and Live precedence of notice/error, committed transcript delta, then phase.
+- Foreground policy, stale-session rejection, pending/active abandonment, nonblocking worker drain, target retirement, and absence of final transcription/history/output are covered by automated tests.
+- Final Windows gate: `cargo fmt --all -- --check`, `git diff --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features -- --test-threads=1` all passed. The full suite ran 931 tests with exit code 0.
+
+## Native compositor blocker
+
+The debug-only fixture created the expected native windows and geometry for Live and Compact modes, and the Windows hardening styles were observed on the current process only. However, full-screen and `CAPTUREBLT` captures in the current Windows/NVIDIA session showed the patterned host but not either overlay child viewport. A temporary debug framebuffer probe then proved that both child OpenGL framebuffers contained the expected pixels before swap: the opaque 55 x 55 control readback contained 3025 opaque pixels and 2909 magenta pixels, while the 750 x 78 Live display readback contained the painted alpha distribution. This isolates the loss downstream of egui tessellation, in native child-surface swap/composition or the current graphics session.
+
+Framebuffer readback is diagnostic evidence, not proof of user-visible compositor output. The temporary A/B routes, readback instrumentation, logs, and invalid blank captures were removed and are not accepted implementation evidence. Consequently, no same-state combined source/implementation comparison can be produced, and visual fidelity must not be marked passed.
+
+Before release, repeat native Windows capture after a graphics-session/driver reset and verify the actual compositor output for Live/Compact, light/dark, top/bottom, mixed-DPI placement, taskbar/Alt+Tab exclusion, body pass-through, nonactivating X input, keyboard-focus preservation, Narrator/NVDA announcements, and real microphone metering. Draft PR #42 remains blocked on that physical release gate.
+
+final result: blocked
+
+---
+
 ## Accordion width follow-up — 2026-08-13
 
 - Source truth: the user-directed requirement that expanding a model must not change the card's horizontal bounds, applied to the three model-card references listed above.
