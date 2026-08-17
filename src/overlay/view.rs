@@ -75,7 +75,7 @@ pub fn show_overlay_viewport(
     }
     let action = Cell::new(None);
     let control_visible = presented && is_cancellable(state);
-    let control_bounds = bounds.map(control_window_bounds);
+    let control_bounds = bounds.map(|display| control_window_bounds(display, spec));
     let control_hardened = control_bounds.is_some_and(|bounds| {
         harden_overlay_window_at(
             OVERLAY_CONTROL_WINDOW_TITLE,
@@ -136,8 +136,11 @@ fn is_cancellable(state: &OverlayViewState) -> bool {
         )
 }
 
-fn control_window_bounds(display: OverlayWindowBounds) -> OverlayWindowBounds {
-    let scale = display.width as f32 / window_spec(OverlayMode::Minimal).width_points;
+fn control_window_bounds(
+    display: OverlayWindowBounds,
+    display_spec: OverlayWindowSpec,
+) -> OverlayWindowBounds {
+    let scale = display.width as f32 / display_spec.width_points;
     let size = (CONTROL_SIZE * scale).round() as i32;
     OverlayWindowBounds {
         x: display.x + display.width - size,
@@ -513,12 +516,15 @@ mod tests {
 
     #[test]
     fn control_bounds_cover_the_display_right_edge() {
-        let control = control_window_bounds(OverlayWindowBounds {
-            x: 100,
-            y: 20,
-            width: 320,
-            height: 52,
-        });
+        let control = control_window_bounds(
+            OverlayWindowBounds {
+                x: 100,
+                y: 20,
+                width: 320,
+                height: 52,
+            },
+            window_spec(OverlayMode::Minimal),
+        );
         assert_eq!(control.x + control.width, 420);
         assert_eq!((control.width, control.height), (44, 44));
     }
