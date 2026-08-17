@@ -13,4 +13,4 @@ pub use platform::{
     CapturedTarget, OverlayPosition, capture_foreground_target,
     captured_target_application_identity, overlay_focus_safety_available, reduced_motion_preferred,
 };
-pub use view::{OverlayAction, OverlayViewportOutput, show_overlay_viewport};
+pub use view::{OverlayAction, show_overlay_viewport};
