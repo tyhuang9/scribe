@@ -11,7 +11,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -1830,12 +1829,13 @@ fn offline_recognizer_config(model: &OnnxModelSpec) -> Result<OfflineRecognizerC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prepared_audio::PreparedAudio;
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver as TestReceiver, Sender as TestSender, channel};
     use std::thread::JoinHandle;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     enum PipeChunk {
         Bytes(Vec<u8>),
@@ -2434,6 +2434,177 @@ mod tests {
             ),
             other => panic!("expected worker error, got {other:?}"),
         }
+    }
+
+    fn required_fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(std::env::var(name).unwrap_or_else(|_| {
+            panic!("set {name} to the reviewed local fixture before running this ignored test")
+        }))
+    }
+
+    fn fixture_audio() -> PreparedAudio {
+        PreparedAudio::from_wav_path(required_fixture_path("SCRIBE_ONNX_AUDIO"))
+            .expect("SCRIBE_ONNX_AUDIO must name a readable speech WAV fixture")
+    }
+
+    fn moonshine_fixture_spec() -> OnnxModelSpec {
+        let root = required_fixture_path("SCRIBE_ONNX_MOONSHINE_ROOT");
+        OnnxModelSpec {
+            id: "moonshine-tiny-en-local-fixture".to_owned(),
+            root,
+            family: OnnxModelFamily::Moonshine,
+            files: BTreeMap::from([
+                (OnnxFileRole::Encoder, PathBuf::from("encoder_model.ort")),
+                (
+                    OnnxFileRole::MergedDecoder,
+                    PathBuf::from("decoder_model_merged.ort"),
+                ),
+                (OnnxFileRole::Tokens, PathBuf::from("tokens.txt")),
+            ]),
+            num_threads: 1,
+        }
+    }
+
+    fn zipformer_fixture_spec() -> OnnxModelSpec {
+        let root = required_fixture_path("SCRIBE_ONNX_ZIPFORMER_ROOT");
+        OnnxModelSpec {
+            id: "zipformer-en-20m-local-fixture".to_owned(),
+            root,
+            family: OnnxModelFamily::OnlineTransducer,
+            files: BTreeMap::from([
+                (
+                    OnnxFileRole::Encoder,
+                    PathBuf::from("encoder-epoch-99-avg-1.int8.onnx"),
+                ),
+                (
+                    OnnxFileRole::Decoder,
+                    PathBuf::from("decoder-epoch-99-avg-1.int8.onnx"),
+                ),
+                (
+                    OnnxFileRole::Joiner,
+                    PathBuf::from("joiner-epoch-99-avg-1.int8.onnx"),
+                ),
+                (OnnxFileRole::Tokens, PathBuf::from("tokens.txt")),
+            ]),
+            num_threads: 1,
+        }
+    }
+
+    fn run_native_worker(input: Vec<u8>) -> Vec<(u64, u64, Control)> {
+        let mut output = Vec::new();
+        worker_loop(Cursor::new(input), &mut output).unwrap();
+        let mut output = Cursor::new(output);
+        let mut responses = Vec::new();
+        while output.position() < output.get_ref().len() as u64 {
+            responses.push(parse_worker_control(read_frame(&mut output).unwrap()).unwrap());
+        }
+        responses
+    }
+
+    #[test]
+    #[ignore = "requires SCRIBE_ONNX_MOONSHINE_ROOT and SCRIBE_ONNX_AUDIO; local fixtures only, never downloads"]
+    fn native_moonshine_offline_fixture_uses_the_typed_bundle_contract() {
+        let model = moonshine_fixture_spec();
+        model.validate().unwrap();
+        let audio = fixture_audio();
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 0, 2, Control::Health);
+        append_control(&mut input, 1, 3, Control::Load { model });
+        append_control(&mut input, 1, 4, Control::Transcribe);
+        append_pcm(&mut input, 1, 4, &audio.samples);
+        append_control(&mut input, 0, 5, Control::Shutdown);
+
+        let responses = run_native_worker(input);
+        assert!(matches!(responses[0].2, Control::Ready));
+        assert!(matches!(responses[1].2, Control::Ok));
+        assert!(matches!(responses[2].2, Control::Ok));
+        assert!(matches!(
+            responses[3].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        assert!(matches!(responses[4].2, Control::Ok));
+    }
+
+    #[test]
+    #[ignore = "requires SCRIBE_ONNX_ZIPFORMER_ROOT and SCRIBE_ONNX_AUDIO; local fixtures only, never downloads"]
+    fn native_zipformer_fixture_uses_true_online_streaming() {
+        let model = zipformer_fixture_spec();
+        model.validate().unwrap();
+        let audio = fixture_audio();
+        let midpoint = audio.samples.len() / 2;
+        assert!(midpoint > 0, "fixture must contain at least two samples");
+        let mut input = Vec::new();
+        append_control(&mut input, 0, 1, Control::Hello);
+        append_control(&mut input, 2, 2, Control::Load { model });
+        append_control(&mut input, 8, 3, Control::StartStream);
+        append_control(&mut input, 8, 4, Control::AudioChunk);
+        append_pcm(&mut input, 8, 4, &audio.samples[..midpoint]);
+        append_control(&mut input, 8, 5, Control::AudioChunk);
+        append_pcm(&mut input, 8, 5, &audio.samples[midpoint..]);
+        append_control(&mut input, 8, 6, Control::EndStream);
+        append_control(&mut input, 0, 7, Control::Shutdown);
+
+        let responses = run_native_worker(input);
+        assert!(matches!(responses[0].2, Control::Ready));
+        assert!(matches!(responses[1].2, Control::Ok));
+        assert!(matches!(responses[2].2, Control::Ok));
+        assert!(matches!(
+            responses[3].2,
+            Control::Text {
+                final_result: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            responses[4].2,
+            Control::Text {
+                final_result: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            responses[5].2,
+            Control::Text {
+                final_result: true,
+                ..
+            }
+        ));
+        assert!(matches!(responses[6].2, Control::Ok));
+    }
+
+    #[test]
+    #[ignore = "requires SCRIBE_ONNX_WORKER_EXE to name a built Scribe executable; runs the hidden worker protocol without downloading"]
+    fn hidden_worker_manual_protocol_smoke() {
+        let executable = required_fixture_path("SCRIBE_ONNX_WORKER_EXE");
+        let mut child = Command::new(executable)
+            .arg("--onnx-worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn hidden ONNX worker executable");
+        let mut input = child.stdin.take().expect("worker stdin");
+        let mut output = child.stdout.take().expect("worker stdout");
+        for (request_id, control, expected) in [
+            (1, Control::Hello, "ready"),
+            (2, Control::Health, "ok"),
+            (3, Control::Shutdown, "ok"),
+        ] {
+            write_frame(&mut input, &control_frame(0, request_id, &control).unwrap()).unwrap();
+            let (_, received_request, response) =
+                parse_worker_control(read_frame(&mut output).unwrap()).unwrap();
+            assert_eq!(received_request, request_id);
+            match expected {
+                "ready" => assert!(matches!(response, Control::Ready)),
+                "ok" => assert!(matches!(response, Control::Ok)),
+                _ => unreachable!(),
+            }
+        }
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

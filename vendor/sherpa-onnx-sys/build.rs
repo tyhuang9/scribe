@@ -1,5 +1,4 @@
 use std::env;
-use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
@@ -7,9 +6,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, ffi::OsString};
 
-use bzip2::read::BzDecoder;
-use sha2::{Digest, Sha256};
-use tar::Archive;
+#[path = "src/archive_verifier.rs"]
+mod archive_verifier;
+use archive_verifier::{
+    reviewed_static_archive_integrity, static_archive_name, unpack_archive_safely, verify_archive,
+    DynError,
+};
 
 const RELEASE_BASE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download";
 const SHERPA_ONNX_STATIC_LIBS: &[&str] = &[
@@ -28,45 +30,6 @@ const SHERPA_ONNX_STATIC_LIBS: &[&str] = &[
     "ssentencepiece_core",
 ];
 
-type DynError = Box<dyn Error>;
-
-/// Immutable release metadata reviewed by Scribe. Do not accept an archive
-/// merely because its name resembles a sherpa-onnx release asset.
-#[derive(Clone, Copy)]
-struct ArchiveIntegrity {
-    name: &'static str,
-    size: u64,
-    sha256: &'static str,
-}
-
-const STATIC_ARCHIVES: &[ArchiveIntegrity] = &[
-    ArchiveIntegrity {
-        name: "sherpa-onnx-v1.13.5-win-x64-static-MT-Release-lib.tar.bz2",
-        size: 120_217_991,
-        sha256: "b7080b6f470bac96ef0afe56b25ae9b2f9f0ca82d10dad19bf3a2fc5ffd6cffc",
-    },
-    ArchiveIntegrity {
-        name: "sherpa-onnx-v1.13.5-linux-x64-static-lib.tar.bz2",
-        size: 22_394_054,
-        sha256: "2ade8b7c62de66b9cf2e32bd7dbe077addaa4b18f422b49dc1bf3a1a0b1f762e",
-    },
-    ArchiveIntegrity {
-        name: "sherpa-onnx-v1.13.5-linux-aarch64-static-lib.tar.bz2",
-        size: 20_775_501,
-        sha256: "f78af8260892f3060c8c0aba9ae93e4e4c1b16fe509238b88e3688889235e1b2",
-    },
-    ArchiveIntegrity {
-        name: "sherpa-onnx-v1.13.5-osx-x64-static-lib.tar.bz2",
-        size: 19_623_101,
-        sha256: "689f8167a52dc4dbaf05369705e26c8f203c748a8c342750fdfdcd8ca6bb8699",
-    },
-    ArchiveIntegrity {
-        name: "sherpa-onnx-v1.13.5-osx-arm64-static-lib.tar.bz2",
-        size: 19_862_746,
-        sha256: "339c8fc19bb4b26e118c80792bbc4546eb263040fac36ef0cc027ec29c756b44",
-    },
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinkMode {
     Static,
@@ -82,6 +45,7 @@ fn main() {
 fn try_main() -> Result<(), DynError> {
     println!("cargo:rerun-if-env-changed=SHERPA_ONNX_LIB_DIR");
     println!("cargo:rerun-if-env-changed=SHERPA_ONNX_ARCHIVE_DIR");
+    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
 
     if env::var_os("DOCS_RS").is_some() {
@@ -97,8 +61,7 @@ fn try_main() -> Result<(), DynError> {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-    if link_mode == LinkMode::Shared
-        && matches!(target_os.as_str(), "linux" | "macos" | "android")
+    if link_mode == LinkMode::Shared && matches!(target_os.as_str(), "linux" | "macos" | "android")
     {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
         emit_relative_rpath(&target_os);
@@ -158,7 +121,7 @@ fn download_prebuilt_libs(
     target_arch: &str,
 ) -> Result<PathBuf, DynError> {
     let archive_name = archive_name(link_mode, target_os, target_arch)?;
-    let integrity = static_archive_integrity(link_mode, &archive_name)?;
+    let integrity = reviewed_static_archive_integrity(&archive_name)?;
     let archive_stem = archive_name.trim_end_matches(".tar.bz2");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -192,7 +155,7 @@ fn download_prebuilt_libs(
 
             verify_archive(&local_archive_path, integrity)?;
             copy_file_atomically(&local_archive_path, &archive_path)?;
-        } else {
+        } else if allow_debug_network_download() {
             let version = env!("CARGO_PKG_VERSION");
             let url = format!("{RELEASE_BASE_URL}/v{version}/{archive_name}");
             eprintln!("Downloading sherpa-onnx libs from {url}");
@@ -205,6 +168,11 @@ fn download_prebuilt_libs(
                 .map_err(|e| format!("Failed to download sherpa-onnx archive from {url}: {e}"))?;
             let mut reader = response.into_reader();
             write_reader_atomically(&mut reader, &archive_path)?;
+        } else {
+            return Err(format!(
+                "sherpa-onnx archive {archive_name} is not cached; set SHERPA_ONNX_ARCHIVE_DIR to a reviewed local archive. Release builds never download native archives (debug-only downloads require SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD=1)."
+            )
+            .into());
         }
     }
 
@@ -232,11 +200,12 @@ fn download_prebuilt_libs(
 
     if !lib_dir.is_dir() {
         // Android archives use jniLibs/{abi}/ instead of lib/.
-        let android_lib_dir = extracted_dir
-            .join("jniLibs")
-            .join(android_abi(target_arch));
+        let android_lib_dir = extracted_dir.join("jniLibs").join(android_abi(target_arch));
         if android_lib_dir.is_dir() {
-            eprintln!("Downloaded sherpa-onnx Android libs to {}", android_lib_dir.display());
+            eprintln!(
+                "Downloaded sherpa-onnx Android libs to {}",
+                android_lib_dir.display()
+            );
             return Ok(android_lib_dir);
         }
         return Err(format!(
@@ -251,126 +220,9 @@ fn download_prebuilt_libs(
     Ok(lib_dir)
 }
 
-fn static_archive_integrity(
-    link_mode: LinkMode,
-    archive_name: &str,
-) -> Result<&'static ArchiveIntegrity, DynError> {
-    if link_mode != LinkMode::Static {
-        return Err("Scribe requires sherpa-onnx static linking; shared archives are not admitted".into());
-    }
-    STATIC_ARCHIVES
-        .iter()
-        .find(|candidate| candidate.name == archive_name)
-        .ok_or_else(|| format!("No reviewed SHA-256 metadata for sherpa-onnx archive {archive_name}").into())
-}
-
-fn verify_archive(path: &Path, integrity: &ArchiveIntegrity) -> Result<(), DynError> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() != integrity.size {
-        return Err(format!(
-            "sherpa-onnx archive size mismatch for {}: expected {}, got {}",
-            path.display(), integrity.size, metadata.len()
-        ).into());
-    }
-
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = io::Read::read(&mut file, &mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != integrity.sha256 {
-        return Err(format!(
-            "sherpa-onnx archive SHA-256 mismatch for {}: expected {}, got {}",
-            path.display(), integrity.sha256, actual
-        ).into());
-    }
-    Ok(())
-}
-
-fn unpack_archive_safely(
-    archive_path: &Path,
-    destination: &Path,
-    expected_root: &str,
-) -> Result<(), DynError> {
-    let tar_file = File::open(archive_path)?;
-    let decoder = BzDecoder::new(tar_file);
-    let mut archive = Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.into_owned();
-        let mut components = entry_path.components();
-        let Some(first) = components.next() else {
-            return Err("sherpa-onnx archive contains an empty path".into());
-        };
-        if first.as_os_str() != expected_root {
-            return Err(format!(
-                "sherpa-onnx archive entry is outside expected root {expected_root}: {}",
-                entry_path.display()
-            ).into());
-        }
-        if components.clone().next().is_none() && !entry.header().entry_type().is_dir() {
-            return Err(format!("invalid sherpa-onnx archive root entry: {}", entry_path.display()).into());
-        }
-        if entry_path.is_absolute()
-            || entry_path.components().any(|component| !matches!(component, std::path::Component::Normal(_)))
-            || entry.header().entry_type().is_symlink()
-            || entry.header().entry_type().is_hard_link()
-        {
-            return Err(format!("unsafe sherpa-onnx archive entry: {}", entry_path.display()).into());
-        }
-        if !entry.unpack_in(destination)? {
-            return Err(format!("sherpa-onnx archive entry escaped destination: {}", entry_path.display()).into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod verifier_tests {
-    use super::*;
-
-    #[test]
-    fn every_supported_static_target_has_reviewed_metadata() {
-        for (os, arch) in [
-            ("windows", "x86_64"),
-            ("linux", "x86_64"),
-            ("linux", "aarch64"),
-            ("macos", "x86_64"),
-            ("macos", "aarch64"),
-        ] {
-            let name = archive_name(LinkMode::Static, os, arch).unwrap();
-            let integrity = static_archive_integrity(LinkMode::Static, &name).unwrap();
-            assert_eq!(integrity.name, name);
-            assert_eq!(integrity.sha256.len(), 64);
-            assert!(integrity.size > 1_000_000);
-        }
-    }
-
-    #[test]
-    fn verifier_rejects_wrong_size_and_hash() {
-        let path = std::env::temp_dir().join(format!("scribe-sherpa-archive-{}", std::process::id()));
-        fs::write(&path, b"abc").unwrap();
-        let wrong_size = ArchiveIntegrity { name: "test", size: 4, sha256: "00" };
-        assert!(verify_archive(&path, &wrong_size).unwrap_err().to_string().contains("size mismatch"));
-        let wrong_hash = ArchiveIntegrity { name: "test", size: 3, sha256: "00" };
-        assert!(verify_archive(&path, &wrong_hash).unwrap_err().to_string().contains("SHA-256 mismatch"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn source_rejects_traversal_and_link_entries_before_unpacking() {
-        let source = include_str!("build.rs");
-        assert!(source.contains("Component::Normal"));
-        assert!(source.contains("is_symlink"));
-        assert!(source.contains("is_hard_link"));
-        assert!(source.contains("unpack_in(destination)"));
-    }
+fn allow_debug_network_download() -> bool {
+    cfg!(debug_assertions)
+        && env::var("SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD").ok().as_deref() == Some("1")
 }
 
 /// Map a Rust target architecture to the Android ABI directory name used
@@ -392,21 +244,7 @@ fn archive_name(
 ) -> Result<String, DynError> {
     let version = env!("CARGO_PKG_VERSION");
     let name = match (link_mode, target_os, target_arch) {
-        (LinkMode::Static, "linux", "x86_64") => {
-            format!("sherpa-onnx-v{version}-linux-x64-static-lib.tar.bz2")
-        }
-        (LinkMode::Static, "linux", "aarch64") => {
-            format!("sherpa-onnx-v{version}-linux-aarch64-static-lib.tar.bz2")
-        }
-        (LinkMode::Static, "macos", "x86_64") => {
-            format!("sherpa-onnx-v{version}-osx-x64-static-lib.tar.bz2")
-        }
-        (LinkMode::Static, "macos", "aarch64") => {
-            format!("sherpa-onnx-v{version}-osx-arm64-static-lib.tar.bz2")
-        }
-        (LinkMode::Static, "windows", "x86_64") => {
-            format!("sherpa-onnx-v{version}-win-x64-static-MT-Release-lib.tar.bz2")
-        }
+        (LinkMode::Static, os, arch) => static_archive_name(version, os, arch)?,
         (LinkMode::Shared, "linux", "x86_64") => {
             format!("sherpa-onnx-v{version}-linux-x64-shared-lib.tar.bz2")
         }
@@ -426,10 +264,12 @@ fn archive_name(
         (LinkMode::Shared, "android", "aarch64" | "arm" | "x86" | "x86_64") => {
             format!("sherpa-onnx-v{version}-android.tar.bz2")
         }
-        _ => return Err(format!(
+        _ => {
+            return Err(format!(
             "Unsupported target for sherpa-onnx prebuilt libs: os={target_os}, arch={target_arch}"
         )
-        .into()),
+            .into())
+        }
     };
 
     Ok(name)
@@ -506,9 +346,9 @@ fn copy_unix_runtime_libs(lib_dir: &Path, target_os: &str) -> Result<(), DynErro
         .filter(|path| {
             path.file_name()
                 .and_then(OsStr::to_str)
-                 .map(|name| match target_os {
-                     "linux" | "android" => name.contains(".so"),
-                     "macos" => name.ends_with(".dylib"),
+                .map(|name| match target_os {
+                    "linux" | "android" => name.contains(".so"),
+                    "macos" => name.ends_with(".dylib"),
                     _ => false,
                 })
                 .unwrap_or(false)
@@ -516,11 +356,7 @@ fn copy_unix_runtime_libs(lib_dir: &Path, target_os: &str) -> Result<(), DynErro
         .collect();
 
     if runtime_libs.is_empty() {
-        return Err(format!(
-            "No shared runtime libraries found in {}",
-            lib_dir.display()
-        )
-        .into());
+        return Err(format!("No shared runtime libraries found in {}", lib_dir.display()).into());
     }
 
     let mut copy_plan = Vec::<(PathBuf, OsString)>::new();
