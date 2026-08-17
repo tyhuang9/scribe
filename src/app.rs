@@ -3250,6 +3250,7 @@ pub struct LocalTranscriberApp {
     captured_targets: HashMap<SessionId, CapturedTarget>,
     overlay_controller: OverlayController,
     overlay_hide_at: Option<Instant>,
+    overlay_presented: bool,
     hotkey_service: HotkeyService,
     tray_service: Option<TrayService>,
     last_tray_state: Option<TrayUiState>,
@@ -3405,6 +3406,7 @@ impl LocalTranscriberApp {
             captured_targets: HashMap::new(),
             overlay_controller: OverlayController::new(overlay::reduced_motion_preferred()),
             overlay_hide_at: None,
+            overlay_presented: false,
             tray_service: None,
             last_tray_state: None,
             window_hidden_to_tray: false,
@@ -9195,6 +9197,28 @@ impl eframe::App for LocalTranscriberApp {
         self.poll_settings_save();
         self.sync_tray_state();
 
+        self.sync_overlay_state();
+        let overlay_session_id = self.overlay_controller.state().session_id;
+        let target = overlay_session_id.and_then(|id| self.captured_targets.get(&id));
+        let overlay_output = overlay::show_overlay_viewport(
+            ctx,
+            self.overlay_controller.state(),
+            target,
+            native_overlay_position(self.config.overlay.position),
+            crate::overlay::OverlayPresentation {
+                focused: ctx.input(|input| input.viewport().focused),
+                minimized: ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+                hidden_to_tray: self.window_hidden_to_tray,
+            },
+        );
+        self.overlay_presented = overlay_output.presented;
+        if overlay_output.presented {
+            self.record_overlay_presented(overlay_session_id);
+        }
+        if let Some(overlay::OverlayAction::Abandon(session_id)) = overlay_output.action {
+            self.abandon_recording(session_id);
+        }
+
         match self.current_tab {
             Tab::Advanced => {
                 self.settings_tab = SettingsTab::Advanced;
@@ -9238,27 +9262,6 @@ impl eframe::App for LocalTranscriberApp {
 
         self.sync_passive_microphone_monitor();
 
-        self.sync_overlay_state();
-        let overlay_session_id = self.overlay_controller.state().session_id;
-        let target = overlay_session_id.and_then(|id| self.captured_targets.get(&id));
-        let overlay_output = overlay::show_overlay_viewport(
-            ctx,
-            self.overlay_controller.state(),
-            target,
-            native_overlay_position(self.config.overlay.position),
-            crate::overlay::OverlayPresentation {
-                focused: ctx.input(|input| input.viewport().focused),
-                minimized: ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
-                hidden_to_tray: self.window_hidden_to_tray,
-            },
-        );
-        if overlay_output.presented {
-            self.record_overlay_presented(overlay_session_id);
-        }
-        if let Some(overlay::OverlayAction::Abandon(session_id)) = overlay_output.action {
-            self.abandon_recording(session_id);
-        }
-
         let repaint_delay = self.next_repaint_delay();
         if self.window_hidden_to_tray
             && let Some(error) = self
@@ -9301,7 +9304,7 @@ impl LocalTranscriberApp {
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        let state = transcription_state(
+        let mut state = transcription_state(
             self.effective_status(),
             selected_model_id,
             model_readiness,
@@ -9322,6 +9325,7 @@ impl LocalTranscriberApp {
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             microphone_permission,
         );
+        state.suppress_live_announcements = self.overlay_presented;
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -9416,6 +9420,11 @@ impl LocalTranscriberApp {
                 self.start_recording(RecordingSource::Transcribe)
             }
             ScreenAction::StopRecording => self.stop_recording(),
+            ScreenAction::AbandonRecording => {
+                if let Some(session_id) = self.session_coordinator.active_session_id() {
+                    self.abandon_recording(session_id);
+                }
+            }
             ScreenAction::OpenAudioSettings => self.open_system_audio_settings(),
             ScreenAction::ClearTranscript => self.clear_transcript_history(),
             ScreenAction::CopyTranscript => self.copy_transcript_to_clipboard(),
@@ -11803,7 +11812,7 @@ impl LocalTranscriberApp {
         ) * 100.0)
             .round() as u8;
         let no_speech = self.status_message == "No speech detected; nothing was pasted.";
-        let state = transcription_state(
+        let mut state = transcription_state(
             self.effective_status(),
             selected_model_id,
             model_readiness,
@@ -11821,6 +11830,7 @@ impl LocalTranscriberApp {
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),
         );
+        state.suppress_live_announcements = self.overlay_presented;
         let settings = RecordingSettingsView {
             close_to_tray: self.config.general.close_to_tray,
             duration_seconds: self.config.recording.max_recording_seconds,
@@ -12175,6 +12185,7 @@ impl LocalTranscriberApp {
             | ScreenAction::ChangeModel
             | ScreenAction::StartRecording
             | ScreenAction::StopRecording
+            | ScreenAction::AbandonRecording
             | ScreenAction::ClearTranscript
             | ScreenAction::CopyTranscript
             | ScreenAction::ToggleComparison
@@ -18952,6 +18963,7 @@ mod layout_tests {
             captured_targets: HashMap::new(),
             overlay_controller: OverlayController::new(false),
             overlay_hide_at: None,
+            overlay_presented: false,
             tray_service: None,
             last_tray_state: None,
             window_hidden_to_tray: false,

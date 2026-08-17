@@ -22,6 +22,9 @@ const MINIMAL_WIDTH: f32 = 320.0;
 const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
 const CONTROL_SIZE: f32 = 44.0;
+const CONTROL_CONTENT_GAP: f32 = 8.0;
+const MAX_PREVIEW_CHARS: usize = 512;
+const MAX_PREVIEW_ROWS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayAction {
@@ -272,6 +275,9 @@ fn render_overlay(context: &egui::Context, state: &OverlayViewState) {
                 .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
+                    ui.set_max_width(
+                        (ui.available_width() - CONTROL_SIZE - CONTROL_CONTENT_GAP).max(1.0),
+                    );
                     render_status_row(ui, state);
                     if state.mode == OverlayMode::Live {
                         ui.add_space(8.0);
@@ -348,16 +354,26 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
             OverlayRecovery::Retry => " You can retry.",
             OverlayRecovery::WaitForPreview => " Wait for the current preview worker to exit.",
         };
-        let response = ui.label(
-            RichText::new(format!("{}{suffix}", error.message))
-                .color(Color32::from_rgb(255, 174, 168)),
-        );
+        let message = format!("{}{suffix}", error.message);
+        let response = ui.label(message_layout_for_rows(
+            ui,
+            &message,
+            Color32::from_rgb(255, 174, 168),
+            ui.available_width(),
+            2,
+        ));
         mark_polite_live_region(ui.ctx(), response.id);
         return;
     }
 
     if let Some(notice) = &state.notice {
-        let response = ui.label(RichText::new(notice).color(Color32::from_rgb(255, 211, 132)));
+        let response = ui.label(message_layout_for_rows(
+            ui,
+            notice,
+            Color32::from_rgb(255, 211, 132),
+            ui.available_width(),
+            2,
+        ));
         mark_polite_live_region(ui.ctx(), response.id);
     }
 
@@ -365,9 +381,13 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
         return;
     }
 
-    let committed = preview_tail(&state.transcript.committed, 2, 240);
-    let tentative = preview_tail(&state.transcript.tentative, 2, 120);
-    let text = transcript_layout(&committed, &tentative, ui.available_width());
+    let text = transcript_layout_for_rows(
+        ui,
+        &state.transcript.committed,
+        &state.transcript.tentative,
+        ui.available_width(),
+        MAX_PREVIEW_ROWS,
+    );
     let response = ui.label(text);
     let accessible_text = if state.transcript.tentative.is_empty() {
         format!("Committed transcript: {}", state.transcript.committed)
@@ -390,21 +410,127 @@ fn render_live_content(ui: &mut egui::Ui, state: &OverlayViewState) {
     }
 }
 
-/// Keeps rendered preview bounded without mutating the authoritative
-/// controller transcript. `char_indices` makes the truncation Unicode-safe.
-fn preview_tail(text: &str, max_lines: usize, max_chars: usize) -> String {
-    let lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
-    let joined = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-    let char_count = joined.chars().count();
-    if char_count <= max_chars {
-        return joined;
+fn transcript_layout_for_rows(
+    ui: &egui::Ui,
+    committed: &str,
+    tentative: &str,
+    max_width: f32,
+    max_rows: usize,
+) -> egui::text::LayoutJob {
+    let full = transcript_layout(committed, tentative, max_width);
+    let total_chars = full.text.chars().count();
+    let mut low = 0;
+    let mut high = total_chars.min(MAX_PREVIEW_CHARS);
+    let mut best = tail_layout_job(&full, 0);
+    while low <= high {
+        let keep = low + (high - low) / 2;
+        let candidate = tail_layout_job(&full, keep);
+        let rows = ui.fonts(|fonts| fonts.layout_job(candidate.clone()).rows.len());
+        if rows <= max_rows {
+            best = candidate;
+            low = keep.saturating_add(1);
+        } else if keep == 0 {
+            break;
+        } else {
+            high = keep - 1;
+        }
     }
-    let start = joined
+    best
+}
+
+fn message_layout_for_rows(
+    ui: &egui::Ui,
+    message: &str,
+    color: Color32,
+    max_width: f32,
+    max_rows: usize,
+) -> egui::text::LayoutJob {
+    let mut full = egui::text::LayoutJob::default();
+    full.append(
+        message,
+        0.0,
+        egui::TextFormat {
+            color,
+            ..Default::default()
+        },
+    );
+    full.wrap.max_width = max_width;
+    let total_chars = full.text.chars().count();
+    let mut low = 0;
+    let mut high = total_chars.min(256);
+    let mut best = head_layout_job(&full, 0);
+    while low <= high {
+        let keep = low + (high - low) / 2;
+        let candidate = head_layout_job(&full, keep);
+        let rows = ui.fonts(|fonts| fonts.layout_job(candidate.clone()).rows.len());
+        if rows <= max_rows {
+            best = candidate;
+            low = keep.saturating_add(1);
+        } else if keep == 0 {
+            break;
+        } else {
+            high = keep - 1;
+        }
+    }
+    best
+}
+
+fn head_layout_job(full: &egui::text::LayoutJob, keep_chars: usize) -> egui::text::LayoutJob {
+    let total_chars = full.text.chars().count();
+    if keep_chars >= total_chars {
+        return full.clone();
+    }
+    let end = full
+        .text
         .char_indices()
-        .nth(char_count - max_chars)
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    format!("…{}", &joined[start..])
+        .nth(keep_chars)
+        .map_or(full.text.len(), |(index, _)| index);
+    let mut result = full.clone();
+    result.text.clear();
+    result.sections.clear();
+    let format = full
+        .sections
+        .first()
+        .map(|section| section.format.clone())
+        .unwrap_or_default();
+    if end > 0 {
+        result.append(&full.text[..end], 0.0, format.clone());
+    }
+    result.append("…", 0.0, format);
+    result
+}
+
+fn tail_layout_job(full: &egui::text::LayoutJob, keep_chars: usize) -> egui::text::LayoutJob {
+    let total_chars = full.text.chars().count();
+    if keep_chars >= total_chars {
+        return full.clone();
+    }
+    let start = full
+        .text
+        .char_indices()
+        .nth(total_chars.saturating_sub(keep_chars))
+        .map_or(full.text.len(), |(index, _)| index);
+    let mut result = full.clone();
+    result.text.clear();
+    result.sections.clear();
+    let first_format = full
+        .sections
+        .iter()
+        .find(|section| section.byte_range.end > start)
+        .map(|section| section.format.clone())
+        .unwrap_or_default();
+    result.append("…", 0.0, first_format);
+    for section in &full.sections {
+        let section_start = section.byte_range.start.max(start);
+        if section_start < section.byte_range.end {
+            result.append(
+                &full.text[section_start..section.byte_range.end],
+                0.0,
+                section.format.clone(),
+            );
+        }
+    }
+    result
 }
 
 fn transcript_layout(committed: &str, tentative: &str, max_width: f32) -> egui::text::LayoutJob {
@@ -521,6 +647,36 @@ mod tests {
     }
 
     #[test]
+    fn rendered_cancel_control_has_exact_accessible_name_and_full_bounds() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
+            )),
+            ..Default::default()
+        };
+        let output = context.run(input, |context| {
+            assert!(!render_cancel_control(context));
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let control = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Cancel recording and discard it."))
+                .then_some(node)
+            })
+            .expect("cancel control should be an accessible button");
+        let bounds = control
+            .bounds()
+            .expect("cancel control should expose bounds");
+        assert!(bounds.x1 - bounds.x0 >= f64::from(CONTROL_SIZE));
+        assert!(bounds.y1 - bounds.y0 >= f64::from(CONTROL_SIZE));
+    }
+
+    #[test]
     fn control_bounds_cover_the_display_right_edge() {
         let control = control_window_bounds(
             OverlayWindowBounds {
@@ -541,10 +697,29 @@ mod tests {
     }
 
     #[test]
-    fn preview_tail_keeps_two_unicode_safe_lines() {
-        assert_eq!(preview_tail("one\ntwo\nthree", 2, 240), "two\nthree");
-        let tail = preview_tail("éééé", 2, 3);
-        assert_eq!(tail, "…ééé");
+    fn preview_tail_is_unicode_safe_and_limited_to_two_rendered_rows() {
+        let context = egui::Context::default();
+        let mut result = None;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let layout = transcript_layout_for_rows(
+                    ui,
+                    "one two three four five six seven éééééé",
+                    "tentative-unbroken-text-that-must-wrap",
+                    72.0,
+                    2,
+                );
+                let rows = ui.fonts(|fonts| fonts.layout_job(layout.clone()).rows.len());
+                result = Some((layout, rows));
+            });
+        });
+        let (layout, rows) = result.unwrap();
+        assert!(rows <= 2);
+        assert!(layout.text.is_char_boundary(layout.text.len()));
+        assert!(
+            layout.sections.len() >= 2,
+            "styled tail should retain formatting"
+        );
     }
 
     #[test]

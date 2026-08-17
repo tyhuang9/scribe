@@ -57,6 +57,9 @@ pub(crate) struct TranscriptionState {
     pub selected_audio_device_id: Option<String>,
     pub recording_mode: RecordingMode,
     pub hotkey: String,
+    /// True only while the successfully presented background overlay owns
+    /// recording announcements for this frame.
+    pub suppress_live_announcements: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -623,6 +623,10 @@ fn apply_action(data: &mut FixtureData, page: &mut AppPage, action: ScreenAction
         }
         ScreenAction::StartRecording => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::StopRecording => data.transcription.phase = TranscriptionPhase::Finalizing,
+        ScreenAction::AbandonRecording => {
+            data.transcription.phase = TranscriptionPhase::Ready;
+            data.transcription.provisional_transcript.clear();
+        }
         ScreenAction::OpenAudioSettings => *page = AppPage::General,
         ScreenAction::RetryMicrophone => data.transcription.phase = TranscriptionPhase::Listening,
         ScreenAction::ClearTranscript => data.transcription.committed_transcript.clear(),
