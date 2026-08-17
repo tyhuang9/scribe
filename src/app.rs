@@ -14954,6 +14954,37 @@ mod layout_tests {
     }
 
     #[test]
+    fn abandon_ignores_a_current_session_after_capture_is_no_longer_cancellable() {
+        let mut app = test_app();
+        let session_id = SessionId(42);
+        app.session_coordinator.seed_active_for_test(
+            session_id,
+            SessionPurpose::Dictation,
+            std::iter::empty(),
+        );
+        let cancellation = CaptureCancellation::new();
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::AppAction),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            cancellation: cancellation.clone(),
+        });
+
+        app.abandon_recording(session_id);
+
+        assert!(!cancellation.is_cancelled());
+        assert!(app.pending_recording.is_some());
+        assert_eq!(
+            app.session_coordinator.phase(),
+            DictationPhase::Transcribing
+        );
+        assert!(app.abandoned_capture_cleanups.is_empty());
+    }
+
+    #[test]
     fn capture_ready_after_pending_abandon_drains_without_ui_blocking_or_output() {
         let mut app = test_app();
         let session_id = app
