@@ -1,6 +1,16 @@
 //! Development-only deterministic fixtures. Actions update only local fixture state.
 
+use std::time::Duration;
+
 use eframe::egui::{self, CentralPanel, Frame};
+
+use crate::{
+    overlay::{
+        self, OverlayAudioLevel, OverlayMode, OverlayPhase, OverlayPosition, OverlayPresentation,
+        OverlayTranscript, OverlayViewState,
+    },
+    transcription::SessionId,
+};
 
 use super::{
     configure_accessible_style,
@@ -40,6 +50,10 @@ pub(crate) enum Fixture {
     ModelsCompareExpanded,
     History,
     SettingsRecording,
+    OverlayLiveLight,
+    OverlayLiveDark,
+    OverlayCompactLight,
+    OverlayCompactDark,
 }
 
 impl Fixture {
@@ -84,9 +98,40 @@ impl Fixture {
             "models/compare-expanded" => Self::ModelsCompareExpanded,
             "history" => Self::History,
             "settings/recording" => Self::SettingsRecording,
+            "overlay/live-light" => Self::OverlayLiveLight,
+            "overlay/live-dark" => Self::OverlayLiveDark,
+            "overlay/compact-light" => Self::OverlayCompactLight,
+            "overlay/compact-dark" => Self::OverlayCompactDark,
             _ => return None,
         })
     }
+
+    fn overlay(self) -> Option<OverlayHarnessFixture> {
+        let (mode, dark_mode) = match self {
+            Self::OverlayLiveLight => (OverlayMode::Live, false),
+            Self::OverlayLiveDark => (OverlayMode::Live, true),
+            Self::OverlayCompactLight => (OverlayMode::Minimal, false),
+            Self::OverlayCompactDark => (OverlayMode::Minimal, true),
+            _ => return None,
+        };
+        Some(OverlayHarnessFixture {
+            dark_mode,
+            state: OverlayViewState {
+                session_id: Some(SessionId(42)),
+                mode,
+                phase: OverlayPhase::Listening,
+                audio_level: OverlayAudioLevel::new(0.58, 0.78),
+                transcript: OverlayTranscript {
+                    committed: "Clicking the settings icon in the top".to_owned(),
+                    tentative: "right opens recording preferences.".to_owned(),
+                    revision: 1,
+                },
+                elapsed: Some(Duration::from_secs(12)),
+                ..OverlayViewState::default()
+            },
+        })
+    }
+
     fn page(self) -> AppPage {
         match self {
             Self::ModelsInstalled
@@ -163,9 +208,13 @@ impl Fixture {
                 transcription.phase = TranscriptionPhase::MicrophoneError;
                 transcription.notice = Some("Scribe couldn’t access your microphone".into());
             }
-            Self::ModelsInstalled | Self::SettingsRecording | Self::History => {
-                transcription.phase = TranscriptionPhase::Ready
-            }
+            Self::ModelsInstalled
+            | Self::SettingsRecording
+            | Self::History
+            | Self::OverlayLiveLight
+            | Self::OverlayLiveDark
+            | Self::OverlayCompactLight
+            | Self::OverlayCompactDark => transcription.phase = TranscriptionPhase::Ready,
             Self::ModelsLifecycle
             | Self::ModelsDownloadDownloading
             | Self::ModelsDownloadRetained
@@ -291,6 +340,12 @@ impl Fixture {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct OverlayHarnessFixture {
+    dark_mode: bool,
+    state: OverlayViewState,
+}
+
 fn model(
     display_name: &str,
     variant_label: &str,
@@ -411,24 +466,63 @@ pub(crate) fn fixture_from_env() -> Option<Fixture> {
 pub(crate) struct UiHarnessApp {
     page: AppPage,
     data: FixtureData,
+    overlay: Option<OverlayHarnessFixture>,
+    overlay_presented: bool,
 }
 
-fn configure_harness_style(ctx: &egui::Context) {
-    ctx.set_visuals(egui::Visuals::light());
+fn configure_harness_style(ctx: &egui::Context, dark_mode: bool) {
+    ctx.set_visuals(if dark_mode {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    });
     configure_accessible_style(ctx);
 }
 
 impl UiHarnessApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, fixture: Fixture) -> Self {
-        configure_harness_style(&cc.egui_ctx);
+        let overlay = fixture.overlay();
+        configure_harness_style(
+            &cc.egui_ctx,
+            overlay.as_ref().is_some_and(|fixture| fixture.dark_mode),
+        );
+        if overlay.is_some() {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                "Scribe Overlay Fixture Background".to_owned(),
+            ));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         Self {
             page: fixture.page(),
             data: fixture.data(),
+            overlay,
+            overlay_presented: false,
         }
     }
 }
 impl eframe::App for UiHarnessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(overlay) = &self.overlay {
+            show_overlay_fixture_host(ctx, self.overlay_presented);
+            let output = overlay::show_overlay_viewport(
+                ctx,
+                &overlay.state,
+                None,
+                OverlayPosition::BottomCenter,
+                OverlayPresentation {
+                    focused: Some(false),
+                    minimized: false,
+                    hidden_to_tray: false,
+                },
+            );
+            self.overlay_presented = output.presented;
+            // Immediate child viewports are driven by the root update loop.
+            // Keep the patterned host and real hardened overlay repaintable
+            // throughout an extended capture session.
+            ctx.request_repaint_after(Duration::from_millis(33));
+            return;
+        }
         let clear_initial_dialog_focus = self.data.model_management.focus_dialog_initial;
         let clear_add_focus = self.data.model_management.restore_add_focus;
         let clear_reference_editor_focus = self.data.comparison.focus_reference_editor;
@@ -461,6 +555,64 @@ impl eframe::App for UiHarnessApp {
         apply_action(&mut self.data, &mut self.page, action);
         ctx.request_repaint_after(std::time::Duration::from_secs(60));
     }
+}
+
+fn show_overlay_fixture_host(ctx: &egui::Context, overlay_presented: bool) {
+    CentralPanel::default()
+        .frame(Frame::none().fill(theme_palette(ctx).content_bg))
+        .show(ctx, |ui| {
+            let viewport = ui.max_rect();
+            let sample_top = (viewport.bottom() - 180.0).max(viewport.top());
+            let sample_area = egui::Rect::from_min_max(
+                egui::pos2(viewport.left(), sample_top),
+                viewport.right_bottom(),
+            );
+            let panel_width = 150.0;
+            let panels = [
+                (
+                    egui::Color32::from_rgb(248, 250, 253),
+                    egui::Color32::from_rgb(29, 33, 42),
+                    "LIGHT SAMPLE",
+                ),
+                (
+                    egui::Color32::from_rgb(22, 27, 36),
+                    egui::Color32::from_rgb(236, 241, 247),
+                    "DARK SAMPLE",
+                ),
+                (
+                    egui::Color32::from_rgb(37, 99, 235),
+                    egui::Color32::WHITE,
+                    "SCRIBE BLUE",
+                ),
+            ];
+            let panel_count = (sample_area.width() / panel_width).ceil() as usize;
+            for index in 0..panel_count {
+                let left = sample_area.left() + index as f32 * panel_width;
+                let panel = egui::Rect::from_min_max(
+                    egui::pos2(left, sample_area.top()),
+                    egui::pos2(
+                        (left + panel_width).min(sample_area.right()),
+                        sample_area.bottom(),
+                    ),
+                );
+                let (fill, text, label) = panels[index % panels.len()];
+                ui.painter().rect_filled(panel, 0.0, fill);
+                for row in 0..3 {
+                    ui.painter().text(
+                        egui::pos2(panel.center().x, panel.top() + 30.0 + row as f32 * 54.0),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::monospace(12.0),
+                        text,
+                    );
+                }
+            }
+            if !overlay_presented {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Preparing the hardened overlay capture fixture...");
+                });
+            }
+        });
 }
 
 fn harness_route(page: AppPage, fixture_route: UiRoute) -> UiRoute {
@@ -837,7 +989,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
 
-        configure_harness_style(&ctx);
+        configure_harness_style(&ctx, false);
 
         let style = ctx.style();
         assert!(!style.visuals.dark_mode);
@@ -846,6 +998,66 @@ mod tests {
             style.text_styles[&egui::TextStyle::Body],
             egui::FontId::new(14.0, egui::FontFamily::Proportional)
         );
+    }
+
+    #[test]
+    fn overlay_fixture_parser_accepts_only_the_four_capture_variants() {
+        assert_eq!(
+            Fixture::parse("overlay/live-light"),
+            Some(Fixture::OverlayLiveLight)
+        );
+        assert_eq!(
+            Fixture::parse("overlay/live-dark"),
+            Some(Fixture::OverlayLiveDark)
+        );
+        assert_eq!(
+            Fixture::parse("overlay/compact-light"),
+            Some(Fixture::OverlayCompactLight)
+        );
+        assert_eq!(
+            Fixture::parse("overlay/compact-dark"),
+            Some(Fixture::OverlayCompactDark)
+        );
+        assert_eq!(Fixture::parse("overlay/live"), None);
+        assert_eq!(Fixture::parse("overlay/compact-system"), None);
+    }
+
+    #[test]
+    fn overlay_capture_fixtures_have_fixed_isolated_state() {
+        for (fixture, expected_mode, expected_dark) in [
+            (Fixture::OverlayLiveLight, OverlayMode::Live, false),
+            (Fixture::OverlayLiveDark, OverlayMode::Live, true),
+            (Fixture::OverlayCompactLight, OverlayMode::Minimal, false),
+            (Fixture::OverlayCompactDark, OverlayMode::Minimal, true),
+        ] {
+            let overlay = fixture.overlay().expect("overlay fixture should parse");
+            assert_eq!(overlay.dark_mode, expected_dark);
+            assert_eq!(overlay.state.session_id, Some(SessionId(42)));
+            assert_eq!(overlay.state.mode, expected_mode);
+            assert_eq!(overlay.state.phase, OverlayPhase::Listening);
+            assert_eq!(
+                overlay.state.audio_level,
+                OverlayAudioLevel::new(0.58, 0.78)
+            );
+            assert_eq!(overlay.state.elapsed, Some(Duration::from_secs(12)));
+            assert_eq!(overlay.state.transcript.revision, 1);
+            assert!(!overlay.state.transcript.committed.is_empty());
+            assert!(!overlay.state.transcript.tentative.is_empty());
+            assert!(overlay.state.transcript_announcement.is_none());
+            assert!(overlay.state.notice.is_none());
+            assert!(overlay.state.error.is_none());
+        }
+    }
+
+    #[test]
+    fn overlay_fixture_style_selects_requested_theme_without_changing_normal_default() {
+        let light_ctx = egui::Context::default();
+        configure_harness_style(&light_ctx, false);
+        assert!(!light_ctx.style().visuals.dark_mode);
+
+        let dark_ctx = egui::Context::default();
+        configure_harness_style(&dark_ctx, true);
+        assert!(dark_ctx.style().visuals.dark_mode);
     }
 
     fn render(fixture: Fixture, width: f32, height: f32) -> egui::FullOutput {

@@ -45,6 +45,38 @@ not runtime assets.
 - `models/compare-expanded`
 - `history`
 - `settings/recording`
+- `overlay/live-light` and `overlay/live-dark` -- the real 600 x 62 hardened
+  Live preview viewport with fixed Recording state, microphone level, `00:12`
+  timer, and sample committed/tentative transcript.
+- `overlay/compact-light` and `overlay/compact-dark` -- the real 320 x 52
+  hardened Compact status viewport with the same fixed state.
+
+## Overlay capture fixtures
+
+Run these fixtures only from a debug build with the `ui-harness` feature. For
+example:
+
+```powershell
+$env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
+$env:SCRIBE_UI_HARNESS_VIEWPORT = '960x680'
+cargo run --features ui-harness
+```
+
+Substitute `overlay/live-light`, `overlay/compact-light`, or
+`overlay/compact-dark` for the other approved captures. The passive display
+window title is exactly `Scribe Dictation Overlay`; the separate 44 x 44
+cancel-window title is exactly `Scribe Dictation Overlay Cancel`. Capture the
+combined screen region because the X intentionally lives in its own native
+window. The maximized fixture host is titled exactly
+`Scribe Overlay Fixture Background` and remains repaintable behind the overlay.
+Its repeating light, dark, and Scribe-blue panels provide hard edges and text
+for judging backdrop diffusion, tint, and any seam between the two overlay
+windows; they are fixture-only paint, not a production asset.
+
+These fixtures pass an explicit unfocused presentation state through the same
+`show_overlay_viewport` path as production. They do not initialize microphone,
+hotkey, model, history, or settings services and do not perform release or
+discard behavior.
 
 ## Model-card contract
 
