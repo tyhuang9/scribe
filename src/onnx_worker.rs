@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,29 @@ const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUDIO_SAMPLES: usize = MAX_AUDIO_BYTES / size_of::<f32>();
+
+#[derive(Clone, Copy)]
+struct SupervisorDeadlines {
+    hello: Duration,
+    load: Duration,
+    health: Duration,
+    data: Duration,
+    control: Duration,
+    cancel: Duration,
+}
+
+impl Default for SupervisorDeadlines {
+    fn default() -> Self {
+        Self {
+            hello: Duration::from_secs(10),
+            load: Duration::from_secs(15 * 60),
+            health: Duration::from_secs(10),
+            data: Duration::from_secs(60 * 60),
+            control: Duration::from_secs(30),
+            cancel: Duration::from_millis(250),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +89,10 @@ pub(crate) struct OnnxModelSpec {
 
 impl OnnxModelSpec {
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validated().map(|_| ())
+    }
+
+    fn validated(&self) -> Result<ValidatedOnnxModel> {
         if self.id.trim().is_empty() || self.num_threads == 0 {
             bail!("ONNX model id and thread count must be non-empty/non-zero");
         }
@@ -91,6 +119,7 @@ impl OnnxModelSpec {
                 format_roles(&actual_roles)
             );
         }
+        let mut canonical_files = BTreeMap::new();
         for (role, relative) in &self.files {
             if relative.is_absolute()
                 || relative
@@ -114,20 +143,55 @@ impl OnnxModelSpec {
                     path.display()
                 );
             }
+            canonical_files.insert(*role, canonical);
         }
-        Ok(())
+        Ok(ValidatedOnnxModel {
+            id: self.id.clone(),
+            root,
+            family: self.family,
+            files: canonical_files,
+            num_threads: self.num_threads,
+        })
     }
 
     fn fingerprint(&self) -> Result<String> {
-        self.validate()?;
+        self.validated()?.fingerprint()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ValidatedOnnxModel {
+    id: String,
+    root: PathBuf,
+    family: OnnxModelFamily,
+    files: BTreeMap<OnnxFileRole, PathBuf>,
+    num_threads: u16,
+}
+
+impl ValidatedOnnxModel {
+    fn fingerprint(&self) -> Result<String> {
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
 
     fn path(&self, role: OnnxFileRole) -> Result<String> {
-        self.files
+        let path = self
+            .files
             .get(&role)
-            .map(|path| self.root.join(path).to_string_lossy().into_owned())
-            .ok_or_else(|| anyhow!("ONNX model {} missing {role:?}", self.id))
+            .ok_or_else(|| anyhow!("ONNX model {} missing {role:?}", self.id))?;
+        reject_link_components(path)?;
+        let current = std::fs::canonicalize(path).map_err(|error| {
+            anyhow!(
+                "validated ONNX model {} {role:?} artifact is unavailable: {error}",
+                self.id
+            )
+        })?;
+        if current != *path || !canonical_file_is_within_root(&self.root, &current) {
+            bail!(
+                "validated ONNX model {} {role:?} artifact changed after admission",
+                self.id
+            );
+        }
+        Ok(path.to_string_lossy().into_owned())
     }
 }
 
@@ -559,6 +623,7 @@ struct SupervisorInner {
     // sequentially, never nested. Invalidation uses writer.try_lock so process
     // termination never depends on pipe progress.
     launcher: Arc<dyn WorkerLauncher>,
+    deadlines: SupervisorDeadlines,
     reaper: std::sync::mpsc::Sender<ReapRequest>,
     spawn_gate: Mutex<()>,
     state: Mutex<SupervisorState>,
@@ -580,10 +645,18 @@ impl OnnxWorkerSupervisor {
     }
 
     fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
+        Self::with_launcher_and_deadlines(launcher, SupervisorDeadlines::default())
+    }
+
+    fn with_launcher_and_deadlines(
+        launcher: Arc<dyn WorkerLauncher>,
+        deadlines: SupervisorDeadlines,
+    ) -> Result<Self> {
         let reaper = start_reaper()?;
         let supervisor = Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
+                deadlines,
                 reaper,
                 spawn_gate: Mutex::new(()),
                 state: Mutex::new(SupervisorState::default()),
@@ -616,12 +689,17 @@ impl OnnxWorkerSupervisor {
         if reused {
             return Ok(true);
         }
-        if let Err(error) = self.round_trip_on_generation(
-            generation,
-            session_id,
-            request_id,
-            Control::Load { model },
-        ) {
+        let load = control_frame(session_id, request_id, &Control::Load { model })?;
+        if let Err(error) = self
+            .active_round_trip_with_timeout(
+                generation,
+                session_id,
+                request_id,
+                &[load],
+                self.inner.deadlines.load,
+            )
+            .and_then(expect_ok)
+        {
             self.invalidate_generation(generation, "ONNX model load failed", true);
             return Err(error);
         }
@@ -820,6 +898,7 @@ impl OnnxWorkerSupervisor {
                 target_session_id: stream.session_id,
                 target_request_id: stream.last_request_id,
             },
+            self.inner.deadlines.cancel,
         )?;
         self.clear_stream(stream.generation, stream.session_id);
         Ok(())
@@ -827,12 +906,26 @@ impl OnnxWorkerSupervisor {
 
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.ensure_generation()?;
-        self.round_trip_on_generation(generation, session_id, request_id, Control::Health)
+        let frame = control_frame(session_id, request_id, &Control::Health)?;
+        self.active_round_trip_with_timeout(
+            generation,
+            session_id,
+            request_id,
+            &[frame],
+            self.inner.deadlines.health,
+        )
+        .and_then(expect_ok)
     }
 
     pub(crate) fn unload(&self) -> Result<()> {
         let generation = self.ensure_generation()?;
-        self.round_trip_on_generation(generation, 0, 0, Control::Unload)?;
+        self.round_trip_on_generation(
+            generation,
+            0,
+            0,
+            Control::Unload,
+            self.inner.deadlines.control,
+        )?;
         let mut state = self
             .inner
             .state
@@ -892,6 +985,20 @@ impl OnnxWorkerSupervisor {
         }
         self.invalidate_generation(target.generation, "ONNX request cancelled", true);
         Ok(())
+    }
+
+    /// Abandons a stream without waiting for child I/O. Used only by RAII drop
+    /// paths, where blocking can deadlock application teardown.
+    pub(crate) fn abandon_stream(&self, session_id: u64) {
+        let generation = self.inner.state.lock().ok().and_then(|state| {
+            state
+                .active_stream
+                .filter(|stream| stream.session_id == session_id)
+                .map(|stream| stream.generation)
+        });
+        if let Some(generation) = generation {
+            self.invalidate_generation(generation, "ONNX stream was abandoned", true);
+        }
     }
 
     fn ensure_generation(&self) -> Result<u64> {
@@ -959,7 +1066,13 @@ impl OnnxWorkerSupervisor {
             self.invalidate_generation(generation, &error.to_string(), true);
             return Err(error);
         }
-        if let Err(error) = self.round_trip_on_generation(generation, 0, 0, Control::Hello) {
+        if let Err(error) = self.round_trip_on_generation(
+            generation,
+            0,
+            0,
+            Control::Hello,
+            self.inner.deadlines.hello,
+        ) {
             self.invalidate_generation(generation, &error.to_string(), true);
             return Err(error);
         }
@@ -1074,6 +1187,23 @@ impl OnnxWorkerSupervisor {
         request_id: u64,
         frames: &[Frame],
     ) -> Result<Control> {
+        self.active_round_trip_with_timeout(
+            generation,
+            session_id,
+            request_id,
+            frames,
+            self.inner.deadlines.data,
+        )
+    }
+
+    fn active_round_trip_with_timeout(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        frames: &[Frame],
+        timeout: Duration,
+    ) -> Result<Control> {
         let correlation = Correlation {
             generation,
             session_id,
@@ -1106,7 +1236,7 @@ impl OnnxWorkerSupervisor {
         if let Err(error) = self.write_frames(generation, frames) {
             self.invalidate_generation(generation, &error.to_string(), true);
         }
-        let result = self.await_response(response);
+        let result = self.await_response(correlation, response, timeout);
         self.clear_active(correlation);
         result
     }
@@ -1137,6 +1267,7 @@ impl OnnxWorkerSupervisor {
         session_id: u64,
         request_id: u64,
         command: Control,
+        timeout: Duration,
     ) -> Result<()> {
         if !command.is_parent_command() {
             bail!("cannot send a response-only control to the ONNX worker");
@@ -1158,7 +1289,7 @@ impl OnnxWorkerSupervisor {
         if let Err(error) = self.write_frames(generation, &[frame]) {
             self.invalidate_generation(generation, &error.to_string(), true);
         }
-        match self.await_response(response)? {
+        match self.await_response(correlation, response, timeout)? {
             Control::Ready if expects_ready => Ok(()),
             Control::Ok if !expects_ready => Ok(()),
             Control::Error { message } => bail!("ONNX worker: {message}"),
@@ -1189,11 +1320,30 @@ impl OnnxWorkerSupervisor {
         Ok(())
     }
 
-    fn await_response(&self, response: Receiver<PendingResult>) -> Result<Control> {
-        response
-            .recv()
-            .map_err(|_| anyhow!("ONNX worker response channel disconnected"))?
-            .map_err(anyhow::Error::msg)
+    fn await_response(
+        &self,
+        correlation: Correlation,
+        response: Receiver<PendingResult>,
+        timeout: Duration,
+    ) -> Result<Control> {
+        match response.recv_timeout(timeout) {
+            Ok(result) => result.map_err(anyhow::Error::msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.unregister(correlation);
+                self.invalidate_generation(
+                    correlation.generation,
+                    "ONNX worker response deadline exceeded",
+                    true,
+                );
+                bail!(
+                    "ONNX worker response deadline exceeded after {} ms",
+                    timeout.as_millis()
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("ONNX worker response channel disconnected")
+            }
+        }
     }
 
     fn clear_active(&self, correlation: Correlation) {
@@ -1297,6 +1447,14 @@ impl OnnxWorkerSupervisor {
     }
 }
 
+fn expect_ok(response: Control) -> Result<()> {
+    match response {
+        Control::Ok => Ok(()),
+        Control::Error { message } => bail!("ONNX worker: {message}"),
+        _ => bail!("unexpected ONNX worker control response"),
+    }
+}
+
 struct ReapRequest {
     process: Arc<dyn WorkerProcess>,
     force_kill: bool,
@@ -1368,7 +1526,7 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
 trait WorkerRecognizerFactory {
     type Recognizer: WorkerRecognizer;
 
-    fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer>;
+    fn create(&self, model: &ValidatedOnnxModel) -> Result<Self::Recognizer>;
 }
 
 trait WorkerRecognizer {
@@ -1414,6 +1572,7 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
             }
             Control::Load { model } => {
                 let result = (|| {
+                    let model = model.validated()?;
                     let identity = model.fingerprint()?;
                     if loaded
                         .as_ref()
@@ -1661,7 +1820,7 @@ enum NativeRecognizer {
 impl WorkerRecognizerFactory for NativeRecognizerFactory {
     type Recognizer = NativeRecognizer;
 
-    fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer> {
+    fn create(&self, model: &ValidatedOnnxModel) -> Result<Self::Recognizer> {
         if model.family == OnnxModelFamily::OnlineTransducer {
             let config = online_recognizer_config(model)?;
             return OnlineRecognizer::create(&config)
@@ -1753,7 +1912,7 @@ fn decode_online_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
     }
 }
 
-fn online_recognizer_config(model: &OnnxModelSpec) -> Result<OnlineRecognizerConfig> {
+fn online_recognizer_config(model: &ValidatedOnnxModel) -> Result<OnlineRecognizerConfig> {
     let mut config = OnlineRecognizerConfig::default();
     config.model_config.provider = Some("cpu".into());
     config.model_config.num_threads = i32::from(model.num_threads);
@@ -1766,7 +1925,7 @@ fn online_recognizer_config(model: &OnnxModelSpec) -> Result<OnlineRecognizerCon
     Ok(config)
 }
 
-fn offline_recognizer_config(model: &OnnxModelSpec) -> Result<OfflineRecognizerConfig> {
+fn offline_recognizer_config(model: &ValidatedOnnxModel) -> Result<OfflineRecognizerConfig> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.provider = Some("cpu".into());
     config.model_config.num_threads = i32::from(model.num_threads);
@@ -1953,7 +2112,7 @@ mod tests {
     impl WorkerRecognizerFactory for FakeRecognizerFactory {
         type Recognizer = FakeRecognizer;
 
-        fn create(&self, model: &OnnxModelSpec) -> Result<Self::Recognizer> {
+        fn create(&self, model: &ValidatedOnnxModel) -> Result<Self::Recognizer> {
             let mut state = self.state.lock().unwrap();
             state.create_attempts += 1;
             state.events.push(format!("create-attempt:{}", model.id));
@@ -2088,12 +2247,20 @@ mod tests {
             started: TestSender<()>,
             release: TestReceiver<()>,
         },
+        HoldLoad {
+            started: TestSender<()>,
+            release: TestReceiver<()>,
+        },
+        HoldCancel {
+            started: TestSender<()>,
+            release: TestReceiver<()>,
+        },
         HoldStale {
             started: TestSender<()>,
             release: TestReceiver<()>,
             sent: TestSender<()>,
         },
-        FailTwo {
+        FailRequest {
             received: TestSender<()>,
             malformed: bool,
         },
@@ -2278,6 +2445,26 @@ mod tests {
                 respond(&mut output, session_id, request_id, Control::Ok);
                 run_normal_worker(&mut input, &mut output);
             }
+            TestMode::HoldLoad { started, release } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Load { .. }));
+                started.send(()).unwrap();
+                if release.recv().is_ok() {
+                    respond(&mut output, session_id, request_id, Control::Ok);
+                    run_normal_worker(&mut input, &mut output);
+                }
+            }
+            TestMode::HoldCancel { started, release } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::StartStream));
+                respond(&mut output, session_id, request_id, Control::Ok);
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Cancel { .. }));
+                started.send(()).unwrap();
+                if release.recv().is_ok() {
+                    respond(&mut output, session_id, request_id, Control::Ok);
+                }
+            }
             TestMode::HoldStale {
                 started,
                 release,
@@ -2290,14 +2477,12 @@ mod tests {
                 respond(&mut output, session_id, request_id, Control::Ok);
                 sent.send(()).unwrap();
             }
-            TestMode::FailTwo {
+            TestMode::FailRequest {
                 received,
                 malformed,
             } => {
-                for _ in 0..2 {
-                    let (_, _, control) = read_parent_control(&mut input);
-                    assert!(matches!(control, Control::Health));
-                }
+                let (_, _, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Health));
                 received.send(()).unwrap();
                 if malformed {
                     output.write_all(b"BAD!").unwrap();
@@ -2340,6 +2525,17 @@ mod tests {
 
     fn test_supervisor(launcher: Arc<TestLauncher>) -> OnnxWorkerSupervisor {
         OnnxWorkerSupervisor::with_launcher(launcher).unwrap()
+    }
+
+    fn short_deadlines() -> SupervisorDeadlines {
+        SupervisorDeadlines {
+            hello: Duration::from_secs(1),
+            load: Duration::from_millis(40),
+            health: Duration::from_millis(40),
+            data: Duration::from_millis(40),
+            control: Duration::from_millis(40),
+            cancel: Duration::from_millis(40),
+        }
     }
 
     fn test_root(label: &str) -> PathBuf {
@@ -3019,6 +3215,148 @@ mod tests {
     }
 
     #[test]
+    fn hung_health_expires_its_deadline_invalidates_generation_and_recovers() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::HoldOne {
+                started: started_tx,
+                release: release_rx,
+            },
+            TestMode::Normal,
+        ]));
+        let supervisor =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let waiting = supervisor.clone();
+        let request = std::thread::spawn(move || waiting.health(70, 71));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let error = request.join().unwrap().unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.to_string().contains("deadline exceeded"));
+        drop(release_tx);
+        supervisor.health(72, 73).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn hung_load_is_cancellable_and_cannot_deliver_a_stale_success() {
+        let root = test_root("hung-load-cancel");
+        let model = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::HoldLoad {
+                started: started_tx,
+                release: release_rx,
+            },
+            TestMode::Normal,
+        ]));
+        let supervisor =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let waiting = supervisor.clone();
+        let first_model = model.clone();
+        let request = std::thread::spawn(move || waiting.load(80, 81, first_model));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancel_started = Instant::now();
+        supervisor.cancel_active().unwrap();
+        assert!(cancel_started.elapsed() < Duration::from_millis(250));
+        assert!(
+            request
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        drop(release_tx);
+        assert!(!supervisor.load(82, 83, model).unwrap());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hung_load_deadline_fails_closed_and_recovers_on_a_new_generation() {
+        let root = test_root("hung-load-deadline");
+        let model = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::HoldLoad {
+                started: started_tx,
+                release: release_rx,
+            },
+            TestMode::Normal,
+        ]));
+        let supervisor =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let waiting = supervisor.clone();
+        let first_model = model.clone();
+        let request = std::thread::spawn(move || waiting.load(84, 85, first_model));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let error = request.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        drop(release_tx);
+        assert!(!supervisor.load(86, 87, model).unwrap());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cooperative_stream_cancel_timeout_invalidates_and_kills_generation() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, _reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::HoldCancel {
+                started: started_tx,
+                release: release_rx,
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher, short_deadlines()).unwrap();
+        supervisor.start_stream(88, 89).unwrap();
+        let waiting = supervisor.clone();
+        let cancel = std::thread::spawn(move || waiting.cancel_stream(88, 90));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let error = cancel.join().unwrap().unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(error.to_string().contains("deadline exceeded"));
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        drop(release_tx);
+    }
+
+    #[test]
+    fn abandoning_stream_returns_without_waiting_for_worker_io() {
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, _reaped_rx) = channel();
+        let (operation_started_tx, _operation_started_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::BlockedStreamOperation {
+                end_stream: false,
+                started: operation_started_tx,
+            }])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(launcher);
+        supervisor.start_stream(90, 91).unwrap();
+        let started = Instant::now();
+        supervisor.abandon_stream(90);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+    }
+
+    #[test]
     fn blocked_stream_chunk_and_end_are_cancelled_and_reaped_within_250_milliseconds() {
         for end_stream in [false, true] {
             let (started_tx, started_rx) = channel();
@@ -3151,7 +3489,7 @@ mod tests {
         let (reaped_tx, reaped_rx) = channel();
         let launcher = Arc::new(
             TestLauncher::new([
-                TestMode::FailTwo {
+                TestMode::FailRequest {
                     received: received_tx,
                     malformed,
                 },
@@ -3161,13 +3499,10 @@ mod tests {
         );
         let supervisor = test_supervisor(Arc::clone(&launcher));
         let first_supervisor = supervisor.clone();
-        let second_supervisor = supervisor.clone();
         let first = std::thread::spawn(move || first_supervisor.health(10, 20));
-        let second = std::thread::spawn(move || second_supervisor.health(11, 21));
         received_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         assert!(first.join().unwrap().is_err());
-        assert!(second.join().unwrap().is_err());
         kill_started_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
@@ -3362,6 +3697,44 @@ mod tests {
             PathBuf::from("..").join(external.file_name().unwrap()),
         );
         assert!(spec.validate().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    fn recognizer_configs_use_validated_canonical_paths_and_fail_after_removal() {
+        let root = test_root("validated-config-paths");
+        let spec = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let validated = spec.validated().unwrap();
+        let canonical_model = std::fs::canonicalize(root.join("model.onnx")).unwrap();
+        let config = offline_recognizer_config(&validated).unwrap();
+        assert_eq!(
+            config.model_config.nemo_ctc.model.as_deref(),
+            Some(canonical_model.to_string_lossy().as_ref())
+        );
+
+        std::fs::remove_file(&canonical_model).unwrap();
+        assert!(offline_recognizer_config(&validated).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_artifact_rejects_a_symlink_swap_before_config_creation() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("validated-symlink-swap");
+        let external = root
+            .parent()
+            .unwrap()
+            .join(format!("scribe-onnx-swap-external-{}", std::process::id()));
+        std::fs::write(&external, b"replacement").unwrap();
+        let spec = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let validated = spec.validated().unwrap();
+        let model_path = root.join("model.onnx");
+        std::fs::remove_file(&model_path).unwrap();
+        symlink(&external, &model_path).unwrap();
+        assert!(offline_recognizer_config(&validated).is_err());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_file(external).unwrap();
     }

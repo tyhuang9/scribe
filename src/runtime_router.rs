@@ -314,6 +314,7 @@ pub(crate) trait OnnxSupervisorControl: Send + Sync {
     fn health(&self, session_id: u64, request_id: u64) -> anyhow::Result<()>;
     fn unload(&self) -> anyhow::Result<()>;
     fn cancel_active(&self) -> anyhow::Result<()>;
+    fn abandon_stream(&self, session_id: u64);
 }
 
 impl OnnxSupervisorControl for OnnxWorkerSupervisor {
@@ -361,6 +362,10 @@ impl OnnxSupervisorControl for OnnxWorkerSupervisor {
 
     fn cancel_active(&self) -> anyhow::Result<()> {
         OnnxWorkerSupervisor::cancel_active(self)
+    }
+
+    fn abandon_stream(&self, session_id: u64) {
+        OnnxWorkerSupervisor::abandon_stream(self, session_id)
     }
 }
 
@@ -1838,8 +1843,7 @@ impl SpeechStream for OnnxSpeechStream {
 impl Drop for OnnxSpeechStream {
     fn drop(&mut self) {
         if self.active {
-            let request_id = self.next_request_id();
-            let _ = self.supervisor.cancel_stream(self.session_id, request_id);
+            self.supervisor.abandon_stream(self.session_id);
             self.active = false;
         }
         self.activity_lease.take();
@@ -2502,6 +2506,8 @@ mod tests {
         fn cancel_active(&self) -> anyhow::Result<()> {
             Ok(())
         }
+
+        fn abandon_stream(&self, _session_id: u64) {}
     }
 
     fn collect_rust_sources(root: &Path, output: &mut Vec<(PathBuf, String)>) {

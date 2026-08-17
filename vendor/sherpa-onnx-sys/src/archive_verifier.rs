@@ -9,6 +9,8 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bzip2::read::BzDecoder;
 use sha2::{Digest, Sha256};
@@ -52,6 +54,14 @@ pub const STATIC_ARCHIVES: &[ArchiveIntegrity] = &[
         sha256: "339c8fc19bb4b26e118c80792bbc4546eb263040fac36ef0cc027ec29c756b44",
     },
 ];
+
+pub fn debug_escape_allowed(
+    cargo_profile: &str,
+    debug_assertions: bool,
+    explicitly_enabled: bool,
+) -> bool {
+    cargo_profile == "debug" && debug_assertions && explicitly_enabled
+}
 
 pub fn static_archive_name(
     version: &str,
@@ -169,4 +179,102 @@ pub fn unpack_archive_safely(
         }
     }
     Ok(())
+}
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn validate_static_library_layout(
+    lib_dir: &Path,
+    target_os: &str,
+    required_libraries: &[&str],
+) -> Result<(), DynError> {
+    if !lib_dir.is_dir() {
+        return Err(format!(
+            "missing sherpa-onnx static library directory: {}",
+            lib_dir.display()
+        )
+        .into());
+    }
+    let extension = if target_os == "windows" { "lib" } else { "a" };
+    for library in required_libraries {
+        let filename = if target_os == "windows" {
+            format!("{library}.{extension}")
+        } else {
+            format!("lib{library}.{extension}")
+        };
+        let path = lib_dir.join(filename);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "missing required sherpa-onnx static library {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("invalid sherpa-onnx static library: {}", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+pub fn activate_verified_archive(
+    archive_path: &Path,
+    integrity: &ArchiveIntegrity,
+    cache_root: &Path,
+    archive_stem: &str,
+    target_os: &str,
+    required_libraries: &[&str],
+) -> Result<std::path::PathBuf, DynError> {
+    // The extracted tree is never an authority. Every reuse first proves the
+    // immutable archive bytes that produced it.
+    verify_archive(archive_path, integrity)?;
+    fs::create_dir_all(cache_root)?;
+    let activated = cache_root.join(archive_stem);
+    let activated_lib = activated.join("lib");
+
+    let staging_parent = unique_sibling(cache_root, archive_stem, "staging");
+    fs::create_dir(&staging_parent)?;
+    let staged_tree = staging_parent.join(archive_stem);
+    let staged_lib = staged_tree.join("lib");
+    let result = (|| {
+        unpack_archive_safely(archive_path, &staging_parent, archive_stem)?;
+        validate_static_library_layout(&staged_lib, target_os, required_libraries)?;
+
+        let quarantine = unique_sibling(cache_root, archive_stem, "replaced");
+        let had_previous = activated.exists();
+        if had_previous {
+            match fs::rename(&activated, &quarantine) {
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not isolate partial sherpa-onnx cache {}: {error}",
+                        activated.display()
+                    )
+                    .into());
+                }
+            }
+        }
+
+        if let Err(error) = fs::rename(&staged_tree, &activated) {
+            if had_previous && !activated.exists() {
+                let _ = fs::rename(&quarantine, &activated);
+            }
+            return Err(format!("could not activate verified sherpa-onnx cache: {error}").into());
+        }
+        let _ = fs::remove_dir_all(&quarantine);
+        Ok(activated_lib.clone())
+    })();
+    let _ = fs::remove_dir_all(&staging_parent);
+    result
+}
+
+fn unique_sibling(parent: &Path, stem: &str, label: &str) -> std::path::PathBuf {
+    let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!(
+        ".{stem}.{label}-{}-{nanos}-{sequence}",
+        std::process::id()
+    ))
 }
