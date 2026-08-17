@@ -55,9 +55,10 @@ fn concrete_runtime_selection_is_private_and_single_handler() {
         1,
         "the application must ship exactly one primary runtime declaration"
     );
-    assert!(
-        !router.contains("struct OnnxSpeechRuntime"),
-        "the evidence-gated ONNX handler must not exist without passing evidence"
+    assert_eq!(
+        router.matches("struct OnnxSpeechRuntime").count(),
+        1,
+        "the private ONNX handler must have exactly one router-owned declaration"
     );
     assert_eq!(
         router
@@ -79,6 +80,39 @@ fn concrete_runtime_selection_is_private_and_single_handler() {
             assert!(
                 !source.contains(concrete),
                 "{concrete} escaped the private router into {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn private_onnx_runtime_contract_does_not_leak_into_product_surfaces() {
+    let sources = rust_sources();
+    let protected = [
+        Path::new("app.rs"),
+        Path::new("config.rs"),
+        Path::new("model_catalog.rs"),
+        Path::new("runtime_catalog.rs"),
+    ];
+    let forbidden = [
+        "OnnxModelSpec",
+        "OnnxModelFamily",
+        "OnnxFileRole",
+        "OnnxBundle",
+        "OnnxSpeech",
+        "native-onnx",
+    ];
+
+    for (path, source) in &sources {
+        if !protected.iter().any(|protected| path == protected) && !path.starts_with("ui") {
+            continue;
+        }
+        let production = production_prefix(source);
+        for identifier in forbidden {
+            assert!(
+                !production.contains(identifier),
+                "private ONNX runtime identifier {identifier:?} leaked into {}",
                 path.display()
             );
         }
@@ -150,6 +184,7 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "managed_downloads.rs",
         "model_catalog.rs",
         "models.rs",
+        "onnx_worker.rs",
         "runtime_catalog.rs",
         "runtime_router.rs",
         "settings/schema.rs",
