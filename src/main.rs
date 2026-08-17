@@ -23,6 +23,7 @@ mod runtime_catalog;
 mod runtime_router;
 mod streaming;
 mod stt;
+mod support_assets;
 mod text_output;
 mod transcription;
 mod tray;
@@ -50,6 +51,9 @@ fn main() -> eframe::Result<()> {
     }
     if let Some(exit_code) = benchmark::maybe_run_local_command() {
         std::process::exit(exit_code);
+    }
+    if let Err(error) = support_assets::materialize_bundled_support_assets() {
+        eprintln!("Scribe support assets are unavailable: {error:#}");
     }
     configure_graphics_environment();
 
