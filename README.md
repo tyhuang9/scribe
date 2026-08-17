@@ -61,6 +61,7 @@ use **GitHub Actions** as its source. The default project site uses
 
 - A current stable Rust toolchain with Rust 2024 edition support. The recorded automated verification used Rust 1.96.0; the project does not currently declare a tested minimum Rust version.
 - A Windows, Linux, or macOS desktop session compatible with `eframe` and `global-hotkey`. Windows x64 is the primary release target; Linux and macOS retain conservative build/output fallbacks but are not release-qualified.
+- Windows source builds require the Visual Studio 2022 C++ build tools and a Windows-native CMake on `PATH`. An MSYS CMake cannot select the required Visual Studio generator.
 - A microphone visible to the host OS.
 - Normal transcription requires an installed compatible GGUF model. Its CPU runtime is statically linked in-process; no separate runtime package or sidecar process is required.
 - GPU transcription is not currently verified. An explicit GPU preference fails clearly instead of silently changing the backend.
