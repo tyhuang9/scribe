@@ -617,7 +617,15 @@ impl OnnxWorkerSupervisor {
         if reused {
             return Ok(true);
         }
-        self.round_trip_on_generation(generation, session_id, request_id, Control::Load { model })?;
+        if let Err(error) = self.round_trip_on_generation(
+            generation,
+            session_id,
+            request_id,
+            Control::Load { model },
+        ) {
+            self.invalidate_generation(generation, "ONNX model load failed", true);
+            return Err(error);
+        }
         let mut state = self
             .inner
             .state
@@ -1417,6 +1425,7 @@ fn worker_loop_with_factory<F: WorkerRecognizerFactory>(
                     if active_stream.is_some() {
                         bail!("cannot replace an ONNX recognizer while a stream is active");
                     }
+                    drop(loaded.take());
                     let recognizer = factory.create(&model)?;
                     loaded = Some(LoadedWorkerRecognizer {
                         identity,
@@ -2091,6 +2100,7 @@ mod tests {
         InvalidResponse {
             pcm_kind: bool,
         },
+        FailChangedLoad,
     }
 
     struct TestLauncher {
@@ -2309,6 +2319,22 @@ mod tests {
                 };
                 write_frame(&mut output, &frame).unwrap();
             }
+            TestMode::FailChangedLoad => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Load { .. }));
+                respond(&mut output, session_id, request_id, Control::Ok);
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Load { .. }));
+                respond(
+                    &mut output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "replacement failed".to_owned(),
+                    },
+                );
+                let _ = read_frame(&mut input);
+            }
         }
     }
 
@@ -2489,12 +2515,12 @@ mod tests {
             .iter()
             .position(|event| event == &format!("drop-recognizer:{first_id}"))
             .unwrap();
-        assert!(create_second < drop_first);
+        assert!(drop_first < create_second);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn failed_changed_load_preserves_previous_recognizer_without_claiming_success() {
+    fn failed_changed_load_drops_previous_recognizer_and_leaves_worker_cold() {
         let root = test_root("worker-failed-load");
         let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
         let mut failing = first.clone();
@@ -2517,18 +2543,23 @@ mod tests {
 
         let responses = run_framed_fake_worker(&factory, input);
         assert_error(&responses[2], "construction failed");
-        match &responses[3].2 {
-            Control::Text {
-                text,
-                final_result: true,
-            } => assert!(text.contains(&first.id)),
-            other => panic!("expected retained recognizer transcription, got {other:?}"),
-        }
+        assert_error(&responses[3], "no ONNX model is loaded");
         let state = factory.snapshot();
         assert_eq!(state.create_attempts, 2);
         assert_eq!(state.recognizers_created, 1);
-        assert_eq!(state.transcriptions, 1);
+        assert_eq!(state.transcriptions, 0);
         assert_eq!(state.recognizer_drops, 1);
+        let dropped = state
+            .events
+            .iter()
+            .position(|event| event == &format!("drop-recognizer:{}", first.id))
+            .unwrap();
+        let attempted = state
+            .events
+            .iter()
+            .position(|event| event == "create-attempt:fail-replacement")
+            .unwrap();
+        assert!(dropped < attempted);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2912,6 +2943,35 @@ mod tests {
         sent_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         supervisor.health(3, 3).unwrap();
         assert_eq!(supervisor.generation_for_test(), replacement_generation);
+    }
+
+    #[test]
+    fn failed_changed_load_invalidates_cached_identity_and_recovers_on_clean_generation() {
+        let root = test_root("supervisor-failed-changed-load");
+        let first = spec_with_roles(&root, OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES);
+        let mut changed = first.clone();
+        changed.id = "changed-model".to_owned();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::FailChangedLoad, TestMode::Normal])
+                .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(Arc::clone(&launcher));
+
+        assert!(!supervisor.load(1, 1, first.clone()).unwrap());
+        let error = supervisor.load(2, 2, changed).unwrap_err();
+        assert!(error.to_string().contains("replacement failed"));
+        kill_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(!supervisor.load(3, 3, first.clone()).unwrap());
+        assert!(supervisor.load(4, 4, first).unwrap());
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn assert_generation_failure_fails_all_pending_and_recovers(malformed: bool) {
