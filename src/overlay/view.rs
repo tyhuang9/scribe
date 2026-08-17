@@ -270,7 +270,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(202, 211, 224),
             tentative_text: Color32::from_rgb(166, 180, 202),
-            waveform: palette.accent,
+            waveform: palette.recording_waveform,
             meter_active: palette.success,
             meter_inactive: Color32::from_rgb(128, 142, 162),
             error: palette.error,
@@ -285,7 +285,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
             tentative_text: Color32::from_rgb(72, 84, 102),
-            waveform: palette.accent,
+            waveform: palette.recording_waveform,
             meter_active: palette.success_text,
             meter_inactive: Color32::from_rgb(100, 112, 132),
             error: palette.error_text,
@@ -1645,9 +1645,12 @@ mod tests {
                 assert!(contrast(colors.tentative_text) >= 4.5);
                 assert!(contrast(colors.meter_inactive) >= 3.0);
                 assert_eq!(colors.waveform.a(), 255);
+                let waveform_contrast = contrast(colors.waveform);
                 assert!(
-                    contrast(colors.waveform) >= 3.0,
-                    "waveform glyph must remain distinguishable over a composited {background:?} backdrop"
+                    waveform_contrast >= 3.0,
+                    "waveform {:?} must remain distinguishable over composited surface {:?} on a {background:?} backdrop (contrast {waveform_contrast})",
+                    colors.waveform,
+                    surface,
                 );
             }
         }

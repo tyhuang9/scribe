@@ -192,7 +192,7 @@ fn display_tree(state: &OverlayViewState, visible: bool) -> TreeUpdate {
         }
         nodes.push((DISPLAY_PREVIEW_ID, preview.build(&mut classes)));
     }
-    if let Some(announcement) = announcement {
+    if preview_visible && let Some(announcement) = announcement {
         let mut live = NodeBuilder::new(Role::StaticText);
         live.set_name(announcement);
         live.set_live(Live::Polite);
@@ -289,5 +289,29 @@ mod tests {
                 && node.name()
                     == Some("Committed transcript: committed. Tentative transcript:  tentative")
         }));
+    }
+
+    #[test]
+    fn compact_tree_has_no_orphaned_preview_or_live_nodes() {
+        let state = OverlayViewState {
+            mode: OverlayMode::Minimal,
+            phase: OverlayPhase::Listening,
+            transcript_announcement: Some("Committed transcript: hidden compact text".to_owned()),
+            ..OverlayViewState::default()
+        };
+        let tree = display_tree(&state, true);
+        let root = tree
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == DISPLAY_ROOT_ID)
+            .map(|(_, node)| node)
+            .expect("display root");
+        assert_eq!(root.children().len(), tree.nodes.len() - 1);
+        assert!(tree.nodes.iter().all(|(_, node)| node.live().is_none()));
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|(id, _)| *id != DISPLAY_PREVIEW_ID && *id != DISPLAY_ANNOUNCEMENT_ID)
+        );
     }
 }

@@ -6,14 +6,14 @@ mod raster;
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
-    mem::{size_of, zeroed},
+    mem::{offset_of, size_of, zeroed},
     ptr::{null, null_mut},
     sync::{Arc, Mutex, OnceLock},
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
@@ -22,7 +22,8 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{
-            TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTS_ALWAYSTIP,
+            ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW,
+            TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_NEWTOOLRECTW, TTS_ALWAYSTIP,
             TTS_NOPREFIX, TTTOOLINFOW,
         },
         Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
@@ -197,7 +198,7 @@ impl NativeWindow {
         *window._procedure_state.accessibility.borrow_mut() =
             NativeAccessibility::install(hwnd, role, accessibility_bridge);
         if role == WindowRole::Control {
-            window.tooltip = NativeTooltip::create(hwnd);
+            window.tooltip = NativeTooltip::create(hwnd).ok();
         }
         Ok(window)
     }
@@ -265,8 +266,17 @@ impl NativeWindow {
             .is_some_and(|surface| surface.submit(self.hwnd, bounds, frame))
     }
 
-    fn show_no_activate(&self, bounds: OverlayWindowBounds) -> bool {
+    fn show_no_activate(&mut self, bounds: OverlayWindowBounds) -> bool {
         if !self.is_hardened() {
+            self.hide();
+            return false;
+        }
+        if self.role == WindowRole::Control
+            && !self
+                .tooltip
+                .as_mut()
+                .is_some_and(|tooltip| tooltip.update_bounds(bounds.width, bounds.height))
+        {
             self.hide();
             return false;
         }
@@ -333,13 +343,23 @@ struct NativeTooltip {
     hwnd: HWND,
     tool_hwnd: HWND,
     text: Vec<u16>,
+    rect: RECT,
 }
 
 impl NativeTooltip {
-    fn create(tool_hwnd: HWND) -> Option<Self> {
+    fn create(tool_hwnd: HWND) -> Result<Self, NativeTooltipError> {
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        };
+        if unsafe { InitCommonControlsEx(&controls) } == 0 {
+            return Err(NativeTooltipError::InitializeCommonControls(unsafe {
+                GetLastError()
+            }));
+        }
         let module = unsafe { GetModuleHandleW(null()) };
         if module.is_null() {
-            return None;
+            return Err(NativeTooltipError::ModuleHandle);
         }
         let hwnd = unsafe {
             CreateWindowExW(
@@ -358,16 +378,25 @@ impl NativeTooltip {
             )
         };
         if hwnd.is_null() {
-            return None;
+            return Err(NativeTooltipError::CreateWindow(unsafe { GetLastError() }));
         }
         let mut tooltip = Self {
             hwnd,
             tool_hwnd,
             text: wide_null(CANCEL_RECORDING_LABEL),
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
         };
         let tool = tooltip.tool_info();
         let added =
             unsafe { SendMessageW(hwnd, TTM_ADDTOOLW, 0, (&raw const tool) as LPARAM) != 0 };
+        if !added {
+            return Err(NativeTooltipError::RegisterTool);
+        }
         let positioned = unsafe {
             SetWindowPos(
                 hwnd,
@@ -379,25 +408,55 @@ impl NativeTooltip {
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             ) != 0
         };
-        if !added || !positioned {
-            return None;
+        if !positioned {
+            return Err(NativeTooltipError::PositionWindow(unsafe {
+                GetLastError()
+            }));
         }
-        Some(tooltip)
+        Ok(tooltip)
+    }
+
+    fn update_bounds(&mut self, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        self.rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let tool = self.tool_info();
+        unsafe {
+            SendMessageW(self.hwnd, TTM_NEWTOOLRECTW, 0, (&raw const tool) as LPARAM);
+        }
+        true
     }
 
     fn tool_info(&mut self) -> TTTOOLINFOW {
         TTTOOLINFOW {
-            cbSize: size_of::<TTTOOLINFOW>() as u32,
-            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            // The process does not require a comctl32 v6 visual-style manifest. Use the v2
+            // structure size so the system v5 tooltip implementation accepts the tool.
+            cbSize: offset_of!(TTTOOLINFOW, lpReserved) as u32,
+            uFlags: TTF_SUBCLASS,
             hwnd: self.tool_hwnd,
-            uId: self.tool_hwnd as usize,
-            rect: unsafe { zeroed() },
+            uId: 1,
+            rect: self.rect,
             hinst: null_mut(),
             lpszText: self.text.as_mut_ptr(),
             lParam: 0,
             lpReserved: null_mut(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeTooltipError {
+    InitializeCommonControls(u32),
+    ModuleHandle,
+    CreateWindow(u32),
+    RegisterTool,
+    PositionWindow(u32),
 }
 
 impl Drop for NativeTooltip {
@@ -773,7 +832,7 @@ unsafe extern "system" fn native_overlay_wnd_proc(
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         }
-        return 1;
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
 
     let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowProcedureState;
