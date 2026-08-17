@@ -4,7 +4,7 @@
 //! installer supplies a verified [`OnnxModelSpec`]; the router remains the only
 //! component allowed to construct a worker client.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -19,11 +19,14 @@ use sherpa_onnx::{
     OnlineRecognizerConfig, OnlineTransducerModelConfig,
 };
 
+use crate::transcription::{AccelerationPreference, ComputeDevice, ResolvedAcceleration};
+
 pub(crate) const PROTOCOL_MAGIC: [u8; 4] = *b"SCON";
 pub(crate) const PROTOCOL_VERSION: u8 = 1;
 const HEADER_LEN: usize = 26;
 const MAX_CONTROL_BYTES: usize = 256 * 1024;
 const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AUDIO_SAMPLES: usize = MAX_AUDIO_BYTES / size_of::<f32>();
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,25 +69,27 @@ impl OnnxModelSpec {
         let root = std::fs::canonicalize(&self.root)
             .map_err(|error| anyhow!("ONNX model root is unavailable: {error}"))?;
         reject_link_components(&self.root)?;
-        let required: &[OnnxFileRole] = match self.family {
-            OnnxModelFamily::Moonshine => &[OnnxFileRole::Encoder, OnnxFileRole::Tokens],
-            OnnxModelFamily::NemoCtc => &[OnnxFileRole::Model, OnnxFileRole::Tokens],
-            OnnxModelFamily::Canary => &[
-                OnnxFileRole::Encoder,
-                OnnxFileRole::Decoder,
-                OnnxFileRole::Tokens,
-            ],
-            OnnxModelFamily::OfflineTransducer | OnnxModelFamily::OnlineTransducer => &[
-                OnnxFileRole::Encoder,
-                OnnxFileRole::Decoder,
-                OnnxFileRole::Joiner,
-                OnnxFileRole::Tokens,
-            ],
-        };
-        for role in required {
-            let Some(relative) = self.files.get(role) else {
-                bail!("ONNX model {} is missing required {role:?} file", self.id);
-            };
+        if !root.is_dir() {
+            bail!(
+                "ONNX model root is not a directory: {}",
+                self.root.display()
+            );
+        }
+        let actual_roles = self.files.keys().copied().collect::<BTreeSet<_>>();
+        let expected_layouts = expected_role_layouts(self.family);
+        if !expected_layouts
+            .iter()
+            .any(|roles| roles.iter().copied().collect::<BTreeSet<_>>() == actual_roles)
+        {
+            bail!(
+                "ONNX model {} has an invalid {:?} artifact role set: expected {}, got {}",
+                self.id,
+                self.family,
+                format_role_layouts(expected_layouts),
+                format_roles(&actual_roles)
+            );
+        }
+        for (role, relative) in &self.files {
             if relative.is_absolute()
                 || relative
                     .components()
@@ -100,22 +105,11 @@ impl OnnxModelSpec {
             reject_link_components(&path)?;
             let canonical = std::fs::canonicalize(&path)
                 .map_err(|error| anyhow!("ONNX model {} file is unavailable: {error}", self.id))?;
-            if !canonical.starts_with(&root) || !canonical.is_file() {
-                bail!("ONNX model {} file is missing: {}", self.id, path.display());
-            }
-        }
-        if self.family == OnnxModelFamily::Moonshine {
-            let merged = self.files.contains_key(&OnnxFileRole::MergedDecoder);
-            let v1 = [
-                OnnxFileRole::Preprocessor,
-                OnnxFileRole::UncachedDecoder,
-                OnnxFileRole::CachedDecoder,
-            ]
-            .into_iter()
-            .all(|role| self.files.contains_key(&role));
-            if !merged && !v1 {
+            if !canonical_file_is_within_root(&root, &canonical) {
                 bail!(
-                    "Moonshine requires merged_decoder or preprocessor + uncached_decoder + cached_decoder"
+                    "ONNX model {} {role:?} file is outside its canonical root or is not a file: {}",
+                    self.id,
+                    path.display()
                 );
             }
         }
@@ -133,6 +127,84 @@ impl OnnxModelSpec {
             .map(|path| self.root.join(path).to_string_lossy().into_owned())
             .ok_or_else(|| anyhow!("ONNX model {} missing {role:?}", self.id))
     }
+}
+
+const MOONSHINE_MERGED_ROLES: &[OnnxFileRole] = &[
+    OnnxFileRole::Encoder,
+    OnnxFileRole::Tokens,
+    OnnxFileRole::MergedDecoder,
+];
+const MOONSHINE_V1_ROLES: &[OnnxFileRole] = &[
+    OnnxFileRole::Encoder,
+    OnnxFileRole::Tokens,
+    OnnxFileRole::Preprocessor,
+    OnnxFileRole::UncachedDecoder,
+    OnnxFileRole::CachedDecoder,
+];
+const NEMO_CTC_ROLES: &[OnnxFileRole] = &[OnnxFileRole::Model, OnnxFileRole::Tokens];
+const CANARY_ROLES: &[OnnxFileRole] = &[
+    OnnxFileRole::Encoder,
+    OnnxFileRole::Decoder,
+    OnnxFileRole::Tokens,
+];
+const TRANSDUCER_ROLES: &[OnnxFileRole] = &[
+    OnnxFileRole::Encoder,
+    OnnxFileRole::Decoder,
+    OnnxFileRole::Joiner,
+    OnnxFileRole::Tokens,
+];
+
+fn expected_role_layouts(family: OnnxModelFamily) -> &'static [&'static [OnnxFileRole]] {
+    match family {
+        OnnxModelFamily::Moonshine => &[MOONSHINE_MERGED_ROLES, MOONSHINE_V1_ROLES],
+        OnnxModelFamily::NemoCtc => &[NEMO_CTC_ROLES],
+        OnnxModelFamily::Canary => &[CANARY_ROLES],
+        OnnxModelFamily::OfflineTransducer | OnnxModelFamily::OnlineTransducer => {
+            &[TRANSDUCER_ROLES]
+        }
+    }
+}
+
+fn format_role_layouts(layouts: &[&[OnnxFileRole]]) -> String {
+    layouts
+        .iter()
+        .map(|roles| format_roles(&roles.iter().copied().collect()))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+fn format_roles(roles: &BTreeSet<OnnxFileRole>) -> String {
+    roles
+        .iter()
+        .map(|role| format!("{role:?}"))
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+pub(crate) fn resolve_cpu_only_acceleration(
+    requested: AccelerationPreference,
+) -> Result<ResolvedAcceleration> {
+    match requested {
+        AccelerationPreference::Auto => Ok(ResolvedAcceleration {
+            requested,
+            resolved: ComputeDevice::Cpu,
+            diagnostic: Some(
+                "sherpa-onnx runs in an isolated CPU-only worker; Auto selected CPU".to_owned(),
+            ),
+        }),
+        AccelerationPreference::Cpu => Ok(ResolvedAcceleration {
+            requested,
+            resolved: ComputeDevice::Cpu,
+            diagnostic: None,
+        }),
+        AccelerationPreference::Gpu => bail!(
+            "GPU acceleration is unavailable for sherpa-onnx because the isolated runtime is CPU-only; select Auto or CPU only"
+        ),
+    }
+}
+
+fn canonical_file_is_within_root(root: &Path, file: &Path) -> bool {
+    file.starts_with(root) && file.is_file()
 }
 
 fn reject_link_components(path: &Path) -> Result<()> {
@@ -222,6 +294,50 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame> {
     })
 }
 
+fn encode_pcm(samples: &[f32]) -> Result<Vec<u8>> {
+    validate_pcm_samples(samples)?;
+    Ok(samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect())
+}
+
+fn decode_pcm(body: &[u8]) -> Result<Vec<f32>> {
+    if body.is_empty() {
+        bail!("ONNX PCM must contain at least one sample");
+    }
+    if body.len() % size_of::<f32>() != 0 {
+        bail!("ONNX PCM byte length must be a multiple of four");
+    }
+    if body.len() > MAX_AUDIO_BYTES {
+        bail!("ONNX PCM exceeds the {MAX_AUDIO_BYTES}-byte limit");
+    }
+    let samples = body
+        .chunks_exact(size_of::<f32>())
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 chunk width is exact")))
+        .collect::<Vec<_>>();
+    validate_pcm_samples(&samples)?;
+    Ok(samples)
+}
+
+fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
+    if samples.is_empty() {
+        bail!("ONNX PCM must contain at least one sample");
+    }
+    if samples.len() > MAX_AUDIO_SAMPLES {
+        bail!("ONNX PCM exceeds the {MAX_AUDIO_BYTES}-byte limit");
+    }
+    if let Some((index, sample)) = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, sample)| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+    {
+        bail!("ONNX PCM sample {index} is non-finite or outside [-1, 1]: {sample}");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Control {
@@ -238,6 +354,30 @@ enum Control {
     Text { text: String, final_result: bool },
     Ok,
     Error { message: String },
+}
+
+impl Control {
+    fn is_parent_command(&self) -> bool {
+        matches!(
+            self,
+            Self::Hello
+                | Self::Load { .. }
+                | Self::Transcribe
+                | Self::StartStream
+                | Self::EndStream
+                | Self::Cancel
+                | Self::Unload
+                | Self::Health
+                | Self::Shutdown
+        )
+    }
+
+    fn is_worker_response(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Text { .. } | Self::Ok | Self::Error { .. }
+        )
+    }
 }
 
 fn control_frame(session_id: u64, request_id: u64, control: &Control) -> Result<Frame> {
@@ -261,6 +401,22 @@ fn parse_control(frame: Frame) -> Result<(u64, u64, Control)> {
         frame.request_id,
         serde_json::from_slice(&frame.body)?,
     ))
+}
+
+fn parse_parent_control(frame: Frame) -> Result<(u64, u64, Control)> {
+    let parsed = parse_control(frame)?;
+    if !parsed.2.is_parent_command() {
+        bail!("worker received a response-only control from its parent");
+    }
+    Ok(parsed)
+}
+
+fn parse_worker_control(frame: Frame) -> Result<(u64, u64, Control)> {
+    let parsed = parse_control(frame)?;
+    if !parsed.2.is_worker_response() {
+        bail!("parent received a command-only control from its worker");
+    }
+    Ok(parsed)
 }
 
 /// Parent-side persistent worker client. It accepts only one active request and
@@ -370,16 +526,16 @@ impl OnnxWorkerClient {
         Ok(())
     }
     fn send(&mut self, session_id: u64, request_id: u64, control: Control) -> Result<()> {
+        if !control.is_parent_command() {
+            bail!("cannot send a response-only control to the ONNX worker");
+        }
         write_frame(
             &mut self.stdin,
             &control_frame(session_id, request_id, &control)?,
         )
     }
     fn send_pcm(&mut self, session_id: u64, request_id: u64, samples: &[f32]) -> Result<()> {
-        let bytes = samples
-            .iter()
-            .flat_map(|sample| sample.to_le_bytes())
-            .collect();
+        let bytes = encode_pcm(samples)?;
         write_frame(
             &mut self.stdin,
             &Frame {
@@ -391,11 +547,17 @@ impl OnnxWorkerClient {
         )
     }
     fn receive(&mut self) -> Result<(u64, u64, Control)> {
-        parse_control(read_frame(&mut self.stdout)?)
+        parse_worker_control(read_frame(&mut self.stdout)?)
     }
     fn round_trip(&mut self, session_id: u64, request_id: u64, command: Control) -> Result<()> {
         self.send(session_id, request_id, command)?;
-        let (actual_session, actual_request, response) = self.receive()?;
+        let (actual_session, actual_request, response) = match self.receive() {
+            Ok(response) => response,
+            Err(error) => {
+                self.kill();
+                return Err(error);
+            }
+        };
         if actual_session != session_id || actual_request != request_id {
             self.kill();
             bail!(
@@ -406,11 +568,20 @@ impl OnnxWorkerClient {
         match response {
             Control::Ok | Control::Ready => Ok(()),
             Control::Error { message } => bail!("ONNX worker: {message}"),
-            _ => bail!("unexpected ONNX worker response"),
+            _ => {
+                self.kill();
+                bail!("unexpected ONNX worker response")
+            }
         }
     }
     fn await_text(&mut self, session_id: u64, request_id: u64) -> Result<String> {
-        let (actual_session, actual_request, response) = self.receive()?;
+        let (actual_session, actual_request, response) = match self.receive() {
+            Ok(response) => response,
+            Err(error) => {
+                self.kill();
+                return Err(error);
+            }
+        };
         if actual_session != session_id || actual_request != request_id {
             self.kill();
             bail!("stale ONNX worker response");
@@ -421,7 +592,10 @@ impl OnnxWorkerClient {
                 final_result: true,
             } => Ok(text),
             Control::Error { message } => bail!("ONNX worker: {message}"),
-            _ => bail!("unexpected ONNX worker transcription response"),
+            _ => {
+                self.kill();
+                bail!("unexpected ONNX worker transcription response")
+            }
         }
     }
     fn kill(&mut self) {
@@ -462,7 +636,7 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
     let mut loaded: Option<OnnxModelSpec> = None;
     loop {
         let frame = read_frame(&mut input)?;
-        let (session_id, request_id, control) = parse_control(frame)?;
+        let (session_id, request_id, control) = parse_parent_control(frame)?;
         match control {
             Control::Hello => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ready)?)?,
             Control::Load { model } => { model.validate()?; loaded = Some(model); write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; }
@@ -474,11 +648,10 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
                 None => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: "no ONNX model is loaded".into() })?)?,
                 Some(model) => {
                     let pcm = read_frame(&mut input)?;
-                    if pcm.kind != FrameKind::Pcm || pcm.session_id != session_id || pcm.request_id != request_id || pcm.body.len() % 4 != 0 {
+                    if pcm.kind != FrameKind::Pcm || pcm.session_id != session_id || pcm.request_id != request_id {
                         bail!("invalid or mis-correlated ONNX PCM frame");
                     }
-                    let samples = pcm.body.chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
-                    match native_transcribe(model, &samples) {
+                    match decode_pcm(&pcm.body).and_then(|samples| native_transcribe(model, &samples)) {
                         Ok(text) => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Text { text, final_result: true })?)?,
                         Err(error) => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: error.to_string() })?)?,
                     }
@@ -493,6 +666,7 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
 /// Creates real sherpa-onnx safe API recognizers. This is intentionally kept
 /// in the child process: a native failure cannot take down the eframe process.
 fn native_transcribe(model: &OnnxModelSpec, samples: &[f32]) -> Result<String> {
+    validate_pcm_samples(samples)?;
     if model.family == OnnxModelFamily::OnlineTransducer {
         let mut config = OnlineRecognizerConfig::default();
         config.model_config.provider = Some("cpu".into());
@@ -587,22 +761,76 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn test_root(label: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "scribe-onnx-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn spec_with_roles(
+        root: &Path,
+        family: OnnxModelFamily,
+        roles: &[OnnxFileRole],
+    ) -> OnnxModelSpec {
+        let files = roles
+            .iter()
+            .copied()
+            .map(|role| {
+                let relative = PathBuf::from(format!("{role:?}.onnx").to_ascii_lowercase());
+                std::fs::write(root.join(&relative), format!("fixture-{role:?}")).unwrap();
+                (role, relative)
+            })
+            .collect();
+        OnnxModelSpec {
+            id: format!("test-{family:?}"),
+            root: root.to_path_buf(),
+            family,
+            files,
+            num_threads: 1,
+        }
+    }
+
+    fn raw_header(version: u8, kind: u8, body_len: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PROTOCOL_MAGIC);
+        bytes.extend_from_slice(&[version, kind]);
+        bytes.extend_from_slice(&body_len.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
+        bytes.extend_from_slice(&11_u64.to_le_bytes());
+        bytes
+    }
+
     #[test]
-    fn protocol_rejects_bad_magic_version_and_oversized_frames() {
-        for bytes in [vec![0; HEADER_LEN], {
-            let mut value = Vec::new();
-            value.extend_from_slice(&PROTOCOL_MAGIC);
-            value.extend_from_slice(&[2, 1]);
-            value.extend_from_slice(&0_u32.to_le_bytes());
-            value.extend_from_slice(&0_u64.to_le_bytes());
-            value.extend_from_slice(&0_u64.to_le_bytes());
-            value
-        }] {
+    fn protocol_rejects_bad_magic_version_kind_truncation_and_oversized_frames() {
+        for bytes in [
+            vec![0; HEADER_LEN],
+            raw_header(PROTOCOL_VERSION + 1, FrameKind::Control as u8, 0),
+            raw_header(PROTOCOL_VERSION, 99, 0),
+            raw_header(PROTOCOL_VERSION, FrameKind::Control as u8, 1),
+            raw_header(
+                PROTOCOL_VERSION,
+                FrameKind::Control as u8,
+                (MAX_CONTROL_BYTES + 1) as u32,
+            ),
+            raw_header(
+                PROTOCOL_VERSION,
+                FrameKind::Pcm as u8,
+                (MAX_AUDIO_BYTES + 1) as u32,
+            ),
+        ] {
             assert!(read_frame(&mut Cursor::new(bytes)).is_err());
         }
     }
+
     #[test]
-    fn protocol_round_trips_fragmented_pcm_and_correlations() {
+    fn protocol_round_trips_pcm_and_preserves_correlations() {
         let frame = Frame {
             kind: FrameKind::Pcm,
             session_id: 7,
@@ -614,15 +842,154 @@ mod tests {
         let decoded = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, frame);
     }
+
     #[test]
-    fn model_spec_rejects_traversal_and_missing_roles() {
-        let spec = OnnxModelSpec {
-            id: "x".into(),
-            root: std::env::temp_dir(),
-            family: OnnxModelFamily::OnlineTransducer,
-            files: BTreeMap::from([(OnnxFileRole::Encoder, PathBuf::from("../encoder.onnx"))]),
-            num_threads: 1,
+    fn control_parser_enforces_direction_and_json_shape() {
+        let parent_command = control_frame(7, 11, &Control::Health).unwrap();
+        let worker_response = control_frame(7, 11, &Control::Ok).unwrap();
+        assert!(parse_parent_control(parent_command.clone()).is_ok());
+        assert!(parse_worker_control(parent_command).is_err());
+        assert!(parse_worker_control(worker_response.clone()).is_ok());
+        assert!(parse_parent_control(worker_response).is_err());
+
+        let malformed = Frame {
+            kind: FrameKind::Control,
+            session_id: 7,
+            request_id: 11,
+            body: br#"{"command":"unknown"}"#.to_vec(),
         };
+        assert!(parse_control(malformed).is_err());
+        let pcm = Frame {
+            kind: FrameKind::Pcm,
+            session_id: 7,
+            request_id: 11,
+            body: 0.0_f32.to_le_bytes().to_vec(),
+        };
+        assert!(parse_control(pcm).is_err());
+    }
+
+    #[test]
+    fn every_model_family_accepts_only_its_exact_role_layouts() {
+        let cases = [
+            (OnnxModelFamily::Moonshine, MOONSHINE_MERGED_ROLES),
+            (OnnxModelFamily::Moonshine, MOONSHINE_V1_ROLES),
+            (OnnxModelFamily::NemoCtc, NEMO_CTC_ROLES),
+            (OnnxModelFamily::Canary, CANARY_ROLES),
+            (OnnxModelFamily::OfflineTransducer, TRANSDUCER_ROLES),
+            (OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES),
+        ];
+        for (index, (family, roles)) in cases.into_iter().enumerate() {
+            let root = test_root(&format!("roles-{index}"));
+            let valid = spec_with_roles(&root, family, roles);
+            valid.validate().unwrap();
+
+            let mut missing = valid.clone();
+            missing.files.remove(roles.last().unwrap());
+            assert!(
+                missing.validate().is_err(),
+                "{family:?} accepted a missing role"
+            );
+
+            let mut extra = valid;
+            let unexpected = OnnxFileRole::Model;
+            if !extra.files.contains_key(&unexpected) {
+                let relative = PathBuf::from("unexpected.onnx");
+                std::fs::write(root.join(&relative), b"unexpected").unwrap();
+                extra.files.insert(unexpected, relative);
+            } else {
+                let relative = PathBuf::from("unexpected-joiner.onnx");
+                std::fs::write(root.join(&relative), b"unexpected").unwrap();
+                extra.files.insert(OnnxFileRole::Joiner, relative);
+            }
+            assert!(
+                extra.validate().is_err(),
+                "{family:?} accepted an extra role"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn moonshine_rejects_partial_or_mixed_decoder_layouts() {
+        let root = test_root("moonshine-mixed");
+        let mut mixed = spec_with_roles(&root, OnnxModelFamily::Moonshine, MOONSHINE_V1_ROLES);
+        let merged = PathBuf::from("merged.onnx");
+        std::fs::write(root.join(&merged), b"merged").unwrap();
+        mixed.files.insert(OnnxFileRole::MergedDecoder, merged);
+        assert!(mixed.validate().is_err());
+
+        let partial_roles = [
+            OnnxFileRole::Encoder,
+            OnnxFileRole::Tokens,
+            OnnxFileRole::Preprocessor,
+            OnnxFileRole::UncachedDecoder,
+        ];
+        assert!(
+            spec_with_roles(&root, OnnxModelFamily::Moonshine, &partial_roles)
+                .validate()
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_spec_rejects_traversal_and_canonical_escape() {
+        let root = test_root("containment");
+        let external = root
+            .parent()
+            .unwrap()
+            .join(format!("scribe-onnx-external-{}", std::process::id()));
+        std::fs::write(&external, b"external").unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_external = std::fs::canonicalize(&external).unwrap();
+        assert!(!canonical_file_is_within_root(
+            &canonical_root,
+            &canonical_external
+        ));
+
+        let mut spec = spec_with_roles(&root, OnnxModelFamily::OnlineTransducer, TRANSDUCER_ROLES);
+        spec.files.insert(
+            OnnxFileRole::Encoder,
+            PathBuf::from("..").join(external.file_name().unwrap()),
+        );
         assert!(spec.validate().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    fn pcm_codec_rejects_empty_misaligned_nonfinite_out_of_range_and_oversized_audio() {
+        assert!(validate_pcm_samples(&[]).is_err());
+        assert!(decode_pcm(&[0, 1, 2]).is_err());
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.01, 1.01] {
+            assert!(
+                validate_pcm_samples(&[invalid]).is_err(),
+                "accepted {invalid}"
+            );
+            assert!(
+                decode_pcm(&invalid.to_le_bytes()).is_err(),
+                "decoded {invalid}"
+            );
+        }
+        assert!(validate_pcm_samples(&vec![0.0; MAX_AUDIO_SAMPLES + 1]).is_err());
+
+        let samples = [-1.0, -0.25, 0.0, 0.25, 1.0];
+        let encoded = encode_pcm(&samples).unwrap();
+        assert_eq!(decode_pcm(&encoded).unwrap(), samples);
+    }
+
+    #[test]
+    fn cpu_only_acceleration_accepts_auto_and_cpu_but_rejects_gpu() {
+        let auto = resolve_cpu_only_acceleration(AccelerationPreference::Auto).unwrap();
+        assert_eq!(auto.resolved, ComputeDevice::Cpu);
+        assert!(auto.diagnostic.is_some());
+
+        let cpu = resolve_cpu_only_acceleration(AccelerationPreference::Cpu).unwrap();
+        assert_eq!(cpu.resolved, ComputeDevice::Cpu);
+        assert_eq!(cpu.diagnostic, None);
+
+        let gpu = resolve_cpu_only_acceleration(AccelerationPreference::Gpu).unwrap_err();
+        assert!(gpu.to_string().contains("CPU-only"));
+        assert!(gpu.to_string().contains("Auto or CPU"));
     }
 }
