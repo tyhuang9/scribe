@@ -937,6 +937,10 @@ fn effective_native_overlay_mode(mode: OverlayMode) -> NativeOverlayMode {
     }
 }
 
+fn live_overlay_owns_announcements(presented: bool, mode: NativeOverlayMode) -> bool {
+    presented && mode == NativeOverlayMode::Live
+}
+
 fn rolling_preview_enabled(source: RecordingSource, mode: StreamingMode) -> bool {
     source == RecordingSource::Transcribe && mode != StreamingMode::FinalOnly
 }
@@ -9424,7 +9428,10 @@ impl LocalTranscriberApp {
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             microphone_permission,
         );
-        state.suppress_live_announcements = self.overlay_presented;
+        state.suppress_live_announcements = live_overlay_owns_announcements(
+            self.overlay_presented,
+            self.overlay_controller.state().mode,
+        );
         let settings = RecordingSettingsView {
             duration_label: format!("{} seconds", self.config.recording.max_recording_seconds),
             provisional_feedback: self.config.streaming.mode != StreamingMode::FinalOnly,
@@ -11929,7 +11936,10 @@ impl LocalTranscriberApp {
             recording_mode(self.config.recording.hotkey_mode == HotkeyMode::HoldToTalk),
             self.microphone_permission(),
         );
-        state.suppress_live_announcements = self.overlay_presented;
+        state.suppress_live_announcements = live_overlay_owns_announcements(
+            self.overlay_presented,
+            self.overlay_controller.state().mode,
+        );
         let settings = RecordingSettingsView {
             close_to_tray: self.config.general.close_to_tray,
             duration_seconds: self.config.recording.max_recording_seconds,
@@ -24914,6 +24924,26 @@ mod layout_tests {
                 .tentative
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn only_a_presented_live_overlay_owns_live_announcements() {
+        assert!(live_overlay_owns_announcements(
+            true,
+            NativeOverlayMode::Live
+        ));
+        assert!(!live_overlay_owns_announcements(
+            true,
+            NativeOverlayMode::Minimal
+        ));
+        assert!(!live_overlay_owns_announcements(
+            false,
+            NativeOverlayMode::Live
+        ));
+        assert!(!live_overlay_owns_announcements(
+            true,
+            NativeOverlayMode::Off
+        ));
     }
 
     #[test]

@@ -2062,7 +2062,7 @@ mod tests {
                 "Add a speech model to start transcribing",
             ),
             (Fixture::TranscribeReady, "Start recording"),
-            (Fixture::TranscribeListening, "Listening"),
+            (Fixture::TranscribeListening, "Recording"),
             (Fixture::TranscribeFinalizing, "Finalizing transcript…"),
             (
                 Fixture::TranscribeNoSpeech,

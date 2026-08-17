@@ -1044,7 +1044,7 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                         ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     ui.painter()
                         .circle_filled(dot_rect.center(), 4.0, colors.error);
-                    let status = ui.label(RichText::new("Listening").strong().color(colors.error));
+                    let status = ui.label(RichText::new("Recording").strong().color(colors.error));
                     ui.ctx().accesskit_node_builder(status.id, |builder| {
                         if !state.suppress_live_announcements {
                             builder.set_live(egui::accesskit::Live::Polite);
@@ -8574,7 +8574,7 @@ mod tests {
     }
 
     #[test]
-    fn presented_overlay_suppresses_root_live_transcript_ownership() {
+    fn presented_live_overlay_suppresses_root_live_transcript_ownership() {
         let state = TranscriptionState {
             phase: TranscriptionPhase::Listening,
             selected_model_id: Some("base.en".into()),
@@ -8592,8 +8592,61 @@ mod tests {
                 })
         }));
         assert!(!nodes.iter().any(|(_, node)| {
-            node.live().is_some() && node.name().is_some_and(|name| name.contains("Listening"))
+            node.live().is_some() && node.name().is_some_and(|name| name.contains("Recording"))
         }));
+    }
+
+    #[test]
+    fn root_owns_live_transcript_when_overlay_does_not() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            committed_transcript: "committed words".into(),
+            provisional_transcript: "tentative words".into(),
+            suppress_live_announcements: false,
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let transcript_live_nodes = nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.live().is_some()
+                    && node
+                        .name()
+                        .is_some_and(|name| name.contains("committed words"))
+            })
+            .count();
+
+        assert_eq!(transcript_live_nodes, 1);
+        assert!(!nodes.iter().any(|(_, node)| {
+            node.live().is_some()
+                && node
+                    .name()
+                    .is_some_and(|name| name.contains("tentative words"))
+        }));
+    }
+
+    #[test]
+    fn listening_phase_is_exposed_as_recording() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording"))
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Listening"))
+        );
     }
 
     #[test]
