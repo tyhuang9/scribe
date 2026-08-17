@@ -1826,16 +1826,20 @@ impl SpeechStream for OnnxSpeechStream {
             .supervisor
             .end_stream(self.session_id, request_id)
             .map(text_only_transcript);
-        self.active = false;
-        self.activity_lease.take();
+        if result.is_ok() {
+            self.active = false;
+            self.activity_lease.take();
+        }
         result
     }
 
     fn cancel(mut self: Box<Self>) -> anyhow::Result<()> {
         let request_id = self.next_request_id();
         let result = self.supervisor.cancel_stream(self.session_id, request_id);
-        self.active = false;
-        self.activity_lease.take();
+        if result.is_ok() {
+            self.active = false;
+            self.activity_lease.take();
+        }
         result
     }
 }
@@ -2508,6 +2512,236 @@ mod tests {
         }
 
         fn abandon_stream(&self, _session_id: u64) {}
+    }
+
+    #[derive(Default)]
+    struct FailingStreamState {
+        active_session: Option<u64>,
+        started_sessions: Vec<u64>,
+        abandon_calls: usize,
+        end_calls: usize,
+        cancel_calls: usize,
+        fail_next_end: bool,
+        fail_next_cancel: bool,
+    }
+
+    #[derive(Default)]
+    struct FailingStreamControl {
+        state: Mutex<FailingStreamState>,
+    }
+
+    impl FailingStreamControl {
+        fn fail_next_end(&self) {
+            self.state.lock().unwrap().fail_next_end = true;
+        }
+
+        fn fail_next_cancel(&self) {
+            self.state.lock().unwrap().fail_next_cancel = true;
+        }
+
+        fn snapshot(&self) -> (Option<u64>, Vec<u64>, usize, usize, usize) {
+            let state = self.state.lock().unwrap();
+            (
+                state.active_session,
+                state.started_sessions.clone(),
+                state.abandon_calls,
+                state.end_calls,
+                state.cancel_calls,
+            )
+        }
+    }
+
+    impl OnnxSupervisorControl for FailingStreamControl {
+        fn load(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _model: OnnxModelSpec,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        fn transcribe(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("stream-only fake does not transcribe")
+        }
+
+        fn start_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.active_session.is_some() {
+                anyhow::bail!("fake stream already active")
+            }
+            state.active_session = Some(session_id);
+            state.started_sessions.push(session_id);
+            Ok(())
+        }
+
+        fn audio_chunk(
+            &self,
+            _session_id: u64,
+            _request_id: u64,
+            _samples: &[f32],
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn end_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<String> {
+            let mut state = self.state.lock().unwrap();
+            state.end_calls += 1;
+            if state.active_session != Some(session_id) {
+                anyhow::bail!("fake stream session mismatch")
+            }
+            if std::mem::take(&mut state.fail_next_end) {
+                anyhow::bail!("deterministic end-stream failure")
+            }
+            state.active_session = None;
+            Ok("final".to_owned())
+        }
+
+        fn cancel_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.cancel_calls += 1;
+            if state.active_session != Some(session_id) {
+                anyhow::bail!("fake stream session mismatch")
+            }
+            if std::mem::take(&mut state.fail_next_cancel) {
+                anyhow::bail!("deterministic cancel-stream failure")
+            }
+            state.active_session = None;
+            Ok(())
+        }
+
+        fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn unload(&self) -> anyhow::Result<()> {
+            self.state.lock().unwrap().active_session = None;
+            Ok(())
+        }
+
+        fn cancel_active(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn abandon_stream(&self, session_id: u64) {
+            let mut state = self.state.lock().unwrap();
+            state.abandon_calls += 1;
+            if state.active_session == Some(session_id) {
+                state.active_session = None;
+            }
+        }
+    }
+
+    fn online_stream_runtime(
+        supervisor: Arc<dyn OnnxSupervisorControl>,
+        runtime_activity: RuntimeActivity,
+    ) -> OnnxSpeechRuntime {
+        let mut runtime =
+            OnnxSpeechRuntime::new(supervisor, Arc::new(AtomicU64::new(0)), runtime_activity);
+        runtime
+            .load_model(
+                OnnxModelSpec {
+                    id: "stream-test".to_owned(),
+                    root: PathBuf::from("."),
+                    family: OnnxModelFamily::OnlineTransducer,
+                    files: std::collections::BTreeMap::new(),
+                    num_threads: 1,
+                },
+                AccelerationPreference::Cpu,
+            )
+            .unwrap();
+        runtime
+    }
+
+    #[test]
+    fn failed_stream_finalize_abandons_once_releases_lease_and_allows_recovery() {
+        let control = Arc::new(FailingStreamControl::default());
+        control.fail_next_end();
+        let activity = RuntimeActivity::default();
+        let mut runtime = online_stream_runtime(
+            Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>,
+            activity.clone(),
+        );
+
+        let stream =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        let error = stream.finalize().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic end-stream failure")
+        );
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 1);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 1);
+        assert_eq!(cancel_calls, 0);
+        assert_eq!(activity.active_streams(), 0);
+
+        let recovered =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        assert_eq!(recovered.finalize().unwrap().text, "final");
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 2);
+        assert_ne!(started_sessions[0], started_sessions[1]);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 2);
+        assert_eq!(cancel_calls, 0);
+        assert_eq!(activity.active_streams(), 0);
+    }
+
+    #[test]
+    fn failed_stream_cancel_abandons_once_releases_lease_and_allows_recovery() {
+        let control = Arc::new(FailingStreamControl::default());
+        control.fail_next_cancel();
+        let activity = RuntimeActivity::default();
+        let mut runtime = online_stream_runtime(
+            Arc::clone(&control) as Arc<dyn OnnxSupervisorControl>,
+            activity.clone(),
+        );
+
+        let stream =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        let error = stream.cancel().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic cancel-stream failure")
+        );
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 1);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 0);
+        assert_eq!(cancel_calls, 1);
+        assert_eq!(activity.active_streams(), 0);
+
+        let recovered =
+            StreamingSpeechEngine::start_stream(&mut runtime, &TranscriptionOptions::default())
+                .unwrap();
+        recovered.cancel().unwrap();
+        let (active_session, started_sessions, abandon_calls, end_calls, cancel_calls) =
+            control.snapshot();
+        assert_eq!(active_session, None);
+        assert_eq!(started_sessions.len(), 2);
+        assert_ne!(started_sessions[0], started_sessions[1]);
+        assert_eq!(abandon_calls, 1);
+        assert_eq!(end_calls, 0);
+        assert_eq!(cancel_calls, 2);
+        assert_eq!(activity.active_streams(), 0);
     }
 
     fn collect_rust_sources(root: &Path, output: &mut Vec<(PathBuf, String)>) {
