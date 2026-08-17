@@ -16,6 +16,7 @@ mod installed_manifest;
 mod managed_downloads;
 mod model_catalog;
 mod models;
+mod onnx_worker;
 mod overlay;
 mod prepared_audio;
 mod runtime_catalog;
@@ -41,6 +42,9 @@ enum LinuxDisplayBackend {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = onnx_worker::maybe_run_worker() {
+        std::process::exit(exit_code);
+    }
     if let Some(exit_code) = transcription::maybe_run_installation_smoke_helper() {
         std::process::exit(exit_code);
     }
