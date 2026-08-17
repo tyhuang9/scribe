@@ -1,4 +1,6 @@
 mod controller;
+#[cfg(target_os = "windows")]
+mod native_windows;
 pub mod platform;
 mod view;
 
