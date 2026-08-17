@@ -4,11 +4,14 @@
 //! installer supplies a verified [`OnnxModelSpec`]; the router remains the only
 //! component allowed to construct a worker client.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Write};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -342,18 +345,28 @@ fn validate_pcm_samples(samples: &[f32]) -> Result<()> {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Control {
     Hello,
-    Load { model: OnnxModelSpec },
+    Load {
+        model: OnnxModelSpec,
+    },
     Transcribe,
     StartStream,
     EndStream,
-    Cancel,
+    Cancel {
+        target_session_id: u64,
+        target_request_id: u64,
+    },
     Unload,
     Health,
     Shutdown,
     Ready,
-    Text { text: String, final_result: bool },
+    Text {
+        text: String,
+        final_result: bool,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 impl Control {
@@ -365,7 +378,7 @@ impl Control {
                 | Self::Transcribe
                 | Self::StartStream
                 | Self::EndStream
-                | Self::Cancel
+                | Self::Cancel { .. }
                 | Self::Unload
                 | Self::Health
                 | Self::Shutdown
@@ -419,32 +432,35 @@ fn parse_worker_control(frame: Frame) -> Result<(u64, u64, Control)> {
     Ok(parsed)
 }
 
-/// Parent-side persistent worker client. It accepts only one active request and
-/// drops a process on protocol failure, so stale responses cannot survive a
-/// generation restart.
-pub(crate) struct OnnxWorkerClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+type PendingResult = std::result::Result<Control, String>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Correlation {
     generation: u64,
-    active_model: Option<String>,
+    session_id: u64,
+    request_id: u64,
 }
 
-impl OnnxWorkerClient {
-    pub(crate) fn spawn() -> Result<Self> {
-        let (child, stdin, stdout) = Self::spawn_process()?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout,
-            generation: 1,
-            active_model: None,
-        };
-        client.round_trip(0, 0, Control::Hello)?;
-        Ok(client)
-    }
+trait WorkerProcess: Send + Sync {
+    fn is_running(&self) -> Result<bool>;
+    fn kill_and_wait(&self) -> Result<()>;
+    fn wait(&self) -> Result<()>;
+}
 
-    fn spawn_process() -> Result<(Child, ChildStdin, ChildStdout)> {
+struct SpawnedWorker {
+    stdin: Box<dyn Write + Send>,
+    stdout: Box<dyn Read + Send>,
+    process: Arc<dyn WorkerProcess>,
+}
+
+trait WorkerLauncher: Send + Sync {
+    fn launch(&self) -> Result<SpawnedWorker>;
+}
+
+struct OsWorkerLauncher;
+
+impl WorkerLauncher for OsWorkerLauncher {
+    fn launch(&self) -> Result<SpawnedWorker> {
         let executable = std::env::current_exe()?;
         let mut child = Command::new(executable)
             .arg("--onnx-worker")
@@ -460,156 +476,675 @@ impl OnnxWorkerClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ONNX worker stdout unavailable"))?;
-        Ok((child, stdin, stdout))
+        Ok(SpawnedWorker {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            process: Arc::new(OsWorkerProcess {
+                child: Mutex::new(child),
+            }),
+        })
+    }
+}
+
+struct OsWorkerProcess {
+    child: Mutex<Child>,
+}
+
+impl WorkerProcess for OsWorkerProcess {
+    fn is_running(&self) -> Result<bool> {
+        Ok(self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?
+            .try_wait()?
+            .is_none())
     }
 
-    fn ensure_worker(&mut self) -> Result<()> {
-        if self.child.try_wait()?.is_none() {
-            return Ok(());
+    fn kill_and_wait(&self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?;
+        if child.try_wait()?.is_none() {
+            if let Err(kill_error) = child.kill()
+                && child.try_wait()?.is_none()
+            {
+                return Err(anyhow!("could not terminate ONNX worker: {kill_error}"));
+            }
         }
-        let (child, stdin, stdout) = Self::spawn_process()?;
-        self.child = child;
-        self.stdin = stdin;
-        self.stdout = stdout;
-        self.generation = self.generation.saturating_add(1);
-        self.active_model = None;
-        self.round_trip(0, 0, Control::Hello)
+        child.wait()?;
+        Ok(())
+    }
+
+    fn wait(&self) -> Result<()> {
+        let _ = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("ONNX worker process lock was poisoned"))?
+            .wait()?;
+        Ok(())
+    }
+}
+
+struct WriterSlot {
+    generation: u64,
+    stdin: Box<dyn Write + Send>,
+}
+
+struct CurrentGeneration {
+    generation: u64,
+    process: Arc<dyn WorkerProcess>,
+}
+
+#[derive(Default)]
+struct SupervisorState {
+    next_generation: u64,
+    current: Option<CurrentGeneration>,
+    active_request: Option<Correlation>,
+    active_model: Option<(u64, String)>,
+}
+
+struct SupervisorInner {
+    // Locking rule: spawn_gate is the sole outer lock during generation startup;
+    // no other path acquires it. State, writer, and pending are otherwise taken
+    // sequentially, never nested. Invalidation uses writer.try_lock so process
+    // termination never depends on pipe progress.
+    launcher: Arc<dyn WorkerLauncher>,
+    reaper: std::sync::mpsc::Sender<ReapRequest>,
+    spawn_gate: Mutex<()>,
+    state: Mutex<SupervisorState>,
+    writer: Mutex<Option<WriterSlot>>,
+    pending: Mutex<HashMap<Correlation, SyncSender<PendingResult>>>,
+}
+
+/// Cloneable parent-side worker supervisor. Request threads block only on their
+/// own correlated reply channel. A dedicated reader owns each generation's
+/// stdout, and stdin is locked only while a complete logical request is emitted.
+#[derive(Clone)]
+pub(crate) struct OnnxWorkerSupervisor {
+    inner: Arc<SupervisorInner>,
+}
+
+impl OnnxWorkerSupervisor {
+    pub(crate) fn spawn() -> Result<Self> {
+        Self::with_launcher(Arc::new(OsWorkerLauncher))
+    }
+
+    fn with_launcher(launcher: Arc<dyn WorkerLauncher>) -> Result<Self> {
+        let reaper = start_reaper()?;
+        let supervisor = Self {
+            inner: Arc::new(SupervisorInner {
+                launcher,
+                reaper,
+                spawn_gate: Mutex::new(()),
+                state: Mutex::new(SupervisorState::default()),
+                writer: Mutex::new(None),
+                pending: Mutex::new(HashMap::new()),
+            }),
+        };
+        supervisor.ensure_generation()?;
+        Ok(supervisor)
     }
 
     pub(crate) fn load(
-        &mut self,
+        &self,
         session_id: u64,
         request_id: u64,
         model: OnnxModelSpec,
     ) -> Result<bool> {
-        self.ensure_worker()?;
         let identity = model.fingerprint()?;
-        let reused = self.active_model.as_deref() == Some(&identity);
-        if !reused {
-            self.round_trip(
-                session_id,
-                request_id,
-                Control::Load {
-                    model: model.clone(),
-                },
-            )?;
-            self.active_model = Some(identity);
+        let generation = self.ensure_generation()?;
+        let reused = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?
+            .active_model
+            .as_ref()
+            .is_some_and(|(loaded_generation, loaded_identity)| {
+                *loaded_generation == generation && loaded_identity == &identity
+            });
+        if reused {
+            return Ok(true);
         }
-        Ok(reused)
+        self.round_trip_on_generation(generation, session_id, request_id, Control::Load { model })?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            state.active_model = Some((generation, identity));
+        }
+        Ok(false)
     }
 
     pub(crate) fn transcribe(
-        &mut self,
+        &self,
         session_id: u64,
         request_id: u64,
         samples: &[f32],
     ) -> Result<String> {
-        self.ensure_worker()?;
-        self.send(session_id, request_id, Control::Transcribe)?;
-        self.send_pcm(session_id, request_id, samples)?;
-        self.await_text(session_id, request_id)
-    }
-
-    pub(crate) fn cancel(&mut self, session_id: u64, request_id: u64) -> Result<()> {
-        // Native offline decode is not interruptible. The process boundary is
-        // the cancellation mechanism: terminate without attempting a blocking
-        // receive, then lazily respawn on the next use.
-        self.kill();
-        let _ = (session_id, request_id);
-        Ok(())
-    }
-
-    pub(crate) fn unload(&mut self) -> Result<()> {
-        self.ensure_worker()?;
-        self.round_trip(0, 0, Control::Unload)?;
-        self.active_model = None;
-        Ok(())
-    }
-    fn send(&mut self, session_id: u64, request_id: u64, control: Control) -> Result<()> {
-        if !control.is_parent_command() {
-            bail!("cannot send a response-only control to the ONNX worker");
+        let pcm = encode_pcm(samples)?;
+        let generation = self.ensure_generation()?;
+        let correlation = Correlation {
+            generation,
+            session_id,
+            request_id,
+        };
+        let response = self.register(correlation)?;
+        let active_error = match self.inner.state.lock() {
+            Ok(mut state)
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation) =>
+            {
+                if state.active_request.is_some() {
+                    Some(anyhow!("an ONNX transcription request is already active"))
+                } else {
+                    state.active_request = Some(correlation);
+                    None
+                }
+            }
+            Ok(_) => Some(anyhow!(
+                "ONNX worker generation {generation} is unavailable"
+            )),
+            Err(_) => Some(anyhow!("ONNX supervisor state lock was poisoned")),
+        };
+        if let Some(error) = active_error {
+            self.unregister(correlation);
+            return Err(error);
         }
-        write_frame(
-            &mut self.stdin,
-            &control_frame(session_id, request_id, &control)?,
-        )
-    }
-    fn send_pcm(&mut self, session_id: u64, request_id: u64, samples: &[f32]) -> Result<()> {
-        let bytes = encode_pcm(samples)?;
-        write_frame(
-            &mut self.stdin,
-            &Frame {
+        let control = match control_frame(session_id, request_id, &Control::Transcribe) {
+            Ok(control) => control,
+            Err(error) => {
+                self.unregister(correlation);
+                self.clear_active(correlation);
+                return Err(error);
+            }
+        };
+        let frames = [
+            control,
+            Frame {
                 kind: FrameKind::Pcm,
                 session_id,
                 request_id,
-                body: bytes,
+                body: pcm,
             },
-        )
-    }
-    fn receive(&mut self) -> Result<(u64, u64, Control)> {
-        parse_worker_control(read_frame(&mut self.stdout)?)
-    }
-    fn round_trip(&mut self, session_id: u64, request_id: u64, command: Control) -> Result<()> {
-        self.send(session_id, request_id, command)?;
-        let (actual_session, actual_request, response) = match self.receive() {
-            Ok(response) => response,
-            Err(error) => {
-                self.kill();
-                return Err(error);
-            }
-        };
-        if actual_session != session_id || actual_request != request_id {
-            self.kill();
-            bail!(
-                "stale or mis-correlated ONNX worker response from generation {}",
-                self.generation
-            );
+        ];
+        if let Err(error) = self.write_frames(generation, &frames) {
+            self.invalidate_generation(generation, &error.to_string(), true);
         }
-        match response {
-            Control::Ok | Control::Ready => Ok(()),
-            Control::Error { message } => bail!("ONNX worker: {message}"),
-            _ => {
-                self.kill();
-                bail!("unexpected ONNX worker response")
-            }
-        }
-    }
-    fn await_text(&mut self, session_id: u64, request_id: u64) -> Result<String> {
-        let (actual_session, actual_request, response) = match self.receive() {
-            Ok(response) => response,
-            Err(error) => {
-                self.kill();
-                return Err(error);
-            }
-        };
-        if actual_session != session_id || actual_request != request_id {
-            self.kill();
-            bail!("stale ONNX worker response");
-        }
-        match response {
+        let result = self.await_response(response);
+        self.clear_active(correlation);
+        match result? {
             Control::Text {
                 text,
                 final_result: true,
             } => Ok(text),
             Control::Error { message } => bail!("ONNX worker: {message}"),
             _ => {
-                self.kill();
+                self.invalidate_generation(
+                    generation,
+                    "unexpected ONNX worker transcription response",
+                    true,
+                );
                 bail!("unexpected ONNX worker transcription response")
             }
         }
     }
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.generation = self.generation.saturating_add(1);
-        self.active_model = None;
+
+    pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
+        let generation = self.ensure_generation()?;
+        self.round_trip_on_generation(generation, session_id, request_id, Control::Health)
+    }
+
+    pub(crate) fn unload(&self) -> Result<()> {
+        let generation = self.ensure_generation()?;
+        self.round_trip_on_generation(generation, 0, 0, Control::Unload)?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            state.active_model = None;
+        }
+        Ok(())
+    }
+
+    /// Cancels without taking the request waiter's or stdin writer's lock. The
+    /// worker currently reads controls and performs native decode on the same
+    /// thread, so a cooperative Cancel cannot be observed while decode is
+    /// blocked. The supervisor therefore fails the exact active correlation,
+    /// invalidates its generation, and starts an owned OS kill/wait reaper
+    /// immediately. Cancellation is independent of blocked pipe I/O, and stale
+    /// output cannot reach a later generation.
+    pub(crate) fn cancel_active(&self) -> Result<()> {
+        let target = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            let Some(target) = state.active_request else {
+                return Ok(());
+            };
+            let Some(current) = state.current.as_ref() else {
+                return Ok(());
+            };
+            if current.generation != target.generation {
+                return Ok(());
+            }
+            state.active_request = None;
+            target
+        };
+
+        let waiter = self
+            .inner
+            .pending
+            .lock()
+            .map_err(|_| anyhow!("ONNX pending map lock was poisoned"))?
+            .remove(&target);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(Err("ONNX transcription request was cancelled".to_owned()));
+        } else {
+            // The stdout reader already claimed the response. Treat that as
+            // completion winning the race rather than killing a healthy
+            // generation after its request has completed.
+            return Ok(());
+        }
+        self.invalidate_generation(target.generation, "ONNX request cancelled", true);
+        Ok(())
+    }
+
+    fn ensure_generation(&self) -> Result<u64> {
+        let _spawn_guard = self
+            .inner
+            .spawn_gate
+            .lock()
+            .map_err(|_| anyhow!("ONNX spawn lock was poisoned"))?;
+        let existing = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            state
+                .current
+                .as_ref()
+                .map(|current| (current.generation, Arc::clone(&current.process)))
+        };
+        if let Some((generation, process)) = existing {
+            match process.is_running() {
+                Ok(true) => return Ok(generation),
+                Ok(false) => {
+                    self.invalidate_generation(generation, "ONNX worker exited", false);
+                }
+                Err(error) => {
+                    self.invalidate_generation(
+                        generation,
+                        "could not inspect ONNX worker process",
+                        true,
+                    );
+                    return Err(anyhow!("could not inspect ONNX worker process: {error}"));
+                }
+            }
+        }
+
+        let SpawnedWorker {
+            stdin,
+            stdout,
+            process,
+        } = self.inner.launcher.launch()?;
+        let generation = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("ONNX supervisor state lock was poisoned"))?;
+            state.next_generation = state.next_generation.saturating_add(1).max(1);
+            let generation = state.next_generation;
+            state.current = Some(CurrentGeneration {
+                generation,
+                process: Arc::clone(&process),
+            });
+            state.active_model = None;
+            generation
+        };
+        *self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("ONNX writer lock was poisoned"))? =
+            Some(WriterSlot { generation, stdin });
+        if let Err(error) = Self::start_reader(&self.inner, generation, stdout) {
+            self.invalidate_generation(generation, &error.to_string(), true);
+            return Err(error);
+        }
+        if let Err(error) = self.round_trip_on_generation(generation, 0, 0, Control::Hello) {
+            self.invalidate_generation(generation, &error.to_string(), true);
+            return Err(error);
+        }
+        Ok(generation)
+    }
+
+    fn start_reader(
+        inner: &Arc<SupervisorInner>,
+        generation: u64,
+        mut stdout: Box<dyn Read + Send>,
+    ) -> Result<()> {
+        let weak = Arc::downgrade(inner);
+        std::thread::Builder::new()
+            .name(format!("scribe-onnx-reader-{generation}"))
+            .spawn(move || {
+                loop {
+                    let response = read_frame(&mut stdout).and_then(parse_worker_control);
+                    let Some(inner) = Weak::upgrade(&weak) else {
+                        break;
+                    };
+                    let (session_id, request_id, control) = match response {
+                        Ok(response) => response,
+                        Err(error) => {
+                            OnnxWorkerSupervisor::from_inner(inner).invalidate_generation(
+                                generation,
+                                &format!("ONNX worker stdout failed: {error}"),
+                                true,
+                            );
+                            break;
+                        }
+                    };
+                    let correlation = Correlation {
+                        generation,
+                        session_id,
+                        request_id,
+                    };
+                    let waiter = match inner.pending.lock() {
+                        Ok(mut pending) => pending.remove(&correlation),
+                        Err(_) => None,
+                    };
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(Ok(control));
+                        continue;
+                    }
+                    OnnxWorkerSupervisor::from_inner(inner).invalidate_generation(
+                        generation,
+                        "stale or mis-correlated ONNX worker response",
+                        true,
+                    );
+                    break;
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| anyhow!("could not start ONNX worker stdout reader: {error}"))
+    }
+
+    fn from_inner(inner: Arc<SupervisorInner>) -> Self {
+        Self { inner }
+    }
+
+    fn register(&self, correlation: Correlation) -> Result<Receiver<PendingResult>> {
+        let (reply, response) = sync_channel(1);
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .map_err(|_| anyhow!("ONNX pending map lock was poisoned"))?;
+        match pending.entry(correlation) {
+            Entry::Vacant(entry) => {
+                entry.insert(reply);
+            }
+            Entry::Occupied(_) => {
+                bail!(
+                    "duplicate ONNX request correlation for generation {}, session {}, request {}",
+                    correlation.generation,
+                    correlation.session_id,
+                    correlation.request_id
+                );
+            }
+        }
+        drop(pending);
+        let current = match self.inner.state.lock() {
+            Ok(state) => state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.generation == correlation.generation),
+            Err(_) => {
+                self.unregister(correlation);
+                bail!("ONNX supervisor state lock was poisoned");
+            }
+        };
+        if !current {
+            self.unregister(correlation);
+            bail!(
+                "ONNX worker generation {} is unavailable",
+                correlation.generation
+            );
+        }
+        Ok(response)
+    }
+
+    fn unregister(&self, correlation: Correlation) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(&correlation);
+        }
+    }
+
+    fn round_trip_on_generation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        command: Control,
+    ) -> Result<()> {
+        if !command.is_parent_command() {
+            bail!("cannot send a response-only control to the ONNX worker");
+        }
+        let expects_ready = matches!(command, Control::Hello);
+        let correlation = Correlation {
+            generation,
+            session_id,
+            request_id,
+        };
+        let response = self.register(correlation)?;
+        let frame = match control_frame(session_id, request_id, &command) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.unregister(correlation);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.write_frames(generation, &[frame]) {
+            self.invalidate_generation(generation, &error.to_string(), true);
+        }
+        match self.await_response(response)? {
+            Control::Ready if expects_ready => Ok(()),
+            Control::Ok if !expects_ready => Ok(()),
+            Control::Error { message } => bail!("ONNX worker: {message}"),
+            _ => {
+                self.invalidate_generation(
+                    generation,
+                    "unexpected ONNX worker control response",
+                    true,
+                );
+                bail!("unexpected ONNX worker control response")
+            }
+        }
+    }
+
+    fn write_frames(&self, generation: u64, frames: &[Frame]) -> Result<()> {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("ONNX writer lock was poisoned"))?;
+        let slot = writer
+            .as_mut()
+            .filter(|slot| slot.generation == generation)
+            .ok_or_else(|| anyhow!("ONNX worker generation {generation} is unavailable"))?;
+        for frame in frames {
+            write_frame(&mut slot.stdin, frame)?;
+        }
+        Ok(())
+    }
+
+    fn await_response(&self, response: Receiver<PendingResult>) -> Result<Control> {
+        response
+            .recv()
+            .map_err(|_| anyhow!("ONNX worker response channel disconnected"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn clear_active(&self, correlation: Correlation) {
+        if let Ok(mut state) = self.inner.state.lock()
+            && state.active_request == Some(correlation)
+        {
+            state.active_request = None;
+        }
+    }
+
+    fn invalidate_generation(&self, generation: u64, reason: &str, force_kill: bool) {
+        let process = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
+            let Some(current) = state.current.as_ref() else {
+                return;
+            };
+            if current.generation != generation {
+                return;
+            }
+            let process = Arc::clone(&current.process);
+            state.current = None;
+            state.active_request = None;
+            state.active_model = None;
+            process
+        };
+        let failed = if let Ok(mut pending) = self.inner.pending.lock() {
+            let correlations = pending
+                .keys()
+                .copied()
+                .filter(|correlation| correlation.generation == generation)
+                .collect::<Vec<_>>();
+            correlations
+                .into_iter()
+                .filter_map(|correlation| pending.remove(&correlation))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for waiter in failed {
+            let _ = waiter.send(Err(reason.to_owned()));
+        }
+        let _ = self.inner.reaper.send(ReapRequest {
+            process,
+            force_kill,
+        });
+        // Invalidation, especially cancellation, must never wait for a pipe
+        // writer that is blocked in an OS write. Killing the process releases
+        // that writer; a later generation replaces the stale slot. Clear it
+        // eagerly only when the mutex is immediately available.
+        if let Ok(mut writer) = self.inner.writer.try_lock()
+            && writer
+                .as_ref()
+                .is_some_and(|slot| slot.generation == generation)
+        {
+            *writer = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn abandon_generation_for_test(&self, generation: u64, reason: &str) {
+        let process = {
+            let mut state = self.inner.state.lock().unwrap();
+            let current = state.current.take().unwrap();
+            assert_eq!(current.generation, generation);
+            state.active_request = None;
+            state.active_model = None;
+            current.process
+        };
+        self.inner.writer.lock().unwrap().take();
+        let failed = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let keys = pending
+                .keys()
+                .copied()
+                .filter(|key| key.generation == generation)
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| pending.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for waiter in failed {
+            let _ = waiter.send(Err(reason.to_owned()));
+        }
+        drop(process);
+    }
+
+    #[cfg(test)]
+    fn generation_for_test(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .generation
     }
 }
 
-impl Drop for OnnxWorkerClient {
+struct ReapRequest {
+    process: Arc<dyn WorkerProcess>,
+    force_kill: bool,
+}
+
+fn start_reaper() -> Result<std::sync::mpsc::Sender<ReapRequest>> {
+    let (requests, receiver) = std::sync::mpsc::channel::<ReapRequest>();
+    std::thread::Builder::new()
+        .name("scribe-onnx-reaper".to_owned())
+        .spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let result = if request.force_kill {
+                    request.process.kill_and_wait()
+                } else {
+                    request.process.wait()
+                };
+                if let Err(error) = result {
+                    eprintln!("ONNX worker reaper failed: {error:#}");
+                }
+            }
+        })
+        .map(|_| requests)
+        .map_err(|error| anyhow!("could not start ONNX worker reaper: {error}"))
+}
+
+impl Drop for SupervisorInner {
     fn drop(&mut self) {
-        let _ = self.send(0, 0, Control::Shutdown);
-        self.kill();
+        self.writer
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(current) = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .take()
+        {
+            if let Err(error) = current.process.kill_and_wait() {
+                eprintln!("ONNX worker shutdown failed: {error:#}");
+            }
+        }
     }
 }
 
@@ -642,7 +1177,7 @@ fn worker_loop(mut input: impl Read, mut output: impl Write) -> Result<()> {
             Control::Load { model } => { model.validate()?; loaded = Some(model); write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; }
             Control::Health => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?,
             Control::Unload => { loaded = None; write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; }
-            Control::Cancel => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?,
+            Control::Cancel { .. } => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?,
             Control::Shutdown => { write_frame(&mut output, &control_frame(session_id, request_id, &Control::Ok)?)?; return Ok(()); }
             Control::Transcribe => match loaded.as_ref() {
                 None => write_frame(&mut output, &control_frame(session_id, request_id, &Control::Error { message: "no ONNX model is loaded".into() })?)?,
@@ -759,7 +1294,329 @@ fn native_transcribe(model: &OnnxModelSpec, samples: &[f32]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver as TestReceiver, Sender as TestSender, channel};
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    enum PipeChunk {
+        Bytes(Vec<u8>),
+        Eof,
+    }
+
+    struct ChannelWriter {
+        sender: TestSender<PipeChunk>,
+    }
+
+    impl Write for ChannelWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.sender
+                .send(PipeChunk::Bytes(bytes.to_vec()))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ChannelReader {
+        receiver: TestReceiver<PipeChunk>,
+        buffered: Cursor<Vec<u8>>,
+        eof: bool,
+    }
+
+    impl ChannelReader {
+        fn new(receiver: TestReceiver<PipeChunk>) -> Self {
+            Self {
+                receiver,
+                buffered: Cursor::new(Vec::new()),
+                eof: false,
+            }
+        }
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let read = self.buffered.read(output)?;
+                if read != 0 || self.eof {
+                    return Ok(read);
+                }
+                match self.receiver.recv() {
+                    Ok(PipeChunk::Bytes(bytes)) => self.buffered = Cursor::new(bytes),
+                    Ok(PipeChunk::Eof) | Err(_) => self.eof = true,
+                }
+            }
+        }
+    }
+
+    struct TestProcess {
+        running: AtomicBool,
+        input: TestSender<PipeChunk>,
+        output: TestSender<PipeChunk>,
+        worker: Mutex<Option<JoinHandle<()>>>,
+        kill_started: Option<TestSender<()>>,
+        reaped: Option<TestSender<()>>,
+    }
+
+    impl WorkerProcess for TestProcess {
+        fn is_running(&self) -> Result<bool> {
+            Ok(self.running.load(Ordering::Acquire))
+        }
+
+        fn kill_and_wait(&self) -> Result<()> {
+            if let Some(kill_started) = &self.kill_started {
+                let _ = kill_started.send(());
+            }
+            self.running.store(false, Ordering::Release);
+            let _ = self.input.send(PipeChunk::Eof);
+            let _ = self.output.send(PipeChunk::Eof);
+            self.wait()?;
+            if let Some(reaped) = &self.reaped {
+                let _ = reaped.send(());
+            }
+            Ok(())
+        }
+
+        fn wait(&self) -> Result<()> {
+            if let Some(worker) = self
+                .worker
+                .lock()
+                .map_err(|_| anyhow!("test worker lock poisoned"))?
+                .take()
+            {
+                let _ = worker.join();
+            }
+            Ok(())
+        }
+    }
+
+    enum TestMode {
+        Normal,
+        BlockedDecode {
+            started: TestSender<()>,
+        },
+        HoldOne {
+            started: TestSender<()>,
+            release: TestReceiver<()>,
+        },
+        HoldStale {
+            started: TestSender<()>,
+            release: TestReceiver<()>,
+            sent: TestSender<()>,
+        },
+        FailTwo {
+            received: TestSender<()>,
+            malformed: bool,
+        },
+        InvalidResponse {
+            pcm_kind: bool,
+        },
+    }
+
+    struct TestLauncher {
+        modes: Mutex<VecDeque<TestMode>>,
+        launches: AtomicUsize,
+        kill_started: Option<TestSender<()>>,
+        reaped: Option<TestSender<()>>,
+    }
+
+    impl TestLauncher {
+        fn new(modes: impl IntoIterator<Item = TestMode>) -> Self {
+            Self {
+                modes: Mutex::new(modes.into_iter().collect()),
+                launches: AtomicUsize::new(0),
+                kill_started: None,
+                reaped: None,
+            }
+        }
+
+        fn with_process_events(
+            mut self,
+            kill_started: TestSender<()>,
+            reaped: TestSender<()>,
+        ) -> Self {
+            self.kill_started = Some(kill_started);
+            self.reaped = Some(reaped);
+            self
+        }
+    }
+
+    impl WorkerLauncher for TestLauncher {
+        fn launch(&self) -> Result<SpawnedWorker> {
+            let mode = self
+                .modes
+                .lock()
+                .map_err(|_| anyhow!("test launcher lock poisoned"))?
+                .pop_front()
+                .ok_or_else(|| anyhow!("test launcher has no generation script"))?;
+            self.launches.fetch_add(1, Ordering::AcqRel);
+            let (parent_input, worker_input) = channel();
+            let (worker_output, parent_output) = channel();
+            let process = Arc::new(TestProcess {
+                running: AtomicBool::new(true),
+                input: parent_input.clone(),
+                output: worker_output.clone(),
+                worker: Mutex::new(None),
+                kill_started: self.kill_started.clone(),
+                reaped: self.reaped.clone(),
+            });
+            let worker_process = Arc::clone(&process);
+            let worker_output_for_exit = worker_output.clone();
+            let worker = std::thread::spawn(move || {
+                let input = ChannelReader::new(worker_input);
+                let output = ChannelWriter {
+                    sender: worker_output,
+                };
+                run_test_worker(input, output, mode);
+                worker_process.running.store(false, Ordering::Release);
+                let _ = worker_output_for_exit.send(PipeChunk::Eof);
+            });
+            *process.worker.lock().unwrap() = Some(worker);
+            Ok(SpawnedWorker {
+                stdin: Box::new(ChannelWriter {
+                    sender: parent_input,
+                }),
+                stdout: Box::new(ChannelReader::new(parent_output)),
+                process,
+            })
+        }
+    }
+
+    fn read_parent_control(input: &mut impl Read) -> (u64, u64, Control) {
+        parse_parent_control(read_frame(input).unwrap()).unwrap()
+    }
+
+    fn respond(output: &mut impl Write, session_id: u64, request_id: u64, control: Control) {
+        write_frame(
+            output,
+            &control_frame(session_id, request_id, &control).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn handshake(input: &mut impl Read, output: &mut impl Write) {
+        let (session_id, request_id, control) = read_parent_control(input);
+        assert!(matches!(control, Control::Hello));
+        respond(output, session_id, request_id, Control::Ready);
+    }
+
+    fn run_normal_worker(input: &mut impl Read, output: &mut impl Write) {
+        loop {
+            let Ok(frame) = read_frame(input) else {
+                return;
+            };
+            let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+            match control {
+                Control::Transcribe => {
+                    let pcm = read_frame(input).unwrap();
+                    assert_eq!(pcm.kind, FrameKind::Pcm);
+                    assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                    respond(
+                        output,
+                        session_id,
+                        request_id,
+                        Control::Text {
+                            text: "test transcript".to_owned(),
+                            final_result: true,
+                        },
+                    );
+                }
+                Control::Shutdown => {
+                    respond(output, session_id, request_id, Control::Ok);
+                    return;
+                }
+                Control::Hello
+                | Control::Load { .. }
+                | Control::Cancel { .. }
+                | Control::Unload
+                | Control::Health => respond(output, session_id, request_id, Control::Ok),
+                Control::StartStream | Control::EndStream => respond(
+                    output,
+                    session_id,
+                    request_id,
+                    Control::Error {
+                        message: "streaming unavailable".to_owned(),
+                    },
+                ),
+                Control::Ready | Control::Text { .. } | Control::Ok | Control::Error { .. } => {
+                    panic!("test parent sent response-only control")
+                }
+            }
+        }
+    }
+
+    fn run_test_worker(mut input: impl Read, mut output: impl Write, mode: TestMode) {
+        handshake(&mut input, &mut output);
+        match mode {
+            TestMode::Normal => run_normal_worker(&mut input, &mut output),
+            TestMode::BlockedDecode { started } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Transcribe));
+                let pcm = read_frame(&mut input).unwrap();
+                assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                started.send(()).unwrap();
+                let _ = read_frame(&mut input);
+            }
+            TestMode::HoldOne { started, release } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Health));
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                respond(&mut output, session_id, request_id, Control::Ok);
+                run_normal_worker(&mut input, &mut output);
+            }
+            TestMode::HoldStale {
+                started,
+                release,
+                sent,
+            } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Health));
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                respond(&mut output, session_id, request_id, Control::Ok);
+                sent.send(()).unwrap();
+            }
+            TestMode::FailTwo {
+                received,
+                malformed,
+            } => {
+                for _ in 0..2 {
+                    let (_, _, control) = read_parent_control(&mut input);
+                    assert!(matches!(control, Control::Health));
+                }
+                received.send(()).unwrap();
+                if malformed {
+                    output.write_all(b"BAD!").unwrap();
+                    output.flush().unwrap();
+                }
+            }
+            TestMode::InvalidResponse { pcm_kind } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::Health));
+                let frame = if pcm_kind {
+                    Frame {
+                        kind: FrameKind::Pcm,
+                        session_id,
+                        request_id,
+                        body: 0.0_f32.to_le_bytes().to_vec(),
+                    }
+                } else {
+                    control_frame(session_id, request_id, &Control::Health).unwrap()
+                };
+                write_frame(&mut output, &frame).unwrap();
+            }
+        }
+    }
+
+    fn test_supervisor(launcher: Arc<TestLauncher>) -> OnnxWorkerSupervisor {
+        OnnxWorkerSupervisor::with_launcher(launcher).unwrap()
+    }
 
     fn test_root(label: &str) -> PathBuf {
         let suffix = std::time::SystemTime::now()
@@ -805,6 +1662,170 @@ mod tests {
         bytes.extend_from_slice(&7_u64.to_le_bytes());
         bytes.extend_from_slice(&11_u64.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn blocked_transcription_is_cancelled_within_250_milliseconds() {
+        let (started_tx, started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::BlockedDecode {
+                    started: started_tx,
+                },
+                TestMode::Normal,
+            ])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(launcher);
+        let transcription_supervisor = supervisor.clone();
+        let transcription = std::thread::spawn(move || {
+            transcription_supervisor.transcribe(41, 91, &[0.0, 0.25, -0.25])
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Model a request thread blocked inside an OS pipe write: cancellation
+        // must not wait for or attempt to take the stdin writer mutex.
+        let writer_guard = supervisor.inner.writer.lock().unwrap();
+
+        let cancel_started = Instant::now();
+        supervisor.cancel_active().unwrap();
+        let error = transcription.join().unwrap().unwrap_err();
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        let remaining = Duration::from_millis(250).saturating_sub(cancel_started.elapsed());
+        reaped_rx.recv_timeout(remaining).unwrap();
+        let cancel_and_reap_duration = cancel_started.elapsed();
+
+        assert!(
+            cancel_and_reap_duration <= Duration::from_millis(250),
+            "cancellation and reaping took {cancel_and_reap_duration:?}"
+        );
+        assert!(error.to_string().contains("cancelled"));
+        drop(writer_guard);
+        supervisor.health(42, 92).unwrap();
+    }
+
+    #[test]
+    fn duplicate_generation_correlation_is_rejected_without_displacing_original_waiter() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([TestMode::HoldOne {
+            started: started_tx,
+            release: release_rx,
+        }]));
+        let supervisor = test_supervisor(launcher);
+        let first_supervisor = supervisor.clone();
+        let first = std::thread::spawn(move || first_supervisor.health(7, 11));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let duplicate = supervisor.health(7, 11).unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate"));
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stale_old_generation_response_cannot_invalidate_replacement() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (sent_tx, sent_rx) = channel();
+        let launcher = Arc::new(TestLauncher::new([
+            TestMode::HoldStale {
+                started: started_tx,
+                release: release_rx,
+                sent: sent_tx,
+            },
+            TestMode::Normal,
+        ]));
+        let supervisor = test_supervisor(launcher);
+        let old_generation = supervisor.generation_for_test();
+        let old_supervisor = supervisor.clone();
+        let old_request = std::thread::spawn(move || old_supervisor.health(1, 1));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        supervisor.abandon_generation_for_test(old_generation, "test generation retired");
+        assert!(old_request.join().unwrap().is_err());
+        supervisor.health(2, 2).unwrap();
+        let replacement_generation = supervisor.generation_for_test();
+        assert!(replacement_generation > old_generation);
+
+        release_tx.send(()).unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        supervisor.health(3, 3).unwrap();
+        assert_eq!(supervisor.generation_for_test(), replacement_generation);
+    }
+
+    fn assert_generation_failure_fails_all_pending_and_recovers(malformed: bool) {
+        let (received_tx, received_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::FailTwo {
+                    received: received_tx,
+                    malformed,
+                },
+                TestMode::Normal,
+            ])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(Arc::clone(&launcher));
+        let first_supervisor = supervisor.clone();
+        let second_supervisor = supervisor.clone();
+        let first = std::thread::spawn(move || first_supervisor.health(10, 20));
+        let second = std::thread::spawn(move || second_supervisor.health(11, 21));
+        received_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(first.join().unwrap().is_err());
+        assert!(second.join().unwrap().is_err());
+        kill_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        supervisor.health(12, 22).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn protocol_failure_fails_all_pending_and_next_request_recovers() {
+        assert_generation_failure_fails_all_pending_and_recovers(true);
+    }
+
+    #[test]
+    fn eof_fails_all_pending_and_next_request_recovers() {
+        assert_generation_failure_fails_all_pending_and_recovers(false);
+    }
+
+    #[test]
+    fn bad_response_direction_and_frame_kind_invalidate_the_generation() {
+        for pcm_kind in [false, true] {
+            let launcher = Arc::new(TestLauncher::new([
+                TestMode::InvalidResponse { pcm_kind },
+                TestMode::Normal,
+            ]));
+            let supervisor = test_supervisor(launcher);
+            let generation = supervisor.generation_for_test();
+            assert!(supervisor.health(30, 40).is_err());
+            supervisor.health(31, 41).unwrap();
+            assert!(supervisor.generation_for_test() > generation);
+        }
+    }
+
+    #[test]
+    fn dropping_last_supervisor_owner_synchronously_kills_and_reaps_worker() {
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::Normal]).with_process_events(kill_started_tx, reaped_tx),
+        );
+        let supervisor = test_supervisor(launcher);
+
+        drop(supervisor);
+
+        kill_started_rx.try_recv().unwrap();
+        reaped_rx.try_recv().unwrap();
     }
 
     #[test]
