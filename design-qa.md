@@ -199,31 +199,45 @@ final result: passed
 ## Source and implementation scope
 
 - Visual source of truth: `C:\Users\huang\.codex\attachments\1262dc67-8414-4589-960b-16e952d23970\image-1.png` (1142 x 137 source pixels).
-- Reviewed implementation head: `2640f64` (`Keep compact announcements in root viewport`).
+- Reviewed implementation head: `69372d1` (`Remove obsolete native overlay seam helpers`), including native renderer commits `b208f1b`, `6507543`, `62b6d50`, and `bbc3994`.
 - Live target: a 600 x 62 logical-point bottom/top-center capsule with waveform, elapsed time, one divider, a one-line Unicode-grapheme-safe transcript/status tail, and a separately hardened 44 x 44 cancel viewport.
 - Compact target: a 320 x 52 logical-point status capsule without transcript preview.
-- The implementation reuses the checked-in Phosphor waveform icon, existing theme palette, serialized `Minimal`/`Live`/`Off` values, and existing overlay controller instead of introducing a parallel component or settings migration.
+- Windows paints two UI-thread-owned top-level layered HWNDs from a premultiplied BGRA DIB through `UpdateLayeredWindow(ULW_ALPHA)`. The display is pass-through and nonactivating; only the separate cancel HWND accepts pointer input, without activation.
+- The implementation reuses the checked-in Phosphor waveform/X glyphs, a shared contrast-checked Scribe-purple recording token, serialized `Minimal`/`Live`/`Off` values, and the existing overlay controller/action contract. No settings migration was introduced.
 
 ## Verified design and behavior evidence
 
 - Deterministic geometry tests cover Live and Compact capsule/control containment at 100%, 125%, 150%, and 200% DPI.
 - The visual hierarchy matches the selected source order: waveform, timer, divider, one-line rolling text, cancel.
-- Light and dark theme tokens include a translucent painted surface, border, top highlight, contained shadow, and contrast checks against conservative black/white composited backgrounds. The experimental DWM system backdrop was removed because native capture did not prove a safe translucent result; the painted surface is the fail-soft production path.
+- Light and dark theme tokens include a translucent painted surface, border, top highlight, contained shadow, and contrast checks against conservative black/white composited backgrounds. The dark recording mark matches the measured reference purple `#8B7CF6`; light mode uses the deeper `#765EEB` companion required for contrast over translucent content.
+- The experimental DWM system backdrop was removed. The production path uses deterministic painted translucency without native backdrop blur.
 - The waveform base glyph remains contrast-safe while its decorative halo reflects actual microphone level and freezes when reduced motion is requested.
 - Unicode tests cover combining marks, CJK, flags, skin-tone modifiers, and ZWJ emoji at the production one-line limit.
 - Accessibility tests verify exact cancel naming, a contained 44 x 44 target, non-live tentative text, single-owner Compact/root announcements, and Live precedence of notice/error, committed transcript delta, then phase.
 - Foreground policy, stale-session rejection, pending/active abandonment, nonblocking worker drain, target retirement, and absence of final transcription/history/output are covered by automated tests.
-- Final Windows gate: `cargo fmt --all -- --check`, `git diff --check`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features -- --test-threads=1` all passed. The full suite ran 931 tests with exit code 0.
+- Native tests cover ordered fail-closed presentation, pass-through/control profile separation, DIB sizing, premultiplication, real Phosphor glyph output, tooltip/control capability gating, AccessKit tree integrity, and session binding. Focused gates passed: native 22/22, overlay view 25/25, and theme 8/8.
+- Final branch gates passed: formatting, `git diff --check`, all-target/all-feature check, strict Clippy, and the serialized all-target/all-feature suite. The suite discovered 954 tests, passed 943, failed 0, and ignored 11 explicit local runtime/fixture tests.
 
-## Native compositor blocker
+## Native Windows capture and interaction evidence
 
-The debug-only fixture created the expected native windows and geometry for Live and Compact modes, and the Windows hardening styles were observed on the current process only. However, full-screen and `CAPTUREBLT` captures in the current Windows/NVIDIA session showed the patterned host but not either overlay child viewport. A temporary debug framebuffer probe then proved that both child OpenGL framebuffers contained the expected pixels before swap: the opaque 55 x 55 control readback contained 3025 opaque pixels and 2909 magenta pixels, while the 750 x 78 Live display readback contained the painted alpha distribution. This isolates the loss downstream of egui tessellation, in native child-surface swap/composition or the current graphics session.
+All captures below were produced with `Windows.Graphics.Capture` monitor capture and a hardware D3D device at feature level `0xB100`. They show the actual compositor result, not an application framebuffer. Every manifest records both overlay windows visible and uncloaked, the display style `0x80800A8`, the control style `0x8080088`, and an unchanged foreground HWND before, during, and after capture.
 
-Framebuffer readback is diagnostic evidence, not proof of user-visible compositor output. The temporary A/B routes, readback instrumentation, logs, and invalid blank captures were removed and are not accepted implementation evidence. Consequently, no same-state combined source/implementation comparison can be produced, and visual fidelity must not be marked passed.
+- Live light: `design-qa-evidence/overlay-native/live-light-20260817-161758.png` and `.json` (750 x 78 at 120 DPI; 55 x 55 control).
+- Live dark: `design-qa-evidence/overlay-native/live-dark-20260817-161801.png` and `.json` (750 x 78 at 120 DPI; 55 x 55 control).
+- Compact light: `design-qa-evidence/overlay-native/compact-light-20260817-161703.png` and `.json` (320 x 52 at 96 DPI; 44 x 44 control).
+- Compact dark: `design-qa-evidence/overlay-native/compact-dark-20260817-161805.png` and `.json` (400 x 65 at 120 DPI; 55 x 55 control).
+- Same-state comparison: `design-qa-evidence/overlay-native/comparison-reference-live-dark.png`.
+- Win32/UIA probe: `design-qa-evidence/overlay-native/native-probes-20260817-162324.json`.
 
-Before release, repeat native Windows capture after a graphics-session/driver reset and verify the actual compositor output for Live/Compact, light/dark, top/bottom, mixed-DPI placement, taskbar/Alt+Tab exclusion, body pass-through, nonactivating X input, keyboard-focus preservation, Narrator/NVDA announcements, and real microphone metering. Draft PR #42 remains blocked on that physical release gate.
+The combined comparison was inspected at native resolution. Capsule silhouette/height, content order, purple Phosphor waveform, elapsed time, divider, transcript, X, transparency, and the join between the display/control HWNDs match closely; no black control tile or seam is present. Intentional differences are the theme-aware navy/light painted tint instead of a reference-only neutral dark surface, italic tentative text required by the preview contract, and deterministic translucency without native backdrop blur. Timer/divider alignment is approximately 5-13 logical points left of the reference cluster but remains within the approved 600 x 62 layout and does not impair hierarchy or readability.
 
-final result: blocked
+The probe verified `HTTRANSPARENT` (-1) for the display and `HTCLIENT` (1) for the control, `MA_NOACTIVATE` (3) for both, server-side UIA providers on both HWNDs, the exact control/button name `Cancel recording and discard it`, Invoke-pattern availability, `IsKeyboardFocusable=false`, and no foreground-HWND change.
+
+## Remaining physical release gates
+
+The deterministic fixture does not open a microphone, issue a real abandon action, or prove taskbar/Alt+Tab enumeration, Narrator/NVDA speech, tooltip dwell, physical pointer routing into an underlying third-party app, every top/bottom monitor edge, or a full mixed-DPI monitor matrix. Those checks remain required through UI-06, UI-08, UI-10, UI-11, REC-04, and the applicable output-target rows in `docs/MANUAL_TEST_MATRIX.md`. They do not block the native visual-fidelity verdict, but they remain release gates for the complete feature.
+
+final result: passed
 
 ---
 

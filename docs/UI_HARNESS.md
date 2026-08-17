@@ -57,9 +57,11 @@ Run these fixtures only from a debug build with the `ui-harness` feature. For
 example:
 
 ```powershell
-$env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
+$env:PATH = 'C:\Program Files\CMake\bin;' + $env:PATH
+$env:CARGO_TARGET_DIR = "$PWD\target\native-layered"
 $env:SCRIBE_UI_HARNESS_VIEWPORT = '960x680'
-cargo run --features ui-harness
+$env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
+cargo run --all-features
 ```
 
 Substitute `overlay/live-light`, `overlay/compact-light`, or
@@ -77,6 +79,60 @@ These fixtures pass an explicit unfocused presentation state through the same
 `show_overlay_viewport` path as production. They do not initialize microphone,
 hotkey, model, history, or settings services and do not perform release or
 discard behavior.
+
+On Windows, this path does not use an eframe immediate child viewport. It owns
+two native top-level `WS_POPUP` layered windows on the UI thread. The passive
+display has `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+WS_EX_TOOLWINDOW`; the cancel control has the same profile without
+`WS_EX_TRANSPARENT`. Both are submitted as top-down premultiplied BGRA DIBs by
+`UpdateLayeredWindow(ULW_ALPHA)` and shown topmost without activation. The
+display exposes the current phase/preview through its native AccessKit adapter;
+the control exposes the exact `Cancel recording and discard it` button and a
+standard Windows tooltip. If display accessibility or pixel presentation
+fails, both windows hide. If only the cancel tooltip/control capability fails,
+the passive display remains and the X hides.
+
+The surface is deliberately painted translucent glass, not a native backdrop
+blur. This keeps light/dark output deterministic and fail-soft on Windows
+versions and graphics drivers where compositor blur cannot be proved. Physical
+pixel dimensions scale with the destination monitor DPI: 600 x 62 Live and
+320 x 52 Compact are logical-point dimensions.
+
+For compositor acceptance, use `Windows.Graphics.Capture`; `BitBlt` and
+`PrintWindow` are not authoritative for layered-window visibility. The local
+acceptance workstation has a temporary, exact-executable-pinned helper. After
+building once, this is the command shape used to capture a fixture and its HWND
+manifest:
+
+```powershell
+$exe = "$PWD\target\native-layered\debug\local-transcriber.exe"
+$helper = "$env:LOCALAPPDATA\Temp\scribe-native-layered-wgc\capture-wgc-native.exe"
+$out = "$env:LOCALAPPDATA\Temp\scribe-native-layered-wgc"
+$env:SCRIBE_UI_HARNESS = 'overlay/live-dark'
+$env:SCRIBE_UI_HARNESS_VIEWPORT = '960x680'
+$fixture = Start-Process -FilePath $exe -WorkingDirectory $PWD -PassThru
+
+& $helper `
+  --pid $fixture.Id `
+  --exe $exe `
+  --out "$out\manual-live-dark-$($fixture.Id).png" `
+  --manifest "$out\manual-live-dark-$($fixture.Id).json"
+```
+
+Before stopping a fixture, confirm its `ExecutablePath` equals `$exe`, then
+stop only that exact PID:
+
+```powershell
+$owned = Get-CimInstance Win32_Process -Filter "ProcessId=$($fixture.Id)"
+if ([string]::Equals($owned.ExecutablePath, $exe, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Stop-Process -Id $owned.ProcessId
+}
+```
+
+Repeat with `overlay/live-light`,
+`overlay/compact-light`, and `overlay/compact-dark`. The helper is local QA
+instrumentation rather than a shipped Scribe executable; the four fixture
+routes themselves are checked-in and reproducible without it.
 
 ## Model-card contract
 
