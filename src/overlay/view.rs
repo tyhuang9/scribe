@@ -479,18 +479,25 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
                 builder.set_live(egui::accesskit::Live::Polite);
             }
         });
-        if state.error.is_none()
-            && state.notice.is_none()
-            && let Some(announcement_text) = &state.transcript_announcement
-        {
+        if let Some(announcement_text) = live_overlay_announcement(state) {
             let announcement = ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
             ui.ctx().accesskit_node_builder(announcement.id, |builder| {
                 builder.set_role(egui::accesskit::Role::StaticText);
-                builder.set_name(announcement_text.as_str());
+                builder.set_name(announcement_text);
                 builder.set_live(egui::accesskit::Live::Polite);
             });
         }
     });
+}
+
+fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
+    if state.error.is_some() || state.notice.is_some() {
+        return None;
+    }
+    if let Some(announcement) = state.transcript_announcement.as_deref() {
+        return Some(announcement);
+    }
+    (state.phase != OverlayPhase::Hidden).then(|| state.phase.label())
 }
 
 fn render_divider(ui: &mut egui::Ui, colors: OverlayColors) {
@@ -1339,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_and_status_are_polite_live_regions_without_controls() {
+    fn committed_transcript_is_the_only_polite_live_region_without_controls() {
         let context = egui::Context::default();
         context.enable_accesskit();
         let state = OverlayViewState {
@@ -1367,10 +1374,16 @@ mod tests {
         );
         let update = output.platform_output.accesskit_update.unwrap();
 
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.live() == Some(egui::accesskit::Live::Polite)
-                && node.name() == Some("Committed transcript: hello")
-        }));
+        let polite_nodes = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+            .collect::<Vec<_>>();
+        assert_eq!(polite_nodes.len(), 1);
+        assert_eq!(
+            polite_nodes[0].1.name(),
+            Some("Committed transcript: hello")
+        );
         assert!(update.nodes.iter().any(|(_, node)| {
             node.live().is_none()
                 && node.name() == Some("Committed transcript: hello. Tentative transcript: world")
@@ -1392,6 +1405,54 @@ mod tests {
                 .iter()
                 .all(|(_, node)| node.role() != egui::accesskit::Role::Button)
         );
+    }
+
+    #[test]
+    fn phase_only_updates_have_one_polite_live_region() {
+        for (phase, expected) in [
+            (OverlayPhase::Preparing, "Preparing"),
+            (OverlayPhase::Listening, "Recording"),
+            (OverlayPhase::Finalizing, "Finalizing"),
+        ] {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            let state = OverlayViewState {
+                phase,
+                transcript: super::super::controller::OverlayTranscript {
+                    tentative: "tentative words".to_owned(),
+                    ..Default::default()
+                },
+                ..OverlayViewState::default()
+            };
+
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(LIVE_WIDTH, LIVE_HEIGHT),
+                    )),
+                    ..Default::default()
+                },
+                |context| render_overlay(context, &state),
+            );
+            let polite_nodes = output
+                .platform_output
+                .accesskit_update
+                .expect("overlay should expose AccessKit")
+                .nodes
+                .into_iter()
+                .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                .collect::<Vec<_>>();
+
+            assert_eq!(polite_nodes.len(), 1, "{expected} must have one live owner");
+            assert_eq!(polite_nodes[0].1.name(), Some(expected));
+            assert!(
+                !polite_nodes[0]
+                    .1
+                    .name()
+                    .is_some_and(|name| name.contains("tentative words"))
+            );
+        }
     }
 
     #[test]
