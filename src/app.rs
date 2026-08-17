@@ -5166,7 +5166,9 @@ impl LocalTranscriberApp {
                 message,
             } => self.fail_dictation_session_now(session_id, message),
             PreviewDrainAction::Cancel { session_id } => {
-                let _ = self.session_coordinator.cancel_active();
+                if self.session_coordinator.active_session_id() == Some(session_id) {
+                    let _ = self.session_coordinator.cancel_active();
+                }
                 self.retire_captured_target(session_id);
                 let _ = self.overlay_controller.hide(session_id);
                 self.playground_runs.remove(&session_id);
