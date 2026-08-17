@@ -5,14 +5,12 @@ and egui/eframe. It does not use Tauri, Electron, React, cloud STT, an account
 or sync service, or a plugin system. The normal GGUF path is in-process and has
 no Python, localhost server, runtime package, or inference executable.
 
-The runtime-consolidated implementation has one logical runtime kind and zero
-Supported models. The normal UI exposes package-free embedded GGUF models: one
-pinned fallback plus trusted discovered or locally imported variants, all
-Experimental. Three older GGML records remain resolution-only migration
-compatibility. Its final automated Phase 11 gate discovered 623 tests: 614
-passed, 0 failed, and 9 explicit
-runtime/fixture tests remained ignored. The release is still NO-GO pending the
-documented manual and compatibility evidence; see
+The runtime-consolidated implementation has private GGUF and ONNX runtime
+variants and zero Supported models. The normal UI exposes package-free embedded
+GGUF models: one pinned fallback plus trusted discovered or locally imported
+variants, all Experimental. Three older GGML records remain resolution-only
+migration compatibility. The release is still NO-GO pending the documented
+manual and compatibility evidence; see
 `docs/SCRIBE_REVAMP_IMPLEMENTATION_REPORT.md` and the newer
 `docs/EMBEDDED_STT_AND_MODELS.md` implementation record.
 
@@ -48,7 +46,7 @@ use **GitHub Actions** as its source. The default project site uses
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
 - Native microphone capture through `cpal`; callback samples enter a fixed-capacity SPSC ring and native workers perform downmixing, 16 kHz resampling, normalization, metering, VAD, endpointing, and post-roll without sending PCM through the UI.
-- One application-level logical runtime kind, selected only by the private `RuntimeRouter`. The normal user-facing path uses the statically linked `transcribe-cpp` 0.1.3 adapter for GGUF models; zero models are Supported.
+- Two private runtime variants selected only by the runtime-neutral `TranscriptionService` and `RuntimeRouter`: the statically linked `transcribe-cpp` 0.1.3 GGUF adapter and the isolated CPU-only sherpa-onnx worker. Zero models are Supported.
 - Trusted GGUF discovery/import plus resumable, exact-hash model installation with staged native smoke tests, atomic activation, and crash recovery. Runtime-package transactions remain only for retained GGML compatibility.
 - Non-blocking native workers for capture, model preload, rolling batch preview, final transcription, and diagnostic latency breakdowns.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions. Show/Hide has live Windows evidence; the remaining tray actions still require the documented manual matrix.
@@ -197,9 +195,50 @@ The safe embedded adapter is CPU-only. `Auto` resolves to CPU, `CPU` requests it
 explicitly, and `GPU` fails clearly because no verified accelerator backend
 ships.
 
-Runtime selection is private to `RuntimeRouter`. There is one logical handler,
-`TranscribeCppRuntime`; `OnnxSpeechRuntime` is absent because the named
-Zipformer candidate has not passed the complete evidence gate.
+Runtime selection is private to `RuntimeRouter`. `TranscribeCppRuntime` owns
+embedded GGUF execution and `OnnxSpeechRuntime` owns the isolated CPU-only
+sherpa-onnx worker. Neither runtime makes a model Supported: the named
+Moonshine and Zipformer fixtures remain Experimental until their exact artifact
+and platform evidence gates pass.
+
+### ONNX runtime validation fixtures
+
+The isolated sherpa-onnx worker is CPU-only and has no live model discovery or
+download path. The native runtime remains Experimental until each exact
+artifact has completed the platform, license, and benchmark evidence gate.
+Two ignored tests exercise real, locally supplied bundles without contacting a
+network service:
+
+```powershell
+$env:SCRIBE_ONNX_AUDIO = 'C:\fixtures\speech.wav'
+$env:SCRIBE_ONNX_MOONSHINE_ROOT = 'C:\models\moonshine-tiny-en'
+cargo test onnx_worker::tests::native_moonshine_offline_fixture_uses_the_typed_bundle_contract -- --ignored --exact
+
+$env:SCRIBE_ONNX_ZIPFORMER_ROOT = 'C:\models\sherpa-onnx-streaming-zipformer-en-20M-2023-02-17'
+cargo test onnx_worker::tests::native_zipformer_fixture_uses_true_online_streaming -- --ignored --exact
+```
+
+Moonshine requires exactly `encoder_model.ort`, `decoder_model_merged.ort`,
+and `tokens.txt`; the `.ort` files are sherpa's ONNX Runtime-optimized bundle
+artifacts and retain explicit Encoder/MergedDecoder roles. The experimental
+Zipformer fixture requires exactly `encoder-epoch-99-avg-1.int8.onnx`,
+`decoder-epoch-99-avg-1.int8.onnx`, `joiner-epoch-99-avg-1.int8.onnx`, and
+`tokens.txt`. These are typed bundle roles; Scribe does not infer them from
+arbitrary filenames.
+
+To manually verify the actual hidden-worker executable boundary (Hello,
+Health, and Shutdown), build Scribe first and point the ignored test at that
+exact binary:
+
+```powershell
+$env:SCRIBE_ONNX_WORKER_EXE = '.\target\debug\local-transcriber.exe'
+cargo test onnx_worker::tests::hidden_worker_manual_protocol_smoke -- --ignored --exact
+```
+
+Release builds use only a cached archive or `SHERPA_ONNX_ARCHIVE_DIR` containing
+the exact reviewed sherpa-onnx 1.13.5 static archive. They never fetch a native
+archive. An explicit debug-only download escape hatch exists solely for local
+developer recovery: `SHERPA_ONNX_ALLOW_DEBUG_DOWNLOAD=1`.
 
 ### Runtime packaging and legacy development tools
 
