@@ -52,6 +52,7 @@ use **GitHub Actions** as its source. The default project site uses
 - Trusted GGUF discovery/import plus resumable, exact-hash model installation with staged native smoke tests, atomic activation, and crash recovery. Runtime-package transactions remain only for retained GGML compatibility.
 - Non-blocking native workers for capture, model preload, rolling batch preview, final transcription, and diagnostic latency breakdowns.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions. Show/Hide has live Windows evidence; the remaining tray actions still require the documented manual matrix.
+- A Windows background-recording overlay that stays hidden while Scribe is foreground, offers privacy-safe Compact status and optional Live preview modes, and exposes a non-activating discard control without changing the captured paste target.
 - Optional Windows insertion of the completed transcript into the captured app; other platforms use an explicit clipboard-only fallback.
 - Runtime-neutral metadata for trusted GGUF variants, with one pinned fallback and private source-owned discovery. Older tiny/base/small/medium family distinctions remain private compatibility data.
 - Debug comparison selection is explicit: choose installed models, retain drag order, and decode the same native prepared audio through the shared `TranscriptionService`.
