@@ -40,8 +40,8 @@ pub use crate::model_catalog::{
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
-    NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution, RuntimeLoadExecution,
-    RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
+    IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
+    RuntimeLoadExecution, RuntimeModel, RuntimeRouter, WARM_MODEL_TTL, verify_compatibility_cli,
 };
 use crate::streaming::{
     HypothesisWord, PreviewAudioPublisher, PreviewEvent, RollingPreviewSession, StreamIdentity,
@@ -865,8 +865,10 @@ impl fmt::Debug for RuntimeWorker {
 }
 
 fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>) {
+    let activity = router.runtime_activity();
+    let mut idle_wait = WARM_MODEL_TTL;
     loop {
-        match commands.recv_timeout(WARM_MODEL_TTL) {
+        let (succeeded, mut request_activity) = match commands.recv_timeout(idle_wait) {
             Ok(RuntimeCommand::Transcribe {
                 artifact,
                 preference,
@@ -875,27 +877,39 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 cancellation_snapshot,
                 reply,
             }) => {
-                let _ = reply.send(router.transcribe(
+                let request_activity = activity.acquire_request().ok();
+                let result = router.transcribe(
                     artifact,
                     preference,
                     &audio,
                     &options,
                     cancellation_snapshot,
-                ));
+                );
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Load {
                 artifact,
                 preference,
                 reply,
             }) => {
-                let _ = reply.send(router.load(artifact, preference));
+                let request_activity = activity.acquire_request().ok();
+                let result = router.load(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Health {
                 artifact,
                 preference,
                 reply,
             }) => {
-                let _ = reply.send(router.health_check(artifact, preference));
+                let request_activity = activity.acquire_request().ok();
+                let result = router.health_check(artifact, preference);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::StartStream {
                 artifact,
@@ -903,10 +917,18 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 options,
                 reply,
             }) => {
-                let _ = reply.send(router.start_stream(artifact, preference, &options));
+                let request_activity = activity.acquire_request().ok();
+                let result = router.start_stream(artifact, preference, &options);
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Unload { reply }) => {
-                let _ = reply.send(router.unload_all());
+                let request_activity = activity.acquire_request().ok();
+                let result = router.unload_all();
+                let succeeded = result.is_ok();
+                let _ = reply.send(result);
+                (succeeded, request_activity)
             }
             Ok(RuntimeCommand::Shutdown { reply }) => {
                 let result = router.unload_all();
@@ -914,13 +936,36 @@ fn runtime_worker_loop(router: RuntimeRouter, commands: Receiver<RuntimeCommand>
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
-                let _ = router.unload_all();
+                match activity.timeout_action(WARM_MODEL_TTL) {
+                    IdleTimeoutAction::Unload => {
+                        if router.unload_all().is_ok() {
+                            activity.mark_command_complete();
+                        }
+                        idle_wait = WARM_MODEL_TTL;
+                    }
+                    IdleTimeoutAction::Defer(remaining) => {
+                        idle_wait = remaining;
+                    }
+                }
+                continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = router.unload_all();
                 break;
             }
+        };
+        if succeeded {
+            if let Some(request_activity) = request_activity.as_mut() {
+                request_activity.complete_successfully();
+            } else {
+                activity.mark_command_complete();
+            }
         }
+        drop(request_activity);
+        idle_wait = match activity.timeout_action(WARM_MODEL_TTL) {
+            IdleTimeoutAction::Unload => Duration::ZERO,
+            IdleTimeoutAction::Defer(remaining) => remaining,
+        };
     }
 }
 
@@ -2541,9 +2586,16 @@ mod tests {
     struct FakeOnnxState {
         loaded: Option<OnnxModelSpec>,
         load_calls: usize,
+        maximum_loaded_models: usize,
+        events: Vec<String>,
+        fail_next_load: bool,
+        fail_transcribe: bool,
+        fail_health: bool,
+        fail_start_stream: bool,
         transcribe_calls: usize,
         health_calls: usize,
         unload_calls: usize,
+        unloaded_active_streams: usize,
         cancel_active_calls: usize,
         stream: Option<(u64, usize)>,
         stream_cancels: usize,
@@ -2569,6 +2621,14 @@ mod tests {
                 state = self.changed.wait(state).unwrap();
             }
         }
+
+        fn fail_next_load(&self) {
+            self.state.lock().unwrap().fail_next_load = true;
+        }
+
+        fn fail_transcribe(&self) {
+            self.state.lock().unwrap().fail_transcribe = true;
+        }
     }
 
     impl OnnxSupervisorControl for FakeOnnxControl {
@@ -2581,7 +2641,17 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.load_calls += 1;
             let warm = state.loaded.as_ref() == Some(&model);
+            if !warm {
+                if let Some(previous) = state.loaded.take() {
+                    state.events.push(format!("evict:{}", previous.id));
+                }
+                state.events.push(format!("load:{}", model.id));
+            }
+            if std::mem::take(&mut state.fail_next_load) {
+                anyhow::bail!("deterministic ONNX load failure");
+            }
             state.loaded = Some(model);
+            state.maximum_loaded_models = state.maximum_loaded_models.max(1);
             Ok(warm)
         }
 
@@ -2593,6 +2663,10 @@ mod tests {
         ) -> anyhow::Result<String> {
             let mut state = self.state.lock().unwrap();
             state.transcribe_calls += 1;
+            if state.fail_transcribe {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX transcribe failure");
+            }
             state.batch_started = true;
             self.changed.notify_all();
             while state.block_batch && !state.batch_cancelled {
@@ -2606,6 +2680,10 @@ mod tests {
 
         fn start_stream(&self, session_id: u64, _request_id: u64) -> anyhow::Result<()> {
             let mut state = self.state.lock().unwrap();
+            if state.fail_start_stream {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX start-stream failure");
+            }
             if state.stream.is_some() {
                 anyhow::bail!("fake ONNX stream already active");
             }
@@ -2653,15 +2731,23 @@ mod tests {
         }
 
         fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
-            self.state.lock().unwrap().health_calls += 1;
+            let mut state = self.state.lock().unwrap();
+            state.health_calls += 1;
+            if state.fail_health {
+                state.loaded = None;
+                anyhow::bail!("deterministic ONNX health failure");
+            }
             Ok(())
         }
 
         fn unload(&self) -> anyhow::Result<()> {
             let mut state = self.state.lock().unwrap();
+            state.unload_calls += 1;
+            if state.stream.is_some() {
+                state.unloaded_active_streams += 1;
+            }
             state.stream = None;
             state.loaded = None;
-            state.unload_calls += 1;
             Ok(())
         }
 
@@ -2798,6 +2884,152 @@ mod tests {
     }
 
     #[test]
+    fn onnx_same_model_reuses_warm_and_changed_model_evicts_first() {
+        let (first_root, first) = onnx_spec("same-model-first", OnnxModelFamily::NemoCtc);
+        let (second_root, second) = onnx_spec("same-model-second", OnnxModelFamily::NemoCtc);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+
+        let cold = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
+            .unwrap();
+        let warm = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        let replacement = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap();
+
+        assert!(!cold.diagnostics.warm_reused);
+        assert!(warm.diagnostics.warm_reused);
+        assert!(!replacement.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.maximum_loaded_models, 1);
+        assert_eq!(
+            state.events,
+            [
+                "load:private-same-model-first",
+                "evict:private-same-model-first",
+                "load:private-same-model-second",
+            ]
+        );
+        drop(state);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_load_discards_adapter_owner_and_cancellation_then_recovers_cold() {
+        let (first_root, first) = onnx_spec("failed-load-first", OnnxModelFamily::NemoCtc);
+        let (second_root, second) = onnx_spec("failed-load-second", OnnxModelFamily::NemoCtc);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first.clone()))
+            .unwrap();
+        control.fail_next_load();
+
+        let error = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(second))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX load failure")
+        );
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert!(control.state.lock().unwrap().loaded.is_none());
+        let recovered = service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(first))
+            .unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_transcribe_discards_adapter_owner_and_cancellation() {
+        let (root, spec) = onnx_spec("failed-transcribe", OnnxModelFamily::NemoCtc);
+        let artifact = RuntimeArtifact::OnnxBundle(spec);
+        let (service, control, spawn_count) = onnx_test_service(AccelerationPreference::Cpu);
+        service.preload_runtime_artifact(artifact.clone()).unwrap();
+        control.fail_transcribe();
+
+        let error = service
+            .transcribe_runtime_artifact(
+                artifact.clone(),
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic ONNX transcribe failure")
+        );
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        let recovered = service.preload_runtime_artifact(artifact).unwrap();
+        assert!(!recovered.diagnostics.warm_reused);
+        assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_onnx_health_and_stream_start_discard_adapter_state() {
+        let (health_root, health_spec) = onnx_spec("failed-health", OnnxModelFamily::NemoCtc);
+        let (health_service, health_control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        health_service
+            .preload_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec.clone()))
+            .unwrap();
+        health_control.state.lock().unwrap().fail_health = true;
+        assert!(
+            health_service
+                .health_check_runtime_artifact(RuntimeArtifact::OnnxBundle(health_spec))
+                .is_err()
+        );
+        assert_eq!(
+            health_service.router.onnx_state_for_test(),
+            (false, false, false)
+        );
+
+        let (stream_root, stream_spec) =
+            onnx_spec("failed-start", OnnxModelFamily::OnlineTransducer);
+        let (stream_service, stream_control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        stream_control.state.lock().unwrap().fail_start_stream = true;
+        assert!(
+            stream_service
+                .start_runtime_stream(
+                    RuntimeArtifact::OnnxBundle(stream_spec),
+                    TranscriptionOptions::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            stream_service.router.onnx_state_for_test(),
+            (false, false, false)
+        );
+        assert_eq!(stream_service.router.runtime_activity().active_streams(), 0);
+
+        drop(health_service);
+        drop(stream_service);
+        fs::remove_dir_all(health_root).unwrap();
+        fs::remove_dir_all(stream_root).unwrap();
+    }
+
+    #[test]
     fn private_onnx_gpu_request_fails_before_supervisor_spawn() {
         let (root, spec) = onnx_spec("gpu-rejected", OnnxModelFamily::NemoCtc);
         let (service, _control, spawn_count) = onnx_test_service(AccelerationPreference::Gpu);
@@ -2825,6 +3057,7 @@ mod tests {
                 TranscriptionOptions::default(),
             )
             .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
         assert_eq!(
             stream.push_audio(&[0.1]).unwrap(),
             StreamUpdate {
@@ -2834,18 +3067,32 @@ mod tests {
         );
         assert_eq!(stream.push_audio(&[-0.1]).unwrap().tentative, "partial-2");
         let final_transcript = stream.finalize().unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
         assert_eq!(final_transcript.text, "final-2");
         assert!(final_transcript.segments.is_empty());
         assert_eq!(final_transcript.detected_language, None);
 
         let stream = service
             .start_runtime_stream(
-                RuntimeArtifact::OnnxBundle(online),
+                RuntimeArtifact::OnnxBundle(online.clone()),
                 TranscriptionOptions::default(),
             )
             .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
         stream.cancel().unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
         assert_eq!(control.state.lock().unwrap().stream_cancels, 1);
+
+        let stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(online.clone()),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+        drop(stream);
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(control.state.lock().unwrap().stream_cancels, 2);
 
         let error = service
             .start_runtime_stream(
@@ -2859,6 +3106,30 @@ mod tests {
         drop(service);
         fs::remove_dir_all(online_root).unwrap();
         fs::remove_dir_all(offline_root).unwrap();
+    }
+
+    #[test]
+    fn explicit_unload_clears_active_stream_lease_and_native_stream() {
+        let (root, spec) = onnx_spec("explicit-stream-unload", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let stream = service
+            .start_runtime_stream(
+                RuntimeArtifact::OnnxBundle(spec),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(service.router.runtime_activity().active_streams(), 1);
+
+        service.unload_runtime_artifacts().unwrap();
+
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+        assert_eq!(control.state.lock().unwrap().unloaded_active_streams, 1);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(stream);
+        assert_eq!(service.router.runtime_activity().active_streams(), 0);
+
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
