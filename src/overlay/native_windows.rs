@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod accessibility;
 mod raster;
 
@@ -13,7 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::Gdi::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
@@ -235,21 +233,6 @@ impl NativeWindow {
             && (self.role.requires_transparency() || style & WS_EX_TRANSPARENT == 0)
     }
 
-    fn position_hidden(&self, bounds: OverlayWindowBounds) -> bool {
-        self.hide();
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            ) != 0
-        }
-    }
-
     fn submit_frame(&mut self, bounds: OverlayWindowBounds, frame: &LayeredFrame) -> bool {
         if frame.width != bounds.width || frame.height != bounds.height {
             return false;
@@ -353,9 +336,7 @@ impl NativeTooltip {
             dwICC: ICC_WIN95_CLASSES,
         };
         if unsafe { InitCommonControlsEx(&controls) } == 0 {
-            return Err(NativeTooltipError::InitializeCommonControls(unsafe {
-                GetLastError()
-            }));
+            return Err(NativeTooltipError::InitializeCommonControls);
         }
         let module = unsafe { GetModuleHandleW(null()) };
         if module.is_null() {
@@ -378,7 +359,7 @@ impl NativeTooltip {
             )
         };
         if hwnd.is_null() {
-            return Err(NativeTooltipError::CreateWindow(unsafe { GetLastError() }));
+            return Err(NativeTooltipError::CreateWindow);
         }
         let mut tooltip = Self {
             hwnd,
@@ -409,9 +390,7 @@ impl NativeTooltip {
             ) != 0
         };
         if !positioned {
-            return Err(NativeTooltipError::PositionWindow(unsafe {
-                GetLastError()
-            }));
+            return Err(NativeTooltipError::PositionWindow);
         }
         Ok(tooltip)
     }
@@ -452,11 +431,11 @@ impl NativeTooltip {
 
 #[derive(Clone, Copy, Debug)]
 enum NativeTooltipError {
-    InitializeCommonControls(u32),
+    InitializeCommonControls,
     ModuleHandle,
-    CreateWindow(u32),
+    CreateWindow,
     RegisterTool,
-    PositionWindow(u32),
+    PositionWindow,
 }
 
 impl Drop for NativeTooltip {
@@ -494,10 +473,6 @@ impl NativeOverlayHost {
             action_bridge,
             action_rx,
         })
-    }
-
-    fn bind_cancellable_session(&self, session_id: Option<SessionId>) {
-        self.action_bridge.bind(session_id);
     }
 
     fn next_action(&self) -> Option<OverlayAction> {
