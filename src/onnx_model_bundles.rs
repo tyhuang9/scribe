@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -622,12 +622,14 @@ impl OsFileLock {
                 parent.display()
             ))
         })?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
+        verify_regular_directory_root(parent)?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        configure_lock_no_follow(&mut options);
+        let file = options
             .open(path)
             .map_err(|error| failed(format!("could not open lock {}: {error}", path.display())))?;
+        verify_open_lock_file(&file, path)?;
         if !lock_file(&file, wait)
             .map_err(|error| failed(format!("could not lock {}: {error}", path.display())))?
         {
@@ -643,6 +645,43 @@ impl OsFileLock {
             additional_remove_on_drop: None,
         })
     }
+}
+
+#[cfg(unix)]
+fn configure_lock_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn configure_lock_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+fn verify_open_lock_file(file: &File, path: &Path) -> Result<(), InstallError> {
+    let metadata = file.metadata().map_err(|error| {
+        failed(format!(
+            "could not inspect ONNX bundle lock {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = metadata.file_type().is_symlink();
+    if !metadata.is_file() || is_link {
+        return Err(failed(format!(
+            "ONNX bundle lock is not a regular non-link file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 impl Drop for OsFileLock {
@@ -677,6 +716,7 @@ fn acquire_bundle_disk_reservation(
             reservation_root.display()
         ))
     })?;
+    verify_regular_directory_root(&reservation_root)?;
     let _ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), true, false)?;
     let mut active_reserved_bytes = 0_u64;
     for entry in fs::read_dir(&reservation_root).map_err(|error| {
@@ -695,17 +735,16 @@ fn acquire_bundle_disk_reservation(
             continue;
         }
         let lock_path = path.with_extension("lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                failed(format!(
-                    "could not open ONNX bundle reservation lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        configure_lock_no_follow(&mut options);
+        let file = options.open(&lock_path).map_err(|error| {
+            failed(format!(
+                "could not open ONNX bundle reservation lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        verify_open_lock_file(&file, &lock_path)?;
         if lock_file(&file, false).map_err(|error| {
             failed(format!(
                 "could not inspect ONNX bundle reservation lock {}: {error}",
@@ -717,16 +756,10 @@ fn acquire_bundle_disk_reservation(
             let _ = fs::remove_file(&lock_path);
             continue;
         }
-        let mut file = File::open(&path).map_err(|error| {
+        let bytes = read_regular_file_no_follow(&path, 64)?;
+        let contents = std::str::from_utf8(&bytes).map_err(|_| {
             failed(format!(
-                "could not open active ONNX bundle reservation {}: {error}",
-                path.display()
-            ))
-        })?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).map_err(|error| {
-            failed(format!(
-                "could not read active ONNX bundle reservation {}: {error}",
+                "active ONNX bundle reservation {} is not UTF-8",
                 path.display()
             ))
         })?;
@@ -782,7 +815,7 @@ fn acquire_bundle_disk_reservation(
             }
         }
     };
-    write!(file, "{reserved_bytes}\n").map_err(|error| {
+    writeln!(file, "{reserved_bytes}").map_err(|error| {
         failed(format!(
             "could not write ONNX bundle reservation {}: {error}",
             path.display()

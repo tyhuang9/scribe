@@ -1019,15 +1019,14 @@ impl RouterState {
             .and_then(|runtime| SpeechEngine::unload(runtime).err());
         if let Some(runtime) = self.onnx.as_ref()
             && let Some(unload_error) = unload_error
+            && let Err(termination_error) = runtime.supervisor.terminate_current()
         {
-            if let Err(termination_error) = runtime.supervisor.terminate_current() {
-                // A failed unload and termination can still leave a heavy
-                // native owner. Keep that ownership visible to later work.
-                self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
-                return RuntimeError::Engine(format!(
-                    "{failure}; failed to unload the ONNX worker after the error: {unload_error:#}; forced retirement also failed: {termination_error:#}"
-                ));
-            }
+            // A failed unload and termination can still leave a heavy native
+            // owner. Keep that ownership visible to later work.
+            self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+            return RuntimeError::Engine(format!(
+                "{failure}; failed to unload the ONNX worker after the error: {unload_error:#}; forced retirement also failed: {termination_error:#}"
+            ));
         }
         self.discard_onnx_runtime(cancellation, runtime_activity);
         failure
