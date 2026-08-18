@@ -1700,6 +1700,72 @@ fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
     Ok(target_root.with_file_name(format!(".{name}.installing")))
 }
 
+pub(crate) fn file_bundle_staging_root(target_root: &Path) -> Result<PathBuf, InstallError> {
+    stable_staging_path(target_root)
+}
+
+pub(crate) fn directory_activation_rollback_root(target_root: &Path) -> PathBuf {
+    directory_rollback_path(target_root)
+}
+
+pub(crate) fn path_entry_exists_no_follow(path: &Path) -> Result<bool, InstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failed(format!(
+            "failed to inspect filesystem entry {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub(crate) fn discard_file_bundle_staging(target_root: &Path) -> Result<bool, InstallError> {
+    let staging = stable_staging_path(target_root)?;
+    if !path_entry_exists_no_follow(&staging)? {
+        return Ok(false);
+    }
+    remove_path_if_exists(&staging)?;
+    Ok(true)
+}
+
+pub(crate) fn restore_interrupted_directory_replacement(
+    target_root: &Path,
+) -> Result<(), InstallError> {
+    let rollback = directory_rollback_path(target_root);
+    if path_entry_exists_no_follow(target_root)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot restore interrupted directory replacement because target still exists: {}",
+            target_root.display()
+        )));
+    }
+    if !path_entry_exists_no_follow(&rollback)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot restore interrupted directory replacement without rollback: {}",
+            rollback.display()
+        )));
+    }
+    restore_directory_replacement(target_root, true)
+}
+
+pub(crate) fn retain_interrupted_directory_replacement(
+    target_root: &Path,
+) -> Result<(), InstallError> {
+    if !path_entry_exists_no_follow(target_root)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot retain an interrupted directory replacement without an active target: {}",
+            target_root.display()
+        )));
+    }
+    let rollback = directory_rollback_path(target_root);
+    if !path_entry_exists_no_follow(&rollback)? {
+        return Err(InstallError::RecoveryRequired(format!(
+            "cannot retain an interrupted directory replacement without rollback: {}",
+            rollback.display()
+        )));
+    }
+    finalize_directory_replacement(target_root, true)
+}
+
 fn copy_regular_file_to_stage(
     source: &Path,
     stage_root: &Path,

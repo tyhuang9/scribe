@@ -17,9 +17,11 @@ use crate::disk_space::{self, CanonicalTargetIdentity, DiskSpacePreflight};
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
     InstallError, InstallProgress, PinnedArtifact, RuntimeFileSpec, StagedRuntime,
+    directory_activation_rollback_root, discard_file_bundle_staging,
     discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    pinned_artifact_retained_partial, read_regular_file_no_follow, rollback_to_previous_runtime,
-    stage_file_bundle_for_target, verify_runtime_tree,
+    path_entry_exists_no_follow, pinned_artifact_retained_partial, read_regular_file_no_follow,
+    restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
+    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_runtime_tree,
 };
 use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 
@@ -546,6 +548,12 @@ impl StagedOnnxBundle {
         self,
         cancellation: &InstallCancellation,
     ) -> Result<ActivatedOnnxBundle, InstallError> {
+        let (receipt, spec) = verified_receipt_at(&self.staged.root)?;
+        if receipt != self.receipt || spec != self.spec {
+            return Err(failed(
+                "staged ONNX bundle changed after verification and before activation",
+            ));
+        }
         cancellation
             .try_commit_activation()
             .map_err(|state| match state {
@@ -1005,6 +1013,85 @@ pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<boo
     rollback_to_previous_runtime(target_root)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OnnxBundleRecovery {
+    pub(crate) restored_interrupted_previous: bool,
+    pub(crate) retained_interrupted_previous: bool,
+    pub(crate) discarded_incomplete_staging: bool,
+}
+
+/// Reconciles only transaction-owned directory names and never contacts the
+/// network. Active or previous bundles are mutated only after their complete
+/// self-contained receipts and exact trees verify.
+pub(crate) fn recover_onnx_bundle_installation(
+    target_root: &Path,
+) -> Result<OnnxBundleRecovery, InstallError> {
+    let _guard = acquire_bundle_target(target_root)?;
+    let rollback = directory_activation_rollback_root(target_root);
+    let mut recovery = OnnxBundleRecovery::default();
+    if path_entry_exists_no_follow(&rollback)? {
+        verified_receipt_at(&rollback).map_err(|error| {
+            InstallError::RecoveryRequired(format!(
+                "interrupted ONNX bundle rollback is not exact at {}: {error}",
+                rollback.display()
+            ))
+        })?;
+        if path_entry_exists_no_follow(target_root)? {
+            verified_receipt_at(target_root).map_err(|error| {
+                InstallError::RecoveryRequired(format!(
+                    "interrupted ONNX bundle target is not exact at {}: {error}",
+                    target_root.display()
+                ))
+            })?;
+            retain_interrupted_directory_replacement(target_root)?;
+            recovery.retained_interrupted_previous = true;
+        } else {
+            restore_interrupted_directory_replacement(target_root)?;
+            recovery.restored_interrupted_previous = true;
+        }
+    }
+    recovery.discarded_incomplete_staging = discard_file_bundle_staging(target_root)?;
+    Ok(recovery)
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_receipt_for_spec(spec: &OnnxModelSpec) -> Result<(), InstallError> {
+    let template = catalog()
+        .bundles
+        .iter()
+        .find(|manifest| {
+            manifest.availability == BundleAvailability::Available && manifest.family == spec.family
+        })
+        .ok_or_else(|| failed("no embedded bundle template for test ONNX family"))?;
+    let mut manifest = template.clone();
+    manifest.id = spec.id.clone();
+    manifest.num_threads = spec.num_threads;
+    manifest
+        .files
+        .retain(|file| file.role != BundleFileRole::License);
+    for file in &mut manifest.files {
+        let runtime_role = file
+            .role
+            .runtime_role()
+            .ok_or_else(|| failed("test receipt unexpectedly retained a license role"))?;
+        file.path = spec
+            .files
+            .get(&runtime_role)
+            .cloned()
+            .ok_or_else(|| failed("test ONNX spec is missing a template runtime role"))?;
+        let bytes = read_regular_file_no_follow(&spec.root.join(&file.path), 16 * 1024 * 1024)?;
+        file.size_bytes = bytes.len() as u64;
+        file.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    }
+    validate_bundle_manifest(&manifest)?;
+    let receipt = receipt_for_manifest(&manifest, 1);
+    std::fs::write(spec.root.join(RECEIPT_FILE_NAME), receipt_bytes(&receipt)?)
+        .map_err(|error| failed(format!("failed to write test ONNX receipt: {error}")))?;
+    std::fs::write(spec.root.join(NOTICE_FILE_NAME), notice_bytes(&receipt))
+        .map_err(|error| failed(format!("failed to write test ONNX notice: {error}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1384,82 @@ mod tests {
                 .0,
             old_receipt
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_recovery_retains_or_restores_only_exact_directory_transactions() {
+        let root = unique_root("crash-recovery");
+        let target = root.join("target");
+        let source = root.join("source");
+        let old_receipt = write_fixture_bundle(&target, "old-moonshine", "old");
+        let new_receipt = write_fixture_bundle(&source, "new-moonshine", "new");
+        let staged = stage_file_bundle_for_target(
+            &fixture_assembly(&source, &new_receipt),
+            &fixture_generated(&new_receipt),
+            &target,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        drop(staged.activate().unwrap());
+        let recovery = recover_onnx_bundle_installation(&target).unwrap();
+        assert!(recovery.retained_interrupted_previous);
+        assert_eq!(verified_receipt_at(&target).unwrap().0, new_receipt);
+        assert_eq!(
+            verified_receipt_at(&crate::installations::previous_runtime_root(&target))
+                .unwrap()
+                .0,
+            old_receipt
+        );
+
+        let newer_source = root.join("newer-source");
+        let newer_receipt = write_fixture_bundle(&newer_source, "newer-moonshine", "newer");
+        let staged = stage_file_bundle_for_target(
+            &fixture_assembly(&newer_source, &newer_receipt),
+            &fixture_generated(&newer_receipt),
+            &target,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        drop(staged.activate().unwrap());
+        fs::remove_dir_all(&target).unwrap();
+        let incomplete = crate::installations::file_bundle_staging_root(&target).unwrap();
+        fs::create_dir(&incomplete).unwrap();
+        let recovery = recover_onnx_bundle_installation(&target).unwrap();
+        assert!(recovery.restored_interrupted_previous);
+        assert!(recovery.discarded_incomplete_staging);
+        assert_eq!(verified_receipt_at(&target).unwrap().0, new_receipt);
+        assert!(!incomplete.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_recovery_preserves_ambiguous_or_corrupt_state_for_operator_review() {
+        let root = unique_root("crash-ambiguous");
+        let target = root.join("target");
+        let source = root.join("source");
+        write_fixture_bundle(&target, "old-moonshine", "old");
+        let new_receipt = write_fixture_bundle(&source, "new-moonshine", "new");
+        let staged = stage_file_bundle_for_target(
+            &fixture_assembly(&source, &new_receipt),
+            &fixture_generated(&new_receipt),
+            &target,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        drop(staged.activate().unwrap());
+        let rollback = directory_activation_rollback_root(&target);
+        fs::write(rollback.join("unexpected"), b"corrupt").unwrap();
+        assert!(
+            recover_onnx_bundle_installation(&target)
+                .unwrap_err()
+                .requires_recovery()
+        );
+        assert!(target.exists());
+        assert!(rollback.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
