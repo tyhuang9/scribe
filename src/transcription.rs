@@ -1056,6 +1056,100 @@ impl TranscriptionService {
         self.worker.unload().map_err(Into::into)
     }
 
+    /// Resolves a private installed ONNX bundle solely from its durable exact
+    /// receipt. This path is local-only and intentionally bypasses public
+    /// model descriptors, settings, and dynamic catalog discovery.
+    fn onnx_artifact_from_receipt(&self, root: &Path) -> Result<RuntimeArtifact> {
+        let (_, spec) = crate::onnx_model_bundles::verified_receipt_at(root)
+            .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
+        Ok(RuntimeArtifact::OnnxBundle(spec))
+    }
+
+    pub(crate) fn preload_onnx_bundle_from_receipt(
+        &self,
+        root: &Path,
+    ) -> Result<RuntimeLoadExecution> {
+        self.preload_runtime_artifact(self.onnx_artifact_from_receipt(root)?)
+    }
+
+    pub(crate) fn transcribe_onnx_bundle_from_receipt(
+        &self,
+        root: &Path,
+        audio: Arc<PreparedAudio>,
+        options: TranscriptionOptions,
+    ) -> Result<RuntimeExecution> {
+        self.transcribe_runtime_artifact(self.onnx_artifact_from_receipt(root)?, audio, options)
+    }
+
+    /// Runs the staged bundle through the process-isolated ONNX worker before
+    /// activation. CPU is fixed here because the delivery unit carries no GPU
+    /// support or evidence.
+    pub(crate) fn verify_onnx_bundle_for_installation(
+        &self,
+        root: &Path,
+        cancellation: &InstallCancellation,
+    ) -> Result<InstallSmoke> {
+        ensure_install_not_cancelled(cancellation)?;
+        let artifact = self.onnx_artifact_from_receipt(root)?;
+        let preference = AccelerationPreference::Cpu;
+
+        let health_started = Instant::now();
+        self.worker
+            .health_check(artifact.clone(), preference)
+            .map_err(|error| anyhow!("staged ONNX bundle health check failed: {error}"))?;
+        let health_duration_ms = health_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        let load_started = Instant::now();
+        let load = self
+            .worker
+            .load(artifact.clone(), preference)
+            .map_err(|error| anyhow!("staged ONNX bundle load failed: {error}"))?;
+        let load_duration_ms = load_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        let audio = Arc::new(PreparedAudio::from_captured_mono(
+            vec![0.0; PREPARED_SAMPLE_RATE as usize],
+            PREPARED_SAMPLE_RATE,
+            1,
+            PREPARED_SAMPLE_RATE as usize,
+        )?);
+        let decode_started = Instant::now();
+        self.worker
+            .transcribe(
+                artifact.clone(),
+                preference,
+                audio,
+                TranscriptionOptions::default(),
+                self.router.cancellation_snapshot(),
+            )
+            .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
+        let decode_duration_ms = decode_started.elapsed().as_millis();
+        ensure_install_not_cancelled(cancellation)?;
+
+        self.worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle unload failed: {error}"))?;
+        let reload_started = Instant::now();
+        self.worker
+            .load(artifact, preference)
+            .map_err(|error| anyhow!("staged ONNX bundle reload failed: {error}"))?;
+        let reload_duration_ms = reload_started.elapsed().as_millis();
+        self.worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle final unload failed: {error}"))?;
+
+        Ok(InstallSmoke {
+            resolved_acceleration: load.diagnostics.resolved_acceleration,
+            detected_architecture: load.detected_architecture,
+            capabilities: load.capabilities,
+            health_duration_ms,
+            load_duration_ms,
+            decode_duration_ms,
+            reload_duration_ms,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn configured_acceleration_preference(&self) -> AccelerationPreference {
         self.config.performance.acceleration_preference
@@ -2907,6 +3001,103 @@ mod tests {
 
         drop(service);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_backed_onnx_bundle_routes_below_transcription_service() {
+        let (root, spec) = onnx_spec("receipt-service", OnnxModelFamily::OnlineTransducer);
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+
+        let load = service.preload_onnx_bundle_from_receipt(&root).unwrap();
+        let execution = service
+            .transcribe_onnx_bundle_from_receipt(
+                &root,
+                prepared_audio(),
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(load.detected_architecture, "online-transducer");
+        assert_eq!(execution.transcript.text, "neutral fake transcript");
+        assert_eq!(control.state.lock().unwrap().transcribe_calls, 1);
+
+        fs::write(root.join("unexpected.onnx"), b"unexpected").unwrap();
+        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
+        service.unload_runtime_artifacts().unwrap();
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_receipt_smoke_uses_fixed_cpu_and_observed_worker_evidence() {
+        let (root, spec) = onnx_spec("receipt-smoke", OnnxModelFamily::OnlineTransducer);
+        crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Gpu);
+        let smoke = service
+            .verify_onnx_bundle_for_installation(&root, &InstallCancellation::default())
+            .unwrap();
+
+        assert_eq!(
+            smoke.resolved_acceleration.requested,
+            AccelerationPreference::Cpu
+        );
+        assert_eq!(smoke.resolved_acceleration.resolved, ComputeDevice::Cpu);
+        assert_eq!(smoke.detected_architecture, "online-transducer");
+        assert!(smoke.capabilities.streaming);
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.transcribe_calls, 1);
+        assert_eq!(state.load_calls, 4);
+        drop(state);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "downloads an exact pinned Hugging Face bundle and requires SCRIBE_ONNX_BUNDLE_TEST=1 plus a spoken WAV fixture"]
+    fn real_hugging_face_bundle_install_load_and_decode_smoke() {
+        if std::env::var("SCRIBE_ONNX_BUNDLE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let model_id = std::env::var("SCRIBE_ONNX_BUNDLE_MODEL_ID")
+            .unwrap_or_else(|_| "moonshine-tiny-en-int8-onnx".to_owned());
+        let storage = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_BUNDLE_STORAGE_DIR")
+                .expect("set SCRIBE_ONNX_BUNDLE_STORAGE_DIR to a dedicated test directory"),
+        );
+        let audio_path = PathBuf::from(
+            std::env::var_os("SCRIBE_ONNX_BUNDLE_WAV")
+                .expect("set SCRIBE_ONNX_BUNDLE_WAV to a known spoken PCM WAV"),
+        );
+        fs::create_dir_all(&storage).unwrap();
+        let cancellation = InstallCancellation::default();
+        let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
+            &model_id,
+            &storage,
+            &cancellation,
+            &|_| {},
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.performance.acceleration_preference = AccelerationPreference::Cpu;
+        let service = TranscriptionService::new(config);
+        let smoke = service
+            .verify_onnx_bundle_for_installation(staged.root(), &cancellation)
+            .unwrap();
+        assert_eq!(smoke.resolved_acceleration.resolved, ComputeDevice::Cpu);
+        let activated = staged.activate(&cancellation).unwrap();
+        let installed_root = activated.spec().root.clone();
+        activated.commit().unwrap();
+        let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
+        let execution = service
+            .transcribe_onnx_bundle_from_receipt(
+                &installed_root,
+                audio,
+                TranscriptionOptions::default(),
+            )
+            .unwrap();
+        assert!(!execution.transcript.text.trim().is_empty());
+        service.unload_runtime_artifacts().unwrap();
     }
 
     #[test]
