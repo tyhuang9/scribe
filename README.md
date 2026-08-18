@@ -45,10 +45,10 @@ use **GitHub Actions** as its source. The default project site uses
 - Versioned local JSON settings with field-level salvage, unknown-field preservation, debounced atomic replacement, and legacy migration.
 - One-time migration from the old Local Transcriber config path when a Scribe config does not exist.
 - Global hotkey support with `Ctrl+Shift+Space` as the default and configurable toggle or hold-to-talk behavior.
-- Native microphone capture through `cpal`; callback samples enter a fixed-capacity SPSC ring and native workers perform downmixing, 16 kHz resampling, normalization, metering, VAD, endpointing, and post-roll without sending PCM through the UI.
+- Native microphone capture through `cpal`; callback samples enter a fixed-capacity SPSC ring and workers perform downmixing, 16 kHz resampling, metering, exact-window Silero VAD, endpointing, post-roll, and post-capture normalization without sending PCM through the UI.
 - Two private runtime variants selected only by the runtime-neutral `TranscriptionService` and `RuntimeRouter`: the statically linked `transcribe-cpp` 0.1.3 GGUF adapter and the isolated CPU-only sherpa-onnx worker. Zero models are Supported.
 - Trusted GGUF discovery/import plus resumable, exact-hash model installation with staged native smoke tests, atomic activation, and crash recovery. Runtime-package transactions remain only for retained GGML compatibility.
-- Non-blocking native workers for capture, model preload, rolling batch preview, final transcription, and diagnostic latency breakdowns.
+- Non-blocking native workers for capture, model preload, Silero-confirmed bounded batch preview with one terminal tail, final transcription, and diagnostic latency breakdowns.
 - Tray/menu integration with close-to-tray behavior and Show, Hide, Start/Stop Recording, Copy Last Transcript, and Quit actions. Show/Hide has live Windows evidence; the remaining tray actions still require the documented manual matrix.
 - A Windows background-recording overlay that stays hidden while Scribe is foreground, offers privacy-safe Compact status and optional Live preview modes, and exposes a non-activating discard control without changing the captured paste target.
 - Optional Windows insertion of the completed transcript into the captured app; other platforms use an explicit clipboard-only fallback.

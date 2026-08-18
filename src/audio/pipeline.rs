@@ -124,6 +124,9 @@ impl Pipeline {
                 vad_result = vad.push(output);
             }
         });
+        if vad_result.is_err() {
+            self.invalidate_preview();
+        }
         vad_result
     }
 
@@ -137,6 +140,13 @@ impl Pipeline {
         let Some(publisher) = self.preview_publisher.as_ref() else {
             return;
         };
+        let Some(speech_trigger_frame) = self.vad.speech_trigger_frame else {
+            return;
+        };
+        if self.vad.state != VadState::Active {
+            return;
+        }
+        self.next_preview_frame = self.next_preview_frame.max(speech_trigger_frame);
         if self.prepared.len() < self.next_preview_frame {
             return;
         }
@@ -150,7 +160,17 @@ impl Pipeline {
             .next_preview_frame
             .saturating_add(missed_intervals.saturating_mul(PREVIEW_INTERVAL_FRAMES));
         self.next_preview_frame = end.saturating_add(PREVIEW_INTERVAL_FRAMES);
-        let start = end.saturating_sub(PREVIEW_WINDOW_FRAMES);
+        let utterance_start = self
+            .vad
+            .speech_start_frame
+            .unwrap_or(speech_trigger_frame)
+            .saturating_sub(duration_to_prepared_frames(self.vad.options.pre_roll));
+        let start = end
+            .saturating_sub(PREVIEW_WINDOW_FRAMES)
+            .max(utterance_start);
+        if start >= end {
+            return;
+        }
         let mut samples = self.prepared[start..end].to_vec();
         normalize_loudness(&mut samples);
         if !matches!(publisher.publish_window(start as u64, samples), Ok(true)) {
@@ -198,36 +218,42 @@ impl Pipeline {
                 vad_result = vad.push(output);
             }
         });
-        vad_result?;
+        if let Err(error) = vad_result {
+            self.invalidate_preview();
+            return Err(error);
+        }
         self.levels.finish_windows();
-        self.vad.finish_detector()?;
-
         if self.limit_exceeded {
             return Err(CaptureError::PreparedAudioLimit {
                 maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
             });
         }
+        self.vad.finish_detector()?;
 
         if !self.retain_audio {
+            self.invalidate_preview();
             return Ok(None);
         }
 
         if !self.vad_enabled {
             if self.prepared.is_empty() || self.source_frames == 0 {
+                self.invalidate_preview();
                 return Ok(None);
             }
             normalize_loudness(&mut self.prepared);
-            return PreparedAudio::from_captured_mono(
+            let audio = PreparedAudio::from_captured_mono(
                 std::mem::take(&mut self.prepared),
                 self.source_sample_rate,
                 self.source_channels,
                 self.source_frames,
             )
-            .map(Some)
             .map_err(|error| CaptureError::Preparation(error.to_string()));
+            self.invalidate_preview();
+            return audio.map(Some);
         }
 
         let Some(speech_start) = self.vad.speech_start_frame else {
+            self.invalidate_preview();
             return Ok(None);
         };
         let start =
@@ -241,6 +267,7 @@ impl Pipeline {
                 .min(self.prepared.len()),
         };
         if start >= end {
+            self.invalidate_preview();
             return Ok(None);
         }
         let mut samples = std::mem::take(&mut self.prepared);
@@ -250,14 +277,15 @@ impl Pipeline {
         }
         normalize_loudness(&mut samples);
         let source_frames = prepared_to_source_frames(samples.len(), self.source_sample_rate);
-        PreparedAudio::from_captured_mono(
+        let audio = PreparedAudio::from_captured_mono(
             samples,
             self.source_sample_rate,
             self.source_channels,
             source_frames,
         )
-        .map(Some)
-        .map_err(|error| CaptureError::Preparation(error.to_string()))
+        .map_err(|error| CaptureError::Preparation(error.to_string()))?;
+        self.publish_terminal_preview(&audio, start);
+        Ok(Some(audio))
     }
 
     pub(super) fn maximum_levels(&self) -> LevelSnapshot {
@@ -265,7 +293,39 @@ impl Pipeline {
     }
 
     pub(super) fn cancel_speech_detector(&mut self) -> Result<(), CaptureError> {
+        self.invalidate_preview();
         self.vad.cancel_detector()
+    }
+
+    pub(super) fn invalidate_preview(&mut self) {
+        if let Some(publisher) = self.preview_publisher.take() {
+            publisher.invalidate();
+        }
+    }
+
+    fn publish_terminal_preview(&mut self, audio: &PreparedAudio, utterance_start: usize) {
+        let Some(publisher) = self.preview_publisher.take() else {
+            return;
+        };
+        if audio.samples.is_empty() {
+            publisher.invalidate();
+            return;
+        }
+        let relative_start = audio.samples.len().saturating_sub(PREVIEW_WINDOW_FRAMES);
+        let start = utterance_start.saturating_add(relative_start);
+        let samples = audio.samples[relative_start..].to_vec();
+        if !matches!(
+            publisher.publish_terminal_window(start as u64, samples),
+            Ok(true)
+        ) {
+            publisher.invalidate();
+        }
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.invalidate_preview();
     }
 }
 
@@ -826,17 +886,40 @@ mod tests {
             RequestId(5),
             ModelId::new("preview-model"),
         );
-        let disabled_vad = CaptureOptions {
-            vad_enabled: false,
+        let options = CaptureOptions {
             endpointing_enabled: false,
             ..CaptureOptions::default()
         };
+        let (preview_detector, preview_vad) = fake_detector();
+        preview_vad
+            .lock()
+            .unwrap()
+            .decisions
+            .extend(std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.9,
+                    speech: true,
+                }),
+                128,
+            ));
+        let (final_detector, final_vad) = fake_detector();
+        final_vad
+            .lock()
+            .unwrap()
+            .decisions
+            .extend(std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.9,
+                    speech: true,
+                }),
+                128,
+            ));
         let (preview_rms, preview_peak, preview_observed, preview_revision) = level_state();
         let mut with_preview = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
-            disabled_vad,
-            None,
+            options,
+            Some(preview_detector),
             preview_rms,
             preview_peak,
             preview_observed,
@@ -848,8 +931,8 @@ mod tests {
         let mut final_only = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
-            disabled_vad,
-            None,
+            options,
+            Some(final_detector),
             final_rms,
             final_peak,
             final_observed,
@@ -890,6 +973,263 @@ mod tests {
     }
 
     #[test]
+    fn preview_waits_for_confirmation_and_starts_at_bounded_pre_roll() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((snapshot.window_start_frame, snapshot.window_end_frame))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(3),
+            RequestId(5),
+            ModelId::new("preview-model"),
+        );
+        let (detector, state) = fake_detector();
+        state.lock().unwrap().decisions.extend(
+            std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.1,
+                    speech: false,
+                }),
+                20,
+            )
+            .chain(std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.9,
+                    speech: true,
+                }),
+                5,
+            )),
+        );
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+
+        for window in 0..25 {
+            for _ in 0..WINDOW_SAMPLES {
+                pipeline.push_interleaved(0.5).unwrap();
+            }
+            pipeline.publish_due_previews();
+            if window < 24 {
+                assert!(snapshot_rx.try_recv().is_err());
+            }
+        }
+
+        let (start, end) = snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(end, (25 * WINDOW_SAMPLES) as u64);
+        assert_eq!(
+            start,
+            (20 * WINDOW_SAMPLES - duration_to_prepared_frames(VadOptions::default().pre_roll))
+                as u64
+        );
+        pipeline.invalidate_preview();
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn paused_capture_emits_one_bounded_terminal_tail_and_no_repeated_batches() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((
+                    snapshot.window_start_frame,
+                    snapshot.window_end_frame,
+                    snapshot.audio.samples.len(),
+                ))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(3),
+            RequestId(5),
+            ModelId::new("preview-model"),
+        );
+        let (detector, state) = fake_detector();
+        state.lock().unwrap().decisions.extend(
+            std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.9,
+                    speech: true,
+                }),
+                5,
+            )
+            .chain(std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.1,
+                    speech: false,
+                }),
+                29,
+            )),
+        );
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+
+        for _ in 0..34 * WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.5).unwrap();
+        }
+        assert!(pipeline.endpoint_triggered());
+        for _ in 0..4 {
+            pipeline.publish_due_previews();
+        }
+        assert!(snapshot_rx.try_recv().is_err());
+
+        let audio = pipeline
+            .finish(CaptureStopReason::Endpoint)
+            .unwrap()
+            .unwrap();
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        let (start, end, samples) = snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(samples, audio.samples.len().min(PREVIEW_WINDOW_FRAMES));
+        assert_eq!(end - start, samples as u64);
+        assert!(samples <= PREVIEW_WINDOW_FRAMES);
+        assert!(snapshot_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_hold_stop_emits_exactly_one_terminal_tail() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx
+                .send((snapshot.window_start_frame, snapshot.window_end_frame))
+                .unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(4),
+            RequestId(6),
+            ModelId::new("preview-model"),
+        );
+        let (detector, state) = fake_detector();
+        state.lock().unwrap().decisions.extend(
+            std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.9,
+                    speech: true,
+                }),
+                5,
+            )
+            .chain(std::iter::repeat_n(
+                Ok(SileroVadDecision {
+                    probability: 0.1,
+                    speech: false,
+                }),
+                15,
+            )),
+        );
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions {
+                endpointing_enabled: false,
+                ..CaptureOptions::default()
+            },
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+        for _ in 0..20 * WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.5).unwrap();
+        }
+        assert_eq!(pipeline.vad.state, VadState::Paused);
+
+        let audio = pipeline
+            .finish(CaptureStopReason::Explicit)
+            .unwrap()
+            .unwrap();
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        assert_eq!(
+            snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (0, audio.samples.len() as u64)
+        );
+        assert!(audio.samples.len() <= PREVIEW_WINDOW_FRAMES);
+        assert!(snapshot_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_speech_publishes_and_decodes_zero_terminal_tails() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx.send(snapshot.identity.sequence).unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(5),
+            RequestId(7),
+            ModelId::new("preview-model"),
+        );
+        let (detector, state) = fake_detector();
+        state.lock().unwrap().decisions.extend(std::iter::repeat_n(
+            Ok(SileroVadDecision {
+                probability: 0.1,
+                speech: false,
+            }),
+            40,
+        ));
+        let (rms, peak, observed, revision) = level_state();
+        let mut pipeline = Pipeline::new(
+            PREPARED_SAMPLE_RATE,
+            1,
+            CaptureOptions::default(),
+            Some(detector),
+            rms,
+            peak,
+            observed,
+            revision,
+        )
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
+        for _ in 0..40 * WINDOW_SAMPLES {
+            pipeline.push_interleaved(0.5).unwrap();
+            pipeline.publish_due_previews();
+        }
+
+        assert!(
+            pipeline
+                .finish(CaptureStopReason::MaximumDuration)
+                .unwrap()
+                .is_none()
+        );
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        assert!(snapshot_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn delayed_preview_publication_skips_obsolete_cadence_windows() {
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
@@ -909,15 +1249,22 @@ mod tests {
             ModelId::new("preview-model"),
         );
         let (rms, peak, observed, revision) = level_state();
+        let (detector, vad) = fake_detector();
+        vad.lock().unwrap().decisions.extend(std::iter::repeat_n(
+            Ok(SileroVadDecision {
+                probability: 0.9,
+                speech: true,
+            }),
+            128,
+        ));
         let mut pipeline = Pipeline::new(
             PREPARED_SAMPLE_RATE,
             1,
             CaptureOptions {
-                vad_enabled: false,
                 endpointing_enabled: false,
                 ..CaptureOptions::default()
             },
-            None,
+            Some(detector),
             rms,
             peak,
             observed,

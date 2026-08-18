@@ -392,6 +392,7 @@ impl Drop for WorkerSpeechDetector {
 
 pub struct RecordingSession {
     stop_requested: Arc<AtomicBool>,
+    discard_requested: Arc<AtomicBool>,
     finished_rx: Receiver<Result<CaptureCompletion, CaptureError>>,
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
@@ -433,6 +434,7 @@ impl RecordingSession {
     }
 
     pub fn stop_and_discard(self, timeout: Duration) -> Result<(), CaptureError> {
+        self.discard_requested.store(true, Ordering::Release);
         self.stop();
         let result = match self.finished_rx.recv_timeout(timeout) {
             Ok(Ok(_completion)) => Ok(()),
@@ -523,6 +525,7 @@ impl RecordingSession {
         });
         Self {
             stop_requested,
+            discard_requested: Arc::new(AtomicBool::new(false)),
             finished_rx,
             rms_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             peak_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
@@ -544,6 +547,7 @@ impl RecordingSession {
 
 impl Drop for RecordingSession {
     fn drop(&mut self) {
+        self.discard_requested.store(true, Ordering::Release);
         self.stop_requested.store(true, Ordering::Release);
         self.reap_worker();
     }
@@ -568,6 +572,7 @@ pub fn start_recording(
     VadThreshold::new(options.speech_probability_threshold)
         .map_err(WorkerSpeechDetector::vad_error)?;
     let stop_requested = Arc::clone(&cancellation.stop_requested);
+    let discard_requested = Arc::new(AtomicBool::new(false));
     let rms_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let level_observed = Arc::new(AtomicBool::new(false));
@@ -576,6 +581,7 @@ pub fn start_recording(
     let (finished_tx, finished_rx) = bounded(1);
 
     let worker_stop = Arc::clone(&stop_requested);
+    let worker_discard = Arc::clone(&discard_requested);
     let worker_rms = Arc::clone(&rms_bits);
     let worker_peak = Arc::clone(&peak_bits);
     let worker_observed = Arc::clone(&level_observed);
@@ -590,6 +596,7 @@ pub fn start_recording(
                 options,
                 preview_publisher,
                 worker_stop,
+                worker_discard,
                 worker_rms,
                 worker_peak,
                 worker_observed,
@@ -607,6 +614,7 @@ pub fn start_recording(
     match await_capture_start(&started_rx, &cancellation, worker, START_TIMEOUT) {
         Ok(worker) => Ok(RecordingSession {
             stop_requested,
+            discard_requested,
             finished_rx,
             rms_bits,
             peak_bits,
@@ -650,6 +658,7 @@ fn capture_worker(
     options: CaptureOptions,
     preview_publisher: Option<PreviewAudioPublisher>,
     stop_requested: Arc<AtomicBool>,
+    discard_requested: Arc<AtomicBool>,
     rms_bits: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     level_observed: Arc<AtomicBool>,
@@ -733,7 +742,13 @@ fn capture_worker(
 
     let (stop_reason, stop_trigger_elapsed) = loop {
         drain_ring_bounded(&mut consumer, &mut pipeline, MAX_DRAIN_SAMPLES_PER_TICK)?;
-        pipeline.publish_due_previews();
+        let elapsed = capture_started.elapsed();
+        if explicit_stop.is_none() && stop_requested.load(Ordering::Acquire) {
+            explicit_stop = Some((Instant::now(), pipeline.source_frames(), elapsed));
+        }
+        if explicit_stop.is_none() {
+            pipeline.publish_due_previews();
+        }
         if pipeline.limit_exceeded() {
             return Err(CaptureError::PreparedAudioLimit {
                 maximum_frames: MAX_CAPTURE_PREPARED_FRAMES,
@@ -780,11 +795,6 @@ fn capture_worker(
             _ => {}
         }
 
-        let elapsed = capture_started.elapsed();
-        if explicit_stop.is_none() && stop_requested.load(Ordering::Acquire) {
-            explicit_stop = Some((Instant::now(), pipeline.source_frames(), elapsed));
-        }
-
         let explicit_post_roll_complete =
             explicit_stop.is_some_and(|(stop_seen, source_frame, _)| {
                 let post_roll_frames =
@@ -807,7 +817,9 @@ fn capture_worker(
 
     drop(stream.take());
     drain_ring_all(&mut consumer, &mut pipeline)?;
-    pipeline.publish_due_previews();
+    if discard_requested.load(Ordering::Acquire) {
+        pipeline.invalidate_preview();
+    }
     if fault.load(Ordering::Acquire) == FAULT_OVERFLOW {
         return Err(CaptureError::BufferOverflow {
             dropped_samples: dropped_samples.load(Ordering::Relaxed).max(1),

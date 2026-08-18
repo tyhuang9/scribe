@@ -5166,7 +5166,11 @@ impl LocalTranscriberApp {
             self.rolling_preview = Some(preview);
             return false;
         }
-        preview.close();
+        if matches!(&action, PreviewDrainAction::FinishCapture(capture) if capture.result.is_ok()) {
+            preview.close();
+        } else {
+            preview.invalidate();
+        }
         self.pending_preview_drain = Some(PendingPreviewDrain {
             preview,
             action,
@@ -5230,9 +5234,18 @@ impl LocalTranscriberApp {
             .take()
             .expect("preview drain checked above");
         let identity = pending.preview.identity().clone();
+        let terminal_preview = matches!(
+            &pending.action,
+            PreviewDrainAction::FinishCapture(capture) if capture.result.is_ok()
+        )
+        .then(|| pending.preview.try_next())
+        .flatten();
         if !pending.preview.stop_and_join(Duration::ZERO) {
             self.pending_preview_drain = Some(pending);
             return;
+        }
+        if let Some(event) = terminal_preview {
+            self.apply_rolling_preview_event(event);
         }
         let _ = self.session_coordinator.finish_preview(
             identity.session_id,
