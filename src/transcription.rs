@@ -3038,6 +3038,22 @@ mod tests {
         })
     }
 
+    fn normalize_fixture_transcript(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn private_runtime_artifact_routes_onnx_load_health_and_transcribe_through_worker() {
         let (root, spec) = onnx_spec("online-service", OnnxModelFamily::OnlineTransducer);
@@ -3200,6 +3216,12 @@ mod tests {
             std::env::var_os("SCRIBE_ONNX_BUNDLE_WAV")
                 .expect("set SCRIBE_ONNX_BUNDLE_WAV to a known spoken PCM WAV"),
         );
+        let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
+            .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
+        assert!(
+            !normalize_fixture_transcript(&expected_text).is_empty(),
+            "the required expected transcript must contain letters or numbers"
+        );
         fs::create_dir_all(&storage).unwrap();
         let cancellation = InstallCancellation::default();
         let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
@@ -3219,19 +3241,34 @@ mod tests {
             verified.smoke().resolved_acceleration.resolved,
             ComputeDevice::Cpu
         );
-        let activated = verified.activate().unwrap();
-        let installed_root = activated.spec().root.clone();
-        activated.commit().unwrap();
         let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
-        let execution = service
-            .transcribe_onnx_bundle_from_receipt(
-                &installed_root,
-                audio,
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert!(!execution.transcript.text.trim().is_empty());
-        service.unload_runtime_artifacts().unwrap();
+        let execution_result = service.transcribe_onnx_bundle_from_receipt(
+            verified.root(),
+            audio,
+            TranscriptionOptions::default(),
+        );
+        let unload_result = service.unload_runtime_artifacts();
+        let execution = match (execution_result, unload_result) {
+            (Ok(execution), Ok(())) => execution,
+            (Err(error), _) => {
+                let _ = verified.discard();
+                panic!("pre-activation fixture decode failed: {error:#}");
+            }
+            (Ok(_), Err(error)) => {
+                let _ = verified.discard();
+                panic!("pre-activation fixture unload failed: {error:#}");
+            }
+        };
+        let actual = normalize_fixture_transcript(&execution.transcript.text);
+        let expected = normalize_fixture_transcript(&expected_text);
+        if actual != expected {
+            let _ = verified.discard();
+            panic!(
+                "fixture transcript must equal the required normalized expected text before activation: expected {expected:?}, got {actual:?}"
+            );
+        }
+        let activated = verified.activate().unwrap();
+        activated.commit().unwrap();
     }
 
     #[test]

@@ -40,6 +40,18 @@ const RECEIPT_FILE_NAME: &str = "install-receipt.json";
 const NOTICE_FILE_NAME: &str = "NOTICE.txt";
 const LOCK_DIRECTORY_NAME: &str = ".onnx-bundle-locks";
 const RESERVATION_DIRECTORY_NAME: &str = ".onnx-bundle-reservations";
+const APACHE_2_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/licenses/Apache-2.0.txt"
+));
+const CC_BY_4_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/licenses/CC-BY-4.0.txt"
+));
+const MOONSHINE_MIT_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/licenses/Moonshine-MIT.txt"
+));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -127,7 +139,17 @@ struct LicenseEvidence {
     copyright: String,
     source_repository: String,
     source_revision: Option<String>,
+    legal_url: String,
+    changes_notice: String,
     notice: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedLicenseFileEvidence {
+    path: PathBuf,
+    size_bytes: u64,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,6 +190,7 @@ pub(crate) struct OnnxBundleReceipt {
     files: Vec<BundleFileManifest>,
     capability: CapabilityEvidence,
     license: LicenseEvidence,
+    generated_license_files: Vec<GeneratedLicenseFileEvidence>,
     verified_at_unix_seconds: u64,
     state: ReceiptState,
 }
@@ -260,6 +283,8 @@ fn validate_bundle_manifest(bundle: &OnnxBundleManifest) -> Result<(), InstallEr
     if bundle.license.spdx.trim().is_empty()
         || bundle.license.copyright.trim().is_empty()
         || bundle.license.notice.trim().is_empty()
+        || bundle.license.legal_url.trim().is_empty()
+        || bundle.license.changes_notice.trim().is_empty()
     {
         return Err(failed(format!(
             "ONNX bundle {} has incomplete license evidence",
@@ -269,6 +294,17 @@ fn validate_bundle_manifest(bundle: &OnnxBundleManifest) -> Result<(), InstallEr
     validate_repository(&bundle.license.source_repository)?;
     if let Some(revision) = &bundle.license.source_revision {
         validate_revision(revision, "license source revision")?;
+    }
+    let legal_url = url::Url::parse(&bundle.license.legal_url)
+        .map_err(|error| failed(format!("invalid license legal URL: {error}")))?;
+    if legal_url.scheme() != "https"
+        || legal_url.host_str().is_none()
+        || legal_url.username() != ""
+        || legal_url.password().is_some()
+        || legal_url.query().is_some()
+        || legal_url.fragment().is_some()
+    {
+        return Err(failed("license evidence requires an exact HTTPS legal URL"));
     }
     match bundle.availability {
         BundleAvailability::Available => {
@@ -302,6 +338,16 @@ fn validate_bundle_manifest(bundle: &OnnxBundleManifest) -> Result<(), InstallEr
         if file.path == Path::new(RECEIPT_FILE_NAME) || file.path == Path::new(NOTICE_FILE_NAME) {
             return Err(failed(format!(
                 "ONNX bundle {} reserves file path {}",
+                bundle.id,
+                file.path.display()
+            )));
+        }
+        if generated_license_materials(&bundle.license)
+            .iter()
+            .any(|material| material.install_path == file.path)
+        {
+            return Err(failed(format!(
+                "ONNX bundle {} collides with generated license path {}",
                 bundle.id,
                 file.path.display()
             )));
@@ -887,6 +933,10 @@ pub(crate) struct VerifiedStagedOnnxBundle {
 }
 
 impl VerifiedStagedOnnxBundle {
+    pub(crate) fn root(&self) -> &Path {
+        self.staged.root()
+    }
+
     pub(crate) fn smoke(&self) -> &InstallSmoke {
         &self.smoke
     }
@@ -930,6 +980,12 @@ impl VerifiedStagedOnnxBundle {
             target_guard: staged.target_guard,
             disk_reservation: staged.disk_reservation,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discard(self) -> Result<(), InstallError> {
+        discard_file_bundle_staging(&self.staged.staged.target_root)?;
+        Ok(())
     }
 }
 
@@ -1064,6 +1120,14 @@ fn receipt_for_manifest(
     manifest: &OnnxBundleManifest,
     verified_at_unix_seconds: u64,
 ) -> OnnxBundleReceipt {
+    let generated_license_files = generated_license_materials(&manifest.license)
+        .into_iter()
+        .map(|file| GeneratedLicenseFileEvidence {
+            path: file.install_path,
+            size_bytes: file.bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&file.bytes)),
+        })
+        .collect();
     OnnxBundleReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
         manifest_schema_version: CATALOG_SCHEMA_VERSION,
@@ -1077,19 +1141,35 @@ fn receipt_for_manifest(
         files: manifest.files.clone(),
         capability: manifest.capability.clone(),
         license: manifest.license.clone(),
+        generated_license_files,
         verified_at_unix_seconds,
         state: ReceiptState::Verified,
     }
 }
 
+fn generated_license_materials(license: &LicenseEvidence) -> Vec<GeneratedBundleFile> {
+    let (path, bytes): (&str, &[u8]) = match license.spdx.as_str() {
+        "Apache-2.0" => ("LICENSES/Apache-2.0.txt", APACHE_2_LICENSE_BYTES),
+        "CC-BY-4.0" => ("LICENSES/CC-BY-4.0.txt", CC_BY_4_LICENSE_BYTES),
+        "MIT" => ("LICENSES/Moonshine-MIT.txt", MOONSHINE_MIT_LICENSE_BYTES),
+        _ => return Vec::new(),
+    };
+    vec![GeneratedBundleFile {
+        install_path: PathBuf::from(path),
+        bytes: bytes.to_vec(),
+    }]
+}
+
 fn notice_bytes(receipt: &OnnxBundleReceipt) -> Vec<u8> {
     format!(
-        "Scribe ONNX model bundle\n\nModel: {}\nSource: https://huggingface.co/{}\nRevision: {}\nLicense: {}\nAttribution: {}\n\n{}\n",
+        "Scribe ONNX model bundle\n\nModel: {}\nSource: https://huggingface.co/{}\nRevision: {}\nLicense: {}\nLegal text: {}\nAttribution: {}\nChanges: {}\n\n{}\n",
         receipt.model_id,
         receipt.repository,
         receipt.revision,
         receipt.license.spdx,
+        receipt.license.legal_url,
         receipt.license.copyright,
+        receipt.license.changes_notice,
         receipt.license.notice
     )
     .into_bytes()
@@ -1141,6 +1221,11 @@ fn bundle_required_install_bytes(
         .checked_add(receipt_bytes(&receipt)?.len() as u64)
         .and_then(|total| total.checked_add(notice_bytes(&receipt).len() as u64))
         .ok_or_else(|| failed("ONNX bundle metadata-space requirement overflowed"))?;
+    for material in generated_license_materials(&receipt.license) {
+        additional = additional
+            .checked_add(material.bytes.len() as u64)
+            .ok_or_else(|| failed("ONNX bundle license-space requirement overflowed"))?;
+    }
     Ok(additional)
 }
 
@@ -1199,7 +1284,7 @@ pub(crate) fn stage_onnx_bundle_install(
             .ok_or_else(|| failed("ONNX bundle progress overflowed"))?;
     }
     let receipt = receipt_for_manifest(manifest, unix_seconds());
-    let generated = vec![
+    let mut generated = vec![
         GeneratedBundleFile {
             install_path: PathBuf::from(RECEIPT_FILE_NAME),
             bytes: receipt_bytes(&receipt)?,
@@ -1209,6 +1294,7 @@ pub(crate) fn stage_onnx_bundle_install(
             bytes: notice_bytes(&receipt),
         },
     ];
+    generated.extend(generated_license_materials(&receipt.license));
     let retain_previous =
         target_root.is_dir() && current_executable_receipt_at(&target_root).is_ok();
     let staged = stage_file_bundle_for_target(
@@ -1280,7 +1366,21 @@ fn validate_receipt(receipt: &OnnxBundleReceipt) -> Result<(), InstallError> {
         capability: receipt.capability.clone(),
         license: receipt.license.clone(),
         files: receipt.files.clone(),
-    })
+    })?;
+    let expected = generated_license_materials(&receipt.license)
+        .into_iter()
+        .map(|file| GeneratedLicenseFileEvidence {
+            path: file.install_path,
+            size_bytes: file.bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&file.bytes)),
+        })
+        .collect::<Vec<_>>();
+    if receipt.generated_license_files != expected || expected.is_empty() {
+        return Err(failed(
+            "ONNX bundle receipt has incomplete generated license materials",
+        ));
+    }
+    Ok(())
 }
 
 fn receipt_matches_manifest(receipt: &OnnxBundleReceipt, manifest: &OnnxBundleManifest) -> bool {
@@ -1324,6 +1424,17 @@ pub(crate) fn verified_receipt_at(
         size_bytes: bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&bytes)),
     });
+    exact_files.extend(
+        receipt
+            .generated_license_files
+            .iter()
+            .map(|file| RuntimeFileSpec {
+                archive_path: file.path.clone(),
+                install_path: file.path.clone(),
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            }),
+    );
     exact_files.push(RuntimeFileSpec {
         archive_path: PathBuf::from(NOTICE_FILE_NAME),
         install_path: PathBuf::from(NOTICE_FILE_NAME),
@@ -1477,6 +1588,13 @@ pub(crate) fn write_test_receipt_for_spec(spec: &OnnxModelSpec) -> Result<(), In
         .map_err(|error| failed(format!("failed to write test ONNX receipt: {error}")))?;
     std::fs::write(spec.root.join(NOTICE_FILE_NAME), notice_bytes(&receipt))
         .map_err(|error| failed(format!("failed to write test ONNX notice: {error}")))?;
+    for material in generated_license_materials(&receipt.license) {
+        let path = spec.root.join(&material.install_path);
+        std::fs::create_dir_all(path.parent().expect("license material has a parent"))
+            .map_err(|error| failed(format!("failed to create test license directory: {error}")))?;
+        std::fs::write(&path, material.bytes)
+            .map_err(|error| failed(format!("failed to write test license material: {error}")))?;
+    }
     Ok(())
 }
 
@@ -1515,6 +1633,11 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join(NOTICE_FILE_NAME), notice_bytes(&receipt)).unwrap();
+        for material in generated_license_materials(&receipt.license) {
+            let path = root.join(&material.install_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, material.bytes).unwrap();
+        }
         receipt
     }
 
@@ -1532,7 +1655,7 @@ mod tests {
     }
 
     fn fixture_generated(receipt: &OnnxBundleReceipt) -> Vec<GeneratedBundleFile> {
-        vec![
+        let mut generated = vec![
             GeneratedBundleFile {
                 install_path: PathBuf::from(RECEIPT_FILE_NAME),
                 bytes: receipt_bytes(receipt).unwrap(),
@@ -1541,7 +1664,9 @@ mod tests {
                 install_path: PathBuf::from(NOTICE_FILE_NAME),
                 bytes: notice_bytes(receipt),
             },
-        ]
+        ];
+        generated.extend(generated_license_materials(&receipt.license));
+        generated
     }
 
     #[test]
@@ -1555,14 +1680,44 @@ mod tests {
             "d1e6c30921780b8508d04b492dfb3ce8a51605d4"
         );
         assert_eq!(moonshine.files.len(), 4);
+        assert_eq!(
+            moonshine.license.source_repository,
+            "moonshine-ai/moonshine"
+        );
+        assert_eq!(
+            moonshine.license.source_revision.as_deref(),
+            Some("06f74196a6212fe8642df143d87a243970f15114")
+        );
+        assert!(moonshine.files.iter().any(|file| {
+            file.role == BundleFileRole::License && file.path == Path::new("LICENSE")
+        }));
         let parakeet = bundle_manifest("parakeet-tdt-ctc-110m-en-int8-onnx").unwrap();
         assert_eq!(parakeet.availability, BundleAvailability::Unavailable);
         assert!(parakeet.files.is_empty());
         let canary = bundle_manifest("canary-180m-flash-int8-onnx").unwrap();
         assert_eq!(canary.capability.languages, ["en"]);
         assert!(!canary.capability.native_streaming);
+        assert_eq!(
+            canary.license.legal_url,
+            "https://creativecommons.org/licenses/by/4.0/legalcode"
+        );
+        assert!(
+            canary
+                .license
+                .changes_notice
+                .contains("dynamically quantized")
+        );
         let zipformer = bundle_manifest("zipformer-streaming-en-20m-int8-onnx").unwrap();
         assert!(zipformer.capability.native_streaming);
+        assert_eq!(
+            zipformer.license.source_repository,
+            "desh2608/icefall-asr-librispeech-pruned-transducer-stateless7-streaming-small"
+        );
+        assert_eq!(
+            zipformer.license.source_revision.as_deref(),
+            Some("be162ecc09bade73063a671fad9d18220149d25b")
+        );
+        assert!(zipformer.license.changes_notice.contains("unpinned"));
         assert_eq!(
             catalog.runtime.source_revision,
             "3dc7c569f31ca2cd4a20ed6f7db780327e6714c5"
@@ -1661,6 +1816,21 @@ mod tests {
     }
 
     #[test]
+    fn rollback_rejects_a_retired_receipt_without_deleting_it() {
+        let root = unique_root("retired-rollback");
+        let target = root.join("target");
+        fs::create_dir_all(&root).unwrap();
+        let previous = crate::installations::previous_runtime_root(&target);
+        write_fixture_bundle(&previous, "retired-moonshine-build", "retired");
+
+        assert!(rollback_to_previous_onnx_bundle(&target).is_err());
+        assert!(previous.exists());
+        assert!(verified_receipt_at(&previous).is_ok());
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn receipt_verification_rejects_extras_hash_changes_and_notice_changes() {
         let root = unique_root("receipt-negative");
         let receipt = write_fixture_bundle(&root, "fixture-moonshine", "exact");
@@ -1673,6 +1843,27 @@ mod tests {
         fs::write(root.join(NOTICE_FILE_NAME), b"wrong notice").unwrap();
         assert!(verified_receipt_at(&root).is_err());
         assert!(!receipt.files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipts_cover_complete_generated_license_materials() {
+        assert!(CC_BY_4_LICENSE_BYTES.len() > 16_000);
+        assert!(APACHE_2_LICENSE_BYTES.len() > 11_000);
+        assert!(MOONSHINE_MIT_LICENSE_BYTES.starts_with(b"MIT License"));
+        let root = unique_root("license-materials");
+        let receipt = write_fixture_bundle(&root, "fixture-moonshine", "licenses");
+        assert_eq!(receipt.generated_license_files.len(), 1);
+        let evidence = &receipt.generated_license_files[0];
+        assert_eq!(evidence.path, Path::new("LICENSES/Moonshine-MIT.txt"));
+        assert_eq!(
+            evidence.size_bytes,
+            MOONSHINE_MIT_LICENSE_BYTES.len() as u64
+        );
+        verified_receipt_at(&root).unwrap();
+
+        fs::write(root.join(&evidence.path), b"tampered license").unwrap();
+        assert!(verified_receipt_at(&root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1882,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery_retains_or_restores_only_exact_directory_transactions() {
+    fn crash_recovery_rejects_retired_receipts_without_deleting_them() {
         let root = unique_root("crash-recovery");
         let target = root.join("target");
         let source = root.join("source");
@@ -1897,35 +2088,13 @@ mod tests {
         )
         .unwrap();
         drop(staged.activate().unwrap());
-        let recovery = recover_onnx_bundle_installation(&target).unwrap();
-        assert!(recovery.retained_interrupted_previous);
+        let error = recover_onnx_bundle_installation(&target).unwrap_err();
+        assert!(error.requires_recovery());
         assert_eq!(verified_receipt_at(&target).unwrap().0, new_receipt);
-        assert_eq!(
-            verified_receipt_at(&crate::installations::previous_runtime_root(&target))
-                .unwrap()
-                .0,
-            old_receipt
-        );
-
-        let newer_source = root.join("newer-source");
-        let newer_receipt = write_fixture_bundle(&newer_source, "newer-moonshine", "newer");
-        let staged = stage_file_bundle_for_target(
-            &fixture_assembly(&newer_source, &newer_receipt),
-            &fixture_generated(&newer_receipt),
-            &target,
-            &InstallCancellation::default(),
-            &|_| {},
-        )
-        .unwrap();
-        drop(staged.activate().unwrap());
-        fs::remove_dir_all(&target).unwrap();
-        let incomplete = crate::installations::file_bundle_staging_root(&target).unwrap();
-        fs::create_dir(&incomplete).unwrap();
-        let recovery = recover_onnx_bundle_installation(&target).unwrap();
-        assert!(recovery.restored_interrupted_previous);
-        assert!(recovery.discarded_incomplete_staging);
-        assert_eq!(verified_receipt_at(&target).unwrap().0, new_receipt);
-        assert!(!incomplete.exists());
+        let rollback = directory_activation_rollback_root(&target);
+        assert_eq!(verified_receipt_at(&rollback).unwrap().0, old_receipt);
+        assert!(target.exists());
+        assert!(rollback.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
