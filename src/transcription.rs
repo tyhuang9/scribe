@@ -2758,7 +2758,10 @@ mod tests {
     use crate::runtime_router::{OnnxSupervisorControl, RuntimeArtifact};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::Condvar;
+
+    const MAX_DIAGNOSTIC_ONNX_WAV_BYTES: u64 = 256 * 1024 * 1024;
 
     #[derive(Default)]
     struct FakeOnnxState {
@@ -2767,6 +2770,7 @@ mod tests {
         maximum_loaded_models: usize,
         events: Vec<String>,
         fail_next_load: bool,
+        fail_load_call: Option<usize>,
         fail_transcribe: bool,
         fail_health: bool,
         fail_start_stream: bool,
@@ -2806,6 +2810,10 @@ mod tests {
 
         fn fail_next_load(&self) {
             self.state.lock().unwrap().fail_next_load = true;
+        }
+
+        fn fail_load_call(&self, call: usize) {
+            self.state.lock().unwrap().fail_load_call = Some(call);
         }
 
         fn fail_transcribe(&self) {
@@ -2848,6 +2856,12 @@ mod tests {
                     state.events.push(format!("evict:{}", previous.id));
                 }
                 state.events.push(format!("load:{}", model.id));
+            }
+            if state.fail_load_call == Some(state.load_calls) {
+                state.fail_load_call = None;
+                state.loaded = Some(model);
+                state.maximum_loaded_models = state.maximum_loaded_models.max(1);
+                anyhow::bail!("deterministic ONNX load failure on call");
             }
             if std::mem::take(&mut state.fail_next_load) {
                 anyhow::bail!("deterministic ONNX load failure");
@@ -3081,6 +3095,51 @@ mod tests {
             .join(" ")
     }
 
+    fn decode_digest_pinned_diagnostic_wav_with_hook(
+        path: &Path,
+        expected_sha256: &str,
+        after_verified_read: impl FnOnce(),
+    ) -> Result<PreparedAudio> {
+        anyhow::ensure!(
+            expected_sha256.len() == 64
+                && expected_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "diagnostic WAV SHA-256 must be exactly 64 lowercase hexadecimal characters"
+        );
+        let bytes =
+            crate::installations::read_regular_file_no_follow(path, MAX_DIAGNOSTIC_ONNX_WAV_BYTES)?;
+        anyhow::ensure!(!bytes.is_empty(), "diagnostic WAV fixture is empty");
+        let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(
+            actual_sha256 == expected_sha256,
+            "diagnostic WAV fixture checksum mismatch: expected {expected_sha256}, got {actual_sha256}"
+        );
+        after_verified_read();
+        PreparedAudio::from_wav_reader(Cursor::new(bytes))
+    }
+
+    fn diagnostic_wav_bytes(samples: &[i16]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: PREPARED_SAMPLE_RATE,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for sample in samples {
+                writer.write_sample(*sample).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
     #[test]
     fn private_runtime_artifact_routes_onnx_load_health_and_transcribe_through_worker() {
         let (root, spec) = onnx_spec("online-service", OnnxModelFamily::OnlineTransducer);
@@ -3277,8 +3336,69 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads an exact pinned Hugging Face bundle and requires SCRIBE_ONNX_BUNDLE_TEST=1 plus a digest-pinned spoken WAV fixture"]
-    fn real_hugging_face_bundle_install_load_and_decode_smoke() {
+    fn staged_onnx_smoke_unloads_after_reload_load_failure() {
+        let (root, spec) = onnx_spec("smoke-reload-failure", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        control.fail_load_call(4);
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reload failed"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.load_calls, 4);
+        assert_eq!(state.unload_calls, 3);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_wav_decode_is_bound_to_verified_bytes_not_a_reopened_path() {
+        let root = std::env::temp_dir().join(format!(
+            "scribe-diagnostic-wav-binding-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.wav");
+        let original = diagnostic_wav_bytes(&[i16::MAX / 2, i16::MAX / 4]);
+        let replacement = diagnostic_wav_bytes(&[-i16::MAX / 2, -i16::MAX / 4]);
+        fs::write(&path, &original).unwrap();
+        let expected_sha256 = format!("{:x}", Sha256::digest(&original));
+        let moved = root.join("verified-original.wav");
+
+        let audio = decode_digest_pinned_diagnostic_wav_with_hook(&path, &expected_sha256, {
+            let path = path.clone();
+            let moved = moved.clone();
+            let replacement = replacement.clone();
+            move || {
+                fs::rename(&path, &moved).unwrap();
+                fs::write(&path, replacement).unwrap();
+            }
+        })
+        .unwrap();
+
+        assert!(audio.samples[0] > 0.0);
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Developer diagnostic only. It is deliberately non-promotional and
+    // cannot support a compatibility claim unless a canonical WAV digest and
+    // normalized transcript later become versioned repository evidence.
+    #[test]
+    #[ignore = "non-promotional diagnostic: downloads an exact pinned Hugging Face bundle and requires a digest-pinned spoken WAV fixture"]
+    fn diagnostic_real_hugging_face_bundle_install_load_and_decode() {
         if std::env::var("SCRIBE_ONNX_BUNDLE_TEST").as_deref() != Ok("1") {
             return;
         }
@@ -3294,13 +3414,6 @@ mod tests {
         );
         let expected_wav_sha256 = std::env::var("SCRIBE_ONNX_BUNDLE_WAV_SHA256")
             .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
-        assert!(
-            expected_wav_sha256.len() == 64
-                && expected_wav_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "SCRIBE_ONNX_BUNDLE_WAV_SHA256 must be exactly 64 lowercase hexadecimal characters"
-        );
         let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
             .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
         assert!(
@@ -3308,12 +3421,11 @@ mod tests {
             "the required expected transcript must contain letters or numbers"
         );
         let cancellation = InstallCancellation::default();
-        let fixture_fingerprint =
-            crate::installations::fingerprint_file_cancellable(&audio_path, &cancellation)
-                .expect("the configured WAV fixture must be a readable regular nonempty file");
-        assert_eq!(
-            fixture_fingerprint.sha256, expected_wav_sha256,
-            "the configured WAV fixture does not match SCRIBE_ONNX_BUNDLE_WAV_SHA256"
+        let audio = Arc::new(
+            decode_digest_pinned_diagnostic_wav_with_hook(&audio_path, &expected_wav_sha256, || {})
+                .expect(
+                    "the configured WAV fixture must match its digest and decode from exact bytes",
+                ),
         );
         fs::create_dir_all(&storage).unwrap();
         let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
@@ -3333,7 +3445,6 @@ mod tests {
             verified.smoke().resolved_acceleration.resolved,
             ComputeDevice::Cpu
         );
-        let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
         let execution_result = service.transcribe_onnx_bundle_from_receipt(
             verified.root(),
             audio,
