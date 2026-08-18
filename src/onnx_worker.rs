@@ -55,6 +55,25 @@ impl Default for SupervisorDeadlines {
     }
 }
 
+#[derive(Clone, Copy)]
+struct VadDeadlines {
+    startup: Duration,
+    operation: Duration,
+}
+
+impl Default for VadDeadlines {
+    fn default() -> Self {
+        Self {
+            // Model construction may legitimately take longer than one 32 ms
+            // window, but capture must still fail before the microphone plays.
+            startup: Duration::from_secs(2),
+            // One stall consumes at most one eighth of the two-second capture
+            // ring, so capture fails closed well before the callback exhausts it.
+            operation: Duration::from_millis(250),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OnnxFileRole {
@@ -889,6 +908,15 @@ impl OnnxWorkerSupervisor {
     }
 
     pub(crate) fn cancel_stream(&self, session_id: u64, request_id: u64) -> Result<()> {
+        self.cancel_stream_with_timeout(session_id, request_id, self.inner.deadlines.cancel)
+    }
+
+    fn cancel_stream_with_timeout(
+        &self,
+        session_id: u64,
+        request_id: u64,
+        timeout: Duration,
+    ) -> Result<()> {
         let (stream, active_request) = {
             let state = self
                 .inner
@@ -917,7 +945,7 @@ impl OnnxWorkerSupervisor {
                 target_session_id: stream.session_id,
                 target_request_id: stream.last_request_id,
             },
-            self.inner.deadlines.cancel,
+            timeout,
         )?;
         self.clear_stream(stream.generation, stream.session_id);
         Ok(())
@@ -1567,19 +1595,43 @@ pub(crate) struct SileroVadDecision {
 #[allow(dead_code)]
 pub(crate) struct SileroVadWorkerSupervisor {
     transport: OnnxWorkerSupervisor,
+    deadlines: VadDeadlines,
 }
 
 #[allow(dead_code)]
 impl SileroVadWorkerSupervisor {
     pub(crate) fn spawn() -> Result<Self> {
+        let deadlines = VadDeadlines::default();
+        let transport_deadlines = SupervisorDeadlines {
+            hello: deadlines.startup,
+            ..SupervisorDeadlines::default()
+        };
         Ok(Self {
-            transport: OnnxWorkerSupervisor::spawn()?,
+            transport: OnnxWorkerSupervisor::with_launcher_and_deadlines(
+                Arc::new(OsWorkerLauncher),
+                transport_deadlines,
+            )?,
+            deadlines,
         })
     }
 
     #[cfg(test)]
     fn with_transport(transport: OnnxWorkerSupervisor) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            deadlines: VadDeadlines::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport_and_deadlines(
+        transport: OnnxWorkerSupervisor,
+        deadlines: VadDeadlines,
+    ) -> Self {
+        Self {
+            transport,
+            deadlines,
+        }
     }
 
     pub(crate) fn load(&self, session_id: u64, request_id: u64, num_threads: u16) -> Result<bool> {
@@ -1613,7 +1665,7 @@ impl SileroVadWorkerSupervisor {
                 session_id,
                 request_id,
                 &[frame],
-                self.transport.inner.deadlines.load,
+                self.deadlines.startup,
             )
             .and_then(expect_ok)
         {
@@ -1662,10 +1714,24 @@ impl SileroVadWorkerSupervisor {
                 threshold: threshold.value(),
             },
         )?;
-        match self
-            .transport
-            .active_round_trip(generation, session_id, request_id, &[frame])?
-        {
+        let response = match self.transport.active_round_trip_with_timeout(
+            generation,
+            session_id,
+            request_id,
+            &[frame],
+            self.deadlines.startup,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                self.transport.invalidate_generation(
+                    generation,
+                    "Silero VAD start failed",
+                    true,
+                )?;
+                return Err(error);
+            }
+        };
+        match response {
             Control::Ok => {
                 let mut state = self
                     .transport
@@ -1687,7 +1753,14 @@ impl SileroVadWorkerSupervisor {
                 });
                 Ok(())
             }
-            Control::Error { message } => bail!("Silero VAD worker: {message}"),
+            Control::Error { message } => {
+                self.transport.invalidate_generation(
+                    generation,
+                    "Silero VAD start failed",
+                    true,
+                )?;
+                bail!("Silero VAD worker: {message}")
+            }
             _ => {
                 self.transport.invalidate_generation(
                     generation,
@@ -1720,10 +1793,13 @@ impl SileroVadWorkerSupervisor {
                 body: pcm,
             },
         ];
-        let response = match self
-            .transport
-            .active_round_trip(generation, session_id, request_id, &frames)
-        {
+        let response = match self.transport.active_round_trip_with_timeout(
+            generation,
+            session_id,
+            request_id,
+            &frames,
+            self.deadlines.operation,
+        ) {
             Ok(response) => response,
             Err(error) => {
                 self.retire_failed_session(stream, "Silero VAD compute transport failed")?;
@@ -1748,7 +1824,7 @@ impl SileroVadWorkerSupervisor {
                 })
             }
             Control::Error { message } => {
-                self.transport.clear_stream(generation, session_id);
+                self.retire_failed_session(stream, "Silero VAD compute failed")?;
                 bail!("Silero VAD worker: {message}")
             }
             _ => {
@@ -1769,7 +1845,7 @@ impl SileroVadWorkerSupervisor {
             session_id,
             request_id,
             Control::ResetVad,
-            self.transport.inner.deadlines.control,
+            self.deadlines.operation,
         );
         if let Err(error) = result {
             self.retire_failed_session(stream, "Silero VAD reset failed")?;
@@ -1792,7 +1868,7 @@ impl SileroVadWorkerSupervisor {
             session_id,
             request_id,
             Control::EndVad,
-            self.transport.inner.deadlines.control,
+            self.deadlines.operation,
         );
         self.transport
             .clear_stream(stream.generation, stream.session_id);
@@ -1808,7 +1884,16 @@ impl SileroVadWorkerSupervisor {
     }
 
     pub(crate) fn cancel_session(&self, session_id: u64, request_id: u64) -> Result<()> {
-        self.transport.cancel_stream(session_id, request_id)
+        let stream = self.transport.require_stream(session_id)?;
+        if let Err(error) = self.transport.cancel_stream_with_timeout(
+            session_id,
+            request_id,
+            self.deadlines.operation,
+        ) {
+            self.retire_failed_session(stream, "Silero VAD cancel failed")?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn abandon_session(&self, session_id: u64) {
@@ -1816,7 +1901,27 @@ impl SileroVadWorkerSupervisor {
     }
 
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
-        self.transport.health(session_id, request_id)
+        let generation = self.transport.ensure_generation()?;
+        let frame = control_frame(session_id, request_id, &Control::Health)?;
+        let result = self
+            .transport
+            .active_round_trip_with_timeout(
+                generation,
+                session_id,
+                request_id,
+                &[frame],
+                self.deadlines.startup,
+            )
+            .and_then(expect_ok);
+        if let Err(error) = result {
+            self.transport.invalidate_generation(
+                generation,
+                "Silero VAD health check failed",
+                true,
+            )?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn retire_failed_session(&self, stream: SupervisorStream, reason: &str) -> Result<()> {
@@ -2868,6 +2973,17 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum BlockedVadOperation {
+        Load,
+        Start,
+        Health,
+        Compute,
+        Reset,
+        End,
+        Cancel,
+    }
+
     enum TestMode {
         Normal,
         BlockedDecode {
@@ -2905,6 +3021,11 @@ mod tests {
         VadCrashOnWindow,
         VadCrashOnReset,
         VadCrashOnEnd,
+        BlockedVad {
+            operation: BlockedVadOperation,
+            started: TestSender<()>,
+        },
+        MalformedVadWindow,
         FailChangedLoad,
         FailChangedLoadWithActiveStream,
     }
@@ -3085,6 +3206,12 @@ mod tests {
             TestMode::VadCrashOnEnd => {
                 run_vad_test_worker(&mut input, &mut output, false, false, true)
             }
+            TestMode::BlockedVad { operation, started } => {
+                run_blocked_vad_worker(&mut input, &mut output, operation, started)
+            }
+            TestMode::MalformedVadWindow => {
+                run_malformed_vad_window_worker(&mut input, &mut output)
+            }
             TestMode::BlockedDecode { started } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::Transcribe));
@@ -3255,6 +3382,9 @@ mod tests {
                     }
                     respond(output, session_id, request_id, Control::Ok);
                 }
+                Control::Cancel { .. } => {
+                    respond(output, session_id, request_id, Control::Ok);
+                }
                 Control::VadWindow => {
                     let pcm = read_frame(input).unwrap();
                     assert_eq!(pcm.kind, FrameKind::Pcm);
@@ -3284,6 +3414,83 @@ mod tests {
         }
     }
 
+    fn run_blocked_vad_worker(
+        input: &mut impl Read,
+        output: &mut impl Write,
+        operation: BlockedVadOperation,
+        started: TestSender<()>,
+    ) {
+        loop {
+            let Ok(frame) = read_frame(input) else {
+                return;
+            };
+            let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+            let is_blocked = matches!(
+                (operation, &control),
+                (BlockedVadOperation::Load, Control::LoadVad { .. })
+                    | (BlockedVadOperation::Start, Control::StartVad { .. })
+                    | (BlockedVadOperation::Health, Control::Health)
+                    | (BlockedVadOperation::Compute, Control::VadWindow)
+                    | (BlockedVadOperation::Reset, Control::ResetVad)
+                    | (BlockedVadOperation::End, Control::EndVad)
+                    | (BlockedVadOperation::Cancel, Control::Cancel { .. })
+            );
+            if matches!(&control, Control::VadWindow) {
+                let pcm = read_frame(input).unwrap();
+                assert_eq!(pcm.kind, FrameKind::Pcm);
+                assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                assert_eq!(decode_pcm(&pcm.body).unwrap().len(), WINDOW_SAMPLES);
+            }
+            if is_blocked {
+                started.send(()).unwrap();
+                // The fake process termination path writes EOF into this pipe,
+                // so the worker and its owned reaper both terminate promptly.
+                let _ = read_frame(input);
+                return;
+            }
+            match control {
+                Control::LoadVad { .. }
+                | Control::StartVad { .. }
+                | Control::Health
+                | Control::ResetVad
+                | Control::EndVad
+                | Control::Cancel { .. } => {
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::VadWindow => respond(
+                    output,
+                    session_id,
+                    request_id,
+                    Control::VadDecision {
+                        probability: 0.4,
+                        speech: false,
+                    },
+                ),
+                other => panic!("unexpected blocked-VAD command: {other:?}"),
+            }
+        }
+    }
+
+    fn run_malformed_vad_window_worker(input: &mut impl Read, output: &mut impl Write) {
+        loop {
+            let frame = read_frame(input).unwrap();
+            let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
+            match control {
+                Control::LoadVad { .. } | Control::StartVad { .. } | Control::Health => {
+                    respond(output, session_id, request_id, Control::Ok);
+                }
+                Control::VadWindow => {
+                    let pcm = read_frame(input).unwrap();
+                    assert_eq!((pcm.session_id, pcm.request_id), (session_id, request_id));
+                    output.write_all(b"BAD!").unwrap();
+                    output.flush().unwrap();
+                    return;
+                }
+                other => panic!("unexpected malformed-VAD command: {other:?}"),
+            }
+        }
+    }
+
     fn test_supervisor(launcher: Arc<TestLauncher>) -> OnnxWorkerSupervisor {
         OnnxWorkerSupervisor::with_launcher(launcher).unwrap()
     }
@@ -3296,6 +3503,13 @@ mod tests {
             data: Duration::from_millis(40),
             control: Duration::from_millis(40),
             cancel: Duration::from_millis(40),
+        }
+    }
+
+    fn short_vad_deadlines() -> VadDeadlines {
+        VadDeadlines {
+            startup: Duration::from_millis(40),
+            operation: Duration::from_millis(40),
         }
     }
 
@@ -4204,6 +4418,163 @@ mod tests {
     #[test]
     fn end_transport_failure_retires_vad_generation() {
         assert_vad_control_crash_retires_generation(TestMode::VadCrashOnEnd, true);
+    }
+
+    fn assert_blocked_vad_request_retires_reaps_and_recovers(operation: BlockedVadOperation) {
+        let (started_tx, started_rx) = channel();
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::BlockedVad {
+                    operation,
+                    started: started_tx,
+                },
+                TestMode::VadNormal,
+            ])
+            .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let transport =
+            OnnxWorkerSupervisor::with_launcher_and_deadlines(launcher.clone(), short_deadlines())
+                .unwrap();
+        let vad = SileroVadWorkerSupervisor::with_transport_and_deadlines(
+            transport,
+            short_vad_deadlines(),
+        );
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let window = [0.9; WINDOW_SAMPLES];
+        let old_session = 501;
+        let mut request_id = 1;
+
+        if !matches!(operation, BlockedVadOperation::Load) {
+            vad.load(old_session, request_id, 1).unwrap();
+            request_id += 1;
+        }
+        if matches!(
+            operation,
+            BlockedVadOperation::Compute
+                | BlockedVadOperation::Reset
+                | BlockedVadOperation::End
+                | BlockedVadOperation::Cancel
+        ) {
+            vad.start_session(old_session, request_id, threshold)
+                .unwrap();
+            request_id += 1;
+        }
+
+        let failure_started = Instant::now();
+        let result = match operation {
+            BlockedVadOperation::Load => vad.load(old_session, request_id, 1).map(|_| ()),
+            BlockedVadOperation::Start => vad
+                .start_session(old_session, request_id, threshold)
+                .map(|_| ()),
+            BlockedVadOperation::Health => vad.health(old_session, request_id).map(|_| ()),
+            BlockedVadOperation::Compute => {
+                vad.compute(old_session, request_id, &window).map(|_| ())
+            }
+            BlockedVadOperation::Reset => vad.reset(old_session, request_id).map(|_| ()),
+            BlockedVadOperation::End => vad.end_session(old_session, request_id).map(|_| ()),
+            BlockedVadOperation::Cancel => vad.cancel_session(old_session, request_id).map(|_| ()),
+        };
+        let error = result.unwrap_err();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        let remaining = Duration::from_millis(250).saturating_sub(failure_started.elapsed());
+        reaped_rx.recv_timeout(remaining).unwrap();
+        let elapsed = failure_started.elapsed();
+        eprintln!("blocked VAD {operation:?} retired and reaped in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "blocked VAD {operation:?} exceeded the test bound: {elapsed:?}"
+        );
+        assert!(vad.compute(old_session, request_id + 1, &window).is_err());
+
+        let new_session = 502;
+        assert!(!vad.load(new_session, 100, 1).unwrap());
+        vad.health(new_session, 101).unwrap();
+        vad.start_session(new_session, 102, threshold).unwrap();
+        let decision = vad.compute(new_session, 103, &window).unwrap();
+        assert_eq!(decision.probability, 0.4);
+        assert!(!decision.speech);
+        vad.end_session(new_session, 104).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn production_vad_deadlines_are_bounded_without_changing_stt_deadlines() {
+        let stt = SupervisorDeadlines::default();
+        assert_eq!(stt.load, Duration::from_secs(15 * 60));
+        assert_eq!(stt.data, Duration::from_secs(60 * 60));
+
+        let vad = VadDeadlines::default();
+        assert_eq!(vad.startup, Duration::from_secs(2));
+        assert_eq!(vad.operation, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn blocked_vad_load_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Load);
+    }
+
+    #[test]
+    fn blocked_vad_start_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Start);
+    }
+
+    #[test]
+    fn blocked_vad_health_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Health);
+    }
+
+    #[test]
+    fn blocked_vad_compute_is_bounded_reaped_and_recovers_without_a_decision() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Compute);
+    }
+
+    #[test]
+    fn blocked_vad_reset_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Reset);
+    }
+
+    #[test]
+    fn blocked_vad_end_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::End);
+    }
+
+    #[test]
+    fn blocked_vad_cancel_is_bounded_reaped_and_recovers() {
+        assert_blocked_vad_request_retires_reaps_and_recovers(BlockedVadOperation::Cancel);
+    }
+
+    #[test]
+    fn malformed_vad_compute_retires_generation_and_recovers_without_a_decision() {
+        let (kill_started_tx, kill_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([TestMode::MalformedVadWindow, TestMode::VadNormal])
+                .with_process_events(kill_started_tx, reaped_tx),
+        );
+        let transport = test_supervisor(launcher.clone());
+        let vad = SileroVadWorkerSupervisor::with_transport(transport);
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let window = [0.9; WINDOW_SAMPLES];
+
+        vad.load(601, 1, 1).unwrap();
+        vad.start_session(601, 2, threshold).unwrap();
+        assert!(vad.compute(601, 3, &window).is_err());
+        kill_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(250)).unwrap();
+
+        assert!(!vad.load(602, 4, 1).unwrap());
+        vad.start_session(602, 5, threshold).unwrap();
+        assert_eq!(vad.compute(602, 6, &window).unwrap().probability, 0.4);
+        vad.end_session(602, 7).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
     }
 
     #[test]

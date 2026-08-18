@@ -212,7 +212,8 @@ pub struct CaptureMetrics {
     pub source_channels: u16,
     pub source_frames: usize,
     pub prepared_frames: usize,
-    /// Maximum native RMS observed across 10 ms VAD signal frames.
+    /// Maximum native RMS observed across 10 ms diagnostic windows.
+    /// This value never classifies speech.
     pub maximum_input_rms: f32,
     /// Maximum native sample peak observed by the 30 ms meter windows.
     pub maximum_input_peak: f32,
