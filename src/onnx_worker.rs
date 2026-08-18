@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -57,20 +58,50 @@ impl Default for SupervisorDeadlines {
 
 #[derive(Clone, Copy)]
 struct VadDeadlines {
-    startup: Duration,
+    acquisition: Duration,
     operation: Duration,
 }
 
 impl Default for VadDeadlines {
     fn default() -> Self {
         Self {
-            // Model construction may legitimately take longer than one 32 ms
-            // window, but capture must still fail before the microphone plays.
-            startup: Duration::from_secs(2),
+            // This single budget covers process launch/Hello, model load, both
+            // health checks, and session start before the microphone plays.
+            acquisition: Duration::from_secs(2),
             // One stall consumes at most one eighth of the two-second capture
             // ring, so capture fails closed well before the callback exhausts it.
             operation: Duration::from_millis(250),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MonotonicDeadline {
+    expires_at: Instant,
+    budget: Duration,
+}
+
+impl MonotonicDeadline {
+    fn after(budget: Duration) -> Result<Self> {
+        if budget.is_zero() {
+            bail!("Silero VAD acquisition budget must be positive");
+        }
+        let started = Instant::now();
+        let expires_at = started
+            .checked_add(budget)
+            .ok_or_else(|| anyhow!("Silero VAD acquisition deadline overflowed"))?;
+        Ok(Self { expires_at, budget })
+    }
+
+    fn remaining(self) -> Result<Duration> {
+        let remaining = self.expires_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "Silero VAD acquisition deadline exceeded after {} ms",
+                self.budget.as_millis()
+            );
+        }
+        Ok(remaining)
     }
 }
 
@@ -693,7 +724,16 @@ impl OnnxWorkerSupervisor {
         launcher: Arc<dyn WorkerLauncher>,
         deadlines: SupervisorDeadlines,
     ) -> Result<Self> {
-        let supervisor = Self {
+        let supervisor = Self::unstarted_with_launcher_and_deadlines(launcher, deadlines);
+        supervisor.ensure_generation()?;
+        Ok(supervisor)
+    }
+
+    fn unstarted_with_launcher_and_deadlines(
+        launcher: Arc<dyn WorkerLauncher>,
+        deadlines: SupervisorDeadlines,
+    ) -> Self {
+        Self {
             inner: Arc::new(SupervisorInner {
                 launcher,
                 deadlines,
@@ -703,9 +743,7 @@ impl OnnxWorkerSupervisor {
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
             }),
-        };
-        supervisor.ensure_generation()?;
-        Ok(supervisor)
+        }
     }
 
     pub(crate) fn load(
@@ -1075,6 +1113,14 @@ impl OnnxWorkerSupervisor {
     }
 
     fn ensure_generation(&self) -> Result<u64> {
+        self.ensure_generation_before(None, None)
+    }
+
+    fn ensure_generation_before(
+        &self,
+        deadline: Option<MonotonicDeadline>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<u64> {
         let _spawn_guard = self
             .inner
             .spawn_gate
@@ -1108,11 +1154,15 @@ impl OnnxWorkerSupervisor {
             }
         }
 
+        let spawned = match deadline {
+            Some(deadline) => self.launch_before(deadline, cancelled)?,
+            None => self.inner.launcher.launch()?,
+        };
         let SpawnedWorker {
             stdin,
             stdout,
             process,
-        } = self.inner.launcher.launch()?;
+        } = spawned;
         let generation = {
             let mut state = self
                 .inner
@@ -1139,17 +1189,84 @@ impl OnnxWorkerSupervisor {
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
-        if let Err(error) = self.round_trip_on_generation(
+        let hello_timeout = match deadline {
+            Some(deadline) => match deadline.remaining() {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    self.invalidate_generation(
+                        generation,
+                        "Silero VAD acquisition deadline expired before Hello",
+                        true,
+                    )?;
+                    return Err(error);
+                }
+            },
+            None => self.inner.deadlines.hello,
+        };
+        if let Err(error) = self.round_trip_on_generation_with_cancellation(
             generation,
             0,
             0,
             Control::Hello,
-            self.inner.deadlines.hello,
+            hello_timeout,
+            cancelled,
         ) {
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
         Ok(generation)
+    }
+
+    fn launch_before(
+        &self,
+        deadline: MonotonicDeadline,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<SpawnedWorker> {
+        let launcher = Arc::clone(&self.inner.launcher);
+        let (result_tx, result_rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("scribe-onnx-launch".to_owned())
+            .spawn(move || {
+                let result = launcher.launch();
+                if deadline.remaining().is_err() {
+                    if let Ok(worker) = result {
+                        retire_unpublished_worker_synchronously(worker);
+                    }
+                    return;
+                }
+                if let Err(send_error) = result_tx.send(result)
+                    && let Ok(worker) = send_error.0
+                {
+                    retire_unpublished_worker_synchronously(worker);
+                }
+            })
+            .context("could not start bounded ONNX worker launcher")?;
+
+        loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                bail!("Silero VAD acquisition was cancelled");
+            }
+            let remaining = deadline.remaining()?;
+            match result_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => {
+                    let worker = result?;
+                    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        retire_unpublished_worker(worker);
+                        bail!("Silero VAD acquisition was cancelled");
+                    }
+                    if let Err(error) = deadline.remaining() {
+                        retire_unpublished_worker(worker);
+                        return Err(error);
+                    }
+                    return Ok(worker);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    deadline.remaining()?;
+                    bail!("ONNX worker launcher disconnected")
+                }
+            }
+        }
     }
 
     fn start_reader(
@@ -1292,6 +1409,20 @@ impl OnnxWorkerSupervisor {
         frames: &[Frame],
         timeout: Duration,
     ) -> Result<Control> {
+        self.active_round_trip_with_timeout_and_cancellation(
+            generation, session_id, request_id, frames, timeout, None,
+        )
+    }
+
+    fn active_round_trip_with_timeout_and_cancellation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        frames: &[Frame],
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Control> {
         let correlation = Correlation {
             generation,
             session_id,
@@ -1326,7 +1457,8 @@ impl OnnxWorkerSupervisor {
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
-        let result = self.await_response(correlation, response, timeout);
+        let result =
+            self.await_response_with_cancellation(correlation, response, timeout, cancelled);
         self.clear_active(correlation);
         result
     }
@@ -1359,6 +1491,20 @@ impl OnnxWorkerSupervisor {
         command: Control,
         timeout: Duration,
     ) -> Result<()> {
+        self.round_trip_on_generation_with_cancellation(
+            generation, session_id, request_id, command, timeout, None,
+        )
+    }
+
+    fn round_trip_on_generation_with_cancellation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        command: Control,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
         if !command.is_parent_command() {
             bail!("cannot send a response-only control to the ONNX worker");
         }
@@ -1381,7 +1527,7 @@ impl OnnxWorkerSupervisor {
             self.invalidate_generation(generation, &error.to_string(), true)?;
             return Err(error);
         }
-        match self.await_response(correlation, response, timeout)? {
+        match self.await_response_with_cancellation(correlation, response, timeout, cancelled)? {
             Control::Ready if expects_ready => Ok(()),
             Control::Ok if !expects_ready => Ok(()),
             Control::Error { message } => bail!("ONNX worker: {message}"),
@@ -1412,15 +1558,28 @@ impl OnnxWorkerSupervisor {
         Ok(())
     }
 
-    fn await_response(
+    fn await_response_with_cancellation(
         &self,
         correlation: Correlation,
         response: Receiver<PendingResult>,
         timeout: Duration,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<Control> {
-        match response.recv_timeout(timeout) {
-            Ok(result) => result.map_err(anyhow::Error::msg),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("ONNX worker response deadline overflowed"))?;
+        loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                self.unregister(correlation);
+                self.invalidate_generation(
+                    correlation.generation,
+                    "Silero VAD acquisition was cancelled",
+                    true,
+                )?;
+                bail!("Silero VAD acquisition was cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 self.unregister(correlation);
                 self.invalidate_generation(
                     correlation.generation,
@@ -1430,10 +1589,19 @@ impl OnnxWorkerSupervisor {
                 bail!(
                     "ONNX worker response deadline exceeded after {} ms",
                     timeout.as_millis()
-                )
+                );
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("ONNX worker response channel disconnected")
+            let wait = if cancelled.is_some() {
+                remaining.min(Duration::from_millis(10))
+            } else {
+                remaining
+            };
+            match response.recv_timeout(wait) {
+                Ok(result) => return result.map_err(anyhow::Error::msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("ONNX worker response channel disconnected")
+                }
             }
         }
     }
@@ -1603,7 +1771,7 @@ impl SileroVadWorkerSupervisor {
     pub(crate) fn spawn() -> Result<Self> {
         let deadlines = VadDeadlines::default();
         let transport_deadlines = SupervisorDeadlines {
-            hello: deadlines.startup,
+            hello: deadlines.acquisition,
             ..SupervisorDeadlines::default()
         };
         Ok(Self {
@@ -1613,6 +1781,108 @@ impl SileroVadWorkerSupervisor {
             )?,
             deadlines,
         })
+    }
+
+    /// Starts a dedicated worker and establishes a ready VAD session within one
+    /// aggregate monotonic budget. The returned request id is the first id that
+    /// may be used for a window; ids before it belong to acquisition controls.
+    pub(crate) fn acquire_session(
+        session_id: u64,
+        first_request_id: u64,
+        num_threads: u16,
+        threshold: VadThreshold,
+        cancelled: &AtomicBool,
+    ) -> Result<(Self, u64)> {
+        Self::acquire_session_with_launcher_and_deadlines(
+            Arc::new(OsWorkerLauncher),
+            session_id,
+            first_request_id,
+            num_threads,
+            threshold,
+            VadDeadlines::default(),
+            cancelled,
+        )
+    }
+
+    fn acquire_session_with_launcher_and_deadlines(
+        launcher: Arc<dyn WorkerLauncher>,
+        session_id: u64,
+        first_request_id: u64,
+        num_threads: u16,
+        threshold: VadThreshold,
+        deadlines: VadDeadlines,
+        cancelled: &AtomicBool,
+    ) -> Result<(Self, u64)> {
+        let deadline = MonotonicDeadline::after(deadlines.acquisition)?;
+        let transport_deadlines = SupervisorDeadlines {
+            hello: deadlines.acquisition,
+            cancel: deadlines.operation,
+            ..SupervisorDeadlines::default()
+        };
+        let supervisor = Self {
+            transport: OnnxWorkerSupervisor::unstarted_with_launcher_and_deadlines(
+                launcher,
+                transport_deadlines,
+            ),
+            deadlines,
+        };
+        let generation = supervisor
+            .transport
+            .ensure_generation_before(Some(deadline), Some(cancelled))?;
+        let mut request_id = first_request_id;
+        supervisor.load_on_generation(
+            generation,
+            session_id,
+            request_id,
+            num_threads,
+            supervisor.acquisition_remaining(deadline, generation, "load")?,
+            Some(cancelled),
+        )?;
+        request_id = request_id.wrapping_add(1).max(1);
+        supervisor.health_on_generation(
+            generation,
+            session_id,
+            request_id,
+            supervisor.acquisition_remaining(deadline, generation, "health check")?,
+            Some(cancelled),
+        )?;
+        request_id = request_id.wrapping_add(1).max(1);
+        supervisor.start_session_on_generation(
+            generation,
+            session_id,
+            request_id,
+            threshold,
+            supervisor.acquisition_remaining(deadline, generation, "session start")?,
+            Some(cancelled),
+        )?;
+        request_id = request_id.wrapping_add(1).max(1);
+        supervisor.health_on_generation(
+            generation,
+            session_id,
+            request_id,
+            supervisor.acquisition_remaining(deadline, generation, "readiness check")?,
+            Some(cancelled),
+        )?;
+        Ok((supervisor, request_id.wrapping_add(1).max(1)))
+    }
+
+    fn acquisition_remaining(
+        &self,
+        deadline: MonotonicDeadline,
+        generation: u64,
+        stage: &str,
+    ) -> Result<Duration> {
+        match deadline.remaining() {
+            Ok(remaining) => Ok(remaining),
+            Err(error) => {
+                self.transport.invalidate_generation(
+                    generation,
+                    &format!("Silero VAD acquisition deadline expired before {stage}"),
+                    true,
+                )?;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1635,6 +1905,26 @@ impl SileroVadWorkerSupervisor {
     }
 
     pub(crate) fn load(&self, session_id: u64, request_id: u64, num_threads: u16) -> Result<bool> {
+        let generation = self.transport.ensure_generation()?;
+        self.load_on_generation(
+            generation,
+            session_id,
+            request_id,
+            num_threads,
+            self.deadlines.acquisition,
+            None,
+        )
+    }
+
+    fn load_on_generation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        num_threads: u16,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<bool> {
         if num_threads == 0 || num_threads > 64 {
             bail!("Silero VAD thread count must be within [1, 64]");
         }
@@ -1642,7 +1932,6 @@ impl SileroVadWorkerSupervisor {
             "silero-vad:{}:{num_threads}",
             crate::support_assets::SILERO_VAD_SHA256
         );
-        let generation = self.transport.ensure_generation()?;
         let reused = self
             .transport
             .inner
@@ -1660,12 +1949,13 @@ impl SileroVadWorkerSupervisor {
         let frame = control_frame(session_id, request_id, &Control::LoadVad { num_threads })?;
         if let Err(error) = self
             .transport
-            .active_round_trip_with_timeout(
+            .active_round_trip_with_timeout_and_cancellation(
                 generation,
                 session_id,
                 request_id,
                 &[frame],
-                self.deadlines.startup,
+                timeout,
+                cancelled,
             )
             .and_then(expect_ok)
         {
@@ -1696,6 +1986,25 @@ impl SileroVadWorkerSupervisor {
         threshold: VadThreshold,
     ) -> Result<()> {
         let generation = self.transport.ensure_generation()?;
+        self.start_session_on_generation(
+            generation,
+            session_id,
+            request_id,
+            threshold,
+            self.deadlines.acquisition,
+            None,
+        )
+    }
+
+    fn start_session_on_generation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        threshold: VadThreshold,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
         if self
             .transport
             .inner
@@ -1714,13 +2023,16 @@ impl SileroVadWorkerSupervisor {
                 threshold: threshold.value(),
             },
         )?;
-        let response = match self.transport.active_round_trip_with_timeout(
-            generation,
-            session_id,
-            request_id,
-            &[frame],
-            self.deadlines.startup,
-        ) {
+        let response = match self
+            .transport
+            .active_round_trip_with_timeout_and_cancellation(
+                generation,
+                session_id,
+                request_id,
+                &[frame],
+                timeout,
+                cancelled,
+            ) {
             Ok(response) => response,
             Err(error) => {
                 self.transport.invalidate_generation(
@@ -1902,15 +2214,33 @@ impl SileroVadWorkerSupervisor {
 
     pub(crate) fn health(&self, session_id: u64, request_id: u64) -> Result<()> {
         let generation = self.transport.ensure_generation()?;
+        self.health_on_generation(
+            generation,
+            session_id,
+            request_id,
+            self.deadlines.acquisition,
+            None,
+        )
+    }
+
+    fn health_on_generation(
+        &self,
+        generation: u64,
+        session_id: u64,
+        request_id: u64,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
         let frame = control_frame(session_id, request_id, &Control::Health)?;
         let result = self
             .transport
-            .active_round_trip_with_timeout(
+            .active_round_trip_with_timeout_and_cancellation(
                 generation,
                 session_id,
                 request_id,
                 &[frame],
-                self.deadlines.startup,
+                timeout,
+                cancelled,
             )
             .and_then(expect_ok);
         if let Err(error) = result {
@@ -1937,6 +2267,38 @@ fn expect_ok(response: Control) -> Result<()> {
         Control::Ok => Ok(()),
         Control::Error { message } => bail!("ONNX worker: {message}"),
         _ => bail!("unexpected ONNX worker control response"),
+    }
+}
+
+fn retire_unpublished_worker(worker: SpawnedWorker) {
+    let SpawnedWorker {
+        stdin,
+        stdout,
+        process,
+    } = worker;
+    drop(stdin);
+    drop(stdout);
+    if let Err(error) = process.terminate() {
+        eprintln!("could not terminate late ONNX worker launch: {error:#}");
+    }
+    if let Err(error) = reap_process(process, 0) {
+        eprintln!("could not reap late ONNX worker launch: {error:#}");
+    }
+}
+
+fn retire_unpublished_worker_synchronously(worker: SpawnedWorker) {
+    let SpawnedWorker {
+        stdin,
+        stdout,
+        process,
+    } = worker;
+    drop(stdin);
+    drop(stdout);
+    if let Err(error) = process.terminate() {
+        eprintln!("could not terminate late ONNX worker launch: {error:#}");
+    }
+    if let Err(error) = process.wait() {
+        eprintln!("could not reap late ONNX worker launch: {error:#}");
     }
 }
 
@@ -2986,6 +3348,14 @@ mod tests {
 
     enum TestMode {
         Normal,
+        DelayedLaunch {
+            started: TestSender<()>,
+            release: TestReceiver<()>,
+            then: Box<TestMode>,
+        },
+        BlockedHello {
+            started: TestSender<()>,
+        },
         BlockedDecode {
             started: TestSender<()>,
         },
@@ -3024,6 +3394,10 @@ mod tests {
         BlockedVad {
             operation: BlockedVadOperation,
             started: TestSender<()>,
+        },
+        CumulativeVadAcquisition {
+            stage_delay: Duration,
+            blocked: TestSender<()>,
         },
         MalformedVadWindow,
         FailChangedLoad,
@@ -3066,6 +3440,18 @@ mod tests {
                 .map_err(|_| anyhow!("test launcher lock poisoned"))?
                 .pop_front()
                 .ok_or_else(|| anyhow!("test launcher has no generation script"))?;
+            let mode = match mode {
+                TestMode::DelayedLaunch {
+                    started,
+                    release,
+                    then,
+                } => {
+                    started.send(()).unwrap();
+                    release.recv().unwrap();
+                    *then
+                }
+                mode => mode,
+            };
             self.launches.fetch_add(1, Ordering::AcqRel);
             let (parent_input, worker_input) = channel();
             let (worker_output, parent_output) = channel();
@@ -3104,17 +3490,20 @@ mod tests {
     }
 
     fn respond(output: &mut impl Write, session_id: u64, request_id: u64, control: Control) {
-        write_frame(
+        let _ = write_frame(
             output,
             &control_frame(session_id, request_id, &control).unwrap(),
-        )
-        .unwrap();
+        );
     }
 
-    fn handshake(input: &mut impl Read, output: &mut impl Write) {
-        let (session_id, request_id, control) = read_parent_control(input);
+    fn handshake(input: &mut impl Read, output: &mut impl Write) -> bool {
+        let Ok(frame) = read_frame(input) else {
+            return false;
+        };
+        let (session_id, request_id, control) = parse_parent_control(frame).unwrap();
         assert!(matches!(control, Control::Hello));
         respond(output, session_id, request_id, Control::Ready);
+        true
     }
 
     fn run_normal_worker(input: &mut impl Read, output: &mut impl Write) {
@@ -3191,8 +3580,26 @@ mod tests {
     }
 
     fn run_test_worker(mut input: impl Read, mut output: impl Write, mode: TestMode) {
-        handshake(&mut input, &mut output);
+        let mode = match mode {
+            TestMode::BlockedHello { started } => {
+                let Ok(frame) = read_frame(&mut input) else {
+                    return;
+                };
+                let (_, _, control) = parse_parent_control(frame).unwrap();
+                assert!(matches!(control, Control::Hello));
+                started.send(()).unwrap();
+                let _ = read_frame(&mut input);
+                return;
+            }
+            mode => mode,
+        };
+        if !handshake(&mut input, &mut output) {
+            return;
+        }
         match mode {
+            TestMode::DelayedLaunch { .. } | TestMode::BlockedHello { .. } => {
+                unreachable!("launch-only test mode reached a worker")
+            }
             TestMode::Normal => run_normal_worker(&mut input, &mut output),
             TestMode::VadNormal => {
                 run_vad_test_worker(&mut input, &mut output, false, false, false)
@@ -3208,6 +3615,12 @@ mod tests {
             }
             TestMode::BlockedVad { operation, started } => {
                 run_blocked_vad_worker(&mut input, &mut output, operation, started)
+            }
+            TestMode::CumulativeVadAcquisition {
+                stage_delay,
+                blocked,
+            } => {
+                run_cumulative_vad_acquisition_worker(&mut input, &mut output, stage_delay, blocked)
             }
             TestMode::MalformedVadWindow => {
                 run_malformed_vad_window_worker(&mut input, &mut output)
@@ -3247,9 +3660,10 @@ mod tests {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
                 assert!(matches!(control, Control::Health));
                 started.send(()).unwrap();
-                release.recv().unwrap();
-                respond(&mut output, session_id, request_id, Control::Ok);
-                run_normal_worker(&mut input, &mut output);
+                if release.recv().is_ok() {
+                    respond(&mut output, session_id, request_id, Control::Ok);
+                    run_normal_worker(&mut input, &mut output);
+                }
             }
             TestMode::HoldLoad { started, release } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -3471,6 +3885,33 @@ mod tests {
         }
     }
 
+    fn run_cumulative_vad_acquisition_worker(
+        input: &mut impl Read,
+        output: &mut impl Write,
+        stage_delay: Duration,
+        blocked: TestSender<()>,
+    ) {
+        for expected in ["load", "health", "start"] {
+            let (session_id, request_id, control) = read_parent_control(input);
+            let matches_expected = match expected {
+                "load" => matches!(control, Control::LoadVad { .. }),
+                "health" => matches!(control, Control::Health),
+                "start" => matches!(control, Control::StartVad { .. }),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches_expected,
+                "unexpected {expected} control: {control:?}"
+            );
+            std::thread::sleep(stage_delay);
+            respond(output, session_id, request_id, Control::Ok);
+        }
+        let (_, _, control) = read_parent_control(input);
+        assert!(matches!(control, Control::Health));
+        blocked.send(()).unwrap();
+        let _ = read_frame(input);
+    }
+
     fn run_malformed_vad_window_worker(input: &mut impl Read, output: &mut impl Write) {
         loop {
             let frame = read_frame(input).unwrap();
@@ -3508,7 +3949,14 @@ mod tests {
 
     fn short_vad_deadlines() -> VadDeadlines {
         VadDeadlines {
-            startup: Duration::from_millis(40),
+            acquisition: Duration::from_millis(40),
+            operation: Duration::from_millis(40),
+        }
+    }
+
+    fn acquisition_test_deadlines(budget: Duration) -> VadDeadlines {
+        VadDeadlines {
+            acquisition: budget,
             operation: Duration::from_millis(40),
         }
     }
@@ -4510,8 +4958,287 @@ mod tests {
         assert_eq!(stt.data, Duration::from_secs(60 * 60));
 
         let vad = VadDeadlines::default();
-        assert_eq!(vad.startup, Duration::from_secs(2));
+        assert_eq!(vad.acquisition, Duration::from_secs(2));
         assert_eq!(vad.operation, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn blocked_hello_obeys_aggregate_budget_reaps_and_later_session_recovers() {
+        let budget = Duration::from_millis(120);
+        let (blocked_tx, blocked_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::BlockedHello {
+                    started: blocked_tx,
+                },
+                TestMode::VadNormal,
+            ])
+            .with_process_events(kill_tx, reaped_tx),
+        );
+        let cancelled = AtomicBool::new(false);
+        let threshold = VadThreshold::new(0.5).unwrap();
+
+        let started = Instant::now();
+        let error = SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+            launcher.clone(),
+            701,
+            1,
+            1,
+            threshold,
+            acquisition_test_deadlines(budget),
+            &cancelled,
+        )
+        .err()
+        .expect("blocked Hello must fail acquisition");
+        let elapsed = started.elapsed();
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(
+            elapsed <= budget + Duration::from_millis(80),
+            "blocked Hello exceeded aggregate bound: {elapsed:?}"
+        );
+
+        let (vad, next_request_id) =
+            SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                launcher.clone(),
+                702,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                &cancelled,
+            )
+            .unwrap();
+        let decision = vad
+            .compute(702, next_request_id, &[0.9; WINDOW_SAMPLES])
+            .unwrap();
+        assert_eq!(decision.probability, 0.4);
+        assert!(!decision.speech);
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        vad.end_session(702, next_request_id + 1).unwrap();
+        vad.transport.terminate_current().unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        eprintln!("blocked Hello aggregate acquisition elapsed: {elapsed:?}");
+    }
+
+    #[test]
+    fn cumulative_acquisition_delays_share_one_budget_and_recover_cleanly() {
+        let budget = Duration::from_millis(140);
+        let stage_delay = Duration::from_millis(30);
+        let (blocked_tx, blocked_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::CumulativeVadAcquisition {
+                    stage_delay,
+                    blocked: blocked_tx,
+                },
+                TestMode::VadNormal,
+            ])
+            .with_process_events(kill_tx, reaped_tx),
+        );
+        let cancelled = AtomicBool::new(false);
+        let threshold = VadThreshold::new(0.5).unwrap();
+
+        let started = Instant::now();
+        let error = SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+            launcher.clone(),
+            711,
+            1,
+            1,
+            threshold,
+            acquisition_test_deadlines(budget),
+            &cancelled,
+        )
+        .err()
+        .expect("final readiness must share the spent stage budget");
+        let elapsed = started.elapsed();
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(
+            elapsed >= stage_delay * 3,
+            "successful stages did not spend the shared budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= budget + Duration::from_millis(80),
+            "stages received independent budgets: {elapsed:?}"
+        );
+
+        let (vad, next_request_id) =
+            SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                launcher.clone(),
+                712,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            vad.compute(712, next_request_id, &[0.9; WINDOW_SAMPLES])
+                .unwrap()
+                .probability,
+            0.4
+        );
+        vad.end_session(712, next_request_id + 1).unwrap();
+        vad.transport.terminate_current().unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        eprintln!("cumulative VAD acquisition elapsed: {elapsed:?}");
+    }
+
+    #[test]
+    fn late_launch_is_never_published_and_is_killed_reaped_before_recovery() {
+        let budget = Duration::from_millis(70);
+        let (launch_started_tx, launch_started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::DelayedLaunch {
+                    started: launch_started_tx,
+                    release: release_rx,
+                    then: Box::new(TestMode::VadNormal),
+                },
+                TestMode::VadNormal,
+            ])
+            .with_process_events(kill_tx, reaped_tx),
+        );
+        let acquisition_launcher = launcher.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let acquisition_cancelled = Arc::clone(&cancelled);
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let (result_tx, result_rx) = channel();
+        let started = Instant::now();
+        let acquisition = std::thread::spawn(move || {
+            let result = SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                acquisition_launcher,
+                721,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                acquisition_cancelled.as_ref(),
+            );
+            result_tx.send(result.map(|_| ())).unwrap();
+        });
+        launch_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let error = result_rx
+            .recv_timeout(budget + Duration::from_millis(100))
+            .unwrap()
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(elapsed <= budget + Duration::from_millis(80));
+        acquisition.join().unwrap();
+
+        release_tx.send(()).unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+
+        let (vad, next_request_id) =
+            SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                launcher.clone(),
+                722,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                cancelled.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            vad.compute(722, next_request_id, &[0.9; WINDOW_SAMPLES])
+                .unwrap()
+                .probability,
+            0.4
+        );
+        vad.end_session(722, next_request_id + 1).unwrap();
+        vad.transport.terminate_current().unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        eprintln!("late launch acquisition returned in {elapsed:?}");
+    }
+
+    #[test]
+    fn cancellation_interrupts_acquisition_and_reaps_before_later_recovery() {
+        let budget = Duration::from_millis(400);
+        let (blocked_tx, blocked_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let launcher = Arc::new(
+            TestLauncher::new([
+                TestMode::BlockedHello {
+                    started: blocked_tx,
+                },
+                TestMode::VadNormal,
+            ])
+            .with_process_events(kill_tx, reaped_tx),
+        );
+        let acquisition_launcher = launcher.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let acquisition_cancelled = Arc::clone(&cancelled);
+        let threshold = VadThreshold::new(0.5).unwrap();
+        let acquisition = std::thread::spawn(move || {
+            SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                acquisition_launcher,
+                731,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                acquisition_cancelled.as_ref(),
+            )
+            .map(|_| ())
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancelled_at = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let error = acquisition.join().unwrap().unwrap_err();
+        let cancellation_elapsed = cancelled_at.elapsed();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(cancellation_elapsed <= Duration::from_millis(100));
+
+        cancelled.store(false, Ordering::Release);
+        let (vad, next_request_id) =
+            SileroVadWorkerSupervisor::acquire_session_with_launcher_and_deadlines(
+                launcher.clone(),
+                732,
+                1,
+                1,
+                threshold,
+                acquisition_test_deadlines(budget),
+                cancelled.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            vad.compute(732, next_request_id, &[0.9; WINDOW_SAMPLES])
+                .unwrap()
+                .probability,
+            0.4
+        );
+        vad.end_session(732, next_request_id + 1).unwrap();
+        vad.transport.terminate_current().unwrap();
+        kill_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        reaped_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 2);
+        eprintln!("VAD acquisition cancellation elapsed: {cancellation_elapsed:?}");
     }
 
     #[test]

@@ -282,7 +282,11 @@ trait SpeechDetector: Send {
 }
 
 trait SpeechDetectorFactory: Send + Sync {
-    fn acquire(&self, threshold: VadThreshold) -> Result<Box<dyn SpeechDetector>, CaptureError>;
+    fn acquire(
+        &self,
+        threshold: VadThreshold,
+        cancelled: &AtomicBool,
+    ) -> Result<Box<dyn SpeechDetector>, CaptureError>;
 }
 
 struct WorkerSpeechDetectorFactory;
@@ -309,37 +313,21 @@ impl WorkerSpeechDetector {
 }
 
 impl SpeechDetectorFactory for WorkerSpeechDetectorFactory {
-    fn acquire(&self, threshold: VadThreshold) -> Result<Box<dyn SpeechDetector>, CaptureError> {
-        let supervisor =
-            SileroVadWorkerSupervisor::spawn().map_err(WorkerSpeechDetector::vad_error)?;
+    fn acquire(
+        &self,
+        threshold: VadThreshold,
+        cancelled: &AtomicBool,
+    ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
         let session_id = NEXT_VAD_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let mut detector = WorkerSpeechDetector {
+        let (supervisor, next_request_id) =
+            SileroVadWorkerSupervisor::acquire_session(session_id, 1, 1, threshold, cancelled)
+                .map_err(WorkerSpeechDetector::vad_error)?;
+        let detector = WorkerSpeechDetector {
             supervisor,
             session_id,
-            next_request_id: 1,
-            active: false,
+            next_request_id,
+            active: true,
         };
-        let load_request = detector.request_id();
-        detector
-            .supervisor
-            .load(session_id, load_request, 1)
-            .map_err(WorkerSpeechDetector::vad_error)?;
-        let health_request = detector.request_id();
-        detector
-            .supervisor
-            .health(session_id, health_request)
-            .map_err(WorkerSpeechDetector::vad_error)?;
-        let start_request = detector.request_id();
-        detector
-            .supervisor
-            .start_session(session_id, start_request, threshold)
-            .map_err(WorkerSpeechDetector::vad_error)?;
-        detector.active = true;
-        let ready_request = detector.request_id();
-        detector
-            .supervisor
-            .health(session_id, ready_request)
-            .map_err(WorkerSpeechDetector::vad_error)?;
         Ok(Box::new(detector))
     }
 }
@@ -702,7 +690,11 @@ fn capture_worker(
         Arc::clone(&fault),
         Arc::clone(&dropped_samples),
     )?);
-    let detector = acquire_speech_detector(&options, &WorkerSpeechDetectorFactory)?;
+    let detector = acquire_speech_detector(
+        &options,
+        &WorkerSpeechDetectorFactory,
+        &cancellation.stop_requested,
+    )?;
     let mut pipeline = Pipeline::new(
         format.sample_rate,
         format.channels,
@@ -874,13 +866,14 @@ fn drain_ring_all(consumer: &mut Consumer, pipeline: &mut Pipeline) -> Result<()
 fn acquire_speech_detector(
     options: &CaptureOptions,
     factory: &dyn SpeechDetectorFactory,
+    cancelled: &AtomicBool,
 ) -> Result<Option<Box<dyn SpeechDetector>>, CaptureError> {
     if options.intent == CaptureIntent::MeterOnly || !options.vad_enabled {
         return Ok(None);
     }
     let threshold = VadThreshold::new(options.speech_probability_threshold)
         .map_err(WorkerSpeechDetector::vad_error)?;
-    factory.acquire(threshold).map(Some)
+    factory.acquire(threshold, cancelled).map(Some)
 }
 
 fn duration_to_source_frames(duration: Duration, sample_rate: u32) -> usize {
@@ -1160,15 +1153,36 @@ mod tests {
 
     struct NoopDetector;
 
+    struct CancellationBlockingDetectorFactory {
+        entered: Sender<()>,
+    }
+
     impl SpeechDetectorFactory for CountingDetectorFactory {
         fn acquire(
             &self,
             threshold: VadThreshold,
+            _cancelled: &AtomicBool,
         ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.threshold_bits
                 .store(threshold.value().to_bits(), Ordering::Relaxed);
             Ok(Box::new(NoopDetector))
+        }
+    }
+
+    impl SpeechDetectorFactory for CancellationBlockingDetectorFactory {
+        fn acquire(
+            &self,
+            _threshold: VadThreshold,
+            cancelled: &AtomicBool,
+        ) -> Result<Box<dyn SpeechDetector>, CaptureError> {
+            self.entered.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(CaptureError::SpeechDetection(
+                "injected acquisition cancellation".to_owned(),
+            ))
         }
     }
 
@@ -1204,15 +1218,19 @@ mod tests {
         };
 
         assert!(
-            acquire_speech_detector(&options, &factory)
+            acquire_speech_detector(&options, &factory, &AtomicBool::new(false))
                 .unwrap()
                 .is_none()
         );
         assert_eq!(factory.calls.load(Ordering::Relaxed), 0);
 
-        let detector = acquire_speech_detector(&CaptureOptions::default(), &factory)
-            .unwrap()
-            .unwrap();
+        let detector = acquire_speech_detector(
+            &CaptureOptions::default(),
+            &factory,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
@@ -1232,13 +1250,56 @@ mod tests {
             ..CaptureOptions::default()
         };
 
-        drop(acquire_speech_detector(&options, &factory).unwrap());
+        drop(acquire_speech_detector(&options, &factory, &AtomicBool::new(false)).unwrap());
 
         assert_eq!(factory.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             f32::from_bits(factory.threshold_bits.load(Ordering::Relaxed)),
             0.73
         );
+    }
+
+    #[test]
+    fn cancelled_vad_acquisition_joins_capture_worker_without_output() {
+        let cancellation = CaptureCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let (entered_tx, entered_rx) = bounded(1);
+        let (started_tx, started_rx) = bounded(1);
+        let output_delivered = Arc::new(AtomicBool::new(false));
+        let worker_output = Arc::clone(&output_delivered);
+        let lifetime = Arc::new(());
+        let weak_lifetime = Arc::downgrade(&lifetime);
+        let worker_lifetime = Arc::clone(&lifetime);
+        drop(lifetime);
+        let worker = thread::spawn(move || {
+            let _lifetime = worker_lifetime;
+            let factory = CancellationBlockingDetectorFactory {
+                entered: entered_tx,
+            };
+            let result = acquire_speech_detector(
+                &CaptureOptions::default(),
+                &factory,
+                &worker_cancellation.stop_requested,
+            );
+            if result.is_ok() {
+                worker_output.store(true, Ordering::Release);
+            }
+            let _ = started_tx.send(result.map(|_| ()));
+        });
+
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.cancel();
+        let error = await_capture_start(
+            &started_rx,
+            &cancellation,
+            worker,
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::SpeechDetection(_)));
+        assert!(!output_delivered.load(Ordering::Acquire));
+        assert!(weak_lifetime.upgrade().is_none());
     }
 
     #[test]
