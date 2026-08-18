@@ -21,7 +21,8 @@ use crate::installations::{
     discard_pinned_artifact_partial, download_pinned_artifact_for_target,
     path_entry_exists_no_follow, pinned_artifact_retained_partial, read_regular_file_no_follow,
     restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
-    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_runtime_tree,
+    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
+    verify_runtime_tree,
 };
 use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 
@@ -946,6 +947,7 @@ pub(crate) fn verified_receipt_at(
     root: &Path,
 ) -> Result<(OnnxBundleReceipt, OnnxModelSpec), InstallError> {
     const MAX_RECEIPT_BYTES: u64 = 256 * 1024;
+    verify_regular_directory_root(root)?;
     let receipt_path = root.join(RECEIPT_FILE_NAME);
     let bytes = read_regular_file_no_follow(&receipt_path, MAX_RECEIPT_BYTES)?;
     let receipt: OnnxBundleReceipt = serde_json::from_slice(&bytes)
@@ -1356,6 +1358,34 @@ mod tests {
         let cancellation = InstallCancellation::default();
         pause_onnx_bundle_install(&cancellation);
         assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn pause_interrupts_the_final_exact_tree_hash_before_activation() {
+        let root = unique_root("pause-final-hash");
+        let source = root.join("source");
+        let target = root.join("target");
+        let receipt = write_fixture_bundle(&source, "fixture-moonshine", "pause-hash");
+        let cancellation = InstallCancellation::default();
+        let progress_cancellation = cancellation.clone();
+        let error = stage_file_bundle_for_target(
+            &fixture_assembly(&source, &receipt),
+            &fixture_generated(&receipt),
+            &target,
+            &cancellation,
+            &move |event| {
+                if event.stage == crate::installations::InstallStage::Extracting
+                    && event.completed_bytes == event.total_bytes
+                {
+                    pause_onnx_bundle_install(&progress_cancellation);
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(!target.exists());
+        assert!(!root.join(".target.installing").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

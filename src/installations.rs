@@ -1680,7 +1680,7 @@ pub(crate) fn stage_file_bundle_for_target(
             size_bytes: file.bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(&file.bytes)),
         }));
-        verify_runtime_tree(&stage_root, &exact_files)
+        verify_runtime_tree_cancellable(&stage_root, &exact_files, cancellation)
     })();
     if let Err(error) = preparation {
         let _ = remove_path_if_exists(&stage_root);
@@ -2012,6 +2012,10 @@ pub(crate) fn verify_runtime_tree(
     root: &Path,
     files: &[RuntimeFileSpec],
 ) -> Result<(), InstallError> {
+    verify_runtime_tree_cancellable(root, files, &InstallCancellation::default())
+}
+
+pub(crate) fn verify_regular_directory_root(root: &Path) -> Result<(), InstallError> {
     reject_link_or_reparse_ancestors(root)?;
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| failed(format!("failed to inspect {}: {error}", root.display())))?;
@@ -2021,6 +2025,15 @@ pub(crate) fn verify_runtime_tree(
             root.display()
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn verify_runtime_tree_cancellable(
+    root: &Path,
+    files: &[RuntimeFileSpec],
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    verify_regular_directory_root(root)?;
     let mut allowed_files = HashSet::new();
     let mut allowed_directories = HashSet::new();
     for file in files {
@@ -2040,20 +2053,33 @@ pub(crate) fn verify_runtime_tree(
             parent = directory.parent();
         }
         ensure_no_symlink_components(root, &file.install_path)?;
-        verify_file(
+        verify_file_cancellable(
             &root.join(&file.install_path),
             file.size_bytes,
             &file.sha256,
+            cancellation,
         )?;
     }
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Err(InstallError::Cancelled {
+                partial_path: root.to_path_buf(),
+                downloaded_bytes: 0,
+            });
+        }
         for entry in fs::read_dir(&directory).map_err(|error| {
             failed(format!(
                 "failed to enumerate {}: {error}",
                 directory.display()
             ))
         })? {
+            if cancellation.is_cancelled() {
+                return Err(InstallError::Cancelled {
+                    partial_path: root.to_path_buf(),
+                    downloaded_bytes: 0,
+                });
+            }
             let entry = entry.map_err(|error| {
                 failed(format!(
                     "failed to enumerate {}: {error}",
