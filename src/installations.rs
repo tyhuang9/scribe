@@ -24,6 +24,10 @@ const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 const MAX_REMOVAL_DISCOVERY_DEPTH: usize = 12;
 const MAX_REMOVAL_DISCOVERY_ENTRIES: usize = 8_192;
 
+#[cfg(test)]
+static FILE_HASH_COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::OnceLock::new();
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstallStage {
     Downloading,
@@ -137,6 +141,43 @@ pub(crate) struct PinnedArtifact {
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
     pub(crate) destination: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct PinnedArtifactInspectionPlan {
+    artifact: PinnedArtifact,
+    target_identity: CanonicalTargetIdentity,
+    state: PinnedArtifactInspectionState,
+}
+
+#[derive(Debug)]
+enum PinnedArtifactInspectionState {
+    VerifiedDestination(OpenedFileIdentity),
+    RequiresDownload(u64),
+}
+
+impl PinnedArtifactInspectionPlan {
+    pub(crate) fn required_download_bytes(&self) -> u64 {
+        match self.state {
+            PinnedArtifactInspectionState::VerifiedDestination(_) => 0,
+            PinnedArtifactInspectionState::RequiresDownload(bytes) => bytes,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedFileIdentity {
+    volume_serial: u32,
+    file_index_high: u32,
+    file_index_low: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -966,19 +1007,62 @@ pub(crate) fn download_pinned_artifact(
     }
     let expected_target_identity = disk_space::canonical_target_identity(&artifact.destination)
         .map_err(InstallError::Failed)?;
-    download_pinned_artifact_for_target(artifact, &expected_target_identity, cancellation, progress)
+    download_pinned_artifact_for_target(
+        artifact,
+        &expected_target_identity,
+        None,
+        cancellation,
+        progress,
+    )
 }
 
 pub(crate) fn download_pinned_artifact_for_target(
     artifact: &PinnedArtifact,
     expected_target_identity: &CanonicalTargetIdentity,
+    inspection: Option<PinnedArtifactInspectionPlan>,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
+    if let Some(inspection) = inspection {
+        validate_artifact_inspection(artifact, expected_target_identity, &inspection)?;
+        match inspection.state {
+            PinnedArtifactInspectionState::VerifiedDestination(expected_file_identity) => {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled_before_artifact_inspection(artifact)?);
+                }
+                revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+                let (file, metadata) = open_regular_file_no_follow(&artifact.destination)?;
+                if metadata.len() != artifact.size_bytes
+                    || opened_file_identity(&file)? != expected_file_identity
+                {
+                    return Err(failed(format!(
+                        "verified artifact changed after inspection: {}",
+                        artifact.destination.display()
+                    )));
+                }
+                return Ok(downloaded_candidate(
+                    artifact,
+                    artifact.destination.clone(),
+                    expected_target_identity,
+                ));
+            }
+            PinnedArtifactInspectionState::RequiresDownload(_) => {
+                return download_pinned_artifact_with_target(
+                    &UreqHttpSource,
+                    artifact,
+                    expected_target_identity,
+                    false,
+                    cancellation,
+                    progress,
+                );
+            }
+        }
+    }
     download_pinned_artifact_with_target(
         &UreqHttpSource,
         artifact,
         expected_target_identity,
+        true,
         cancellation,
         progress,
     )
@@ -1014,24 +1098,64 @@ pub(crate) fn pinned_artifact_retained_partial(
 /// network. Exact completed destinations need no download capacity. Only a
 /// regular, strictly short partial is treated as resumable; full, corrupt, or
 /// oversized partials conservatively reserve a complete replacement.
-pub(crate) fn pinned_artifact_required_download_bytes(
+pub(crate) fn inspect_pinned_artifact_for_target(
     artifact: &PinnedArtifact,
-) -> Result<u64, InstallError> {
+    expected_target_identity: &CanonicalTargetIdentity,
+) -> Result<PinnedArtifactInspectionPlan, InstallError> {
     validate_artifact_spec(artifact)?;
-    if artifact_destination_is_regular(&artifact.destination)?
-        && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
-    {
-        return Ok(0);
+    revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
+    if artifact_destination_is_regular(&artifact.destination)? {
+        let (mut file, metadata) = open_regular_file_no_follow(&artifact.destination)?;
+        let identity = opened_file_identity(&file)?;
+        if verify_opened_file_cancellable(
+            &mut file,
+            &metadata,
+            &artifact.destination,
+            artifact.size_bytes,
+            &artifact.sha256,
+            &InstallCancellation::default(),
+        )
+        .is_ok()
+        {
+            return Ok(PinnedArtifactInspectionPlan {
+                artifact: artifact.clone(),
+                target_identity: expected_target_identity.clone(),
+                state: PinnedArtifactInspectionState::VerifiedDestination(identity),
+            });
+        }
     }
     let partial = partial_path(&artifact.destination)?;
-    let Some(metadata) = partial_file_metadata(&partial)? else {
-        return Ok(artifact.size_bytes);
+    let required = match partial_file_metadata(&partial)? {
+        Some(metadata) if metadata.len() < artifact.size_bytes => {
+            artifact.size_bytes - metadata.len()
+        }
+        Some(_) | None => artifact.size_bytes,
     };
-    if metadata.len() < artifact.size_bytes {
-        Ok(artifact.size_bytes - metadata.len())
-    } else {
-        Ok(artifact.size_bytes)
+    Ok(PinnedArtifactInspectionPlan {
+        artifact: artifact.clone(),
+        target_identity: expected_target_identity.clone(),
+        state: PinnedArtifactInspectionState::RequiresDownload(required),
+    })
+}
+
+#[cfg(test)]
+fn pinned_artifact_required_download_bytes(artifact: &PinnedArtifact) -> Result<u64, InstallError> {
+    let identity = disk_space::canonical_target_identity(&artifact.destination)
+        .map_err(InstallError::Failed)?;
+    Ok(inspect_pinned_artifact_for_target(artifact, &identity)?.required_download_bytes())
+}
+
+fn validate_artifact_inspection(
+    artifact: &PinnedArtifact,
+    expected_target_identity: &CanonicalTargetIdentity,
+    inspection: &PinnedArtifactInspectionPlan,
+) -> Result<(), InstallError> {
+    if inspection.artifact != *artifact || inspection.target_identity != *expected_target_identity {
+        return Err(failed(
+            "pinned artifact inspection does not match the requested artifact and target",
+        ));
     }
+    Ok(())
 }
 
 /// Removes only the resumable sidecar derived from a validated artifact.
@@ -1083,7 +1207,6 @@ fn partial_file_metadata(partial: &Path) -> Result<Option<fs::Metadata>, Install
     }
 }
 
-#[cfg(test)]
 fn cancelled_before_artifact_inspection(
     artifact: &PinnedArtifact,
 ) -> Result<InstallError, InstallError> {
@@ -1195,6 +1318,45 @@ fn open_regular_file_no_follow(path: &Path) -> Result<(File, fs::Metadata), Inst
     Ok((file, metadata))
 }
 
+#[cfg(unix)]
+fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| failed(format!("failed to inspect open artifact: {error}")))?;
+    Ok(OpenedFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn opened_file_identity(file: &File) -> Result<OpenedFileIdentity, InstallError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: the all-zero representation is valid for this plain C output
+    // structure, and the OS initializes every field on success.
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: `file` owns a valid handle for the duration of this call and
+    // `information` points to writable storage of the required type.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return Err(failed(format!(
+            "failed to identify open artifact: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(OpenedFileIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index_high: information.nFileIndexHigh,
+        file_index_low: information.nFileIndexLow,
+    })
+}
+
 fn additional_download_bytes(
     artifact_size_bytes: u64,
     partial_bytes: u64,
@@ -1245,6 +1407,7 @@ fn download_pinned_artifact_with(
         source,
         artifact,
         &expected_target_identity,
+        true,
         cancellation,
         progress,
     )
@@ -1254,6 +1417,7 @@ fn download_pinned_artifact_with_target(
     source: &dyn HttpSource,
     artifact: &PinnedArtifact,
     expected_target_identity: &CanonicalTargetIdentity,
+    verify_existing_destination: bool,
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
@@ -1267,7 +1431,8 @@ fn download_pinned_artifact_with_target(
     }
     revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     let partial_exists = partial_file_exists(&partial)?;
-    if artifact_destination_is_regular(&artifact.destination)?
+    if verify_existing_destination
+        && artifact_destination_is_regular(&artifact.destination)?
         && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
     {
         return Ok(DownloadedArtifact {
@@ -1583,6 +1748,7 @@ pub(crate) fn stage_runtime_archive_for_target(
     let archive = download_pinned_artifact_for_target(
         &spec.artifact,
         expected_archive_target_identity,
+        None,
         cancellation,
         progress,
     )?;
@@ -2430,12 +2596,45 @@ pub(crate) fn verify_file_cancellable(
         });
     }
     let (mut file, metadata) = open_regular_file_no_follow(path)?;
+    verify_opened_file_cancellable(
+        &mut file,
+        &metadata,
+        path,
+        expected_size,
+        expected_sha256,
+        cancellation,
+    )
+}
+
+fn verify_opened_file_cancellable(
+    file: &mut File,
+    metadata: &fs::Metadata,
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    validate_sha256(expected_sha256)?;
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: path.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
     if !metadata.is_file() || metadata.len() != expected_size {
         return Err(failed(format!(
             "artifact size mismatch for {}: expected {expected_size} bytes, got {}",
             path.display(),
             metadata.len()
         )));
+    }
+    #[cfg(test)]
+    {
+        let mut counts = FILE_HASH_COUNTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("file hash count lock poisoned");
+        *counts.entry(path.to_path_buf()).or_default() += 1;
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; BUFFER_BYTES];
@@ -2462,6 +2661,26 @@ pub(crate) fn verify_file_cancellable(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn reset_file_hash_count(path: &Path) {
+    FILE_HASH_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash count lock poisoned")
+        .remove(path);
+}
+
+#[cfg(test)]
+fn file_hash_count(path: &Path) -> usize {
+    FILE_HASH_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash count lock poisoned")
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<(), InstallError> {
@@ -3308,6 +3527,61 @@ mod tests {
         fs::write(&spec.destination, bytes).unwrap();
         assert_eq!(pinned_artifact_required_download_bytes(&spec).unwrap(), 0);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_destination_inspection_is_consumed_without_a_second_hash() {
+        let root = unique_root("verified-cache-single-hash");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        fs::write(&spec.destination, bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+
+        let inspection = inspect_pinned_artifact_for_target(&spec, &identity).unwrap();
+        assert_eq!(inspection.required_download_bytes(), 0);
+        assert_eq!(file_hash_count(&spec.destination), 1);
+
+        let downloaded = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(downloaded.path, spec.destination);
+        assert_eq!(file_hash_count(&downloaded.path), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_destination_replacement_after_inspection_fails_closed() {
+        let root = unique_root("verified-cache-replaced");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+        fs::write(&spec.destination, bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+        let inspection = inspect_pinned_artifact_for_target(&spec, &identity).unwrap();
+        fs::rename(&spec.destination, root.join("original.bin")).unwrap();
+        fs::write(&spec.destination, bytes).unwrap();
+
+        let error = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after inspection"));
+        assert_eq!(file_hash_count(&spec.destination), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -27,7 +27,13 @@ pub(crate) fn prepare_model(
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     let artifact = normalized_model_download_spec(config, model_id)?;
-    download_pinned_artifact_for_target(&artifact, expected_target_identity, cancellation, progress)
+    download_pinned_artifact_for_target(
+        &artifact,
+        expected_target_identity,
+        None,
+        cancellation,
+        progress,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,7 +102,13 @@ pub(crate) fn prepare_trusted_gguf_model(
     progress: &dyn Fn(InstallProgress),
 ) -> Result<DownloadedArtifact, InstallError> {
     let pinned = trusted_gguf_download_spec(config, artifact)?;
-    download_pinned_artifact_for_target(&pinned, expected_target_identity, cancellation, progress)
+    download_pinned_artifact_for_target(
+        &pinned,
+        expected_target_identity,
+        None,
+        cancellation,
+        progress,
+    )
 }
 
 pub(crate) fn trusted_gguf_download_admission(
