@@ -170,6 +170,22 @@ pub(crate) struct RuntimeArchiveSpec {
     pub(crate) files: Vec<RuntimeFileSpec>,
 }
 
+/// One already downloaded, exact file copied into a freshly assembled bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BundleAssemblyFile {
+    pub(crate) source_path: PathBuf,
+    pub(crate) install_path: PathBuf,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+/// One deterministic metadata file generated while assembling a bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GeneratedBundleFile {
+    pub(crate) install_path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ActivationPhase {
@@ -1582,6 +1598,200 @@ pub(crate) fn stage_runtime_archive_for_target(
     })
 }
 
+/// Assembles exact, individually verified files into a fresh same-volume
+/// staging directory. A prior crash can leave only the reserved staging path;
+/// the next explicit installation safely replaces that path before doing any
+/// assembly. Installed and retained-previous directories are never touched.
+pub(crate) fn stage_file_bundle_for_target(
+    files: &[BundleAssemblyFile],
+    generated_files: &[GeneratedBundleFile],
+    target_root: &Path,
+    cancellation: &InstallCancellation,
+    progress: &dyn Fn(InstallProgress),
+) -> Result<StagedRuntime, InstallError> {
+    if files.is_empty() {
+        return Err(failed("file bundle has no downloaded files"));
+    }
+    let stage_root = stable_staging_path(target_root)?;
+    validate_non_overlapping_paths(&stage_root, target_root)?;
+    reject_link_or_reparse_ancestors(target_root)?;
+    remove_path_if_exists(&stage_root)?;
+    fs::create_dir(&stage_root).map_err(|error| {
+        failed(format!(
+            "failed to create fresh bundle staging directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+    let preparation = (|| {
+        let total_bytes = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("bundle assembly size overflow"))
+        })?;
+        let mut completed_bytes = 0_u64;
+        for file in files {
+            if cancellation.is_cancelled() {
+                return Err(InstallError::Cancelled {
+                    partial_path: file.source_path.clone(),
+                    downloaded_bytes: completed_bytes,
+                });
+            }
+            validate_relative_path(&file.install_path)?;
+            validate_sha256(&file.sha256)?;
+            verify_file_cancellable(
+                &file.source_path,
+                file.size_bytes,
+                &file.sha256,
+                cancellation,
+            )?;
+            copy_regular_file_to_stage(
+                &file.source_path,
+                &stage_root,
+                &file.install_path,
+                file.size_bytes,
+                cancellation,
+            )?;
+            completed_bytes = completed_bytes
+                .checked_add(file.size_bytes)
+                .ok_or_else(|| failed("bundle assembly size overflow"))?;
+            progress(InstallProgress {
+                stage: InstallStage::Extracting,
+                completed_bytes,
+                total_bytes,
+                bytes_per_second: None,
+            });
+        }
+        for file in generated_files {
+            validate_relative_path(&file.install_path)?;
+            write_new_bundle_file(&stage_root, &file.install_path, &file.bytes)?;
+        }
+        let mut exact_files = files
+            .iter()
+            .map(|file| RuntimeFileSpec {
+                archive_path: file.install_path.clone(),
+                install_path: file.install_path.clone(),
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        exact_files.extend(generated_files.iter().map(|file| RuntimeFileSpec {
+            archive_path: file.install_path.clone(),
+            install_path: file.install_path.clone(),
+            size_bytes: file.bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&file.bytes)),
+        }));
+        verify_runtime_tree(&stage_root, &exact_files)
+    })();
+    if let Err(error) = preparation {
+        let _ = remove_path_if_exists(&stage_root);
+        return Err(error);
+    }
+    Ok(StagedRuntime {
+        root: stage_root,
+        target_root: target_root.to_path_buf(),
+    })
+}
+
+fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
+    let name = target_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| failed(format!("{} has no safe filename", target_root.display())))?;
+    Ok(target_root.with_file_name(format!(".{name}.installing")))
+}
+
+fn copy_regular_file_to_stage(
+    source: &Path,
+    stage_root: &Path,
+    relative: &Path,
+    expected_size: u64,
+    cancellation: &InstallCancellation,
+) -> Result<(), InstallError> {
+    ensure_no_symlink_components(stage_root, relative)?;
+    let output = stage_root.join(relative);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
+        ensure_no_symlink_components(stage_root, relative)?;
+    }
+    let (mut input, metadata) = open_regular_file_no_follow(source)?;
+    if metadata.len() != expected_size {
+        return Err(failed(format!(
+            "bundle source changed size before assembly: {}",
+            source.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    configure_no_follow(&mut options);
+    let mut destination = options
+        .open(&output)
+        .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
+    validate_opened_regular_file(&destination, &output)?;
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(InstallError::Cancelled {
+                partial_path: source.to_path_buf(),
+                downloaded_bytes: copied,
+            });
+        }
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| failed(format!("failed to read {}: {error}", source.display())))?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| failed("bundle copy size overflow"))?;
+        if copied > expected_size {
+            return Err(failed(format!(
+                "bundle source exceeded its pinned size: {}",
+                source.display()
+            )));
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
+    }
+    if copied != expected_size {
+        return Err(failed(format!(
+            "bundle source length changed during assembly: {}",
+            source.display()
+        )));
+    }
+    destination
+        .sync_all()
+        .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
+}
+
+fn write_new_bundle_file(
+    stage_root: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), InstallError> {
+    ensure_no_symlink_components(stage_root, relative)?;
+    let output = stage_root.join(relative);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
+        ensure_no_symlink_components(stage_root, relative)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    configure_no_follow(&mut options);
+    let mut file = options
+        .open(&output)
+        .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
+    validate_opened_regular_file(&file, &output)?;
+    file.write_all(bytes)
+        .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
+    file.sync_all()
+        .map_err(|error| failed(format!("failed to sync {}: {error}", output.display())))
+}
+
 fn extract_runtime_archive(
     archive_path: &Path,
     stage_root: &Path,
@@ -1829,6 +2039,19 @@ pub(crate) fn activate_directory(
     target_root: &Path,
 ) -> Result<DirectoryReplacement, InstallError> {
     validate_non_overlapping_paths(stage_root, target_root)?;
+    let stage_metadata = fs::symlink_metadata(stage_root).map_err(|error| {
+        failed(format!(
+            "failed to inspect staged directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+    if !stage_metadata.is_dir() || runtime_metadata_is_link_or_reparse(&stage_metadata) {
+        return Err(failed(format!(
+            "staged bundle is not a regular non-link directory: {}",
+            stage_root.display()
+        )));
+    }
+    reject_link_or_reparse_ancestors(target_root)?;
     let parent = target_root
         .parent()
         .ok_or_else(|| failed(format!("{} has no parent", target_root.display())))?;
@@ -1836,7 +2059,25 @@ pub(crate) fn activate_directory(
         .map_err(|error| failed(format!("failed to create {}: {error}", parent.display())))?;
     let rollback = directory_rollback_path(target_root);
     remove_path_if_exists(&rollback)?;
-    let previous = if target_root.exists() {
+    let target_exists = match fs::symlink_metadata(target_root) {
+        Ok(metadata) if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) => {
+            true
+        }
+        Ok(_) => {
+            return Err(failed(format!(
+                "directory activation target is a link, reparse point, or non-directory: {}",
+                target_root.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(failed(format!(
+                "failed to inspect directory activation target {}: {error}",
+                target_root.display()
+            )));
+        }
+    };
+    let previous = if target_exists {
         durable_rename(target_root, &rollback).map_err(|error| {
             failed(format!(
                 "failed to preserve existing runtime {}: {error}",
@@ -1930,6 +2171,33 @@ pub(crate) fn verify_file(
         expected_sha256,
         &InstallCancellation::default(),
     )
+}
+
+/// Reads a small regular metadata file without following a final symbolic
+/// link or Windows reparse point. Large model artifacts must use streaming
+/// verification instead.
+pub(crate) fn read_regular_file_no_follow(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, InstallError> {
+    let (mut file, metadata) = open_regular_file_no_follow(path)?;
+    if metadata.len() > maximum_bytes {
+        return Err(failed(format!(
+            "metadata file {} exceeds the {}-byte safety limit",
+            path.display(),
+            maximum_bytes
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| failed(format!("failed to read {}: {error}", path.display())))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(failed(format!(
+            "metadata file changed while it was read: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Streams a regular, non-link file through SHA-256 without buffering its
@@ -2387,12 +2655,22 @@ fn transaction_path(target: &Path, phase: &str) -> Result<PathBuf, InstallError>
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), InstallError> {
-    if path.as_os_str().is_empty() || !path.exists() {
+    if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| failed(format!("failed to inspect {}: {error}", path.display())))?;
-    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(failed(format!(
+                "failed to inspect {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let result = if runtime_metadata_is_link_or_reparse(&metadata) && metadata.is_dir() {
+        fs::remove_dir(path)
+    } else if metadata.is_dir() {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
@@ -2404,6 +2682,34 @@ fn remove_path_if_exists(path: &Path) -> Result<(), InstallError> {
             path.display()
         ))
     })
+}
+
+fn reject_link_or_reparse_ancestors(path: &Path) -> Result<(), InstallError> {
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata)
+                if metadata.is_dir() && !runtime_metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(failed(format!(
+                    "bundle target crosses a symbolic link, reparse point, or non-directory ancestor: {}",
+                    ancestor.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failed(format!(
+                    "failed to inspect bundle target ancestor {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
