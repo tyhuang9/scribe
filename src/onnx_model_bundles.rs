@@ -1754,6 +1754,9 @@ pub(crate) fn write_test_receipt_for_spec(spec: &OnnxModelSpec) -> Result<(), In
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     fn unique_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2145,6 +2148,83 @@ mod tests {
         assert!(acquire_bundle_target(&target).is_err());
         drop(first);
         assert!(acquire_bundle_target(&target).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_bundle_targets_share_a_storage_root_without_serializing_each_other() {
+        let root = unique_root("distinct-target-concurrency");
+        fs::create_dir_all(&root).unwrap();
+        let first_target = root.join("first-model");
+        let second_target = root.join("second-model");
+        let start = Arc::new(Barrier::new(3));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+
+        let spawn_holder = |label: &'static str,
+                            target: PathBuf,
+                            start: Arc<Barrier>,
+                            held_tx: mpsc::Sender<(&'static str, Result<(), String>)>,
+                            release_rx: mpsc::Receiver<()>| {
+            thread::spawn(move || {
+                start.wait();
+                let guard = acquire_bundle_target(&target);
+                let status = guard.as_ref().map(|_| ()).map_err(ToString::to_string);
+                held_tx.send((label, status)).unwrap();
+                if guard.is_ok() {
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("holder release must arrive before the bounded timeout");
+                }
+                drop(guard);
+            })
+        };
+        let first_thread = spawn_holder(
+            "first",
+            first_target.clone(),
+            Arc::clone(&start),
+            held_tx.clone(),
+            release_first_rx,
+        );
+        let second_thread = spawn_holder(
+            "second",
+            second_target.clone(),
+            Arc::clone(&start),
+            held_tx,
+            release_second_rx,
+        );
+
+        start.wait();
+        let first_held = held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first distinct target acquisition must complete without blocking");
+        let second_held = held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second distinct target acquisition must complete without blocking");
+        let same_first = acquire_bundle_target(&first_target);
+        let same_second = acquire_bundle_target(&second_target);
+
+        let _ = release_first_tx.send(());
+        let _ = release_second_tx.send(());
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+
+        let mut held = [first_held, second_held];
+        held.sort_by_key(|(label, _)| *label);
+        assert_eq!(held[0].0, "first");
+        assert!(held[0].1.is_ok(), "first target failed: {:?}", held[0].1);
+        assert_eq!(held[1].0, "second");
+        assert!(held[1].1.is_ok(), "second target failed: {:?}", held[1].1);
+        assert!(same_first.is_err());
+        assert!(same_second.is_err());
+        drop(same_first);
+        drop(same_second);
+
+        let first_after_release = acquire_bundle_target(&first_target).unwrap();
+        let second_after_release = acquire_bundle_target(&second_target).unwrap();
+        drop(first_after_release);
+        drop(second_after_release);
         fs::remove_dir_all(root).unwrap();
     }
 
