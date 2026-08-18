@@ -1496,7 +1496,18 @@ mod tests {
     }
 
     #[test]
-    fn silero_compute_failure_stops_the_pipeline_without_an_rms_fallback() {
+    fn silero_compute_failure_suppresses_preview_and_final_audio_without_an_rms_fallback() {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let mut preview_session = RollingPreviewSession::<()>::new(move |snapshot| {
+            snapshot_tx.send(snapshot.identity.sequence).unwrap();
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        let publisher = preview_session.audio_publisher(
+            SessionId(9),
+            RequestId(11),
+            ModelId::new("preview-model"),
+        );
         let (rms, peak, observed, revision) = level_state();
         let (detector, state) = fake_detector();
         state
@@ -1516,7 +1527,8 @@ mod tests {
             observed,
             revision,
         )
-        .unwrap();
+        .unwrap()
+        .with_preview_publisher(Some(publisher));
 
         for _ in 0..WINDOW_SAMPLES - 1 {
             pipeline.push_interleaved(0.9).unwrap();
@@ -1525,6 +1537,10 @@ mod tests {
         assert!(matches!(error, CaptureError::SpeechDetection(_)));
         assert!(pipeline.vad.speech_start_frame.is_none());
         assert_eq!(state.lock().unwrap().windows.len(), 1);
+        drop(pipeline);
+        preview_session.close();
+        assert!(preview_session.stop_and_join(Duration::from_secs(1)));
+        assert!(snapshot_rx.try_recv().is_err());
     }
 
     #[test]

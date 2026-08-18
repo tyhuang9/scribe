@@ -6,6 +6,14 @@ remains **NO-GO** pending the manual, compatibility, streaming, soak, and
 measurement evidence identified below. This document preserves the historical
 Phase 0 audit and records each implemented phase against the consolidated plan.
 
+> **Current implementation note (2026-08-17):** RMS-based adaptive VAD,
+> `manual_activation_rms`, and the combined `Input sensitivity` slider described
+> in historical checkpoints below are superseded. Current capture classifies
+> speech only from exact sequential 512-sample Silero decisions. Settings expose
+> `Speech detection sensitivity`, which maps inversely to Silero's probability
+> threshold, plus a separate noninteractive RMS/peak input meter. RMS is retained
+> only for level display and low-input diagnostic guidance.
+
 ## How to read this document
 
 - **Verified** means observed in the current checkout, source, lockfile, or a
@@ -1133,6 +1141,10 @@ the real overlay level/state interface and the authoritative session boundary.
 
 ## Phase 6 checkpoint - native audio pipeline, VAD, and endpointing
 
+> **Historical and superseded VAD design:** This checkpoint records the former
+> adaptive RMS/noise-floor classifier. It is not a description of the current
+> Silero implementation summarized at the top of this document.
+
 Phase 6 removes microphone WAV transport from the normal and comparison paths.
 CPAL now feeds a fixed-capacity, preallocated SPSC ring; a dedicated native
 worker produces the one canonical mono 16 kHz `f32` `PreparedAudio` shared by
@@ -2069,6 +2081,11 @@ single tray-service lifecycle.
 
 ## Post-Phase 11 low-input diagnostic checkpoint
 
+> **Historical classifier evidence:** References in this checkpoint to a 0.012
+> activation floor and 10 ms VAD-frame RMS describe the superseded RMS
+> classifier. The hardware measurements remain useful diagnostic evidence, but
+> current speech classification is performed only by Silero.
+
 Recorded 2026-08-05 on Windows x64 after the configured FIFINE A8 repeatedly
 ended as no-speech. Two no-save CPAL probes verified F32, 48 kHz, stereo input,
 matching channels, and complete callback delivery. The independent probe's
@@ -2095,6 +2112,11 @@ correcting the A8 top mute or bottom gain remains **NOT VERIFIED** and no manual
 matrix row is promoted by this checkpoint.
 
 ## Input sensitivity slider
+
+> **Superseded UI and persistence design:** The combined RMS/threshold slider and
+> `manual_activation_rms` behavior below are retained as historical context only.
+> Current UI has a `Speech detection sensitivity` control for Silero probability
+> and a separate noninteractive input-level meter.
 
 General > Audio exposes one model-independent `Input sensitivity` slider. Its
 track combines the latest microphone RMS with the persisted activation

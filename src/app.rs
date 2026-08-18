@@ -121,8 +121,8 @@ fn native_main_window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize>
 
 fn capture_options_from_config(config: &AppConfig) -> CaptureOptions {
     CaptureOptions {
-        // Input sensitivity always gates accepted speech. The legacy VAD setting controls
-        // only whether Toggle mode stops automatically after the configured silence.
+        // Silero always classifies speech. The legacy VAD setting controls only
+        // whether Toggle mode stops automatically after the configured silence.
         vad_enabled: true,
         endpointing_enabled: config.recording.vad_enabled
             && config.recording.hotkey_mode == HotkeyMode::Toggle,
@@ -262,11 +262,11 @@ struct NoSpeechFeedback {
 fn no_speech_feedback(
     maximum_input_rms: Option<f32>,
     input_device_name: Option<&str>,
-    activation_floor: f32,
+    low_input_diagnostic_floor: f32,
 ) -> NoSpeechFeedback {
     let input_was_too_low = maximum_input_rms
         .filter(|rms| rms.is_finite())
-        .is_some_and(|rms| rms < activation_floor);
+        .is_some_and(|rms| rms < low_input_diagnostic_floor);
     if !input_was_too_low {
         return NoSpeechFeedback {
             status_message: "No speech detected; nothing was pasted.".to_owned(),
@@ -297,11 +297,11 @@ fn no_speech_feedback_for_capture(
     no_speech_feedback(
         maximum_input_rms,
         diagnostics.input_device_name.as_deref(),
-        diagnostics.activation_floor,
+        diagnostics.low_input_diagnostic_floor,
     )
 }
 
-fn diagnostic_activation_floor(_config: &AppConfig) -> f32 {
+fn low_input_diagnostic_floor(_config: &AppConfig) -> f32 {
     audio::LOW_INPUT_DIAGNOSTIC_RMS
 }
 
@@ -520,14 +520,14 @@ impl MicrophoneTest {
 
 #[derive(Clone, Debug, PartialEq)]
 struct CaptureDiagnosticContext {
-    activation_floor: f32,
+    low_input_diagnostic_floor: f32,
     input_device_name: Option<String>,
 }
 
 impl CaptureDiagnosticContext {
     fn from_config(config: &AppConfig) -> Self {
         Self {
-            activation_floor: diagnostic_activation_floor(config),
+            low_input_diagnostic_floor: low_input_diagnostic_floor(config),
             input_device_name: config.recording.audio_input_device_name.clone(),
         }
     }
@@ -536,7 +536,7 @@ impl CaptureDiagnosticContext {
 impl Default for CaptureDiagnosticContext {
     fn default() -> Self {
         Self {
-            activation_floor: audio::LOW_INPUT_DIAGNOSTIC_RMS,
+            low_input_diagnostic_floor: audio::LOW_INPUT_DIAGNOSTIC_RMS,
             input_device_name: None,
         }
     }
@@ -14795,6 +14795,74 @@ mod layout_tests {
     }
 
     #[test]
+    fn vad_start_deadline_failure_discards_preview_and_never_dispatches_final_output() {
+        let mut app = test_app();
+        app.transcript = "keep prior transcript".to_owned();
+        let session_id = app
+            .session_coordinator
+            .begin(SessionPurpose::Dictation)
+            .unwrap();
+        let model_id = ModelId::new("whisper_cpp_base_en");
+        let request_id = app
+            .session_coordinator
+            .start_preview(session_id, model_id.clone())
+            .unwrap();
+        let decode_calls = Arc::new(AtomicU64::new(0));
+        let worker_calls = Arc::clone(&decode_calls);
+        let identity = StreamIdentity {
+            session_id,
+            request_id,
+            model_id,
+            sequence: 0,
+        };
+        let (_publisher, preview) = RollingPreviewHandle::simulated(identity, move |_| {
+            worker_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(StreamUpdate::default())
+        })
+        .unwrap();
+        app.rolling_preview = Some(preview);
+        app.pending_recording = Some(PendingRecording {
+            session_id,
+            source: RecordingSource::Transcribe,
+            stop_requested: false,
+            max_duration_seconds: 30,
+            latency: LatencyTrace::started_at(Instant::now(), TriggerObservation::HotkeyPoll),
+            capture_diagnostics: CaptureDiagnosticContext::default(),
+            abandon: Arc::new(AtomicBool::new(false)),
+        });
+
+        app.tx
+            .send(AppEvent::CaptureReady {
+                session_id,
+                result: Err(CaptureError::SpeechDetection(
+                    "worker response deadline exceeded after 2000 ms".to_owned(),
+                )),
+            })
+            .unwrap();
+        app.poll_events();
+        for _ in 0..100 {
+            app.poll_preview_drain_at(Instant::now(), || panic!("unexpected decoder cancel"));
+            if app.pending_preview_drain.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app.pending_preview_drain.is_none());
+        assert!(app.rolling_preview.is_none());
+        assert!(app.active_recording.is_none());
+        assert!(app.pending_output.is_none());
+        assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(app.transcript, "keep prior transcript");
+        assert_eq!(app.status, TranscriptionStatus::Error);
+        assert!(app.status_message.contains("Silero speech detection"));
+        assert_eq!(
+            app.session_coordinator.last_terminal().unwrap().outcome,
+            crate::core::TerminalOutcome::Failed
+        );
+    }
+
+    #[test]
     fn reachable_no_speech_completions_never_dispatch_or_paste() {
         for stop_reason in [
             CaptureStopReason::MaximumDuration,
@@ -14894,13 +14962,13 @@ mod layout_tests {
         let feedback = no_speech_feedback(
             Some(audio::LOW_INPUT_DIAGNOSTIC_RMS / 2.0),
             Some("Microphone Array"),
-            diagnostic_activation_floor(&config),
+            low_input_diagnostic_floor(&config),
         );
 
         assert!(feedback.status_message.contains("silent or too low"));
         config.recording.speech_probability_threshold = 0.8;
         assert_eq!(
-            diagnostic_activation_floor(&config),
+            low_input_diagnostic_floor(&config),
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
     }
@@ -15403,7 +15471,7 @@ mod layout_tests {
         );
 
         assert_eq!(
-            diagnostics.activation_floor,
+            diagnostics.low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(diagnostics.input_device_name.as_deref(), Some("FIFINE A8"));
@@ -15440,7 +15508,7 @@ mod layout_tests {
                 .as_ref()
                 .unwrap()
                 .capture_diagnostics
-                .activation_floor,
+                .low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(
@@ -15448,7 +15516,7 @@ mod layout_tests {
                 .as_ref()
                 .unwrap()
                 .capture_diagnostics
-                .activation_floor,
+                .low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
@@ -15486,14 +15554,14 @@ mod layout_tests {
         let active = app.active_recording.as_ref().unwrap();
         assert_eq!(app.config.recording.speech_probability_threshold, 0.2);
         assert_eq!(
-            active.capture_diagnostics.activation_floor,
+            active.capture_diagnostics.low_input_diagnostic_floor,
             audio::LOW_INPUT_DIAGNOSTIC_RMS
         );
         app.stop_and_discard_active_recording();
     }
 
     #[test]
-    fn typed_recording_settings_keep_sensitivity_gating_when_endpointing_is_off() {
+    fn typed_recording_settings_keep_silero_classification_when_endpointing_is_off() {
         let mut config = AppConfig::default();
         config.recording.vad_enabled = false;
         config.recording.speech_confirmation_ms = 175;
@@ -15506,7 +15574,7 @@ mod layout_tests {
 
         assert!(
             options.vad_enabled,
-            "input sensitivity must continue to gate accepted speech"
+            "Silero must continue to classify speech when endpointing is disabled"
         );
         assert!(!options.endpointing_enabled);
         assert_eq!(options.vad.speech_confirmation, Duration::from_millis(175));
