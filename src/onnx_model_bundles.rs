@@ -1307,23 +1307,27 @@ pub(crate) fn bundle_disk_space_preflight(
     let manifest = bundle_manifest(model_id)
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let inspections = inspect_bundle_artifacts(&artifacts)?;
-    let additional = bundle_required_install_bytes(manifest, &inspections)?;
+    // Browse-time preflight is deliberately metadata-only. Without an
+    // installation cancellation handle it must not hash multi-gigabyte cache
+    // entries; reserving every pinned download is conservative and local-only.
+    let additional = bundle_required_install_bytes(
+        manifest,
+        artifacts.iter().map(|artifact| artifact.size_bytes),
+    )?;
     let target = bundle_target_root(storage_root, model_id)?;
     disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
 }
 
 fn bundle_required_install_bytes(
     manifest: &OnnxBundleManifest,
-    inspections: &[(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)],
+    required_download_bytes: impl IntoIterator<Item = u64>,
 ) -> Result<u64, InstallError> {
     let mut additional = manifest.files.iter().try_fold(0_u64, |total, file| {
         total
             .checked_add(file.size_bytes)
             .ok_or_else(|| failed("ONNX bundle expanded-size requirement overflowed"))
     })?;
-    for (_, inspection) in inspections {
-        let remaining = inspection.required_download_bytes();
+    for remaining in required_download_bytes {
         additional = additional
             .checked_add(remaining)
             .ok_or_else(|| failed("ONNX bundle download-space requirement overflowed"))?;
@@ -1343,13 +1347,14 @@ fn bundle_required_install_bytes(
 
 fn inspect_bundle_artifacts(
     artifacts: &[PinnedArtifact],
+    cancellation: &InstallCancellation,
 ) -> Result<Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>, InstallError> {
     artifacts
         .iter()
         .map(|artifact| {
             let identity = disk_space::canonical_target_identity(&artifact.destination)
                 .map_err(InstallError::Failed)?;
-            let inspection = inspect_pinned_artifact_for_target(artifact, &identity)?;
+            let inspection = inspect_pinned_artifact_for_target(artifact, &identity, cancellation)?;
             Ok((identity, inspection))
         })
         .collect()
@@ -1364,13 +1369,30 @@ pub(crate) fn stage_onnx_bundle_install(
     cancellation: &InstallCancellation,
     progress: &dyn Fn(InstallProgress),
 ) -> Result<StagedOnnxBundle, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: storage_root.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
     let manifest = bundle_manifest(model_id)
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let target_root = bundle_target_root(storage_root, model_id)?;
-    let target_guard = acquire_bundle_target(&target_root)?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let inspections = inspect_bundle_artifacts(&artifacts)?;
-    let required_bytes = bundle_required_install_bytes(manifest, &inspections)?;
+    let inspections = inspect_bundle_artifacts(&artifacts, cancellation)?;
+    let required_bytes = bundle_required_install_bytes(
+        manifest,
+        inspections
+            .iter()
+            .map(|(_, inspection)| inspection.required_download_bytes()),
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled {
+            partial_path: storage_root.to_path_buf(),
+            downloaded_bytes: 0,
+        });
+    }
+    let target_guard = acquire_bundle_target(&target_root)?;
     let disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
@@ -1987,6 +2009,67 @@ mod tests {
         drop(guard);
         assert_eq!(discard_onnx_bundle_partials(model_id, &root).unwrap(), 1);
         assert!(!partial.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_cancelled_bundle_stage_creates_no_storage_or_coordination_state() {
+        let root = unique_root("stage-pre-cancel");
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+
+        let error =
+            stage_onnx_bundle_install("moonshine-tiny-en-int8-onnx", &root, &cancellation, &|_| {})
+                .unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn browse_disk_preflight_does_not_hash_complete_sized_cache_entries() {
+        let root = unique_root("browse-preflight-metadata-only");
+        let manifest = bundle_manifest("moonshine-tiny-en-int8-onnx").unwrap();
+        let artifacts = pinned_files(&root, manifest).unwrap();
+        let cached = &artifacts[0];
+        fs::create_dir_all(cached.destination.parent().unwrap()).unwrap();
+        File::create(&cached.destination)
+            .unwrap()
+            .set_len(cached.size_bytes)
+            .unwrap();
+        crate::installations::reset_file_hash_count(&cached.destination);
+
+        bundle_disk_space_preflight(manifest.id.as_str(), &root).unwrap();
+
+        assert_eq!(
+            crate::installations::file_hash_count(&cached.destination),
+            0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_bundle_cache_inspection_precedes_locks_and_reservations() {
+        let root = unique_root("stage-inspection-cancel");
+        let manifest = bundle_manifest("moonshine-tiny-en-int8-onnx").unwrap();
+        let artifacts = pinned_files(&root, manifest).unwrap();
+        let cached = &artifacts[0];
+        fs::create_dir_all(cached.destination.parent().unwrap()).unwrap();
+        File::create(&cached.destination)
+            .unwrap()
+            .set_len(cached.size_bytes)
+            .unwrap();
+        let cancellation = InstallCancellation::default();
+        crate::installations::cancel_file_hash_after(&cached.destination, 1, cancellation.clone());
+        let target = bundle_target_root(&root, manifest.id.as_str()).unwrap();
+
+        let error = stage_onnx_bundle_install(manifest.id.as_str(), &root, &cancellation, &|_| {})
+            .unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!target.exists());
+        assert!(!target.parent().unwrap().join(LOCK_DIRECTORY_NAME).exists());
+        assert!(!cached.destination.with_extension("ort.partial").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
