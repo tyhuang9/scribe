@@ -23,9 +23,11 @@
       "license": {
         "spdx": "MIT",
         "copyright": "Useful Sensors / Moonshine AI, Copyright (c) 2025",
-        "source_repository": "UsefulSensors/moonshine-tiny",
-        "source_revision": null,
-        "notice": "Moonshine Tiny is distributed under the MIT License. Preserve the bundled LICENSE file."
+        "source_repository": "moonshine-ai/moonshine",
+        "source_revision": "06f74196a6212fe8642df143d87a243970f15114",
+        "legal_url": "https://opensource.org/license/mit",
+        "changes_notice": "The pinned artifact is an ONNX Runtime conversion with int8 quantization; it is not the unmodified source checkpoint.",
+        "notice": "Moonshine Tiny is distributed under the MIT License. Preserve the downloaded artifact LICENSE and generated Moonshine MIT evidence."
       },
       "files": [
         {"role":"encoder","path":"encoder_model.ort","size_bytes":13281600,"sha256":"94e90a4654fc45cdfedb77c4c08e1739f48862998e58fada384b25118134f221"},
@@ -54,6 +56,8 @@
         "copyright": "NVIDIA Corporation",
         "source_repository": "nvidia/parakeet-tdt_ctc-110m",
         "source_revision": "431a349f3051ab85c22b9b7a2741b5fe77065665",
+        "legal_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+        "changes_notice": "No converted runtime artifact is distributed because the pinned converted repository is empty.",
         "notice": "Source-model evidence is CC BY 4.0. The empty converted repository is intentionally not installable."
       },
       "files": []
@@ -77,7 +81,9 @@
         "copyright": "NVIDIA Corporation",
         "source_repository": "nvidia/canary-180m-flash",
         "source_revision": "b12ab418510d093e83890178fd0e8b0d0f7918a6",
-        "notice": "Canary 180M Flash source-model evidence is CC BY 4.0 and records upstream attribution changes."
+        "legal_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+        "changes_notice": "Scribe distributes a sherpa-onnx conversion of the source model whose encoder and decoder were dynamically quantized to int8; this is not the unmodified NVIDIA checkpoint.",
+        "notice": "Canary 180M Flash source-model evidence is CC BY 4.0. Attribution, the legal URL, and the conversion/dynamic-quantization changes must be retained."
       },
       "files": [
         {"role":"encoder","path":"encoder.int8.onnx","size_bytes":132678643,"sha256":"7a75b4e2a5857a6dcc0819503bbe3fad66943db4a3ccf21d3f27c633667d303f"},
@@ -102,9 +108,11 @@
       "license": {
         "spdx": "Apache-2.0",
         "copyright": "k2-fsa / icefall contributors",
-        "source_repository": "csukuangfj/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
-        "source_revision": "d42f2d9f7ca24806fb667456a18a9f1b60f70d16",
-        "notice": "The pinned model repository records an Apache-2.0 license chain; compatibility remains Experimental."
+        "source_repository": "desh2608/icefall-asr-librispeech-pruned-transducer-stateless7-streaming-small",
+        "source_revision": "be162ecc09bade73063a671fad9d18220149d25b",
+        "legal_url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "changes_notice": "The training weights are pinned, but the exporter checkout used for this ONNX conversion is unpinned; compatibility therefore remains Experimental.",
+        "notice": "The pinned training weights record an Apache-2.0 license chain. The ONNX exporter revision is not known and no Supported claim is made."
       },
       "files": [
         {"role":"encoder","path":"encoder-epoch-99-avg-1.int8.onnx","size_bytes":42845182,"sha256":"3810755ce7c3ab26b42a8bcf39d191308fa27fb0f53358823ba46141d03b7eb3"},

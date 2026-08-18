@@ -1719,11 +1719,6 @@ fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
     Ok(target_root.with_file_name(format!(".{name}.installing")))
 }
 
-#[cfg(test)]
-pub(crate) fn file_bundle_staging_root(target_root: &Path) -> Result<PathBuf, InstallError> {
-    stable_staging_path(target_root)
-}
-
 pub(crate) fn directory_activation_rollback_root(target_root: &Path) -> PathBuf {
     directory_rollback_path(target_root)
 }
