@@ -27,6 +27,10 @@ const MAX_REMOVAL_DISCOVERY_ENTRIES: usize = 8_192;
 #[cfg(test)]
 static FILE_HASH_COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
     std::sync::OnceLock::new();
+#[cfg(test)]
+static FILE_HASH_CANCELLATIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, (u64, InstallCancellation)>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstallStage {
@@ -1101,28 +1105,37 @@ pub(crate) fn pinned_artifact_retained_partial(
 pub(crate) fn inspect_pinned_artifact_for_target(
     artifact: &PinnedArtifact,
     expected_target_identity: &CanonicalTargetIdentity,
+    cancellation: &InstallCancellation,
 ) -> Result<PinnedArtifactInspectionPlan, InstallError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
+    }
     validate_artifact_spec(artifact)?;
     revalidate_artifact_target(&artifact.destination, expected_target_identity)?;
     if artifact_destination_is_regular(&artifact.destination)? {
         let (mut file, metadata) = open_regular_file_no_follow(&artifact.destination)?;
         let identity = opened_file_identity(&file)?;
-        if verify_opened_file_cancellable(
+        match verify_opened_file_cancellable(
             &mut file,
             &metadata,
             &artifact.destination,
             artifact.size_bytes,
             &artifact.sha256,
-            &InstallCancellation::default(),
-        )
-        .is_ok()
-        {
-            return Ok(PinnedArtifactInspectionPlan {
-                artifact: artifact.clone(),
-                target_identity: expected_target_identity.clone(),
-                state: PinnedArtifactInspectionState::VerifiedDestination(identity),
-            });
+            cancellation,
+        ) {
+            Ok(()) => {
+                return Ok(PinnedArtifactInspectionPlan {
+                    artifact: artifact.clone(),
+                    target_identity: expected_target_identity.clone(),
+                    state: PinnedArtifactInspectionState::VerifiedDestination(identity),
+                });
+            }
+            Err(error @ InstallError::Cancelled { .. }) => return Err(error),
+            Err(_) => {}
         }
+    }
+    if cancellation.is_cancelled() {
+        return Err(cancelled_before_artifact_inspection(artifact)?);
     }
     let partial = partial_path(&artifact.destination)?;
     let required = match partial_file_metadata(&partial)? {
@@ -1142,7 +1155,10 @@ pub(crate) fn inspect_pinned_artifact_for_target(
 fn pinned_artifact_required_download_bytes(artifact: &PinnedArtifact) -> Result<u64, InstallError> {
     let identity = disk_space::canonical_target_identity(&artifact.destination)
         .map_err(InstallError::Failed)?;
-    Ok(inspect_pinned_artifact_for_target(artifact, &identity)?.required_download_bytes())
+    Ok(
+        inspect_pinned_artifact_for_target(artifact, &identity, &InstallCancellation::default())?
+            .required_download_bytes(),
+    )
 }
 
 fn validate_artifact_inspection(
@@ -2638,6 +2654,8 @@ fn verify_opened_file_cancellable(
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; BUFFER_BYTES];
+    #[cfg(test)]
+    let mut hashed_bytes = 0_u64;
     loop {
         if cancellation.is_cancelled() {
             return Err(InstallError::Cancelled {
@@ -2652,6 +2670,11 @@ fn verify_opened_file_cancellable(
             break;
         }
         hasher.update(&buffer[..count]);
+        #[cfg(test)]
+        {
+            hashed_bytes = hashed_bytes.saturating_add(count as u64);
+            cancel_file_hash_at_test_threshold(path, hashed_bytes);
+        }
     }
     let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected_sha256) {
@@ -2664,7 +2687,7 @@ fn verify_opened_file_cancellable(
 }
 
 #[cfg(test)]
-fn reset_file_hash_count(path: &Path) {
+pub(crate) fn reset_file_hash_count(path: &Path) {
     FILE_HASH_COUNTS
         .get_or_init(Default::default)
         .lock()
@@ -2673,7 +2696,7 @@ fn reset_file_hash_count(path: &Path) {
 }
 
 #[cfg(test)]
-fn file_hash_count(path: &Path) -> usize {
+pub(crate) fn file_hash_count(path: &Path) -> usize {
     FILE_HASH_COUNTS
         .get_or_init(Default::default)
         .lock()
@@ -2681,6 +2704,40 @@ fn file_hash_count(path: &Path) -> usize {
         .get(path)
         .copied()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn cancel_file_hash_at_test_threshold(path: &Path, hashed_bytes: u64) {
+    let cancellation = {
+        let mut hooks = FILE_HASH_CANCELLATIONS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("file hash cancellation lock poisoned");
+        if hooks
+            .get(path)
+            .is_some_and(|(threshold, _)| hashed_bytes >= *threshold)
+        {
+            hooks.remove(path).map(|(_, cancellation)| cancellation)
+        } else {
+            None
+        }
+    };
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_file_hash_after(
+    path: &Path,
+    threshold: u64,
+    cancellation: InstallCancellation,
+) {
+    FILE_HASH_CANCELLATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("file hash cancellation lock poisoned")
+        .insert(path.to_path_buf(), (threshold, cancellation));
 }
 
 fn ensure_no_symlink_components(root: &Path, relative: &Path) -> Result<(), InstallError> {
@@ -3540,7 +3597,9 @@ mod tests {
         let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
         reset_file_hash_count(&spec.destination);
 
-        let inspection = inspect_pinned_artifact_for_target(&spec, &identity).unwrap();
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
         assert_eq!(inspection.required_download_bytes(), 0);
         assert_eq!(file_hash_count(&spec.destination), 1);
 
@@ -3567,7 +3626,9 @@ mod tests {
         fs::write(&spec.destination, bytes).unwrap();
         let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
         reset_file_hash_count(&spec.destination);
-        let inspection = inspect_pinned_artifact_for_target(&spec, &identity).unwrap();
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
         fs::rename(&spec.destination, root.join("original.bin")).unwrap();
         fs::write(&spec.destination, bytes).unwrap();
 
@@ -3582,6 +3643,101 @@ mod tests {
 
         assert!(error.to_string().contains("changed after inspection"));
         assert_eq!(file_hash_count(&spec.destination), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_inspection_honors_pre_cancel_without_touching_artifact_paths() {
+        let root = unique_root("inspection-pre-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let spec = artifact(&root, b"complete artifact");
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        let cancellation = InstallCancellation::default();
+        cancellation.cancel();
+
+        let error =
+            inspect_pinned_artifact_for_target(&spec, &identity, &cancellation).unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert!(!spec.destination.exists());
+        assert!(!partial_path(&spec.destination).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_inspection_cancellation_interrupts_cache_hash_without_mutation() {
+        let root = unique_root("inspection-hash-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![0x5a; BUFFER_BYTES * 3];
+        let spec = artifact(&root, &bytes);
+        fs::write(&spec.destination, &bytes).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        let cancellation = InstallCancellation::default();
+        cancel_file_hash_after(&spec.destination, BUFFER_BYTES as u64, cancellation.clone());
+
+        let error =
+            inspect_pinned_artifact_for_target(&spec, &identity, &cancellation).unwrap_err();
+
+        assert!(error.is_cancelled());
+        assert_eq!(fs::read(&spec.destination).unwrap(), bytes);
+        assert!(!partial_path(&spec.destination).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_inode_cache_mutation_fails_during_hashing_copy_without_activation() {
+        let root = unique_root("verified-cache-same-inode-mutation");
+        fs::create_dir_all(&root).unwrap();
+        let expected = b"complete artifact";
+        let mutated = b"mutated artifact!";
+        assert_eq!(expected.len(), mutated.len());
+        let spec = artifact(&root, expected);
+        fs::write(&spec.destination, expected).unwrap();
+        let identity = disk_space::canonical_target_identity(&spec.destination).unwrap();
+        reset_file_hash_count(&spec.destination);
+        let inspection =
+            inspect_pinned_artifact_for_target(&spec, &identity, &InstallCancellation::default())
+                .unwrap();
+        let mut same_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&spec.destination)
+            .unwrap();
+        same_file.write_all(mutated).unwrap();
+        same_file.sync_all().unwrap();
+        drop(same_file);
+
+        let downloaded = download_pinned_artifact_for_target(
+            &spec,
+            &identity,
+            Some(inspection),
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(file_hash_count(&spec.destination), 1);
+        let target = root.join("assembled");
+        let error = stage_file_bundle_for_target(
+            &[BundleAssemblyFile {
+                source_path: downloaded.path,
+                install_path: PathBuf::from("model.bin"),
+                size_bytes: spec.size_bytes,
+                sha256: spec.sha256,
+            }],
+            &[],
+            &target,
+            &InstallCancellation::default(),
+            &|_| {},
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("checksum mismatch while copying")
+        );
+        assert!(!target.exists());
+        assert!(!stable_staging_path(&target).unwrap().exists());
         fs::remove_dir_all(root).unwrap();
     }
 
