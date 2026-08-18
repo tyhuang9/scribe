@@ -1164,21 +1164,27 @@ impl TranscriptionService {
         let preference = AccelerationPreference::Cpu;
 
         let health_started = Instant::now();
-        self.worker
-            .health_check(artifact.clone(), preference)
-            .map_err(|error| anyhow!("staged ONNX bundle health check failed: {error}"))?;
-        let health_duration_ms = health_started.elapsed().as_millis();
-        ensure_install_not_cancelled(cancellation)?;
+        let health_result = (|| {
+            self.worker
+                .health_check(artifact.clone(), preference)
+                .map_err(|error| anyhow!("staged ONNX bundle health check failed: {error}"))?;
+            let duration = health_started.elapsed().as_millis();
+            ensure_install_not_cancelled(cancellation)?;
+            Ok(duration)
+        })();
+        let health_unload = self
+            .worker
+            .unload()
+            .map_err(|error| anyhow!("staged ONNX bundle health unload failed: {error}"));
+        let health_duration_ms = preserve_primary_smoke_error(health_result, health_unload)?;
 
         let load_started = Instant::now();
-        let load = self
-            .worker
-            .load(artifact.clone(), preference)
-            .map_err(|error| anyhow!("staged ONNX bundle load failed: {error}"))?;
-        let load_duration_ms = load_started.elapsed().as_millis();
-        ensure_install_not_cancelled(cancellation)?;
-
-        let decode_result = (|| {
+        let load_decode_result = (|| {
+            let load = self
+                .worker
+                .load(artifact.clone(), preference)
+                .map_err(|error| anyhow!("staged ONNX bundle load failed: {error}"))?;
+            let load_duration_ms = load_started.elapsed().as_millis();
             ensure_install_not_cancelled(cancellation)?;
             let audio = Arc::new(PreparedAudio::from_captured_mono(
                 vec![0.0; PREPARED_SAMPLE_RATE as usize],
@@ -1197,25 +1203,29 @@ impl TranscriptionService {
                 )
                 .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
             ensure_install_not_cancelled(cancellation)?;
-            Ok(decode_started.elapsed().as_millis())
+            Ok((load, load_duration_ms, decode_started.elapsed().as_millis()))
         })();
         let unload_result = self
             .worker
             .unload()
             .map_err(|error| anyhow!("staged ONNX bundle unload failed: {error}"));
-        let decode_duration_ms = preserve_primary_smoke_error(decode_result, unload_result)?;
+        let (load, load_duration_ms, decode_duration_ms) =
+            preserve_primary_smoke_error(load_decode_result, unload_result)?;
 
         let reload_started = Instant::now();
-        self.worker
-            .load(artifact, preference)
-            .map_err(|error| anyhow!("staged ONNX bundle reload failed: {error}"))?;
-        let reload_duration_ms = reload_started.elapsed().as_millis();
-        let reload_result = ensure_install_not_cancelled(cancellation);
+        let reload_result = (|| {
+            self.worker
+                .load(artifact, preference)
+                .map_err(|error| anyhow!("staged ONNX bundle reload failed: {error}"))?;
+            let duration = reload_started.elapsed().as_millis();
+            ensure_install_not_cancelled(cancellation)?;
+            Ok(duration)
+        })();
         let unload_result = self
             .worker
             .unload()
             .map_err(|error| anyhow!("staged ONNX bundle final unload failed: {error}"));
-        preserve_primary_smoke_error(reload_result, unload_result)?;
+        let reload_duration_ms = preserve_primary_smoke_error(reload_result, unload_result)?;
 
         Ok(InstallSmoke {
             resolved_acceleration: load.diagnostics.resolved_acceleration,
@@ -2776,6 +2786,8 @@ mod tests {
         block_batch: bool,
         batch_cancelled: bool,
         cancel_install_on_transcribe: Option<InstallCancellation>,
+        cancel_install_on_health: Option<InstallCancellation>,
+        cancel_install_on_load_call: Option<(usize, InstallCancellation)>,
     }
 
     #[derive(Default)]
@@ -2807,6 +2819,14 @@ mod tests {
         fn cancel_install_on_transcribe(&self, cancellation: InstallCancellation) {
             self.state.lock().unwrap().cancel_install_on_transcribe = Some(cancellation);
         }
+
+        fn cancel_install_on_health(&self, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_health = Some(cancellation);
+        }
+
+        fn cancel_install_on_load_call(&self, call: usize, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_load_call = Some((call, cancellation));
+        }
     }
 
     impl OnnxSupervisorControl for FakeOnnxControl {
@@ -2818,6 +2838,14 @@ mod tests {
         ) -> anyhow::Result<bool> {
             let mut state = self.state.lock().unwrap();
             state.load_calls += 1;
+            if state
+                .cancel_install_on_load_call
+                .as_ref()
+                .is_some_and(|(call, _)| *call == state.load_calls)
+                && let Some((_, cancellation)) = state.cancel_install_on_load_call.take()
+            {
+                cancellation.cancel();
+            }
             let warm = state.loaded.as_ref() == Some(&model);
             if !warm {
                 if let Some(previous) = state.loaded.take() {
@@ -2914,6 +2942,9 @@ mod tests {
         fn health(&self, _session_id: u64, _request_id: u64) -> anyhow::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.health_calls += 1;
+            if let Some(cancellation) = state.cancel_install_on_health.take() {
+                cancellation.cancel();
+            }
             if state.fail_health {
                 state.loaded = None;
                 anyhow::bail!("deterministic ONNX health failure");
@@ -3153,6 +3184,8 @@ mod tests {
         assert_eq!(state.health_calls, 1);
         assert_eq!(state.transcribe_calls, 1);
         assert_eq!(state.load_calls, 4);
+        assert_eq!(state.unload_calls, 3);
+        assert!(state.loaded.is_none());
         drop(state);
         drop(service);
         fs::remove_dir_all(root).unwrap();
@@ -3173,9 +3206,10 @@ mod tests {
 
         assert!(error.to_string().contains("decode smoke failed"));
         let state = control.state.lock().unwrap();
-        assert_eq!(state.unload_calls, 1);
+        assert_eq!(state.unload_calls, 2);
         assert!(state.loaded.is_none());
         drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3193,9 +3227,55 @@ mod tests {
 
         assert!(error.to_string().contains("cancelled"));
         let state = control.state.lock().unwrap();
+        assert_eq!(state.unload_calls, 2);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_cancelled_after_health() {
+        let (root, spec) = onnx_spec("smoke-cancel-health", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_health(cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
         assert_eq!(state.unload_calls, 1);
         assert!(state.loaded.is_none());
         drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_cancelled_immediately_after_load() {
+        let (root, spec) = onnx_spec("smoke-cancel-load", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_load_call(2, cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.health_calls, 1);
+        assert_eq!(state.load_calls, 2);
+        assert_eq!(state.unload_calls, 2);
+        assert!(state.loaded.is_none());
+        drop(state);
+        assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }
