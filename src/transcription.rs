@@ -3340,7 +3340,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_model_replacement_during_stream_terminates_before_discard_and_recovers() {
+    fn failed_model_replacement_during_stream_unloads_before_discard_and_recovers() {
         let (first_root, first) = onnx_spec(
             "stream-replacement-first",
             OnnxModelFamily::OnlineTransducer,
@@ -3370,11 +3370,11 @@ mod tests {
         );
         {
             let state = control.state.lock().unwrap();
-            assert_eq!(state.termination_calls, 1);
+            assert_eq!(state.unload_calls, 1);
+            assert_eq!(state.termination_calls, 0);
             assert!(state.loaded.is_none());
             assert!(state.stream.is_none());
             assert_eq!(state.maximum_loaded_models, 1);
-            assert_eq!(state.events.last().unwrap(), "terminate:onnx");
         }
         assert_eq!(service.router.onnx_state_for_test(), (false, false, false));
         assert_eq!(service.router.runtime_activity().active_streams(), 0);
