@@ -580,6 +580,10 @@ impl RollingPreviewHandle {
         self.session.close();
     }
 
+    pub(crate) fn invalidate(&self) {
+        self.session.invalidate();
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.session.is_finished()
     }

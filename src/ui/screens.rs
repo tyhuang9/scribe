@@ -11421,11 +11421,14 @@ mod tests {
                     SettingsTab::Recording => &[
                         ("Duration limit", egui::accesskit::Role::ComboBox),
                         ("Device", egui::accesskit::Role::ComboBox),
-                        ("Input level", egui::accesskit::Role::Slider),
                         ("Streaming mode", egui::accesskit::Role::ComboBox),
                         ("Transcription device", egui::accesskit::Role::ComboBox),
                     ],
                     SettingsTab::Advanced => &[
+                        (
+                            "Speech detection sensitivity",
+                            egui::accesskit::Role::Slider,
+                        ),
                         ("Speech confirmation ms", egui::accesskit::Role::SpinButton),
                         ("History storage", egui::accesskit::Role::ComboBox),
                         (
@@ -11442,7 +11445,8 @@ mod tests {
                             (node.name() == Some(*label)).then(|| {
                                 nodes.iter().find_map(|(_, control)| {
                                     (control.role() == *role
-                                        && control.labelled_by().contains(label_id))
+                                        && (control.labelled_by().contains(label_id)
+                                            || control.name() == Some(*label)))
                                     .then(|| control.bounds())
                                     .flatten()
                                 })
