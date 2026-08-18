@@ -3281,7 +3281,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads an exact pinned Hugging Face bundle and requires SCRIBE_ONNX_BUNDLE_TEST=1 plus a spoken WAV fixture"]
+    #[ignore = "downloads an exact pinned Hugging Face bundle and requires SCRIBE_ONNX_BUNDLE_TEST=1 plus a digest-pinned spoken WAV fixture"]
     fn real_hugging_face_bundle_install_load_and_decode_smoke() {
         if std::env::var("SCRIBE_ONNX_BUNDLE_TEST").as_deref() != Ok("1") {
             return;
@@ -3296,14 +3296,30 @@ mod tests {
             std::env::var_os("SCRIBE_ONNX_BUNDLE_WAV")
                 .expect("set SCRIBE_ONNX_BUNDLE_WAV to a known spoken PCM WAV"),
         );
+        let expected_wav_sha256 = std::env::var("SCRIBE_ONNX_BUNDLE_WAV_SHA256")
+            .expect("set SCRIBE_ONNX_BUNDLE_WAV_SHA256 to the exact lowercase WAV SHA-256");
+        assert!(
+            expected_wav_sha256.len() == 64
+                && expected_wav_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "SCRIBE_ONNX_BUNDLE_WAV_SHA256 must be exactly 64 lowercase hexadecimal characters"
+        );
         let expected_text = std::env::var("SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT")
             .expect("set SCRIBE_ONNX_BUNDLE_EXPECTED_TRANSCRIPT to the required spoken text");
         assert!(
             !normalize_fixture_transcript(&expected_text).is_empty(),
             "the required expected transcript must contain letters or numbers"
         );
-        fs::create_dir_all(&storage).unwrap();
         let cancellation = InstallCancellation::default();
+        let fixture_fingerprint =
+            crate::installations::fingerprint_file_cancellable(&audio_path, &cancellation)
+                .expect("the configured WAV fixture must be a readable regular nonempty file");
+        assert_eq!(
+            fixture_fingerprint.sha256, expected_wav_sha256,
+            "the configured WAV fixture does not match SCRIBE_ONNX_BUNDLE_WAV_SHA256"
+        );
+        fs::create_dir_all(&storage).unwrap();
         let staged = crate::onnx_model_bundles::stage_onnx_bundle_install(
             &model_id,
             &storage,
