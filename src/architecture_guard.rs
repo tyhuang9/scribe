@@ -184,6 +184,7 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
         "managed_downloads.rs",
         "model_catalog.rs",
         "models.rs",
+        "onnx_model_bundles.rs",
         "onnx_worker.rs",
         "runtime_catalog.rs",
         "runtime_router.rs",
@@ -220,6 +221,52 @@ fn model_family_logic_is_confined_to_private_adapters_and_catalog_validation() {
                 !production.contains(term),
                 "model-family logic {term:?} escaped private adapters/catalog validation into {}",
                 path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn onnx_bundle_http_and_typed_receipts_stay_below_the_service_boundary() {
+    let sources = rust_sources();
+    let bundles = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("onnx_model_bundles.rs"))
+        .map(|(_, source)| production_prefix(source))
+        .expect("private ONNX bundle module exists");
+    assert_eq!(
+        bundles
+            .matches("download_pinned_artifact_for_target(")
+            .count(),
+        1,
+        "only the explicit bundle installation path may invoke the HTTP downloader"
+    );
+    assert!(bundles.contains("fn stage_onnx_bundle_install("));
+    assert!(bundles.contains("fn verified_receipt_at("));
+    assert!(bundles.contains("OnnxModelSpec"));
+
+    for protected in [
+        Path::new("app.rs"),
+        Path::new("config.rs"),
+        Path::new("model_catalog.rs"),
+        Path::new("models.rs"),
+        Path::new("runtime_catalog.rs"),
+    ] {
+        let production = sources
+            .iter()
+            .find(|(path, _)| path == protected)
+            .map(|(_, source)| production_prefix(source))
+            .expect("protected source exists");
+        for forbidden in [
+            "onnx_model_bundles",
+            "OnnxBundleReceipt",
+            "OnnxBundleManifest",
+            "stage_onnx_bundle_install",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "private ONNX bundle contract {forbidden:?} leaked into {}",
+                protected.display()
             );
         }
     }
