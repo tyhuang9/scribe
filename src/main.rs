@@ -16,6 +16,7 @@ mod installed_manifest;
 mod managed_downloads;
 mod model_catalog;
 mod models;
+mod onnx_model_bundles;
 mod onnx_worker;
 mod overlay;
 mod prepared_audio;
