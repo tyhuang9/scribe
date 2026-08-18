@@ -7,6 +7,8 @@
 //! activating a bundle additionally requires the current embedded catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,10 +22,10 @@ use crate::installations::{
     InstallError, InstallProgress, PinnedArtifact, RuntimeFileSpec, StagedRuntime,
     directory_activation_rollback_root, discard_file_bundle_staging,
     discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    path_entry_exists_no_follow, pinned_artifact_retained_partial, read_regular_file_no_follow,
-    restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
-    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
-    verify_runtime_tree,
+    path_entry_exists_no_follow, pinned_artifact_required_download_bytes,
+    read_regular_file_no_follow, restore_interrupted_directory_replacement,
+    retain_interrupted_directory_replacement, rollback_to_previous_runtime,
+    stage_file_bundle_for_target, verify_regular_directory_root, verify_runtime_tree,
 };
 use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
@@ -36,6 +38,8 @@ const CATALOG_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_FILE_NAME: &str = "install-receipt.json";
 const NOTICE_FILE_NAME: &str = "NOTICE.txt";
+const LOCK_DIRECTORY_NAME: &str = ".onnx-bundle-locks";
+const RESERVATION_DIRECTORY_NAME: &str = ".onnx-bundle-reservations";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -443,12 +447,15 @@ fn validate_sha256(value: &str) -> Result<(), InstallError> {
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), InstallError> {
+    let rendered = path.to_string_lossy();
     if path.as_os_str().is_empty()
         || path.is_absolute()
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
-        || path.to_string_lossy().contains('\0')
+        || rendered.contains('\0')
+        || rendered.contains('%')
+        || rendered.contains('\\')
         || path.to_str().is_none()
     {
         return Err(failed(format!(
@@ -494,6 +501,7 @@ fn spec_from_parts(
 #[derive(Debug)]
 struct BundleTargetGuard {
     identity: CanonicalTargetIdentity,
+    _process_lock: OsFileLock,
 }
 
 impl Drop for BundleTargetGuard {
@@ -522,7 +530,306 @@ fn acquire_bundle_target(target: &Path) -> Result<BundleTargetGuard, InstallErro
             target.display()
         )));
     }
-    Ok(BundleTargetGuard { identity })
+    let storage_root = target
+        .parent()
+        .ok_or_else(|| failed("ONNX bundle target has no storage root"))?;
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| failed("ONNX bundle target has no safe lock name"))?;
+    validate_stable_id(target_name)?;
+    let lock_path = storage_root
+        .join(LOCK_DIRECTORY_NAME)
+        .join(format!("{target_name}.lock"));
+    let process_lock = match OsFileLock::acquire(&lock_path, false, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            active_bundle_targets()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&identity);
+            return Err(error);
+        }
+    };
+    Ok(BundleTargetGuard {
+        identity,
+        _process_lock: process_lock,
+    })
+}
+
+#[derive(Debug)]
+struct OsFileLock {
+    file: File,
+    path: PathBuf,
+    remove_on_drop: bool,
+    additional_remove_on_drop: Option<PathBuf>,
+}
+
+impl OsFileLock {
+    fn acquire(path: &Path, wait: bool, remove_on_drop: bool) -> Result<Self, InstallError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| failed(format!("lock path {} has no parent", path.display())))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            failed(format!(
+                "could not create ONNX bundle lock directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| failed(format!("could not open lock {}: {error}", path.display())))?;
+        if !lock_file(&file, wait)
+            .map_err(|error| failed(format!("could not lock {}: {error}", path.display())))?
+        {
+            return Err(failed(format!(
+                "another process owns ONNX bundle lock {}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            remove_on_drop,
+            additional_remove_on_drop: None,
+        })
+    }
+}
+
+impl Drop for OsFileLock {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            if let Some(path) = &self.additional_remove_on_drop {
+                let _ = fs::remove_file(path);
+            }
+            let _ = unlock_file(&self.file);
+            let _ = fs::remove_file(&self.path);
+        } else {
+            let _ = unlock_file(&self.file);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BundleDiskReservation {
+    _reserved_bytes: u64,
+    _entry_lock: OsFileLock,
+}
+
+fn acquire_bundle_disk_reservation(
+    storage_root: &Path,
+    target: &Path,
+    requested_bytes: u64,
+) -> Result<BundleDiskReservation, InstallError> {
+    let reservation_root = storage_root.join(RESERVATION_DIRECTORY_NAME);
+    fs::create_dir_all(&reservation_root).map_err(|error| {
+        failed(format!(
+            "could not create ONNX bundle reservation directory {}: {error}",
+            reservation_root.display()
+        ))
+    })?;
+    let _ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), true, false)?;
+    let mut active_reserved_bytes = 0_u64;
+    for entry in fs::read_dir(&reservation_root).map_err(|error| {
+        failed(format!(
+            "could not inspect ONNX bundle reservations at {}: {error}",
+            reservation_root.display()
+        ))
+    })? {
+        let path = entry
+            .map_err(|error| failed(format!("could not read reservation entry: {error}")))?
+            .path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("ledger.lock") {
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("reservation") {
+            continue;
+        }
+        let lock_path = path.with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                failed(format!(
+                    "could not open ONNX bundle reservation lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        if lock_file(&file, false).map_err(|error| {
+            failed(format!(
+                "could not inspect ONNX bundle reservation lock {}: {error}",
+                path.display()
+            ))
+        })? {
+            let _ = fs::remove_file(&path);
+            let _ = unlock_file(&file);
+            let _ = fs::remove_file(&lock_path);
+            continue;
+        }
+        let mut file = File::open(&path).map_err(|error| {
+            failed(format!(
+                "could not open active ONNX bundle reservation {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).map_err(|error| {
+            failed(format!(
+                "could not read active ONNX bundle reservation {}: {error}",
+                path.display()
+            ))
+        })?;
+        let reserved = contents.trim().parse::<u64>().map_err(|_| {
+            failed(format!(
+                "active ONNX bundle reservation {} is invalid",
+                path.display()
+            ))
+        })?;
+        active_reserved_bytes = active_reserved_bytes
+            .checked_add(reserved)
+            .ok_or_else(|| failed("aggregate ONNX bundle reservation overflowed"))?;
+    }
+    let aggregate_request = active_reserved_bytes
+        .checked_add(requested_bytes)
+        .ok_or_else(|| failed("aggregate ONNX bundle disk requirement overflowed"))?;
+    let preflight = disk_space::preflight_download_destination(target, aggregate_request)
+        .map_err(InstallError::Failed)?;
+    if !preflight.has_sufficient_space() {
+        return Err(failed(format!(
+            "insufficient unreserved free space on {}: {} bytes are available but {} bytes are required across active ONNX bundle installs",
+            preflight.volume, preflight.available_bytes, preflight.required_bytes
+        )));
+    }
+    let reserved_bytes = requested_bytes
+        .checked_add(disk_space::SAFETY_HEADROOM_BYTES)
+        .ok_or_else(|| failed("ONNX bundle reservation headroom overflowed"))?;
+    let mut attempt = 0_u32;
+    let (path, mut file) = loop {
+        let path = reservation_root.join(format!(
+            "{}-{}-{}.reservation",
+            std::process::id(),
+            unix_seconds(),
+            attempt
+        ));
+        match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                attempt = attempt
+                    .checked_add(1)
+                    .ok_or_else(|| failed("could not allocate unique reservation name"))?;
+            }
+            Err(error) => {
+                return Err(failed(format!(
+                    "could not create ONNX bundle reservation {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    };
+    write!(file, "{reserved_bytes}\n").map_err(|error| {
+        failed(format!(
+            "could not write ONNX bundle reservation {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.flush().map_err(|error| {
+        failed(format!(
+            "could not flush ONNX bundle reservation {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        failed(format!(
+            "could not sync ONNX bundle reservation {}: {error}",
+            path.display()
+        ))
+    })?;
+    let lock_path = path.with_extension("lock");
+    let mut entry_lock = OsFileLock::acquire(&lock_path, false, true)?;
+    entry_lock.additional_remove_on_drop = Some(path);
+    Ok(BundleDiskReservation {
+        _reserved_bytes: reserved_bytes,
+        _entry_lock: entry_lock,
+    })
+}
+
+#[cfg(unix)]
+fn lock_file(file: &File, wait: bool) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let operation = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if result == 0 {
+        Ok(true)
+    } else {
+        let error = io::Error::last_os_error();
+        if !wait && error.kind() == io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(file: &File, wait: bool) -> io::Result<bool> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
+    let result = unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut overlapped) };
+    if result != 0 {
+        Ok(true)
+    } else {
+        let error = io::Error::last_os_error();
+        if !wait && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) -> io::Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    if unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[derive(Debug)]
@@ -532,6 +839,7 @@ pub(crate) struct StagedOnnxBundle {
     spec: OnnxModelSpec,
     retain_previous: bool,
     target_guard: BundleTargetGuard,
+    disk_reservation: BundleDiskReservation,
 }
 
 impl StagedOnnxBundle {
@@ -620,6 +928,7 @@ impl VerifiedStagedOnnxBundle {
             spec,
             retain_previous: staged.retain_previous,
             target_guard: staged.target_guard,
+            disk_reservation: staged.disk_reservation,
         })
     }
 }
@@ -631,6 +940,7 @@ pub(crate) struct ActivatedOnnxBundle {
     spec: OnnxModelSpec,
     retain_previous: bool,
     target_guard: BundleTargetGuard,
+    disk_reservation: BundleDiskReservation,
 }
 
 impl ActivatedOnnxBundle {
@@ -646,11 +956,13 @@ impl ActivatedOnnxBundle {
         let Self {
             replacement,
             target_guard,
+            disk_reservation,
             retain_previous,
             ..
         } = self;
         replacement.commit_with_previous_policy(retain_previous)?;
         drop(target_guard);
+        drop(disk_reservation);
         Ok(())
     }
 
@@ -658,10 +970,12 @@ impl ActivatedOnnxBundle {
         let Self {
             replacement,
             target_guard,
+            disk_reservation,
             ..
         } = self;
         replacement.rollback()?;
         drop(target_guard);
+        drop(disk_reservation);
         Ok(())
     }
 }
@@ -802,19 +1116,22 @@ pub(crate) fn bundle_disk_space_preflight(
     let manifest = bundle_manifest(model_id)
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let artifacts = pinned_files(storage_root, manifest)?;
+    let additional = bundle_required_install_bytes(manifest, &artifacts)?;
+    let target = bundle_target_root(storage_root, model_id)?;
+    disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
+}
+
+fn bundle_required_install_bytes(
+    manifest: &OnnxBundleManifest,
+    artifacts: &[PinnedArtifact],
+) -> Result<u64, InstallError> {
     let mut additional = manifest.files.iter().try_fold(0_u64, |total, file| {
         total
             .checked_add(file.size_bytes)
             .ok_or_else(|| failed("ONNX bundle expanded-size requirement overflowed"))
     })?;
-    for artifact in &artifacts {
-        let partial =
-            pinned_artifact_retained_partial(artifact)?.map_or(0, |partial| partial.bytes);
-        let remaining = if partial > artifact.size_bytes {
-            artifact.size_bytes
-        } else {
-            artifact.size_bytes - partial
-        };
+    for artifact in artifacts {
+        let remaining = pinned_artifact_required_download_bytes(artifact)?;
         additional = additional
             .checked_add(remaining)
             .ok_or_else(|| failed("ONNX bundle download-space requirement overflowed"))?;
@@ -824,8 +1141,7 @@ pub(crate) fn bundle_disk_space_preflight(
         .checked_add(receipt_bytes(&receipt)?.len() as u64)
         .and_then(|total| total.checked_add(notice_bytes(&receipt).len() as u64))
         .ok_or_else(|| failed("ONNX bundle metadata-space requirement overflowed"))?;
-    let target = bundle_target_root(storage_root, model_id)?;
-    disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
+    Ok(additional)
 }
 
 /// The sole production entry point that may contact Hugging Face for an ONNX
@@ -841,14 +1157,10 @@ pub(crate) fn stage_onnx_bundle_install(
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
-    let preflight = bundle_disk_space_preflight(model_id, storage_root)?;
-    if !preflight.has_sufficient_space() {
-        return Err(failed(format!(
-            "insufficient free space on {}: {} bytes are available but {} bytes are required",
-            preflight.volume, preflight.available_bytes, preflight.required_bytes
-        )));
-    }
     let artifacts = pinned_files(storage_root, manifest)?;
+    let required_bytes = bundle_required_install_bytes(manifest, &artifacts)?;
+    let disk_reservation =
+        acquire_bundle_disk_reservation(storage_root, &target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
             .checked_add(artifact.size_bytes)
@@ -918,6 +1230,7 @@ pub(crate) fn stage_onnx_bundle_install(
         spec,
         retain_previous,
         target_guard,
+        disk_reservation,
     })
 }
 
@@ -1276,6 +1589,15 @@ mod tests {
         let mut catalog = parse_catalog(CATALOG_BYTES).unwrap();
         catalog.bundles[0].files[0].size_bytes = 0;
         assert!(validate_catalog(&catalog).is_err());
+        let mut catalog = parse_catalog(CATALOG_BYTES).unwrap();
+        catalog.bundles[0].files[0].path = PathBuf::from("encoded%2fescape.onnx");
+        assert!(validate_catalog(&catalog).is_err());
+        let mut catalog = parse_catalog(CATALOG_BYTES).unwrap();
+        catalog.bundles[0].files[0].path = PathBuf::from("nested\\escape.onnx");
+        assert!(validate_catalog(&catalog).is_err());
+        let mut catalog = parse_catalog(CATALOG_BYTES).unwrap();
+        catalog.bundles[0].repository = "owner/repo%2fescape".to_owned();
+        assert!(validate_catalog(&catalog).is_err());
     }
 
     #[test]
@@ -1389,6 +1711,68 @@ mod tests {
         assert!(acquire_bundle_target(&target).is_err());
         drop(first);
         assert!(acquire_bundle_target(&target).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_lock_remains_exclusive_without_the_in_process_registry() {
+        let root = unique_root("os-lock");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("model");
+        let first = acquire_bundle_target(&target).unwrap();
+        active_bundle_targets()
+            .lock()
+            .unwrap()
+            .remove(&first.identity);
+
+        let error = acquire_bundle_target(&target).unwrap_err();
+        assert!(error.to_string().contains("another process owns"));
+        drop(first);
+        assert!(acquire_bundle_target(&target).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_reservations_are_aggregated_and_released_with_the_guard() {
+        let root = unique_root("reservation-lifetime");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("model");
+        let first = acquire_bundle_disk_reservation(&root, &target, 1).unwrap();
+        let second = acquire_bundle_disk_reservation(&root, &target, 1).unwrap();
+        let reservations = root.join(RESERVATION_DIRECTORY_NAME);
+        let count = || {
+            fs::read_dir(&reservations)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "reservation")
+                })
+                .count()
+        };
+        assert_eq!(count(), 2);
+        drop(first);
+        assert_eq!(count(), 1);
+        drop(second);
+        assert_eq!(count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_reservation_contention_participates_in_aggregate_admission() {
+        let root = unique_root("reservation-contention");
+        let reservations = root.join(RESERVATION_DIRECTORY_NAME);
+        fs::create_dir_all(&reservations).unwrap();
+        let entry = reservations.join("other-process.reservation");
+        fs::write(&entry, format!("{}\n", u64::MAX)).unwrap();
+        let active = OsFileLock::acquire(&entry.with_extension("lock"), false, false).unwrap();
+
+        let error = acquire_bundle_disk_reservation(&root, &root.join("model"), 1).unwrap_err();
+        assert!(error.to_string().contains("overflow"));
+
+        drop(active);
         fs::remove_dir_all(root).unwrap();
     }
 

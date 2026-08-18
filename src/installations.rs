@@ -1010,6 +1010,30 @@ pub(crate) fn pinned_artifact_retained_partial(
     )
 }
 
+/// Computes the bytes that a new request must reserve before touching the
+/// network. Exact completed destinations need no download capacity. Only a
+/// regular, strictly short partial is treated as resumable; full, corrupt, or
+/// oversized partials conservatively reserve a complete replacement.
+pub(crate) fn pinned_artifact_required_download_bytes(
+    artifact: &PinnedArtifact,
+) -> Result<u64, InstallError> {
+    validate_artifact_spec(artifact)?;
+    if artifact_destination_is_regular(&artifact.destination)?
+        && verify_file(&artifact.destination, artifact.size_bytes, &artifact.sha256).is_ok()
+    {
+        return Ok(0);
+    }
+    let partial = partial_path(&artifact.destination)?;
+    let Some(metadata) = partial_file_metadata(&partial)? else {
+        return Ok(artifact.size_bytes);
+    };
+    if metadata.len() < artifact.size_bytes {
+        Ok(artifact.size_bytes - metadata.len())
+    } else {
+        Ok(artifact.size_bytes)
+    }
+}
+
 /// Removes only the resumable sidecar derived from a validated artifact.
 /// The activated destination is deliberately never removed.
 pub(crate) fn discard_pinned_artifact_partial(
@@ -3253,6 +3277,43 @@ mod tests {
         assert_eq!(additional_download_bytes(100, 40).unwrap(), 60);
         assert_eq!(additional_download_bytes(100, 100).unwrap(), 0);
         assert_eq!(additional_download_bytes(100, 101).unwrap(), 100);
+    }
+
+    #[test]
+    fn bundle_download_accounting_distinguishes_cache_partial_and_replacement() {
+        let root = unique_root("bundle-accounting");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete artifact";
+        let spec = artifact(&root, bytes);
+
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64
+        );
+        fs::write(partial_path(&spec.destination).unwrap(), &bytes[..5]).unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            (bytes.len() - 5) as u64
+        );
+        fs::write(partial_path(&spec.destination).unwrap(), bytes).unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64,
+            "a full partial reserves a clean replacement"
+        );
+        fs::write(
+            partial_path(&spec.destination).unwrap(),
+            b"oversized invalid partial",
+        )
+        .unwrap();
+        assert_eq!(
+            pinned_artifact_required_download_bytes(&spec).unwrap(),
+            bytes.len() as u64
+        );
+        fs::write(&spec.destination, bytes).unwrap();
+        assert_eq!(pinned_artifact_required_download_bytes(&spec).unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
