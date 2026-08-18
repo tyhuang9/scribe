@@ -38,6 +38,7 @@ pub use crate::model_catalog::{
     CompatibilityStatus, ModelCapabilities, ModelDescriptor, ModelRole,
 };
 use crate::models::{SttModelInfo, TranscriptResult as LegacyTranscriptResult};
+use crate::onnx_worker::OnnxModelSpec;
 use crate::prepared_audio::{PREPARED_SAMPLE_RATE, PreparedAudio};
 use crate::runtime_router::{
     IdleTimeoutAction, NativeBootstrapFailure, RuntimeArtifact, RuntimeError, RuntimeExecution,
@@ -54,6 +55,14 @@ const INSTALL_SMOKE_HELPER_FLAG: &str = "--scribe-install-smoke";
 const INSTALL_SMOKE_PARENT_FLAG: &str = "--scribe-install-smoke-parent";
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+fn preserve_primary_smoke_error<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Err(primary), _) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
 
 /// Identifies one user dictation session.
 ///
@@ -340,6 +349,36 @@ pub(crate) struct InstallSmoke {
     pub(crate) load_duration_ms: u128,
     pub(crate) decode_duration_ms: u128,
     pub(crate) reload_duration_ms: u128,
+}
+
+/// Unforgeable outside this module: only the real `TranscriptionService`
+/// smoke path can create the witness consumed by `StagedOnnxBundle`.
+pub(crate) struct VerifiedOnnxBundleSmoke {
+    root: PathBuf,
+    receipt: crate::onnx_model_bundles::OnnxBundleReceipt,
+    spec: OnnxModelSpec,
+    cancellation: InstallCancellation,
+    smoke: InstallSmoke,
+}
+
+impl VerifiedOnnxBundleSmoke {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        crate::onnx_model_bundles::OnnxBundleReceipt,
+        OnnxModelSpec,
+        InstallCancellation,
+        InstallSmoke,
+    ) {
+        (
+            self.root,
+            self.receipt,
+            self.spec,
+            self.cancellation,
+            self.smoke,
+        )
+    }
 }
 
 /// Single-use installation evidence sealed by the isolated verifier and bound
@@ -1060,11 +1099,12 @@ impl TranscriptionService {
         self.worker.unload().map_err(Into::into)
     }
 
-    /// Resolves a private installed ONNX bundle solely from its durable exact
-    /// receipt. This path is local-only and intentionally bypasses public
-    /// model descriptors, settings, and dynamic catalog discovery.
+    /// Resolves a private installed ONNX bundle from its durable exact receipt
+    /// only when that receipt still equals a currently embedded available
+    /// manifest. This path is local-only and never grants a self-authored or
+    /// retired receipt executable trust.
     fn onnx_artifact_from_receipt(&self, root: &Path) -> Result<RuntimeArtifact> {
-        let (_, spec) = crate::onnx_model_bundles::verified_receipt_at(root)
+        let (_, spec) = crate::onnx_model_bundles::current_executable_receipt_at(root)
             .map_err(|error| anyhow!("installed ONNX bundle verification failed: {error}"))?;
         Ok(RuntimeArtifact::OnnxBundle(spec))
     }
@@ -1090,11 +1130,37 @@ impl TranscriptionService {
     /// support or evidence.
     pub(crate) fn verify_onnx_bundle_for_installation(
         &self,
-        root: &Path,
+        staged: crate::onnx_model_bundles::StagedOnnxBundle,
+        cancellation: &InstallCancellation,
+    ) -> Result<crate::onnx_model_bundles::VerifiedStagedOnnxBundle> {
+        ensure_install_not_cancelled(cancellation)?;
+        let root = staged.root().to_path_buf();
+        let (receipt, spec) = crate::onnx_model_bundles::current_executable_receipt_at(&root)
+            .map_err(|error| anyhow!("staged ONNX bundle verification failed: {error}"))?;
+        if staged.receipt() != &receipt || staged.spec() != &spec {
+            return Err(anyhow!(
+                "staged ONNX bundle changed before service smoke verification"
+            ));
+        }
+        let artifact = RuntimeArtifact::OnnxBundle(spec.clone());
+        let smoke = self.verify_onnx_artifact_smoke(artifact, cancellation)?;
+        ensure_install_not_cancelled(cancellation)?;
+        staged
+            .bind_verified(VerifiedOnnxBundleSmoke {
+                root,
+                receipt,
+                spec,
+                cancellation: cancellation.clone(),
+                smoke,
+            })
+            .map_err(Into::into)
+    }
+
+    fn verify_onnx_artifact_smoke(
+        &self,
+        artifact: RuntimeArtifact,
         cancellation: &InstallCancellation,
     ) -> Result<InstallSmoke> {
-        ensure_install_not_cancelled(cancellation)?;
-        let artifact = self.onnx_artifact_from_receipt(root)?;
         let preference = AccelerationPreference::Cpu;
 
         let health_started = Instant::now();
@@ -1112,36 +1178,44 @@ impl TranscriptionService {
         let load_duration_ms = load_started.elapsed().as_millis();
         ensure_install_not_cancelled(cancellation)?;
 
-        let audio = Arc::new(PreparedAudio::from_captured_mono(
-            vec![0.0; PREPARED_SAMPLE_RATE as usize],
-            PREPARED_SAMPLE_RATE,
-            1,
-            PREPARED_SAMPLE_RATE as usize,
-        )?);
-        let decode_started = Instant::now();
-        self.worker
-            .transcribe(
-                artifact.clone(),
-                preference,
-                audio,
-                TranscriptionOptions::default(),
-                self.router.cancellation_snapshot(),
-            )
-            .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
-        let decode_duration_ms = decode_started.elapsed().as_millis();
-        ensure_install_not_cancelled(cancellation)?;
-
-        self.worker
+        let decode_result = (|| {
+            ensure_install_not_cancelled(cancellation)?;
+            let audio = Arc::new(PreparedAudio::from_captured_mono(
+                vec![0.0; PREPARED_SAMPLE_RATE as usize],
+                PREPARED_SAMPLE_RATE,
+                1,
+                PREPARED_SAMPLE_RATE as usize,
+            )?);
+            let decode_started = Instant::now();
+            self.worker
+                .transcribe(
+                    artifact.clone(),
+                    preference,
+                    audio,
+                    TranscriptionOptions::default(),
+                    self.router.cancellation_snapshot(),
+                )
+                .map_err(|error| anyhow!("staged ONNX bundle decode smoke failed: {error}"))?;
+            ensure_install_not_cancelled(cancellation)?;
+            Ok(decode_started.elapsed().as_millis())
+        })();
+        let unload_result = self
+            .worker
             .unload()
-            .map_err(|error| anyhow!("staged ONNX bundle unload failed: {error}"))?;
+            .map_err(|error| anyhow!("staged ONNX bundle unload failed: {error}"));
+        let decode_duration_ms = preserve_primary_smoke_error(decode_result, unload_result)?;
+
         let reload_started = Instant::now();
         self.worker
             .load(artifact, preference)
             .map_err(|error| anyhow!("staged ONNX bundle reload failed: {error}"))?;
         let reload_duration_ms = reload_started.elapsed().as_millis();
-        self.worker
+        let reload_result = ensure_install_not_cancelled(cancellation);
+        let unload_result = self
+            .worker
             .unload()
-            .map_err(|error| anyhow!("staged ONNX bundle final unload failed: {error}"))?;
+            .map_err(|error| anyhow!("staged ONNX bundle final unload failed: {error}"));
+        preserve_primary_smoke_error(reload_result, unload_result)?;
 
         Ok(InstallSmoke {
             resolved_acceleration: load.diagnostics.resolved_acceleration,
@@ -2701,6 +2775,7 @@ mod tests {
         batch_started: bool,
         block_batch: bool,
         batch_cancelled: bool,
+        cancel_install_on_transcribe: Option<InstallCancellation>,
     }
 
     #[derive(Default)]
@@ -2727,6 +2802,10 @@ mod tests {
 
         fn fail_transcribe(&self) {
             self.state.lock().unwrap().fail_transcribe = true;
+        }
+
+        fn cancel_install_on_transcribe(&self, cancellation: InstallCancellation) {
+            self.state.lock().unwrap().cancel_install_on_transcribe = Some(cancellation);
         }
     }
 
@@ -2762,6 +2841,9 @@ mod tests {
         ) -> anyhow::Result<String> {
             let mut state = self.state.lock().unwrap();
             state.transcribe_calls += 1;
+            if let Some(cancellation) = state.cancel_install_on_transcribe.take() {
+                cancellation.cancel();
+            }
             if state.fail_transcribe {
                 state.loaded = None;
                 anyhow::bail!("deterministic ONNX transcribe failure");
@@ -3013,17 +3095,17 @@ mod tests {
         crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
         let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
 
-        let load = service.preload_onnx_bundle_from_receipt(&root).unwrap();
-        let execution = service
-            .transcribe_onnx_bundle_from_receipt(
-                &root,
-                prepared_audio(),
-                TranscriptionOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(load.detected_architecture, "online-transducer");
-        assert_eq!(execution.transcript.text, "neutral fake transcript");
-        assert_eq!(control.state.lock().unwrap().transcribe_calls, 1);
+        assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
+        assert!(
+            service
+                .transcribe_onnx_bundle_from_receipt(
+                    &root,
+                    prepared_audio(),
+                    TranscriptionOptions::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(control.state.lock().unwrap().transcribe_calls, 0);
 
         fs::write(root.join("unexpected.onnx"), b"unexpected").unwrap();
         assert!(service.preload_onnx_bundle_from_receipt(&root).is_err());
@@ -3038,7 +3120,10 @@ mod tests {
         crate::onnx_model_bundles::write_test_receipt_for_spec(&spec).unwrap();
         let (service, control, _) = onnx_test_service(AccelerationPreference::Gpu);
         let smoke = service
-            .verify_onnx_bundle_for_installation(&root, &InstallCancellation::default())
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -3052,6 +3137,48 @@ mod tests {
         assert_eq!(state.health_calls, 1);
         assert_eq!(state.transcribe_calls, 1);
         assert_eq!(state.load_calls, 4);
+        drop(state);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_after_decode_failure_and_preserves_primary_error() {
+        let (root, spec) = onnx_spec("smoke-decode-failure", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        control.fail_transcribe();
+
+        let error = service
+            .verify_onnx_artifact_smoke(
+                RuntimeArtifact::OnnxBundle(spec),
+                &InstallCancellation::default(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("decode smoke failed"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.unload_calls, 1);
+        assert!(state.loaded.is_none());
+        drop(state);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_onnx_smoke_unloads_when_install_is_cancelled_during_decode() {
+        let (root, spec) = onnx_spec("smoke-cancel", OnnxModelFamily::OnlineTransducer);
+        let (service, control, _) = onnx_test_service(AccelerationPreference::Cpu);
+        let cancellation = InstallCancellation::default();
+        control.cancel_install_on_transcribe(cancellation.clone());
+
+        let error = service
+            .verify_onnx_artifact_smoke(RuntimeArtifact::OnnxBundle(spec), &cancellation)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.unload_calls, 1);
+        assert!(state.loaded.is_none());
         drop(state);
         drop(service);
         fs::remove_dir_all(root).unwrap();
@@ -3085,11 +3212,14 @@ mod tests {
         let mut config = AppConfig::default();
         config.performance.acceleration_preference = AccelerationPreference::Cpu;
         let service = TranscriptionService::new(config);
-        let smoke = service
-            .verify_onnx_bundle_for_installation(staged.root(), &cancellation)
+        let verified = service
+            .verify_onnx_bundle_for_installation(staged, &cancellation)
             .unwrap();
-        assert_eq!(smoke.resolved_acceleration.resolved, ComputeDevice::Cpu);
-        let activated = staged.activate(&cancellation).unwrap();
+        assert_eq!(
+            verified.smoke().resolved_acceleration.resolved,
+            ComputeDevice::Cpu
+        );
+        let activated = verified.activate().unwrap();
         let installed_root = activated.spec().root.clone();
         activated.commit().unwrap();
         let audio = Arc::new(PreparedAudio::from_wav_path(audio_path).unwrap());
