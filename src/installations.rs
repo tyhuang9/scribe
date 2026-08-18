@@ -1700,6 +1700,7 @@ fn stable_staging_path(target_root: &Path) -> Result<PathBuf, InstallError> {
     Ok(target_root.with_file_name(format!(".{name}.installing")))
 }
 
+#[cfg(test)]
 pub(crate) fn file_bundle_staging_root(target_root: &Path) -> Result<PathBuf, InstallError> {
     stable_staging_path(target_root)
 }
@@ -2011,6 +2012,7 @@ pub(crate) fn verify_runtime_tree(
     root: &Path,
     files: &[RuntimeFileSpec],
 ) -> Result<(), InstallError> {
+    reject_link_or_reparse_ancestors(root)?;
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| failed(format!("failed to inspect {}: {error}", root.display())))?;
     if runtime_metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
@@ -4691,6 +4693,34 @@ mod tests {
         let error = verify_runtime_tree(&linked, &files).unwrap_err();
 
         assert!(error.to_string().contains("symbolic link/reparse point"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_tree_rejects_a_linked_or_reparse_ancestor() {
+        let root = unique_root("runtime-ancestor-link");
+        let external = root.join("external");
+        let linked_parent = root.join("linked-parent");
+        let package = external.join("runtime");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("runtime.dll"), b"runtime").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &linked_parent).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&external, &linked_parent).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let files = [RuntimeFileSpec {
+            archive_path: PathBuf::from("runtime.dll"),
+            install_path: PathBuf::from("runtime.dll"),
+            size_bytes: 7,
+            sha256: format!("{:x}", Sha256::digest(b"runtime")),
+        }];
+
+        let error = verify_runtime_tree(&linked_parent.join("runtime"), &files).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link, reparse point"));
         fs::remove_dir_all(root).unwrap();
     }
 

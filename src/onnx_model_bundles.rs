@@ -894,6 +894,13 @@ pub(crate) fn discard_onnx_bundle_partials(
     Ok(discarded)
 }
 
+/// Pause is represented by the downloader's cancellation token. Any current
+/// file is synced before return and its exact resumable partial is retained;
+/// already completed revision-cache files are also left intact.
+pub(crate) fn pause_onnx_bundle_install(cancellation: &InstallCancellation) {
+    cancellation.cancel();
+}
+
 fn validate_receipt(receipt: &OnnxBundleReceipt) -> Result<(), InstallError> {
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION
         || receipt.manifest_schema_version != CATALOG_SCHEMA_VERSION
@@ -1342,6 +1349,13 @@ mod tests {
         assert!(!stale.exists());
         assert!(!target.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pause_uses_the_resumable_cancellation_state() {
+        let cancellation = InstallCancellation::default();
+        pause_onnx_bundle_install(&cancellation);
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]

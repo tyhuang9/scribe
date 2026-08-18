@@ -328,15 +328,37 @@ fn reject_link_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
-        if current.exists()
-            && std::fs::symlink_metadata(&current)?
-                .file_type()
-                .is_symlink()
-        {
-            bail!("ONNX path contains a symbolic link: {}", current.display());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
+                bail!(
+                    "ONNX path contains a symbolic link or reparse point: {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
