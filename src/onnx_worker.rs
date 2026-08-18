@@ -3363,6 +3363,9 @@ mod tests {
             end_stream: bool,
             started: TestSender<()>,
         },
+        AbandonStream {
+            completed: TestSender<()>,
+        },
         HoldOne {
             started: TestSender<()>,
             release: TestReceiver<()>,
@@ -3655,6 +3658,19 @@ mod tests {
                 }
                 started.send(()).unwrap();
                 let _ = read_frame(&mut input);
+            }
+            TestMode::AbandonStream { completed } => {
+                let (session_id, request_id, control) = read_parent_control(&mut input);
+                assert!(matches!(control, Control::StartStream));
+                respond(&mut output, session_id, request_id, Control::Ok);
+                let error = read_frame(&mut input).expect_err("abandon must close the fake pipe");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::UnexpectedEof)
+                );
+                completed.send(()).unwrap();
             }
             TestMode::HoldOne { started, release } => {
                 let (session_id, request_id, control) = read_parent_control(&mut input);
@@ -5528,12 +5544,11 @@ mod tests {
     #[test]
     fn abandoning_stream_returns_without_waiting_for_worker_io() {
         let (kill_started_tx, kill_started_rx) = channel();
-        let (reaped_tx, _reaped_rx) = channel();
-        let (operation_started_tx, _operation_started_rx) = channel();
+        let (reaped_tx, reaped_rx) = channel();
+        let (completed_tx, completed_rx) = channel();
         let launcher = Arc::new(
-            TestLauncher::new([TestMode::BlockedStreamOperation {
-                end_stream: false,
-                started: operation_started_tx,
+            TestLauncher::new([TestMode::AbandonStream {
+                completed: completed_tx,
             }])
             .with_process_events(kill_started_tx, reaped_tx),
         );
@@ -5545,6 +5560,12 @@ mod tests {
         kill_started_rx
             .recv_timeout(Duration::from_millis(250))
             .unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("the fake worker must treat abandon EOF as clean termination");
+        reaped_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("the abandoned fake worker must be joined");
     }
 
     #[test]
