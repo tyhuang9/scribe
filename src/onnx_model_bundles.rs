@@ -39,7 +39,7 @@ const RECEIPT_SCHEMA_VERSION: u16 = 1;
 const RECEIPT_FILE_NAME: &str = "install-receipt.json";
 const NOTICE_FILE_NAME: &str = "NOTICE.txt";
 const LOCK_DIRECTORY_NAME: &str = ".onnx-bundle-locks";
-const RESERVATION_DIRECTORY_NAME: &str = ".onnx-bundle-reservations";
+const RESERVATION_CONTROL_DIRECTORY_NAME: &str = "onnx-bundle-volume-reservations";
 const APACHE_2_LICENSE_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/licenses/Apache-2.0.txt"
@@ -587,7 +587,7 @@ fn acquire_bundle_target(target: &Path) -> Result<BundleTargetGuard, InstallErro
     let lock_path = storage_root
         .join(LOCK_DIRECTORY_NAME)
         .join(format!("{target_name}.lock"));
-    let process_lock = match OsFileLock::acquire(&lock_path, false, false) {
+    let process_lock = match OsFileLock::acquire(&lock_path, false) {
         Ok(lock) => lock,
         Err(error) => {
             active_bundle_targets()
@@ -606,13 +606,10 @@ fn acquire_bundle_target(target: &Path) -> Result<BundleTargetGuard, InstallErro
 #[derive(Debug)]
 struct OsFileLock {
     file: File,
-    path: PathBuf,
-    remove_on_drop: bool,
-    additional_remove_on_drop: Option<PathBuf>,
 }
 
 impl OsFileLock {
-    fn acquire(path: &Path, wait: bool, remove_on_drop: bool) -> Result<Self, InstallError> {
+    fn acquire(path: &Path, wait: bool) -> Result<Self, InstallError> {
         let parent = path
             .parent()
             .ok_or_else(|| failed(format!("lock path {} has no parent", path.display())))?;
@@ -638,12 +635,7 @@ impl OsFileLock {
                 path.display()
             )));
         }
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            remove_on_drop,
-            additional_remove_on_drop: None,
-        })
+        Ok(Self { file })
     }
 }
 
@@ -686,30 +678,72 @@ fn verify_open_lock_file(file: &File, path: &Path) -> Result<(), InstallError> {
 
 impl Drop for OsFileLock {
     fn drop(&mut self) {
-        if self.remove_on_drop {
-            if let Some(path) = &self.additional_remove_on_drop {
-                let _ = fs::remove_file(path);
-            }
-            let _ = unlock_file(&self.file);
-            let _ = fs::remove_file(&self.path);
-        } else {
-            let _ = unlock_file(&self.file);
-        }
+        let _ = unlock_file(&self.file);
     }
 }
 
 #[derive(Debug)]
 struct BundleDiskReservation {
-    _reserved_bytes: u64,
-    _entry_lock: OsFileLock,
+    _requested_bytes: u64,
+    reservation_root: PathBuf,
+    entry_path: PathBuf,
+    entry_lock: Option<OsFileLock>,
+}
+
+impl Drop for BundleDiskReservation {
+    fn drop(&mut self) {
+        let ledger_path = self.reservation_root.join("ledger.lock");
+        let Ok(_ledger) = OsFileLock::acquire(&ledger_path, false) else {
+            // Unlock the entry but leave both paths for the next ledger owner
+            // to prune. Release never mutates a live ledger without owning it.
+            self.entry_lock.take();
+            return;
+        };
+        match fs::remove_file(&self.entry_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                self.entry_lock.take();
+                return;
+            }
+        }
+        self.entry_lock.take();
+        let lock_path = self.entry_path.with_extension("lock");
+        match fs::remove_file(lock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
 }
 
 fn acquire_bundle_disk_reservation(
-    storage_root: &Path,
     target: &Path,
     requested_bytes: u64,
 ) -> Result<BundleDiskReservation, InstallError> {
-    let reservation_root = storage_root.join(RESERVATION_DIRECTORY_NAME);
+    let control_root = crate::config::cache_dir()
+        .map_err(|error| {
+            failed(format!(
+                "could not resolve Scribe cache directory: {error:#}"
+            ))
+        })?
+        .join(RESERVATION_CONTROL_DIRECTORY_NAME);
+    acquire_bundle_disk_reservation_with_control_root(&control_root, target, requested_bytes)
+}
+
+fn volume_reservation_root(control_root: &Path, volume: &str) -> PathBuf {
+    let volume_key = format!("{:x}", Sha256::digest(volume.as_bytes()));
+    control_root.join(volume_key)
+}
+
+fn acquire_bundle_disk_reservation_with_control_root(
+    control_root: &Path,
+    target: &Path,
+    requested_bytes: u64,
+) -> Result<BundleDiskReservation, InstallError> {
+    let initial_preflight =
+        disk_space::preflight_download_destination(target, 0).map_err(InstallError::Failed)?;
+    let reservation_root = volume_reservation_root(control_root, &initial_preflight.volume);
     fs::create_dir_all(&reservation_root).map_err(|error| {
         failed(format!(
             "could not create ONNX bundle reservation directory {}: {error}",
@@ -717,7 +751,7 @@ fn acquire_bundle_disk_reservation(
         ))
     })?;
     verify_regular_directory_root(&reservation_root)?;
-    let _ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), true, false)?;
+    let _ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), true)?;
     let mut active_reserved_bytes = 0_u64;
     for entry in fs::read_dir(&reservation_root).map_err(|error| {
         failed(format!(
@@ -725,9 +759,11 @@ fn acquire_bundle_disk_reservation(
             reservation_root.display()
         ))
     })? {
-        let path = entry
-            .map_err(|error| failed(format!("could not read reservation entry: {error}")))?
-            .path();
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(failed(format!("could not read reservation entry: {error}"))),
+        };
         if path.file_name().and_then(|name| name.to_str()) == Some("ledger.lock") {
             continue;
         }
@@ -756,6 +792,16 @@ fn acquire_bundle_disk_reservation(
             let _ = fs::remove_file(&lock_path);
             continue;
         }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(failed(format!(
+                    "could not inspect active ONNX bundle reservation {}: {error}",
+                    path.display()
+                )));
+            }
+        }
         let bytes = read_regular_file_no_follow(&path, 64)?;
         let contents = std::str::from_utf8(&bytes).map_err(|_| {
             failed(format!(
@@ -778,15 +824,17 @@ fn acquire_bundle_disk_reservation(
         .ok_or_else(|| failed("aggregate ONNX bundle disk requirement overflowed"))?;
     let preflight = disk_space::preflight_download_destination(target, aggregate_request)
         .map_err(InstallError::Failed)?;
+    if preflight.volume != initial_preflight.volume {
+        return Err(failed(
+            "ONNX bundle target changed physical volume during reservation admission",
+        ));
+    }
     if !preflight.has_sufficient_space() {
         return Err(failed(format!(
             "insufficient unreserved free space on {}: {} bytes are available but {} bytes are required across active ONNX bundle installs",
             preflight.volume, preflight.available_bytes, preflight.required_bytes
         )));
     }
-    let reserved_bytes = requested_bytes
-        .checked_add(disk_space::SAFETY_HEADROOM_BYTES)
-        .ok_or_else(|| failed("ONNX bundle reservation headroom overflowed"))?;
     let mut attempt = 0_u32;
     let (path, mut file) = loop {
         let path = reservation_root.join(format!(
@@ -815,7 +863,7 @@ fn acquire_bundle_disk_reservation(
             }
         }
     };
-    writeln!(file, "{reserved_bytes}").map_err(|error| {
+    writeln!(file, "{requested_bytes}").map_err(|error| {
         failed(format!(
             "could not write ONNX bundle reservation {}: {error}",
             path.display()
@@ -834,11 +882,12 @@ fn acquire_bundle_disk_reservation(
         ))
     })?;
     let lock_path = path.with_extension("lock");
-    let mut entry_lock = OsFileLock::acquire(&lock_path, false, true)?;
-    entry_lock.additional_remove_on_drop = Some(path);
+    let entry_lock = OsFileLock::acquire(&lock_path, false)?;
     Ok(BundleDiskReservation {
-        _reserved_bytes: reserved_bytes,
-        _entry_lock: entry_lock,
+        _requested_bytes: requested_bytes,
+        reservation_root,
+        entry_path: path,
+        entry_lock: Some(entry_lock),
     })
 }
 
@@ -1277,8 +1326,7 @@ pub(crate) fn stage_onnx_bundle_install(
     let target_guard = acquire_bundle_target(&target_root)?;
     let artifacts = pinned_files(storage_root, manifest)?;
     let required_bytes = bundle_required_install_bytes(manifest, &artifacts)?;
-    let disk_reservation =
-        acquire_bundle_disk_reservation(storage_root, &target_root, required_bytes)?;
+    let disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
             .checked_add(artifact.size_bytes)
@@ -1359,6 +1407,8 @@ pub(crate) fn discard_onnx_bundle_partials(
 ) -> Result<u64, InstallError> {
     let manifest = bundle_manifest(model_id)
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
+    let target_root = bundle_target_root(storage_root, model_id)?;
+    let _target_guard = acquire_bundle_target(&target_root)?;
     let mut discarded = 0_u64;
     for artifact in pinned_files(storage_root, manifest)? {
         if discard_pinned_artifact_partial(&artifact)? {
@@ -1532,6 +1582,7 @@ pub(crate) fn current_executable_receipt_at(
 }
 
 pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<bool, InstallError> {
+    let _target_guard = acquire_bundle_target(target_root)?;
     let previous = crate::installations::previous_runtime_root(target_root);
     if !previous.exists() {
         return Ok(false);
@@ -1856,10 +1907,40 @@ mod tests {
         let previous = crate::installations::previous_runtime_root(&target);
         write_fixture_bundle(&previous, "retired-moonshine-build", "retired");
 
+        let guard = acquire_bundle_target(&target).unwrap();
+        assert!(rollback_to_previous_onnx_bundle(&target).is_err());
+        assert!(previous.exists());
+        drop(guard);
         assert!(rollback_to_previous_onnx_bundle(&target).is_err());
         assert!(previous.exists());
         assert!(verified_receipt_at(&previous).is_ok());
         assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_discard_uses_the_target_mutation_guard() {
+        let root = unique_root("discard-guard");
+        fs::create_dir_all(&root).unwrap();
+        let model_id = "moonshine-tiny-en-int8-onnx";
+        let artifact = pinned_files(&root, bundle_manifest(model_id).unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::create_dir_all(artifact.destination.parent().unwrap()).unwrap();
+        let mut partial_name = artifact.destination.file_name().unwrap().to_os_string();
+        partial_name.push(".partial");
+        let partial = artifact.destination.with_file_name(partial_name);
+        fs::write(&partial, b"retained").unwrap();
+        let target = bundle_target_root(&root, model_id).unwrap();
+        let guard = acquire_bundle_target(&target).unwrap();
+
+        assert!(discard_onnx_bundle_partials(model_id, &root).is_err());
+        assert!(partial.exists());
+        drop(guard);
+        assert_eq!(discard_onnx_bundle_partials(model_id, &root).unwrap(), 1);
+        assert!(!partial.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1959,11 +2040,37 @@ mod tests {
     #[test]
     fn disk_reservations_are_aggregated_and_released_with_the_guard() {
         let root = unique_root("reservation-lifetime");
-        fs::create_dir_all(&root).unwrap();
-        let target = root.join("model");
-        let first = acquire_bundle_disk_reservation(&root, &target, 1).unwrap();
-        let second = acquire_bundle_disk_reservation(&root, &target, 1).unwrap();
-        let reservations = root.join(RESERVATION_DIRECTORY_NAME);
+        let control = root.join("control");
+        let first_storage = root.join("first-storage");
+        let second_storage = root.join("second-storage");
+        fs::create_dir_all(&first_storage).unwrap();
+        fs::create_dir_all(&second_storage).unwrap();
+        let first = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &first_storage.join("model"),
+            7,
+        )
+        .unwrap();
+        let second = acquire_bundle_disk_reservation_with_control_root(
+            &control,
+            &second_storage.join("other-model"),
+            11,
+        )
+        .unwrap();
+        assert_eq!(first.reservation_root, second.reservation_root);
+        assert_eq!(first._requested_bytes, 7);
+        assert_eq!(second._requested_bytes, 11);
+        assert_eq!(fs::read_to_string(&first.entry_path).unwrap().trim(), "7");
+        assert_eq!(fs::read_to_string(&second.entry_path).unwrap().trim(), "11");
+        let exact =
+            disk_space::preflight_download_destination(&first_storage.join("model"), 18).unwrap();
+        assert_eq!(exact.additional_bytes, 18);
+        assert_eq!(
+            exact.required_bytes,
+            18 + disk_space::SAFETY_HEADROOM_BYTES,
+            "one shared headroom floor is added after aggregating live requested bytes"
+        );
+        let reservations = first.reservation_root.clone();
         let count = || {
             fs::read_dir(&reservations)
                 .unwrap()
@@ -1987,16 +2094,67 @@ mod tests {
     #[test]
     fn active_reservation_contention_participates_in_aggregate_admission() {
         let root = unique_root("reservation-contention");
-        let reservations = root.join(RESERVATION_DIRECTORY_NAME);
+        let control = root.join("control");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("model");
+        let volume = disk_space::preflight_download_destination(&target, 0)
+            .unwrap()
+            .volume;
+        let reservations = volume_reservation_root(&control, &volume);
         fs::create_dir_all(&reservations).unwrap();
         let entry = reservations.join("other-process.reservation");
         fs::write(&entry, format!("{}\n", u64::MAX)).unwrap();
-        let active = OsFileLock::acquire(&entry.with_extension("lock"), false, false).unwrap();
+        let active = OsFileLock::acquire(&entry.with_extension("lock"), false).unwrap();
 
-        let error = acquire_bundle_disk_reservation(&root, &root.join("model"), 1).unwrap_err();
+        let error =
+            acquire_bundle_disk_reservation_with_control_root(&control, &target, 1).unwrap_err();
         assert!(error.to_string().contains("overflow"));
 
         drop(active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn contended_ledger_defers_release_and_next_owner_prunes_the_stale_entry() {
+        let root = unique_root("reservation-release-interleave");
+        let control = root.join("control");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("model");
+        let reservation =
+            acquire_bundle_disk_reservation_with_control_root(&control, &target, 13).unwrap();
+        let reservation_root = reservation.reservation_root.clone();
+        let entry_path = reservation.entry_path.clone();
+        let entry_lock_path = entry_path.with_extension("lock");
+        let ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), false).unwrap();
+
+        drop(reservation);
+        assert!(entry_path.exists());
+        assert!(entry_lock_path.exists());
+        let stale_is_unlocked = OsFileLock::acquire(&entry_lock_path, false).unwrap();
+        drop(stale_is_unlocked);
+        drop(ledger);
+
+        let replacement =
+            acquire_bundle_disk_reservation_with_control_root(&control, &target, 17).unwrap();
+        assert_eq!(
+            fs::read_to_string(&replacement.entry_path).unwrap().trim(),
+            "17"
+        );
+        assert_eq!(
+            fs::read_dir(&reservation_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|value| value == "reservation")
+                })
+                .count(),
+            1,
+            "the stale reservation is pruned before the replacement is recorded"
+        );
+        drop(replacement);
         fs::remove_dir_all(root).unwrap();
     }
 
