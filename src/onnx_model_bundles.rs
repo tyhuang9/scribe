@@ -19,13 +19,13 @@ use sha2::{Digest, Sha256};
 use crate::disk_space::{self, CanonicalTargetIdentity, DiskSpacePreflight};
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
-    InstallError, InstallProgress, PinnedArtifact, RuntimeFileSpec, StagedRuntime,
-    directory_activation_rollback_root, discard_file_bundle_staging,
+    InstallError, InstallProgress, PinnedArtifact, PinnedArtifactInspectionPlan, RuntimeFileSpec,
+    StagedRuntime, directory_activation_rollback_root, discard_file_bundle_staging,
     discard_pinned_artifact_partial, download_pinned_artifact_for_target,
-    path_entry_exists_no_follow, pinned_artifact_required_download_bytes,
-    read_regular_file_no_follow, restore_interrupted_directory_replacement,
-    retain_interrupted_directory_replacement, rollback_to_previous_runtime,
-    stage_file_bundle_for_target, verify_regular_directory_root, verify_runtime_tree,
+    inspect_pinned_artifact_for_target, path_entry_exists_no_follow, read_regular_file_no_follow,
+    restore_interrupted_directory_replacement, retain_interrupted_directory_replacement,
+    rollback_to_previous_runtime, stage_file_bundle_for_target, verify_regular_directory_root,
+    verify_runtime_tree,
 };
 use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
 use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
@@ -1278,22 +1278,23 @@ pub(crate) fn bundle_disk_space_preflight(
     let manifest = bundle_manifest(model_id)
         .ok_or_else(|| failed(format!("unknown internal ONNX bundle {model_id}")))?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let additional = bundle_required_install_bytes(manifest, &artifacts)?;
+    let inspections = inspect_bundle_artifacts(&artifacts)?;
+    let additional = bundle_required_install_bytes(manifest, &inspections)?;
     let target = bundle_target_root(storage_root, model_id)?;
     disk_space::preflight_download_destination(&target, additional).map_err(InstallError::Failed)
 }
 
 fn bundle_required_install_bytes(
     manifest: &OnnxBundleManifest,
-    artifacts: &[PinnedArtifact],
+    inspections: &[(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)],
 ) -> Result<u64, InstallError> {
     let mut additional = manifest.files.iter().try_fold(0_u64, |total, file| {
         total
             .checked_add(file.size_bytes)
             .ok_or_else(|| failed("ONNX bundle expanded-size requirement overflowed"))
     })?;
-    for artifact in artifacts {
-        let remaining = pinned_artifact_required_download_bytes(artifact)?;
+    for (_, inspection) in inspections {
+        let remaining = inspection.required_download_bytes();
         additional = additional
             .checked_add(remaining)
             .ok_or_else(|| failed("ONNX bundle download-space requirement overflowed"))?;
@@ -1311,6 +1312,20 @@ fn bundle_required_install_bytes(
     Ok(additional)
 }
 
+fn inspect_bundle_artifacts(
+    artifacts: &[PinnedArtifact],
+) -> Result<Vec<(CanonicalTargetIdentity, PinnedArtifactInspectionPlan)>, InstallError> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            let identity = disk_space::canonical_target_identity(&artifact.destination)
+                .map_err(InstallError::Failed)?;
+            let inspection = inspect_pinned_artifact_for_target(artifact, &identity)?;
+            Ok((identity, inspection))
+        })
+        .collect()
+}
+
 /// The sole production entry point that may contact Hugging Face for an ONNX
 /// bundle. Catalog reads, installed receipt reads, startup resolution, and
 /// rollback validation are all local-only operations.
@@ -1325,7 +1340,8 @@ pub(crate) fn stage_onnx_bundle_install(
     let target_root = bundle_target_root(storage_root, model_id)?;
     let target_guard = acquire_bundle_target(&target_root)?;
     let artifacts = pinned_files(storage_root, manifest)?;
-    let required_bytes = bundle_required_install_bytes(manifest, &artifacts)?;
+    let inspections = inspect_bundle_artifacts(&artifacts)?;
+    let required_bytes = bundle_required_install_bytes(manifest, &inspections)?;
     let disk_reservation = acquire_bundle_disk_reservation(&target_root, required_bytes)?;
     let total_download_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
         total
@@ -1334,9 +1350,9 @@ pub(crate) fn stage_onnx_bundle_install(
     })?;
     let mut completed_before = 0_u64;
     let mut assembly_files = Vec::with_capacity(artifacts.len());
-    for (artifact, file) in artifacts.iter().zip(&manifest.files) {
-        let identity = disk_space::canonical_target_identity(&artifact.destination)
-            .map_err(InstallError::Failed)?;
+    for ((artifact, file), (identity, inspection)) in
+        artifacts.iter().zip(&manifest.files).zip(inspections)
+    {
         let base = completed_before;
         let aggregate_progress = |event: InstallProgress| {
             progress(InstallProgress {
@@ -1349,6 +1365,7 @@ pub(crate) fn stage_onnx_bundle_install(
         let downloaded = download_pinned_artifact_for_target(
             artifact,
             &identity,
+            Some(inspection),
             cancellation,
             &aggregate_progress,
         )?;
