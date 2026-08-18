@@ -3,7 +3,8 @@
 //! This module is deliberately below `TranscriptionService`. The embedded
 //! manifest is the only authority allowed to initiate a remote installation;
 //! installed receipts remain self-contained so retired bundles can still be
-//! verified and opened without catalog or network access.
+//! verified and inventoried without catalog or network access. Executing or
+//! activating a bundle additionally requires the current embedded catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +26,7 @@ use crate::installations::{
     verify_runtime_tree,
 };
 use crate::onnx_worker::{OnnxFileRole, OnnxModelFamily, OnnxModelSpec};
+use crate::transcription::{InstallSmoke, VerifiedOnnxBundleSmoke};
 
 const CATALOG_BYTES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -545,12 +547,50 @@ impl StagedOnnxBundle {
         &self.spec
     }
 
-    pub(crate) fn activate(
+    pub(crate) fn bind_verified(
         self,
-        cancellation: &InstallCancellation,
-    ) -> Result<ActivatedOnnxBundle, InstallError> {
-        let (receipt, spec) = verified_receipt_at(&self.staged.root)?;
-        if receipt != self.receipt || spec != self.spec {
+        witness: VerifiedOnnxBundleSmoke,
+    ) -> Result<VerifiedStagedOnnxBundle, InstallError> {
+        let (witness_root, witness_receipt, witness_spec, cancellation, smoke) =
+            witness.into_parts();
+        if witness_root != self.staged.root
+            || witness_receipt != self.receipt
+            || witness_spec != self.spec
+        {
+            return Err(failed(
+                "ONNX smoke evidence does not match the exact staged receipt and spec",
+            ));
+        }
+        Ok(VerifiedStagedOnnxBundle {
+            staged: self,
+            cancellation,
+            smoke,
+        })
+    }
+}
+
+/// A staged bundle carrying single-use service verification evidence. Raw
+/// staged bundles deliberately expose no activation operation.
+#[derive(Debug)]
+pub(crate) struct VerifiedStagedOnnxBundle {
+    staged: StagedOnnxBundle,
+    cancellation: InstallCancellation,
+    smoke: InstallSmoke,
+}
+
+impl VerifiedStagedOnnxBundle {
+    pub(crate) fn smoke(&self) -> &InstallSmoke {
+        &self.smoke
+    }
+
+    pub(crate) fn activate(self) -> Result<ActivatedOnnxBundle, InstallError> {
+        let Self {
+            staged,
+            cancellation,
+            ..
+        } = self;
+        let (receipt, spec) = current_executable_receipt_at(&staged.staged.root)?;
+        if receipt != staged.receipt || spec != staged.spec {
             return Err(failed(
                 "staged ONNX bundle changed after verification and before activation",
             ));
@@ -565,21 +605,21 @@ impl StagedOnnxBundle {
                     failed("ONNX bundle activation authorization was already consumed")
                 }
             })?;
-        let target_root = self.staged.target_root.clone();
-        let replacement = self.staged.activate()?;
+        let target_root = staged.staged.target_root.clone();
+        let replacement = staged.staged.activate()?;
         let spec = spec_from_parts(
-            &self.receipt.model_id,
+            &staged.receipt.model_id,
             target_root,
-            self.receipt.family,
-            self.receipt.num_threads,
-            &self.receipt.files,
+            staged.receipt.family,
+            staged.receipt.num_threads,
+            &staged.receipt.files,
         )?;
         Ok(ActivatedOnnxBundle {
             replacement,
-            receipt: self.receipt,
+            receipt: staged.receipt,
             spec,
-            retain_previous: self.retain_previous,
-            target_guard: self.target_guard,
+            retain_previous: staged.retain_previous,
+            target_guard: staged.target_guard,
         })
     }
 }
@@ -857,7 +897,8 @@ pub(crate) fn stage_onnx_bundle_install(
             bytes: notice_bytes(&receipt),
         },
     ];
-    let retain_previous = target_root.is_dir() && verified_receipt_at(&target_root).is_ok();
+    let retain_previous =
+        target_root.is_dir() && current_executable_receipt_at(&target_root).is_ok();
     let staged = stage_file_bundle_for_target(
         &assembly_files,
         &generated,
@@ -1008,12 +1049,37 @@ pub(crate) fn current_verified_receipt_at(
     Ok((receipt, spec))
 }
 
+/// Verifies receipt integrity and then separately establishes executable
+/// trust from the currently embedded, available manifest. Retired receipts
+/// intentionally remain readable through `verified_receipt_at`, but cannot
+/// cross this runtime boundary until a future signed catalog exists.
+pub(crate) fn current_executable_receipt_at(
+    root: &Path,
+) -> Result<(OnnxBundleReceipt, OnnxModelSpec), InstallError> {
+    let (receipt, spec) = verified_receipt_at(root)?;
+    let manifest = bundle_manifest(&receipt.model_id)
+        .filter(|manifest| manifest.availability == BundleAvailability::Available)
+        .ok_or_else(|| {
+            failed(format!(
+                "ONNX bundle {} is not executable under the current embedded manifest",
+                receipt.model_id
+            ))
+        })?;
+    if !receipt_matches_manifest(&receipt, manifest) {
+        return Err(failed(format!(
+            "installed ONNX bundle {} does not match the current embedded manifest",
+            receipt.model_id
+        )));
+    }
+    Ok((receipt, spec))
+}
+
 pub(crate) fn rollback_to_previous_onnx_bundle(target_root: &Path) -> Result<bool, InstallError> {
     let previous = crate::installations::previous_runtime_root(target_root);
     if !previous.exists() {
         return Ok(false);
     }
-    verified_receipt_at(&previous).map_err(|error| {
+    current_executable_receipt_at(&previous).map_err(|error| {
         failed(format!(
             "refusing to roll back to an invalid ONNX bundle at {}: {error}",
             previous.display()
@@ -1039,14 +1105,14 @@ pub(crate) fn recover_onnx_bundle_installation(
     let rollback = directory_activation_rollback_root(target_root);
     let mut recovery = OnnxBundleRecovery::default();
     if path_entry_exists_no_follow(&rollback)? {
-        verified_receipt_at(&rollback).map_err(|error| {
+        current_executable_receipt_at(&rollback).map_err(|error| {
             InstallError::RecoveryRequired(format!(
                 "interrupted ONNX bundle rollback is not exact at {}: {error}",
                 rollback.display()
             ))
         })?;
         if path_entry_exists_no_follow(target_root)? {
-            verified_receipt_at(target_root).map_err(|error| {
+            current_executable_receipt_at(target_root).map_err(|error| {
                 InstallError::RecoveryRequired(format!(
                     "interrupted ONNX bundle target is not exact at {}: {error}",
                     target_root.display()

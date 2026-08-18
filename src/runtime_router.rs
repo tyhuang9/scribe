@@ -1013,16 +1013,21 @@ impl RouterState {
         runtime_activity: &RuntimeActivity,
         failure: RuntimeError,
     ) -> RuntimeError {
+        let unload_error = self
+            .onnx
+            .as_mut()
+            .and_then(|runtime| SpeechEngine::unload(runtime).err());
         if let Some(runtime) = self.onnx.as_ref()
-            && let Err(termination_error) = runtime.supervisor.terminate_current()
+            && let Some(unload_error) = unload_error
         {
-            // A failed termination is still a potential heavy native owner.
-            // Preserve that ownership so a later GGUF request must pass
-            // through unload instead of beginning a second heavy load.
-            self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
-            return RuntimeError::Engine(format!(
-                "{failure}; failed to retire the ONNX worker after the error: {termination_error:#}"
-            ));
+            if let Err(termination_error) = runtime.supervisor.terminate_current() {
+                // A failed unload and termination can still leave a heavy
+                // native owner. Keep that ownership visible to later work.
+                self.heavy_ownership.activate(HeavyRuntimeOwner::OnnxSpeech);
+                return RuntimeError::Engine(format!(
+                    "{failure}; failed to unload the ONNX worker after the error: {unload_error:#}; forced retirement also failed: {termination_error:#}"
+                ));
+            }
         }
         self.discard_onnx_runtime(cancellation, runtime_activity);
         failure

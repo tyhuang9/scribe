@@ -1638,17 +1638,12 @@ pub(crate) fn stage_file_bundle_for_target(
             }
             validate_relative_path(&file.install_path)?;
             validate_sha256(&file.sha256)?;
-            verify_file_cancellable(
-                &file.source_path,
-                file.size_bytes,
-                &file.sha256,
-                cancellation,
-            )?;
             copy_regular_file_to_stage(
                 &file.source_path,
                 &stage_root,
                 &file.install_path,
                 file.size_bytes,
+                &file.sha256,
                 cancellation,
             )?;
             completed_bytes = completed_bytes
@@ -1772,8 +1767,10 @@ fn copy_regular_file_to_stage(
     stage_root: &Path,
     relative: &Path,
     expected_size: u64,
+    expected_sha256: &str,
     cancellation: &InstallCancellation,
 ) -> Result<(), InstallError> {
+    validate_sha256(expected_sha256)?;
     ensure_no_symlink_components(stage_root, relative)?;
     let output = stage_root.join(relative);
     if let Some(parent) = output.parent() {
@@ -1796,6 +1793,7 @@ fn copy_regular_file_to_stage(
         .map_err(|error| failed(format!("failed to create {}: {error}", output.display())))?;
     validate_opened_regular_file(&destination, &output)?;
     let mut copied = 0_u64;
+    let mut hasher = Sha256::new();
     let mut buffer = [0_u8; BUFFER_BYTES];
     loop {
         if cancellation.is_cancelled() {
@@ -1819,6 +1817,7 @@ fn copy_regular_file_to_stage(
                 source.display()
             )));
         }
+        hasher.update(&buffer[..count]);
         destination
             .write_all(&buffer[..count])
             .map_err(|error| failed(format!("failed to write {}: {error}", output.display())))?;
@@ -1826,6 +1825,13 @@ fn copy_regular_file_to_stage(
     if copied != expected_size {
         return Err(failed(format!(
             "bundle source length changed during assembly: {}",
+            source.display()
+        )));
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(failed(format!(
+            "bundle source checksum mismatch while copying {}: expected {expected_sha256}, got {actual_sha256}",
             source.display()
         )));
     }
