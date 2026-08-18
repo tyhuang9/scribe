@@ -16,7 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::disk_space::{self, CanonicalTargetIdentity, DiskSpacePreflight};
+use crate::disk_space::{
+    self, CanonicalTargetIdentity, DiskSpacePreflight, PhysicalVolumeIdentity,
+};
 use crate::installations::{
     BundleAssemblyFile, DirectoryReplacement, GeneratedBundleFile, InstallCancellation,
     InstallError, InstallProgress, PinnedArtifact, PinnedArtifactInspectionPlan, RuntimeFileSpec,
@@ -721,19 +723,49 @@ fn acquire_bundle_disk_reservation(
     target: &Path,
     requested_bytes: u64,
 ) -> Result<BundleDiskReservation, InstallError> {
-    let control_root = crate::config::cache_dir()
-        .map_err(|error| {
-            failed(format!(
-                "could not resolve Scribe cache directory: {error:#}"
-            ))
-        })?
-        .join(RESERVATION_CONTROL_DIRECTORY_NAME);
+    let cache_root = crate::config::cache_dir().map_err(|error| {
+        failed(format!(
+            "could not resolve Scribe cache directory: {error:#}"
+        ))
+    })?;
+    fs::create_dir_all(&cache_root).map_err(|error| {
+        failed(format!(
+            "could not create Scribe cache directory {}: {error}",
+            cache_root.display()
+        ))
+    })?;
+    verify_regular_directory_root(&cache_root)?;
+    let control_root = cache_root.join(RESERVATION_CONTROL_DIRECTORY_NAME);
     acquire_bundle_disk_reservation_with_control_root(&control_root, target, requested_bytes)
 }
 
-fn volume_reservation_root(control_root: &Path, volume: &str) -> PathBuf {
-    let volume_key = format!("{:x}", Sha256::digest(volume.as_bytes()));
+fn volume_reservation_root(
+    control_root: &Path,
+    volume_identity: &PhysicalVolumeIdentity,
+) -> PathBuf {
+    let volume_key = format!("{:x}", Sha256::digest(volume_identity.key_material()));
     control_root.join(volume_key)
+}
+
+fn create_verified_reservation_directory(path: &Path) -> Result<(), InstallError> {
+    let parent = path.parent().ok_or_else(|| {
+        failed(format!(
+            "ONNX reservation directory {} has no parent",
+            path.display()
+        ))
+    })?;
+    verify_regular_directory_root(parent)?;
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(failed(format!(
+                "could not create ONNX bundle reservation directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    verify_regular_directory_root(path)
 }
 
 fn acquire_bundle_disk_reservation_with_control_root(
@@ -741,16 +773,11 @@ fn acquire_bundle_disk_reservation_with_control_root(
     target: &Path,
     requested_bytes: u64,
 ) -> Result<BundleDiskReservation, InstallError> {
-    let initial_preflight =
-        disk_space::preflight_download_destination(target, 0).map_err(InstallError::Failed)?;
-    let reservation_root = volume_reservation_root(control_root, &initial_preflight.volume);
-    fs::create_dir_all(&reservation_root).map_err(|error| {
-        failed(format!(
-            "could not create ONNX bundle reservation directory {}: {error}",
-            reservation_root.display()
-        ))
-    })?;
-    verify_regular_directory_root(&reservation_root)?;
+    let initial_volume_identity =
+        disk_space::physical_volume_identity(target).map_err(InstallError::Failed)?;
+    create_verified_reservation_directory(control_root)?;
+    let reservation_root = volume_reservation_root(control_root, &initial_volume_identity);
+    create_verified_reservation_directory(&reservation_root)?;
     let _ledger = OsFileLock::acquire(&reservation_root.join("ledger.lock"), true)?;
     let mut active_reserved_bytes = 0_u64;
     for entry in fs::read_dir(&reservation_root).map_err(|error| {
@@ -824,7 +851,9 @@ fn acquire_bundle_disk_reservation_with_control_root(
         .ok_or_else(|| failed("aggregate ONNX bundle disk requirement overflowed"))?;
     let preflight = disk_space::preflight_download_destination(target, aggregate_request)
         .map_err(InstallError::Failed)?;
-    if preflight.volume != initial_preflight.volume {
+    let admitted_volume_identity =
+        disk_space::physical_volume_identity(target).map_err(InstallError::Failed)?;
+    if admitted_volume_identity != initial_volume_identity {
         return Err(failed(
             "ONNX bundle target changed physical volume during reservation admission",
         ));
@@ -2108,17 +2137,61 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reservation_creation_rejects_preplanted_control_and_volume_links() {
+        let root = unique_root("reservation-control-link");
+        let target = root.join("storage").join("model");
+        let control = root.join("control");
+        let external = root.join("external");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &control).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&external, &control).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let error =
+            acquire_bundle_disk_reservation_with_control_root(&control, &target, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("symbolic link") || error.to_string().contains("reparse")
+        );
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        #[cfg(unix)]
+        fs::remove_file(&control).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(&control).unwrap();
+
+        fs::create_dir(&control).unwrap();
+        let identity = disk_space::physical_volume_identity(&target).unwrap();
+        let volume_root = volume_reservation_root(&control, &identity);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &volume_root).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&external, &volume_root).unwrap();
+
+        let error =
+            acquire_bundle_disk_reservation_with_control_root(&control, &target, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("symbolic link") || error.to_string().contains("reparse")
+        );
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn active_reservation_contention_participates_in_aggregate_admission() {
         let root = unique_root("reservation-contention");
         let control = root.join("control");
         fs::create_dir_all(&root).unwrap();
         let target = root.join("model");
-        let volume = disk_space::preflight_download_destination(&target, 0)
-            .unwrap()
-            .volume;
-        let reservations = volume_reservation_root(&control, &volume);
-        fs::create_dir_all(&reservations).unwrap();
+        let volume_identity = disk_space::physical_volume_identity(&target).unwrap();
+        fs::create_dir(&control).unwrap();
+        let reservations = volume_reservation_root(&control, &volume_identity);
+        fs::create_dir(&reservations).unwrap();
         let entry = reservations.join("other-process.reservation");
         fs::write(&entry, format!("{}\n", u64::MAX)).unwrap();
         let active = OsFileLock::acquire(&entry.with_extension("lock"), false).unwrap();
