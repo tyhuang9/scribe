@@ -1302,10 +1302,11 @@ pub(super) enum RasterError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Mutex};
+    use std::{cell::Cell, fmt::Write as _, path::Path, sync::Mutex};
 
     use super::*;
     use crate::{overlay::controller::OverlayAudioLevel, transcription::SessionId};
+    use sha2::{Digest, Sha256};
 
     static RASTER_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -1331,6 +1332,49 @@ mod tests {
             elapsed: Some(Duration::from_secs(12)),
             ..OverlayViewState::default()
         }
+    }
+
+    fn edge_golden_states() -> Vec<(&'static str, OverlayViewState, i32, i32)> {
+        vec![
+            (
+                "live-empty",
+                OverlayViewState {
+                    session_id: Some(SessionId(43)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Listening,
+                    elapsed: Some(Duration::ZERO),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+            (
+                "compact-finalizing",
+                OverlayViewState {
+                    session_id: Some(SessionId(44)),
+                    mode: OverlayMode::Minimal,
+                    phase: OverlayPhase::Finalizing,
+                    ..OverlayViewState::default()
+                },
+                320,
+                52,
+            ),
+            (
+                "live-error",
+                OverlayViewState {
+                    session_id: Some(SessionId(45)),
+                    mode: OverlayMode::Live,
+                    phase: OverlayPhase::Error,
+                    error: Some(super::super::super::controller::OverlayError {
+                        message: "Microphone unavailable".to_owned(),
+                        recovery: OverlayRecovery::Retry,
+                    }),
+                    ..OverlayViewState::default()
+                },
+                600,
+                62,
+            ),
+        ]
     }
 
     #[test]
@@ -1368,6 +1412,45 @@ mod tests {
             .filter(|pixel| pixel[3] > 0)
             .count();
         assert!(painted < 44 * 44 / 3);
+    }
+
+    #[test]
+    fn production_raster_source_matches_pr50() {
+        const PR50_PRODUCTION_SHA256: &str =
+            "b55312b40a692f1edb70def84e7f374c2577fedcd0e8e1ad83d9b9bc9f9bf079";
+        let source = include_str!("raster.rs").replace("\r\n", "\n");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("native raster test-module boundary must remain explicit")
+            .0;
+
+        assert_eq!(
+            format!("{:x}", Sha256::digest(production.as_bytes())),
+            PR50_PRODUCTION_SHA256,
+            "production native raster source diverged from PR50 commit 1d50d02"
+        );
+    }
+
+    #[test]
+    fn pr50_fixture_checksums_are_valid() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("overlay-pr50");
+        let sums = std::fs::read_to_string(fixture_root.join("SHA256SUMS"))
+            .expect("read PR50 fixture checksums");
+
+        for (line_number, line) in sums.lines().enumerate() {
+            let (expected, name) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("invalid SHA256SUMS line {}", line_number + 1));
+            let bytes = std::fs::read(fixture_root.join(name))
+                .unwrap_or_else(|error| panic!("read PR50 fixture {name}: {error}"));
+            assert_eq!(
+                format!("{:x}", Sha256::digest(bytes)),
+                expected,
+                "fixture digest mismatch for {name}"
+            );
+        }
     }
 
     #[test]
@@ -1415,7 +1498,103 @@ mod tests {
                     );
                 }
             }
+
+            for (name, state, width, height) in edge_golden_states() {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    let frame = rasterizer
+                        .render_display(&state, dark, width, height)
+                        .expect("render edge-state overlay fixture frame");
+                    assert_eq!(
+                        frame.pixels,
+                        std::fs::read(fixture_root.join(format!("{name}-{theme}-96.bgra")))
+                            .expect("read immutable PR50 edge-state fixture"),
+                        "{name} {theme} at 96 DPI diverged from PR50"
+                    );
+                }
+            }
         });
+    }
+
+    #[test]
+    #[ignore = "explicit fixture-maintenance tool; see testdata/overlay-pr50/MANIFEST.md"]
+    fn generate_pr50_overlay_fixture_candidate() {
+        let requested = std::path::PathBuf::from(
+            std::env::var_os("SCRIBE_PR50_GOLDEN_OUTPUT_DIR")
+                .expect("set SCRIBE_PR50_GOLDEN_OUTPUT_DIR to an external output directory"),
+        );
+        assert!(requested.is_absolute(), "fixture output must be absolute");
+        let parent = requested
+            .parent()
+            .expect("fixture output must have a parent")
+            .canonicalize()
+            .expect("fixture output parent must already exist");
+        let output = parent.join(
+            requested
+                .file_name()
+                .expect("fixture output must name a directory"),
+        );
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("canonicalize repository root");
+        assert!(
+            !output.starts_with(&repository),
+            "fixture output must be outside the repository"
+        );
+        std::fs::create_dir_all(&output).expect("create external fixture output directory");
+
+        let mut generated = Vec::new();
+        let mut write_frame = |name: String, pixels: Vec<u8>| {
+            std::fs::write(output.join(&name), &pixels)
+                .unwrap_or_else(|error| panic!("write generated fixture {name}: {error}"));
+            generated.push((name, format!("{:x}", Sha256::digest(pixels))));
+        };
+
+        with_rasterizer(|rasterizer| {
+            for (numerator, denominator, dpi) in
+                [(1, 1, "96"), (5, 4, "120"), (3, 2, "144"), (2, 1, "192")]
+            {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    for (mode, name, logical_width, logical_height) in [
+                        (OverlayMode::Live, "live", 600, 62),
+                        (OverlayMode::Minimal, "compact", 320, 52),
+                    ] {
+                        let frame = rasterizer
+                            .render_display(
+                                &state(mode),
+                                dark,
+                                logical_width * numerator / denominator,
+                                logical_height * numerator / denominator,
+                            )
+                            .expect("render generated fixture frame");
+                        write_frame(format!("{name}-{theme}-{dpi}.bgra"), frame.pixels);
+                    }
+                    let control = rasterizer
+                        .render_control(
+                            dark,
+                            44 * numerator / denominator,
+                            44 * numerator / denominator,
+                        )
+                        .expect("render generated control fixture");
+                    write_frame(format!("cancel-{theme}-{dpi}.bgra"), control.pixels);
+                }
+            }
+
+            for (name, state, width, height) in edge_golden_states() {
+                for (dark, theme) in [(false, "light"), (true, "dark")] {
+                    let frame = rasterizer
+                        .render_display(&state, dark, width, height)
+                        .expect("render generated edge-state fixture");
+                    write_frame(format!("{name}-{theme}-96.bgra"), frame.pixels);
+                }
+            }
+        });
+
+        generated.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut sums = String::new();
+        for (name, digest) in generated {
+            writeln!(&mut sums, "{digest}  {name}").expect("format fixture checksum");
+        }
+        std::fs::write(output.join("SHA256SUMS"), sums).expect("write generated fixture checksums");
     }
 
     #[test]

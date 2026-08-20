@@ -14,6 +14,9 @@ The cancel-control fixture is the independent 44 logical-pixel control.
 | `live` | 600 × 62 | Live | light, dark | 96, 120, 144, 192 |
 | `compact` | 320 × 52 | Minimal | light, dark | 96, 120, 144, 192 |
 | `cancel` | 44 × 44 | cancel control | light, dark | 96, 120, 144, 192 |
+| `live-empty` | 600 × 62 | Live, Listening, empty transcript | light, dark | 96 |
+| `compact-finalizing` | 320 × 52 | Minimal, Finalizing | light, dark | 96 |
+| `live-error` | 600 × 62 | Live, Error, retryable `Microphone unavailable` | light, dark | 96 |
 
 The suffix is the DPI (`96`, `120`, `144`, or `192`). Each `.bgra` file has
 exactly `physical_width × physical_height × 4` bytes. The regression test
@@ -25,8 +28,9 @@ by candidate code.
 The source checkout was created with:
 
 ```powershell
-git worktree add --detach C:\Users\huang\Documents\Projects\scribe-pr50-golden-source 1d50d02
-git -C C:\Users\huang\Documents\Projects\scribe-pr50-golden-source diff --exit-code
+$source = Join-Path $env:TEMP 'scribe-pr50-golden-source'
+git worktree add --detach $source 1d50d02
+git -C $source diff --exit-code
 ```
 
 A temporary test-only dump routine was inserted beside the existing native
@@ -38,6 +42,36 @@ back to the immutable PR #50 content after generation.
 ```powershell
 cargo test --bin local-transcriber overlay::native_windows::raster::tests::dump_pr50_overlay_golden_frames -- --exact --nocapture
 ```
+
+The six empty, non-listening, and error-state fixtures were generated the same
+way from the immutable checkout with the temporary test named
+`dump_pr50_edge_golden_frames`. Afterward, both `git diff --exit-code` and the
+blob-ID check above passed again.
+
+## Production-source lock
+
+The regression suite normalizes CRLF to LF, hashes everything before the
+`#[cfg(test)] mod tests` boundary, and requires SHA-256
+`b55312b40a692f1edb70def84e7f374c2577fedcd0e8e1ad83d9b9bc9f9bf079`.
+That boundary deliberately excludes tests so fixture/test maintenance can grow
+without weakening the guarantee that the production raster implementation is
+identical to PR #50.
+
+## Opt-in candidate generator
+
+The ignored `generate_pr50_overlay_fixture_candidate` test can render the full
+corpus and its `SHA256SUMS` into an explicitly selected directory. It rejects
+relative paths and every path inside this repository, so normal tests and even
+an accidental opt-in cannot overwrite the committed fixtures. For example:
+
+```powershell
+$env:SCRIBE_PR50_GOLDEN_OUTPUT_DIR = Join-Path $env:TEMP 'scribe-pr50-overlay-candidate'
+cargo test --bin local-transcriber overlay::native_windows::raster::tests::generate_pr50_overlay_fixture_candidate -- --ignored --exact --nocapture
+```
+
+Candidate output is diagnostic only. Updating committed goldens still requires
+generation from the immutable PR #50 checkout and an explicit review of the
+resulting hashes.
 
 `SHA256SUMS` records a digest for every generated frame. The candidate test
 does not compare only those digests: it reads the PR #50 bytes and requires the
