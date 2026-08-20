@@ -411,6 +411,7 @@ pub(crate) enum ScreenAction {
     ChangeModel,
     StartRecording,
     StopRecording,
+    AbandonRecording,
     OpenAudioSettings,
     RetryMicrophone,
     ClearTranscript,
@@ -1025,6 +1026,17 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
             if stop.clicked() {
                 action = ScreenAction::StopRecording;
             }
+            let abandon = recording_square_button(
+                ui,
+                Icon::Close,
+                "Cancel recording and discard it",
+                colors.error,
+                colors.danger_button_text,
+                Stroke::NONE,
+            );
+            if abandon.clicked() {
+                action = ScreenAction::AbandonRecording;
+            }
             ui.vertical(|ui| {
                 ui.spacing_mut().interact_size.y = 0.0;
                 ui.horizontal(|ui| {
@@ -1032,10 +1044,12 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                         ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     ui.painter()
                         .circle_filled(dot_rect.center(), 4.0, colors.error);
-                    let status = ui.label(RichText::new("Listening").strong().color(colors.error));
+                    let status = ui.label(RichText::new("Recording").strong().color(colors.error));
                     ui.ctx().accesskit_node_builder(status.id, |builder| {
-                        builder.set_live(egui::accesskit::Live::Polite);
-                        builder.set_live_atomic();
+                        if !state.suppress_live_announcements {
+                            builder.set_live(egui::accesskit::Live::Polite);
+                            builder.set_live_atomic();
+                        }
                     });
                 });
                 ui.label(format_elapsed(state.elapsed_ms));
@@ -1047,20 +1061,35 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Finalizing transcript…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
+                    if !state.suppress_live_announcements {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    }
                 });
                 ui.label("This may take a moment.");
             });
         }
         TranscriptionPhase::RequestingMicrophone => {
+            let abandon = recording_square_button(
+                ui,
+                Icon::Close,
+                "Cancel recording and discard it",
+                colors.error,
+                colors.danger_button_text,
+                Stroke::NONE,
+            );
+            if abandon.clicked() {
+                action = ScreenAction::AbandonRecording;
+            }
             status_spinner(ui, "Requesting microphone access progress");
             ui.vertical(|ui| {
                 ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Requesting microphone access…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
+                    if !state.suppress_live_announcements {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    }
                 });
                 ui.label("Recording will start after access is granted.");
             });
@@ -1071,8 +1100,10 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui.spacing_mut().interact_size.y = 0.0;
                 let status = ui.label(RichText::new("Loading speech model…").strong());
                 ui.ctx().accesskit_node_builder(status.id, |builder| {
-                    builder.set_live(egui::accesskit::Live::Polite);
-                    builder.set_live_atomic();
+                    if !state.suppress_live_announcements {
+                        builder.set_live(egui::accesskit::Live::Polite);
+                        builder.set_live_atomic();
+                    }
                 });
                 ui.label("Recording will be available when the model is ready.");
             });
@@ -1279,8 +1310,10 @@ fn transcript_frame(
                             } else {
                                 let response = neutral_notice(ui, text);
                                 ui.ctx().accesskit_node_builder(response.id, |builder| {
-                                    builder.set_live(egui::accesskit::Live::Polite);
-                                    builder.set_live_atomic();
+                                    if !state.suppress_live_announcements {
+                                        builder.set_live(egui::accesskit::Live::Polite);
+                                        builder.set_live_atomic();
+                                    }
                                 });
                             }
                             ui.add_space(12.0);
@@ -1292,8 +1325,10 @@ fn transcript_frame(
                             );
                             ui.ctx().accesskit_node_builder(response.id, |builder| {
                                 builder.set_role(egui::accesskit::Role::Alert);
-                                builder.set_live(egui::accesskit::Live::Assertive);
-                                builder.set_live_atomic();
+                                if !state.suppress_live_announcements {
+                                    builder.set_live(egui::accesskit::Live::Assertive);
+                                    builder.set_live_atomic();
+                                }
                             });
                             if button(ui, "Open model settings", ButtonTone::Danger).clicked() {
                                 action = ScreenAction::ChangeModel;
@@ -1334,8 +1369,11 @@ fn transcript_frame(
                                 ui.label(transcript)
                             };
                             ui.ctx().accesskit_node_builder(response.id, |builder| {
-                                builder.set_live(egui::accesskit::Live::Polite);
-                                builder.set_live_atomic();
+                                builder.set_name(state.committed_transcript.as_str());
+                                if !state.suppress_live_announcements {
+                                    builder.set_live(egui::accesskit::Live::Polite);
+                                    builder.set_live_atomic();
+                                }
                             });
                         }
                         if state.committed_transcript.trim().is_empty()
@@ -6222,7 +6260,7 @@ fn general_settings_panel(
                     ComboBox::from_id_source("overlay-mode")
                         .selected_text(&overlay)
                         .show_ui(ui, |ui| {
-                            for value in ["Live", "Minimal", "Off"] {
+                            for value in ["Live preview", "Compact status", "Off"] {
                                 ui.selectable_value(&mut overlay, value.to_owned(), value);
                             }
                         })
@@ -6239,15 +6277,20 @@ fn general_settings_panel(
         }
         let mut position = settings.overlay_position_label.clone();
         setting_row(ui, "Overlay position", |ui, label_id| {
-            ComboBox::from_id_source("overlay-position")
-                .selected_text(&position)
-                .show_ui(ui, |ui| {
-                    for value in ["Top", "Bottom"] {
-                        ui.selectable_value(&mut position, value.to_owned(), value);
-                    }
-                })
-                .response
-                .labelled_by(label_id);
+            ui.add_enabled_ui(
+                settings.overlay_available && settings.overlay_label != "Off",
+                |ui| {
+                    ComboBox::from_id_source("overlay-position")
+                        .selected_text(&position)
+                        .show_ui(ui, |ui| {
+                            for value in ["Top", "Bottom"] {
+                                ui.selectable_value(&mut position, value.to_owned(), value);
+                            }
+                        })
+                        .response
+                        .labelled_by(label_id);
+                },
+            );
         });
         if position != settings.overlay_position_label {
             *action = ScreenAction::SetOverlayPosition(position);
@@ -8508,6 +8551,105 @@ mod tests {
                 node.role() == egui::accesskit::Role::Button && node.name() == Some(expected_name)
             }));
         }
+    }
+
+    #[test]
+    fn active_capture_exposes_keyboard_operable_discard_action() {
+        for phase in [
+            TranscriptionPhase::RequestingMicrophone,
+            TranscriptionPhase::Listening,
+        ] {
+            let state = TranscriptionState {
+                phase,
+                selected_model_id: Some("base.en".into()),
+                ..Default::default()
+            };
+            let output = render_transcribe(&state, &[]);
+            let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.name() == Some("Cancel recording and discard it")
+            }));
+        }
+    }
+
+    #[test]
+    fn presented_live_overlay_suppresses_root_live_transcript_ownership() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            committed_transcript: "committed words".into(),
+            provisional_transcript: "tentative words".into(),
+            suppress_live_announcements: true,
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(!nodes.iter().any(|(_, node)| {
+            node.live().is_some()
+                && node.name().is_some_and(|name| {
+                    name.contains("committed words") || name.contains("tentative words")
+                })
+        }));
+        assert!(!nodes.iter().any(|(_, node)| {
+            node.live().is_some() && node.name().is_some_and(|name| name.contains("Recording"))
+        }));
+    }
+
+    #[test]
+    fn enabled_root_announces_phase_and_committed_transcript() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            committed_transcript: "committed words".into(),
+            provisional_transcript: "tentative words".into(),
+            suppress_live_announcements: false,
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let polite_nodes = nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+            .collect::<Vec<_>>();
+
+        assert_eq!(polite_nodes.len(), 2);
+        assert!(
+            polite_nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording"))
+        );
+        assert!(polite_nodes.iter().any(|(_, node)| {
+            node.name()
+                .is_some_and(|name| name.contains("committed words"))
+        }));
+        assert!(polite_nodes.iter().all(|(_, node)| {
+            !node
+                .name()
+                .is_some_and(|name| name.contains("tentative words"))
+        }));
+    }
+
+    #[test]
+    fn listening_phase_is_exposed_as_recording() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Listening,
+            selected_model_id: Some("base.en".into()),
+            ..Default::default()
+        };
+        let output = render_transcribe(&state, &[]);
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Recording"))
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.name() == Some("Listening"))
+        );
     }
 
     #[test]

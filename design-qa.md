@@ -194,6 +194,55 @@ final result: passed
 
 ---
 
+# Foreground-aware recording overlay QA - 2026-08-17
+
+## Source and implementation scope
+
+- Visual source of truth: `C:\Users\huang\.codex\attachments\1262dc67-8414-4589-960b-16e952d23970\image-1.png` (1142 x 137 source pixels).
+- Reviewed implementation source head: `6d5492c` (`Harden native overlay accessibility presentation`), including native renderer commits `b208f1b`, `6507543`, `62b6d50`, `bbc3994`, and the independent-review remediation.
+- Live target: a 600 x 62 logical-point bottom/top-center capsule with waveform, elapsed time, one divider, a one-line Unicode-grapheme-safe transcript/status tail, and a separately hardened 44 x 44 cancel viewport.
+- Compact target: a 320 x 52 logical-point status capsule without transcript preview.
+- Windows paints two UI-thread-owned top-level layered HWNDs from a premultiplied BGRA DIB through `UpdateLayeredWindow(ULW_ALPHA)`. The display is pass-through and nonactivating; only the separate cancel HWND accepts pointer input, without activation.
+- The implementation reuses the checked-in Phosphor waveform/X glyphs, a shared contrast-checked Scribe-purple recording token, serialized `Minimal`/`Live`/`Off` values, and the existing overlay controller/action contract. No settings migration was introduced.
+
+## Verified design and behavior evidence
+
+- Deterministic geometry tests cover Live and Compact capsule/control containment at 100%, 125%, 150%, and 200% DPI.
+- The visual hierarchy matches the selected source order: waveform, timer, divider, one-line rolling text, cancel.
+- Light and dark theme tokens include a translucent painted surface, border, top highlight, contained shadow, and contrast checks against conservative black/white composited backgrounds. The dark recording mark matches the measured reference purple `#8B7CF6`; light mode uses the deeper `#765EEB` companion required for contrast over translucent content.
+- The experimental DWM system backdrop was removed. The production path uses deterministic painted translucency without native backdrop blur.
+- The waveform base glyph remains contrast-safe while its decorative halo reflects actual microphone level and freezes when reduced motion is requested.
+- Unicode tests cover combining marks, CJK, flags, skin-tone modifiers, and ZWJ emoji at the production one-line limit.
+- Accessibility tests verify exact cancel naming, a contained 44 x 44 logical target, DPI-derived physical desktop bounds for every visible native node, non-live elapsed/tentative text, no phantom Compact timer, single-owner Compact/root announcements, and Live precedence of notice/error, committed transcript delta, then phase.
+- Foreground policy, stale-session rejection, pending/active abandonment, nonblocking worker drain, target retirement, and absence of final transcription/history/output are covered by automated tests.
+- Native tests cover ordered fail-closed presentation, atomic reset of both AccessKit trees before both HWNDs hide, pass-through/control profile separation, DIB sizing, fallible extreme-dimension allocation, premultiplication, real Phosphor glyph output, tooltip/control capability gating, WndProc panic containment/cleanup, AccessKit tree integrity, and session binding. Remediation-focused gates passed at `6d5492c`: native 31/31, overlay view 25/25, formatting, `git diff --check`, and strict all-target/all-feature Clippy.
+- The final clean-head gate at `6eae6b1` passed formatting, all-target/all-feature check, strict Clippy, base-to-head diff hygiene, and the Astro documentation check with 0 diagnostics. Its serialized all-target/all-feature suite discovered 963 tests, passed 952, failed 0, and ignored 11 explicit local runtime/fixture tests.
+
+## Native Windows capture and interaction evidence
+
+All captures below were produced with `Windows.Graphics.Capture` monitor capture and a hardware D3D device at feature level `0xB100`. They show the actual compositor result, not an application framebuffer. Every manifest records both overlay windows visible and uncloaked, the display style `0x80800A8`, the control style `0x8080088`, and an unchanged foreground HWND before, during, and after capture.
+
+- Live light: `design-qa-evidence/overlay-native/live-light-6d5492c-39988.png` and `.json` (750 x 78 at 120 DPI; 55 x 55 control).
+- Live dark: `design-qa-evidence/overlay-native/live-dark-6d5492c-39464.png` and `.json` (750 x 78 at 120 DPI; 55 x 55 control).
+- Compact light: `design-qa-evidence/overlay-native/compact-light-6d5492c-29856.png` and `.json` (400 x 65 at 120 DPI; 55 x 55 control).
+- Compact dark: `design-qa-evidence/overlay-native/compact-dark-6d5492c-31940.png` and `.json` (400 x 65 at 120 DPI; 55 x 55 control).
+- Same-state comparison: `design-qa-evidence/overlay-native/comparison-reference-live-dark.png`.
+- Win32/UIA and forced-failure probe: `design-qa-evidence/overlay-native/native-uia-hidden-probe-6d5492c.json`.
+
+The combined comparison was inspected at native resolution. Capsule silhouette/height, content order, purple Phosphor waveform, elapsed time, divider, transcript, X, transparency, and the join between the display/control HWNDs match closely; no black control tile or seam is present. Intentional differences are the theme-aware navy/light painted tint instead of a reference-only neutral dark surface, italic tentative text required by the preview contract, and deterministic translucency without native backdrop blur. Timer/divider alignment is approximately 5-13 logical points left of the reference cluster but remains within the approved 600 x 62 layout and does not impair hierarchy or readability.
+
+The visible probe verified `HTTRANSPARENT` (-1) for the display and `HTCLIENT` (1) for the control, `MA_NOACTIVATE` (3) for both, the exact control/button name `Cancel recording and discard it`, `IsKeyboardFocusable=false`, ElementFromPoint resolution to that button, and no foreground-HWND change. At 120 DPI, UIA reported the display root at `[905,1272..1655,1350]`, status/meter at `[925,1290..962,1327]`, `Elapsed time 00:12` at `[975,1297..1035,1325]`, preview/announcement at `[1058,1297..1590,1325]`, and the control root/button at `[1590,1283..1645,1338]` (55 x 55 physical pixels). Elapsed is static rather than live, so it does not duplicate phase/transcript announcements.
+
+The same live fixture then had `WS_EX_LAYERED` removed from the display HWND to force a real hardening-verification failure after visible AccessKit updates. The production failure path hid both HWNDs, both UIA subtree snapshots became empty, and ElementFromPoint at the former X center resolved the underlying fixture instead of the cancel button. This directly confirms that a failed `presented=false` result does not leave a stale visible tree or active cancel target.
+
+## Remaining physical release gates
+
+The deterministic fixture does not open a microphone, issue a real abandon action, or prove taskbar/Alt+Tab enumeration, Narrator/NVDA speech, tooltip dwell, physical pointer routing into an underlying third-party app, every top/bottom monitor edge, or a full mixed-DPI monitor matrix. Those checks remain required through UI-06, UI-08, UI-10, UI-11, REC-04, and the applicable output-target rows in `docs/MANUAL_TEST_MATRIX.md`. These caveats do not block the native visual-fidelity verdict, but they remain release gates for the complete feature.
+
+final result: passed
+
+---
+
 ## Accordion width follow-up — 2026-08-13
 
 - Source truth: the user-directed requirement that expanding a model must not change the card's horizontal bounds, applied to the three model-card references listed above.

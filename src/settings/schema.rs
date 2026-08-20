@@ -121,8 +121,8 @@ pub struct OutputSettings {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayMode {
-    #[default]
     Live,
+    #[default]
     Minimal,
     Off,
 }
@@ -130,8 +130,8 @@ pub enum OverlayMode {
 impl OverlayMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Live => "Live",
-            Self::Minimal => "Minimal",
+            Self::Live => "Live preview",
+            Self::Minimal => "Compact status",
             Self::Off => "Off",
         }
     }
@@ -320,7 +320,7 @@ impl Default for OutputSettings {
 impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
-            mode: OverlayMode::Live,
+            mode: OverlayMode::Minimal,
             position: OverlayPosition::Bottom,
             unknown: UnknownFields::new(),
         }

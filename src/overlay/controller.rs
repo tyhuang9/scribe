@@ -6,8 +6,8 @@ use crate::transcription::SessionId;
 /// schema types so the native overlay can be driven by any application shell.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OverlayMode {
-    #[default]
     Live,
+    #[default]
     Minimal,
     Off,
 }
@@ -30,13 +30,28 @@ impl OverlayPhase {
         match self {
             Self::Hidden => "Hidden",
             Self::Preparing => "Preparing",
-            Self::Listening => "Listening",
+            Self::Listening => "Recording",
             Self::Finalizing => "Finalizing",
             Self::Processing => "Processing",
             Self::Pasting => "Pasting",
             Self::Success => "Done",
             Self::Error => "Error",
         }
+    }
+}
+
+/// Whether the root Scribe viewport is safe to cover with a background-only
+/// overlay.  Unknown focus is intentionally conservative.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OverlayPresentation {
+    pub focused: Option<bool>,
+    pub minimized: bool,
+    pub hidden_to_tray: bool,
+}
+
+impl OverlayPresentation {
+    pub fn permits_background_overlay(self) -> bool {
+        self.hidden_to_tray || self.minimized || self.focused == Some(false)
     }
 }
 
@@ -256,6 +271,7 @@ impl OverlayController {
             return false;
         }
         self.state.phase = OverlayPhase::Error;
+        self.state.transcript_announcement = None;
         self.state.error = Some(OverlayError {
             message: message.into(),
             recovery,
@@ -387,6 +403,18 @@ mod tests {
     }
 
     #[test]
+    fn error_clears_stale_transcript_announcement() {
+        let mut controller = OverlayController::new(false);
+        controller.begin_session(SessionId(7), OverlayMode::Live);
+        controller.update_transcript(SessionId(7), "stable", " draft", 1);
+        assert!(controller.state().transcript_announcement.is_some());
+
+        assert!(controller.show_error(SessionId(7), "Preview failed", OverlayRecovery::None));
+
+        assert!(controller.state().transcript_announcement.is_none());
+    }
+
+    #[test]
     fn audio_levels_are_finite_and_bounded() {
         let mut controller = OverlayController::new(false);
         controller.begin_session(SessionId(1), OverlayMode::Minimal);
@@ -403,5 +431,49 @@ mod tests {
         controller.begin_session(SessionId(1), OverlayMode::Off);
 
         assert!(!controller.state().is_visible());
+    }
+
+    #[test]
+    fn presentation_is_conservative_for_focused_or_unknown_windows() {
+        assert!(
+            !OverlayPresentation {
+                focused: Some(true),
+                minimized: false,
+                hidden_to_tray: false
+            }
+            .permits_background_overlay()
+        );
+        assert!(
+            !OverlayPresentation {
+                focused: None,
+                minimized: false,
+                hidden_to_tray: false
+            }
+            .permits_background_overlay()
+        );
+        assert!(
+            OverlayPresentation {
+                focused: Some(false),
+                minimized: false,
+                hidden_to_tray: false
+            }
+            .permits_background_overlay()
+        );
+        assert!(
+            OverlayPresentation {
+                focused: Some(true),
+                minimized: true,
+                hidden_to_tray: false
+            }
+            .permits_background_overlay()
+        );
+        assert!(
+            OverlayPresentation {
+                focused: None,
+                minimized: false,
+                hidden_to_tray: true
+            }
+            .permits_background_overlay()
+        );
     }
 }

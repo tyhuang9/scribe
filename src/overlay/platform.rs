@@ -69,6 +69,35 @@ pub struct OverlayWindowBounds {
     pub height: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayHardeningProfile {
+    PassThroughDisplay,
+    NonActivatingControl,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn hardened_overlay_ex_style(
+    current: isize,
+    no_activate: isize,
+    tool_window: isize,
+    transparent: isize,
+    profile: OverlayHardeningProfile,
+) -> isize {
+    let base = current | no_activate | tool_window;
+    match profile {
+        OverlayHardeningProfile::PassThroughDisplay => base | transparent,
+        OverlayHardeningProfile::NonActivatingControl => base & !transparent,
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn present_after_hardening<F>(hardening_applied: bool, present: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    hardening_applied && present()
+}
+
 pub fn calculate_window_bounds(
     work_area: PhysicalWorkArea,
     dpi: u32,
@@ -148,7 +177,34 @@ pub fn harden_overlay_window(
     position: OverlayPosition,
     visible: bool,
 ) -> bool {
-    imp::harden_overlay_window(exact_title, target, spec, position, visible)
+    harden_overlay_window_with_profile(
+        exact_title,
+        target,
+        spec,
+        position,
+        visible,
+        OverlayHardeningProfile::PassThroughDisplay,
+    )
+}
+
+pub fn harden_overlay_window_with_profile(
+    exact_title: &str,
+    target: Option<&CapturedTarget>,
+    spec: OverlayWindowSpec,
+    position: OverlayPosition,
+    visible: bool,
+    profile: OverlayHardeningProfile,
+) -> bool {
+    imp::harden_overlay_window(exact_title, target, spec, position, visible, profile)
+}
+
+pub fn harden_overlay_window_at(
+    exact_title: &str,
+    bounds: OverlayWindowBounds,
+    visible: bool,
+    profile: OverlayHardeningProfile,
+) -> bool {
+    imp::harden_overlay_window_at(exact_title, bounds, visible, profile)
 }
 
 pub fn reduced_motion_preferred() -> bool {
@@ -192,8 +248,9 @@ mod imp {
     };
 
     use super::{
-        CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec, PhysicalWorkArea,
-        TargetIdentity, calculate_window_bounds,
+        CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
+        OverlayWindowSpec, PhysicalWorkArea, TargetIdentity, calculate_window_bounds,
+        hardened_overlay_ex_style, present_after_hardening,
     };
 
     trait CapturedTargetProbe {
@@ -404,35 +461,57 @@ mod imp {
         spec: OverlayWindowSpec,
         position: OverlayPosition,
         visible: bool,
+        profile: OverlayHardeningProfile,
+    ) -> bool {
+        let Some(bounds) = overlay_window_bounds(target, spec, position) else {
+            return false;
+        };
+        harden_overlay_window_at(exact_title, bounds, visible, profile)
+    }
+
+    pub(super) fn harden_overlay_window_at(
+        exact_title: &str,
+        bounds: OverlayWindowBounds,
+        visible: bool,
+        profile: OverlayHardeningProfile,
     ) -> bool {
         let Some(window) = find_current_process_window_by_exact_title(exact_title) else {
             return false;
         };
 
         let current_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-        let hardened_style = current_style
-            | WS_EX_NOACTIVATE as isize
-            | WS_EX_TOOLWINDOW as isize
-            | WS_EX_TRANSPARENT as isize;
+        let hardened_style = hardened_overlay_ex_style(
+            current_style,
+            WS_EX_NOACTIVATE as isize,
+            WS_EX_TOOLWINDOW as isize,
+            WS_EX_TRANSPARENT as isize,
+            profile,
+        );
         if hardened_style != current_style {
             unsafe {
                 SetWindowLongPtrW(window, GWL_EXSTYLE, hardened_style);
             }
         }
         let applied_style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
-        if applied_style & hardened_style != hardened_style {
-            return false;
-        }
-
-        let Some(bounds) = overlay_window_bounds(target, spec, position) else {
-            return false;
+        let profile_applied = match profile {
+            OverlayHardeningProfile::PassThroughDisplay => {
+                applied_style & WS_EX_TRANSPARENT as isize != 0
+            }
+            OverlayHardeningProfile::NonActivatingControl => {
+                applied_style & WS_EX_TRANSPARENT as isize == 0
+            }
         };
+        let hardening_applied = applied_style
+            & (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            == (WS_EX_NOACTIVATE as isize | WS_EX_TOOLWINDOW as isize)
+            && profile_applied;
+
         let visibility_flag = if visible {
             SWP_SHOWWINDOW
         } else {
             SWP_HIDEWINDOW
         };
-        unsafe {
+        present_after_hardening(hardening_applied, || unsafe {
             SetWindowPos(
                 window,
                 HWND_TOPMOST,
@@ -442,7 +521,7 @@ mod imp {
                 bounds.height,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED | visibility_flag,
             ) != 0
-        }
+        })
     }
 
     pub(super) fn reduced_motion_preferred() -> bool {
@@ -920,7 +999,10 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
-    use super::{CapturedTarget, OverlayPosition, OverlayWindowBounds, OverlayWindowSpec};
+    use super::{
+        CapturedTarget, OverlayHardeningProfile, OverlayPosition, OverlayWindowBounds,
+        OverlayWindowSpec,
+    };
 
     pub(super) fn capture_foreground_target() -> Option<CapturedTarget> {
         None
@@ -958,6 +1040,16 @@ mod imp {
         _spec: OverlayWindowSpec,
         _position: OverlayPosition,
         _visible: bool,
+        _profile: OverlayHardeningProfile,
+    ) -> bool {
+        false
+    }
+
+    pub(super) fn harden_overlay_window_at(
+        _exact_title: &str,
+        _bounds: OverlayWindowBounds,
+        _visible: bool,
+        _profile: OverlayHardeningProfile,
     ) -> bool {
         false
     }
@@ -974,6 +1066,56 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painted_overlay_presentation_is_gated_only_by_hardening_and_placement() {
+        let mut placement_attempted = false;
+        assert!(!present_after_hardening(false, || {
+            placement_attempted = true;
+            true
+        }));
+        assert!(!placement_attempted);
+
+        assert!(!present_after_hardening(true, || false));
+        assert!(present_after_hardening(true, || true));
+    }
+
+    #[test]
+    fn native_overlay_path_does_not_request_a_system_backdrop() {
+        let platform_source = include_str!("platform.rs");
+        let manifest = include_str!("../../Cargo.toml");
+
+        assert!(!platform_source.contains(concat!("Dwm", "SetWindowAttribute")));
+        assert!(!platform_source.contains(concat!("DWMWA_", "SYSTEMBACKDROP_TYPE")));
+        assert!(!manifest.contains(concat!("Win32_Graphics_", "Dwm")));
+    }
+
+    #[test]
+    fn control_hardening_clears_existing_transparency() {
+        let no_activate = 0b001;
+        let tool_window = 0b010;
+        let transparent = 0b100;
+        assert_eq!(
+            hardened_overlay_ex_style(
+                transparent,
+                no_activate,
+                tool_window,
+                transparent,
+                OverlayHardeningProfile::NonActivatingControl,
+            ),
+            no_activate | tool_window,
+        );
+        assert_eq!(
+            hardened_overlay_ex_style(
+                0,
+                no_activate,
+                tool_window,
+                transparent,
+                OverlayHardeningProfile::PassThroughDisplay,
+            ),
+            no_activate | tool_window | transparent,
+        );
+    }
 
     #[test]
     fn positions_top_center_with_negative_monitor_coordinates() {

@@ -877,7 +877,7 @@ mod tests {
             RecordingSettings::default().manual_activation_rms
         );
         assert_eq!(config.output.paste_delay_ms, 75);
-        assert_eq!(config.overlay.mode, OverlayMode::Live);
+        assert_eq!(config.overlay.mode, OverlayMode::Minimal);
         assert_eq!(config.overlay.position, OverlayPosition::Bottom);
         assert_eq!(config.history.mode, HistoryMode::TranscriptOnly);
         assert_eq!(config.history.max_unpinned_entries, 20);
@@ -983,7 +983,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(config.overlay.mode, OverlayMode::Live);
+        assert_eq!(config.overlay.mode, OverlayMode::Minimal);
         assert_eq!(config.overlay.position, OverlayPosition::Top);
         assert_eq!(
             config.overlay.unknown["future_overlay"],
