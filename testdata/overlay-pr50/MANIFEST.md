@@ -73,9 +73,11 @@ Candidate output is diagnostic only. Updating committed goldens still requires
 generation from the immutable PR #50 checkout and an explicit review of the
 resulting hashes.
 
-`SHA256SUMS` records a digest for every generated frame. The candidate test
-does not compare only those digests: it reads the PR #50 bytes and requires the
-new renderer output to match every byte.
+`SHA256SUMS` records a digest for every generated frame. The golden comparison
+test does not compare only those digests: it reads the committed PR #50 frame
+bytes and requires the new renderer output to match every byte. The separate
+ignored candidate generator only writes diagnostic output outside the
+repository.
 
 ## Tracked compositor references
 
