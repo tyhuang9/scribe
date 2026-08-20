@@ -1,0 +1,28 @@
+{
+  "status": "ok",
+  "api": "Windows.Graphics.Capture",
+  "captureItem": "monitor",
+  "framePool": "CreateFreeThreaded",
+  "hresult": "0x0",
+  "pid": 29856,
+  "exePath": "C:\\Users\\huang\\Documents\\Projects\\scribe-native-layered-overlay\\target\\native-layered\\debug\\local-transcriber.exe",
+  "d3dDriver": "hardware",
+  "d3dFeatureLevel": "0xB100",
+  "windows": {
+    "root": {"hwnd":"0x402EA","rect":{"left":-9,"top":-9,"right":2569,"bottom":1389,"width":2578,"height":1398},"dpi":120,"visible":true,"cloaked":0,"exStyle":"0x40110"},
+    "display": {"hwnd":"0x70340","rect":{"left":1080,"top":1285,"right":1480,"bottom":1350,"width":400,"height":65},"dpi":120,"visible":true,"cloaked":0,"exStyle":"0x80800A8"},
+    "control": {"hwnd":"0x802DE","rect":{"left":1415,"top":1290,"right":1470,"bottom":1345,"width":55,"height":55},"dpi":120,"visible":true,"cloaked":0,"exStyle":"0x8080088"}
+  },
+  "foregroundBefore": {"hwnd":"0x31023A","pid":11748},
+  "foregroundAtFrame": {"hwnd":"0x31023A","pid":11748},
+  "foregroundAfter": {"hwnd":"0x31023A","pid":11748},
+  "monitorRect": {"left":0,"top":0,"right":2560,"bottom":1440,"width":2560,"height":1440},
+  "captureDimensions": {"width":2560,"height":1440},
+  "textureDimensions": {"width":2560,"height":1440},
+  "cropDesktop": {"left":1065,"top":1270,"right":1495,"bottom":1365,"width":430,"height":95},
+  "cropMonitor": {"left":1065,"top":1270,"right":1495,"bottom":1365,"width":430,"height":95},
+  "paddingPixels": 15,
+  "persistedFullMonitor": false,
+  "cursorCaptured": false,
+  "outputPng": "C:\\Users\\huang\\AppData\\Local\\Temp\\scribe-native-layered-wgc\\remediation-6d5492c\\compact-light-29856.png"
+}

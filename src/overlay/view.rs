@@ -18,12 +18,12 @@ pub const OVERLAY_CONTROL_VIEWPORT_KEY: &str = "scribe-dictation-overlay-cancel"
 pub const OVERLAY_CONTROL_WINDOW_TITLE: &str = "Scribe Dictation Overlay Cancel";
 const CANCEL_RECORDING_LABEL: &str = "Cancel recording and discard it";
 
-const LIVE_WIDTH: f32 = 600.0;
-const LIVE_HEIGHT: f32 = 62.0;
-const MINIMAL_WIDTH: f32 = 320.0;
-const MINIMAL_HEIGHT: f32 = 52.0;
+pub(super) const LIVE_WIDTH: f32 = 600.0;
+pub(super) const LIVE_HEIGHT: f32 = 62.0;
+pub(super) const MINIMAL_WIDTH: f32 = 320.0;
+pub(super) const MINIMAL_HEIGHT: f32 = 52.0;
 const WINDOW_MARGIN: f32 = 24.0;
-const CONTROL_SIZE: f32 = 44.0;
+pub(super) const CONTROL_SIZE: f32 = 44.0;
 const CONTROL_CONTENT_GAP: f32 = 8.0;
 const CAPSULE_HORIZONTAL_INSET: f32 = 8.0;
 const LIVE_CAPSULE_VERTICAL_INSET: f32 = 8.0;
@@ -51,6 +51,31 @@ pub struct OverlayViewportOutput {
 }
 
 pub fn show_overlay_viewport(
+    context: &egui::Context,
+    state: &OverlayViewState,
+    target: Option<&CapturedTarget>,
+    position: OverlayPosition,
+    presentation: OverlayPresentation,
+) -> OverlayViewportOutput {
+    #[cfg(target_os = "windows")]
+    {
+        super::native_windows::show_overlay_viewport(context, state, target, position, presentation)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        show_eframe_overlay_viewport(context, state, target, position, presentation)
+    }
+}
+
+#[cfg_attr(
+    target_os = "windows",
+    expect(
+        dead_code,
+        reason = "Windows dispatches to the native layered renderer; this fallback remains compiled for cross-platform contract tests"
+    )
+)]
+fn show_eframe_overlay_viewport(
     context: &egui::Context,
     state: &OverlayViewState,
     target: Option<&CapturedTarget>,
@@ -145,7 +170,7 @@ pub fn control_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(OVERLAY_CONTROL_VIEWPORT_KEY)
 }
 
-fn is_cancellable(state: &OverlayViewState) -> bool {
+pub(super) fn is_cancellable(state: &OverlayViewState) -> bool {
     state.session_id.is_some()
         && matches!(
             state.phase,
@@ -153,7 +178,7 @@ fn is_cancellable(state: &OverlayViewState) -> bool {
         )
 }
 
-fn control_window_bounds(
+pub(super) fn control_window_bounds(
     display: OverlayWindowBounds,
     display_spec: OverlayWindowSpec,
 ) -> OverlayWindowBounds {
@@ -251,7 +276,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(202, 211, 224),
             tentative_text: Color32::from_rgb(166, 180, 202),
-            waveform: palette.accent,
+            waveform: palette.recording_waveform,
             meter_active: palette.success,
             meter_inactive: Color32::from_rgb(128, 142, 162),
             error: palette.error,
@@ -266,7 +291,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
             text: palette.text,
             muted_text: Color32::from_rgb(65, 75, 90),
             tentative_text: Color32::from_rgb(72, 84, 102),
-            waveform: palette.accent,
+            waveform: palette.recording_waveform,
             meter_active: palette.success_text,
             meter_inactive: Color32::from_rgb(100, 112, 132),
             error: palette.error_text,
@@ -276,7 +301,7 @@ fn overlay_colors(context: &egui::Context) -> OverlayColors {
     }
 }
 
-fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
+pub(super) fn window_spec(mode: OverlayMode) -> OverlayWindowSpec {
     match mode {
         OverlayMode::Live => OverlayWindowSpec {
             width_points: LIVE_WIDTH,
@@ -489,7 +514,7 @@ fn render_live_status_row(ui: &mut egui::Ui, state: &OverlayViewState, colors: O
     });
 }
 
-fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
+pub(super) fn live_overlay_announcement(state: &OverlayViewState) -> Option<&str> {
     if state.error.is_some() || state.notice.is_some() {
         return None;
     }
@@ -651,7 +676,7 @@ fn live_preview_layout(
     )
 }
 
-fn live_accessible_text(state: &OverlayViewState) -> String {
+pub(super) fn live_accessible_text(state: &OverlayViewState) -> String {
     if let Some(error) = &state.error {
         return error_message(error);
     }
@@ -1626,9 +1651,12 @@ mod tests {
                 assert!(contrast(colors.tentative_text) >= 4.5);
                 assert!(contrast(colors.meter_inactive) >= 3.0);
                 assert_eq!(colors.waveform.a(), 255);
+                let waveform_contrast = contrast(colors.waveform);
                 assert!(
-                    contrast(colors.waveform) >= 3.0,
-                    "waveform glyph must remain distinguishable over a composited {background:?} backdrop"
+                    waveform_contrast >= 3.0,
+                    "waveform {:?} must remain distinguishable over composited surface {:?} on a {background:?} backdrop (contrast {waveform_contrast})",
+                    colors.waveform,
+                    surface,
                 );
             }
         }

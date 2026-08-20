@@ -28,6 +28,8 @@ pub(crate) struct ThemePalette {
     pub meter_rating_5: Color32,
     pub primary: Color32,
     pub accent: Color32,
+    /// Scribe-purple recording mark shared by foreground and native overlay renderers.
+    pub recording_waveform: Color32,
     /// Theme-coherent blue/neutral track for the compact recording-mode selector.
     pub segmented_control_bg: Color32,
     /// Foreground for the selected segment on the current card surface.
@@ -89,6 +91,9 @@ impl ThemePalette {
             meter_rating_5: Color32::from_rgb(6, 118, 71),
             primary: Color32::from_rgb(6, 10, 18),
             accent: Color32::from_rgb(37, 99, 235),
+            // A slightly deeper companion to the reference purple preserves 3:1 contrast
+            // when the translucent light surface is composited over dark desktop content.
+            recording_waveform: Color32::from_rgb(118, 94, 235),
             segmented_control_bg: Color32::from_rgb(37, 99, 235),
             segmented_control_selected_text: Color32::from_rgb(29, 33, 42),
             inactive_toggle_track: Color32::from_rgb(100, 116, 139),
@@ -135,6 +140,7 @@ impl ThemePalette {
             meter_rating_5: Color32::from_rgb(74, 222, 128),
             primary: Color32::from_rgb(247, 250, 252),
             accent: Color32::from_rgb(96, 165, 250),
+            recording_waveform: Color32::from_rgb(139, 124, 246),
             segmented_control_bg: Color32::from_rgb(96, 115, 140),
             segmented_control_selected_text: Color32::from_rgb(236, 241, 247),
             inactive_toggle_track: Color32::from_rgb(96, 115, 140),
@@ -222,6 +228,18 @@ mod tests {
         for palette in [ThemePalette::light(), ThemePalette::dark()] {
             assert!(contrast_ratio(palette.inactive_toggle_track, palette.card_bg) >= 3.0);
         }
+    }
+
+    #[test]
+    fn recording_waveform_uses_reference_purple_tokens() {
+        assert_eq!(
+            ThemePalette::light().recording_waveform,
+            Color32::from_rgb(118, 94, 235)
+        );
+        assert_eq!(
+            ThemePalette::dark().recording_waveform,
+            Color32::from_rgb(139, 124, 246)
+        );
     }
 
     #[test]

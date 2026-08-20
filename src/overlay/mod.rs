@@ -1,4 +1,6 @@
 mod controller;
+#[cfg(target_os = "windows")]
+mod native_windows;
 pub mod platform;
 mod view;
 
@@ -14,3 +16,8 @@ pub use platform::{
     captured_target_application_identity, overlay_focus_safety_available, reduced_motion_preferred,
 };
 pub use view::{OverlayAction, show_overlay_viewport};
+
+pub(crate) fn shutdown_overlay_viewport() {
+    #[cfg(target_os = "windows")]
+    native_windows::shutdown_overlay_viewport();
+}

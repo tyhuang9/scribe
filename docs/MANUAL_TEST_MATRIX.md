@@ -448,14 +448,31 @@ manual row above to PASS.
 
 | Area | Evidence | Status |
 | --- | --- | --- |
-| Repository gates | `cargo fmt --all -- --check`; `cargo check --all-targets --all-features`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test --all-targets --all-features -- --test-threads=1` | **PASS** - 931 tests discovered, 920 passed, 0 failed, 11 ignored because they require explicit local runtime/fixture environments |
-| Presentation policy | Focused/unfocused/minimized/tray-hidden/unknown-focus, Off/Hidden/non-Windows, state preservation, and first-successful-presentation timing tests | **PASS automated policy** - physical Win32 focus and show/hide behavior remains NOT VERIFIED |
-| Display and control separation | Distinct pass-through/non-activating hardening profiles, transparency-bit verification, 320 x 52 Compact status and 600 x 62 Live preview geometry, capsule-contained reserved control bounds, and 44 x 44 AccessKit button tests | **PASS automated contracts** - native HWND hit-testing, activation, taskbar/Alt+Tab, and mixed-DPI alignment remain NOT VERIFIED |
+| Repository gates | Final clean-head gate at `6eae6b1`: formatting, all-target/all-feature check, strict Clippy, base-to-head diff check, and Astro docs check (8 files; 0 diagnostics). The serialized suite discovered 963 tests, passed 952, failed 0, and ignored 11 explicit local runtime/fixture tests. | **PASS** |
+| Presentation policy | Focused/unfocused/minimized/tray-hidden/unknown-focus, Off/Hidden/non-Windows, state preservation, and first-successful-presentation timing tests; WGC manifests record unchanged foreground HWNDs across actual presentation | **PASS automated/native fixture policy** - physical focus transitions between Scribe and arbitrary third-party apps remain NOT VERIFIED |
+| Display and control separation | Distinct layered HWNDs; final WGC-visible/uncloaked 120-DPI geometry plus automated 96/120/144/192-DPI layout contracts; display `HTTRANSPARENT`, control `HTCLIENT`, both `MA_NOACTIVATE`; 320 x 52 Compact and 600 x 62 Live logical geometry; UIA reports the 44 x 44 logical control as an exact 55 x 55 desktop target at 120 DPI | **PASS native fixture contracts** - taskbar/Alt+Tab enumeration, physical underlying-app clicks, and the full mixed-DPI matrix remain NOT VERIFIED |
 | Discard lifecycle | Session-correlated pending/active discard, stale action rejection, startup cancellation, app-owned worker draining, capture-admission blocking, preview cancellation, audio release, and zero transcript/history/output tests | **PASS automated lifecycle** - physical microphone startup/driver shutdown remains NOT VERIFIED |
-| Preview and accessibility | Grapheme-safe one-rendered-row tail, committed/tentative styling, bounded notices, exclusive foreground/background live-region ownership, exact cancel name/tooltip, and foreground keyboard-equivalent discard | **PASS automated rendering semantics** - Narrator/Accessibility Insights behavior remains NOT VERIFIED |
+| Preview and accessibility | Grapheme-safe one-rendered-row tail, committed/tentative styling, bounded notices, exclusive foreground/background live-region ownership, exact cancel name/tooltip, static elapsed semantics in both modes, and DPI-derived physical bounds for root/status/meter/elapsed/preview/announcement/button. The native probe confirms ElementFromPoint resolves the X and a forced post-AccessKit Verify failure leaves both HWNDs hidden with empty UIA subtrees. | **PASS automated/native provider semantics** - Narrator/Accessibility Insights speech and tooltip dwell remain NOT VERIFIED |
+| Native visual fidelity | Hardware `Windows.Graphics.Capture` output from exact head `6d5492c` for Live/Compact in light/dark at 120 DPI, automated scaling contracts at 96/120/144/192 DPI, plus the rebuilt same-state source comparison in `design-qa-evidence/overlay-native/` | **PASS deterministic native visual gate** - no missing display, black X tile, seam, clipping, or focus change; painted translucency intentionally omits native blur |
 | Security review | Specialist review of external-target isolation, native hardening profiles, stale action handling, cancellation ordering, privacy, and configuration compatibility | **PASS / GO** - no reportable security findings |
 
-The remaining release gate is the physical Windows execution of UI-06, UI-08,
-UI-10, UI-11, REC-04, and the applicable output-target rows. Capture a screen
-recording plus foreground-window evidence; automated tests cannot prove native
-focus, click-through, taskbar/Alt+Tab, screen-reader, or DPI behavior.
+Reproduce the deterministic overlay gate from the repository root with:
+
+```powershell
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation
+$env:CMAKE = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+$env:CARGO_TARGET_DIR = "$PWD\target\native-layered"
+cargo fmt --all --check
+cargo test --all-features overlay::native_windows --no-fail-fast
+cargo test --all-features overlay::view --no-fail-fast
+cargo test --all-features ui::theme::tests --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The exact fixture-launch and WGC command shape is documented in
+`docs/UI_HARNESS.md`. The remaining release gate is the physical Windows
+execution of UI-06, UI-08, UI-10, UI-11, REC-04, and the applicable
+output-target rows. Capture a screen recording plus foreground-window evidence;
+message-level tests and deterministic WGC fixtures do not prove physical
+click-through into every underlying app, taskbar/Alt+Tab exclusion,
+screen-reader speech, real microphone behavior, or the full monitor/DPI matrix.
