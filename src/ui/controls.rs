@@ -167,6 +167,7 @@ pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding)
 /// need an explicit submit action.
 pub(crate) struct SearchFieldResponse {
     pub input: Response,
+    pub clear: Response,
     pub changed: bool,
     pub clear_requested: bool,
 }
@@ -183,6 +184,8 @@ pub(crate) fn search_field(
     let field_id = ui.make_persistent_id(id_source);
     // Read Escape before TextEdit can consume its editing/navigation event.
     let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let clear_key_pressed = ui
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space));
     // TextEdit surrenders focus for Escape, so preserve its pre-edit focus
     // state to let the route handle the intended clear action.
     let had_input_focus = ui.memory(|memory| memory.has_focus(field_id));
@@ -227,8 +230,10 @@ pub(crate) fn search_field(
         });
     let input = input_response.expect("search field must allocate an input");
     let clear = clear_response.expect("search field must allocate a clear action");
-    let clear_requested =
-        !value.is_empty() && (clear.clicked() || (had_input_focus && escape_pressed));
+    let clear_requested = !value.is_empty()
+        && (clear.clicked()
+            || (clear.has_focus() && clear_key_pressed)
+            || (had_input_focus && escape_pressed));
 
     ui.ctx().accesskit_node_builder(input.id, |builder| {
         builder.set_name(accessible_name);
@@ -248,6 +253,7 @@ pub(crate) fn search_field(
     let changed = input.changed();
     SearchFieldResponse {
         input,
+        clear,
         changed,
         clear_requested,
     }
@@ -695,5 +701,72 @@ mod tests {
             },
         );
         assert!(clear_requested);
+    }
+
+    #[test]
+    fn search_field_clear_supports_enter_and_space_activation() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            configure_accessible_style(&ctx);
+            let mut query = "base".to_owned();
+            let mut clear_id = egui::Id::NULL;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(320.0, 120.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        clear_id = search_field(
+                            ui,
+                            "search-field-keyboard-clear",
+                            &mut query,
+                            "Search models",
+                            "Search models",
+                            "Filters models as you type.",
+                        )
+                        .clear
+                        .id;
+                    });
+                },
+            );
+            let mut clear_requested = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(320.0, 120.0),
+                    )),
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.memory_mut(|memory| memory.request_focus(clear_id));
+                        clear_requested = search_field(
+                            ui,
+                            "search-field-keyboard-clear",
+                            &mut query,
+                            "Search models",
+                            "Search models",
+                            "Filters models as you type.",
+                        )
+                        .clear_requested;
+                    });
+                },
+            );
+            assert!(clear_requested, "{key:?} should activate the clear action");
+        }
     }
 }
