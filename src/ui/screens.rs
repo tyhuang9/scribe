@@ -803,7 +803,7 @@ fn selector_row(
             ui.set_enabled(was_enabled && model_disabled_reason.is_none());
             let response = ui.interact(
                 action_rect,
-                ui.make_persistent_id("selected-model-action"),
+                egui::Id::new("selected-model-action"),
                 egui::Sense::click(),
             );
             ui.set_enabled(was_enabled);
@@ -861,7 +861,11 @@ fn selector_row(
                 focus_tooltip(ui, &response, reason);
                 response.clone().on_hover_text(reason);
             }
-            if response.clicked() {
+            let model_keyboard_activated = response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                });
+            if response.clicked() || model_keyboard_activated {
                 action = if no_model {
                     ScreenAction::AddModel
                 } else {
@@ -869,7 +873,7 @@ fn selector_row(
                 };
                 if !no_model {
                     ui.memory_mut(|memory| {
-                        memory.toggle_popup(ui.make_persistent_id("quick-model-picker"));
+                        memory.toggle_popup(egui::Id::new("quick-model-picker"));
                     });
                 }
             }
@@ -914,8 +918,13 @@ fn selector_row(
             let hotkey_card_id = ui.make_persistent_id("recording-hotkey-card");
             let was_enabled = ui.is_enabled();
             ui.set_enabled(was_enabled && hotkey_disabled_reason.is_none());
-            let (hotkey_card_rect, hotkey_response) = ui.allocate_exact_size(
+            let (hotkey_card_rect, _) = ui.allocate_exact_size(
                 Vec2::new(hotkey_width, hotkey_card_height),
+                egui::Sense::hover(),
+            );
+            let hotkey_response = ui.interact(
+                hotkey_card_rect,
+                egui::Id::new("recording-hotkey-action"),
                 egui::Sense::click(),
             );
             ui.set_enabled(was_enabled);
@@ -1029,7 +1038,11 @@ fn selector_row(
             } else {
                 focus_tooltip(ui, &hotkey_response, hotkey_action_name);
             }
-            if hotkey_response.clicked() {
+            let hotkey_keyboard_activated = hotkey_response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                });
+            if hotkey_response.clicked() || hotkey_keyboard_activated {
                 action = if state.hotkey_capture_active {
                     ScreenAction::CancelHotkeyCapture
                 } else {
@@ -1060,7 +1073,7 @@ fn quick_model_picker(
     state: &TranscriptionState,
     models: &[ModelViewModel],
 ) -> Option<ScreenAction> {
-    let popup_id = ui.make_persistent_id("quick-model-picker");
+    let popup_id = egui::Id::new("quick-model-picker");
     let mut action = None;
     egui::popup::popup_below_widget(ui, popup_id, anchor, |ui| {
         ui.set_min_width(anchor.rect.width().max(260.0));
@@ -1077,13 +1090,36 @@ fn quick_model_picker(
             for model in ready_models {
                 let current = state.selected_model_id.as_deref() == Some(model.id.as_str());
                 let label = if current {
-                    format!("{}  (Current)", model.display_name)
+                    format!(
+                        "{}  {}  (Current)",
+                        icon_glyph(Icon::CheckCircle),
+                        model.display_name
+                    )
                 } else {
                     model.display_name.clone()
                 };
-                let response = ui.add_sized(
+                let (rect, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), SELECTOR_CONTROL_HEIGHT),
-                    egui::Button::new(label),
+                    egui::Sense::hover(),
+                );
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new(("quick-model-picker-option", model.id.as_str())),
+                    egui::Sense::click(),
+                );
+                let visuals = ui.style().interact(&response);
+                ui.painter().rect(
+                    rect,
+                    Rounding::same(5.0),
+                    visuals.bg_fill,
+                    visuals.bg_stroke,
+                );
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    visuals.text_color(),
                 );
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(
@@ -1095,8 +1131,18 @@ fn quick_model_picker(
                         },
                     )
                 });
+                ui.ctx().accesskit_node_builder(response.id, |builder| {
+                    builder.set_selected(current);
+                    if current {
+                        builder.set_description("Current selected model");
+                    }
+                });
                 paint_focus_ring(ui, &response, Rounding::same(5.0));
-                if response.clicked() && !current {
+                let keyboard_activated = response.has_focus()
+                    && ui.input(|input| {
+                        input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+                    });
+                if (response.clicked() || keyboard_activated) && !current {
                     action = Some(ScreenAction::SelectQuickModel(model.id.clone()));
                     ui.memory_mut(|memory| memory.close_popup());
                 }
@@ -8683,6 +8729,46 @@ mod tests {
         })
     }
 
+    fn render_selector_with_key(
+        ctx: &egui::Context,
+        state: &TranscriptionState,
+        models: &[ModelViewModel],
+        focus_id: egui::Id,
+        key: egui::Key,
+        picker_open: bool,
+    ) -> (egui::FullOutput, ScreenAction) {
+        let mut action = ScreenAction::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 300.0),
+                )),
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if picker_open {
+                        ui.memory_mut(|memory| {
+                            memory.open_popup(egui::Id::new("quick-model-picker"));
+                        });
+                    }
+                    ctx.memory_mut(|memory| memory.request_focus(focus_id));
+                    action = selector_row(ui, state, models, models);
+                });
+            },
+        );
+        (output, action)
+    }
+
     #[test]
     fn elapsed_display_is_deterministic() {
         assert_eq!(format_elapsed(8_000), "00:08");
@@ -8728,6 +8814,141 @@ mod tests {
             .expect("recording shortcut button");
         let bounds = hotkey.bounds().expect("recording shortcut bounds");
         assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+    }
+
+    #[test]
+    fn quick_controls_support_enter_space_current_checkmark_and_ready_models_only() {
+        let state = TranscriptionState {
+            phase: TranscriptionPhase::Ready,
+            selected_model_id: Some("base.en".into()),
+            hotkey: "Ctrl+Space".into(),
+            ..Default::default()
+        };
+        let models = vec![
+            ModelViewModel {
+                id: "base.en".into(),
+                display_name: "Whisper Base".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "tiny.en".into(),
+                display_name: "Whisper Tiny".into(),
+                installed: true,
+                ready: true,
+                ..Default::default()
+            },
+            ModelViewModel {
+                id: "broken.en".into(),
+                display_name: "Broken model".into(),
+                installed: true,
+                ready: false,
+                ..Default::default()
+            },
+        ];
+
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::ui::controls::configure_accessible_style(&ctx);
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (_, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::StartHotkeyCapture);
+
+            let capturing = TranscriptionState {
+                hotkey_capture_active: true,
+                ..state.clone()
+            };
+            let _ = render_selector_with_key(
+                &ctx,
+                &capturing,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (_, action) = render_selector_with_key(
+                &ctx,
+                &capturing,
+                &models,
+                egui::Id::new("recording-hotkey-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::CancelHotkeyCapture);
+
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                egui::Key::Escape,
+                false,
+            );
+            let (picker, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new("selected-model-action"),
+                key,
+                false,
+            );
+            assert_eq!(action, ScreenAction::None);
+            let nodes = picker.platform_output.accesskit_update.unwrap().nodes;
+            let change = nodes
+                .iter()
+                .find_map(|(_, node)| (node.name() == Some("Change")).then_some(node))
+                .expect("Change action");
+            let bounds = change.bounds().expect("Change bounds");
+            assert!(bounds.width() >= 44.0 && bounds.height() >= 44.0);
+
+            let _ = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new(("quick-model-picker-option", "tiny.en")),
+                egui::Key::Escape,
+                true,
+            );
+            let (picker, action) = render_selector_with_key(
+                &ctx,
+                &state,
+                &models,
+                egui::Id::new(("quick-model-picker-option", "tiny.en")),
+                key,
+                true,
+            );
+            assert_eq!(action, ScreenAction::SelectQuickModel("tiny.en".into()));
+            let nodes = picker.platform_output.accesskit_update.unwrap().nodes;
+            assert!(nodes.iter().any(|(_, node)| {
+                node.name() == Some("Current selected model") && node.is_selected() == Some(true)
+            }));
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Select installed model"))
+            );
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.name() == Some("Broken model"))
+            );
+        }
     }
 
     #[test]
