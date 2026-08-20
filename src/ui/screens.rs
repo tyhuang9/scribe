@@ -1409,6 +1409,17 @@ fn transcript_frame(
                                     builder.set_live_atomic();
                                 }
                             });
+                            if !state.provisional_transcript.is_empty() {
+                                let estimate =
+                                    ui.allocate_response(Vec2::ZERO, egui::Sense::hover());
+                                ui.ctx().accesskit_node_builder(estimate.id, |builder| {
+                                    builder.set_role(egui::accesskit::Role::StaticText);
+                                    builder.set_name(format!(
+                                        "Live estimate, may change: {}",
+                                        state.provisional_transcript
+                                    ));
+                                });
+                            }
                         }
                         if state.committed_transcript.trim().is_empty()
                             && !state.provisional_transcript.is_empty()
@@ -8796,10 +8807,19 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.name() == Some("Recording"))
         );
-        assert!(polite_nodes.iter().any(|(_, node)| {
-            node.name()
-                .is_some_and(|name| name.contains("committed words"))
-        }));
+        let committed = nodes
+            .iter()
+            .find_map(|(_, node)| (node.name() == Some("committed words")).then_some(node))
+            .expect("committed transcript node");
+        assert_eq!(committed.live(), Some(egui::accesskit::Live::Polite));
+        let estimate = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.name() == Some("Live estimate, may change: tentative words")).then_some(node)
+            })
+            .expect("separate live-estimate node with actual provisional text");
+        assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
+        assert!(estimate.live().is_none());
         assert!(polite_nodes.iter().all(|(_, node)| {
             !node
                 .name()

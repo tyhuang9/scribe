@@ -1964,6 +1964,22 @@ impl TranscribeCppRuntime {
         Ok(false)
     }
 
+    fn validate_transcription_options(options: &TranscriptionOptions) -> anyhow::Result<()> {
+        // The retained native shim always returns segment timing. Accept the
+        // preview-only request flag even though no additional native switch is
+        // necessary; final service requests remain default-only.
+        let supported_options = TranscriptionOptions {
+            enable_timestamps: options.enable_timestamps,
+            ..TranscriptionOptions::default()
+        };
+        if *options != supported_options {
+            return Err(anyhow::anyhow!(
+                "the verified native whisper.cpp adapter currently accepts only default transcription options and preview timestamps"
+            ));
+        }
+        Ok(())
+    }
+
     fn runtime_capabilities() -> RuntimeCapabilities {
         RuntimeCapabilities {
             cancellation: true,
@@ -1997,18 +2013,7 @@ impl SpeechEngine for TranscribeCppRuntime {
         audio: &PreparedAudio,
         options: &TranscriptionOptions,
     ) -> anyhow::Result<Transcript> {
-        // The retained native shim always returns segment timing. Accept the
-        // preview-only request flag even though no additional native switch is
-        // necessary; final service requests remain default-only.
-        let supported_options = TranscriptionOptions {
-            enable_timestamps: options.enable_timestamps,
-            ..TranscriptionOptions::default()
-        };
-        if *options != supported_options {
-            return Err(anyhow::anyhow!(
-                "the verified native whisper.cpp adapter currently accepts only default transcription options and preview timestamps"
-            ));
-        }
+        Self::validate_transcription_options(options)?;
         if audio.sample_rate != PREPARED_SAMPLE_RATE
             || audio.samples.is_empty()
             || audio
@@ -3239,6 +3244,25 @@ mod tests {
     fn native_handler_implements_the_common_speech_engine_contract() {
         fn assert_engine<T: SpeechEngine>() {}
         assert_engine::<TranscribeCppRuntime>();
+    }
+
+    #[test]
+    fn transcribe_cpp_accepts_preview_timestamps_but_rejects_other_non_default_options() {
+        let preview_options = TranscriptionOptions {
+            enable_timestamps: true,
+            ..TranscriptionOptions::default()
+        };
+        assert!(TranscribeCppRuntime::validate_transcription_options(&preview_options).is_ok());
+        assert!(
+            TranscribeCppRuntime::validate_transcription_options(&TranscriptionOptions::default())
+                .is_ok()
+        );
+
+        let unsupported = TranscriptionOptions {
+            initial_prompt: Some("do not accept this on the native route".to_owned()),
+            ..preview_options
+        };
+        assert!(TranscribeCppRuntime::validate_transcription_options(&unsupported).is_err());
     }
 
     #[test]

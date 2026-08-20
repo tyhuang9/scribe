@@ -1476,6 +1476,91 @@ mod tests {
     }
 
     #[test]
+    fn timestamped_rollover_preserves_repeated_word_count_and_exact_prefixes() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let opening = |sequence| TranscriptHypothesis {
+            identity: identity(sequence),
+            window_start_frame: 0,
+            window_end_frame: 48_000,
+            words: vec![
+                HypothesisWord::new("we").at_absolute_frames(4_000, 8_000),
+                HypothesisWord::new("go").at_absolute_frames(9_000, 13_000),
+                HypothesisWord::new("go").at_absolute_frames(14_000, 18_000),
+                HypothesisWord::new("home").at_absolute_frames(40_000, 44_000),
+            ],
+        };
+        stabilizer.push(opening(1)).unwrap();
+        let before_rollover = stabilizer.push(opening(2)).unwrap();
+        assert_eq!(before_rollover.committed, "we go go");
+        assert_eq!(before_rollover.tentative, "home");
+
+        let rolled = TranscriptHypothesis {
+            identity: identity(3),
+            window_start_frame: 12_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("go").at_absolute_frames(14_000, 18_000),
+                HypothesisWord::new("home").at_absolute_frames(40_000, 44_000),
+                HypothesisWord::new("now").at_absolute_frames(52_000, 56_000),
+            ],
+        };
+        let after_rollover = stabilizer.push(rolled).unwrap();
+
+        assert!(
+            after_rollover
+                .committed
+                .starts_with(&before_rollover.committed)
+        );
+        assert_eq!(after_rollover.committed, "we go go home");
+        assert_eq!(after_rollover.tentative, "now");
+        assert_eq!(
+            after_rollover
+                .committed
+                .split_whitespace()
+                .filter(|word| *word == "go")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn untimed_rollover_fallback_preserves_repeated_word_count_and_exact_prefixes() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer
+            .push(hypothesis(1, 0, 48_000, "we go go home"))
+            .unwrap();
+        let before_rollover = stabilizer
+            .push(hypothesis(2, 0, 48_000, "we go go home"))
+            .unwrap();
+        assert_eq!(before_rollover.committed, "we go go");
+        assert_eq!(before_rollover.tentative, "home");
+
+        let overlap = stabilizer
+            .push(hypothesis(3, 16_000, 64_000, "go home now"))
+            .unwrap();
+        assert!(overlap.committed.starts_with(&before_rollover.committed));
+        assert_eq!(overlap.committed, "we go go");
+        assert_eq!(overlap.tentative, "home now");
+
+        let after_rollover = stabilizer
+            .push(hypothesis(4, 24_000, 72_000, "home now"))
+            .unwrap();
+        assert!(after_rollover.committed.starts_with(&overlap.committed));
+        assert_eq!(after_rollover.committed, "we go go home");
+        assert_eq!(after_rollover.tentative, "now");
+        assert_eq!(
+            after_rollover
+                .committed
+                .split_whitespace()
+                .filter(|word| *word == "go")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn repeated_words_are_deduplicated_after_normal_consecutive_updates() {
         let mut stabilizer =
             TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));

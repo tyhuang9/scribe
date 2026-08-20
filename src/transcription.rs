@@ -4024,18 +4024,26 @@ mod tests {
     }
 
     #[test]
-    fn preview_timestamp_policy_is_capability_gated_and_keeps_text_fallback() {
-        let enabled = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities {
+    fn capable_preview_route_requests_and_accepts_segment_timestamps() {
+        let preview = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities {
             timestamps: true,
             ..RuntimeCapabilities::default()
         });
-        let disabled = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities::default());
-        assert!(enabled.use_segment_timestamps);
-        assert!(!disabled.use_segment_timestamps);
-        assert!(enabled.transcription_options().enable_timestamps);
-        assert!(!disabled.transcription_options().enable_timestamps);
-        assert!(validate_preview_options(&enabled.transcription_options()).is_ok());
-        assert!(validate_default_options(&enabled.transcription_options()).is_err());
+
+        let request_options = preview.transcription_options();
+
+        assert!(preview.use_segment_timestamps);
+        assert!(request_options.enable_timestamps);
+        assert!(validate_preview_options(&request_options).is_ok());
+    }
+
+    #[test]
+    fn incapable_preview_route_keeps_default_text_only_options_and_fallback() {
+        let preview = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities::default());
+        let request_options = preview.transcription_options();
+        assert!(!preview.use_segment_timestamps);
+        assert_eq!(request_options, TranscriptionOptions::default());
+        assert!(validate_preview_options(&request_options).is_ok());
 
         let transcript = Transcript {
             text: "fallback words".to_owned(),
@@ -4058,7 +4066,7 @@ mod tests {
             16_000,
             32_000,
             &transcript,
-            disabled,
+            preview,
         );
 
         assert!(
@@ -4067,6 +4075,18 @@ mod tests {
                 .iter()
                 .all(|word| { word.start_frame.is_none() && word.end_frame.is_none() })
         );
+    }
+
+    #[test]
+    fn public_final_route_keeps_timestamps_disabled_and_rejects_an_explicit_request() {
+        assert!(!TranscriptionOptions::default().enable_timestamps);
+        let timestamp_request = TranscriptionOptions {
+            enable_timestamps: true,
+            ..TranscriptionOptions::default()
+        };
+
+        assert!(validate_default_options(&timestamp_request).is_err());
+        assert!(validate_preview_options(&timestamp_request).is_ok());
     }
 
     fn legacy_result() -> LegacyTranscriptResult {

@@ -24,7 +24,10 @@ use super::{
     super::{
         controller::{OverlayMode, OverlayPhase, OverlayRecovery, OverlayViewState},
         platform::OverlayWindowBounds,
-        view::{CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH},
+        view::{
+            CONTROL_SIZE, LIVE_HEIGHT, LIVE_WIDTH, MINIMAL_HEIGHT, MINIMAL_WIDTH,
+            live_estimate_marker,
+        },
     },
     layout::DisplayLayout,
 };
@@ -370,7 +373,28 @@ fn draw_live(
     )?;
 
     let preview = layout.preview.expect("live layout includes preview bounds");
-    let max_width = preview.width();
+    let mut text_x = preview.x0;
+    let mut max_width = preview.width();
+    if let Some(marker) = live_estimate_marker(state) {
+        let marker_font_size = 11.0 * scale;
+        let marker_width = canvas
+            .measure_text(marker, marker_font_size, TextStyle::Bold)?
+            .min(max_width);
+        canvas.draw_text(
+            marker,
+            text_x,
+            preview.y0,
+            marker_width,
+            preview.height(),
+            marker_font_size,
+            TextStyle::Bold,
+            colors.tentative_text,
+        )?;
+        let marker_gap = 6.0 * scale;
+        let marker_reservation = (marker_width + marker_gap).min(max_width);
+        text_x += marker_reservation;
+        max_width -= marker_reservation;
+    }
     let line = live_line(state, colors);
     let line = if state.error.is_some() || state.notice.is_some() {
         fit_head(
@@ -391,7 +415,7 @@ fn draw_live(
     };
     canvas.draw_styled_line(
         &line,
-        preview.x0,
+        text_x,
         preview.y0,
         max_width,
         preview.height(),

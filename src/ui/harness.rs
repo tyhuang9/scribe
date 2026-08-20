@@ -1433,7 +1433,10 @@ mod tests {
             assert_within_tolerance(hotkey.y0, 118.0, 3.0, "wide hotkey row start");
             assert_within_tolerance(panel.y0, 185.0, 6.0, "wide transcript panel top");
 
-            let bounds = node_matching(&output, |node| node.name() == Some(committed.as_str()))
+            let committed_node =
+                node_matching(&output, |node| node.name() == Some(committed.as_str()));
+            assert_eq!(committed_node.live(), Some(egui::accesskit::Live::Polite));
+            let bounds = committed_node
                 .bounds()
                 .expect("inline transcript label should expose bounds");
             assert_bounds_within(bounds, panel, "wrapped inline transcript text");
@@ -1441,11 +1444,24 @@ mod tests {
                 bounds.y1 - bounds.y0 > 32.0,
                 "inline transcript label did not wrap: {bounds:?}"
             );
+            let estimate_name = format!("Live estimate, may change: {provisional}");
+            let estimate =
+                node_matching(&output, |node| node.name() == Some(estimate_name.as_str()));
+            assert_eq!(estimate.role(), egui::accesskit::Role::StaticText);
+            assert!(estimate.live().is_none());
             assert!(
-                !node_names(&output)
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
                     .iter()
-                    .any(|name| name.contains(&provisional)),
-                "provisional text should remain visual-only and outside live accessibility names"
+                    .filter(|(_, node)| node.live() == Some(egui::accesskit::Live::Polite))
+                    .all(|(_, node)| {
+                        !node.name().is_some_and(|name| name.contains(&provisional))
+                    }),
+                "provisional text must remain outside polite live regions"
             );
             for name in ["Clear", "Copy"] {
                 let bounds = node_matching(&output, |node| {
