@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText};
 
 use crate::history::{HistoryRecord, HistoryStatus};
 
-use super::controls::{ButtonTone, button, search_field};
+use super::controls::search_field;
 
 fn semantic_heading(ui: &mut egui::Ui, text: RichText) -> egui::Response {
     let response = ui.label(text);
@@ -89,8 +89,13 @@ pub(crate) fn history_page(
     } = state;
     let mut action = None;
     ui.horizontal(|ui| {
+        const HISTORY_ACTION_WIDTH: f32 = 86.0;
+        let search_width =
+            (ui.available_width() - HISTORY_ACTION_WIDTH * 2.0 - ui.spacing().item_spacing.x * 2.0)
+                .max(44.0);
         let search_response = search_field(
             ui,
+            search_width,
             "history-search",
             search,
             "Search history",
@@ -100,12 +105,19 @@ pub(crate) fn history_page(
         if focus_search {
             search_response.input.request_focus();
         }
-        let enter = search_response.input.has_focus()
+        let enter = search_response.input.lost_focus()
             && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if button(ui, "Search", ButtonTone::Secondary).clicked() || enter {
+        if ui
+            .add_sized([HISTORY_ACTION_WIDTH, 44.0], egui::Button::new("Search"))
+            .clicked()
+            || enter
+        {
             action = Some(HistoryPageAction::ApplySearch);
         }
-        if button(ui, "Refresh", ButtonTone::Secondary).clicked() {
+        if ui
+            .add_sized([HISTORY_ACTION_WIDTH, 44.0], egui::Button::new("Refresh"))
+            .clicked()
+        {
             action = Some(HistoryPageAction::Refresh);
         }
         if search_response.clear_requested {
@@ -508,4 +520,70 @@ pub(crate) fn about_page(ui: &mut egui::Ui, model_dir: &Path, config_path: Optio
         Some(path) => format!("Settings: {}", path.display()),
         None => "Settings: platform path unavailable".to_owned(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::configure_accessible_style;
+
+    fn state<'a>(search: &'a mut String, focus_search: bool) -> HistoryPageState<'a> {
+        HistoryPageState {
+            search,
+            records: &[],
+            has_more: false,
+            loading: false,
+            error: None,
+            confirm_delete: None,
+            work_active: false,
+            playing: None,
+            playback_stopping: false,
+            armed_repaste: None,
+            focus_search,
+            focus_delete_confirmation: false,
+        }
+    }
+
+    #[test]
+    fn history_search_enter_applies_the_typed_query_once() {
+        let ctx = egui::Context::default();
+        configure_accessible_style(&ctx);
+        let mut search = String::new();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(375.0, 240.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(history_page(ui, state(&mut search, true)), None);
+            });
+        });
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("meeting".into()),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..raw()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = history_page(ui, state(&mut search, false));
+                });
+            },
+        );
+        assert_eq!(search, "meeting");
+        assert_eq!(action, Some(HistoryPageAction::ApplySearch));
+    }
 }

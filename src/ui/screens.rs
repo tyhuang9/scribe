@@ -4046,7 +4046,31 @@ fn render_inline_model_details(
                     }
                 }
             }
-            ModelCard::Remote(_, _) => {}
+            ModelCard::Remote(entry, variant) => {
+                render_model_layout_gap(ui, model_name, "requirements provenance gap", 12.0);
+                let provenance_heading = detail_heading(ui, "PROVENANCE", colors);
+                ui.ctx()
+                    .accesskit_node_builder(provenance_heading.id, |builder| {
+                        builder.set_name("Model provenance");
+                    });
+                render_model_layout_gap(ui, model_name, "provenance heading content gap", 6.0);
+                let publisher = ui.label(format!("{} · {}", entry.trust_label, entry.repository));
+                ui.ctx().accesskit_node_builder(publisher.id, |builder| {
+                    builder.set_name(format!(
+                        "Trusted source: {} from {}",
+                        entry.trust_label, entry.repository
+                    ));
+                    builder.set_description(entry.compatibility_detail.as_str());
+                });
+                let revision = ui.label(format!("Pinned revision: {}", entry.pinned_revision));
+                ui.ctx().accesskit_node_builder(revision.id, |builder| {
+                    builder.set_name(format!("Pinned revision: {}", entry.pinned_revision));
+                });
+                let artifact = ui.label(format!("Artifact: {}", variant.filename));
+                ui.ctx().accesskit_node_builder(artifact.id, |builder| {
+                    builder.set_name(format!("Verified artifact: {}", variant.filename));
+                });
+            }
         }
     });
     restored_remove_focus
@@ -4234,6 +4258,7 @@ fn models(
     let mut query = remote_catalog.query.clone();
     let search = search_field(
         ui,
+        ui.available_width(),
         "models-search",
         &mut query,
         "Search models",

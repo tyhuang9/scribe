@@ -167,7 +167,7 @@ pub(crate) fn paint_focus_ring(ui: &Ui, response: &Response, rounding: Rounding)
 /// need an explicit submit action.
 pub(crate) struct SearchFieldResponse {
     pub input: Response,
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub clear: Response,
     pub changed: bool,
     pub clear_requested: bool,
@@ -175,6 +175,7 @@ pub(crate) struct SearchFieldResponse {
 
 pub(crate) fn search_field(
     ui: &mut Ui,
+    width: f32,
     id_source: impl std::hash::Hash,
     value: &mut String,
     accessible_name: &str,
@@ -193,7 +194,7 @@ pub(crate) fn search_field(
     // Allocate one fixed surface before adding child controls. This exactly
     // preserves the old full-width 44px edit geometry at every route width.
     let (surface_rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), PRIMARY_TARGET_HEIGHT),
+        Vec2::new(width.min(ui.available_width()), PRIMARY_TARGET_HEIGHT),
         Sense::hover(),
     );
     ui.painter().rect(
@@ -264,6 +265,7 @@ pub(crate) fn search_field(
     let changed = input.changed();
     SearchFieldResponse {
         input,
+        #[cfg(test)]
         clear,
         changed,
         clear_requested,
@@ -589,6 +591,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let response = search_field(
                         ui,
+                        ui.available_width(),
                         "search-field-contract",
                         &mut query,
                         "Search models",
@@ -634,6 +637,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let response = search_field(
                         ui,
+                        ui.available_width(),
                         "empty-search-field-contract",
                         &mut empty_query,
                         "Search models",
@@ -701,6 +705,7 @@ mod tests {
                     ui.memory_mut(|memory| memory.request_focus(id));
                     let response = search_field(
                         ui,
+                        ui.available_width(),
                         "search-field-escape",
                         &mut query,
                         "Search models",
@@ -734,6 +739,7 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         clear_id = search_field(
                             ui,
+                            ui.available_width(),
                             "search-field-keyboard-clear",
                             &mut query,
                             "Search models",
@@ -767,6 +773,7 @@ mod tests {
                         ui.memory_mut(|memory| memory.request_focus(clear_id));
                         clear_requested = search_field(
                             ui,
+                            ui.available_width(),
                             "search-field-keyboard-clear",
                             &mut query,
                             "Search models",
