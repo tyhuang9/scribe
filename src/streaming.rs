@@ -771,8 +771,11 @@ impl TranscriptStabilizer {
         }
 
         if commit_count > 0 {
-            self.committed.extend(current.drain(..commit_count));
-            self.state.committed = render_words(&self.committed);
+            for word in current.drain(..commit_count) {
+                append_display_word(&mut self.state.committed, &word.display);
+                self.committed.push(word);
+            }
+            debug_assert_eq!(self.state.committed, render_words(&self.committed));
         }
         self.previous = Some(current.clone());
         self.refresh_tentative(&current);
@@ -902,10 +905,14 @@ fn remove_committed_overlap(
     let overlap = (1..=max_overlap)
         .rev()
         .find(|&count| {
-            committed[committed.len() - count..]
+            let committed_tail = &committed[committed.len() - count..];
+            let current_prefix = &current[..count];
+            let timestamped = timestamps_are_trustworthy(committed_tail)
+                && timestamps_are_trustworthy(current_prefix);
+            committed_tail
                 .iter()
-                .zip(&current[..count])
-                .all(|(left, right)| normalized(&left.display) == normalized(&right.display))
+                .zip(current_prefix)
+                .all(|(left, right)| words_match(left, right, timestamped))
         })
         .unwrap_or_default();
     if overlap > 0 {
@@ -915,12 +922,21 @@ fn remove_committed_overlap(
 }
 
 fn has_full_committed_prefix(committed: &[HypothesisWord], current: &[HypothesisWord]) -> bool {
-    !committed.is_empty()
-        && current.len() >= committed.len()
-        && committed
-            .iter()
-            .zip(&current[..committed.len()])
-            .all(|(left, right)| normalized(&left.display) == normalized(&right.display))
+    if committed.is_empty() || current.len() < committed.len() {
+        return false;
+    }
+    let current_prefix = &current[..committed.len()];
+    let timestamped =
+        timestamps_are_trustworthy(committed) && timestamps_are_trustworthy(current_prefix);
+    committed
+        .iter()
+        .zip(current_prefix)
+        .all(|(left, right)| words_match(left, right, timestamped))
+}
+
+fn words_match(left: &HypothesisWord, right: &HypothesisWord, timestamped: bool) -> bool {
+    normalized(&left.display) == normalized(&right.display)
+        && (!timestamped || timestamps_match(left, right))
 }
 
 fn normalized(display: &str) -> String {
@@ -934,15 +950,19 @@ fn normalized(display: &str) -> String {
 fn render_words(words: &[HypothesisWord]) -> String {
     let mut text = String::new();
     for word in words {
-        if word.display.is_empty() {
-            continue;
-        }
-        if !text.is_empty() && !is_closing_punctuation(&word.display) {
-            text.push(' ');
-        }
-        text.push_str(&word.display);
+        append_display_word(&mut text, &word.display);
     }
     text
+}
+
+fn append_display_word(text: &mut String, display: &str) {
+    if display.is_empty() {
+        return;
+    }
+    if !text.is_empty() && !is_closing_punctuation(display) {
+        text.push(' ');
+    }
+    text.push_str(display);
 }
 
 fn is_closing_punctuation(word: &str) -> bool {
@@ -1309,6 +1329,42 @@ mod tests {
     }
 
     #[test]
+    fn correction_dropout_punctuation_and_rollover_trace_keeps_committed_bytes_monotonic() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        let trace = [
+            hypothesis(1, 0, 48_000, "Schedule a meeting with Alice"),
+            hypothesis(2, 0, 48_000, "Schedule a meeting with Alice"),
+            hypothesis(3, 0, 48_000, "Schedule a meeting with Alex tomorrow"),
+            hypothesis(4, 0, 48_000, "Schedule a meeting with Alex tomorrow"),
+            hypothesis(5, 0, 48_000, ""),
+            hypothesis(6, 16_000, 64_000, "with Alex tomorrow, tomorrow at noon"),
+            hypothesis(7, 16_000, 64_000, "with Alex tomorrow, tomorrow at noon"),
+        ];
+        let mut previous_committed = String::new();
+        let mut states = Vec::new();
+
+        for hypothesis in trace {
+            let state = stabilizer.push(hypothesis).unwrap();
+            assert!(
+                state.committed.starts_with(&previous_committed),
+                "committed bytes changed from {previous_committed:?} to {:?}",
+                state.committed
+            );
+            previous_committed = state.committed.clone();
+            states.push(state);
+        }
+
+        assert_eq!(states[2].committed, "Schedule a meeting with");
+        assert_eq!(states[2].tentative, "Alex tomorrow");
+        assert_eq!(
+            states[4], states[3],
+            "a decode dropout must preserve display state"
+        );
+        assert!(states.last().unwrap().tentative.contains("tomorrow"));
+    }
+
+    #[test]
     fn punctuation_and_case_stay_tentative_until_their_display_form_repeats() {
         let mut stabilizer =
             TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
@@ -1391,6 +1447,32 @@ mod tests {
 
         assert_eq!(state.committed, "go go");
         assert_eq!(state.tentative, "now please");
+    }
+
+    #[test]
+    fn absolute_timing_distinguishes_a_new_repeated_word_from_window_overlap() {
+        let mut stabilizer =
+            TranscriptStabilizer::new(SessionId(7), RequestId(11), ModelId::new("preview-model"));
+        stabilizer.committed = vec![HypothesisWord::new("go").at_absolute_frames(1_000, 4_000)];
+        stabilizer.state.committed = "go".to_owned();
+        stabilizer.previous = Some(vec![
+            HypothesisWord::new("go").at_absolute_frames(20_000, 24_000),
+            HypothesisWord::new("now").at_absolute_frames(25_000, 29_000),
+        ]);
+        let new_occurrence = TranscriptHypothesis {
+            identity: identity(1),
+            window_start_frame: 16_000,
+            window_end_frame: 64_000,
+            words: vec![
+                HypothesisWord::new("go").at_absolute_frames(20_000, 24_000),
+                HypothesisWord::new("now").at_absolute_frames(25_000, 29_000),
+            ],
+        };
+
+        let state = stabilizer.push(new_occurrence).unwrap();
+
+        assert_eq!(state.committed, "go go now");
+        assert!(state.tentative.is_empty());
     }
 
     #[test]

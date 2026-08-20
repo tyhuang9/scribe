@@ -202,6 +202,7 @@ fn transcript_hypothesis(
     window_start_frame: u64,
     window_end_frame: u64,
     transcript: &Transcript,
+    preview_options: PreviewDecodeOptions,
 ) -> TranscriptHypothesis {
     let window_frames = window_end_frame.saturating_sub(window_start_frame);
     let mut words = Vec::new();
@@ -210,9 +211,10 @@ fn transcript_hypothesis(
         if displays.is_empty() {
             continue;
         }
-        let timed_span = segment
-            .start_ms
-            .zip(segment.end_ms)
+        let timed_span = preview_options
+            .use_segment_timestamps
+            .then(|| segment.start_ms.zip(segment.end_ms))
+            .flatten()
             .and_then(|(start, end)| {
                 let frames_per_ms = u64::from(PREPARED_SAMPLE_RATE) / 1_000;
                 let start_frame = start.saturating_mul(frames_per_ms).min(window_frames);
@@ -262,6 +264,23 @@ pub struct TranscriptionOptions {
     pub translate_to_english: bool,
     pub enable_timestamps: bool,
     pub initial_prompt: Option<String>,
+}
+
+/// Internal rolling-preview policy. Native runtimes that expose segment
+/// timing already return it with their ordinary decode result, so preview can
+/// opt into using that metadata without changing the caller-facing final
+/// transcription options or sending an unsupported decoder option.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PreviewDecodeOptions {
+    use_segment_timestamps: bool,
+}
+
+impl PreviewDecodeOptions {
+    fn for_capabilities(capabilities: &RuntimeCapabilities) -> Self {
+        Self {
+            use_segment_timestamps: capabilities.timestamps,
+        }
+    }
 }
 
 /// Features that the selected model/backend can currently expose.
@@ -1805,6 +1824,8 @@ impl TranscriptionService {
         // Resolve before capture starts so a missing artifact degrades to the
         // final-only path instead of emitting repeated asynchronous errors.
         self.resolve_runtime_model(self.resolve_model(&model_id, model_path.clone())?)?;
+        let preview_options =
+            PreviewDecodeOptions::for_capabilities(&self.capabilities_for(&model_id)?);
 
         let identity = StreamIdentity {
             session_id,
@@ -1835,6 +1856,7 @@ impl TranscriptionService {
                     window_start_frame,
                     window_end_frame,
                     &outcome.transcript,
+                    preview_options,
                 );
                 let state = stabilizer
                     .push(hypothesis)
@@ -3929,7 +3951,15 @@ mod tests {
             duration_ms: Some(1_000),
         };
 
-        let hypothesis = transcript_hypothesis(identity, 16_000, 32_000, &transcript);
+        let hypothesis = transcript_hypothesis(
+            identity,
+            16_000,
+            32_000,
+            &transcript,
+            PreviewDecodeOptions {
+                use_segment_timestamps: true,
+            },
+        );
 
         assert_eq!(hypothesis.words.len(), 3);
         assert_eq!(hypothesis.words[0].start_frame, Some(17_600));
@@ -3955,7 +3985,13 @@ mod tests {
             duration_ms: None,
         };
 
-        let hypothesis = transcript_hypothesis(identity, 0, 16_000, &transcript);
+        let hypothesis = transcript_hypothesis(
+            identity,
+            0,
+            16_000,
+            &transcript,
+            PreviewDecodeOptions::default(),
+        );
 
         assert_eq!(
             hypothesis
@@ -3970,6 +4006,48 @@ mod tests {
                 .words
                 .iter()
                 .all(|word| word.start_frame.is_none() && word.end_frame.is_none())
+        );
+    }
+
+    #[test]
+    fn preview_timestamp_policy_is_capability_gated_and_keeps_text_fallback() {
+        let enabled = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities {
+            timestamps: true,
+            ..RuntimeCapabilities::default()
+        });
+        let disabled = PreviewDecodeOptions::for_capabilities(&RuntimeCapabilities::default());
+        assert!(enabled.use_segment_timestamps);
+        assert!(!disabled.use_segment_timestamps);
+
+        let transcript = Transcript {
+            text: "fallback words".to_owned(),
+            segments: vec![TranscriptSegment {
+                text: "fallback words".to_owned(),
+                start_ms: Some(100),
+                end_ms: Some(500),
+                confidence: None,
+            }],
+            detected_language: None,
+            duration_ms: Some(1_000),
+        };
+        let hypothesis = transcript_hypothesis(
+            StreamIdentity {
+                session_id: SessionId(1),
+                request_id: RequestId(2),
+                model_id: ModelId::new("untimed-preview-model"),
+                sequence: 1,
+            },
+            16_000,
+            32_000,
+            &transcript,
+            disabled,
+        );
+
+        assert!(
+            hypothesis
+                .words
+                .iter()
+                .all(|word| { word.start_frame.is_none() && word.end_frame.is_none() })
         );
     }
 
