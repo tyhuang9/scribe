@@ -1156,7 +1156,9 @@ fn recording_status_header(ui: &mut egui::Ui, state: &TranscriptionState) -> Scr
                 ui.label(RichText::new("Start recording").strong());
                 ui.label(match state.recording_mode {
                     RecordingMode::Hold => format!("Hold {} to record", state.hotkey),
-                    RecordingMode::PressOnce => format!("Press {} to toggle", state.hotkey),
+                    RecordingMode::PressOnce => {
+                        format!("Press {} to use the record shortcut", state.hotkey)
+                    }
                 });
             });
         }
